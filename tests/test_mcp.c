@@ -3631,7 +3631,8 @@ TEST(tool_query_graph_uses_query_max_rows_config_when_omitted) {
         srv, "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"query_graph\","
              "\"arguments\":{\"project\":\"query-max-rows-config\","
-             "\"query\":\"MATCH (f:Function) RETURN f.name\"}}}");
+             "\"query\":\"MATCH (f:Function) RETURN f.name\","
+             "\"format\":\"json\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -3642,6 +3643,8 @@ TEST(tool_query_graph_uses_query_max_rows_config_when_omitted) {
         p += strlen("ConfigLimitedFn");
     }
     ASSERT_EQ(hits, 2);
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "query_max_rows returned a complete prefix"));
 
     free(inner);
     free(resp);
@@ -3651,7 +3654,8 @@ TEST(tool_query_graph_uses_query_max_rows_config_when_omitted) {
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\","
                                       "\"params\":{\"name\":\"query_graph\","
                                       "\"arguments\":{\"project\":\"query-max-rows-config\","
-                                      "\"query\":\"MATCH (f:Function) RETURN f.name LIMIT 4\"}}}");
+                                      "\"query\":\"MATCH (f:Function) RETURN f.name LIMIT 4\","
+                                      "\"format\":\"json\"}}}");
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -3662,9 +3666,77 @@ TEST(tool_query_graph_uses_query_max_rows_config_when_omitted) {
         p += strlen("ConfigLimitedFn");
     }
     ASSERT_EQ(hits, 2);
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
 
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(tool_query_graph_fails_loudly_when_working_row_budget_is_exhausted) {
+    char *cache = th_mktempdir("cbm_mcp_query_working_rows_cache");
+    ASSERT_NOT_NULL(cache);
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "2"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "query-working-rows-config";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-working-rows-config"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+    for (int i = 0; i < 2; i++) {
+        char name[CBM_SZ_64];
+        char qn[CBM_SZ_128];
+        int n = snprintf(name, sizeof(name), "WorkingLimitedFn%d", i);
+        ASSERT(n >= 0 && (size_t)n < sizeof(name));
+        n = snprintf(qn, sizeof(qn), "query.working.WorkingLimitedFn%d", i);
+        ASSERT(n >= 0 && (size_t)n < sizeof(qn));
+        cbm_node_t fn = {.project = proj,
+                         .label = "Function",
+                         .name = name,
+                         .qualified_name = qn,
+                         .file_path = "src/main.c"};
+        ASSERT_GT(cbm_store_upsert_node(st, &fn), 0);
+    }
+
+    const char *request =
+        "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"query_graph\",\"arguments\":{"
+        "\"project\":\"query-working-rows-config\","
+        "\"query\":\"MATCH (a:Function) MATCH (b:Function) RETURN a.name, b.name\"}}}";
+    char *resp = cbm_mcp_server_handle(srv, request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    if (!strstr(inner, "working-row budget (2)")) {
+        FAIL(inner);
+    }
+    ASSERT_NOT_NULL(strstr(inner, "raise query_max_working_rows"));
+    free(inner);
+    free(resp);
+
+    /* Reaching the budget exactly is complete, so it must remain successful.
+     * The independent output cap still shapes the response down to one row. */
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "4"), 0);
+    resp = cbm_mcp_server_handle(srv, request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "WorkingLimitedFn"));
+    free(inner);
+    free(resp);
+
     cbm_mcp_server_free(srv);
     cbm_config_close(cfg);
     th_cleanup(cache);
@@ -15754,6 +15826,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_query_graph_chained_with_optional_multi_order_formats);
     RUN_TEST(tool_query_graph_uses_query_max_rows_config_when_omitted);
+    RUN_TEST(tool_query_graph_fails_loudly_when_working_row_budget_is_exhausted);
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
     RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_query_graph_uses_ready_overlay_for_node_only_query);

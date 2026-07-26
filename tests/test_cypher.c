@@ -2171,6 +2171,7 @@ TEST(cypher_apply_limit) {
     int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 5", "lim", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 5);
+    ASSERT_FALSE(r.truncated);
     cbm_cypher_result_free(&r);
 
     /* No LIMIT, max_rows=10 → capped at 10 */
@@ -2178,6 +2179,7 @@ TEST(cypher_apply_limit) {
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "lim", 10, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 10);
+    ASSERT_TRUE(r.truncated);
     cbm_cypher_result_free(&r);
 
     /* LIMIT can reduce but cannot bypass the caller/server output cap. */
@@ -2185,6 +2187,7 @@ TEST(cypher_apply_limit) {
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 30", "lim", 10, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 10);
+    ASSERT_TRUE(r.truncated);
     cbm_cypher_result_free(&r);
 
     /* LIMIT 0 is an explicit empty result, not the no-limit sentinel. */
@@ -2192,6 +2195,7 @@ TEST(cypher_apply_limit) {
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 0", "lim", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 0);
+    ASSERT_FALSE(r.truncated);
     cbm_cypher_result_free(&r);
 
     /* WITH has a separate skip/limit path and must preserve the same semantics. */
@@ -3595,6 +3599,190 @@ TEST(cypher_exec_union_all) {
     PASS();
 }
 
+TEST(cypher_exec_union_all_respects_caller_output_cap) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name CONTAINS \"Order\" RETURN f.name "
+                                "UNION ALL "
+                                "MATCH (f:Function) WHERE f.name CONTAINS \"Order\" RETURN f.name",
+                                "test", 2, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_TRUE(r.truncated);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_union_deduplicates_complete_branches_before_output_cap) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "union-cap", "/tmp/union-cap"), CBM_STORE_OK);
+    const char *names[] = {"Duplicate", "Duplicate", "UniqueAfterDuplicates"};
+    for (int i = 0; i < 3; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "union.cap.%d", i);
+        cbm_node_t node = {.project = "union-cap",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "src/union.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    const char *query =
+        "MATCH (f:Function) RETURN f.name "
+        "UNION "
+        "MATCH (m:Module) WHERE m.name = \"Missing\" RETURN m.name";
+    cbm_cypher_limits_t limits = {.max_output_rows = 2, .max_working_rows = 3};
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute_with_limits(s, query, "union-cap", &limits, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "Duplicate");
+    ASSERT_STR_EQ(r.rows[1][0], "UniqueAfterDuplicates");
+    ASSERT_FALSE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    limits.max_working_rows = 2;
+    rc = cbm_cypher_execute_with_limits(s, query, "union-cap", &limits, &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget (2)"));
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_limits_separate_output_cap_from_working_budget) {
+    enum { NAME_SIZE = 32, QN_SIZE = 64 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "limits", "/tmp/limits"), CBM_STORE_OK);
+    for (int i = 0; i < 2; i++) {
+        char name[NAME_SIZE];
+        char qn[QN_SIZE];
+        snprintf(name, sizeof(name), "Fn%d", i);
+        snprintf(qn, sizeof(qn), "limits.Fn%d", i);
+        cbm_node_t node = {.project = "limits",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "src/limits.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    const char *query = "MATCH (a:Function) MATCH (b:Function) RETURN a.name, b.name";
+    cbm_cypher_limits_t limits = {.max_output_rows = 4, .max_working_rows = 2};
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute_with_limits(s, query, "limits", &limits, &r);
+    ASSERT_EQ(rc, 0);
+    /* An explicit output cap raises the effective working budget, and reaching
+     * that budget exactly is valid: two nodes cross-join to four rows. */
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    limits.max_output_rows = 1;
+    rc = cbm_cypher_execute_with_limits(s, query, "limits", &limits, &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget (2)"));
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_working_budget_replaces_silent_bfs_prefix_cap) {
+    enum { DECOY_COUNT = 100, NAME_SIZE = 32, QN_SIZE = 64 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "bfs-budget", "/tmp/bfs-budget"), CBM_STORE_OK);
+
+    cbm_node_t root = {.project = "bfs-budget",
+                       .label = "Module",
+                       .name = "Root",
+                       .qualified_name = "bfs.Root",
+                       .file_path = "src/bfs.c"};
+    int64_t root_id = cbm_store_upsert_node(s, &root);
+    ASSERT_GT(root_id, 0);
+    for (int i = 0; i <= DECOY_COUNT; i++) {
+        char name[NAME_SIZE];
+        char qn[QN_SIZE];
+        bool target = i == DECOY_COUNT;
+        snprintf(name, sizeof(name), target ? "TargetAfterHundred" : "Decoy%03d", i);
+        snprintf(qn, sizeof(qn), "bfs.%s", name);
+        cbm_node_t node = {.project = "bfs-budget",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "src/bfs.c"};
+        int64_t node_id = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(node_id, 0);
+        cbm_edge_t edge = {
+            .project = "bfs-budget", .source_id = root_id, .target_id = node_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    const char *query = "MATCH (a:Module {name: \"Root\"})-[:CALLS*1..2]->"
+                        "(b:Function {name: \"TargetAfterHundred\"}) RETURN b.name";
+    cbm_cypher_limits_t limits = {.max_output_rows = 1, .max_working_rows = 101};
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute_with_limits(s, query, "bfs-budget", &limits, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "TargetAfterHundred");
+    cbm_cypher_result_free(&r);
+
+    limits.max_working_rows = 100;
+    rc = cbm_cypher_execute_with_limits(s, query, "bfs-budget", &limits, &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget (100)"));
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_working_budget_bounds_initial_scan_without_prefix_answer) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "scan-budget", "/tmp/scan-budget"), CBM_STORE_OK);
+    const char *names[] = {"Decoy0", "Decoy1", "TargetAfterBudget"};
+    for (int i = 0; i < 3; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "scan.%s", names[i]);
+        cbm_node_t node = {.project = "scan-budget",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "src/scan.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    const char *query = "MATCH (f:Function {name: \"TargetAfterBudget\"}) RETURN f.name";
+    cbm_cypher_limits_t limits = {.max_output_rows = 1, .max_working_rows = 2};
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute_with_limits(s, query, "scan-budget", &limits, &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget (2)"));
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
+    limits.max_working_rows = 3;
+    rc = cbm_cypher_execute_with_limits(s, query, "scan-budget", &limits, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "TargetAfterBudget");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_union) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -4187,6 +4375,11 @@ SUITE(cypher) {
     /* Phase 8: UNION */
     RUN_TEST(cypher_exec_union);
     RUN_TEST(cypher_exec_union_all);
+    RUN_TEST(cypher_exec_union_all_respects_caller_output_cap);
+    RUN_TEST(cypher_exec_union_deduplicates_complete_branches_before_output_cap);
+    RUN_TEST(cypher_exec_limits_separate_output_cap_from_working_budget);
+    RUN_TEST(cypher_exec_working_budget_replaces_silent_bfs_prefix_cap);
+    RUN_TEST(cypher_exec_working_budget_bounds_initial_scan_without_prefix_answer);
     RUN_TEST(cypher_parse_union);
     /* Phase 9: UNWIND */
     RUN_TEST(cypher_parse_unwind);

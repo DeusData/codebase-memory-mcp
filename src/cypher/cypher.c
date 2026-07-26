@@ -2299,7 +2299,7 @@ static void binding_free(binding_t *b);
 
 /* Per-execution state: query execution is re-entrant across server threads,
  * while a ceiling hit must never be reported by another request. */
-static _Thread_local int g_cypher_row_ceiling_hit = 0;
+static _Thread_local int g_cypher_working_row_limit_hit = 0;
 
 /* Grow an owning binding array without losing the existing rows on OOM.
  * The caller retains and frees the old allocation when growth fails. */
@@ -2328,7 +2328,7 @@ static bool binding_array_reserve(binding_t **rows, int *capacity, int needed, i
 static bool binding_array_append(binding_t **rows, int *count, int *capacity, int limit,
                                  binding_t *row) {
     if (*count >= limit) {
-        g_cypher_row_ceiling_hit = limit;
+        g_cypher_working_row_limit_hit = limit;
         binding_free(row);
         return false;
     }
@@ -3065,6 +3065,7 @@ typedef struct {
     int row_cap;
     const char **columns;
     int col_count;
+    bool truncated;
 } result_builder_t;
 
 typedef enum {
@@ -3101,11 +3102,7 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 
 /* ── Main execution ─────────────────────────────────────────────── */
 
-/* Hard ceiling: queries returning more than this trigger an error instead of data.
- * Prevents accidental multi-GB JSON payloads from unbounded MATCH (n) RETURN n. */
-#define CYPHER_RESULT_CEILING 100000
-
-/* Wall-clock execution deadline (#601). The row ceiling above only fires once
+/* Wall-clock execution deadline (#601). A working-row budget only fires once
  * rows exist, but an unbounded `OPTIONAL MATCH` over the full node set (or a
  * high-fanout OPTIONAL MATCH can run for minutes before a single row is
  * produced, so the ceiling never trips. Aggregate grouping formerly had the
@@ -3438,8 +3435,8 @@ static bool label_alt_matches(const char *actual, const char *pat) {
  * Node-struct fields are moved (shallow) into out_nodes; each per-label array
  * container is freed. */
 static void scan_alternation_labels(cbm_store_t *store, const char *project, const char *labels,
-                                    cypher_node_scan_mode_t scan_mode, cbm_node_t **out_nodes,
-                                    int *out_count) {
+                                    int candidate_limit, cypher_node_scan_mode_t scan_mode,
+                                    cbm_node_t **out_nodes, int *out_count) {
     *out_nodes = NULL;
     *out_count = 0;
     int cap = 0;
@@ -3449,12 +3446,17 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
     }
     char *save = NULL;
     for (char *tok = strtok_r(copy, "|", &save); tok; tok = strtok_r(NULL, "|", &save)) {
+        int remaining = candidate_limit > 0 ? candidate_limit - *out_count : 0;
+        if (candidate_limit > 0 && remaining <= 0) {
+            break;
+        }
         cbm_node_t *part = NULL;
         int pc = 0;
         if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-            cbm_store_find_nodes_by_label_overlay_view(store, project, tok, &part, &pc);
+            cbm_store_find_nodes_by_label_overlay_view_limited(store, project, tok, remaining,
+                                                               &part, &pc);
         } else {
-            cbm_store_find_nodes_by_label(store, project, tok, &part, &pc);
+            cbm_store_find_nodes_by_label_limited(store, project, tok, remaining, &part, &pc);
         }
         if (pc > 0 && part) {
             if (*out_count + pc > cap) {
@@ -3524,17 +3526,20 @@ static const char *where_file_contains_conjunct(const cbm_where_clause_t *where,
 }
 
 static void scan_pattern_nodes(cbm_store_t *store, const char *project, int candidate_limit,
-                               cbm_node_pattern_t *first, const cbm_where_clause_t *where,
-                               const char *variable, cypher_node_scan_mode_t scan_mode,
-                               cbm_node_t **out_nodes, int *out_count) {
+                               int working_row_budget, cbm_node_pattern_t *first,
+                               const cbm_where_clause_t *where, const char *variable,
+                               cypher_node_scan_mode_t scan_mode, cbm_node_t **out_nodes,
+                               int *out_count) {
     if (first->label && strchr(first->label, '|')) {
-        scan_alternation_labels(store, project, first->label, scan_mode, out_nodes, out_count);
+        scan_alternation_labels(store, project, first->label, candidate_limit, scan_mode, out_nodes,
+                                out_count);
     } else if (first->label) {
         if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-            cbm_store_find_nodes_by_label_overlay_view(store, project, first->label, out_nodes,
-                                                       out_count);
+            cbm_store_find_nodes_by_label_overlay_view_limited(
+                store, project, first->label, candidate_limit, out_nodes, out_count);
         } else {
-            cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
+            cbm_store_find_nodes_by_label_limited(store, project, first->label, candidate_limit,
+                                                  out_nodes, out_count);
         }
     } else if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
         cbm_store_find_nodes_by_label_overlay_view_limited(store, project, NULL, candidate_limit,
@@ -3560,6 +3565,9 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int cand
             sout.results[i].node.properties_json = NULL;
         }
         cbm_store_search_free(&sout);
+    }
+    if (working_row_budget > 0 && *out_count > working_row_budget) {
+        g_cypher_working_row_limit_hit = working_row_budget;
     }
     /* Apply inline property filters — free rejected nodes' strings */
     if (first->prop_count > 0) {
@@ -3594,7 +3602,7 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
      * the result of dead-code queries and produced wrong rows (#627). */
     cbm_node_t *bound_to = binding_get(b, to_var);
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
-    for (int ei = 0; ei < edge_count && *new_count < max_new; ei++) {
+    for (int ei = 0; ei < edge_count; ei++) {
         int64_t tid = inbound ? edges[ei].source_id : edges[ei].target_id;
         if (bound_to && tid != bound_to_id) {
             continue;
@@ -3622,9 +3630,10 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             binding_free(&nb);
             continue;
         }
-        if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
-            (*match_count)++;
+        if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+            return;
         }
+        (*match_count)++;
     }
 }
 
@@ -3640,7 +3649,7 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
             ? bound_to->qualified_name
             : NULL;
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
-    for (int ri = 0; ri < row_count && *new_count < max_new; ri++) {
+    for (int ri = 0; ri < row_count; ri++) {
         cbm_node_t *found = &rows[ri].node;
         if (bound_to_qn) {
             if (!found->qualified_name || strcmp(bound_to_qn, found->qualified_name) != 0) {
@@ -3665,9 +3674,10 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
             binding_free(&nb);
             continue;
         }
-        if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
-            (*match_count)++;
+        if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+            return;
         }
+        (*match_count)++;
     }
 }
 
@@ -3702,15 +3712,21 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     const char *dir = rel->direction ? rel->direction : "outbound";
     if (b->use_active_overlay_edges && b->project && src->qualified_name &&
         src->qualified_name[0]) {
-        int max_results = max_new - *new_count;
-        if (max_results <= 0) {
-            return;
-        }
+        int remaining = max_new - *new_count;
+        /* Fetch one sentinel candidate beyond the remaining budget. This keeps
+         * traversal output memory O(min(reachable, remaining + 1)) and makes
+         * exhaustion observable without re-walking the graph. Candidates are
+         * budgeted before predicates because the traversal has already paid
+         * their runtime and memory cost. */
+        int probe_limit = remaining + SKIP_ONE;
         cbm_traverse_result_t tr = {0};
         if (cbm_store_bfs_overlay_view(store, b->project, src->qualified_name, dir,
                                        (const char **)rel->types, rel->type_count, max_depth,
-                                       max_results, &tr) == CBM_STORE_OK) {
-            for (int v = 0; v < tr.visited_count && *new_count < max_new; v++) {
+                                       probe_limit, &tr) == CBM_STORE_OK) {
+            if (tr.visited_count > remaining) {
+                g_cypher_working_row_limit_hit = max_new;
+            }
+            for (int v = 0; v < tr.visited_count; v++) {
                 cbm_node_hop_t *hop = &tr.visited[v];
                 if (hop->hop < rel->min_hops) {
                     continue;
@@ -3729,17 +3745,25 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                     binding_free(&nb);
                     continue;
                 }
-                if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
-                    (*match_count)++;
+                if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+                    break;
                 }
+                (*match_count)++;
             }
         }
         cbm_store_traverse_free(&tr);
         return;
     }
     cbm_traverse_result_t tr = {0};
-    cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
-    for (int v = 0; v < tr.visited_count && *new_count < max_new; v++) {
+    int remaining = max_new - *new_count;
+    /* Match the overlay path's one-row sentinel contract. cbm_store_bfs owns
+     * its visited set until cbm_store_traverse_free below. */
+    int probe_limit = remaining + SKIP_ONE;
+    cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, probe_limit, &tr);
+    if (tr.visited_count > remaining) {
+        g_cypher_working_row_limit_hit = max_new;
+    }
+    for (int v = 0; v < tr.visited_count; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
         if (hop->hop < rel->min_hops) {
             continue;
@@ -3757,9 +3781,10 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             binding_free(&nb);
             continue;
         }
-        if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
-            (*match_count)++;
+        if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+            break;
         }
+        (*match_count)++;
     }
     cbm_store_traverse_free(&tr);
 }
@@ -3846,7 +3871,7 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
 
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
                                 int *bind_count, const char **var_name, bool is_optional,
-                                const cbm_where_clause_t *pattern_where) {
+                                const cbm_where_clause_t *pattern_where, int max_new) {
     for (int ri = 0; ri < pat->rel_count; ri++) {
         /* #601: stop expanding further hops once the wall-clock budget is spent
          * (an unbounded expansion is exactly what blows up here). */
@@ -3859,7 +3884,6 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        int max_new = CYPHER_RESULT_CEILING;
         int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
         if (new_capacity > max_new) {
             new_capacity = max_new;
@@ -5242,6 +5266,9 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
         if (ret->limit >= 0 && ret->limit < proj_cap) {
             proj_cap = ret->limit;
         }
+        if ((ret->limit < 0 || ret->limit > max_rows) && bind_count > max_rows) {
+            rb->truncated = true;
+        }
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
         const char *vals[CBM_SZ_32];
@@ -5284,6 +5311,9 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
         }
     }
     build_default_columns(rb, vars, vc);
+    if (bind_count > max_rows) {
+        rb->truncated = true;
+    }
     for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
         const char *vals[CYP_COL_BUF];
         for (int v = 0; v < vc; v++) {
@@ -5300,11 +5330,10 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
 /* Cross-join node-only pattern into existing bindings */
 static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
                              int extra_count, const char *nvar, bool opt,
-                             const cbm_where_clause_t *pattern_where) {
+                             const cbm_where_clause_t *pattern_where, int max_new) {
     /* Bound intermediate cardinality at the engine's public result ceiling.
      * This avoids signed multiplication overflow and keeps memory O(ceiling)
      * while still scanning rejected candidates until a qualifying row exists. */
-    int max_new = CYPHER_RESULT_CEILING;
     int new_cap = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
     if (new_cap > max_new) {
         new_cap = max_new;
@@ -5314,9 +5343,9 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
         return;
     }
     int new_count = 0;
-    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
+    for (int bi = 0; bi < *bind_count; bi++) {
         int match_count = 0;
-        for (int ni = 0; ni < extra_count && new_count < max_new; ni++) {
+        for (int ni = 0; ni < extra_count; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
@@ -5324,21 +5353,17 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
                 binding_free(&nb);
                 continue;
             }
-            if (!binding_array_reserve(&new_bindings, &new_cap, new_count + SKIP_ONE, max_new)) {
-                binding_free(&nb);
+            if (!binding_array_append(&new_bindings, &new_count, &new_cap, max_new, &nb)) {
                 goto cross_join_nodes_done;
             }
-            new_bindings[new_count++] = nb;
             match_count++;
         }
-        if (opt && match_count == 0 && new_count < max_new) {
+        if (opt && match_count == 0) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
-            if (!binding_array_reserve(&new_bindings, &new_cap, new_count + SKIP_ONE, max_new)) {
-                binding_free(&nb);
+            if (!binding_array_append(&new_bindings, &new_count, &new_cap, max_new, &nb)) {
                 goto cross_join_nodes_done;
             }
-            new_bindings[new_count++] = nb;
         }
     }
 cross_join_nodes_done:
@@ -5354,8 +5379,7 @@ cross_join_nodes_done:
 static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding_t **bindings,
                                  int *bind_count, cbm_node_t *extra_nodes, int extra_count,
                                  const char *nvar, bool opt,
-                                 const cbm_where_clause_t *pattern_where) {
-    int max_new = CYPHER_RESULT_CEILING;
+                                 const cbm_where_clause_t *pattern_where, int max_new) {
     int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
     if (new_capacity > max_new) {
         new_capacity = max_new;
@@ -5365,8 +5389,8 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
         return;
     }
     int new_count = 0;
-    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
-        for (int ni = 0; ni < extra_count && new_count < max_new; ni++) {
+    for (int bi = 0; bi < *bind_count; bi++) {
+        for (int ni = 0; ni < extra_count; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
@@ -5378,7 +5402,7 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             tmp[0] = nb;
             int tc = SKIP_ONE;
             const char *tv = nvar;
-            expand_pattern_rels(store, patn, &tmp, &tc, &tv, opt, pattern_where);
+            expand_pattern_rels(store, patn, &tmp, &tc, &tv, opt, pattern_where, max_new);
             for (int ti = 0; ti < tc; ti++) {
                 if (!binding_array_append(&new_bindings, &new_count, &new_capacity, max_new,
                                           &tmp[ti])) {
@@ -5420,7 +5444,8 @@ cross_join_rels_done:
  * none — the correct dead-code semantics. */
 static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                                        binding_t **bindings, int *bind_count, const char *start_var,
-                                       bool opt, const cbm_where_clause_t *pattern_where) {
+                                       bool opt, const cbm_where_clause_t *pattern_where,
+                                       int max_new) {
     cbm_rel_pattern_t *rel = &patn->rels[0];
     const cbm_node_pattern_t *start_node = &patn->nodes[0];
     /* The relationship is written start-[r]->terminal. To enumerate the start
@@ -5429,7 +5454,6 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     /* (start)->(term): start = edge source = scan terminal's inbound edges. */
     bool scan_targets = !rel_inbound;
 
-    int max_new = CYPHER_RESULT_CEILING;
     int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
     if (new_capacity > max_new) {
         new_capacity = max_new;
@@ -5440,7 +5464,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     }
     int new_count = 0;
 
-    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
+    for (int bi = 0; bi < *bind_count; bi++) {
         binding_t *b = &(*bindings)[bi];
         cbm_node_t *term = binding_get(b, patn->nodes[1].variable ? patn->nodes[1].variable : "");
         int match_count = 0;
@@ -5464,10 +5488,13 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                                               &new_capacity, max_new, &match_count, pattern_where);
                 }
                 cbm_store_free_edge_nodes(rows, row_count);
+                if (g_cypher_working_row_limit_hit > 0) {
+                    goto expand_bound_terminal_done;
+                }
             }
             if (!used_active_overlay_edges) {
                 int type_count = rel->type_count > 0 ? rel->type_count : SKIP_ONE;
-                for (int ti = 0; ti < type_count && new_count < max_new; ti++) {
+                for (int ti = 0; ti < type_count; ti++) {
                     cbm_edge_t *edges = NULL;
                     int edge_count = 0;
                     if (rel->type_count > 0) {
@@ -5483,7 +5510,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                     } else {
                         cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
                     }
-                    for (int ei = 0; ei < edge_count && new_count < max_new; ei++) {
+                    for (int ei = 0; ei < edge_count; ei++) {
                         int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
                         cbm_node_t found = {0};
                         if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
@@ -5510,24 +5537,31 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                             binding_free(&nb);
                             continue;
                         }
-                        if (binding_array_append(&new_bindings, &new_count, &new_capacity, max_new,
-                                                 &nb)) {
-                            match_count++;
+                        if (!binding_array_append(&new_bindings, &new_count, &new_capacity, max_new,
+                                                  &nb)) {
+                            break;
                         }
+                        match_count++;
                     }
                     cbm_store_free_edges(edges, edge_count);
+                    if (g_cypher_working_row_limit_hit > 0) {
+                        goto expand_bound_terminal_done;
+                    }
                 }
             }
         }
-        if (opt && match_count == 0 && new_count < max_new) {
+        if (opt && match_count == 0) {
             /* No matching neighbour: keep the row with start_var left UNBOUND so
              * `WHERE <start> IS NULL` correctly identifies the no-edge case. */
             binding_t nb = {0};
             binding_copy(&nb, b);
-            (void)binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb);
+            if (!binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb)) {
+                goto expand_bound_terminal_done;
+            }
         }
     }
 
+expand_bound_terminal_done:
     for (int bi = 0; bi < *bind_count; bi++) {
         binding_free(&(*bindings)[bi]);
     }
@@ -5540,7 +5574,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
  * at pattern 1 because pattern 0 seeds that stream from a node scan; a stage
  * after WITH starts at pattern 0 and consumes only the projected bindings. */
 static void expand_patterns_from(cbm_store_t *store, cbm_query_t *q, int first_pattern,
-                                 const char *project, int max_rows,
+                                 const char *project, int max_rows, int max_working_rows,
                                  cypher_node_scan_mode_t scan_mode, binding_t **bindings,
                                  int *bind_count, int *bind_cap) {
     for (int pi = first_pattern; pi < q->pattern_count; pi++) {
@@ -5553,7 +5587,8 @@ static void expand_patterns_from(cbm_store_t *store, cbm_query_t *q, int first_p
 
         if (start_bound && patn->rel_count > 0) {
             const char *tv = nvar;
-            expand_pattern_rels(store, patn, bindings, bind_count, &tv, opt, pattern_where);
+            expand_pattern_rels(store, patn, bindings, bind_count, &tv, opt, pattern_where,
+                                max_working_rows);
             continue;
         }
 
@@ -5566,21 +5601,22 @@ static void expand_patterns_from(cbm_store_t *store, cbm_query_t *q, int first_p
             bool term_bound = term_var && binding_get(&(*bindings)[0], term_var) != NULL;
             if (term_bound) {
                 expand_from_bound_terminal(store, patn, bindings, bind_count, nvar, opt,
-                                           pattern_where);
+                                           pattern_where, max_working_rows);
                 continue;
             }
         }
 
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
-        scan_pattern_nodes(store, project, INT_MAX, &patn->nodes[0], pattern_where, nvar, scan_mode,
-                           &extra_nodes, &extra_count);
+        scan_pattern_nodes(store, project, max_working_rows + SKIP_ONE, max_working_rows,
+                           &patn->nodes[0], pattern_where, nvar, scan_mode, &extra_nodes,
+                           &extra_count);
         if (patn->rel_count == 0) {
             cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt,
-                             pattern_where);
+                             pattern_where, max_working_rows);
         } else {
             cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count, nvar,
-                                 opt, pattern_where);
+                                 opt, pattern_where, max_working_rows);
         }
         cbm_store_free_nodes(extra_nodes, extra_count);
     }
@@ -5601,8 +5637,9 @@ static bool query_where_is_optional_pattern_predicate(const cbm_query_t *q) {
  * Ownership of the binding array remains with the outer execute_single call;
  * expansion/projection helpers replace it only after freeing the prior rows. */
 static void execute_bound_stage(cbm_store_t *store, cbm_query_t *q, const char *project,
-                                int max_rows, cypher_node_scan_mode_t scan_mode,
-                                binding_t **bindings, int *bind_count, result_builder_t *rb) {
+                                int max_rows, int max_working_rows,
+                                cypher_node_scan_mode_t scan_mode, binding_t **bindings,
+                                int *bind_count, result_builder_t *rb) {
     while (q) {
         int bind_cap = *bind_count;
         if (bind_cap < max_rows) {
@@ -5612,8 +5649,8 @@ static void execute_bound_stage(cbm_store_t *store, cbm_query_t *q, const char *
             bind_cap = SKIP_ONE;
         }
 
-        expand_patterns_from(store, q, 0, project, max_rows, scan_mode, bindings, bind_count,
-                             &bind_cap);
+        expand_patterns_from(store, q, 0, project, max_rows, max_working_rows, scan_mode, bindings,
+                             bind_count, &bind_cap);
         if (q->where && !query_where_is_optional_pattern_predicate(q)) {
             filter_bindings_where(q->where, *bindings, bind_count);
         }
@@ -5644,6 +5681,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
     }
 
     if (ret->star) {
+        if ((ret->limit < 0 || ret->limit > max_rows) && bind_count > max_rows) {
+            rb->truncated = true;
+        }
         execute_return_star(q, bindings, bind_count, max_rows, rb);
     } else {
         build_return_columns(rb, ret);
@@ -5661,6 +5701,10 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
     int output_limit = max_rows;
     if (ret->limit >= 0 && ret->limit < output_limit) {
         output_limit = ret->limit;
+    }
+    int available_after_skip = rb->row_count - (ret->skip > 0 ? ret->skip : 0);
+    if ((ret->limit < 0 || ret->limit > max_rows) && available_after_skip > max_rows) {
+        rb->truncated = true;
     }
     rb_apply_skip_limit(rb, ret->skip, output_limit);
 }
@@ -5710,17 +5754,30 @@ static bool query_initial_scan_can_stop_at_output_cap(const cbm_query_t *q, cons
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
-                          cypher_node_scan_mode_t scan_mode, result_builder_t *rb) {
+                          int max_working_rows, cypher_node_scan_mode_t scan_mode,
+                          bool allow_output_prefix, result_builder_t *rb) {
     cbm_pattern_t *pat0 = &q->patterns[0];
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
 
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
-    int candidate_limit =
-        query_initial_scan_can_stop_at_output_cap(q, var_name, scan_mode) ? max_rows : INT_MAX;
-    scan_pattern_nodes(store, project, candidate_limit, &pat0->nodes[0], q->where, var_name,
-                       scan_mode, &scanned, &scan_count);
+    bool output_prefix_is_complete =
+        allow_output_prefix && query_initial_scan_can_stop_at_output_cap(q, var_name, scan_mode);
+    bool server_output_cap_applies =
+        !q->ret || q->ret->limit < 0 || q->ret->limit > max_rows;
+    int exact_output_limit =
+        q->ret && q->ret->limit >= 0 && q->ret->limit < max_rows ? q->ret->limit : max_rows;
+    int candidate_limit = output_prefix_is_complete
+                              ? exact_output_limit + (server_output_cap_applies ? SKIP_ONE : 0)
+                              : max_working_rows + SKIP_ONE;
+    int scan_working_budget = output_prefix_is_complete ? 0 : max_working_rows;
+    /* An explicit LIMIT 0 is a complete empty result for this prefix-safe
+     * shape, so avoid touching the store at all. */
+    if (!output_prefix_is_complete || exact_output_limit > 0) {
+        scan_pattern_nodes(store, project, candidate_limit, scan_working_budget, &pat0->nodes[0],
+                           q->where, var_name, scan_mode, &scanned, &scan_count);
+    }
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
@@ -5757,11 +5814,11 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     /* Step 2: Expand first pattern's relationships */
     const cbm_where_clause_t *first_pattern_where = q->pattern_count == SKIP_ONE ? q->where : NULL;
     expand_pattern_rels(store, pat0, &bindings, &bind_count, &var_name, q->pattern_optional[0],
-                        first_pattern_where);
+                        first_pattern_where, max_working_rows);
 
     /* Step 2b: Additional patterns */
-    expand_patterns_from(store, q, SKIP_ONE, project, max_rows, scan_mode, &bindings, &bind_count,
-                         &bind_cap);
+    expand_patterns_from(store, q, SKIP_ONE, project, max_rows, max_working_rows, scan_mode,
+                         &bindings, &bind_count, &bind_cap);
 
     /* Step 3: Late WHERE */
     if (q->where && !query_where_is_optional_pattern_predicate(q) &&
@@ -5774,8 +5831,8 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
     /* Step 4: Project results */
     if (q->next_stage) {
-        execute_bound_stage(store, q->next_stage, project, max_rows, scan_mode, &bindings,
-                            &bind_count, rb);
+        execute_bound_stage(store, q->next_stage, project, max_rows, max_working_rows, scan_mode,
+                            &bindings, &bind_count, rb);
     } else {
         rb_init(rb);
         if (q->ret) {
@@ -5863,17 +5920,33 @@ static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
 /* ── Main entry point ─────────────────────────────────────────── */
 
 static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const char *project,
-                                   int max_rows, bool request_active_nodes,
+                                   const cbm_cypher_limits_t *limits, bool request_active_nodes,
                                    cbm_cypher_result_t *out, bool *used_active_nodes) {
     memset(out, 0, sizeof(*out));
     if (used_active_nodes) {
         *used_active_nodes = false;
     }
     g_cypher_depth_clamped = 0;
-    g_cypher_row_ceiling_hit = 0;
+    g_cypher_working_row_limit_hit = 0;
     cypher_deadline_arm();
-    if (max_rows <= 0) {
-        max_rows = CYPHER_RESULT_CEILING;
+    int max_rows = limits ? limits->max_output_rows : 0;
+    int max_working_rows = limits ? limits->max_working_rows : 0;
+    if (max_rows < 0 || max_rows > CBM_MAX_QUERY_ROWS || max_working_rows < 0 ||
+        max_working_rows > CBM_MAX_QUERY_WORKING_ROWS) {
+        out->error = heap_strdup(
+            "query row limits are outside the supported range; use max_rows 0.."
+            CBM_STRINGIFY(CBM_MAX_QUERY_ROWS) " and query_max_working_rows 1.."
+            CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS));
+        return CBM_NOT_FOUND;
+    }
+    if (max_rows == 0) {
+        max_rows = CBM_DEFAULT_QUERY_MAX_ROWS;
+    }
+    if (max_working_rows == 0) {
+        max_working_rows = CBM_DEFAULT_QUERY_MAX_WORKING_ROWS;
+    }
+    if (max_working_rows < max_rows) {
+        max_working_rows = max_rows;
     }
 
     cbm_query_t *q = NULL;
@@ -5891,9 +5964,12 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         }
     }
 
+    bool has_union = q->union_next != NULL;
+    int branch_output_limit = has_union ? max_working_rows : max_rows;
     result_builder_t rb = {0};
     // cppcheck-suppress knownConditionTrueFalse
-    if (execute_single(store, q, project, max_rows, scan_mode, &rb) < 0) {
+    if (execute_single(store, q, project, branch_output_limit, max_working_rows, scan_mode,
+                       !has_union, &rb) < 0) {
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -5903,7 +5979,8 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     while (uq) {
         result_builder_t rb2 = {0};
         // cppcheck-suppress knownConditionTrueFalse
-        if (execute_single(store, uq, project, max_rows, scan_mode, &rb2) < 0) {
+        if (execute_single(store, uq, project, max_working_rows, max_working_rows, scan_mode, false,
+                           &rb2) < 0) {
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
@@ -5911,6 +5988,10 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         }
         /* Concatenate rows from rb2 into rb */
         for (int i = 0; i < rb2.row_count; i++) {
+            if (rb.row_count >= max_working_rows) {
+                g_cypher_working_row_limit_hit = max_working_rows;
+                break;
+            }
             rb_add_row(&rb, rb2.rows[i]);
         }
         rb_free(&rb2);
@@ -5922,9 +6003,15 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     if (q->union_next && !q->union_all) {
         rb_apply_distinct(&rb);
     }
+    /* max_rows is authoritative for the whole query, not independently for
+     * each UNION branch. Apply it after UNION deduplication. */
+    if (rb.row_count > max_rows) {
+        rb.truncated = true;
+    }
+    rb_apply_skip_limit(&rb, 0, max_rows);
 
     /* #601: abort a runaway query that blew the wall-clock budget before it can
-     * return a misleading partial result. Checked before the row ceiling. */
+     * return a misleading partial result. Checked before the working budget. */
     if (g_cypher_timed_out) {
         rb_free(&rb);
         cbm_query_free(q);
@@ -5935,11 +6022,19 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         return CBM_NOT_FOUND;
     }
 
-    /* Check ceiling */
-    if (g_cypher_row_ceiling_hit > 0 || rb.row_count >= CYPHER_RESULT_CEILING) {
+    if (g_cypher_working_row_limit_hit > 0) {
+        /* Intermediate rows are not a valid partial Cypher result: WHERE,
+         * DISTINCT, aggregation, ORDER BY, and UNION may still change both
+         * membership and ordering. Return a tool-visible error so callers can
+         * narrow the query or explicitly raise the configured budget. */
+        char error[CBM_SZ_256];
+        snprintf(error, sizeof(error),
+                 "query exceeded the working-row budget (%d); raise "
+                 "query_max_working_rows or narrow the pattern",
+                 g_cypher_working_row_limit_hit);
         rb_free(&rb);
         cbm_query_free(q);
-        out->error = heap_strdup("result exceeded row ceiling; use narrower filters or add LIMIT");
+        out->error = heap_strdup(error);
         return CBM_NOT_FOUND;
     }
 
@@ -5947,6 +6042,7 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     out->col_count = rb.col_count;
     out->rows = rb.rows;
     out->row_count = rb.row_count;
+    out->truncated = rb.truncated;
     if (g_cypher_depth_clamped > 0) {
         char wbuf[CBM_SZ_256];
         snprintf(wbuf, sizeof(wbuf),
@@ -5962,13 +6058,33 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
 
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
-    return cbm_cypher_execute_impl(store, query, project, max_rows, false, out, NULL);
+    cbm_cypher_limits_t limits = {
+        .max_output_rows = max_rows > 0 ? max_rows : 0,
+        .max_working_rows = CBM_DEFAULT_QUERY_MAX_WORKING_ROWS,
+    };
+    return cbm_cypher_execute_impl(store, query, project, &limits, false, out, NULL);
+}
+
+int cbm_cypher_execute_with_limits(cbm_store_t *store, const char *query, const char *project,
+                                   const cbm_cypher_limits_t *limits, cbm_cypher_result_t *out) {
+    return cbm_cypher_execute_impl(store, query, project, limits, false, out, NULL);
 }
 
 int cbm_cypher_execute_active_nodes(cbm_store_t *store, const char *query, const char *project,
                                     int max_rows, cbm_cypher_result_t *out,
                                     bool *used_active_nodes) {
-    return cbm_cypher_execute_impl(store, query, project, max_rows, true, out, used_active_nodes);
+    cbm_cypher_limits_t limits = {
+        .max_output_rows = max_rows > 0 ? max_rows : 0,
+        .max_working_rows = CBM_DEFAULT_QUERY_MAX_WORKING_ROWS,
+    };
+    return cbm_cypher_execute_impl(store, query, project, &limits, true, out, used_active_nodes);
+}
+
+int cbm_cypher_execute_active_nodes_with_limits(cbm_store_t *store, const char *query,
+                                                const char *project,
+                                                const cbm_cypher_limits_t *limits,
+                                                cbm_cypher_result_t *out, bool *used_active_nodes) {
+    return cbm_cypher_execute_impl(store, query, project, limits, true, out, used_active_nodes);
 }
 
 void cbm_cypher_result_free(cbm_cypher_result_t *r) {
