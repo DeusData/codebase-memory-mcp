@@ -50,15 +50,10 @@ const char *const CBM_MANIFEST_FILES[] = {
     NULL
 };
 
-/* Upper bound for fetching project Variable/import-reference nodes, shared by
- * cbm_dep_link_cross_edges() (matches project imports to already-indexed dep
- * Module nodes) and rank_by_import_usage() below (counts project imports per
- * not-yet-indexed candidate package). Both consumers match project import
- * references to package names by exact node name over the same node source,
- * so they share one fetch bound and one query shape rather than inventing a
- * second matching scheme (repo CLAUDE.md: prefer extending the established
- * path). */
-#define CBM_DEP_PROJECT_IMPORT_FETCH_LIMIT 500
+/* Upper bound for the one-shot project Variable/import-reference fetch used by
+ * cbm_dep_link_cross_edges(). Dependency ranking below streams the full label
+ * because a partial scan cannot identify the most-imported packages. */
+#define CBM_DEP_LINK_IMPORT_FETCH_LIMIT 500
 
 /* ── Package Manager Parse/String ──────────────────────────────── */
 
@@ -601,6 +596,26 @@ typedef struct {
     int64_t import_count;
 } cbm_dep_rank_entry_t;
 
+typedef struct {
+    CBMHashTable *candidate_counts;
+} cbm_dep_import_count_ctx_t;
+
+static int count_candidate_import(const char *label, const char *name, const char *qualified_name,
+                                  const char *file_path, void *userdata) {
+    (void)label;
+    (void)qualified_name;
+    (void)file_path;
+    cbm_dep_import_count_ctx_t *ctx = userdata;
+    if (!ctx || !ctx->candidate_counts || !name || !name[0]) {
+        return CBM_STORE_OK;
+    }
+    int64_t *count = cbm_ht_get(ctx->candidate_counts, name);
+    if (count) {
+        (*count)++;
+    }
+    return CBM_STORE_OK;
+}
+
 /* Descending by import_count; ties broken by package name ascending so
  * selection is deterministic and reproducible across runs. */
 static int cmp_dep_rank_entry(const void *a, const void *b) {
@@ -617,62 +632,55 @@ static int cmp_dep_rank_entry(const void *a, const void *b) {
  * name each package, descending; tiebreak by package name ascending.
  * Reorders candidates[] in place.
  *
- * Reuses the exact node source cbm_dep_link_cross_edges() matches against
- * dep Module nodes (project-scoped Variable-label nodes, matched by exact
- * name) instead of inventing a second import-matching scheme, per repo
- * CLAUDE.md.
+ * Streams the exact node source cbm_dep_link_cross_edges() matches against dep
+ * Module nodes (project-scoped Variable-label nodes, matched by exact name).
+ * Runtime is O(V + C log C) for V project Variable nodes and C candidates;
+ * auxiliary memory is O(C), independent of the number of import references.
  *
- * Returns 0 on success. Returns -1 if the store query failed; callers MUST
+ * Returns 0 on success. Returns -1 if the store visit failed; callers MUST
  * fail OPEN on -1 (keep discovery order) rather than fail the whole
  * auto-index — ranking is a refinement, not a correctness requirement. */
 static int rank_by_import_usage(cbm_store_t *store, const char *project_name,
                                 cbm_dep_discovered_t *candidates, int candidate_count) {
     if (!store || !project_name || !candidates || candidate_count <= 0) return -1;
 
-    cbm_search_params_t params = {0};
-    params.project = project_name;
-    params.project_exact = true;
-    params.label = "Variable";
-    params.limit = CBM_DEP_PROJECT_IMPORT_FETCH_LIMIT;
-
-    cbm_search_output_t out = {0};
-    if (cbm_store_search(store, &params, &out) != 0) {
-        cbm_store_search_free(&out);
-        return -1;
-    }
-
-    CBMHashTable *counts = cbm_ht_create((uint32_t)(out.count > 0 ? out.count : 1));
-    if (!counts) {
-        cbm_store_search_free(&out);
-        return -1;
-    }
-    for (int i = 0; i < out.count; i++) {
-        const char *name = out.results[i].node.name;
-        if (!name || !name[0]) continue;
-        intptr_t cur = (intptr_t)cbm_ht_get(counts, name);
-        cbm_ht_set(counts, name, (void *)(cur + 1));
-    }
-
     cbm_dep_rank_entry_t *ranked = calloc((size_t)candidate_count, sizeof(*ranked));
     if (!ranked) {
-        cbm_ht_free(counts);
-        cbm_store_search_free(&out);
+        return -1;
+    }
+    CBMHashTable *counts = cbm_ht_create((uint32_t)candidate_count);
+    if (!counts) {
+        free(ranked);
         return -1;
     }
     for (int i = 0; i < candidate_count; i++) {
         ranked[i].entry = candidates[i];
-        ranked[i].import_count = candidates[i].package
-                                      ? (int64_t)(intptr_t)cbm_ht_get(counts, candidates[i].package)
-                                      : 0;
+        const char *package = candidates[i].package;
+        if (package && package[0] && !cbm_ht_get(counts, package)) {
+            /* Keys are candidate-owned; values point into ranked until the
+             * visit finishes. The table is freed before qsort moves entries. */
+            cbm_ht_set(counts, package, &ranked[i].import_count);
+        }
     }
+    cbm_dep_import_count_ctx_t count_ctx = {.candidate_counts = counts};
+    if (cbm_store_visit_nodes_by_label(store, project_name, "Variable", count_candidate_import,
+                                       &count_ctx) != CBM_STORE_OK) {
+        cbm_ht_free(counts);
+        free(ranked);
+        return -1;
+    }
+    for (int i = 0; i < candidate_count; i++) {
+        int64_t *count =
+            candidates[i].package ? cbm_ht_get(counts, candidates[i].package) : NULL;
+        ranked[i].import_count = count ? *count : 0;
+    }
+    cbm_ht_free(counts);
     qsort(ranked, (size_t)candidate_count, sizeof(*ranked), cmp_dep_rank_entry);
     for (int i = 0; i < candidate_count; i++) {
         candidates[i] = ranked[i].entry;
     }
 
     free(ranked);
-    cbm_ht_free(counts);
-    cbm_store_search_free(&out);
     return 0;
 }
 
@@ -1014,7 +1022,7 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
     params.project = project_name;
     params.project_exact = true;
     params.label = "Variable";  /* import statements are typically Variable nodes */
-    params.limit = CBM_DEP_PROJECT_IMPORT_FETCH_LIMIT;
+    params.limit = CBM_DEP_LINK_IMPORT_FETCH_LIMIT;
 
     cbm_search_output_t out = {0};
     int rc = cbm_store_search(store, &params, &out);

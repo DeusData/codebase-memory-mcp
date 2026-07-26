@@ -1328,6 +1328,45 @@ TEST(test_discover_deps_ranks_by_import_usage) {
     PASS();
 }
 
+TEST(test_discover_deps_ranking_counts_imports_beyond_historical_fetch_cap) {
+    enum {
+        EARLY_IMPORTS = 500,
+        LATE_IMPORTS = 501,
+    };
+    char tmp[CBM_SZ_256];
+    const char *names[] = {"pkg-a", "pkg-b", "pkg-z"};
+    ASSERT_EQ(setup_npm_rank_fixture(tmp, sizeof(tmp), names, 3), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "rank-complete-fixture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    /* The historical one-shot search returned only 500 Variable rows in
+     * name/id order, so pkg-z was invisible even though it was the most-used
+     * candidate. Exact ranking must stream the full project label instead. */
+    int seq = 0;
+    for (int i = 0; i < EARLY_IMPORTS; i++) {
+        insert_import_reference(store, project, "pkg-a", seq++);
+    }
+    for (int i = 0; i < LATE_IMPORTS; i++) {
+        insert_import_reference(store, project, "pkg-z", seq++);
+    }
+
+    cbm_dep_discovered_t *out = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_NPM, tmp, store, project, &out, &count, 2), 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out[0].package, "pkg-z");
+    ASSERT_STR_EQ(out[1].package, "pkg-a");
+
+    cbm_dep_discovered_free(out, count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
 TEST(test_discover_deps_tiebreak_by_name_is_deterministic) {
     char tmp[CBM_SZ_256];
     /* Declaration order deliberately not alphabetical, so a passing test
@@ -1398,10 +1437,11 @@ TEST(test_discover_deps_rank_query_failure_falls_back_to_discovery_order) {
     const char *project = "rankfail-fixture";
     ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
 
-    /* Corrupt the store so the import-usage query fails deterministically:
-     * dropping `nodes` breaks cbm_store_search (used by rank_by_import_usage)
-     * while npm discovery itself reads package.json directly from disk and
-     * makes no store query, so discovery must still succeed. */
+    /* Corrupt the store so the import-usage visit fails deterministically:
+     * dropping `nodes` breaks cbm_store_visit_nodes_by_label (used by
+     * rank_by_import_usage), while npm discovery itself reads package.json
+     * directly from disk and makes no store query, so discovery must still
+     * succeed. */
     sqlite3 *db = cbm_store_get_db(store);
     ASSERT_NOT_NULL(db);
     ASSERT_EQ(sqlite3_exec(db, "DROP TABLE nodes;", NULL, NULL, NULL), SQLITE_OK);
@@ -1488,6 +1528,7 @@ SUITE(depindex) {
 
     /* Usage-ranked dependency selection */
     RUN_TEST(test_discover_deps_ranks_by_import_usage);
+    RUN_TEST(test_discover_deps_ranking_counts_imports_beyond_historical_fetch_cap);
     RUN_TEST(test_discover_deps_tiebreak_by_name_is_deterministic);
     RUN_TEST(test_discover_deps_at_limit_preserves_discovery_order);
     RUN_TEST(test_discover_deps_rank_query_failure_falls_back_to_discovery_order);
