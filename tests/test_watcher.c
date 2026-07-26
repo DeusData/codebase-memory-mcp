@@ -1617,6 +1617,74 @@ TEST(watcher_marks_dirty_file_before_failed_index_callback) {
     PASS();
 }
 
+TEST(watcher_dirty_ledger_records_paths_after_former_4096_limit) {
+    enum { DIRTY_FILE_COUNT = CBM_SZ_4K + SKIP_ONE };
+    char tmpdir[256];
+    char abs_path[384];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dirty_ledger_many_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    th_write_file(wt_path(abs_path, sizeof(abs_path), tmpdir, "seed.txt"), "seed\n");
+    wt_git(tmpdir, "add seed.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "dirty-ledger-many", tmpdir), CBM_STORE_OK);
+    cbm_watcher_t *w = cbm_watcher_new(store, always_failing_index_callback, NULL);
+    ASSERT_NOT_NULL(w);
+
+    cbm_watcher_watch(w, "dirty-ledger-many", tmpdir);
+    index_call_count = 0;
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    char rel_path[64];
+    for (int i = 0; i < DIRTY_FILE_COUNT; i++) {
+        snprintf(rel_path, sizeof(rel_path), "dirty-%04d.txt", i);
+        th_write_file(wt_path(abs_path, sizeof(abs_path), tmpdir, rel_path), "x\n");
+    }
+
+    cbm_watcher_touch(w, "dirty-ledger-many");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    int pending = -1;
+    int overlay_ready = -1;
+    ASSERT_EQ(cbm_store_count_dirty_files(store, "dirty-ledger-many", &pending,
+                                          &overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(pending, DIRTY_FILE_COUNT);
+    ASSERT_EQ(overlay_ready, 0);
+
+    cbm_dirty_file_state_t *dirty_rows = NULL;
+    int dirty_row_count = 0;
+    ASSERT_EQ(cbm_store_list_dirty_files(store, "dirty-ledger-many", &dirty_rows,
+                                         &dirty_row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_row_count, DIRTY_FILE_COUNT);
+    bool found_last = false;
+    for (int i = 0; i < dirty_row_count; i++) {
+        if (dirty_rows[i].rel_path &&
+            strcmp(dirty_rows[i].rel_path, "dirty-4096.txt") == 0) {
+            found_last = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_last);
+    cbm_store_free_dirty_files(dirty_rows, dirty_row_count);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_identical_watch_preserves_dirty_baseline) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_same_root_XXXXXX");
@@ -3686,6 +3754,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_detects_sha256_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_marks_dirty_file_before_failed_index_callback);
+    RUN_TEST(watcher_dirty_ledger_records_paths_after_former_4096_limit);
     RUN_TEST(watcher_identical_watch_preserves_dirty_baseline);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
