@@ -641,6 +641,74 @@ TEST(lsh_index_build_and_query) {
     PASS();
 }
 
+TEST(lsh_query_into_reports_exact_partial_result) {
+    cbm_minhash_t fp;
+    for (int i = 0; i < CBM_MINHASH_K; i++) {
+        fp.values[i] = (uint32_t)(i * 17 + 3);
+    }
+    cbm_lsh_index_t *idx = cbm_lsh_new();
+    ASSERT_NOT_NULL(idx);
+    for (int i = 0; i < 3; i++) {
+        cbm_lsh_entry_t entry = {
+            .node_id = i + 1,
+            .fingerprint = &fp,
+            .file_path = "partial.go",
+            .file_ext = ".go",
+        };
+        cbm_lsh_insert(idx, &entry);
+    }
+
+    const cbm_lsh_entry_t *out[2] = {NULL, NULL};
+    cbm_lsh_query_result_t result = cbm_lsh_query_into_result(idx, &fp, out, 2);
+    ASSERT_EQ(result.written, 2);
+    ASSERT_EQ(result.omitted, 1);
+    ASSERT_EQ(result.noisy_buckets, 0);
+    ASSERT_FALSE(result.allocation_failed);
+    ASSERT_NOT_NULL(out[0]);
+    ASSERT_NOT_NULL(out[1]);
+    ASSERT_TRUE(out[0]->node_id != out[1]->node_id);
+
+    cbm_lsh_entry_t sentinel = {0};
+    const cbm_lsh_entry_t *compat_out[3] = {NULL, NULL, &sentinel};
+    ASSERT_EQ(cbm_lsh_query_into(idx, &fp, compat_out, 2), 2);
+    ASSERT_NOT_NULL(compat_out[0]);
+    ASSERT_NOT_NULL(compat_out[1]);
+    ASSERT_TRUE(compat_out[2] == &sentinel);
+
+    cbm_lsh_free(idx);
+    PASS();
+}
+
+TEST(lsh_query_into_reports_every_noisy_bucket) {
+    enum { LSH_NOISY_ENTRY_COUNT = CBM_LSH_MAX_BUCKET_SIZE + 1 };
+    cbm_minhash_t fp;
+    for (int i = 0; i < CBM_MINHASH_K; i++) {
+        fp.values[i] = (uint32_t)(i * 19 + 5);
+    }
+    cbm_lsh_index_t *idx = cbm_lsh_new();
+    ASSERT_NOT_NULL(idx);
+    for (int i = 0; i < LSH_NOISY_ENTRY_COUNT; i++) {
+        cbm_lsh_entry_t entry = {
+            .node_id = i + 1,
+            .fingerprint = &fp,
+            .file_path = "noisy.go",
+            .file_ext = ".go",
+        };
+        cbm_lsh_insert(idx, &entry);
+    }
+
+    const cbm_lsh_entry_t *out[1] = {NULL};
+    cbm_lsh_query_result_t result = cbm_lsh_query_into_result(idx, &fp, out, 1);
+    ASSERT_EQ(result.written, 0);
+    ASSERT_EQ(result.omitted, 0);
+    ASSERT_EQ(result.noisy_buckets, CBM_LSH_BANDS);
+    ASSERT_FALSE(result.allocation_failed);
+    ASSERT_NULL(out[0]);
+
+    cbm_lsh_free(idx);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite 3: Edge Generation (pass_similarity on graph buffer)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1256,6 +1324,8 @@ SUITE(simhash) {
     RUN_TEST(lsh_same_bucket_similar);
     RUN_TEST(lsh_different_bucket_dissimilar);
     RUN_TEST(lsh_index_build_and_query);
+    RUN_TEST(lsh_query_into_reports_exact_partial_result);
+    RUN_TEST(lsh_query_into_reports_every_noisy_bucket);
 
     /* Suite 3: Edge Generation */
     RUN_TEST(pass_similarity_creates_edges);

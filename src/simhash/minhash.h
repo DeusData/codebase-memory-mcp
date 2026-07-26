@@ -38,6 +38,8 @@
 /* LSH parameters: b bands × r rows.  Threshold ≈ (1/b)^(1/r). */
 #define CBM_LSH_BANDS 32
 #define CBM_LSH_ROWS 2
+/* Evidence-backed noise guard from commit 09ce20afc. */
+#define CBM_LSH_MAX_BUCKET_SIZE 200
 
 /* ── MinHash fingerprint ─────────────────────────────────────────── */
 
@@ -108,11 +110,23 @@ void cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry);
 void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                    const cbm_lsh_entry_t ***out, int *count);
 
-/* Thread-safe variant: writes candidates into caller-provided buffer.
- * `out_buf` must have room for at least `out_cap` pointers.
- * Returns the actual candidate count (may exceed out_cap — result is truncated). */
+typedef struct {
+    int written;
+    int omitted;
+    int noisy_buckets;
+    bool allocation_failed;
+} cbm_lsh_query_result_t;
+
+/* Thread-safe compatibility API: writes and returns at most out_cap candidates.
+ * Use cbm_lsh_query_into_result when partial-result metadata is required. */
 int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                        const cbm_lsh_entry_t **out_buf, int out_cap);
+
+/* Metadata-preserving variant: writes at most out_cap candidates and reports
+ * every source of partial results separately. */
+cbm_lsh_query_result_t cbm_lsh_query_into_result(const cbm_lsh_index_t *idx,
+                                                 const cbm_minhash_t *fp,
+                                                 const cbm_lsh_entry_t **out_buf, int out_cap);
 
 /* Free the LSH index and all internal storage. */
 void cbm_lsh_free(cbm_lsh_index_t *idx);

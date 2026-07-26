@@ -25,6 +25,7 @@ enum {
 };
 #include "pipeline/worker_pool.h"
 
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -219,6 +220,9 @@ typedef struct {
     sim_edge_buf_t *worker_bufs;
     _Atomic int next_idx;
     _Atomic int *edge_counts; /* shared atomic array, one per entry */
+    _Atomic uint64_t omitted_candidates;
+    _Atomic uint64_t noisy_bucket_visits;
+    _Atomic bool query_allocation_failed;
     double threshold;         /* Jaccard cutoff; <=0 = use CBM_MINHASH_JACCARD_THRESHOLD */
 } sim_query_ctx_t;
 
@@ -230,6 +234,8 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
 
     /* Thread-local candidate buffer (stack-allocated) */
     const cbm_lsh_entry_t *cands[SIM_CAND_CAP];
+    uint64_t omitted_candidates = 0;
+    uint64_t noisy_bucket_visits = 0;
 
     while (true) {
         int i = atomic_fetch_add_explicit(&sc->next_idx, SKIP_ONE, memory_order_relaxed);
@@ -243,7 +249,15 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
         }
 
         const fp_entry_t *src = &sc->entries[i];
-        int cand_count = cbm_lsh_query_into(sc->lsh, &src->fp, cands, SIM_CAND_CAP);
+        cbm_lsh_query_result_t query =
+            cbm_lsh_query_into_result(sc->lsh, &src->fp, cands, SIM_CAND_CAP);
+        if (query.allocation_failed) {
+            atomic_store_explicit(&sc->query_allocation_failed, true, memory_order_relaxed);
+            break;
+        }
+        omitted_candidates += (uint64_t)query.omitted;
+        noisy_bucket_visits += (uint64_t)query.noisy_buckets;
+        int cand_count = query.written;
         if (cand_count > 1) {
             qsort(cands, (size_t)cand_count, sizeof(cands[0]), cmp_lsh_entry_ptr);
         }
@@ -293,6 +307,24 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             atomic_fetch_add_explicit(&sc->edge_counts[i], emitted, memory_order_relaxed);
         }
     }
+    if (omitted_candidates > 0) {
+        atomic_fetch_add_explicit(&sc->omitted_candidates, omitted_candidates,
+                                  memory_order_relaxed);
+    }
+    if (noisy_bucket_visits > 0) {
+        atomic_fetch_add_explicit(&sc->noisy_bucket_visits, noisy_bucket_visits,
+                                  memory_order_relaxed);
+    }
+}
+
+static void free_sim_edge_bufs(sim_edge_buf_t *worker_bufs, int worker_count) {
+    if (!worker_bufs) {
+        return;
+    }
+    for (int w = 0; w < worker_count; w++) {
+        free(worker_bufs[w].edges);
+    }
+    free(worker_bufs);
 }
 
 /* Merge worker edge buffers into gbuf. Returns total edge count. Frees worker buffers. */
@@ -307,9 +339,8 @@ static int merge_sim_edges(cbm_gbuf_t *gbuf, sim_edge_buf_t *worker_bufs, int wo
             cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SIMILAR_TO", props);
             total++;
         }
-        free(worker_bufs[w].edges);
     }
-    free(worker_bufs);
+    free_sim_edge_bufs(worker_bufs, worker_count);
     return total;
 }
 
@@ -365,6 +396,9 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     int worker_count = cbm_default_worker_count(false);
     sim_edge_buf_t *worker_bufs = calloc((size_t)worker_count, sizeof(sim_edge_buf_t));
 
+    uint64_t omitted_candidates = 0;
+    uint64_t noisy_bucket_visits = 0;
+    bool query_allocation_failed = false;
     {
         sim_query_ctx_t sc = {
             .entries = entries,
@@ -375,10 +409,36 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .threshold = ctx->similarity_threshold, /* #41 tunable; <=0 = default */
         };
         atomic_init(&sc.next_idx, 0);
+        atomic_init(&sc.omitted_candidates, 0);
+        atomic_init(&sc.noisy_bucket_visits, 0);
+        atomic_init(&sc.query_allocation_failed, false);
         cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
         cbm_parallel_for(worker_count, sim_query_worker, &sc, opts);
+        omitted_candidates = atomic_load_explicit(&sc.omitted_candidates, memory_order_relaxed);
+        noisy_bucket_visits = atomic_load_explicit(&sc.noisy_bucket_visits, memory_order_relaxed);
+        query_allocation_failed =
+            atomic_load_explicit(&sc.query_allocation_failed, memory_order_relaxed);
     }
     CBM_PROF_END_N("similarity", "3_query_parallel", t_query_emit, entry_count);
+
+    if (query_allocation_failed) {
+        cbm_log_error("pass.similarity.alloc_failed", "phase", "query_dedup");
+        free_sim_edge_bufs(worker_bufs, worker_count);
+        free(edge_counts);
+        free(lsh_entries);
+        free(entries);
+        cbm_lsh_free(lsh);
+        return CBM_NOT_FOUND;
+    }
+    if (omitted_candidates > 0 || noisy_bucket_visits > 0) {
+        char omitted_buf[CBM_SZ_32];
+        char noisy_buf[CBM_SZ_32];
+        snprintf(omitted_buf, sizeof(omitted_buf), "%" PRIu64, omitted_candidates);
+        snprintf(noisy_buf, sizeof(noisy_buf), "%" PRIu64, noisy_bucket_visits);
+        cbm_log_warn("pass.similarity.candidates_partial", "omitted_candidates", omitted_buf,
+                     "noisy_bucket_visits", noisy_buf, "candidate_capacity", itoa_log(SIM_CAND_CAP),
+                     "noisy_bucket_limit", itoa_log(CBM_LSH_MAX_BUCKET_SIZE));
+    }
 
     CBM_PROF_START(t_merge);
     int total_edges = merge_sim_edges(gbuf, worker_bufs, worker_count);
