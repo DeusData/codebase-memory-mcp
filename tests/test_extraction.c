@@ -12,6 +12,8 @@
 #include <time.h>
 #include "macro_table.h"
 #include "iris_export_xml.h"
+#include "lang_specs.h"
+#include <semantic/ast_profile.h>
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -3597,6 +3599,32 @@ static const CBMDefinition *find_def(CBMFileResult *r, const char *name) {
     return NULL;
 }
 
+static bool compute_go_ast_profile(const char *source, const char **param_names, int param_count,
+                                   cbm_ast_profile_t *profile) {
+    const TSLanguage *language = cbm_ts_language(CBM_LANG_GO);
+    if (!language) {
+        return false;
+    }
+    TSParser *parser = ts_parser_new();
+    if (!parser) {
+        return false;
+    }
+    if (!ts_parser_set_language(parser, language)) {
+        ts_parser_delete(parser);
+        return false;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    if (!tree) {
+        ts_parser_delete(parser);
+        return false;
+    }
+    bool computed =
+        cbm_ast_profile_compute(ts_tree_root_node(tree), source, param_names, param_count, profile);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    return computed;
+}
+
 TEST(extract_go_retains_all_multi_return_types) {
     enum { RETURN_TYPE_TEST_COUNT = 20 };
     char source[CBM_SZ_2K];
@@ -3695,6 +3723,61 @@ TEST(complexity_retains_branches_beyond_4096_siblings) {
 
     cbm_free_result(r);
     free(source);
+    PASS();
+}
+
+/*
+ * Structural profiles feed semantic similarity, so their control-flow counts
+ * must describe the whole function rather than a fixed traversal prefix.
+ */
+TEST(ast_profile_retains_if_nodes_beyond_2048_frontier) {
+    enum { IF_COUNT = 5000 };
+    static const char if_source[] = "if x {}\n";
+    size_t capacity = (size_t)IF_COUNT * (sizeof(if_source) - SKIP_ONE) + CBM_SZ_64;
+    char *source = (char *)malloc(capacity);
+    ASSERT_NOT_NULL(source);
+    size_t used = 0;
+    int n = snprintf(source, capacity, "package p\nfunc profileWide(x bool) {\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, capacity);
+    used = (size_t)n;
+    for (int i = 0; i < IF_COUNT; i++) {
+        n = snprintf(source + used, capacity - used, "%s", if_source);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, capacity - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, capacity - used, "}\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, capacity - used);
+
+    cbm_ast_profile_t profile;
+    ASSERT_TRUE(compute_go_ast_profile(source, NULL, 0, &profile));
+    ASSERT_EQ(profile.if_count, IF_COUNT);
+
+    free(source);
+    PASS();
+}
+
+/*
+ * Parameter-flow signals describe identifier ancestry. A parameter in an if
+ * condition and a parameter below a return statement must each be attributed
+ * to the corresponding syntax field/scope.
+ */
+TEST(ast_profile_tracks_parameter_context) {
+    static const char source[] = "package p\n"
+                                 "func choose(x bool) bool {\n"
+                                 "    if x {\n"
+                                 "        return x\n"
+                                 "    }\n"
+                                 "    return false\n"
+                                 "}\n";
+    static const char *param_names[] = {"x"};
+    cbm_ast_profile_t profile;
+    ASSERT_TRUE(compute_go_ast_profile(source, param_names, 1, &profile));
+    ASSERT_EQ(profile.params_in_conditions, 1);
+    ASSERT_EQ(profile.params_in_returns, 1);
+
     PASS();
 }
 
@@ -5766,6 +5849,8 @@ SUITE(extraction) {
     /* Per-function complexity metrics (Tier A) */
     RUN_TEST(complexity_nested_loops_depth);
     RUN_TEST(complexity_retains_branches_beyond_4096_siblings);
+    RUN_TEST(ast_profile_retains_if_nodes_beyond_2048_frontier);
+    RUN_TEST(ast_profile_tracks_parameter_context);
     RUN_TEST(complexity_loop_with_branch);
     RUN_TEST(complexity_flat_no_loops);
     RUN_TEST(complexity_linear_scan_in_loop);
