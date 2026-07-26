@@ -61,6 +61,19 @@ static int has_env_access(CBMFileResult *r, const char *env_key) {
     return 0;
 }
 
+static int has_channel(CBMFileResult *r, const char *channel_name, const char *transport,
+                       CBMChannelDirection direction) {
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *channel = &r->channels.items[i];
+        if (channel->channel_name && channel->transport &&
+            strcmp(channel->channel_name, channel_name) == 0 &&
+            strcmp(channel->transport, transport) == 0 && channel->direction == direction) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *must_contain,
                               const char *must_not_contain) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -113,6 +126,58 @@ static CBMFileResult *extract_with_macros(const char *src, CBMLanguage lang, con
     CBMFileResult *r =
         cbm_extract_file_ex(src, (int)strlen(src), lang, proj, path, 0, NULL, NULL, mt, NULL);
     return r;
+}
+
+TEST(extract_javascript_channel_identifier_after_former_constant_limit) {
+    enum { CHANNEL_TEST_BINDINGS = CBM_SZ_256 + CBM_SZ_64 };
+    char *source = calloc(CBM_SZ_32K, SKIP_ONE);
+    ASSERT_NOT_NULL(source);
+    size_t used = 0;
+    for (int i = 0; i < CHANNEL_TEST_BINDINGS; i++) {
+        int n = snprintf(source + used, CBM_SZ_32K - used,
+                         "const CHANNEL_%03d = \"channel-%03d\";\n", i, i);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, CBM_SZ_32K - used);
+        used += (size_t)n;
+    }
+    int n = snprintf(source + used, CBM_SZ_32K - used,
+                     "socket.emit(CHANNEL_%03d, payload);\n", CHANNEL_TEST_BINDINGS - SKIP_ONE);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, CBM_SZ_32K - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_JAVASCRIPT, "t", "channels.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "channel-319", "socketio", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    free(source);
+    PASS();
+}
+
+TEST(extract_python_channel_identifier_after_former_constant_limit) {
+    enum { CHANNEL_TEST_BINDINGS = CBM_SZ_256 + CBM_SZ_64 };
+    char *source = calloc(CBM_SZ_32K, SKIP_ONE);
+    ASSERT_NOT_NULL(source);
+    size_t used = 0;
+    for (int i = 0; i < CHANNEL_TEST_BINDINGS; i++) {
+        int n = snprintf(source + used, CBM_SZ_32K - used,
+                         "CHANNEL_%03d = \"channel-%03d\"\n", i, i);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, CBM_SZ_32K - used);
+        used += (size_t)n;
+    }
+    int n = snprintf(source + used, CBM_SZ_32K - used,
+                     "sio.emit(CHANNEL_%03d, payload)\n", CHANNEL_TEST_BINDINGS - SKIP_ONE);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, CBM_SZ_32K - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "channels.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "channel-319", "socketio", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    free(source);
+    PASS();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -5467,6 +5532,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     /* restored from merge base */
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_javascript_channel_identifier_after_former_constant_limit);
+    RUN_TEST(extract_python_channel_identifier_after_former_constant_limit);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
     RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
     RUN_TEST(extract_python_mock_patch_is_not_route);
