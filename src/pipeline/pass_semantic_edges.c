@@ -1374,8 +1374,12 @@ static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char **all_tokens, i
                                           int func_count, int worker_count) {
     CBM_PROF_START(t_phase3a);
     cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
-    cbm_sem_corpus_add_docs_batch_with_workers(corpus, all_tokens, token_counts, func_count,
-                                               CBM_SEM_MAX_TOKENS, worker_count);
+    if (!corpus ||
+        !cbm_sem_corpus_add_docs_batch_with_workers(corpus, all_tokens, token_counts, func_count,
+                                                    CBM_SEM_MAX_TOKENS, worker_count)) {
+        cbm_sem_corpus_free(corpus);
+        return NULL;
+    }
     CBM_PROF_END_N("semantic_edges", "3a_corpus_batch", t_phase3a, func_count);
 
     CBM_PROF_START(t_phase3b);
@@ -1545,6 +1549,13 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     /* Phase 3: Build corpus (batch add), finalize, export enriched token vectors. */
     cbm_sem_corpus_t *corpus =
         run_corpus_phase(gbuf, all_tokens, token_counts, func_count, worker_count);
+    if (!corpus) {
+        cbm_log_error("pass.semantic.alloc_failed", "phase", "corpus");
+        free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools,
+                              worker_count);
+        free(token_counts);
+        return -1;
+    }
 
     /* Phase 4: Build per-function TF-IDF + RI vectors and store them. */
     CBM_PROF_START(t_phase4);
