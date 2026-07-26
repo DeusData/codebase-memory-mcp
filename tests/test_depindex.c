@@ -1073,9 +1073,30 @@ TEST(test_search_response_has_session_project) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(test_index_status_shows_deps) {
+    enum {
+        EXTRA_DEP_COUNT = 100,
+        EXPECTED_DEP_COUNT = EXTRA_DEP_COUNT + 1,
+    };
     char tmp[256];
     cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    for (int i = 0; i < EXTRA_DEP_COUNT; i++) {
+        char dep_project[CBM_SZ_128];
+        char qualified_name[CBM_SZ_128];
+        snprintf(dep_project, sizeof(dep_project), "testproj.dep.pkg%03d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "%s.module", dep_project);
+        ASSERT_EQ(cbm_store_upsert_project(store, dep_project, "/tmp/index-status-dep"),
+                  CBM_STORE_OK);
+        cbm_node_t module = {.project = dep_project,
+                             .label = "Module",
+                             .name = "module",
+                             .qualified_name = qualified_name,
+                             .file_path = "__init__.py"};
+        ASSERT_GT(cbm_store_upsert_node(store, &module), 0);
+    }
 
     char *raw = cbm_mcp_handle_tool(srv, "index_status",
                                     "{\"project\":\"testproj\"}");
@@ -1083,9 +1104,11 @@ TEST(test_index_status_shows_deps) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* Should include dependency info */
-    ASSERT_TRUE(strstr(resp, "\"dependencies\"") != NULL ||
-                strstr(resp, "\"dependency_count\"") != NULL);
+    char expected_count[CBM_SZ_64];
+    snprintf(expected_count, sizeof(expected_count), "\"dependency_count\":%d",
+             EXPECTED_DEP_COUNT);
+    ASSERT_NOT_NULL(strstr(resp, expected_count));
+    ASSERT_NOT_NULL(strstr(resp, "\"package\":\"pkg099\""));
 
     free(resp);
     cbm_mcp_server_free(srv);
