@@ -12974,6 +12974,46 @@ TEST(cli_config_registry_query_limits_use_shared_definitions) {
     ASSERT_NOT_NULL(strstr(working_rows->guidance, "instead of partial results"));
     PASS();
 }
+TEST(cli_config_registry_search_previews_use_shared_definitions) {
+    const cbm_config_entry_t *search = NULL;
+    const cbm_config_entry_t *trace = NULL;
+    const cbm_config_entry_t *snippet = NULL;
+    const cbm_config_entry_t *key_functions = NULL;
+    const cbm_config_entry_t *context_key_functions = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        const cbm_config_entry_t *entry = &CBM_CONFIG_REGISTRY[i];
+        if (strcmp(entry->key, CBM_CONFIG_SEARCH_LIMIT) == 0) {
+            search = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_TRACE_MAX_RESULTS) == 0) {
+            trace = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_SNIPPET_MAX_LINES) == 0) {
+            snippet = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_KEY_FUNCTIONS_COUNT) == 0) {
+            key_functions = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT) == 0) {
+            context_key_functions = entry;
+        }
+    }
+
+    ASSERT_NOT_NULL(search);
+    ASSERT_STR_EQ(search->default_val, CBM_DEFAULT_SEARCH_LIMIT_STR);
+    ASSERT_EQ(atoi(search->default_val), CBM_DEFAULT_SEARCH_LIMIT);
+    ASSERT_NOT_NULL(trace);
+    ASSERT_STR_EQ(trace->default_val, CBM_DEFAULT_TRACE_MAX_RESULTS_STR);
+    ASSERT_EQ(atoi(trace->default_val), CBM_DEFAULT_TRACE_MAX_RESULTS);
+    ASSERT_NOT_NULL(snippet);
+    ASSERT_STR_EQ(snippet->default_val, CBM_DEFAULT_SNIPPET_MAX_LINES_STR);
+    ASSERT_EQ(atoi(snippet->default_val), CBM_DEFAULT_SNIPPET_MAX_LINES);
+    ASSERT_NOT_NULL(key_functions);
+    ASSERT_STR_EQ(key_functions->default_val, CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR);
+    ASSERT_EQ(atoi(key_functions->default_val), CBM_DEFAULT_KEY_FUNCTIONS_COUNT);
+    ASSERT_NOT_NULL(context_key_functions);
+    ASSERT_STR_EQ(context_key_functions->default_val,
+                  CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR);
+    ASSERT_EQ(atoi(context_key_functions->default_val),
+              CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT);
+    PASS();
+}
 TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -13632,6 +13672,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_registry_includes_query_max_rows);
     RUN_TEST(cli_config_registry_query_limits_use_shared_definitions);
+    RUN_TEST(cli_config_registry_search_previews_use_shared_definitions);
     RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
     RUN_TEST(cli_config_registry_auto_index_deps_defaults_disabled);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);

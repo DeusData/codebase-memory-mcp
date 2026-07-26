@@ -14179,15 +14179,17 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "'defer_exact_delta_reindexes' defers only for small exact-delta reindexes; other reindexes "
      "recompute at publish."},
     /* ── Search ── */
-    {"search_limit", "50", NULL, "Search",
+    {CBM_CONFIG_SEARCH_LIMIT, CBM_DEFAULT_SEARCH_LIMIT_STR, NULL, "Search",
      "Default max results for search_graph/search_code",
      "1-100000",
      "Higher = more results but more tokens. Overridden by limit param per-query. "
-     "50 is good for exploration; 200+ for exhaustive analysis."},
-    {"trace_max_results", "25", NULL, "Search",
+     CBM_DEFAULT_SEARCH_LIMIT_STR
+     " is good for exploration; 200+ for exhaustive analysis."},
+    {CBM_CONFIG_TRACE_MAX_RESULTS, CBM_DEFAULT_TRACE_MAX_RESULTS_STR, NULL, "Search",
      "Default max nodes per direction in trace_path",
      "1-10000",
-     "Controls how far call chains are traced. 25 covers typical call depth; raise to 100+ for deep dependency tracing."},
+     "Controls how far call chains are traced. " CBM_DEFAULT_TRACE_MAX_RESULTS_STR
+     " covers typical call depth; raise to 100+ for deep dependency tracing."},
     {CBM_CONFIG_QUERY_MAX_ROWS, CBM_DEFAULT_QUERY_MAX_ROWS_STR, NULL, "Search",
      "Default result-row cap for query_graph when max_rows is omitted",
      "0-" CBM_STRINGIFY(CBM_MAX_QUERY_ROWS),
@@ -14203,26 +14205,32 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Max response bytes for query_graph (0=unlimited)",
      "0-104857600",
      "32KB default prevents huge responses. Set 0 for unlimited Cypher results. Raise for bulk analysis queries."},
-    {"snippet_max_lines", "200", NULL, "Search",
+    {CBM_CONFIG_SNIPPET_MAX_LINES, CBM_DEFAULT_SNIPPET_MAX_LINES_STR, NULL, "Search",
      "Max source lines returned by get_code/get_code_snippet (0=unlimited)",
      "0-1000000",
-     "200 lines covers most functions. Set 0 for unlimited to get full file contents."},
+     CBM_DEFAULT_SNIPPET_MAX_LINES_STR
+     " lines covers most functions. Set 0 for unlimited to get full file contents."},
     {"key_functions_exclude", "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
      "Comma-separated glob patterns to exclude from architecture key functions",
      "glob patterns, e.g. graph-ui/**,tests/**",
      "Use to remove UI, generated code, or test helpers from the architecture view. "
      "Example: 'graph-ui/**,tools/**,scripts/**,tests/**'."},
-    {"key_functions_count", "25", NULL, "Search",
+    {CBM_CONFIG_KEY_FUNCTIONS_COUNT, CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR, NULL, "Search",
      "Max key functions returned in codebase://architecture and search context",
      "1-10000",
      "The architecture resource ranks every symbol by PageRank importance and returns the top N. "
-     "Use 25 for most projects. Raise to 50-100 for large multi-language codebases where "
-     "important functions may not appear in the first 25. Lower to 10 when tokens are limited."},
-    {"context_key_functions_limit", "10", NULL, "Search",
-     "Max key functions PUSHED in the first-response _context header (0 = use built-in 10)",
+     "Use " CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR
+     " for most projects. Raise to 50-100 for large multi-language codebases where "
+     "important functions may not appear in the first " CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR
+     ". Lower to 10 when tokens are limited."},
+    {CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT, CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR, NULL,
+     "Search",
+     "Max key functions PUSHED in the first-response _context header (0 = use built-in "
+     CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR ")",
      "0-100",
      "Separate from key_functions_count (the architecture query bound) — this governs only the "
-     "auto-pushed summary that closes the codebase://architecture pull-only gap. Kept small (10) "
+     "auto-pushed summary that closes the codebase://architecture pull-only gap. Kept small ("
+     CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR ") "
      "to keep first-response token cost modest; raise to 20-25 if you want richer upfront context."},
     /* ── Tools ── */
     {CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED, "CBM_TOOL_MODE", "Tools",
