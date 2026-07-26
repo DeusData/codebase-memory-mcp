@@ -502,6 +502,49 @@ TEST(arch_routes) {
     PASS();
 }
 
+TEST(arch_routes_selects_result_limit_after_filtering) {
+    enum { REJECTED_ROUTE_PREFIX_COUNT = 256 };
+    cbm_store_t *s = setup_arch_test_store();
+
+    for (int i = 0; i < REJECTED_ROUTE_PREFIX_COUNT; i++) {
+        char name[TEST_ARCH_PATH_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        snprintf(name, sizeof(name), "https://infra-%03d.example.invalid/service", i);
+        snprintf(qn, sizeof(qn), "__route__infra__%s", name);
+        cbm_node_t infra_route = {.project = "test",
+                                  .label = "Route",
+                                  .name = name,
+                                  .qualified_name = qn,
+                                  .properties_json = "{\"source\":\"infra\"}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &infra_route), 0);
+    }
+
+    cbm_node_t late_route = {.project = "test",
+                             .label = "Route",
+                             .name = "/late-route",
+                             .qualified_name = "__route__GET__/late-route",
+                             .properties_json = "{\"method\":\"GET\",\"path\":\"/late-route\"}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &late_route), 0);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"routes"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    bool saw_late_route = false;
+    for (int i = 0; i < info.route_count; i++) {
+        if (strcmp(info.routes[i].path, "/late-route") == 0) {
+            saw_late_route = true;
+            break;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_TRUE(saw_late_route);
+    PASS();
+}
+
 TEST(arch_hotspots) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1866,6 +1909,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_languages);
     RUN_TEST(arch_file_summaries_use_overlay_active_tombstones);
     RUN_TEST(arch_routes);
+    RUN_TEST(arch_routes_selects_result_limit_after_filtering);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
