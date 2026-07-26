@@ -117,7 +117,8 @@ typedef struct {
 
 // Compute the metrics above in one traversal of `node`'s subtree.
 // `branching_types` is the language's branching node-type set.
-void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
+// Returns false only when traversal scratch storage cannot grow.
+bool cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
 
 // Is `kind` a loop construct node type? Language-agnostic curated set (for/while/
 // do/foreach/repeat/loop variants). Exposed so the unified walk can track loop

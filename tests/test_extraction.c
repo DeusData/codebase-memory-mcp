@@ -3627,6 +3627,46 @@ TEST(complexity_nested_loops_depth) {
     PASS();
 }
 
+/*
+ * Complexity metrics are graph data, not a preview: a wide function must not
+ * silently omit branches after an internal traversal working set fills.
+ */
+TEST(complexity_retains_branches_beyond_4096_siblings) {
+    enum { BRANCH_COUNT = 5000 };
+    static const char branch_source[] = "if x {}\n";
+    size_t capacity = (size_t)BRANCH_COUNT * (sizeof(branch_source) - SKIP_ONE) + CBM_SZ_64;
+    char *source = (char *)malloc(capacity);
+    ASSERT_NOT_NULL(source);
+    size_t used = 0;
+    int n = snprintf(source, capacity, "package p\nfunc wide(x bool) {\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, capacity);
+    used = (size_t)n;
+    for (int i = 0; i < BRANCH_COUNT; i++) {
+        n = snprintf(source + used, capacity - used, "%s", branch_source);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, capacity - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, capacity - used, "}\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, capacity - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_GO, "t", "wide.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *wide = find_def(r, "wide");
+    ASSERT_NOT_NULL(wide);
+    ASSERT_EQ(wide->complexity, BRANCH_COUNT);
+    ASSERT_EQ(wide->cognitive, BRANCH_COUNT);
+    ASSERT_EQ(wide->loop_count, 0);
+    ASSERT_EQ(wide->loop_depth, 0);
+
+    cbm_free_result(r);
+    free(source);
+    PASS();
+}
+
 TEST(complexity_loop_with_branch) {
     CBMFileResult *r = extract("package p\n"
                                "func single() {\n"
@@ -5693,6 +5733,7 @@ SUITE(extraction) {
 
     /* Per-function complexity metrics (Tier A) */
     RUN_TEST(complexity_nested_loops_depth);
+    RUN_TEST(complexity_retains_branches_beyond_4096_siblings);
     RUN_TEST(complexity_loop_with_branch);
     RUN_TEST(complexity_flat_no_loops);
     RUN_TEST(complexity_linear_scan_in_loop);
