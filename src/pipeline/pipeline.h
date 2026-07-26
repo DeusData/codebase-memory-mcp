@@ -293,6 +293,17 @@ bool cbm_pipeline_try_lock(void);
  * Use this in MCP handler and autoindex — wait for busy watcher to finish. */
 void cbm_pipeline_lock(void);
 
+/* Acquire the global index lock unless the request is cancelled while waiting.
+ * Returns true with the lock held, or false with no lock held. A NULL flag
+ * preserves cbm_pipeline_lock()'s unconditional blocking behavior. */
+bool cbm_pipeline_lock_cancellable(const atomic_int *cancelled);
+
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+/* Number of blocking callers that have observed the global pipeline lock held.
+ * Test synchronization only; production builds pay no counter cost. */
+int cbm_pipeline_lock_waiter_count_for_testing(void);
+#endif
+
 /* Release the global index lock. */
 void cbm_pipeline_unlock(void);
 

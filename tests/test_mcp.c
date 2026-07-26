@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include <sqlite3.h>
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
+#include "../src/foundation/compat_thread.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/platform.h"
 #include <depindex/depindex.h>
@@ -9990,11 +9991,13 @@ TEST(first_search_reports_automatic_index_block_reason) {
  *  POLL/GETLINE FILE* BUFFERING FIX
  * ══════════════════════════════════════════════════════════════════ */
 
+enum { MCP_REQUEST_TEST_TIMEOUT_SECONDS = 5 };
+
 #ifndef _WIN32
 #include <unistd.h>
 #include <signal.h>
 
-enum { MCP_STDIO_TEST_TIMEOUT_SECONDS = 5 };
+enum { MCP_STDIO_TEST_TIMEOUT_SECONDS = MCP_REQUEST_TEST_TIMEOUT_SECONDS };
 
 /* Signal handler used by alarm() to abort the test if it hangs */
 static void alarm_handler(int sig) {
@@ -14357,6 +14360,117 @@ TEST(tool_index_repository_early_raw_cancel_survives_index_entry) {
     PASS();
 }
 
+typedef struct {
+    cbm_mcp_server_t *server;
+    const char *args;
+    atomic_int done;
+    char *response;
+} mcp_index_lock_wait_request_t;
+
+static void *mcp_index_lock_wait_request(void *arg) {
+    mcp_index_lock_wait_request_t *request = arg;
+    request->response = cbm_mcp_handle_tool(request->server, "index_repository", request->args);
+    atomic_store(&request->done, 1);
+    return NULL;
+}
+
+/* Request cancellation must remain effective after index_repository passes its
+ * early cancellation check but before it installs active_pipeline. Holding the
+ * branch-side global lock makes that handoff deterministic: cancellation must
+ * finish the upstream request scope while the owner still holds the lock, and
+ * must not consume or release the owner's lock. */
+TEST(tool_index_repository_lock_wait_honors_request_cancel) {
+    char cache[CBM_SZ_256];
+    char repo[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-lock-cancel-cache-XXXXXX", cbm_tmpdir());
+    snprintf(repo, sizeof(repo), "%s/cbm-mcp-lock-cancel-repo-XXXXXX", cbm_tmpdir());
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+    bool repo_created = cbm_mkdtemp(repo) != NULL;
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    if (cache_created) {
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    }
+
+    char *project = repo_created ? cbm_project_name_from_path(repo) : NULL;
+    cbm_mcp_server_t *srv =
+        cache_created && repo_created && project ? cbm_mcp_server_new(NULL) : NULL;
+    if (srv) {
+        cbm_mcp_server_set_background_tasks(srv, false);
+    }
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    mcp_index_lock_wait_request_t request = {
+        .server = srv,
+        .args = args,
+        .response = NULL,
+    };
+    atomic_init(&request.done, 0);
+
+    cbm_thread_t request_thread;
+    cbm_pipeline_lock();
+    bool request_started =
+        srv && cbm_thread_create(&request_thread, 0, mcp_index_lock_wait_request, &request) == 0;
+    uint64_t wait_deadline = cbm_now_ms() + MCP_REQUEST_TEST_TIMEOUT_SECONDS * CBM_MSEC_PER_SEC;
+    while (request_started && cbm_pipeline_lock_waiter_count_for_testing() == 0 &&
+           cbm_now_ms() < wait_deadline) {
+        cbm_usleep(CBM_USEC_PER_SEC / CBM_MSEC_PER_SEC);
+    }
+    bool reached_lock_wait = request_started && cbm_pipeline_lock_waiter_count_for_testing() == 1;
+    bool cancel_accepted = reached_lock_wait && cbm_mcp_server_cancel_active(srv);
+    uint64_t cancel_deadline = cbm_now_ms() + CBM_MSEC_PER_SEC;
+    while (cancel_accepted && atomic_load(&request.done) == 0 && cbm_now_ms() < cancel_deadline) {
+        cbm_usleep(CBM_USEC_PER_SEC / CBM_MSEC_PER_SEC);
+    }
+    bool finished_while_owner_held_lock = atomic_load(&request.done) != 0;
+    bool owner_still_holds_lock = !cbm_pipeline_try_lock();
+    cbm_pipeline_unlock();
+    if (request_started) {
+        (void)cbm_thread_join(&request_thread);
+    }
+
+    bool cancellation_reported = request.response && strstr(request.response, "cancelled") &&
+                                 strstr(request.response, "\"isError\":true");
+    bool waiter_released = cbm_pipeline_lock_waiter_count_for_testing() == 0;
+    bool lock_reusable = cbm_pipeline_try_lock();
+    if (lock_reusable) {
+        cbm_pipeline_unlock();
+    }
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing-project");
+    bool no_project_published = !cbm_file_exists(db_path);
+
+    free(request.response);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    if (cache_created) {
+        (void)cbm_rmdir(cache);
+    }
+    if (repo_created) {
+        (void)cbm_rmdir(repo);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    free(project);
+
+    ASSERT_TRUE(cache_created);
+    ASSERT_TRUE(repo_created);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(request_started);
+    ASSERT_TRUE(reached_lock_wait);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(finished_while_owner_held_lock);
+    ASSERT_TRUE(owner_still_holds_lock);
+    ASSERT_TRUE(cancellation_reported);
+    ASSERT_TRUE(waiter_released);
+    ASSERT_TRUE(lock_reusable);
+    ASSERT_TRUE(no_project_published);
+    PASS();
+}
+
 TEST(tool_cross_repo_mutation_guard_sorts_dedupes_and_unwinds) {
     char repo[256];
     snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-cross-guard-XXXXXX");
@@ -16103,6 +16217,7 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_raw_dispatch_cancel_is_scoped_non_mutating_and_next_request_clean);
     RUN_TEST(tool_outer_request_scope_preserves_predispatch_cancel);
     RUN_TEST(tool_index_repository_early_raw_cancel_survives_index_entry);
+    RUN_TEST(tool_index_repository_lock_wait_honors_request_cancel);
     RUN_TEST(tool_cross_repo_mutation_guard_sorts_dedupes_and_unwinds);
     RUN_TEST(tool_cross_repo_mutation_guard_casefolds_aliases_and_order);
     RUN_TEST(tool_cross_repo_rejects_wildcard_mixed_with_named_targets);
