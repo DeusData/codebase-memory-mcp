@@ -12,6 +12,7 @@
 #include <depindex/depindex.h>
 #include "../src/git/git_command.h"
 #include "../src/foundation/log.h"
+#include "../src/foundation/str_util.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -10664,6 +10665,89 @@ TEST(mcp_index_repository_inprocess_sends_list_changed) {
     PASS();
 }
 
+#endif /* !_WIN32 */
+
+TEST(mcp_incremental_artifact_failure_reports_published_graph) {
+    const char *cache = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache);
+    char repo[CBM_SZ_512];
+    snprintf(repo, sizeof(repo), "%s/cbm-mcp-artifact-failure-XXXXXX", cache);
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+
+    char source_path[CBM_SZ_1K];
+    snprintf(source_path, sizeof(source_path), "%s/main.c", repo);
+    FILE *source = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_TRUE(fputs("int before_artifact_failure(void) { return 0; }\n", source) >= 0);
+    ASSERT_EQ(fclose(source), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char repo_json[CBM_SZ_4K];
+    ASSERT_GT(cbm_json_escape(repo_json, sizeof(repo_json), repo), 0);
+    char args[CBM_SZ_4K];
+    int args_len =
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_json);
+    ASSERT_TRUE(args_len > 0 && (size_t)args_len < sizeof(args));
+    char *initial = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_TRUE(cbm_mcp_index_response_published(initial));
+    free(initial);
+
+    char artifact_dir[CBM_SZ_1K];
+    snprintf(artifact_dir, sizeof(artifact_dir), "%s/.codebase-memory", repo);
+    ASSERT_TRUE(cbm_mkdir_p(artifact_dir, 0755));
+    char artifact_path[CBM_SZ_1K];
+    snprintf(artifact_path, sizeof(artifact_path), "%s/graph.db.zst", artifact_dir);
+    ASSERT_TRUE(cbm_mkdir_p(artifact_path, 0755));
+
+    source = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_TRUE(fputs("int after_artifact_failure_is_longer(void) { return 1; }\n", source) >= 0);
+    ASSERT_EQ(fclose(source), 0);
+
+    args_len = snprintf(args, sizeof(args),
+                        "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"persistence\":true}", repo_json);
+    ASSERT_TRUE(args_len > 0 && (size_t)args_len < sizeof(args));
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(cbm_mcp_index_response_published(response));
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"publish_kind\":\"incremental_exact\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"graph_published\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"degraded\""));
+    ASSERT_NOT_NULL(
+        strstr(inner, "\"error\":\"graph published, but persistence artifact export failed\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"artifact_present\":false"));
+    free(inner);
+    free(response);
+
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    char project_json[CBM_SZ_4K];
+    ASSERT_GT(cbm_json_escape(project_json, sizeof(project_json), project), 0);
+    char query_args[CBM_SZ_4K];
+    int query_len =
+        snprintf(query_args, sizeof(query_args),
+                 "{\"project\":\"%s\",\"name_pattern\":\"after_artifact_failure_is_longer\","
+                 "\"format\":\"json\"}",
+                 project_json);
+    ASSERT_TRUE(query_len > 0 && (size_t)query_len < sizeof(query_args));
+    char *query = cbm_mcp_handle_tool(srv, "search_graph", query_args);
+    ASSERT_NOT_NULL(query);
+    ASSERT_NOT_NULL(strstr(query, "after_artifact_failure_is_longer"));
+    free(query);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    free(project);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
+#ifndef _WIN32
+
 /* Coverage-matrix gap (stage 2, Change 6): RED against the pre-Change-6
  * background autoindex_thread (rc==0 branch), which published a fresh graph
  * from initialize-driven session auto-index without staling the cached
@@ -16146,6 +16230,7 @@ SUITE(mcp) {
     RUN_TEST(parse_file_uri_spaces_in_path);
     RUN_TEST(parse_file_uri_null_out_path);
     RUN_TEST(parse_file_uri_zero_size);
+    RUN_TEST(mcp_incremental_artifact_failure_reports_published_graph);
 
     /* Poll/getline FILE* buffering fix */
 #ifndef _WIN32

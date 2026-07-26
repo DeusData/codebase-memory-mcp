@@ -12839,6 +12839,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     srv->active_pipeline = p;
     cbm_mutex_unlock(&srv->active_request_lock);
     int rc = cbm_pipeline_run(p);
+    int pipeline_rc = rc;
+    bool publication_committed = cbm_pipeline_publication_committed(p);
+    char artifact_export_error[MCP_FIELD_SIZE] = "";
+    if (publication_committed && pipeline_rc != 0) {
+        const char *detail = cbm_artifact_export_last_error();
+        if (detail) {
+            (void)snprintf(artifact_export_error, sizeof(artifact_export_error), "%s", detail);
+        }
+    }
     bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
     bool incremental_fallback = cbm_pipeline_incremental_fallback(p);
@@ -12850,7 +12859,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * a poll that observes the explicit edit can acquire the lock in the gap
      * below and launch a redundant full-mode reindex before the later response
      * bookkeeping reaches cbm_watcher_mark_indexed(). */
-    if (rc == 0 && srv->watcher) {
+    if (publication_committed && srv->watcher) {
         cbm_watcher_mark_indexed(srv->watcher, project_name, repo_path);
     }
     cbm_pipeline_unlock();
@@ -12894,10 +12903,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "publish_reason", publish_reason);
     }
     yyjson_mut_obj_add_bool(doc, root, "graph_changed", graph_changed);
+    yyjson_mut_obj_add_bool(doc, root, "graph_published", publication_committed);
     yyjson_mut_obj_add_bool(doc, root, "incremental_fallback", incremental_fallback);
     add_pipeline_exact_delta_stats(doc, root, cbm_pipeline_exact_delta_stats(p));
 
-    if (rc == 0) {
+    if (publication_committed) {
         CBM_PROF_START(prof_index_resolve_store);
         cbm_store_t *resolved_store = resolve_store(srv, project_name);
         cbm_store_t *owned_writable_store = NULL;
@@ -12916,7 +12926,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             CBM_PROF_END("index_repository", "dep_auto_index", prof_index_deps);
 
             if (dep_owner_rc != CBM_STORE_OK) {
-                rc = dep_owner_rc;
+                if (rc == 0) {
+                    rc = dep_owner_rc;
+                }
                 yyjson_mut_obj_add_str(
                     doc, root, "error",
                     "failed to refresh file-delta owner metadata after dependency indexing");
@@ -12959,7 +12971,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         if (owned_writable_store) {
             cbm_store_close(owned_writable_store);
         }
-        if (rc == 0) {
+        if (pipeline_rc == 0 && rc == 0) {
             /* Full skip/coverage evidence is written while pipeline-owned strings live. */
             char logfile_path[CBM_SZ_1K] = "";
             bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
@@ -12969,6 +12981,24 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                 excluded_count, file_errors, file_error_count,
                 has_logfile ? logfile_path : NULL);
             yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
+        } else if (pipeline_rc != 0 && store) {
+            /* Atomic graph installation precedes optional artifact export.
+             * Preserve the loud tool error, but report the committed graph and
+             * complete freshness/notification work instead of pretending the
+             * publication never happened. */
+            bool graph_degraded = build_index_success_response(
+                srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs,
+                excluded_count, file_errors, file_error_count, NULL);
+            yyjson_mut_obj_add_str(doc, root, "status", graph_degraded ? "error" : "degraded");
+            yyjson_mut_obj_add_str(doc, root, "error",
+                                   "graph published, but persistence artifact export failed");
+            if (artifact_export_error[0]) {
+                yyjson_mut_obj_add_str(doc, root, "artifact_error", artifact_export_error);
+            }
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "Queries use the newly published graph. Fix the .codebase-memory artifact "
+                "destination and retry with persistence=true to refresh the shareable artifact.");
         } else {
             yyjson_mut_obj_add_str(doc, root, "status", "error");
             yyjson_mut_obj_add_str(

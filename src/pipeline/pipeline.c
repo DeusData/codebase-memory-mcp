@@ -220,6 +220,7 @@ struct cbm_pipeline {
     cbm_pipeline_publish_kind_t publish_kind;
     char *publish_reason;
     bool incremental_fallback;
+    bool publication_committed;
     cbm_pipeline_exact_delta_stats_t exact_delta_stats;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
@@ -317,6 +318,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     p->publish_reason = NULL;
     p->incremental_fallback = false;
+    p->publication_committed = false;
     p->exact_delta_stats.changed_paths = -1;
     p->exact_delta_stats.affected_paths = -1;
     p->exact_delta_stats.published_paths = -1;
@@ -942,6 +944,10 @@ const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p) {
 
 bool cbm_pipeline_incremental_fallback(const cbm_pipeline_t *p) {
     return p && p->publish_kind == CBM_PIPELINE_PUBLISH_FULL && p->incremental_fallback;
+}
+
+bool cbm_pipeline_publication_committed(const cbm_pipeline_t *p) {
+    return p && p->publication_committed;
 }
 
 bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p) {
@@ -2377,18 +2383,18 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
-static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
+static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     p->incremental_fallback = false;
+    p->publication_committed = false;
     cbm_pipeline_set_publish_reason(p, NULL);
     cbm_pipeline_set_exact_delta_stats(p, -1, -1, -1);
     p->committed_nodes = -1;
     p->committed_edges = -1;
-    *was_incremental = false;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -2446,9 +2452,6 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
          * last committed database must survive, so it must never fall through
          * to the full rebuild below. */
         if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB || rc >= 0) {
-            if (rc >= 0) {
-                *was_incremental = true;
-            }
             /* Incremental parallel extraction may publish a process-global
              * package map. The full path releases it in cleanup below, but
              * this early return bypasses that block. */
@@ -2635,22 +2638,6 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
             if (rc != CBM_STORE_OK) {
                 goto cleanup;
             }
-
-            /* Export persistent .db.zst artifact when persistence is enabled.
-             * Ported from upstream's dump_and_persist_hashes so the fork's
-             * sqlite dump path keeps the upstream feature; the flush_store
-             * (dep-index) path never writes a DB file so it never exports. */
-            if (p->persistence) {
-                int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name,
-                                              CBM_ARTIFACT_BEST);
-                if (arc != 0) {
-                    const char *err = cbm_artifact_export_last_error();
-                    cbm_log_error("pipeline.err", "phase", "artifact_export",
-                                  "err", err ? err : "unknown");
-                    rc = arc;
-                    goto cleanup;
-                }
-            }
         }
     }
     /* Report what actually landed in the store; the graph-buffer counts remain
@@ -2821,27 +2808,27 @@ static int seal_staging_db(const char *staging_path) {
     return rc;
 }
 
-static int export_after_publish(cbm_pipeline_t *p, const char *final_path, bool was_incremental) {
-    if (p->persistence) {
-        CBM_PROF_START(t_art);
-        int rc = cbm_artifact_export(final_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
-        CBM_PROF_END("persist", "6_artifact_export", t_art);
-        if (rc != 0) {
-            const char *err = cbm_artifact_export_last_error();
-            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
-        }
-        return rc;
+static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
+    bool refresh_existing = p->repo_path && cbm_artifact_exists(p->repo_path);
+    if (!p->persistence && !refresh_existing) {
+        return 0;
     }
-    if (was_incremental && p->repo_path && cbm_artifact_exists(p->repo_path)) {
-        (void)cbm_artifact_export(final_path, p->repo_path, p->project_name, CBM_ARTIFACT_FAST);
+    int quality = p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST;
+    CBM_PROF_START(t_art);
+    int rc = cbm_artifact_export(final_path, p->repo_path, p->project_name, quality);
+    CBM_PROF_END("persist", "6_artifact_export", t_art);
+    if (rc != 0) {
+        const char *err = cbm_artifact_export_last_error();
+        cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
     }
-    return 0;
+    return rc;
 }
 
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->publication_committed = false;
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);
@@ -2874,9 +2861,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
-    bool was_incremental = false;
     p->publish_final_path = final_path;
-    int rc = cbm_pipeline_run_staged(p, &was_incremental);
+    int rc = cbm_pipeline_run_staged(p);
     p->publish_final_path = NULL;
     free(p->db_path);
     p->db_path = configured_db_path;
@@ -2917,7 +2903,13 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
 
-    rc = export_after_publish(p, final_path, was_incremental);
+    /* The authoritative graph is visible from this point onward. Keep this
+     * distinct from the return code: persistence export is intentionally
+     * attempted after the atomic install and can fail independently. Callers
+     * must still invalidate stale stores, refresh derived data, and notify
+     * subscribers when that secondary artifact step reports an error. */
+    p->publication_committed = true;
+    rc = export_after_publish(p, final_path);
     free(staging_path);
     free(final_path);
     return rc;

@@ -18,7 +18,6 @@ enum {
     INCR_NOT_INDEXED_PREFIX_LEN = sizeof("not_indexed") - 1
 };
 #include "pipeline/pipeline.h"
-#include "pipeline/artifact.h"
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
@@ -1497,9 +1496,6 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_set_publish_reason(p, NULL);
     cbm_pipeline_set_exact_delta_stats(p, deleted_count, deleted_count, deleted_count);
-    if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
-        (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
-    }
     cbm_log_info("incremental.exact.delete.done", "files", "1");
     *applied = 1;
     return CBM_STORE_OK;
@@ -2620,9 +2616,6 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_set_publish_reason(p, NULL);
     cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, exact_publish_count);
-    if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
-        (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
-    }
     cbm_log_info("incremental.exact.done", "files", itoa_buf_incr(exact_publish_count));
     *applied = 1;
 
@@ -2824,10 +2817,6 @@ static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char
         return rc;
     }
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
-    }
     return 0;
 }
 
