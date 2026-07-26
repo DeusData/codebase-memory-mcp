@@ -2232,6 +2232,84 @@ TEST(githistory_coupling_carries_last_co_change) {
     PASS();
 }
 
+TEST(githistory_coupling_ranks_bounded_output_and_reports_omissions) {
+    char *weak[] = {"weak-a.go", "weak-b.go"};
+    char *medium[] = {"medium-a.go", "medium-b.go"};
+    char *strong[] = {"strong-a.go", "strong-b.go"};
+    char *noisy[] = {"noisy-a.go", "noisy-b.go"};
+    char *noisy_a[] = {"noisy-a.go"};
+    char *noisy_b[] = {"noisy-b.go"};
+    cbm_commit_files_t commits[] = {
+        {weak, 2, 101},    {medium, 2, 201},  {strong, 2, 301},  {weak, 2, 102},
+        {medium, 2, 202},  {strong, 2, 302},  {weak, 2, 103},    {medium, 2, 203},
+        {strong, 2, 303},  {medium, 2, 204},  {strong, 2, 304},  {strong, 2, 305},
+        {noisy, 2, 401},   {noisy, 2, 402},   {noisy, 2, 403},   {noisy, 2, 404},
+        {noisy, 2, 405},   {noisy, 2, 406},   {noisy_a, 1, 407}, {noisy_a, 1, 408},
+        {noisy_a, 1, 409}, {noisy_a, 1, 410}, {noisy_b, 1, 411}, {noisy_b, 1, 412},
+        {noisy_b, 1, 413}, {noisy_b, 1, 414},
+    };
+    int commit_count = (int)(sizeof(commits) / sizeof(*commits));
+    cbm_change_coupling_t out[2];
+    cbm_change_coupling_result_t result = cbm_compute_change_coupling_result(
+        commits, commit_count, out, (int)(sizeof(out) / sizeof(*out)), 0.0);
+
+    ASSERT_EQ(result.written, 2);
+    ASSERT_EQ(result.eligible, 4);
+    ASSERT_EQ(result.omitted, 2);
+    ASSERT_EQ(result.path_too_long, 0);
+    ASSERT_EQ(result.allocation_failed, 0);
+    ASSERT_STR_EQ(out[0].file_a, "strong-a.go");
+    ASSERT_STR_EQ(out[0].file_b, "strong-b.go");
+    ASSERT_EQ(out[0].co_change_count, 5);
+    ASSERT_STR_EQ(out[1].file_a, "medium-a.go");
+    ASSERT_STR_EQ(out[1].file_b, "medium-b.go");
+    ASSERT_EQ(out[1].co_change_count, 4);
+
+    cbm_change_coupling_t sentinel = {.co_change_count = 777};
+    result = cbm_compute_change_coupling_result(commits, commit_count, &sentinel, 0, 0.0);
+    ASSERT_EQ(result.written, 0);
+    ASSERT_EQ(result.eligible, 4);
+    ASSERT_EQ(result.omitted, 4);
+    ASSERT_EQ(result.allocation_failed, 0);
+    ASSERT_EQ(sentinel.co_change_count, 777);
+
+    cbm_commit_files_t reversed[sizeof(commits) / sizeof(*commits)];
+    for (int i = 0; i < commit_count; i++) {
+        reversed[i] = commits[commit_count - i - 1];
+    }
+    cbm_change_coupling_t reversed_out[2];
+    result = cbm_compute_change_coupling_result(reversed, commit_count, reversed_out,
+                                                (int)(sizeof(reversed_out) / sizeof(*reversed_out)),
+                                                0.0);
+    ASSERT_EQ(result.written, 2);
+    ASSERT_STR_EQ(reversed_out[0].file_a, out[0].file_a);
+    ASSERT_STR_EQ(reversed_out[0].file_b, out[0].file_b);
+    ASSERT_STR_EQ(reversed_out[1].file_a, out[1].file_a);
+    ASSERT_STR_EQ(reversed_out[1].file_b, out[1].file_b);
+
+    char long_a[CBM_SZ_1K];
+    char long_b[CBM_SZ_1K];
+    memset(long_a, 'a', sizeof(long_a));
+    memset(long_b, 'b', sizeof(long_b));
+    long_a[sizeof(long_a) - 1] = '\0';
+    long_b[sizeof(long_b) - 1] = '\0';
+    char *long_files[] = {long_a, long_b};
+    cbm_commit_files_t long_commits[] = {
+        {long_files, 2, 1},
+        {long_files, 2, 2},
+        {long_files, 2, 3},
+    };
+    result = cbm_compute_change_coupling_result(
+        long_commits, (int)(sizeof(long_commits) / sizeof(*long_commits)), &sentinel, 1, 0.0);
+    ASSERT_EQ(result.written, 0);
+    ASSERT_EQ(result.eligible, 1);
+    ASSERT_EQ(result.omitted, 1);
+    ASSERT_EQ(result.path_too_long, 1);
+    ASSERT_EQ(result.allocation_failed, 0);
+    ASSERT_EQ(sentinel.co_change_count, 777);
+    PASS();
+}
+
 TEST(githistory_temporal_retains_files_past_legacy_capacity) {
     enum {
         GH_TEST_FILES_PER_COMMIT = 20,
@@ -19085,6 +19163,7 @@ SUITE(pipeline) {
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
     RUN_TEST(githistory_coupling_carries_last_co_change);
+    RUN_TEST(githistory_coupling_ranks_bounded_output_and_reports_omissions);
     RUN_TEST(githistory_temporal_retains_files_past_legacy_capacity);
     RUN_TEST(githistory_temporal_preserves_long_file_paths);
     RUN_TEST(githistory_skip_large_commits);

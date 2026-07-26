@@ -879,6 +879,14 @@ typedef struct {
     long long last_co_change;
 } cbm_change_coupling_t;
 
+typedef struct {
+    int written;
+    int eligible;
+    int omitted;
+    int path_too_long;
+    int allocation_failed;
+} cbm_change_coupling_result_t;
+
 /* Commit data for coupling analysis */
 typedef struct {
     char **files;
@@ -906,6 +914,11 @@ int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits
                                                int commit_count,
                                                cbm_change_coupling_t *out, int max_out,
                                                double min_coupling_score);
+cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit_files_t *commits,
+                                                                int commit_count,
+                                                                cbm_change_coupling_t *out,
+                                                                int max_out,
+                                                                double min_coupling_score);
 int cbm_compute_file_temporal(const cbm_commit_files_t *commits, int commit_count,
                               cbm_file_temporal_t **out, int *out_count);
 void cbm_file_temporal_free(cbm_file_temporal_t *items, int count);
