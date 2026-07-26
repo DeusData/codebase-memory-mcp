@@ -3958,6 +3958,7 @@ TEST(cypher_parse_unwind) {
         cbm_cypher_parse("UNWIND [\"a\", \"b\", \"c\"] AS x MATCH (f) RETURN f.name", &q, &err);
     ASSERT_EQ(rc, 0);
     ASSERT_NOT_NULL(q->unwind_expr);
+    ASSERT_STR_EQ(q->unwind_expr, "[\"a\",\"b\",\"c\"]");
     ASSERT_STR_EQ(q->unwind_alias, "x");
     cbm_query_free(q);
     PASS();
@@ -3971,6 +3972,103 @@ TEST(cypher_parse_unwind_var) {
     ASSERT_STR_EQ(q->unwind_expr, "items");
     ASSERT_STR_EQ(q->unwind_alias, "item");
     cbm_query_free(q);
+    PASS();
+}
+
+/* Parsing UNWIND without consuming its list made the clause a silent no-op:
+ * the result cardinality stayed at the MATCH cardinality and the alias
+ * projected as null. Pin the observable language contract, not just the AST
+ * fields, so a write-only unwind_expr/unwind_alias pair cannot recur. */
+TEST(cypher_exec_unwind_literal_multiplies_rows_and_binds_alias) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "unwind", "/tmp/unwind"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "unwind",
+                       .label = "Function",
+                       .name = "target",
+                       .qualified_name = "unwind.target",
+                       .file_path = "src/unwind.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "UNWIND [\"alpha\\\"quoted\", \"beta\"] AS item MATCH (f:Function) "
+                                "RETURN item, f.name ORDER BY item",
+                                "unwind", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.col_count, 2);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "alpha\"quoted");
+    ASSERT_STR_EQ(r.rows[0][1], "target");
+    ASSERT_STR_EQ(r.rows[1][0], "beta");
+    ASSERT_STR_EQ(r.rows[1][1], "target");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_unwind_empty_list_returns_no_rows) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "unwind-empty", "/tmp/unwind-empty"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "unwind-empty",
+                       .label = "Function",
+                       .name = "target",
+                       .qualified_name = "unwind_empty.target",
+                       .file_path = "src/unwind.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "UNWIND [] AS item MATCH (f:Function) RETURN item, f.name",
+                                "unwind-empty", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_unwind_variable_without_parameter_scope_fails_loudly) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "UNWIND items AS item MATCH (f) RETURN item", NULL, 0, &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "without query parameters"));
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_unwind_cross_product_obeys_working_row_budget) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "unwind-budget", "/tmp/unwind-budget"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "unwind-budget",
+                       .label = "Function",
+                       .name = "target",
+                       .qualified_name = "unwind_budget.target",
+                       .file_path = "src/unwind.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+
+    cbm_cypher_limits_t limits = {.max_output_rows = 1, .max_working_rows = 3};
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute_with_limits(
+        s, "UNWIND [1, 2, 3, 4] AS item MATCH (f:Function) RETURN item", "unwind-budget", &limits,
+        &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget (3)"));
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -4539,6 +4637,10 @@ SUITE(cypher) {
     /* Phase 9: UNWIND */
     RUN_TEST(cypher_parse_unwind);
     RUN_TEST(cypher_parse_unwind_var);
+    RUN_TEST(cypher_exec_unwind_literal_multiplies_rows_and_binds_alias);
+    RUN_TEST(cypher_exec_unwind_empty_list_returns_no_rows);
+    RUN_TEST(cypher_exec_unwind_variable_without_parameter_scope_fails_loudly);
+    RUN_TEST(cypher_exec_unwind_cross_product_obeys_working_row_budget);
     RUN_TEST(cypher_wide_return_projection_bounded);
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);

@@ -7,11 +7,13 @@
  */
 #include "cypher/cypher.h"
 #include "foundation/compat.h"
-#include "store/store.h"
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
+#include "store/store.h"
+
+#include <yyjson/yyjson.h>
 
 enum {
     CYP_BUF_16 = 16,
@@ -1910,41 +1912,77 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     return 0;
 }
 
-/* Parse UNWIND [...] AS var clause into query */
-static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
+/* Parse UNWIND [...] AS var into a normalized JSON array. The executor consumes
+ * this same owned representation, so parser acceptance cannot drift into a
+ * write-only AST field. Dynamic growth removes the former 2 KiB serialization
+ * ceiling; the lexer still enforces its shared per-token bound. */
+static int parse_unwind_clause(parser_t *p, cbm_query_t *q) {
     advance(p);
     if (check(p, TOK_LBRACKET)) {
-        /* Literal list: [1, 2, 3] — collect as JSON array string */
         advance(p);
-        char buf[CBM_SZ_2K] = "[";
-        int blen = SKIP_ONE;
-        while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-            if (blen > SKIP_ONE) {
-                buf[blen++] = ',';
-            }
-            if (check(p, TOK_STRING)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "\"%s\"", peek(p)->text);
-                advance(p);
-            } else if (check(p, TOK_NUMBER)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "%s", peek(p)->text);
-                advance(p);
-            } else {
-                advance(p);
-            }
-            match(p, TOK_COMMA);
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *list = doc ? yyjson_mut_arr(doc) : NULL;
+        if (!doc || !list) {
+            yyjson_mut_doc_free(doc);
+            snprintf(p->error, sizeof(p->error), "out of memory parsing UNWIND list");
+            return CBM_NOT_FOUND;
         }
-        expect(p, TOK_RBRACKET);
-        buf[blen++] = ']';
-        buf[blen] = '\0';
-        q->unwind_expr = heap_strdup(buf);
+        while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
+            yyjson_mut_val *value = NULL;
+            if (check(p, TOK_STRING)) {
+                value = yyjson_mut_strcpy(doc, advance(p)->text);
+            } else if (check(p, TOK_NUMBER)) {
+                value = yyjson_mut_rawcpy(doc, advance(p)->text);
+            } else {
+                yyjson_mut_doc_free(doc);
+                snprintf(p->error, sizeof(p->error),
+                         "UNWIND literal lists support string and number values");
+                return CBM_NOT_FOUND;
+            }
+            if (!value || !yyjson_mut_arr_append(list, value)) {
+                yyjson_mut_doc_free(doc);
+                snprintf(p->error, sizeof(p->error), "out of memory parsing UNWIND list");
+                return CBM_NOT_FOUND;
+            }
+            if (!match(p, TOK_COMMA) && !check(p, TOK_RBRACKET)) {
+                yyjson_mut_doc_free(doc);
+                snprintf(p->error, sizeof(p->error), "expected ',' or ']' in UNWIND list");
+                return CBM_NOT_FOUND;
+            }
+        }
+        if (!expect(p, TOK_RBRACKET)) {
+            yyjson_mut_doc_free(doc);
+            return CBM_NOT_FOUND;
+        }
+        yyjson_mut_doc_set_root(doc, list);
+        q->unwind_expr = yyjson_mut_write(doc, 0, NULL);
+        yyjson_mut_doc_free(doc);
+        if (!q->unwind_expr) {
+            snprintf(p->error, sizeof(p->error), "out of memory parsing UNWIND list");
+            return CBM_NOT_FOUND;
+        }
     } else if (check(p, TOK_IDENT)) {
         q->unwind_expr = heap_strdup(advance(p)->text);
+        if (!q->unwind_expr) {
+            snprintf(p->error, sizeof(p->error), "out of memory parsing UNWIND expression");
+            return CBM_NOT_FOUND;
+        }
+    } else {
+        snprintf(p->error, sizeof(p->error), "expected a literal list or variable after UNWIND");
+        return CBM_NOT_FOUND;
     }
-    expect(p, TOK_AS);
+    if (!expect(p, TOK_AS)) {
+        return CBM_NOT_FOUND;
+    }
     const cbm_token_t *alias = expect(p, TOK_IDENT);
     if (alias) {
         q->unwind_alias = heap_strdup(alias->text);
+        if (!q->unwind_alias) {
+            snprintf(p->error, sizeof(p->error), "out of memory parsing UNWIND alias");
+            return CBM_NOT_FOUND;
+        }
     }
+    return alias ? 0 : CBM_NOT_FOUND;
 }
 
 /* Parse a chain of MATCH / OPTIONAL MATCH patterns into query.
@@ -2066,9 +2104,17 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     }
 
     cbm_query_t *q = calloc(CBM_ALLOC_ONE, sizeof(cbm_query_t));
+    if (!q) {
+        out->error = heap_strdup("out of memory parsing query");
+        return CBM_NOT_FOUND;
+    }
 
     if (check(&p, TOK_UNWIND)) {
-        parse_unwind_clause(&p, q);
+        if (parse_unwind_clause(&p, q) < 0) {
+            out->error = heap_strdup(p.error[0] ? p.error : "failed to parse UNWIND");
+            cbm_query_free(q);
+            return CBM_NOT_FOUND;
+        }
     }
 
     bool first_optional = false;
@@ -4953,6 +4999,73 @@ static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *
     vb->var_count++;
 }
 
+/* Cross each existing MATCH binding with a leading literal UNWIND list.
+ * The list is independent of graph traversal, so applying the cross product
+ * after MATCH expansion preserves Cypher row semantics while avoiding repeated
+ * store scans. Runtime is O(B * L * V) and memory is O(min(B * L, W) * V),
+ * where B is matched bindings, L list length, V bound variables, and W the
+ * configured working-row budget. Hitting W uses the executor's existing loud
+ * error path; a partial intermediate binding set is never returned. */
+static void execute_unwind_literal(cbm_query_t *q, binding_t **bindings, int *bind_count,
+                                   int *bind_cap, int max_working_rows) {
+    if (!q->unwind_expr || q->unwind_expr[0] != '[' || !q->unwind_alias) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(q->unwind_expr, strlen(q->unwind_expr), 0);
+    yyjson_val *list = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!list || !yyjson_is_arr(list)) {
+        yyjson_doc_free(doc);
+        g_cypher_allocation_failed = true;
+        return;
+    }
+
+    binding_t *source = *bindings;
+    int source_count = *bind_count;
+    binding_t *expanded = NULL;
+    int expanded_count = 0;
+    int expanded_cap = 0;
+    bool stop = false;
+
+    for (int bi = 0; bi < source_count && !stop; bi++) {
+        size_t index;
+        size_t list_count;
+        yyjson_val *value;
+        yyjson_arr_foreach(list, index, list_count, value) {
+            char number[CBM_SZ_64];
+            const char *text = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+            if (yyjson_is_num(value)) {
+                char *end = yyjson_write_number(value, number);
+                if (end) {
+                    *end = '\0';
+                    text = number;
+                }
+            }
+            if (!text) {
+                g_cypher_allocation_failed = true;
+                stop = true;
+                break;
+            }
+            binding_t row = {0};
+            binding_copy(&row, &source[bi]);
+            with_add_vbinding_var(&row, q->unwind_alias, text, false);
+            if (!binding_array_append(&expanded, &expanded_count, &expanded_cap, max_working_rows,
+                                      &row)) {
+                stop = true;
+                break;
+            }
+        }
+    }
+
+    for (int bi = 0; bi < source_count; bi++) {
+        binding_free(&source[bi]);
+    }
+    free(source);
+    yyjson_doc_free(doc);
+    *bindings = expanded;
+    *bind_count = expanded_count;
+    *bind_cap = expanded_cap;
+}
+
 /* Free with_agg_t array */
 static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
     for (int a = 0; a < agg_cnt; a++) {
@@ -6175,9 +6288,13 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     expand_patterns_from(store, q, SKIP_ONE, project, max_rows, max_working_rows, scan_mode,
                          &bindings, &bind_count, &bind_cap);
 
+    /* Step 2c: Leading literal UNWIND. The alias must exist before the late
+     * WHERE/projection stages consume it. */
+    execute_unwind_literal(q, &bindings, &bind_count, &bind_cap, max_working_rows);
+
     /* Step 3: Late WHERE */
     if (q->where && !query_where_is_optional_pattern_predicate(q) &&
-        (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
+        (q->unwind_expr || pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
         filter_bindings_where(q->where, bindings, &bind_count);
     }
 
@@ -6310,6 +6427,21 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     if (cbm_cypher_parse(query, &q, &err) < 0) {
         out->error = err;
         return CBM_NOT_FOUND;
+    }
+
+    /* The public grammar historically accepted a leading variable expression
+     * (`UNWIND items`) despite having no query-parameter or preceding-row scope
+     * from which `items` could be resolved. Reject it explicitly instead of
+     * silently ignoring the write-only AST field. Literal lists are executed
+     * below; a future parameter API can extend this branch deliberately. */
+    for (cbm_query_t *branch = q; branch; branch = branch->union_next) {
+        if (branch->unwind_expr && branch->unwind_expr[0] != '[') {
+            out->error = heap_strdup(
+                "UNWIND variable input is unavailable without query parameters; use a literal "
+                "list such as UNWIND [\"a\", \"b\"] AS item");
+            cbm_query_free(q);
+            return CBM_NOT_FOUND;
+        }
     }
 
     cypher_node_scan_mode_t scan_mode = CYP_NODE_SCAN_CANONICAL;
