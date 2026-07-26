@@ -16465,6 +16465,98 @@ TEST(incremental_publish_failure_keeps_existing_db) {
     PASS();
 }
 
+TEST(incremental_frontier_full_fallback_failure_preserves_dirty_ledger) {
+    pipeline_env_snapshot_t flush_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT);
+    pipeline_env_snapshot_t dump_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char conservative_cap[CBM_SZ_32];
+    int n = snprintf(conservative_cap, sizeof(conservative_cap), "%d", CBM_SZ_4);
+    ASSERT(n >= 0 && (size_t)n < sizeof(conservative_cap));
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, conservative_cap), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int nodes_before = cbm_store_count_nodes(store, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(store);
+    ASSERT_FALSE(pipeline_store_has_function_name(g_incr_dbpath, project, "shared_extra"));
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+    char changed_path[CBM_PATH_MAX];
+    n = snprintf(changed_path, sizeof(changed_path), "%s/shared.h", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(changed_path));
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    cbm_setenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, pipeline_test_env_enabled, 1);
+    cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, pipeline_test_env_enabled, 1);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    pipeline_env_restore(&flush_fail_env);
+    pipeline_env_restore(&dump_fail_env);
+
+    ASSERT_NEQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    char fallback_log[CBM_SZ_128];
+    n = snprintf(fallback_log, sizeof(fallback_log), "msg=incremental.fallback reason=%s scope=%s",
+                 CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE,
+                 CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fallback_log));
+    ASSERT(strstr(logs, fallback_log) != NULL);
+
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_nodes(store, project), nodes_before);
+    cbm_store_close(store);
+    ASSERT_FALSE(pipeline_store_has_function_name(g_incr_dbpath, project, "shared_extra"));
+
+    store = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_dirty_file_state_t *dirty_rows = NULL;
+    int dirty_row_count = 0;
+    ASSERT_EQ(cbm_store_list_dirty_files(store, project, &dirty_rows, &dirty_row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_row_count, 1);
+    ASSERT_STR_EQ(dirty_rows[0].project, project);
+    ASSERT_STR_EQ(dirty_rows[0].rel_path, "shared.h");
+    char expected_dirty_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    ASSERT_EQ(cbm_file_content_hash(changed_path, expected_dirty_hash, sizeof(expected_dirty_hash)),
+              0);
+    ASSERT_STR_EQ(dirty_rows[0].observed_hash, expected_dirty_hash);
+    ASSERT_GT(dirty_rows[0].observed_mtime_ns, 0);
+    ASSERT_GT(dirty_rows[0].observed_size, 0);
+    ASSERT_STR_EQ(dirty_rows[0].source, CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX);
+    ASSERT_STR_EQ(dirty_rows[0].status, CBM_STORE_DIRTY_STATUS_PENDING);
+    cbm_store_free_dirty_files(dirty_rows, dirty_row_count);
+    cbm_store_close(store);
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_postpass_failure_keeps_existing_db) {
     pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
 
@@ -19468,6 +19560,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
     RUN_TEST(incremental_publish_failure_keeps_existing_db);
+    RUN_TEST(incremental_frontier_full_fallback_failure_preserves_dirty_ledger);
     RUN_TEST(incremental_postpass_failure_keeps_existing_db);
     RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
     RUN_TEST(incremental_parallel_extract_failure_keeps_existing_db);

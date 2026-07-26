@@ -720,7 +720,8 @@ GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-syntax test-daemon-smoke \
+.PHONY: test test-par test-focused test-compositional test-repro test-foundation test-tsan \
+        test-syntax test-daemon-smoke \
         test-leak test-analyze test-memory test-gmalloc cbm cbm-launcher \
         cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck \
         lint-format lint-source-safety install test-runner-nosan security
@@ -948,6 +949,35 @@ test-focused: $(BUILD_DIR)/test-runner
 	@test -n "$(strip $(TEST_SUITES))" || \
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
+
+# Cross-parent interaction canaries. Keep this target small: each row pairs a
+# classifier or policy from one side of the merge with the publication action
+# that consumes it, while the full suite remains the exhaustive gate.
+test-compositional: $(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=pipeline \
+		CBM_ONLY_TEST=incremental_frontier_full_fallback_failure_preserves_dirty_ledger \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=input_validation \
+		CBM_ONLY_TEST=path_project_autoindex_honors_auto_dep_limit \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=daemon_application \
+		CBM_ONLY_TEST=daemon_application_auto_index_honors_tracked_file_limit \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=pagerank \
+		CBM_ONLY_TEST=pagerank_refresh_defer_exact_delta_reindexes_does_not_defer_containment \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=pagerank \
+		CBM_ONLY_TEST=pagerank_refresh_defer_all_incremental_reindexes_defers_full_fallback \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=tool_query_graph_uses_active_relationship_query_with_ready_overlay \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=watcher_publication_reopens_cached_store_generation \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=daemon_runtime \
+		CBM_ONLY_TEST=daemon_runtime_request_cancel_is_exact_and_session_remains_usable \
+		$(BUILD_DIR)/test-runner
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
