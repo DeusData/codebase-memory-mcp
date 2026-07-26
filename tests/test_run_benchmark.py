@@ -2356,6 +2356,61 @@ class RunBenchmarkTest(unittest.TestCase):
         self.assertEqual(len(result["measurement_log_markers"]), 2)
         self.assertNotIn("ignored detail", "\n".join(result["measurement_log_markers"]))
 
+    def test_run_index_mcp_reads_only_current_daemon_worker_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            daemon_log = cache_dir / BENCHMARK.DAEMON_LOG_RELATIVE_PATH
+            daemon_log.parent.mkdir(parents=True)
+            old_worker_log = root / "old-worker.log"
+            current_worker_log = root / "current-worker.log"
+            old_worker_log.write_text(
+                "level=info msg=incremental.done elapsed_ms=999 "
+                "rss_mb=999 peak_mb=999\n",
+                encoding="utf-8",
+            )
+            current_worker_log.write_text(
+                "level=info msg=incremental.done elapsed_ms=18 "
+                "rss_mb=42 peak_mb=64\n"
+                "level=info msg=prof phase=index_repository "
+                "sub=TOTAL ms=20 us=20000\n",
+                encoding="utf-8",
+            )
+            daemon_log.write_text(
+                f"level=info msg=index.supervisor.profile_log log={old_worker_log}\n",
+                encoding="utf-8",
+            )
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.env = {"CBM_CACHE_DIR": str(cache_dir)}
+
+                def call_tool(
+                    self, name: str, arguments: dict[str, object]
+                ) -> tuple[dict[str, object], str, int, float]:
+                    self.name = name
+                    self.arguments = arguments
+                    with daemon_log.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            "level=info msg=index.supervisor.profile_log "
+                            f"log={current_worker_log}\n"
+                        )
+                    return (
+                        {"publish_kind": "incremental_exact"},
+                        "",
+                        10,
+                        25.0,
+                    )
+
+            client = FakeClient()
+            result = BENCHMARK.run_index_mcp(client, root / "repo", include_logs=False)
+
+        self.assertEqual(client.name, "index_repository")
+        self.assertEqual(result["peak_rss_mb"], 64)
+        self.assertEqual(result["indexed_work_elapsed_ms"], 18)
+        self.assertEqual(result["worker_elapsed_ms"], 20)
+        self.assertEqual(result["process_overhead_ms"], 5)
+
     def test_build_index_result_archives_worker_log_before_worktree_cleanup(
         self,
     ) -> None:

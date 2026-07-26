@@ -60,6 +60,7 @@ BENCHMARK_TERMINOLOGY_MARKDOWN_PATH = (
 
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
 BENCHMARK_RUN_CONTEXT_ENV = "CBM_BENCHMARK_RUN_CONTEXT"
+DAEMON_LOG_RELATIVE_PATH = Path("logs") / "cbm-daemon.log"
 BENCHMARK_FACT_SCHEMA_VERSION = 2
 BENCHMARK_FACT_SCHEMA = "benchmarks/schema/facts-v2.schema.json"
 BENCHMARK_FACT_COMPATIBLE_SCHEMA_URIS = {
@@ -3366,11 +3367,15 @@ def build_index_result(
     stdout_bytes: int,
     elapsed_ms: float,
     include_logs: bool,
+    measurement_diagnostics: str = "",
 ) -> dict[str, Any]:
     measurement_log_markers: list[str] = []
     measurement_log_artifacts: list[dict[str, Any]] = []
     logfiles: list[str] = []
-    supervisor_log = parse_log_text_field(stderr, "index.supervisor.profile_log", "log")
+    supervisor_diagnostics = f"{stderr}\n{measurement_diagnostics}"
+    supervisor_log = parse_log_text_field(
+        supervisor_diagnostics, "index.supervisor.profile_log", "log"
+    )
     if supervisor_log:
         logfiles.append(supervisor_log)
     response_log = data.get("logfile")
@@ -3404,7 +3409,9 @@ def build_index_result(
             continue
         if measurement_log_markers:
             break
-    measurement_text = "\n".join((stderr, *measurement_log_markers))
+    measurement_text = "\n".join(
+        (stderr, measurement_diagnostics, *measurement_log_markers)
+    )
     elapsed_ms_int = int(elapsed_ms)
     publish_kind = response_publish_kind(data)
     logged_elapsed_ms = {
@@ -3544,10 +3551,36 @@ def run_index_mcp(
     include_logs: bool,
     index_mode: str = "fast",
 ) -> dict[str, Any]:
+    daemon_log = (
+        Path(client.env["CBM_CACHE_DIR"]) / DAEMON_LOG_RELATIVE_PATH
+        if client.env.get("CBM_CACHE_DIR")
+        else None
+    )
+    daemon_log_offset = (
+        daemon_log.stat().st_size if daemon_log and daemon_log.is_file() else 0
+    )
     data, stderr, stdout_bytes, elapsed_ms = client.call_tool(
         "index_repository", index_tool_arguments(repo_dir, index_mode)
     )
-    return build_index_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
+    daemon_diagnostics = ""
+    if daemon_log and daemon_log.is_file():
+        try:
+            current_size = daemon_log.stat().st_size
+            with daemon_log.open("rb") as stream:
+                stream.seek(
+                    daemon_log_offset if current_size >= daemon_log_offset else 0
+                )
+                daemon_diagnostics = stream.read().decode("utf-8", errors="replace")
+        except OSError:
+            daemon_diagnostics = ""
+    return build_index_result(
+        data,
+        stderr,
+        stdout_bytes,
+        elapsed_ms,
+        include_logs,
+        measurement_diagnostics=daemon_diagnostics,
+    )
 
 
 def build_tool_probe_result(
