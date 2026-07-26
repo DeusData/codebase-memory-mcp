@@ -17806,6 +17806,66 @@ TEST(pipeline_semantic_edges_tokenize_complete_long_metadata) {
     PASS();
 }
 
+TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results) {
+    enum {
+        SEM_NOISY_BUCKET_FUNCTIONS = 205,
+        SEM_NOISY_BUCKET_SHARED_TOKENS = 256,
+        SEM_NOISY_BUCKET_JSON_CAP = CBM_SZ_16K,
+    };
+    char *props = malloc(SEM_NOISY_BUCKET_JSON_CAP);
+    ASSERT_NOT_NULL(props);
+    int written = snprintf(props, SEM_NOISY_BUCKET_JSON_CAP, "{\"docstring\":\"");
+    ASSERT_GT(written, 0);
+    size_t used = (size_t)written;
+    for (int i = 0; i < SEM_NOISY_BUCKET_SHARED_TOKENS; i++) {
+        written = snprintf(props + used, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used,
+                           "shared_semantic_%d ", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used);
+        used += (size_t)written;
+    }
+    written = snprintf(props + used, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used, "\"}");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-noisy", "/tmp/sem-noisy");
+    ASSERT_NOT_NULL(gb);
+    for (int i = 0; i < SEM_NOISY_BUCKET_FUNCTIONS; i++) {
+        char qualified_name[CBM_SZ_128];
+        written = snprintf(qualified_name, sizeof(qualified_name), "sem-noisy.clone_%d", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(qualified_name));
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "clone", qualified_name, "clone.py", 1, 2,
+                                       props),
+                  0);
+    }
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "sem-noisy",
+        .repo_path = "/tmp/sem-noisy",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+
+    pipeline_capture_logs_start();
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx), 0);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_NOT_NULL(strstr(logs, "pass.semantic.candidates_partial"));
+    const char *noisy = strstr(logs, "noisy_bucket_visits=");
+    ASSERT_NOT_NULL(noisy);
+    noisy += strlen("noisy_bucket_visits=");
+    char *end = NULL;
+    unsigned long long noisy_visits = strtoull(noisy, &end, 10);
+    ASSERT_TRUE(end != noisy);
+    ASSERT_GT(noisy_visits, 0);
+    ASSERT_NOT_NULL(strstr(logs, "unscored_candidates="));
+
+    cbm_gbuf_free(gb);
+    free(props);
+    PASS();
+}
+
 static const cbm_config_entry_t *find_config_entry(const char *key) {
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
@@ -18805,6 +18865,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_corpus_accepts_nonuniform_docs_beyond_legacy_stride);
     RUN_TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids);
     RUN_TEST(pipeline_semantic_edges_tokenize_complete_long_metadata);
+    RUN_TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(config_registry_includes_extract_timeout);

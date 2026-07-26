@@ -27,6 +27,7 @@
 #include "foundation/platform.h"
 #include "foundation/profile.h"
 
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -961,7 +962,10 @@ enum {
     SEM_BUCKET_COUNT = 65536,
     SEM_BUCKET_MASK = 65535,
     SEM_BUCKET_CAP_INIT = 16,
-    SEM_MAX_CANDIDATES = 200,
+    /* Commit 09ce20af measured this noisy-bucket guard on the Linux kernel.
+     * Keep it distinct from the per-function exact-score work budget. */
+    SEM_NOISY_BUCKET_SIZE = 200,
+    SEM_SCORE_CANDIDATE_BUDGET = 200,
 };
 
 /* Row of a hyperplane matrix in the ROTATED (quantized) basis: LSH only
@@ -1024,6 +1028,8 @@ typedef struct {
     int max_workers;
     _Atomic int next_idx;
     _Atomic bool alloc_failed;
+    _Atomic uint64_t noisy_bucket_visits;
+    _Atomic uint64_t unscored_candidates;
 } score_ctx_t;
 
 enum {
@@ -1031,6 +1037,9 @@ enum {
     SCORE_SEEN_MASK = 8191,
     SCORE_SEEN_EMPTY = -1,
 };
+
+_Static_assert(SEM_LSH_BANDS * SEM_NOISY_BUCKET_SIZE < SCORE_SEEN_CAP,
+               "semantic LSH accepted buckets must fit the candidate seen set");
 
 /* Check whether `j` has already been recorded in the open-addressed `seen`
  * set for this function; insert it if not.  Returns true when the insertion
@@ -1051,12 +1060,15 @@ static bool score_seen_insert(int *seen, int j) {
 }
 
 /* Collect the unique candidate function indices for node `i` by iterating
- * every LSH band and merging bucket members via `seen[]`.  Returns the
- * populated candidate count. */
+ * every LSH band and merging bucket members via `seen[]`.  Continue past
+ * cand_cap so omissions are counted exactly.  The compile-time assertion
+ * above keeps the accepted-bucket working set below SCORE_SEEN_CAP.  Exact
+ * scoring remains bounded without extra heap storage. */
 static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *candidates,
-                                    int cand_cap) {
+                                    int cand_cap, uint64_t *noisy_bucket_visits,
+                                    uint64_t *unscored_candidates) {
     int cand_count = 0;
-    for (int b = 0; b < SEM_LSH_BANDS && cand_count < cand_cap; b++) {
+    for (int b = 0; b < SEM_LSH_BANDS; b++) {
         int shift = b * SEM_LSH_ROWS;
         uint32_t band_val = (uint32_t)((sc->signatures[i] >> shift) &
                                        ((CBM_SEM_EDGE_ONE_ULL << SEM_LSH_ROWS) - CBM_SEM_EDGE_ONE_ULL));
@@ -1064,16 +1076,21 @@ static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *cand
         uint32_t bucket_idx = (uint32_t)(bh & SEM_BUCKET_MASK);
         int bcount = sc->band_buckets[b][bucket_idx].count;
         int *bitems = sc->band_buckets[b][bucket_idx].items;
-        if (bcount > SEM_MAX_CANDIDATES) {
+        if (bcount > SEM_NOISY_BUCKET_SIZE) {
+            (*noisy_bucket_visits)++;
             continue;
         }
-        for (int k = 0; k < bcount && cand_count < cand_cap; k++) {
+        for (int k = 0; k < bcount; k++) {
             int j = bitems[k];
             if (j <= i) {
                 continue;
             }
             if (score_seen_insert(seen, j)) {
-                candidates[cand_count++] = j;
+                if (cand_count < cand_cap) {
+                    candidates[cand_count++] = j;
+                } else {
+                    (*unscored_candidates)++;
+                }
             }
         }
     }
@@ -1117,8 +1134,20 @@ static void score_worker(int worker_id, void *ctx_ptr) {
         for (int s = 0; s < SCORE_SEEN_CAP; s++) {
             seen[s] = SCORE_SEEN_EMPTY;
         }
-        int candidates[SEM_MAX_CANDIDATES];
-        int cand_count = score_collect_candidates(sc, i, seen, candidates, SEM_MAX_CANDIDATES);
+        int candidates[SEM_SCORE_CANDIDATE_BUDGET];
+        uint64_t noisy_bucket_visits = 0;
+        uint64_t unscored_candidates = 0;
+        int cand_count =
+            score_collect_candidates(sc, i, seen, candidates, SEM_SCORE_CANDIDATE_BUDGET,
+                                     &noisy_bucket_visits, &unscored_candidates);
+        if (noisy_bucket_visits > 0) {
+            atomic_fetch_add_explicit(&sc->noisy_bucket_visits, noisy_bucket_visits,
+                                      memory_order_relaxed);
+        }
+        if (unscored_candidates > 0) {
+            atomic_fetch_add_explicit(&sc->unscored_candidates, unscored_candidates,
+                                      memory_order_relaxed);
+        }
         for (int c = 0; c < cand_count; c++) {
             score_try_emit(sc, i, candidates[c], c, my_buf);
         }
@@ -1539,8 +1568,24 @@ static bool phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures
     };
     atomic_init(&sc.next_idx, 0);
     atomic_init(&sc.alloc_failed, false);
+    atomic_init(&sc.noisy_bucket_visits, 0);
+    atomic_init(&sc.unscored_candidates, 0);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_parallel_for(worker_count, score_worker, &sc, opts);
+    uint64_t noisy_bucket_visits =
+        atomic_load_explicit(&sc.noisy_bucket_visits, memory_order_relaxed);
+    uint64_t unscored_candidates =
+        atomic_load_explicit(&sc.unscored_candidates, memory_order_relaxed);
+    if (noisy_bucket_visits > 0 || unscored_candidates > 0) {
+        char noisy_buf[CBM_SZ_32];
+        char unscored_buf[CBM_SZ_32];
+        snprintf(noisy_buf, sizeof(noisy_buf), "%" PRIu64, noisy_bucket_visits);
+        snprintf(unscored_buf, sizeof(unscored_buf), "%" PRIu64, unscored_candidates);
+        cbm_log_warn("pass.semantic.candidates_partial", "noisy_bucket_visits", noisy_buf,
+                     "unscored_candidates", unscored_buf, "score_budget",
+                     itoa_log(SEM_SCORE_CANDIDATE_BUDGET), "noisy_bucket_limit",
+                     itoa_log(SEM_NOISY_BUCKET_SIZE));
+    }
     return !atomic_load_explicit(&sc.alloc_failed, memory_order_relaxed);
 }
 
