@@ -8776,42 +8776,42 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
         yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
 
-        /* Report indexed dependencies by searching for {project}.dep.% nodes.
-         * Uses project_pattern for LIKE query to find all dep projects. */
-        char dep_like[4096];
-        snprintf(dep_like, sizeof(dep_like), "%s.dep.%%", project);
-        cbm_search_params_t dep_params = {0};
-        dep_params.project_pattern = dep_like;
-        dep_params.limit = 100;
-        cbm_search_output_t dep_out = {0};
-        if (cbm_store_search(store, &dep_params, &dep_out) == 0) {
-            /* Collect unique dep project names */
-            if (dep_out.count > 0) {
-                yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
-                const char *last_dep_proj = "";
-                int dep_count = 0;
-                for (int i = 0; i < dep_out.count; i++) {
-                    const char *proj = dep_out.results[i].node.project;
-                    if (!proj || strcmp(proj, last_dep_proj) == 0) continue;
-                    last_dep_proj = proj;
-                    /* Extract package name from "myproj.dep.pandas" */
-                    const char *dep_sep = strstr(proj, CBM_DEP_SEPARATOR);
-                    if (!dep_sep) continue;
-                    const char *pkg = dep_sep + CBM_DEP_SEPARATOR_LEN;
-                    yyjson_mut_val *d = yyjson_mut_obj(doc);
-                    yyjson_mut_obj_add_strcpy(doc, d, "package", pkg);
-                    int dn = cbm_store_count_nodes(store, proj);
-                    yyjson_mut_obj_add_int(doc, d, "nodes", dn);
-                    yyjson_mut_arr_add_val(dep_arr, d);
-                    dep_count++;
+        /* Dependencies are projects, not a prefix of ranked node results.
+         * Enumerating the canonical project registry avoids omitting packages
+         * merely because their nodes fall beyond a search-result limit. */
+        cbm_project_t *all_projects = NULL;
+        int all_project_count = 0;
+        if (cbm_store_list_projects(store, &all_projects, &all_project_count) == CBM_STORE_OK) {
+            yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
+            int dep_count = 0;
+            size_t project_len = strlen(project);
+            for (int i = 0; i < all_project_count; i++) {
+                const char *dep_project = all_projects[i].name;
+                if (!dep_project || strncmp(dep_project, project, project_len) != 0) {
+                    continue;
                 }
-                if (dep_count > 0) {
-                    yyjson_mut_obj_add_val(doc, root, "dependencies", dep_arr);
-                    yyjson_mut_obj_add_int(doc, root, "dependency_count", dep_count);
+                const char *suffix = dep_project + project_len;
+                if (strncmp(suffix, CBM_DEP_SEPARATOR, CBM_DEP_SEPARATOR_LEN) != 0) {
+                    continue;
                 }
+                const char *package = suffix + CBM_DEP_SEPARATOR_LEN;
+                if (!package[0]) {
+                    continue;
+                }
+                yyjson_mut_val *dependency = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, dependency, "package", package);
+                yyjson_mut_obj_add_int(doc, dependency, "nodes",
+                                       cbm_store_count_nodes(store, dep_project));
+                yyjson_mut_arr_add_val(dep_arr, dependency);
+                dep_count++;
             }
-            /* Always free search results — cbm_store_search allocates even when count==0 */
-            cbm_store_search_free(&dep_out);
+            if (dep_count > 0) {
+                yyjson_mut_obj_add_val(doc, root, "dependencies", dep_arr);
+                yyjson_mut_obj_add_int(doc, root, "dependency_count", dep_count);
+            }
+            cbm_store_free_projects(all_projects, all_project_count);
+        } else {
+            yyjson_mut_obj_add_str(doc, root, "dependencies_status", "error");
         }
 
         /* Report detected ecosystem + root_path + git metadata */
