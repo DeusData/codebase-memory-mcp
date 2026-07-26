@@ -21,8 +21,6 @@
 #define MAX_BASES_MINUS_1 15
 #define MAX_PARAMS CBM_SZ_32
 #define MAX_PARAMS_MINUS_1 31
-#define MAX_RETURN_TYPES 16
-#define MAX_RETURN_TYPES_MINUS_1 15
 
 // Tree traversal limits.
 enum {
@@ -2940,7 +2938,7 @@ static const char **extract_param_names(CBMArena *a, TSNode params, const char *
 // Parses Go-style multi-return (T1, T2) and single return types.
 // Returns NULL-terminated arena-allocated array.
 // Clean a type text and add to types array if valid.
-static void add_cleaned_type(CBMArena *a, const char **types, int *count, char *type_text) {
+static void add_cleaned_type(CBMArena *a, const char **types, size_t *count, char *type_text) {
     if (!type_text || !type_text[0]) {
         return;
     }
@@ -2952,13 +2950,10 @@ static void add_cleaned_type(CBMArena *a, const char **types, int *count, char *
 
 // Extract Go multi-return types from a parameter_list result node.
 static void extract_go_multi_return(CBMArena *a, TSNode rt_node, const char *source,
-                                    const char **types, int *count) {
-    uint32_t nc = ts_node_child_count(rt_node);
-    for (uint32_t i = 0; i < nc && *count < MAX_RETURN_TYPES_MINUS_1; i++) {
-        TSNode child = ts_node_child(rt_node, i);
-        if (ts_node_is_null(child) || !ts_node_is_named(child)) {
-            continue;
-        }
+                                    const char **types, size_t *count) {
+    uint32_t nc = ts_node_named_child_count(rt_node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_named_child(rt_node, i);
         if (strcmp(ts_node_type(child), "parameter_declaration") == 0) {
             TSNode tn = ts_node_child_by_field_name(child, TS_FIELD("type"));
             if (!ts_node_is_null(tn)) {
@@ -2970,37 +2965,39 @@ static void extract_go_multi_return(CBMArena *a, TSNode rt_node, const char *sou
     }
 }
 
-// Build a NULL-terminated arena-allocated string array from a types buffer.
-static const char **build_type_array(CBMArena *a, const char **types, int count) {
-    if (count == 0) {
-        return NULL;
-    }
-    const char **result =
-        (const char **)cbm_arena_alloc(a, (count + NULL_TERM) * sizeof(const char *));
-    for (int i = 0; i < count; i++) {
-        result[i] = types[i];
-    }
-    result[count] = NULL;
-    return result;
-}
-
-static const char **extract_return_types(CBMArena *a, TSNode rt_node, const char *source,
-                                         CBMLanguage lang) {
-    (void)lang;
+static const char **extract_return_types(CBMExtractCtx *ctx, TSNode rt_node) {
     if (ts_node_is_null(rt_node)) {
         return NULL;
     }
 
-    const char *types[MAX_RETURN_TYPES];
-    int count = 0;
+    bool multi_return = strcmp(ts_node_type(rt_node), "parameter_list") == 0;
+    size_t capacity = multi_return ? (size_t)ts_node_named_child_count(rt_node) : SKIP_ONE;
+    if (capacity == 0) {
+        return NULL;
+    }
+    if (capacity > SIZE_MAX / sizeof(const char *) - NULL_TERM) {
+        ctx->result->has_error = true;
+        return NULL;
+    }
+    const char **types = cbm_arena_alloc(ctx->arena, (capacity + NULL_TERM) * sizeof(*types));
+    if (!types) {
+        ctx->result->has_error = true;
+        return NULL;
+    }
+    size_t count = 0;
 
-    if (strcmp(ts_node_type(rt_node), "parameter_list") == 0) {
-        extract_go_multi_return(a, rt_node, source, types, &count);
+    if (multi_return) {
+        extract_go_multi_return(ctx->arena, rt_node, ctx->source, types, &count);
     } else {
-        add_cleaned_type(a, types, &count, cbm_node_text(a, rt_node, source));
+        add_cleaned_type(ctx->arena, types, &count,
+                         cbm_node_text(ctx->arena, rt_node, ctx->source));
     }
 
-    return build_type_array(a, types, count);
+    if (count == 0) {
+        return NULL;
+    }
+    types[count] = NULL;
+    return types;
 }
 
 // Extract param_types from a parameter list node.
@@ -3316,7 +3313,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
             def.return_type = cbm_node_text(a, rt, ctx->source);
-            def.return_types = extract_return_types(a, rt, ctx->source, ctx->language);
+            def.return_types = extract_return_types(ctx, rt);
             break;
         }
     }
