@@ -2253,6 +2253,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     }
     cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_buf(gh_result.commit_count),
                  "edges", itoa_buf(gh_edges));
+    cbm_change_coupling_paths_free(gh_result.couplings, gh_result.count);
     free(gh_result.couplings);
     cbm_file_temporal_free(gh_result.file_temporal, gh_result.file_temporal_count);
     return 0;

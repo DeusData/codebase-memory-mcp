@@ -206,8 +206,8 @@ static void free_index_value(const char *key, void *val, void *ud) {
 /* ── Standalone coupling computation (testable) ──────────────────── */
 
 typedef struct {
-    const char *file_a; /* borrowed from commits through collection */
-    const char *file_b;
+    char *file_a; /* borrowed from commits through collection */
+    char *file_b;
     int co_change_count;
     long long last_co_change;
 } coupling_pair_t;
@@ -325,20 +325,49 @@ static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
     }
     cctx->result.eligible++;
 
-    if (strlen(pair->file_a) >= sizeof(((cbm_change_coupling_t *)0)->file_a) ||
-        strlen(pair->file_b) >= sizeof(((cbm_change_coupling_t *)0)->file_b)) {
-        cctx->result.path_too_long++;
-        return;
-    }
-
     cbm_change_coupling_t candidate = {
+        .file_a = pair->file_a,
+        .file_b = pair->file_b,
         .co_change_count = pair->co_change_count,
         .coupling_score = score,
         .last_co_change = pair->last_co_change,
     };
-    snprintf(candidate.file_a, sizeof(candidate.file_a), "%s", pair->file_a);
-    snprintf(candidate.file_b, sizeof(candidate.file_b), "%s", pair->file_b);
     coupling_heap_push(cctx, &candidate);
+}
+
+void cbm_change_coupling_paths_free(cbm_change_coupling_t *items, int count) {
+    if (!items || count <= 0) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i].file_a);
+        free(items[i].file_b);
+        items[i].file_a = NULL;
+        items[i].file_b = NULL;
+    }
+}
+
+/* The selection heap borrows input paths so traversal performs no per-candidate
+ * string allocation. Duplicate only the final K rows after ranking: O(K) string
+ * allocations and O(total selected path bytes), with exact paths at any length. */
+static bool coupling_selected_paths_duplicate(cbm_change_coupling_t *items, int count) {
+    for (int i = 0; i < count; i++) {
+        char *file_a = cbm_strdup(items[i].file_a);
+        char *file_b = cbm_strdup(items[i].file_b);
+        if (!file_a || !file_b) {
+            free(file_a);
+            free(file_b);
+            cbm_change_coupling_paths_free(items, i);
+            for (int j = i; j < count; j++) {
+                items[j].file_a = NULL;
+                items[j].file_b = NULL;
+            }
+            return false;
+        }
+        items[i].file_a = file_a;
+        items[i].file_b = file_b;
+    }
+    return true;
 }
 
 cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit_files_t *commits,
@@ -348,7 +377,8 @@ cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit
                                                                 double min_coupling_score) {
     /* Aggregation remains expected O(file observations + pair observations).
      * The bounded strongest-first selection adds O(E log K) time for E
-     * eligible pairs and output budget K, with O(K) caller-owned output.
+     * eligible pairs and output budget K, with O(K + selected path bytes)
+     * caller-owned output.
      * Keeping timestamp and path references in the pair value avoids the
      * former second hash table and its duplicate key allocation. */
     cbm_change_coupling_result_t result = {0};
@@ -398,10 +428,10 @@ cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit
 
         for (int i = 0; i < commits[c].count; i++) {
             for (int j = i + SKIP_ONE; j < commits[c].count; j++) {
-                const char *a = commits[c].files[i];
-                const char *b = commits[c].files[j];
+                char *a = commits[c].files[i];
+                char *b = commits[c].files[j];
                 if (strcmp(a, b) > 0) {
-                    const char *t = a;
+                    char *t = a;
                     a = b;
                     b = t;
                 }
@@ -460,6 +490,9 @@ cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit
     result.omitted = result.eligible - result.written;
     if (result.written > 1) {
         qsort(out, (size_t)result.written, sizeof(*out), coupling_best_first_qsort);
+    }
+    if (!coupling_selected_paths_duplicate(out, result.written)) {
+        goto allocation_failed;
     }
     goto cleanup;
 
@@ -749,6 +782,7 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
         edge_count = cbm_pipeline_githistory_apply(ctx, &result);
     }
 
+    cbm_change_coupling_paths_free(result.couplings, result.count);
     free(result.couplings);
     cbm_file_temporal_free(result.file_temporal, result.file_temporal_count);
 

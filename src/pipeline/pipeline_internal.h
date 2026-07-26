@@ -869,8 +869,8 @@ bool cbm_is_test_func_name(const char *name);
 
 /* Coupling result from computeChangeCoupling */
 typedef struct {
-    char file_a[CBM_SZ_512];
-    char file_b[CBM_SZ_512];
+    char *file_a;
+    char *file_b;
     int co_change_count;
     double coupling_score;
     /* Unix epoch of the most recent commit that touched both files together.
@@ -907,7 +907,8 @@ typedef struct {
 
 /* Compute change coupling from commit history.
  * Returns number of couplings written to out (up to max_out).
- * Caller owns out[]. */
+ * Each written row owns its exact file_a/file_b strings; release them with
+ * cbm_change_coupling_paths_free before releasing or reusing the row array. */
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
                                 cbm_change_coupling_t *out, int max_out);
 int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits,
@@ -919,6 +920,7 @@ cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit
                                                                 cbm_change_coupling_t *out,
                                                                 int max_out,
                                                                 double min_coupling_score);
+void cbm_change_coupling_paths_free(cbm_change_coupling_t *items, int count);
 int cbm_compute_file_temporal(const cbm_commit_files_t *commits, int commit_count,
                               cbm_file_temporal_t **out, int *out_count);
 void cbm_file_temporal_free(cbm_file_temporal_t *items, int count);

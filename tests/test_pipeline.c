@@ -2189,6 +2189,7 @@ TEST(githistory_compute_coupling) {
                      strcmp(results[i].file_b, "d.go") == 0);
     }
 
+    cbm_change_coupling_paths_free(results, n);
     PASS();
 }
 
@@ -2229,6 +2230,7 @@ TEST(githistory_coupling_carries_last_co_change) {
         found_ab = true;
     }
     ASSERT_TRUE(found_ab);
+    cbm_change_coupling_paths_free(results, n);
     PASS();
 }
 
@@ -2286,6 +2288,8 @@ TEST(githistory_coupling_ranks_bounded_output_and_reports_omissions) {
     ASSERT_STR_EQ(reversed_out[0].file_b, out[0].file_b);
     ASSERT_STR_EQ(reversed_out[1].file_a, out[1].file_a);
     ASSERT_STR_EQ(reversed_out[1].file_b, out[1].file_b);
+    cbm_change_coupling_paths_free(reversed_out, result.written);
+    cbm_change_coupling_paths_free(out, 2);
 
     char long_a[CBM_SZ_1K];
     char long_b[CBM_SZ_1K];
@@ -2299,14 +2303,21 @@ TEST(githistory_coupling_ranks_bounded_output_and_reports_omissions) {
         {long_files, 2, 2},
         {long_files, 2, 3},
     };
+    cbm_change_coupling_t long_out = {0};
     result = cbm_compute_change_coupling_result(
-        long_commits, (int)(sizeof(long_commits) / sizeof(*long_commits)), &sentinel, 1, 0.0);
-    ASSERT_EQ(result.written, 0);
+        long_commits, (int)(sizeof(long_commits) / sizeof(*long_commits)), &long_out, 1, 0.0);
+    ASSERT_EQ(result.written, 1);
     ASSERT_EQ(result.eligible, 1);
-    ASSERT_EQ(result.omitted, 1);
-    ASSERT_EQ(result.path_too_long, 1);
+    ASSERT_EQ(result.omitted, 0);
+    ASSERT_EQ(result.path_too_long, 0);
     ASSERT_EQ(result.allocation_failed, 0);
-    ASSERT_EQ(sentinel.co_change_count, 777);
+    ASSERT_STR_EQ(long_out.file_a, long_a);
+    ASSERT_STR_EQ(long_out.file_b, long_b);
+    ASSERT_EQ(long_out.co_change_count, 3);
+    cbm_change_coupling_paths_free(&long_out, result.written);
+    ASSERT_TRUE(long_out.file_a == NULL);
+    ASSERT_TRUE(long_out.file_b == NULL);
+    cbm_change_coupling_paths_free(&long_out, result.written);
     PASS();
 }
 
@@ -2448,6 +2459,7 @@ TEST(githistory_limits_to_max) {
     ASSERT_TRUE(n <= 100);
 
     /* Cleanup */
+    cbm_change_coupling_paths_free(results, n);
     for (int i = 0; i < ncommits; i++) {
         free(commits[i].files);
     }
@@ -10517,6 +10529,7 @@ TEST(githistory_compute_change_coupling) {
             ASSERT(0); /* d.go should not appear */
         }
     }
+    cbm_change_coupling_paths_free(out, count);
     PASS();
 }
 
@@ -10566,6 +10579,7 @@ TEST(githistory_coupling_limits_output) {
     cbm_change_coupling_t out[200];
     int count = cbm_compute_change_coupling(commits, ci, out, 100);
     ASSERT(count <= 100);
+    cbm_change_coupling_paths_free(out, count);
     PASS();
 }
 
