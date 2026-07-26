@@ -958,7 +958,7 @@ test-compositional: $(BUILD_DIR)/test-runner
 		CBM_ONLY_TEST=incremental_frontier_full_fallback_failure_preserves_dirty_ledger \
 		$(BUILD_DIR)/test-runner
 	cd $(CURDIR) && CBM_ONLY_SUITE=input_validation \
-		CBM_ONLY_TEST=path_project_autoindex_honors_auto_dep_limit \
+		CBM_ONLY_TEST=path_project_autoindex_honors_dep_limit_and_refreshes_rank \
 		$(BUILD_DIR)/test-runner
 	cd $(CURDIR) && CBM_ONLY_SUITE=daemon_application \
 		CBM_ONLY_TEST=daemon_application_auto_index_honors_tracked_file_limit \

@@ -12,6 +12,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <mcp/mcp.h>
+#include <pagerank/pagerank.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <cli/cli.h>
 #include <depindex/depindex.h>
@@ -1622,7 +1624,7 @@ TEST(path_project_autoindex_deps_disabled_by_default) {
     PASS();
 }
 
-TEST(path_project_autoindex_honors_auto_dep_limit) {
+TEST(path_project_autoindex_honors_dep_limit_and_refreshes_rank) {
     char session_tmp[256];
     snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_depcap_sess_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
@@ -1656,6 +1658,7 @@ TEST(path_project_autoindex_honors_auto_dep_limit) {
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
     ASSERT_EQ(cbm_config_set(cfg, "auto_dep_limit", "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_AT_PUBLISH), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -1673,6 +1676,12 @@ TEST(path_project_autoindex_honors_auto_dep_limit) {
     bool dep_b = dep_resp && strstr(dep_resp, "path_dep_cap_b") != NULL;
     free(dep_resp);
 
+    char *target_project = cbm_project_name_from_path(target_tmp);
+    cbm_store_t *published_store = target_project ? cbm_store_open(target_project) : NULL;
+    bool rank_complete =
+        published_store && cbm_pagerank_views_complete(published_store, target_project);
+    cbm_store_close(published_store);
+
     cbm_mcp_server_free(srv);
     cbm_config_close(cfg);
     if (old_auto_index_copy) {
@@ -1681,6 +1690,7 @@ TEST(path_project_autoindex_honors_auto_dep_limit) {
     } else {
         cbm_unsetenv("CBM_AUTO_INDEX");
     }
+    free(target_project);
     th_cleanup(cfg_tmp);
     th_cleanup(target_tmp);
     th_cleanup(session_tmp);
@@ -1689,6 +1699,10 @@ TEST(path_project_autoindex_honors_auto_dep_limit) {
     /* auto_dep_limit=1 with two discovered vendored deps: exactly one must
      * be indexed. RED before the fix: neither is (deps never ran). */
     ASSERT_TRUE(dep_a != dep_b);
+    /* Sync auto-index owns the dependency pass after initial publication.
+     * Its at-publish contract must therefore leave all rank views complete,
+     * matching explicit and background publication. */
+    ASSERT_TRUE(rank_complete);
     PASS();
 }
 
@@ -1866,7 +1880,7 @@ void suite_input_validation(void) {
     RUN_TEST(path_project_autoindex_respects_file_limit);
     RUN_TEST(path_project_autoindex_indexes_dependencies);
     RUN_TEST(path_project_autoindex_deps_disabled_by_default);
-    RUN_TEST(path_project_autoindex_honors_auto_dep_limit);
+    RUN_TEST(path_project_autoindex_honors_dep_limit_and_refreshes_rank);
     RUN_TEST(dep_search_hint_names_index_dependencies_when_deps_disabled);
     RUN_TEST(regression_trace_path_tool_name_still_works);
     RUN_TEST(config_context_injection_disabled);
