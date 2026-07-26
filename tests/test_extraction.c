@@ -3002,6 +3002,37 @@ TEST(html_imports_basic) {
     PASS();
 }
 
+/* Every embedded script is semantic input; collection must not stop after an
+ * internal preview-sized prefix. */
+TEST(html_imports_retain_scripts_beyond_16_blocks) {
+    enum { SCRIPT_BLOCK_COUNT = 20 };
+    char source[CBM_SZ_4K];
+    size_t used = 0;
+    int n = snprintf(source, sizeof(source), "<html><body>\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source));
+    used = (size_t)n;
+    for (int i = 0; i < SCRIPT_BLOCK_COUNT; i++) {
+        n = snprintf(source + used, sizeof(source) - used,
+                     "<script>import item%02d from './module%02d.js';</script>\n", i, i);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, "</body></html>\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source) - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_HTML, "t", "many-scripts.html");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, SCRIPT_BLOCK_COUNT);
+    ASSERT(has_import(r, "module19.js"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * config_extraction_test.go ports (25 tests)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5685,6 +5716,7 @@ SUITE(extraction) {
     RUN_TEST(svelte_imports_no_script);
     RUN_TEST(vue_imports_basic);
     RUN_TEST(html_imports_basic);
+    RUN_TEST(html_imports_retain_scripts_beyond_16_blocks);
 
     /* config_extraction_test.go ports */
     RUN_TEST(toml_basic_table_and_pair);

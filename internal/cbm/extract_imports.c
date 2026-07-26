@@ -1387,38 +1387,96 @@ static void parse_spec_imports(CBMExtractCtx *ctx) {
 // that the main parser uses.  Adding another host language is a one-line
 // declaration in lang_specs.c.
 
-static void embedded_collect_content_nodes(TSNode root, const CBMEmbeddedLangSpec *spec,
-                                           TSNode *out, int *out_count, int max_out) {
-    /* Iterative DFS so deeply-nested script blocks are still found.  Cap the
-     * stack to a sane bound (host grammars do not have million-deep markup
-     * trees) — no need to introduce TSNodeStack here. */
-    enum { EMBED_STACK_CAP = 1024 };
-    TSNode stack[EMBED_STACK_CAP];
-    int top = 0;
-    stack[top++] = root;
-    while (top > 0 && *out_count < max_out) {
-        TSNode node = stack[--top];
-        const char *kind = ts_node_type(node);
-        if (strcmp(kind, spec->script_node_type) == 0) {
-            uint32_t cc = ts_node_child_count(node);
-            for (uint32_t k = 0; k < cc; k++) {
-                TSNode c = ts_node_child(node, k);
-                if (strcmp(ts_node_type(c), spec->content_node_type) == 0) {
-                    out[(*out_count)++] = c;
-                    if (*out_count >= max_out) {
-                        return;
+static bool parse_embedded_content(CBMExtractCtx *ctx, TSParser *parser, TSNode content) {
+    uint32_t start = ts_node_start_byte(content);
+    uint32_t end = ts_node_end_byte(content);
+    if (end <= start || end > (uint32_t)ctx->source_len) {
+        return true;
+    }
+    const char *sub_source = ctx->source + start;
+    uint32_t sub_length = end - start;
+    TSTree *sub_tree = ts_parser_parse_string(parser, NULL, sub_source, sub_length);
+    if (!sub_tree) {
+        return false;
+    }
+    CBMExtractCtx sub_ctx = *ctx;
+    sub_ctx.source = sub_source;
+    sub_ctx.source_len = (int)sub_length;
+    sub_ctx.root = ts_tree_root_node(sub_tree);
+    walk_es_imports(&sub_ctx, sub_ctx.root);
+    ts_tree_delete(sub_tree);
+    return true;
+}
+
+typedef enum {
+    EMBEDDED_WALK_OK = 0,
+    EMBEDDED_WALK_PARSER_ALLOCATION_FAILED,
+    EMBEDDED_WALK_PARSE_ALLOCATION_FAILED,
+} embedded_walk_status_t;
+
+/*
+ * Stream matching content nodes directly into one lazily-created embedded
+ * parser. The cursor visits the host AST in O(N) time with O(1) auxiliary
+ * memory, avoids both a fixed traversal frontier and a fixed script-result
+ * prefix, and preserves the allocation-free path for hosts without scripts.
+ */
+static embedded_walk_status_t walk_embedded_content_nodes(CBMExtractCtx *ctx,
+                                                          const CBMEmbeddedLangSpec *spec,
+                                                          const TSLanguage *embedded_lang) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSParser *parser = NULL;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool descend = true;
+        if (strcmp(ts_node_type(node), spec->script_node_type) == 0) {
+            uint32_t child_count = ts_node_child_count(node);
+            for (uint32_t i = 0; i < child_count; i++) {
+                TSNode child = ts_node_child(node, i);
+                if (strcmp(ts_node_type(child), spec->content_node_type) == 0) {
+                    if (!parser) {
+                        parser = ts_parser_new();
+                        if (!parser) {
+                            ts_tree_cursor_delete(&cursor);
+                            return EMBEDDED_WALK_PARSER_ALLOCATION_FAILED;
+                        }
+                        if (!ts_parser_set_language(parser, embedded_lang)) {
+                            ts_parser_delete(parser);
+                            ts_tree_cursor_delete(&cursor);
+                            return EMBEDDED_WALK_OK;
+                        }
+                    }
+                    if (!parse_embedded_content(ctx, parser, child)) {
+                        ts_parser_delete(parser);
+                        ts_tree_cursor_delete(&cursor);
+                        return EMBEDDED_WALK_PARSE_ALLOCATION_FAILED;
                     }
                     break; /* one content node per script element */
                 }
             }
-            /* Do not descend into <script>'s children — content already taken. */
+            descend = false; /* the matched raw content was parsed separately */
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor)) {
             continue;
         }
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - 1; i >= 0 && top < EMBED_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            continue;
+        }
+        bool found_sibling = false;
+        while (ts_tree_cursor_goto_parent(&cursor)) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                found_sibling = true;
+                break;
+            }
+        }
+        if (!found_sibling) {
+            break;
         }
     }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    ts_tree_cursor_delete(&cursor);
+    return EMBEDDED_WALK_OK;
 }
 
 static void parse_embedded_imports(CBMExtractCtx *ctx) {
@@ -1431,40 +1489,19 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
         if (!embedded_lang) {
             continue; /* embedded grammar not linked in — silently skip */
         }
-        enum { MAX_EMBEDDED_BLOCKS = 16 };
-        TSNode hits[MAX_EMBEDDED_BLOCKS];
-        int hit_count = 0;
-        embedded_collect_content_nodes(ctx->root, e, hits, &hit_count, MAX_EMBEDDED_BLOCKS);
-        if (hit_count == 0) {
-            continue;
+        embedded_walk_status_t status = walk_embedded_content_nodes(ctx, e, embedded_lang);
+        if (status == EMBEDDED_WALK_PARSER_ALLOCATION_FAILED) {
+            ctx->result->has_error = true;
+            ctx->result->error_msg =
+                cbm_arena_strdup(ctx->arena, "embedded import parser allocation failed");
+            return;
         }
-        TSParser *parser = ts_parser_new();
-        if (!parser) {
-            continue;
+        if (status == EMBEDDED_WALK_PARSE_ALLOCATION_FAILED) {
+            ctx->result->has_error = true;
+            ctx->result->error_msg =
+                cbm_arena_strdup(ctx->arena, "embedded import parse allocation failed");
+            return;
         }
-        if (!ts_parser_set_language(parser, embedded_lang)) {
-            ts_parser_delete(parser);
-            continue;
-        }
-        for (int i = 0; i < hit_count; i++) {
-            uint32_t s = ts_node_start_byte(hits[i]);
-            uint32_t end = ts_node_end_byte(hits[i]);
-            if (end <= s) {
-                continue;
-            }
-            const char *sub_src = ctx->source + s;
-            uint32_t sub_len = end - s;
-            TSTree *sub_tree = ts_parser_parse_string(parser, NULL, sub_src, sub_len);
-            if (!sub_tree) {
-                continue;
-            }
-            CBMExtractCtx sub_ctx = *ctx;
-            sub_ctx.source = sub_src;
-            sub_ctx.root = ts_tree_root_node(sub_tree);
-            walk_es_imports(&sub_ctx, sub_ctx.root);
-            ts_tree_delete(sub_tree);
-        }
-        ts_parser_delete(parser);
     }
 }
 
