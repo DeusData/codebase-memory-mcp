@@ -507,14 +507,52 @@ static void watcher_record_dirty_path(cbm_watcher_t *w, const project_state_t *s
  * untracked directories individually (a nested addition under `?? dir/`
  * would otherwise be invisible); -z gives unquoted NUL-separated paths that
  * hash identically across polls and stat cleanly. */
-static void watcher_ledger_free(char **paths, size_t count) {
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} watcher_ledger_paths_t;
+
+/* Geometric growth keeps collection amortized O(N) in the number of dirty
+ * paths and uses O(N + path bytes) memory. Failure is propagated by
+ * git_dirty_signature so a reindex cannot consume a change while publishing
+ * only a prefix of its freshness ledger. */
+static bool watcher_ledger_paths_append(watcher_ledger_paths_t *paths, const char *path) {
+    if (!paths || !path) {
+        return false;
+    }
+    if (paths->count >= paths->capacity) {
+        if (paths->capacity > SIZE_MAX / CBM_SZ_2) {
+            return false;
+        }
+        size_t next_capacity = paths->capacity ? paths->capacity * CBM_SZ_2 : CBM_SZ_64;
+        if (next_capacity > SIZE_MAX / sizeof(*paths->items)) {
+            return false;
+        }
+        char **grown = realloc(paths->items, next_capacity * sizeof(*paths->items));
+        if (!grown) {
+            return false;
+        }
+        paths->items = grown;
+        paths->capacity = next_capacity;
+    }
+    char *copy = cbm_strndup(path, strlen(path));
+    if (!copy) {
+        return false;
+    }
+    paths->items[paths->count++] = copy;
+    return true;
+}
+
+static void watcher_ledger_paths_destroy(watcher_ledger_paths_t *paths) {
     if (!paths) {
         return;
     }
-    for (size_t i = 0; i < count; i++) {
-        free(paths[i]);
+    for (size_t i = 0; i < paths->count; i++) {
+        free(paths->items[i]);
     }
-    free(paths);
+    free(paths->items);
+    *paths = (watcher_ledger_paths_t){0};
 }
 
 static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_t *state,
@@ -530,15 +568,8 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
      * which is the same waste #937's signature exists to avoid. */
     bool ledger = record_ledger && w && w->store &&
                   watcher_store_has_project(w->store, state->project_name);
-    enum { WATCHER_LEDGER_MAX_PATHS = 4096 };
-    char **ledger_paths = ledger ? calloc(WATCHER_LEDGER_MAX_PATHS, sizeof(*ledger_paths)) : NULL;
-    size_t ledger_cap = ledger_paths ? (size_t)WATCHER_LEDGER_MAX_PATHS : 0;
-    size_t ledger_count = 0;
-    if (ledger && !ledger_paths) {
-        ledger = false;
-        cbm_log_warn("watcher.dirty_ledger.warn", "project", state->project_name, "phase",
-                     "alloc");
-    }
+    watcher_ledger_paths_t ledger_paths = {0};
+    bool ledger_failed = false;
     const char *status_argv[] = {"git",    "--no-optional-locks", "-C",    state->root_path,
                                  "status", "--porcelain",         "-uall", "-z",
                                  NULL};
@@ -551,7 +582,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
     FILE *fp = cbm_fopen(output.path, "rb");
     if (!fp) {
         watcher_git_output_cleanup(&output);
-        watcher_ledger_free(ledger_paths, ledger_count);
+        watcher_ledger_paths_destroy(&ledger_paths);
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
 
@@ -588,11 +619,11 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
                     origin_token = true;
                 }
                 h = sig_fold_path_stat(h, state->root_path, entry + 3);
-                if (ledger && ledger_count < ledger_cap) {
-                    ledger_paths[ledger_count] = cbm_strndup(entry + 3, strlen(entry + 3));
-                    if (ledger_paths[ledger_count]) {
-                        ledger_count++;
-                    }
+                if (ledger && !watcher_ledger_paths_append(&ledger_paths, entry + 3)) {
+                    ledger = false;
+                    ledger_failed = true;
+                    cbm_log_warn("watcher.dirty_ledger.warn", "project", state->project_name,
+                                 "phase", "buffer_paths");
                 }
             }
         }
@@ -605,7 +636,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
     bool parsed = !ferror(fp) && fclose(fp) == 0;
     watcher_git_output_cleanup(&output);
     if (!parsed) {
-        watcher_ledger_free(ledger_paths, ledger_count);
+        watcher_ledger_paths_destroy(&ledger_paths);
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
 
@@ -632,7 +663,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
         fp = cbm_fopen(output.path, "rb");
         if (!fp) {
             watcher_git_output_cleanup(&output);
-            watcher_ledger_free(ledger_paths, ledger_count);
+            watcher_ledger_paths_destroy(&ledger_paths);
             return WATCHER_GIT_SUPERVISION_FAILED;
         }
         char line[CBM_SZ_4K];
@@ -654,25 +685,29 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
         parsed = !ferror(fp) && fclose(fp) == 0;
         watcher_git_output_cleanup(&output);
         if (!parsed) {
-            watcher_ledger_free(ledger_paths, ledger_count);
+            watcher_ledger_paths_destroy(&ledger_paths);
             return WATCHER_GIT_SUPERVISION_FAILED;
         }
     } else if (submodule_status != WATCHER_GIT_COMMAND_FAILED) {
-        watcher_ledger_free(ledger_paths, ledger_count);
+        watcher_ledger_paths_destroy(&ledger_paths);
         return submodule_status;
     }
 #endif
 
+    if (ledger_failed) {
+        watcher_ledger_paths_destroy(&ledger_paths);
+        return WATCHER_GIT_SUPERVISION_FAILED;
+    }
     *signature_out = any ? (h ? h : 1) : 0; /* reserve 0 for "clean" */
     /* Flush only on a CHANGED signature: an idle poll over a persistently
      * dirty tree must not rewrite the same rows. Recorded before the index
      * callback runs, so the ledger survives a failed index. */
     if (ledger && *signature_out != state->last_dirty_sig) {
-        for (size_t i = 0; i < ledger_count; i++) {
-            watcher_record_dirty_path(w, state, ledger_paths[i]);
+        for (size_t i = 0; i < ledger_paths.count; i++) {
+            watcher_record_dirty_path(w, state, ledger_paths.items[i]);
         }
     }
-    watcher_ledger_free(ledger_paths, ledger_count);
+    watcher_ledger_paths_destroy(&ledger_paths);
     return WATCHER_GIT_OK;
 }
 
