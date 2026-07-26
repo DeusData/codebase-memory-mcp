@@ -69,6 +69,14 @@ static double pipeline_unit_threshold(double threshold) {
  * Atomic spinlock: 0 = free, 1 = locked. */
 static atomic_int g_pipeline_busy = 0;
 
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+static atomic_int g_pipeline_lock_waiters_for_testing = 0;
+
+int cbm_pipeline_lock_waiter_count_for_testing(void) {
+    return atomic_load(&g_pipeline_lock_waiters_for_testing);
+}
+#endif
+
 bool cbm_pipeline_try_lock(void) {
     return atomic_exchange(&g_pipeline_busy, 1) == 0;
 }
@@ -77,8 +85,7 @@ bool cbm_pipeline_try_lock(void) {
  * interval, not a user-visible timeout; keep it named and derived from the
  * shared time-unit constants so the latency tradeoff is easy to audit. */
 #define CBM_PIPELINE_LOCK_RETRY_MS 100L
-#define CBM_PIPELINE_LOCK_RETRY_NS \
-    (CBM_PIPELINE_LOCK_RETRY_MS * (long)CBM_NSEC_PER_MSEC)
+#define CBM_PIPELINE_LOCK_RETRY_NS (CBM_PIPELINE_LOCK_RETRY_MS * (long)CBM_NSEC_PER_MSEC)
 
 typedef enum {
     CBM_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY = 0,
@@ -97,11 +104,49 @@ typedef enum {
     CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
 } cbm_incremental_derived_results_refresh_policy_t;
 
-void cbm_pipeline_lock(void) {
-    while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
+bool cbm_pipeline_lock_cancellable(const atomic_int *cancelled) {
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+    bool waiter_counted = false;
+#endif
+    for (;;) {
+        if (cancelled && atomic_load_explicit(cancelled, memory_order_acquire) != 0) {
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+            if (waiter_counted) {
+                atomic_fetch_sub(&g_pipeline_lock_waiters_for_testing, 1);
+            }
+#endif
+            return false;
+        }
+        if (atomic_exchange(&g_pipeline_busy, 1) == 0) {
+            if (cancelled && atomic_load_explicit(cancelled, memory_order_acquire) != 0) {
+                atomic_store(&g_pipeline_busy, 0);
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+                if (waiter_counted) {
+                    atomic_fetch_sub(&g_pipeline_lock_waiters_for_testing, 1);
+                }
+#endif
+                return false;
+            }
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+            if (waiter_counted) {
+                atomic_fetch_sub(&g_pipeline_lock_waiters_for_testing, 1);
+            }
+#endif
+            return true;
+        }
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+        if (!waiter_counted) {
+            atomic_fetch_add(&g_pipeline_lock_waiters_for_testing, 1);
+            waiter_counted = true;
+        }
+#endif
         struct timespec ts = {0, CBM_PIPELINE_LOCK_RETRY_NS};
         cbm_nanosleep(&ts, NULL);
     }
+}
+
+void cbm_pipeline_lock(void) {
+    (void)cbm_pipeline_lock_cancellable(NULL);
 }
 
 void cbm_pipeline_unlock(void) {

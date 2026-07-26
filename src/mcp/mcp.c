@@ -12824,7 +12824,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * Track active pipeline so signal handler and notifications/cancelled
      * can cancel it mid-run. */
     CBM_PROF_START(prof_index_locked_run);
-    cbm_pipeline_lock();
+    if (!cbm_pipeline_lock_cancellable(&srv->pipeline_cancel_requested)) {
+        cbm_pipeline_free(p);
+        mcp_project_mutation_end(srv, mutation_project);
+        free(mutation_project);
+        free(project_name);
+        free(repo_path);
+        CBM_PROF_END("index_repository", "pipeline_locked_run", prof_index_locked_run);
+        CBM_PROF_END("index_repository", "TOTAL", prof_index_total);
+        return cbm_mcp_text_result("index operation cancelled for this request", true);
+    }
     cbm_pipeline_bind_cancel_flag(p, &srv->pipeline_cancel_requested);
     cbm_mutex_lock(&srv->active_request_lock);
     srv->active_pipeline = p;
