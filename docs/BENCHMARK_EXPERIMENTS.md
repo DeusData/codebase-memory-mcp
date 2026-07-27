@@ -324,12 +324,18 @@ The coordinator is intentionally smaller than the benchmark engine:
 8. On a candidate-build failure, it exports the work volume's build logs to
    `container-failures/<source-commit>/build-logs/`. If Docker cannot export them,
    the returned error names the retained volume and in-volume path for inspection.
-9. It removes every transient coordinator and measured container in a `finally`
+9. It derives a 24-hexadecimal run key from the exact source revision, Git bundle,
+   effective matrix, resource budget, and measurement arguments. Each cohort runs
+   under `runsets/<run-key>/`; `--audit-only` deliberately retains the same key.
+   Valid older cohorts therefore remain reloadable without being confused with
+   genuinely unplanned cell directories in the current cohort.
+10. It removes every transient coordinator and measured container in a `finally`
    path. The two labeled volumes remain for resume and their exact names are printed.
 
 The experiment root is the human-selected history name; content-addressed source
-specs, resolved specs, plans, cells, reports, environment snapshots, binary hashes,
-and the container environment manifest remain the audit identities beneath it.
+specs, resolved specs, plans, cells, reports, environment snapshots, and binary
+hashes remain under `runsets/<run-key>/`; container environment manifests remain
+under the history's `manifests/` directory.
 Rerunning the same source spec and root resumes completed cells. A failed candidate
 still exports partial immutable evidence before the coordinator returns an error.
 

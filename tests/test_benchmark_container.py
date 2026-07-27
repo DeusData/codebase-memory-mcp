@@ -199,6 +199,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
                 "--product-env",
                 "CBM_WORKERS=4",
             ],
+            experiment_root="/results/runsets/abc123",
             uid=501,
             gid=20,
         )
@@ -209,6 +210,42 @@ class BenchmarkContainerContractTest(unittest.TestCase):
         self.assertIn("CBM_WORKERS=4", command)
         self.assertNotIn("type=bind", " ".join(command))
         self.assertNotIn("/Users/", " ".join(command))
+        self.assertIn("/results/runsets/abc123", command)
+
+    def test_run_key_is_stable_for_audit_only_and_separates_measurement_inputs(
+        self,
+    ) -> None:
+        common = {
+            "source_revision": "a" * 40,
+            "bundle_sha256": "b" * 64,
+            "matrix_spec_sha256": "c" * 64,
+            "resources": {"cpus": 4.0, "memory": "8g", "workers": 4},
+            "runner_arguments": ["--matrix-spec", "/benchmark/matrix.json"],
+        }
+        measured = CONTAINER.container_run_key(**common)
+        audited = CONTAINER.container_run_key(
+            **{
+                **common,
+                "runner_arguments": [*common["runner_arguments"], "--audit-only"],
+            }
+        )
+        self.assertEqual(measured, audited)
+        for field, value in (
+            ("source_revision", "d" * 40),
+            ("bundle_sha256", "e" * 64),
+            ("matrix_spec_sha256", "f" * 64),
+            ("resources", {"cpus": 8.0, "memory": "8g", "workers": 4}),
+            (
+                "runner_arguments",
+                [*common["runner_arguments"], "--stale-lock-hours", "12"],
+            ),
+        ):
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    measured,
+                    CONTAINER.container_run_key(**{**common, field: value}),
+                )
+        self.assertRegex(measured, r"^[0-9a-f]{24}$")
 
     def test_export_merge_is_idempotent_and_rejects_changed_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

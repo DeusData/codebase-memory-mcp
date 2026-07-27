@@ -100,6 +100,31 @@ def failure_log_export_root(experiment_root: Path, source_revision: str) -> Path
     return experiment_root / "container-failures" / source_revision[:12] / "build-logs"
 
 
+def container_run_key(
+    *,
+    source_revision: str,
+    bundle_sha256: str,
+    matrix_spec_sha256: str | None,
+    resources: dict[str, Any],
+    runner_arguments: list[str],
+) -> str:
+    """Identify one resumable measurement cohort inside a named history."""
+    identity = {
+        "source_revision": source_revision,
+        "bundle_sha256": bundle_sha256,
+        "matrix_spec_sha256": matrix_spec_sha256,
+        "resources": resources,
+        # Audit-only changes execution, not the measured plan or environment.
+        "runner_arguments": [
+            argument for argument in runner_arguments if argument != "--audit-only"
+        ],
+    }
+    payload = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
 def native_linux_platform(machine: str) -> str:
     normalized = machine.strip().lower()
     if normalized in {"arm64", "aarch64"}:
@@ -195,6 +220,7 @@ def build_measured_command(
     source_revision: str,
     bundle_name: str,
     runner_arguments: list[str],
+    experiment_root: str,
     uid: int | None,
     gid: int | None,
 ) -> list[str]:
@@ -233,7 +259,7 @@ def build_measured_command(
             source_key,
             *runner_arguments,
             "--experiment-root",
-            "/results",
+            experiment_root,
             "--candidate-root",
             "/benchmark/candidates",
         )
@@ -645,6 +671,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"CBM_WORKERS={args.resources['workers']}",
                 ]
             runner_arguments.extend(args.runner_arguments)
+            run_key = container_run_key(
+                source_revision=source_revision,
+                bundle_sha256=bundle_sha,
+                matrix_spec_sha256=effective_matrix_sha,
+                resources=args.resources,
+                runner_arguments=runner_arguments,
+            )
+            container_experiment_root = f"/results/runsets/{run_key}"
 
             manifest = {
                 "schema_version": 1,
@@ -676,6 +710,8 @@ def main(argv: list[str] | None = None) -> int:
                 "results_volume": results_volume,
                 "volumes_retained_for_resume": True,
                 "runner_arguments": runner_arguments,
+                "run_key": run_key,
+                "container_experiment_root": container_experiment_root,
             }
             manifest_path = write_container_manifest(
                 input_root,
@@ -725,6 +761,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_revision=source_revision,
                 bundle_name=bundle_name,
                 runner_arguments=runner_arguments,
+                experiment_root=container_experiment_root,
                 uid=uid,
                 gid=gid,
             )
