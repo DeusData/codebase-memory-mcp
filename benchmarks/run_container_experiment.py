@@ -25,6 +25,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "test-infrastructure" / "Dockerfile"
+DEFAULT_BUILD_ENVIRONMENT = {
+    "CC": "clang-18",
+    "CXX": "clang++-18",
+}
 OWNED_RUNNER_FLAGS = frozenset(
     {
         "--candidate-root",
@@ -224,6 +228,23 @@ def materialize_container_matrix_spec(
         **product_environment,
         "CBM_WORKERS": expected_workers,
     }
+    build_environment = document.get("build_environment", {})
+    if not isinstance(build_environment, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in build_environment.items()
+    ):
+        raise ValueError("matrix spec build_environment must be string-to-string")
+    declared_compilers = {
+        key for key in DEFAULT_BUILD_ENVIRONMENT if key in build_environment
+    }
+    if declared_compilers and declared_compilers != set(DEFAULT_BUILD_ENVIRONMENT):
+        raise ValueError(
+            "container matrix specs must declare CC and CXX together"
+        )
+    document["build_environment"] = {
+        **DEFAULT_BUILD_ENVIRONMENT,
+        **build_environment,
+    }
     payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
     destination.write_bytes(payload)
     return hashlib.sha256(payload).hexdigest()
@@ -267,6 +288,8 @@ def build_measured_command(
     ]
     if uid is not None and gid is not None:
         command.extend(("--user", f"{uid}:{gid}"))
+    for key, value in DEFAULT_BUILD_ENVIRONMENT.items():
+        command.extend(("--env", f"{key}={value}"))
     source_key = repository_snapshot_sha256[:20]
     command.extend(
         (
@@ -730,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "platform": args.platform,
                 "resources": args.resources,
+                "default_build_environment": DEFAULT_BUILD_ENVIRONMENT,
                 "work_volume": work_volume,
                 "results_volume": results_volume,
                 "volumes_retained_for_resume": True,
