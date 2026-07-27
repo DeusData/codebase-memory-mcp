@@ -4473,6 +4473,48 @@ static void mcp_index_recovery_action(cbm_mcp_server_t *srv, char *out, size_t o
     }
 }
 
+/* Explain stale-rank recovery from the effective configured policy. Keep this
+ * shared by automatic first-response context, tools, and resources so every
+ * delivery route names the same knob without claiming that at_publish permits
+ * deferral. Invalid raw configuration is fail-safe at publish time; surface it
+ * explicitly so users can repair the persisted value. */
+static void mcp_rank_refresh_recovery_action(cbm_mcp_server_t *srv, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    const char *configured =
+        srv && srv->config
+            ? cbm_config_get(srv->config, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFAULT)
+            : CBM_RANK_REFRESH_DEFAULT;
+    char policy[CBM_SZ_128];
+    snprintf(policy, sizeof(policy), "%s",
+             configured && configured[0] ? configured : CBM_RANK_REFRESH_DEFAULT);
+
+    char index_action[CBM_SZ_512];
+    mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+    bool defers = strcmp(policy, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES) == 0 ||
+                  strcmp(policy, CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES) == 0;
+    if (defers) {
+        snprintf(
+            out, out_size,
+            "%s=%s permits deferred rank refresh after some incremental publications. %s "
+            "To refresh at every future publication, run codebase-memory-mcp config set %s %s.",
+            CBM_CONFIG_RANK_REFRESH, policy, index_action, CBM_CONFIG_RANK_REFRESH,
+            CBM_RANK_REFRESH_AT_PUBLISH);
+    } else if (strcmp(policy, CBM_RANK_REFRESH_AT_PUBLISH) == 0) {
+        snprintf(out, out_size,
+                 "%s=%s requires rank refresh during publication, but PageRank is stale. %s "
+                 "If PageRank remains stale, inspect indexing diagnostics.",
+                 CBM_CONFIG_RANK_REFRESH, policy, index_action);
+    } else {
+        snprintf(out, out_size,
+                 "%s=%s is invalid and falls back to %s. Run codebase-memory-mcp config set %s %s, "
+                 "then %s",
+                 CBM_CONFIG_RANK_REFRESH, policy, CBM_RANK_REFRESH_AT_PUBLISH,
+                 CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_AT_PUBLISH, index_action);
+    }
+}
+
 static void mcp_index_recovery_hint(cbm_mcp_server_t *srv, char *out, size_t out_size) {
     if (!out || out_size == 0) {
         return;
@@ -4943,18 +4985,12 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                  index_action);
         yyjson_mut_obj_add_strcpy(doc, architecture, "action", rank_action);
     } else if (pagerank_stale) {
-        mcp_index_recovery_action(srv, index_action, sizeof(index_action));
         yyjson_mut_obj_add_str(doc, architecture, "status", "stale");
         yyjson_mut_obj_add_str(
             doc, architecture, "detail",
             "PageRank is stale; key_functions and rank values were omitted rather than returning "
             "misleading architecture.");
-        snprintf(
-            rank_action, sizeof(rank_action),
-            "%s=%s permits deferred rank refresh after some incremental publications. %s "
-            "To refresh at every future publication, run codebase-memory-mcp config set %s %s.",
-            CBM_CONFIG_RANK_REFRESH, rank_refresh, index_action, CBM_CONFIG_RANK_REFRESH,
-            CBM_RANK_REFRESH_AT_PUBLISH);
+        mcp_rank_refresh_recovery_action(srv, rank_action, sizeof(rank_action));
         yyjson_mut_obj_add_strcpy(doc, architecture, "action", rank_action);
         add_stale_derived_view_warning(doc, ctx, CBM_STORE_DERIVED_VIEW_PAGERANK,
                                        "pagerank derived view is stale; key_functions and stale "
@@ -9719,12 +9755,9 @@ static void arch_node_qn(cbm_store_t *store, int64_t id, char *out, size_t outsz
     free_node_contents(&n);
 }
 
-static bool add_architecture_response_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                             cbm_mcp_server_t *srv, cbm_store_t *store,
-                                             const char *project, bool active_languages_requested,
-                                             bool active_entry_points_requested,
-                                             bool active_routes_requested,
-                                             bool active_file_tree_requested) {
+static bool add_architecture_derived_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            cbm_mcp_server_t *srv, cbm_store_t *store,
+                                            const char *project) {
     bool architecture_stale = project && cbm_store_derived_view_is_stale(
                                              store, project, CBM_STORE_DERIVED_VIEW_ARCHITECTURE);
     bool routes_stale =
@@ -9746,13 +9779,27 @@ static bool add_architecture_response_status(yyjson_mut_doc *doc, yyjson_mut_val
             "pagerank derived view is stale; key_functions were omitted.");
     }
     if (architecture_stale || routes_stale || pagerank_stale) {
-        char index_action[CBM_SZ_512];
         char action[CBM_SZ_1K];
-        mcp_index_recovery_action(srv, index_action, sizeof(index_action));
-        snprintf(action, sizeof(action), "Refresh the stale architecture data: %s", index_action);
+        if (pagerank_stale) {
+            mcp_rank_refresh_recovery_action(srv, action, sizeof(action));
+        } else {
+            char index_action[CBM_SZ_512];
+            mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+            snprintf(action, sizeof(action), "Refresh the stale architecture data: %s",
+                     index_action);
+        }
         yyjson_mut_obj_add_strcpy(doc, root, "action_required", action);
     }
+    return pagerank_stale;
+}
 
+static bool add_architecture_response_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                             cbm_mcp_server_t *srv, cbm_store_t *store,
+                                             const char *project, bool active_languages_requested,
+                                             bool active_entry_points_requested,
+                                             bool active_routes_requested,
+                                             bool active_file_tree_requested) {
+    bool pagerank_stale = add_architecture_derived_status(doc, root, srv, store, project);
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     bool active_architecture_reported = add_overlay_active_architecture_freshness(
@@ -17784,6 +17831,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
     int edges = cbm_store_count_edges(store, proj);
     yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
+    bool pagerank_stale = add_architecture_derived_status(doc, root, srv, store, proj);
 
     const char *resource_aspects[] = {"languages", "entry_points", "routes"};
     cbm_architecture_info_t arch = {0};
@@ -17833,7 +17881,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
 
     /* Key functions by PageRank, with config-driven count and exclude patterns. */
     struct sqlite3 *db = cbm_store_get_db(store);
-    if (db && proj) {
+    if (db && proj && !pagerank_stale) {
         const char *excl_csv = srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
             : "";
@@ -17901,10 +17949,11 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
     if (!add_project_status_summary(doc, root, srv, store, proj)) {
         return;
     }
+    bool pagerank_stale = add_architecture_derived_status(doc, root, srv, store, proj);
 
     /* PageRank stats */
     struct sqlite3 *db = cbm_store_get_db(store);
-    if (db && proj) {
+    if (db && proj && !pagerank_stale) {
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(db,
                 "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
