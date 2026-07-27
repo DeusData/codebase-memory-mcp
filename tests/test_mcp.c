@@ -7594,6 +7594,44 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+TEST(search_code_preserves_valid_utf8_source) {
+    static const char expected[] = "caf\xC3\xA9 \xE2\x80\x94 \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E";
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char src_path[512];
+    int n = snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(src_path));
+    ASSERT_EQ(th_write_file(src_path, "package main\n"
+                                      "\n"
+                                      "func HandleRequest() error {\n"
+                                      "\t// localized caf\xC3\xA9 \xE2\x80\x94 "
+                                      "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\n"
+                                      "\treturn nil\n"
+                                      "}\n"),
+              0);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"localized\",\"project\":\"test-project\","
+                                     "\"mode\":\"full\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    yyjson_doc *inner_doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(inner_doc);
+    yyjson_doc_free(inner_doc);
+    ASSERT_NOT_NULL(strstr(inner, expected));
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(search_code_reports_resolved_project_for_empty_json_and_toon_results) {
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -16646,6 +16684,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_preserves_valid_utf8_source);
     RUN_TEST(search_code_reports_resolved_project_for_empty_json_and_toon_results);
     RUN_TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches);
     RUN_TEST(search_code_uses_overlay_active_nodes_for_graph_annotations);

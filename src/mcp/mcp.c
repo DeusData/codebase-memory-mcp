@@ -13640,13 +13640,56 @@ static bool utf8_is_cont(unsigned char c) {
     return (c & 0xC0) == 0x80;
 }
 
-static char *sanitize_utf8_lossy(const char *s) {
+static size_t utf8_sequence_length(const unsigned char *p, size_t remaining) {
     enum {
-        UTF8_REPLACEMENT_LEN = 3,
+        UTF8_TWO_BYTE_LEN = 2,
         UTF8_THREE_BYTE_LEN = 3,
         UTF8_FOUR_BYTE_LEN = 4,
         UTF8_FOURTH_BYTE = 3,
     };
+    if (!p || remaining == 0) {
+        return 0;
+    }
+    unsigned char c = *p;
+    if (c < 0x80) {
+        return 1;
+    }
+    if (c >= 0xC2 && c <= 0xDF && remaining >= UTF8_TWO_BYTE_LEN && utf8_is_cont(p[SKIP_ONE])) {
+        return UTF8_TWO_BYTE_LEN;
+    }
+    if (c == 0xE0 && remaining >= UTF8_THREE_BYTE_LEN && p[SKIP_ONE] >= 0xA0 &&
+        p[SKIP_ONE] <= 0xBF && utf8_is_cont(p[PAIR_LEN])) {
+        return UTF8_THREE_BYTE_LEN;
+    }
+    if (c >= 0xE1 && c <= 0xEC && remaining >= UTF8_THREE_BYTE_LEN && utf8_is_cont(p[SKIP_ONE]) &&
+        utf8_is_cont(p[PAIR_LEN])) {
+        return UTF8_THREE_BYTE_LEN;
+    }
+    if (c == 0xED && remaining >= UTF8_THREE_BYTE_LEN && p[SKIP_ONE] >= 0x80 &&
+        p[SKIP_ONE] <= 0x9F && utf8_is_cont(p[PAIR_LEN])) {
+        return UTF8_THREE_BYTE_LEN;
+    }
+    if (c >= 0xEE && c <= 0xEF && remaining >= UTF8_THREE_BYTE_LEN && utf8_is_cont(p[SKIP_ONE]) &&
+        utf8_is_cont(p[PAIR_LEN])) {
+        return UTF8_THREE_BYTE_LEN;
+    }
+    if (c == 0xF0 && remaining >= UTF8_FOUR_BYTE_LEN && p[SKIP_ONE] >= 0x90 &&
+        p[SKIP_ONE] <= 0xBF && utf8_is_cont(p[PAIR_LEN]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+        return UTF8_FOUR_BYTE_LEN;
+    }
+    if (c >= 0xF1 && c <= 0xF3 && remaining >= UTF8_FOUR_BYTE_LEN && utf8_is_cont(p[SKIP_ONE]) &&
+        utf8_is_cont(p[PAIR_LEN]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+        return UTF8_FOUR_BYTE_LEN;
+    }
+    if (c == 0xF4 && remaining >= UTF8_FOUR_BYTE_LEN && p[SKIP_ONE] >= 0x80 &&
+        p[SKIP_ONE] <= 0x8F && utf8_is_cont(p[PAIR_LEN]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
+        return UTF8_FOUR_BYTE_LEN;
+    }
+    return 0;
+}
+
+static char *sanitize_utf8_lossy(const char *s) {
+    enum { UTF8_REPLACEMENT_LEN = 3 };
     if (!s) {
         return NULL;
     }
@@ -13663,32 +13706,7 @@ static char *sanitize_utf8_lossy(const char *s) {
     const unsigned char *end = p + len;
     unsigned char *dst = (unsigned char *)out;
     while (p < end) {
-        unsigned char c = *p;
-        size_t n = 0;
-        if (c < 0x80) {
-            n = 1;
-        } else if (c >= 0xC2 && c <= 0xDF && p + 1 < end && utf8_is_cont(p[1])) {
-            n = 2;
-        } else if (c == 0xE0 && p + 2 < end && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_cont(p[2])) {
-            n = UTF8_THREE_BYTE_LEN;
-        } else if (c >= 0xE1 && c <= 0xEC && p + 2 < end && utf8_is_cont(p[1]) &&
-                   utf8_is_cont(p[2])) {
-            n = UTF8_THREE_BYTE_LEN;
-        } else if (c == 0xED && p + 2 < end && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_cont(p[2])) {
-            n = UTF8_THREE_BYTE_LEN;
-        } else if (c >= 0xEE && c <= 0xEF && p + 2 < end && utf8_is_cont(p[1]) &&
-                   utf8_is_cont(p[2])) {
-            n = UTF8_THREE_BYTE_LEN;
-        } else if (c == 0xF0 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x90 && p[1] <= 0xBF &&
-                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
-            n = UTF8_FOUR_BYTE_LEN;
-        } else if (c >= 0xF1 && c <= 0xF3 && p + UTF8_FOURTH_BYTE < end && utf8_is_cont(p[1]) &&
-                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
-            n = UTF8_FOUR_BYTE_LEN;
-        } else if (c == 0xF4 && p + UTF8_FOURTH_BYTE < end && p[1] >= 0x80 && p[1] <= 0x8F &&
-                   utf8_is_cont(p[2]) && utf8_is_cont(p[UTF8_FOURTH_BYTE])) {
-            n = UTF8_FOUR_BYTE_LEN;
-        }
+        size_t n = utf8_sequence_length(p, (size_t)(end - p));
 
         if (n > 0) {
             memcpy(dst, p, n);
@@ -14222,12 +14240,22 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── search_code v2: graph-augmented code search ─────────────── */
 
-/* Strip non-ASCII bytes to guarantee valid UTF-8 JSON output */
-enum { ASCII_MAX = 127 };
-static void sanitize_ascii(char *s) {
-    for (unsigned char *p = (unsigned char *)s; *p; p++) {
-        if (*p > ASCII_MAX) {
-            *p = '?';
+/* Preserve valid UTF-8 in place and replace each malformed byte with ASCII
+ * '?'. This stays O(n) with O(1) auxiliary memory on search_code's hot output
+ * path; the snippet API uses sanitize_utf8_lossy when U+FFFD expansion is
+ * required. */
+static void sanitize_utf8_inplace(char *s) {
+    if (!s) {
+        return;
+    }
+    unsigned char *p = (unsigned char *)s;
+    unsigned char *end = p + strlen(s);
+    while (p < end) {
+        size_t n = utf8_sequence_length(p, (size_t)(end - p));
+        if (n > 0) {
+            p += n;
+        } else {
+            *p++ = '?';
         }
     }
 }
@@ -14459,7 +14487,7 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
         }
         char *source = read_file_lines(abs_path, s, e);
         if (source) {
-            sanitize_ascii(source);
+            sanitize_utf8_inplace(source);
             yyjson_mut_obj_add_strcpy(doc, item, "source", source);
             free(source);
             if (truncated) {
@@ -14475,7 +14503,7 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
         }
         char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
         if (ctx) {
-            sanitize_ascii(ctx);
+            sanitize_utf8_inplace(ctx);
             yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
             yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
             free(ctx);
@@ -14747,7 +14775,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
 
     char *json = yy_doc_to_str(doc);
     if (json) {
-        sanitize_ascii(json);
+        sanitize_utf8_inplace(json);
     }
     yyjson_mut_doc_free(doc);
 
@@ -14819,7 +14847,7 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
         snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
         gm[gm_count].line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
         snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", sep2 + SKIP_ONE);
-        sanitize_ascii(gm[gm_count].content);
+        sanitize_utf8_inplace(gm[gm_count].content);
         gm_count++;
     }
 
