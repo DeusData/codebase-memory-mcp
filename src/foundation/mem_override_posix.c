@@ -25,7 +25,7 @@
 #include <mimalloc.h>
 #include <stddef.h>
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__FreeBSD__)
 
 void *__wrap_malloc(size_t size) {
     void *block = mi_malloc(size);
@@ -66,4 +66,4 @@ char *__wrap_strdup(const char *text) {
     return copy;
 }
 
-#endif /* __linux__ */
+#endif /* __linux__ || __FreeBSD__ */
