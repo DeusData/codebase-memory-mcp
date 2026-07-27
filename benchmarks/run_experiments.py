@@ -336,39 +336,40 @@ def _registered_candidate_worktrees(
     return sorted(matches)
 
 
+def _make_probe(worktree: Path, target: str, recipe: str) -> str:
+    definition = f"{target}:\n\t@{recipe}\n"
+    process = subprocess.run(
+        ["make", "-s", "-f", "Makefile.cbm", "-f", "-", target],
+        cwd=worktree,
+        input=definition,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.strip() or process.stdout.strip())
+    return process.stdout.strip()
+
+
 def _compiler_identity(worktree: Path) -> str:
     try:
-        return _run_text(["cc", "--version"], cwd=worktree).splitlines()[0]
+        return _make_probe(
+            worktree, "cbm-print-compiler-identity", "$(CC) --version"
+        ).splitlines()[0]
     except (OSError, RuntimeError, IndexError):
         return "unknown (see datetime-named build log)"
 
 
 def _production_cflags(worktree: Path) -> str:
     """Read the candidate Makefile's canonical production flags without duplicating them."""
-    target = "cbm-print-production-flags"
-    definition = f"{target}:\n\t@printf '%s\\n' '$(CFLAGS_PROD)'\n"
     try:
-        process = subprocess.run(
-            [
-                "make",
-                "-s",
-                "-f",
-                "Makefile.cbm",
-                "-f",
-                "-",
-                target,
-            ],
-            cwd=worktree,
-            input=definition,
-            capture_output=True,
-            text=True,
-            check=False,
+        value = _make_probe(
+            worktree,
+            "cbm-print-production-flags",
+            "printf '%s\\n' '$(CFLAGS_PROD)'",
         )
-    except OSError:
+    except (OSError, RuntimeError):
         return "unknown (see candidate Makefile.cbm and build log)"
-    if process.returncode != 0:
-        return "unknown (see candidate Makefile.cbm and build log)"
-    value = process.stdout.strip()
     return value or "not declared by candidate Makefile.cbm"
 
 
