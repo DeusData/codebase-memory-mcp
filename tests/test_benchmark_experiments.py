@@ -538,9 +538,16 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 "#!/bin/sh\nprintf 'fixture compiler 1.0\\n'\n", encoding="utf-8"
             )
             fixture_compiler.chmod(0o755)
+            alternate_compiler = repo / "alternate-cc"
+            alternate_compiler.write_text(
+                "#!/bin/sh\nprintf 'alternate compiler 2.0\\n'\n", encoding="utf-8"
+            )
+            alternate_compiler.chmod(0o755)
             (repo / "Makefile.cbm").write_text(
                 "CC = ./fixture-cc\n"
-                "CFLAGS_PROD = -O3 -DFIXTURE_PRODUCTION=1\n"
+                "CXX = ./fixture-cc\n"
+                "CFLAGS_PROD = -O3 -DFIXTURE_PRODUCTION=1 $(EXTRA_CFLAGS)\n"
+                "CXXFLAGS_PROD = -O2 -DFIXTURE_CXX=1 $(EXTRA_CXXFLAGS)\n"
                 "clean-c:\n\t$(RM) -r build/c\n"
                 "cbm:\n\tmkdir -p build/c\n\tcp candidate.sh build/c/codebase-memory-mcp\n"
                 "\ttest ! -e build/c/stale-object\n"
@@ -576,6 +583,8 @@ class BenchmarkExperimentTest(unittest.TestCase):
             self.assertEqual(second["binary"], first["binary"])
             self.assertEqual(second["build"]["compiler"], "fixture compiler 1.0")
             self.assertEqual(second["build"]["cflags"], "-O3 -DFIXTURE_PRODUCTION=1")
+            self.assertEqual(second["build"]["cxx_compiler"], "fixture compiler 1.0")
+            self.assertEqual(second["build"]["cxxflags"], "-O2 -DFIXTURE_CXX=1")
             self.assertTrue(Path(first["binary"]).is_file())
             self.assertEqual(
                 sorted((candidate_root / "build-logs").glob("*.log")),
@@ -601,6 +610,41 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 text=True,
             ).stdout
             self.assertEqual(worktrees.count(expected_revision), 2)
+
+            with_flags = EXPERIMENT.materialize_candidate(
+                repo,
+                candidate_root,
+                "stable-candidate",
+                "stable",
+                jobs=1,
+                build_environment={
+                    "CC": "./alternate-cc",
+                    "CXX": "./alternate-cc",
+                    "EXTRA_CFLAGS": "-Wno-error=maybe-uninitialized",
+                    "EXTRA_CXXFLAGS": "-DFIXTURE_CXX_ABLATION=1",
+                },
+            )
+            self.assertEqual(with_flags["build"]["compiler"], "alternate compiler 2.0")
+            self.assertEqual(
+                with_flags["build"]["cxx_compiler"], "alternate compiler 2.0"
+            )
+            self.assertEqual(
+                with_flags["build"]["cflags"],
+                "-O3 -DFIXTURE_PRODUCTION=1 -Wno-error=maybe-uninitialized",
+            )
+            self.assertEqual(
+                with_flags["build"]["cxxflags"],
+                "-O2 -DFIXTURE_CXX=1 -DFIXTURE_CXX_ABLATION=1",
+            )
+            self.assertEqual(
+                with_flags["build"]["environment"],
+                {
+                    "CC": "./alternate-cc",
+                    "CXX": "./alternate-cc",
+                    "EXTRA_CFLAGS": "-Wno-error=maybe-uninitialized",
+                    "EXTRA_CXXFLAGS": "-DFIXTURE_CXX_ABLATION=1",
+                },
+            )
 
     def test_clean_tree_check_rejects_tracked_edits_but_allows_untracked_artifacts(
         self,
@@ -994,6 +1038,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
     ) -> None:
         source = {
             "schema_version": 1,
+            "build_environment": {"EXTRA_CFLAGS": "-Wno-error=maybe-uninitialized"},
             "candidates": [
                 {
                     "label": "new-design",
@@ -1030,6 +1075,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             "new-design",
             "feature/new-design",
             jobs=6,
+            build_environment={"EXTRA_CFLAGS": "-Wno-error=maybe-uninitialized"},
         )
         self.assertNotIn("ref", resolved["candidates"][0])
         self.assertEqual(
@@ -1040,6 +1086,17 @@ class BenchmarkExperimentTest(unittest.TestCase):
             resolved["candidates"][0]["environment"],
             {"BENCHMARK_VARIANT": "new"},
         )
+
+    def test_build_environment_rejects_keys_outside_shared_policy(self) -> None:
+        for value in (
+            {"PATH": "/tmp/compiler"},
+            {"SECRET_TOKEN": "not-a-build-setting"},
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "build_environment key"),
+            ):
+                EXPERIMENT.validate_build_environment(value, "build_environment")
 
     def test_ref_candidate_rejects_ambiguous_prebuilt_identity(self) -> None:
         spec = {

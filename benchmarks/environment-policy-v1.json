@@ -1,6 +1,12 @@
 {
   "schema_version": 1,
   "product_environment_prefix": "CBM_",
+  "build_environment_keys": [
+    "CC",
+    "CXX",
+    "EXTRA_CFLAGS",
+    "EXTRA_CXXFLAGS"
+  ],
   "harness_owned_keys": [
     "CBM_AUTO_INDEX",
     "CBM_BENCHMARK_ARTIFACT_DIR",

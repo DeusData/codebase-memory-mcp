@@ -215,6 +215,10 @@ flags after the built-in dated presets become irrelevant:
   "repetitions": 3,
   "execution_order": "paired_interleaved",
   "transports": ["mcp"],
+  "build_environment": {
+    "CC": "clang",
+    "CXX": "clang++"
+  },
   "candidates": [
     {
       "label": "baseline",
@@ -269,6 +273,7 @@ Use the existing axes rather than adding branch-specific code:
 
 | Need | Matrix field | Behavior |
 |---|---|---|
+| Shared compiler/diagnostic settings | `build_environment` | Allowlisted `CC`, `CXX`, `EXTRA_CFLAGS`, and `EXTRA_CXXFLAGS`; passed as environment and argv-safe Make overrides to probes, clean builds, and production builds, then retained beside the effective C/C++ compiler identities and expanded production flags |
 | Product configuration | `config_overrides` | Passed through the versioned config-spelling compatibility path |
 | Process/resource knob | `product_environment` | Explicit `CBM_*` variables only; inherited product variables remain removed |
 | New optional benchmark workload flag | `benchmark_args` | Additive arguments; experiment-owned identity, output, transport, config, and scenario flags are rejected |
@@ -277,6 +282,8 @@ Use the existing axes rather than adding branch-specific code:
 
 Top-level product environment is overridden by candidate, then profile, then
 scenario values. Benchmark arguments are appended in that same order.
+Top-level build environment is deliberately shared by every ref candidate so a
+comparison cannot silently build candidates with different compiler settings.
 `CBM_CACHE_DIR`, `CBM_PROFILE`, auto-index isolation, and run-context variables stay
 harness-owned so a matrix cannot redirect live data or suppress measurement logs.
 Fully resolved historical specs remain valid, and specs that omit these new fields
