@@ -2309,10 +2309,10 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
 
     // Phase 2: Metadata tables (projects, file_hashes, summaries, sqlite_sequence)
     CBM_PROF_START(t_meta);
-    uint32_t projects_root;
-    uint32_t file_hashes_root;
-    uint32_t summaries_root;
-    uint32_t sqlite_seq_root;
+    uint32_t projects_root = 0;
+    uint32_t file_hashes_root = 0;
+    uint32_t summaries_root = 0;
+    uint32_t sqlite_seq_root = 0;
     rc = write_metadata_tables(w, &projects_root, &file_hashes_root, &summaries_root, &sqlite_seq_root);
     uint32_t next_page = w->next_page;
     CBM_PROF_END("write_db", "2_metadata_tables", t_meta);
