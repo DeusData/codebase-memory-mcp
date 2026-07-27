@@ -452,6 +452,33 @@ ref explicitly; an explicit override is fail-closed like the rest of the runner 
 an unresolvable override ref raises rather than silently substituting a different
 comparison point.
 
+Automatic presets use MCP transport by default. That is appropriate when the
+benchmark owns an isolated account/runtime or all candidates are compatible with
+the active account-wide CBM daemon. It is not a valid cross-build setup when another
+CBM build is already serving that account: the daemon correctly rejects a candidate
+with a different build identity before the benchmark can configure its isolated
+cache.
+
+Select CLI transport explicitly in that situation:
+
+```sh
+uv run python benchmarks/run_experiments.py --full --transport cli \
+  --candidate-ref upstream-main=main \
+  --experiment-root /durable/path/full-head-vs-main
+```
+
+CLI transport runs the same candidate binaries, profiles, scenarios, repetitions,
+quality gates, and isolated caches without routing them through the account-wide
+daemon. The runner never silently falls back between CLI and MCP. Use MCP when
+measuring protocol/daemon overhead and CLI when comparing candidate indexing and
+query implementations without disrupting an active daemon. The benchmark runs
+directly on the host and does not require Docker.
+
+Candidate labels are stable comparison roles. In the example,
+`upstream-main` still appears as the role label even though it resolves the local
+`main` ref. Reports and claims must therefore cite the resolved ref and exact commit
+recorded in the expanded plan, not infer the source ref from the role label.
+
 ## Cross-experiment composition
 
 Use `benchmarks/summarize_results.py --composition-spec SPEC --out REPORT`

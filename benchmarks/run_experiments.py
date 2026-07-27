@@ -669,10 +669,13 @@ def build_automatic_spec(
     candidates: list[dict[str, Any]],
     *,
     preset: str,
+    transport: str = "mcp",
 ) -> dict[str, Any]:
     """Build the canonical safe quick or repeated full capability matrix."""
     if preset not in {"quick", "full"}:
         raise ValueError("preset must be quick or full")
+    if transport not in {"cli", "mcp"}:
+        raise ValueError("transport must be cli or mcp")
     repository = repository.expanduser().resolve()
     benchmark_script = benchmark_script.expanduser().resolve()
     if not benchmark_script.is_file():
@@ -819,7 +822,7 @@ def build_automatic_spec(
         "cell_timeout_seconds": 1800,
         "accepted_exit_codes": [0, 1],
         "repetitions": 1 if preset == "quick" else 3,
-        "transports": ["mcp"],
+        "transports": [transport],
         "candidates": candidates,
         "profiles": profiles,
         "scenarios": [{"name": "c_new_leaf"}],
@@ -2219,6 +2222,16 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
             "than falling back."
         ),
     )
+    parser.add_argument(
+        "--transport",
+        choices=("cli", "mcp"),
+        default="mcp",
+        help=(
+            "Transport for automatic --quick/--full cells (default: mcp). "
+            "Use cli for cross-build comparisons while an account-wide CBM daemon is "
+            "active; mcp requires an isolated account/runtime or one compatible build."
+        ),
+    )
     parser.add_argument("--minimum-free-gb", type=float, default=2.0)
     parser.add_argument("--stale-lock-hours", type=float, default=6.0)
     parser.add_argument("--audit-only", action="store_true")
@@ -2245,6 +2258,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         candidate_ref_overrides[label] = ref
     if candidate_ref_overrides and args.preset is None:
         parser.error("--candidate-ref only applies to --quick/--full")
+    if args.transport != "mcp" and args.preset is None:
+        parser.error("--transport only applies to --quick/--full")
     args.candidate_ref = candidate_ref_overrides
     return args
 
@@ -2287,6 +2302,7 @@ def prepare_automatic_experiment(
         benchmark_script,
         candidates,
         preset=args.preset,
+        transport=args.transport,
     )
     revision = spec["repository_background"]["revision"]
     tree = spec["repository_background"]["tree"]
