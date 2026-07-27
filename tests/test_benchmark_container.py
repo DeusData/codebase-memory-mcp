@@ -77,9 +77,10 @@ class BenchmarkContainerContractTest(unittest.TestCase):
                     "docker",
                     "image",
                     "results-volume",
-                    "/results/manifests",
+                    "/results",
                     source,
                     "seed",
+                    copy_destination="/results/manifests",
                 )
 
             self.assertEqual(
@@ -90,6 +91,26 @@ class BenchmarkContainerContractTest(unittest.TestCase):
                     f"{source}{CONTAINER.os.sep}.",
                     "seed:/results/manifests",
                 ],
+            )
+            self.assertEqual(
+                run_command.call_args_list[-2].args[0],
+                ["docker", "start", "--attach", "seed"],
+            )
+            self.assertIn(
+                [
+                    "docker",
+                    "create",
+                    "--name",
+                    "seed",
+                    "--mount",
+                    "type=volume,src=results-volume,dst=/results",
+                    "--entrypoint",
+                    "/bin/mkdir",
+                    "image",
+                    "-p",
+                    "/results/manifests",
+                ],
+                [call.args[0] for call in run_command.call_args_list],
             )
 
     def test_native_platform_mapping_is_explicit(self) -> None:
