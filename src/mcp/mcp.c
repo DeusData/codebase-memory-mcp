@@ -1668,10 +1668,22 @@ static const int SUPPORTED_VERSION_COUNT =
 static const char MCP_SERVER_INSTRUCTIONS[] =
     "Use graph tools first for structural discovery: search_graph for symbols, query_graph for "
     "custom structural questions, trace_path for callers and callees, and get_code_snippet for "
-    "exact source. Use search_code or filesystem search for literal or non-code text. Watched "
-    "projects refresh automatically; use check_index_coverage for cited paths and scopes behind "
-    "negative or exhaustive claims. Coverage is best-effort. Paginate when has_more or "
-    "nextCursor is present.";
+    "exact source. Use search_code or filesystem search for literal or non-code text. The first "
+    "graph or source call automatically resolves and, when enabled, indexes its project, then "
+    "returns available session, index, freshness, coverage, and architecture context; follow "
+    "action_required when automation cannot complete. Watched projects refresh automatically; "
+    "use check_index_coverage for cited paths and scopes behind negative or exhaustive claims. "
+    "Coverage is best-effort. Paginate when has_more or nextCursor is present.";
+
+static const char MCP_STREAMLINED_SERVER_INSTRUCTIONS[] =
+    "Use graph tools first for structural discovery: search_graph for symbols, query_graph for "
+    "custom structural questions, trace_path for callers and callees, and get_code for exact "
+    "source. Use search_code or filesystem search for literal or non-code text. The first graph "
+    "or source call automatically resolves and, when enabled, indexes its project, then returns "
+    "available session, index, freshness, coverage, and architecture context; follow "
+    "action_required when automation cannot complete. Watched projects refresh automatically; "
+    "reveal check_index_coverage with _hidden_tools before relying on negative or exhaustive "
+    "claims. Coverage is best-effort. Paginate when has_more or nextCursor is present.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
     "This is the analysis tool profile; graph and index mutation tools are unavailable. Use "
@@ -1688,7 +1700,8 @@ static const char MCP_SCOUT_SERVER_INSTRUCTIONS[] =
     "stale data.";
 
 static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
-                                                     cbm_mcp_tool_profile_t profile) {
+                                                     cbm_mcp_tool_profile_t profile,
+                                                     bool classic_mode) {
     /* Determine protocol version: if client requests a version we support,
      * echo it back; otherwise respond with our latest. */
     const char *version = SUPPORTED_PROTOCOL_VERSIONS[0]; /* default: latest supported version */
@@ -1733,7 +1746,8 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
     yyjson_mut_obj_add_val(doc, caps, "prompts", prompts_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
 
-    const char *instructions = MCP_SERVER_INSTRUCTIONS;
+    const char *instructions =
+        classic_mode ? MCP_SERVER_INSTRUCTIONS : MCP_STREAMLINED_SERVER_INSTRUCTIONS;
     if (profile == CBM_MCP_TOOL_PROFILE_ANALYSIS) {
         instructions = MCP_ANALYSIS_SERVER_INSTRUCTIONS;
     } else if (profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
@@ -1747,7 +1761,7 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
 }
 
 char *cbm_mcp_initialize_response(const char *params_json) {
-    return cbm_mcp_initialize_response_for_profile(params_json, CBM_MCP_TOOL_PROFILE_ALL);
+    return cbm_mcp_initialize_response_for_profile(params_json, CBM_MCP_TOOL_PROFILE_ALL, false);
 }
 
 /* ── Prompt definitions ───────────────────────────────────────── */
@@ -18196,7 +18210,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
-        result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
+        result_json = cbm_mcp_initialize_response_for_profile(
+            req.params_raw, srv->tool_profile, cbm_mcp_tool_mode_is_classic(srv));
         detect_session(srv);
         if (srv->background_tasks && srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
             start_update_check(srv);
