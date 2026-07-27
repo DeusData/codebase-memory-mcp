@@ -164,9 +164,15 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
     return maintenance_cancelled && exit_status == EXIT_SUCCESS ? EXIT_FAILURE : exit_status;
 }
 
-static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
-    "error: active CBM sessions and operations could not be stopped safely; "
-    "no activation was committed.";
+static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
+    "error: the automatic stop request timed out while CBM sessions or operations remained "
+    "active. Close or restart every coding-agent session and CBM command using this cache, "
+    "then retry the same command; no executable, configuration, or index mutation was started.";
+static const char CLI_ACTIVATION_SAFETY_MESSAGE[] =
+    "error: CBM could not prove exclusive activation safety. Verify that the configured cache "
+    "directory (CBM_CACHE_DIR when set) is owner-only and writable, close or restart every "
+    "coding-agent session and CBM command using it, then retry the same command; no executable, "
+    "configuration, or index mutation was started.";
 static const char CLI_ACTIVATION_PARTIAL_MESSAGE[] =
     "error: activation stopped after one or more agent configuration or "
     "cleanup operations failed; the published/current executable was kept, "
@@ -371,7 +377,7 @@ int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]) 
 #endif
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
-    const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
+    const char *diagnostic = message ? message : CLI_ACTIVATION_SAFETY_MESSAGE;
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);
         return;
@@ -383,7 +389,7 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
                                       cbm_cli_activation_mutation_fn mutation,
                                       void *mutation_context) {
     if (!ops || !ops->reserve_for_mutation || !ops->mutation_lease_release) {
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        cli_activation_diagnostic(ops, CLI_ACTIVATION_SAFETY_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -396,7 +402,8 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
         if (mutation_lease) {
             ops->mutation_lease_release(ops->context, mutation_lease);
         }
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        cli_activation_diagnostic(ops, reserve_status == 0 ? CLI_ACTIVATION_BUSY_MESSAGE
+                                                           : CLI_ACTIVATION_SAFETY_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -722,7 +729,7 @@ static void cli_activation_production_diagnostic(void *opaque, const char *messa
         (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_MUTATION_FAILED_MESSAGE);
         return;
     }
-    (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_REFUSED_MESSAGE);
+    (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_SAFETY_MESSAGE);
 }
 
 static bool cli_activation_production_context_init(cli_activation_production_context_t *context,
@@ -849,7 +856,7 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
     cli_activation_production_context_t context;
     if (!cli_activation_production_context_init(&context, action, target_version, target_build)) {
         cli_activation_production_context_close(&context);
-        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_REFUSED_MESSAGE);
+        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_SAFETY_MESSAGE);
         return CLI_TRUE;
     }
     printf("Stopping active CBM sessions and operations for %s...\n",
