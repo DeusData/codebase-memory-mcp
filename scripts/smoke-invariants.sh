@@ -42,6 +42,24 @@ fi
 # Absolutise the binary so cwd changes never break invocation.
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 
+# Bind direct worker probes to these exact executable bytes, using the same
+# portable SHA-256 selection as tests/test_worker_watchdog.sh. The production
+# worker argv rejects absent or mismatched fingerprints before indexing.
+if command -v shasum >/dev/null 2>&1; then
+    BUILD_FINGERPRINT="$(shasum -a 256 "$BINARY" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+    BUILD_FINGERPRINT="$(sha256sum "$BINARY" | awk '{print $1}')"
+elif command -v openssl >/dev/null 2>&1; then
+    BUILD_FINGERPRINT="$(openssl dgst -sha256 "$BINARY" | awk '{print $NF}')"
+else
+    echo "FAIL: setup: no SHA-256 command available for worker build binding" >&2
+    exit 2
+fi
+if [[ ! "$BUILD_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "FAIL: setup: invalid worker build fingerprint '$BUILD_FINGERPRINT'" >&2
+    exit 2
+fi
+
 FAILURES=0
 PASSES=0
 
@@ -152,6 +170,23 @@ cli_call() {
     # cli_call <seconds> <tool> [json_args] [--json]
     local secs="$1"; shift
     run_bounded "$secs" "$BINARY" cli "$@"
+    CLI_OUT="$RB_OUT"
+    CLI_RC="$RB_RC"
+}
+
+# Run the exact build-bound worker argv used by the supervisor. This is only
+# for fault-injector honesty baselines: daemon hosts must never honor ambient
+# requests to disable supervision, while the worker role intentionally indexes
+# in-process and therefore exposes an injected crash or hang to run_bounded.
+worker_call() {
+    # worker_call <seconds> <args_json> <response_path>
+    local secs="$1"
+    local args_json="$2"
+    local response_path="$3"
+    run_bounded "$secs" "$BINARY" cli --index-worker \
+        --index-worker-build "$BUILD_FINGERPRINT" \
+        index_repository "$args_json" \
+        --response-out "$response_path"
     CLI_OUT="$RB_OUT"
     CLI_RC="$RB_RC"
 }
@@ -846,12 +881,13 @@ inv_crasher_skipped_cli() {
     git -C "$crepo" init -q 2>/dev/null || true
     local cn; cn="$(native_path "$crepo")"
 
-    # Honesty baseline: supervisor OFF → the injected fault must escape as a signal.
+    # Honesty baseline: invoke the exact build-bound worker role directly, so
+    # the injected fault must escape as a signal. A normal CLI call now routes
+    # through a marked daemon host, which correctly refuses ambient requests to
+    # disable its mandatory supervisor.
     export CBM_TEST_CRASH_ON=crash_me
-    export CBM_INDEX_SUPERVISOR=0
-    cli_call 60 index_repository --repo-path "$cn"
+    worker_call 60 "{\"repo_path\":\"$cn\"}" "$SCRATCH/crash_baseline_response"
     local base_rc="$CLI_RC"
-    unset CBM_INDEX_SUPERVISOR
 
     # Supervisor ON (default) → the crash must be contained AND skipped-and-continued.
     cli_call 90 index_repository --repo-path "$cn"
@@ -896,10 +932,10 @@ print(max((int(x) for x in m), default=0))' 2>/dev/null)"
 # spin) must be QUARANTINED: the supervisor's quiet-timeout kills the worker,
 # classifies it as a HANG, pins the exact file via the marker, quarantines it as
 # phase="hang", and re-spawns until a clean run indexes the GOOD files while
-# reporting the hanger as a phase="hang" skip. Honest guard: with the supervisor
-# OFF the injected hang must genuinely NOT complete within a bound (timeout
-# status 124 or 137, depending on coreutils), the
-# vacuity guard — proving the injector really hangs); with it ON + a SHORT
+# reporting the hanger as a phase="hang" skip. Honest guard: the direct
+# build-bound worker must genuinely NOT complete within a bound (timeout status
+# 124 or 137, depending on coreutils), proving the injector really hangs;
+# the daemon-supervised call with a SHORT
 # CBM_INDEX_WORKER_TIMEOUT_S the run must COMPLETE (rc<128, not 124), report
 # status="indexed" + the hanger as phase="hang", index the good file (nodes>0),
 # and NOT skip the good file.
@@ -911,13 +947,11 @@ inv_hanger_skipped_cli() {
     git -C "$hrepo" init -q 2>/dev/null || true
     local hn; hn="$(native_path "$hrepo")"
 
-    # Honesty baseline: supervisor OFF → the injected hang must NOT complete within
-    # the bound. The bounded runner fires, proving the injector hangs.
+    # Honesty baseline: invoke the exact build-bound worker role directly. It
+    # must NOT complete within the bound, proving the injector actually hangs.
     export CBM_TEST_HANG_ON=hang_me
-    export CBM_INDEX_SUPERVISOR=0
-    cli_call 12 index_repository --repo-path "$hn"
+    worker_call 12 "{\"repo_path\":\"$hn\"}" "$SCRATCH/hang_baseline_response"
     local base_rc="$CLI_RC"
-    unset CBM_INDEX_SUPERVISOR
 
     # Supervisor ON (default) + a SHORT no-progress timeout → the hang must be
     # detected fast, contained, and skipped-and-continued. Recovery spends two
