@@ -481,7 +481,13 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 check=True,
             )
             (repo / "candidate.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fixture_compiler = repo / "fixture-cc"
+            fixture_compiler.write_text(
+                "#!/bin/sh\nprintf 'fixture compiler 1.0\\n'\n", encoding="utf-8"
+            )
+            fixture_compiler.chmod(0o755)
             (repo / "Makefile.cbm").write_text(
+                "CC = ./fixture-cc\n"
                 "CFLAGS_PROD = -O3 -DFIXTURE_PRODUCTION=1\n"
                 "clean-c:\n\t$(RM) -r build/c\n"
                 "cbm:\n\tmkdir -p build/c\n\tcp candidate.sh build/c/codebase-memory-mcp\n"
@@ -516,6 +522,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             self.assertEqual(second, first)
             self.assertEqual(second["binary_sha256"], first["binary_sha256"])
             self.assertEqual(second["binary"], first["binary"])
+            self.assertEqual(second["build"]["compiler"], "fixture compiler 1.0")
             self.assertEqual(second["build"]["cflags"], "-O3 -DFIXTURE_PRODUCTION=1")
             self.assertTrue(Path(first["binary"]).is_file())
             self.assertEqual(
