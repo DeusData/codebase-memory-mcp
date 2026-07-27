@@ -2026,6 +2026,97 @@ class RunBenchmarkTest(unittest.TestCase):
         )
         self.assertEqual(component["elapsed_ms"], 10.0)
 
+    def test_normalize_self_dogfood_report_preserves_recorded_scope_and_cache(
+        self,
+    ) -> None:
+        scope = {
+            "workload": "self_dogfood",
+            "input_tree": {
+                "file_count": 321,
+                "source": "git_ls_tree_at_declared_revision",
+            },
+            "mutation_policy": {
+                "kind": "deterministic_named_mutations",
+                "scenarios": [
+                    {
+                        "name": "c_new_leaf",
+                        "changed_paths": ["src/cbm_benchmark_leaf.c"],
+                    }
+                ],
+            },
+        }
+        cache = {
+            "process": {
+                "state": "persistent_within_lifecycle",
+                "source": "transport_contract",
+            },
+            "repository_graph": {
+                "initial_state": "empty_harness_owned_cache",
+                "reset_procedure": "remove_project_dbs_before_clean_rebuild",
+            },
+            "os_page_cache": {
+                "state": "uncontrolled",
+                "scheduling": "paired_interleaved",
+            },
+        }
+        report = {
+            "mode": "self_dogfood",
+            "parameters": {"transport": "mcp"},
+            "scope": scope,
+            "cache": cache,
+            "derived": {"passed": True},
+        }
+
+        run = BENCHMARK.normalize_benchmark_report(
+            report,
+            {
+                "cell_identity": "recorded-manifest",
+                "label": "latest.full.mcp.c_new_leaf",
+                "revision": "a" * 40,
+                "repetition": 1,
+                "build": {"compiler": "clang", "cflags": "-O2"},
+                "capabilities": {"rank_enabled": "true"},
+            },
+        )["runs"][0]
+
+        self.assertEqual(run["scope"], scope)
+        self.assertEqual(run["cache"], cache)
+
+    def test_self_dogfood_manifests_record_harness_known_state_without_unknowns(
+        self,
+    ) -> None:
+        scope = BENCHMARK.self_dogfood_scope_manifest(
+            "a" * 40,
+            "b" * 40,
+            ["c_new_leaf"],
+        )
+        cache = BENCHMARK.self_dogfood_cache_manifest(
+            mock.Mock(
+                transport="mcp",
+                config_overrides={"auto_index_deps": "false"},
+            )
+        )
+
+        self.assertEqual(scope["input_tree"]["revision"], "a" * 40)
+        self.assertEqual(scope["input_tree"]["tree"], "b" * 40)
+        self.assertEqual(
+            scope["mutation_policy"]["scenarios"],
+            [
+                {
+                    "name": "c_new_leaf",
+                    "changed_paths": ["src/cbm_benchmark_leaf.c"],
+                }
+            ],
+        )
+        self.assertEqual(
+            cache["dependency_artifacts"]["state"],
+            "disabled_by_explicit_config",
+        )
+        self.assertEqual(cache["os_page_cache"]["state"], "uncontrolled_by_harness")
+        self.assertNotIn(
+            '"status": "unknown"', json.dumps({"scope": scope, "cache": cache})
+        )
+
     def test_normalize_legacy_report_marks_unavailable_metadata_unknown(self) -> None:
         report = {
             "generated_at_utc": "2026-07-20T00:00:00+00:00",
