@@ -62,6 +62,9 @@ PRODUCT_ENVIRONMENT_PREFIX = BENCHMARK_ENVIRONMENT_POLICY["product_environment_p
 HARNESS_OWNED_PRODUCT_ENV = frozenset(
     BENCHMARK_ENVIRONMENT_POLICY["harness_owned_keys"]
 )
+BUILD_ENVIRONMENT_KEYS = frozenset(
+    BENCHMARK_ENVIRONMENT_POLICY["build_environment_keys"]
+)
 
 
 SCHEMA_VERSION = 1
@@ -378,11 +381,22 @@ def _registered_candidate_worktrees(
     return sorted(matches)
 
 
-def _make_probe(worktree: Path, target: str, recipe: str) -> str:
+def _make_probe(
+    worktree: Path,
+    target: str,
+    recipe: str,
+    build_environment: dict[str, str] | None = None,
+) -> str:
     definition = f"{target}:\n\t@{recipe}\n"
+    environment = os.environ.copy()
+    environment.update(build_environment or {})
+    make_variables = [
+        f"{key}={value}" for key, value in sorted((build_environment or {}).items())
+    ]
     process = subprocess.run(
-        ["make", "-s", "-f", "Makefile.cbm", "-f", "-", target],
+        ["make", "-s", "-f", "Makefile.cbm", "-f", "-", *make_variables, target],
         cwd=worktree,
+        env=environment,
         input=definition,
         capture_output=True,
         text=True,
@@ -393,22 +407,34 @@ def _make_probe(worktree: Path, target: str, recipe: str) -> str:
     return process.stdout.strip()
 
 
-def _compiler_identity(worktree: Path) -> str:
+def _compiler_identity(
+    worktree: Path,
+    make_variable: str,
+    build_environment: dict[str, str] | None = None,
+) -> str:
     try:
         return _make_probe(
-            worktree, "cbm-print-compiler-identity", "$(CC) --version"
+            worktree,
+            f"cbm-print-{make_variable.lower()}-identity",
+            f"$({make_variable}) --version",
+            build_environment,
         ).splitlines()[0]
     except (OSError, RuntimeError, IndexError):
         return "unknown (see datetime-named build log)"
 
 
-def _production_cflags(worktree: Path) -> str:
-    """Read the candidate Makefile's canonical production flags without duplicating them."""
+def _production_flags(
+    worktree: Path,
+    make_variable: str,
+    build_environment: dict[str, str] | None = None,
+) -> str:
+    """Read canonical candidate flags without duplicating Makefile definitions."""
     try:
         value = _make_probe(
             worktree,
-            "cbm-print-production-flags",
-            "printf '%s\\n' '$(CFLAGS_PROD)'",
+            f"cbm-print-{make_variable.lower()}",
+            f"printf '%s\\n' '$({make_variable})'",
+            build_environment,
         )
     except (OSError, RuntimeError):
         return "unknown (see candidate Makefile.cbm and build log)"
@@ -442,6 +468,7 @@ def materialize_candidate(
     ref: str,
     *,
     jobs: int = 2,
+    build_environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve, isolate, production-build, and hash one benchmark candidate."""
     repository = repository.expanduser().resolve()
@@ -449,6 +476,11 @@ def materialize_candidate(
     safe_label = _candidate_slug(label)
     if jobs <= 0:
         raise ValueError("build jobs must be positive")
+    explicit_build_environment = validate_build_environment(
+        build_environment, "build_environment"
+    )
+    process_environment = os.environ.copy()
+    process_environment.update(explicit_build_environment)
     source_identity = commit_identity(repository, ref)
     revision = source_identity["revision"]
     candidate_root.mkdir(parents=True, exist_ok=True)
@@ -486,11 +518,19 @@ def materialize_candidate(
     binary = worktree / "build" / "c" / "codebase-memory-mcp"
     stable_build = {
         "target": f"make -j{jobs} -f Makefile.cbm cbm",
-        "compiler": _compiler_identity(worktree),
-        "cflags": _production_cflags(worktree),
+        "compiler": _compiler_identity(worktree, "CC", explicit_build_environment),
+        "cflags": _production_flags(
+            worktree, "CFLAGS_PROD", explicit_build_environment
+        ),
+        "cxx_compiler": _compiler_identity(worktree, "CXX", explicit_build_environment),
+        "cxxflags": _production_flags(
+            worktree, "CXXFLAGS_PROD", explicit_build_environment
+        ),
         "source_commit_datetime": source_identity["committed_at"],
         "source_tree": source_identity["tree"],
     }
+    if explicit_build_environment:
+        stable_build["environment"] = explicit_build_environment
     cache_path = (
         candidate_root
         / "cache"
@@ -518,8 +558,24 @@ def materialize_candidate(
     build_log = (
         log_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.log"
     )
-    clean_command = ["make", "-f", "Makefile.cbm", "clean-c"]
-    command = ["make", f"-j{jobs}", "-f", "Makefile.cbm", "cbm"]
+    make_variables = [
+        f"{key}={value}" for key, value in explicit_build_environment.items()
+    ]
+    clean_command = [
+        "make",
+        "-f",
+        "Makefile.cbm",
+        *make_variables,
+        "clean-c",
+    ]
+    command = [
+        "make",
+        f"-j{jobs}",
+        "-f",
+        "Makefile.cbm",
+        *make_variables,
+        "cbm",
+    ]
     clean_returncode: int | None = None
     build_returncode: int | None = None
     with build_log.open("w", encoding="utf-8") as stream:
@@ -535,6 +591,7 @@ def materialize_candidate(
             clean_process = subprocess.run(
                 clean_command,
                 cwd=worktree,
+                env=process_environment,
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -549,6 +606,7 @@ def materialize_candidate(
             process = subprocess.run(
                 command,
                 cwd=worktree,
+                env=process_environment,
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -617,6 +675,9 @@ def materialize_matrix_candidates(
     remain value-equivalent after the defensive deep copy.
     """
     resolved = copy.deepcopy(spec)
+    build_environment = validate_build_environment(
+        resolved.get("build_environment"), "build_environment"
+    )
     candidates = _nonempty_list(resolved.get("candidates"), "candidates")
     labels: set[str] = set()
     for index, candidate in enumerate(candidates):
@@ -684,6 +745,7 @@ def materialize_matrix_candidates(
             label,
             ref,
             jobs=jobs,
+            build_environment=build_environment,
         )
         materialized.update(passthrough)
         candidates[index] = materialized
@@ -1111,6 +1173,17 @@ def validate_product_environment(value: Any, field: str) -> dict[str, str]:
         if key in HARNESS_OWNED_PRODUCT_ENV:
             raise ValueError(f"{field} key is owned by the benchmark harness: {key}")
     return values
+
+
+def validate_build_environment(value: Any, field: str) -> dict[str, str]:
+    values = _string_map(value, field)
+    unknown = sorted(set(values) - BUILD_ENVIRONMENT_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{field} key is not in the shared build environment policy: "
+            + ", ".join(unknown)
+        )
+    return dict(sorted(values.items()))
 
 
 def parse_product_environment_arguments(items: list[str]) -> dict[str, str]:

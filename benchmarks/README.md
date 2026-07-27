@@ -55,6 +55,9 @@ use `config_overrides` for product config keys, `product_environment` for explic
 `CBM_*` process knobs such as `CBM_WORKERS`, and `benchmark_args` for additive
 workload flags. Candidate, profile, and scenario scopes can add new branches,
 capabilities, and controlled sweeps without editing the built-in dated presets.
+Top-level `build_environment` is shared across candidates and accepts only `CC`,
+`CXX`, `EXTRA_CFLAGS`, and `EXTRA_CXXFLAGS`; probes and builds retain those values
+in candidate identity, and arbitrary environment keys are rejected.
 See [the complete matrix example](../docs/BENCHMARK_EXPERIMENTS.md#reusable-ref-based-matrices).
 
 For cross-build measurements while the host daemon remains active, use the native
