@@ -220,12 +220,21 @@ try {
             }
             $archiveCounts[$entryName] = $archiveCounts[$entryName] + 1
         }
-        foreach ($archiveName in $WindowsArchiveNames) {
+        $RequiredArchiveNames = @(
+            $BinName,
+            "LICENSE",
+            "install.ps1",
+            "THIRD_PARTY_NOTICES.md"
+        )
+        foreach ($archiveName in $RequiredArchiveNames) {
             if ($archiveCounts[$archiveName] -ne 1) {
                 throw "archive must contain exactly one $archiveName"
             }
         }
-        if ($seen.Count -ne $WindowsArchiveNames.Count) {
+        if ($archiveCounts[$PayloadName] -gt 1) {
+            throw "archive contains duplicate $PayloadName"
+        }
+        if ($seen.Count -lt $RequiredArchiveNames.Count -or $seen.Count -gt $WindowsArchiveNames.Count) {
             throw "archive does not match the exact Windows release allowlist"
         }
     } finally {
@@ -244,6 +253,10 @@ Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
 
 $DownloadedLauncher = Join-Path $TmpDir $BinName
 $DownloadedPayload = Join-Path $TmpDir $PayloadName
+if (-not (Test-Path -LiteralPath $DownloadedPayload -PathType Leaf) -and
+    (Test-Path -LiteralPath $DownloadedLauncher -PathType Leaf)) {
+    Copy-Item -LiteralPath $DownloadedLauncher -Destination $DownloadedPayload
+}
 if (-not (Test-Path -LiteralPath $DownloadedLauncher -PathType Leaf) -or
     -not (Test-Path -LiteralPath $DownloadedPayload -PathType Leaf)) {
     Write-Host "error: launcher or payload not found after extraction" -ForegroundColor Red

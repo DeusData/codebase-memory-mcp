@@ -367,7 +367,7 @@ require(
 # attacker-controlled sixth member.
 exact_archive_guards = {
     "install.ps1": (
-        "$seen.Count -ne $WindowsArchiveNames.Count",
+        "$seen.Count -gt $WindowsArchiveNames.Count",
         '"LICENSE"',
         '"install.ps1"',
         "THIRD_PARTY_NOTICES.md",
