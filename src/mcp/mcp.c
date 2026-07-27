@@ -16982,10 +16982,28 @@ static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char
     const char *project = srv->current_project && srv->current_project[0]
                               ? srv->current_project
                               : (srv->session_project[0] ? srv->session_project : NULL);
+    char context_project_copy[sizeof(srv->session_project)] = {0};
     bool json_requested =
         cbm_mcp_response_format(srv, args_json) == CBM_MCP_OUTPUT_JSON;
     cbm_store_t *context_store =
         srv->current_project && srv->current_project[0] ? srv->store : NULL;
+    /* Inventory and informational tools do not resolve a query store themselves,
+     * but the automatic first-response contract still promises the session
+     * project's real index and architecture state. Open that one established
+     * request-scoped store automatically instead of reporting not_indexed for a
+     * project list that contains the same project. Do this only for the first
+     * enabled context and only when no explicit tool project was resolved, so
+     * later calls and explicit missing-project errors add no duplicate lookup.
+     * release_request_store below closes the handle on every return path. */
+    bool first_context_needed =
+        !srv->context_injected &&
+        cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
+    if (!context_store && first_context_needed && !srv->autoindex_active &&
+        (!srv->current_project || !srv->current_project[0]) && project && project[0]) {
+        snprintf(context_project_copy, sizeof(context_project_copy), "%s", project);
+        project = context_project_copy;
+        context_store = resolve_store(srv, project);
+    }
     /* Try the JSON-object path once. The serializer already parses and rejects
      * non-object payloads, avoiding a second full response parse on every JSON
      * tool call while keeping transient memory O(response bytes). */

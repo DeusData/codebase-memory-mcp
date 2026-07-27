@@ -1452,6 +1452,62 @@ TEST(tool_list_projects_includes_tmp_prefixed_project) {
     PASS();
 }
 
+TEST(tool_list_projects_first_context_resolves_session_store) {
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-list-context-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char repo[CBM_SZ_512];
+    ASSERT_TRUE(snprintf(repo, sizeof(repo), "%s/repo", cache) > 0);
+    ASSERT_EQ(th_mkdir_p(repo), 0);
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+
+    char db_path[CBM_SZ_1K];
+    ASSERT_TRUE(snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project) > 0);
+    cbm_store_t *indexed_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(indexed_store);
+    ASSERT_EQ(cbm_store_upsert_project(indexed_store, project, repo), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Project",
+                       .name = project,
+                       .qualified_name = project,
+                       .file_path = ""};
+    ASSERT_GT(cbm_store_upsert_node(indexed_store, &node), 0);
+    cbm_store_close(indexed_store);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, repo, repo));
+    char *resp = cbm_mcp_handle_tool(srv, "list_projects", "{}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, project));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"ready\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"nodes\":1"));
+    ASSERT_NULL(strstr(inner, "\"status\":\"not_indexed\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_remove_db_sidecars(db_path);
+    cbm_unlink(db_path);
+    free(project);
+    th_rmtree(cache);
+    PASS();
+}
+
 TEST(tool_list_projects_paginates_with_explicit_full_compatibility) {
     char cache[CBM_SZ_256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-list-page-XXXXXX");
@@ -16293,6 +16349,7 @@ SUITE(mcp) {
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
+    RUN_TEST(tool_list_projects_first_context_resolves_session_store);
     RUN_TEST(tool_list_projects_paginates_with_explicit_full_compatibility);
     RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
     RUN_TEST(resolve_store_leaves_foreign_sqlite_db_untouched);
