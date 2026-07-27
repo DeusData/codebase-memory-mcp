@@ -483,7 +483,9 @@ class BenchmarkExperimentTest(unittest.TestCase):
             (repo / "candidate.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (repo / "Makefile.cbm").write_text(
                 "CFLAGS_PROD = -O3 -DFIXTURE_PRODUCTION=1\n"
+                "clean-c:\n\t$(RM) -r build/c\n"
                 "cbm:\n\tmkdir -p build/c\n\tcp candidate.sh build/c/codebase-memory-mcp\n"
+                "\ttest ! -e build/c/stale-object\n"
                 "\tchmod +x build/c/codebase-memory-mcp\n",
                 encoding="utf-8",
             )
@@ -521,10 +523,14 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 build_logs_after_first,
             )
             Path(second["binary"]).write_bytes(b"tampered")
+            (Path(second["binary"]).parent / "stale-object").write_text(
+                "objects from the invalidated build identity\n", encoding="utf-8"
+            )
             rebuilt = EXPERIMENT.materialize_candidate(
                 repo, candidate_root, "stable-candidate", "stable", jobs=1
             )
             self.assertEqual(rebuilt, first)
+            self.assertFalse((Path(second["binary"]).parent / "stale-object").exists())
             self.assertEqual(
                 len(list((candidate_root / "build-logs").glob("*.log"))),
                 len(build_logs_after_first) + 1,
