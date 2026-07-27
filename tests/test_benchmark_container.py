@@ -9,6 +9,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = (
@@ -21,9 +22,80 @@ SPEC.loader.exec_module(CONTAINER)
 
 
 class BenchmarkContainerContractTest(unittest.TestCase):
+    def test_environment_manifest_name_is_content_addressed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = CONTAINER.write_container_manifest(
+                root,
+                "a" * 40,
+                "b" * 64,
+                {"runner_arguments": ["--quick"], "recorded_at_utc": "first"},
+            )
+            repeated = CONTAINER.write_container_manifest(
+                root,
+                "a" * 40,
+                "b" * 64,
+                {"runner_arguments": ["--quick"], "recorded_at_utc": "first"},
+            )
+            changed = CONTAINER.write_container_manifest(
+                root,
+                "a" * 40,
+                "b" * 64,
+                {"runner_arguments": ["--audit-only"], "recorded_at_utc": "second"},
+            )
+
+            self.assertEqual(first, repeated)
+            self.assertNotEqual(first, changed)
+            self.assertEqual(first.parent, root / "manifests")
+            self.assertRegex(
+                first.name,
+                r"^container-environment-a{12}-b{12}-[0-9a-f]{12}\.json$",
+            )
+            self.assertEqual(
+                json.loads(first.read_text(encoding="utf-8"))["runner_arguments"],
+                ["--quick"],
+            )
+
+    def test_failed_build_logs_have_a_commit_keyed_export_destination(self) -> None:
+        destination = CONTAINER.failure_log_export_root(
+            Path("/history"), "0123456789abcdef"
+        )
+        self.assertEqual(
+            destination,
+            Path("/history/container-failures/0123456789ab/build-logs"),
+        )
+
+    def test_directory_copy_targets_contents_at_the_declared_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "manifests"
+            source.mkdir()
+            with (
+                mock.patch.object(CONTAINER, "run_command") as run_command,
+                mock.patch.object(CONTAINER, "remove_container"),
+            ):
+                CONTAINER.copy_to_volume(
+                    "docker",
+                    "image",
+                    "results-volume",
+                    "/results/manifests",
+                    source,
+                    "seed",
+                )
+
+            self.assertEqual(
+                run_command.call_args_list[-1].args[0],
+                [
+                    "docker",
+                    "cp",
+                    f"{source}{CONTAINER.os.sep}.",
+                    "seed:/results/manifests",
+                ],
+            )
+
     def test_native_platform_mapping_is_explicit(self) -> None:
         self.assertEqual(CONTAINER.native_linux_platform("arm64"), "linux/arm64")
         self.assertEqual(CONTAINER.native_linux_platform("aarch64"), "linux/arm64")
+        self.assertEqual(CONTAINER.native_linux_platform("AMD64"), "linux/amd64")
         self.assertEqual(CONTAINER.native_linux_platform("x86_64"), "linux/amd64")
         with self.assertRaisesRegex(ValueError, "unsupported host architecture"):
             CONTAINER.native_linux_platform("riscv64")

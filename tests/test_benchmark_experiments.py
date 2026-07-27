@@ -1696,6 +1696,24 @@ class BenchmarkExperimentTest(unittest.TestCase):
             self.assertEqual(audit["counts"]["unplanned"], 1)
             self.assertEqual(audit["unplanned"], ["unplanned-cell"])
 
+    def test_scan_ignores_coordinator_manifests_and_failure_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "manifests").mkdir()
+            (root / "manifests" / "container-environment.json").write_text(
+                '{"schema_version": 1}\n', encoding="utf-8"
+            )
+            build_logs = root / "container-failures" / ("a" * 12) / "build-logs"
+            build_logs.mkdir(parents=True)
+            (build_logs / "candidate.log").write_text(
+                "compiler diagnostic\n", encoding="utf-8"
+            )
+
+            audit = EXPERIMENT.scan_experiment(root, [])
+
+            self.assertEqual(audit["counts"]["unplanned"], 0)
+            self.assertEqual(audit["counts"]["corrupt"], 0)
+
     def test_atomic_json_roundtrip_leaves_no_temporary_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "manifest.json"

@@ -75,6 +75,10 @@ Docker volumes; the coordinator prints their exact names and retains them for
 auditable resume. Rerun the same source spec and experiment root to resume, or remove
 the printed volumes after exported results are verified. The measured container is
 always native `arm64` or `amd64`, resource bounded, and removed on success or failure.
+Each invocation writes a content-addressed container-environment manifest, so changed
+arguments create a new audit record instead of replacing history. Failed candidate
+build logs are exported under `container-failures/<source-commit>/build-logs/`; if
+that export itself fails, the error identifies the retained work volume and path.
 Container numbers are controlled Linux relative comparisons, not absolute macOS
 latency. See [Container isolation](../docs/BENCHMARK_EXPERIMENTS.md#container-isolation).
 
