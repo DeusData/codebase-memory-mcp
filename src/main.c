@@ -768,6 +768,10 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
              * from its own process-level coordination setup and therefore
              * owns the mutation lease while it performs the physical write. */
             cbm_mcp_server_set_background_tasks(srv, false);
+            /* The worker response is internal transport. Its inherited CWD can
+             * differ from the requesting daemon session, so the parent alone
+             * attaches the authoritative one-shot session/_context metadata. */
+            cbm_mcp_server_set_response_context(srv, false);
             if (project_locks) {
                 cbm_mcp_server_set_project_mutation_guard(srv, main_local_cli_mutation_begin,
                                                           main_local_cli_mutation_end, &mutation);
