@@ -9,14 +9,14 @@
 
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
-# Linux: gcc/g++ — system default with full sanitizer support
+# Linux/FreeBSD: gcc/clang — system default with full sanitizer support
 # CI scripts pass CC/CXX explicitly; don't rely on defaults here
 
 # Target architecture (macOS): build.sh/test.sh export ARCHFLAGS="-arch <arch>"
 # (see scripts/env.sh). Fold it into the compiler drivers with `override` so it
 # reaches EVERY compile and link recipe — including the vendored objects below
 # that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
-# ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
+# ARCHFLAGS is empty on Linux/FreeBSD/Windows and for native direct `make` invocations,
 # leaving CC/CXX unchanged there.
 override CC := $(CC) $(ARCHFLAGS)
 override CXX := $(CXX) $(ARCHFLAGS)
@@ -241,6 +241,7 @@ LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(EXECINFO_LIBS) $(TSAN_SANITIZE) $(WI
 FOUNDATION_SRCS = \
 	src/foundation/mem_override_win.c \
 	src/foundation/mem_override_posix.c \
+	src/foundation/mem_profile.c \
     src/foundation/arena.c \
     src/foundation/hash_table.c \
     src/foundation/str_intern.c \
@@ -424,7 +425,7 @@ UI_SRCS = \
 # mimalloc (vendored, global allocator override)
 #
 # Override strategy is platform-specific:
-#  * Unix (macOS/Linux): rely on static-link-order override — the prod mimalloc
+#  * Unix (macOS/Linux/FreeBSD): rely on static-link-order override — the prod mimalloc
 #    object is linked first so its strong malloc/free symbols win. We do NOT
 #    define MI_MALLOC_OVERRIDE here: that would compile alloc-override.c's
 #    forwarding definitions (malloc/free/posix_memalign/...) which, on macOS's
