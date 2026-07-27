@@ -192,6 +192,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
             results_volume="cbm-benchmark-results-abc",
             source_revision="a" * 40,
             bundle_name="repo.bundle",
+            repository_snapshot_sha256="d" * 64,
             runner_arguments=[
                 "--full",
                 "--transport",
@@ -211,13 +212,34 @@ class BenchmarkContainerContractTest(unittest.TestCase):
         self.assertNotIn("type=bind", " ".join(command))
         self.assertNotIn("/Users/", " ".join(command))
         self.assertIn("/results/runsets/abc123", command)
+        self.assertNotIn("--candidate-root", command)
+        self.assertIn("d" * 20, command)
+
+    def test_repository_snapshot_identity_ignores_bundle_byte_order(self) -> None:
+        heads = [
+            {"ref": "refs/heads/main", "revision": "b" * 40},
+            {"ref": "HEAD", "revision": "a" * 40},
+        ]
+        identity = CONTAINER.repository_snapshot_sha256("a" * 40, heads)
+        self.assertEqual(
+            identity,
+            CONTAINER.repository_snapshot_sha256("a" * 40, list(reversed(heads))),
+        )
+        self.assertNotEqual(
+            identity,
+            CONTAINER.repository_snapshot_sha256(
+                "a" * 40,
+                [{**heads[0], "revision": "c" * 40}, heads[1]],
+            ),
+        )
+        self.assertRegex(identity, r"^[0-9a-f]{64}$")
 
     def test_run_key_is_stable_for_audit_only_and_separates_measurement_inputs(
         self,
     ) -> None:
         common = {
             "source_revision": "a" * 40,
-            "bundle_sha256": "b" * 64,
+            "repository_snapshot_sha256": "b" * 64,
             "matrix_spec_sha256": "c" * 64,
             "resources": {"cpus": 4.0, "memory": "8g", "workers": 4},
             "runner_arguments": ["--matrix-spec", "/benchmark/matrix.json"],
@@ -232,7 +254,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
         self.assertEqual(measured, audited)
         for field, value in (
             ("source_revision", "d" * 40),
-            ("bundle_sha256", "e" * 64),
+            ("repository_snapshot_sha256", "e" * 64),
             ("matrix_spec_sha256", "f" * 64),
             ("resources", {"cpus": 8.0, "memory": "8g", "workers": 4}),
             (

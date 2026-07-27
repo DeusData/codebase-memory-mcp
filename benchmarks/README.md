@@ -72,11 +72,12 @@ uv run python benchmarks/run_container_experiment.py \
   --cpus 4 --memory 8g --workers 4
 ```
 
-CPU, memory, and worker budgets are required rather than guessed. Candidate builds,
-Git worktrees, caches, daemon state, and result generation remain on two labeled
-Docker volumes; the coordinator prints their exact names and retains them for
-auditable resume. Rerun the same source spec and experiment root to resume, or remove
-the printed volumes after exported results are verified. The measured container is
+CPU, memory, and worker budgets are required rather than guessed. Candidate builds
+and the repository-relative `.worktrees/benchmark-candidates` default, caches,
+daemon state, and result generation remain on two labeled Docker volumes; the
+coordinator prints their exact names and retains them for auditable resume. Rerun
+the same source spec and experiment root to resume, or remove the printed volumes
+after exported results are verified. The measured container is
 always native `arm64` or `amd64`, resource bounded, and removed on success or failure.
 Each invocation writes a content-addressed container-environment manifest, so changed
 arguments create a new audit record instead of replacing history. Failed candidate
@@ -84,8 +85,10 @@ build logs are exported under `container-failures/<source-commit>/build-logs/`; 
 that export itself fails, the error identifies the retained work volume and path.
 Each measured source/spec/resource cohort is isolated under
 `runsets/<content-id>/`; `--audit-only` resolves to the same cohort and cannot create
-a second attempt, while a different commit, ref bundle, spec, or resource budget
-cannot be misreported as an unplanned cell in the current runset.
+a second attempt. Canonical Git ref/commit content identifies the repository
+snapshot even when equivalent bundle pack bytes differ; the exact bundle SHA-256
+remains in the manifest. A different snapshot, spec, or resource budget cannot be
+misreported as an unplanned cell in the current runset.
 Container numbers are controlled Linux relative comparisons, not absolute macOS
 latency. See [Container isolation](../docs/BENCHMARK_EXPERIMENTS.md#container-isolation).
 

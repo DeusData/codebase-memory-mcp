@@ -44,7 +44,7 @@ bundle_name=$2
 source_key=$3
 shift 3
 export HOME=/benchmark/home
-mkdir -p "$HOME" /benchmark/sources /benchmark/candidates/build-logs
+mkdir -p "$HOME" /benchmark/sources
 repository=/benchmark/sources/$source_key
 if [ ! -d "$repository/.git" ]; then
   git clone --quiet "/benchmark/$bundle_name" "$repository"
@@ -100,10 +100,30 @@ def failure_log_export_root(experiment_root: Path, source_revision: str) -> Path
     return experiment_root / "container-failures" / source_revision[:12] / "build-logs"
 
 
+def repository_snapshot_sha256(
+    source_revision: str, bundle_heads: list[dict[str, str]]
+) -> str:
+    """Hash Git commit/ref content independently of bundle pack bytes."""
+    identity = {
+        "source_revision": source_revision,
+        "bundle_heads": sorted(
+            (
+                {"ref": head["ref"], "revision": head["revision"]}
+                for head in bundle_heads
+            ),
+            key=lambda head: (head["ref"], head["revision"]),
+        ),
+    }
+    payload = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def container_run_key(
     *,
     source_revision: str,
-    bundle_sha256: str,
+    repository_snapshot_sha256: str,
     matrix_spec_sha256: str | None,
     resources: dict[str, Any],
     runner_arguments: list[str],
@@ -111,7 +131,7 @@ def container_run_key(
     """Identify one resumable measurement cohort inside a named history."""
     identity = {
         "source_revision": source_revision,
-        "bundle_sha256": bundle_sha256,
+        "repository_snapshot_sha256": repository_snapshot_sha256,
         "matrix_spec_sha256": matrix_spec_sha256,
         "resources": resources,
         # Audit-only changes execution, not the measured plan or environment.
@@ -219,6 +239,7 @@ def build_measured_command(
     results_volume: str,
     source_revision: str,
     bundle_name: str,
+    repository_snapshot_sha256: str,
     runner_arguments: list[str],
     experiment_root: str,
     uid: int | None,
@@ -245,9 +266,7 @@ def build_measured_command(
     ]
     if uid is not None and gid is not None:
         command.extend(("--user", f"{uid}:{gid}"))
-    source_key = hashlib.sha256(
-        f"{source_revision}\0{bundle_name}".encode("utf-8")
-    ).hexdigest()[:20]
+    source_key = repository_snapshot_sha256[:20]
     command.extend(
         (
             image,
@@ -260,8 +279,6 @@ def build_measured_command(
             *runner_arguments,
             "--experiment-root",
             experiment_root,
-            "--candidate-root",
-            "/benchmark/candidates",
         )
     )
     return command
@@ -626,6 +643,11 @@ def main(argv: list[str] | None = None) -> int:
             bundle_name = f"repository-{bundle_sha}.bundle"
             copied_bundle = input_root / bundle_name
             bundle.replace(copied_bundle)
+            bundle_heads = parse_bundle_heads(copied_bundle)
+            repository_snapshot = repository_snapshot_sha256(
+                source_revision, bundle_heads
+            )
+            source_key = repository_snapshot[:20]
             copy_to_volume(
                 args.docker,
                 image,
@@ -673,7 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             runner_arguments.extend(args.runner_arguments)
             run_key = container_run_key(
                 source_revision=source_revision,
-                bundle_sha256=bundle_sha,
+                repository_snapshot_sha256=repository_snapshot,
                 matrix_spec_sha256=effective_matrix_sha,
                 resources=args.resources,
                 runner_arguments=runner_arguments,
@@ -686,7 +708,8 @@ def main(argv: list[str] | None = None) -> int:
                 "source_revision": source_revision,
                 "source_tree": git_output(["rev-parse", "HEAD^{tree}"]),
                 "bundle_sha256": bundle_sha,
-                "bundle_heads": parse_bundle_heads(copied_bundle),
+                "bundle_heads": bundle_heads,
+                "repository_snapshot_sha256": repository_snapshot,
                 "matrix_spec_sha256": matrix_sha,
                 "effective_matrix_spec_sha256": effective_matrix_sha,
                 "image": image,
@@ -712,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
                 "runner_arguments": runner_arguments,
                 "run_key": run_key,
                 "container_experiment_root": container_experiment_root,
+                "container_repository": f"/benchmark/sources/{source_key}",
             }
             manifest_path = write_container_manifest(
                 input_root,
@@ -760,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
                 results_volume=results_volume,
                 source_revision=source_revision,
                 bundle_name=bundle_name,
+                repository_snapshot_sha256=repository_snapshot,
                 runner_arguments=runner_arguments,
                 experiment_root=container_experiment_root,
                 uid=uid,
@@ -783,7 +808,10 @@ def main(argv: list[str] | None = None) -> int:
                         image,
                         work_volume,
                         "/benchmark",
-                        "/benchmark/candidates/build-logs",
+                        (
+                            f"/benchmark/sources/{source_key}/.worktrees/"
+                            "benchmark-candidates/build-logs"
+                        ),
                         failure_logs,
                         export_name,
                     )
@@ -794,7 +822,8 @@ def main(argv: list[str] | None = None) -> int:
                     failure_log_detail = (
                         "; candidate build logs could not be exported automatically "
                         f"({log_error}); inspect {work_volume} at "
-                        "/benchmark/candidates/build-logs"
+                        f"/benchmark/sources/{source_key}/.worktrees/"
+                        "benchmark-candidates/build-logs"
                     )
                 raise RuntimeError(
                     "container benchmark failed with exit "
