@@ -79,6 +79,10 @@ Each invocation writes a content-addressed container-environment manifest, so ch
 arguments create a new audit record instead of replacing history. Failed candidate
 build logs are exported under `container-failures/<source-commit>/build-logs/`; if
 that export itself fails, the error identifies the retained work volume and path.
+Each measured source/spec/resource cohort is isolated under
+`runsets/<content-id>/`; `--audit-only` resolves to the same cohort and cannot create
+a second attempt, while a different commit, ref bundle, spec, or resource budget
+cannot be misreported as an unplanned cell in the current runset.
 Container numbers are controlled Linux relative comparisons, not absolute macOS
 latency. See [Container isolation](../docs/BENCHMARK_EXPERIMENTS.md#container-isolation).
 
