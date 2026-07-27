@@ -5787,7 +5787,31 @@ TEST(tool_get_architecture_warns_on_stale_derived_views) {
     ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES));
     ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_PAGERANK));
     ASSERT_NOT_NULL(strstr(inner, "key_functions were omitted"));
+    ASSERT_NOT_NULL(strstr(inner, "\"action_required\""));
+    ASSERT_NOT_NULL(strstr(inner, "index_repository"));
     ASSERT_NULL(strstr(inner, "\"key_functions\""));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv,
+                                 "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+                                 "\"params\":{\"name\":\"get_architecture\","
+                                 "\"arguments\":{\"project\":\"arch-stale\",\"aspects\":[\"all\"],"
+                                 "\"format\":\"toon\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "freshness_state: stale_with_warning"));
+    ASSERT_NOT_NULL(strstr(inner, "freshness_stale_views:"));
+    ASSERT_NOT_NULL(strstr(inner, CBM_STORE_DERIVED_VIEW_ARCHITECTURE));
+    ASSERT_NOT_NULL(strstr(inner, CBM_STORE_DERIVED_VIEW_ROUTES));
+    ASSERT_NOT_NULL(strstr(inner, CBM_STORE_DERIVED_VIEW_PAGERANK));
+    ASSERT_NOT_NULL(strstr(inner, "architecture derived view is stale"));
+    ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
+    ASSERT_NOT_NULL(strstr(inner, "key_functions were omitted"));
+    ASSERT_NOT_NULL(strstr(inner, "action_required:"));
+    ASSERT_NOT_NULL(strstr(inner, "index_repository"));
+    ASSERT_NULL(strstr(inner, "key_functions["));
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);

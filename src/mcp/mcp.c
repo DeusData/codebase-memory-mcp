@@ -5974,7 +5974,7 @@ static char *schema_relationship_pattern_text(const cbm_schema_relationship_t *p
     return cbm_sb_finish(&sb);
 }
 
-static void schema_toon_append_freshness(cbm_sb_t *sb, yyjson_mut_val *root) {
+static void response_toon_append_freshness(cbm_sb_t *sb, yyjson_mut_val *root) {
     yyjson_mut_val *freshness = yyjson_mut_obj_get(root, CBM_MCP_FRESHNESS_KEY);
     if (!freshness || !yyjson_mut_is_obj(freshness)) {
         return;
@@ -6015,6 +6015,23 @@ static void schema_toon_append_freshness(cbm_sb_t *sb, yyjson_mut_val *root) {
                 free(joined);
             }
         }
+    }
+}
+
+static void response_toon_append_warnings(cbm_sb_t *sb, yyjson_mut_val *root) {
+    yyjson_mut_val *warnings = yyjson_mut_obj_get(root, "warnings");
+    if (!warnings || !yyjson_mut_is_arr(warnings)) {
+        return;
+    }
+    const char *warning_columns[] = {"message"};
+    cbm_toon_table_header(sb, "warnings", (int)yyjson_mut_arr_size(warnings), warning_columns, 1);
+    yyjson_mut_arr_iter iter;
+    yyjson_mut_val *warning = NULL;
+    yyjson_mut_arr_iter_init(warnings, &iter);
+    while ((warning = yyjson_mut_arr_iter_next(&iter))) {
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, yyjson_mut_get_str(warning), true);
+        cbm_toon_row_end(sb);
     }
 }
 
@@ -6095,21 +6112,8 @@ static char *schema_to_toon(const cbm_schema_info_t *schema, yyjson_mut_val *roo
     if (adr_hint && yyjson_mut_is_str(adr_hint)) {
         cbm_toon_scalar_str(&sb, "adr_hint", yyjson_mut_get_str(adr_hint));
     }
-    schema_toon_append_freshness(&sb, root);
-    yyjson_mut_val *warnings = yyjson_mut_obj_get(root, "warnings");
-    if (warnings && yyjson_mut_is_arr(warnings)) {
-        const char *warning_columns[] = {"message"};
-        cbm_toon_table_header(&sb, "warnings", (int)yyjson_mut_arr_size(warnings),
-                              warning_columns, 1);
-        yyjson_mut_arr_iter iter;
-        yyjson_mut_val *warning = NULL;
-        yyjson_mut_arr_iter_init(warnings, &iter);
-        while ((warning = yyjson_mut_arr_iter_next(&iter))) {
-            cbm_toon_row_begin(&sb);
-            cbm_toon_cell_str(&sb, yyjson_mut_get_str(warning), true);
-            cbm_toon_row_end(&sb);
-        }
-    }
+    response_toon_append_freshness(&sb, root);
+    response_toon_append_warnings(&sb, root);
     return cbm_sb_finish(&sb);
 }
 
@@ -9715,6 +9719,72 @@ static void arch_node_qn(cbm_store_t *store, int64_t id, char *out, size_t outsz
     free_node_contents(&n);
 }
 
+static bool add_architecture_response_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                             cbm_mcp_server_t *srv, cbm_store_t *store,
+                                             const char *project, bool active_languages_requested,
+                                             bool active_entry_points_requested,
+                                             bool active_routes_requested,
+                                             bool active_file_tree_requested) {
+    bool architecture_stale = project && cbm_store_derived_view_is_stale(
+                                             store, project, CBM_STORE_DERIVED_VIEW_ARCHITECTURE);
+    bool routes_stale =
+        project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES);
+    bool pagerank_stale =
+        project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    if (architecture_stale) {
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+            "architecture derived view is stale; summaries may need a full refresh.");
+    }
+    if (routes_stale) {
+        add_stale_derived_view_warning(doc, root, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                       "routes derived view is stale; route results may be stale.");
+    }
+    if (pagerank_stale) {
+        add_stale_derived_view_warning(
+            doc, root, CBM_STORE_DERIVED_VIEW_PAGERANK,
+            "pagerank derived view is stale; key_functions were omitted.");
+    }
+    if (architecture_stale || routes_stale || pagerank_stale) {
+        char index_action[CBM_SZ_512];
+        char action[CBM_SZ_1K];
+        mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+        snprintf(action, sizeof(action), "Refresh the stale architecture data: %s", index_action);
+        yyjson_mut_obj_add_strcpy(doc, root, "action_required", action);
+    }
+
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    bool active_architecture_reported = add_overlay_active_architecture_freshness(
+        doc, root, store, project, active_languages_requested, active_entry_points_requested,
+        active_routes_requested, active_file_tree_requested, NULL);
+    bool overlay_limitation_reported =
+        !active_architecture_reported &&
+        add_canonical_only_overlay_freshness(
+            doc, root, store, project,
+            "get_architecture reads canonical graph summaries; ready overlay rows are not "
+            "included until active architecture views or compaction are available.");
+    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        if (!active_architecture_reported) {
+            add_canonical_only_read_model(doc, root);
+        }
+        if (!overlay_limitation_reported) {
+            add_response_warning(
+                doc, root,
+                active_architecture_reported
+                    ? "get_architecture used active overlay node rows for requested sections; "
+                      "dirty file changes outside ready overlays may still be absent from "
+                      "canonical summaries until overlay or reindex completes."
+                    : "get_architecture reads canonical graph summaries; dirty file changes may "
+                      "be absent until overlay or reindex completes.");
+        }
+    } else if (overlay_limitation_reported) {
+        add_canonical_only_read_model(doc, root);
+    }
+    return pagerank_stale;
+}
+
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
     if (response_format == CBM_MCP_OUTPUT_INVALID) {
@@ -9845,6 +9915,10 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
     char norm_path[CBM_SZ_512];
     bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
+    bool active_languages_requested = aspect_wanted(aspects_doc, aspects_arr, "languages");
+    bool active_entry_points_requested = aspect_wanted(aspects_doc, aspects_arr, "entry_points");
+    bool active_routes_requested = aspect_wanted(aspects_doc, aspects_arr, "routes");
+    bool active_file_tree_requested = aspect_wanted(aspects_doc, aspects_arr, "file_tree");
 
     /* Response encoding: TOON tables by default; format:"json" restores the
      * legacy per-item objects. */
@@ -10104,8 +10178,19 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             }
         }
 
-        cbm_store_architecture_free(&arch);
-        cbm_store_schema_free(&schema);
+        yyjson_mut_doc *status_doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *status_root = yyjson_mut_obj(status_doc);
+        yyjson_mut_doc_set_root(status_doc, status_root);
+        (void)add_architecture_response_status(
+            status_doc, status_root, srv, store, project, active_languages_requested,
+            active_entry_points_requested, active_routes_requested, active_file_tree_requested);
+        response_toon_append_freshness(&sb, status_root);
+        response_toon_append_warnings(&sb, status_root);
+        yyjson_mut_val *action_required = yyjson_mut_obj_get(status_root, "action_required");
+        if (action_required && yyjson_mut_is_str(action_required)) {
+            cbm_toon_scalar_str(&sb, "action_required", yyjson_mut_get_str(action_required));
+        }
+        yyjson_mut_doc_free(status_doc);
 
         cbm_store_architecture_free(&arch);
         cbm_store_schema_free(&schema);
@@ -10147,58 +10232,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_int(doc, root, "total_nodes", node_count);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edge_count);
-    bool architecture_stale =
-        project && cbm_store_derived_view_is_stale(store, project,
-                                                   CBM_STORE_DERIVED_VIEW_ARCHITECTURE);
-    bool routes_stale =
-        project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES);
-    bool pagerank_stale =
-        project && cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK);
-    if (architecture_stale) {
-        add_stale_derived_view_warning(
-            doc, root, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
-            "architecture derived view is stale; summaries may need a full refresh.");
-    }
-    if (routes_stale) {
-        add_stale_derived_view_warning(doc, root, CBM_STORE_DERIVED_VIEW_ROUTES,
-                                       "routes derived view is stale; route results may be stale.");
-    }
-    int dirty_pending = 0;
-    int dirty_overlay_ready = 0;
-    bool active_languages_requested = aspect_wanted(aspects_doc, aspects_arr, "languages");
-    bool active_entry_points_requested = aspect_wanted(aspects_doc, aspects_arr, "entry_points");
-    bool active_routes_requested = aspect_wanted(aspects_doc, aspects_arr, "routes");
-    bool active_file_tree_requested = aspect_wanted(aspects_doc, aspects_arr, "file_tree");
-    bool active_architecture_reported =
-        add_overlay_active_architecture_freshness(doc, root, store, project,
-                                                  active_languages_requested,
-                                                  active_entry_points_requested,
-                                                  active_routes_requested,
-                                                  active_file_tree_requested, NULL);
-    bool overlay_limitation_reported =
-        !active_architecture_reported &&
-        add_canonical_only_overlay_freshness(
-            doc, root, store, project,
-            "get_architecture reads canonical graph summaries; ready overlay rows are not "
-            "included until active architecture views or compaction are available.");
-    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
-        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        if (!active_architecture_reported) {
-            add_canonical_only_read_model(doc, root);
-        }
-        if (!overlay_limitation_reported) {
-            add_response_warning(
-                doc, root,
-                active_architecture_reported
-                    ? "get_architecture used active overlay node rows for requested sections; "
-                      "dirty file changes outside ready overlays may still be absent from "
-                      "canonical summaries until overlay or reindex completes."
-                    : "get_architecture reads canonical graph summaries; dirty file changes may "
-                      "be absent until overlay or reindex completes.");
-        }
-    } else if (overlay_limitation_reported) {
-        add_canonical_only_read_model(doc, root);
-    }
+    bool pagerank_stale = add_architecture_response_status(
+        doc, root, srv, store, project, active_languages_requested, active_entry_points_requested,
+        active_routes_requested, active_file_tree_requested);
 
     /* Node label summary */
     if (aspect_wanted(aspects_doc, aspects_arr, "structure")) {
@@ -10238,11 +10274,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Key functions: top 10 by PageRank with config + param exclude patterns */
-    if (pagerank_stale) {
-        add_stale_derived_view_warning(
-            doc, root, CBM_STORE_DERIVED_VIEW_PAGERANK,
-            "pagerank derived view is stale; key_functions were omitted.");
-    } else {
+    if (!pagerank_stale) {
         sqlite3 *db = cbm_store_get_db(store);
         if (db) {
             int excl_count = 0;
