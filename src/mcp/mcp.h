@@ -229,6 +229,12 @@ const char *cbm_mcp_server_allowed_root(const cbm_mcp_server_t *srv);
  * coordinator owns background work. */
 void cbm_mcp_server_set_background_tasks(cbm_mcp_server_t *srv, bool enabled);
 
+/* Enable or disable automatic session_project/_context response enrichment.
+ * Enabled by default for client-facing servers. Internal supervised workers
+ * disable it because the requesting parent session owns the single externally
+ * visible context block. */
+void cbm_mcp_server_set_response_context(cbm_mcp_server_t *srv, bool enabled);
+
 void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_executor_fn executor,
                                        void *context);
 

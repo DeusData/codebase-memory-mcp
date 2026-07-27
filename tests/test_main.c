@@ -277,6 +277,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     if (!srv) {
         return 1;
     }
+    cbm_mcp_server_set_response_context(srv, false);
     char *result = cbm_mcp_handle_tool(srv, "index_repository", invocation.args_json);
     if (result) {
         const char *ro = cbm_index_worker_response_out();

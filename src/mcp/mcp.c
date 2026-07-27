@@ -2382,6 +2382,7 @@ struct cbm_mcp_server {
     char *allowed_root;               /* explicit per-session boundary (heap, nullable) */
     bool allowed_root_policy_set;     /* true even when explicit policy is unrestricted */
     bool background_tasks;            /* per-server update/auto-index work enabled */
+    bool response_context;            /* automatic client-facing session/_context delivery */
     struct cbm_watcher *watcher;      /* external watcher ref (not owned) */
     struct cbm_config *config;        /* external config ref (not owned) */
     cbm_mcp_index_executor_fn index_executor;
@@ -3314,6 +3315,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     srv->background_tasks = true;
+    srv->response_context = true;
 
     cbm_mutex_init(&srv->overlay_compaction_lock);
     return srv;
@@ -3488,6 +3490,12 @@ const char *cbm_mcp_server_allowed_root(const cbm_mcp_server_t *srv) {
 void cbm_mcp_server_set_background_tasks(cbm_mcp_server_t *srv, bool enabled) {
     if (srv) {
         srv->background_tasks = enabled;
+    }
+}
+
+void cbm_mcp_server_set_response_context(cbm_mcp_server_t *srv, bool enabled) {
+    if (srv) {
+        srv->response_context = enabled;
     }
 }
 
@@ -4809,6 +4817,10 @@ static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root
 static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 cbm_mcp_server_t *srv, cbm_store_t *store,
                                 const char *context_project) {
+    if (!srv->response_context) {
+        return;
+    }
+
     /* Always include session_project */
     if (srv->session_project[0] && !yyjson_mut_obj_get(root, "session_project"))
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
@@ -16996,7 +17008,7 @@ static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char
      * later calls and explicit missing-project errors add no duplicate lookup.
      * release_request_store below closes the handle on every return path. */
     bool first_context_needed =
-        !srv->context_injected &&
+        srv->response_context && !srv->context_injected &&
         cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
     if (!context_store && first_context_needed && !srv->autoindex_active &&
         (!srv->current_project || !srv->current_project[0]) && project && project[0]) {

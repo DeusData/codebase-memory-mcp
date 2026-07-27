@@ -1508,6 +1508,31 @@ TEST(tool_list_projects_first_context_resolves_session_store) {
     PASS();
 }
 
+TEST(response_context_disabled_does_not_consume_first_delivery) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "internal-worker-context");
+    cbm_mcp_server_set_response_context(srv, false);
+
+    char *internal = cbm_mcp_handle_tool(srv, "search_graph", "{\"name_pattern\":\"nothing\"}");
+    ASSERT_NOT_NULL(internal);
+    ASSERT_NULL(strstr(internal, "\\\"_context\\\":"));
+    ASSERT_NULL(strstr(internal, "session_project"));
+    free(internal);
+
+    /* Suppression is transport ownership, not consumption: once this server is
+     * made client-facing, its first response still carries the automatic block. */
+    cbm_mcp_server_set_response_context(srv, true);
+    char *external = cbm_mcp_handle_tool(srv, "search_graph", "{\"name_pattern\":\"nothing\"}");
+    ASSERT_NOT_NULL(external);
+    ASSERT_NOT_NULL(strstr(external, "\\\"_context\\\":"));
+    ASSERT_NOT_NULL(strstr(external, "session_project"));
+    free(external);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_list_projects_paginates_with_explicit_full_compatibility) {
     char cache[CBM_SZ_256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-list-page-XXXXXX");
@@ -12410,6 +12435,7 @@ enum {
     IDX832_NULL_RESP = 52,   /* supervised entry degraded to NULL */
     IDX832_NOT_INDEXED = 53, /* response/store lacks the indexed Function node */
     IDX832_SERVER_FAIL = 54,
+    IDX832_WORKER_CONTEXT = 55, /* internal response leaked externally-owned _context */
 };
 
 #ifndef _WIN32 /* helper used only by the POSIX fork harness below */
@@ -12436,9 +12462,13 @@ static int idx832_supervised_route_check(const char *repo_dir) {
         return IDX832_NULL_RESP;
     }
     bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+    bool leaked_worker_context = strstr(resp, "\\\"_context\\\":") != NULL;
     free(resp);
     if (!indexed) {
         return IDX832_NOT_INDEXED;
+    }
+    if (leaked_worker_context) {
+        return IDX832_WORKER_CONTEXT;
     }
 
     /* Store-level proof the worker child did real work: the Function node it wrote
@@ -16350,6 +16380,7 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
     RUN_TEST(tool_list_projects_first_context_resolves_session_store);
+    RUN_TEST(response_context_disabled_does_not_consume_first_delivery);
     RUN_TEST(tool_list_projects_paginates_with_explicit_full_compatibility);
     RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
     RUN_TEST(resolve_store_leaves_foreign_sqlite_db_untouched);
