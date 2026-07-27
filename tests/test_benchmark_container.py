@@ -149,6 +149,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
             ["--experiment-root", "/tmp/other"],
             ["--experiment-root=/tmp/other"],
             ["--candidate-root=/tmp/other"],
+            ["--candidate-search-root=/tmp/other"],
             ["--matrix-spec", "/tmp/other.json"],
             ["--product-env=CBM_WORKERS=99"],
         ):

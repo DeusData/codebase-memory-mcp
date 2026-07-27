@@ -363,10 +363,10 @@ def ensure_clean_tracked_worktree(repository: Path, role: str) -> None:
 
 
 def _registered_candidate_worktrees(
-    repository: Path, candidate_root: Path, revision: str
+    repository: Path, candidate_roots: list[Path], revision: str
 ) -> list[Path]:
     listing = _run_text(["git", "worktree", "list", "--porcelain"], cwd=repository)
-    matches: list[Path] = []
+    registered: list[Path] = []
     for block in listing.split("\n\n"):
         fields: dict[str, str] = {}
         for line in block.splitlines():
@@ -375,10 +375,29 @@ def _registered_candidate_worktrees(
                 fields[key] = value
         path_value = fields.get("worktree")
         if fields.get("HEAD") == revision and path_value:
-            candidate = Path(path_value).resolve()
-            if _path_within(candidate, candidate_root):
+            registered.append(Path(path_value).resolve())
+    matches: list[Path] = []
+    seen: set[Path] = set()
+    for root in candidate_roots:
+        for candidate in sorted(registered):
+            if candidate not in seen and _path_within(candidate, root):
                 matches.append(candidate)
-    return sorted(matches)
+                seen.add(candidate)
+    return matches
+
+
+def _resolved_candidate_search_roots(
+    candidate_root: Path, candidate_search_roots: list[Path] | None
+) -> list[Path]:
+    roots = [candidate_root]
+    for value in candidate_search_roots or []:
+        root = value.expanduser().resolve()
+        if root in roots:
+            continue
+        if not root.is_dir():
+            raise ValueError(f"candidate search root is not a directory: {root}")
+        roots.append(root)
+    return roots
 
 
 def _make_probe(
@@ -469,6 +488,7 @@ def materialize_candidate(
     *,
     jobs: int = 2,
     build_environment: dict[str, str] | None = None,
+    candidate_search_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Resolve, isolate, production-build, and hash one benchmark candidate."""
     repository = repository.expanduser().resolve()
@@ -484,8 +504,11 @@ def materialize_candidate(
     source_identity = commit_identity(repository, ref)
     revision = source_identity["revision"]
     candidate_root.mkdir(parents=True, exist_ok=True)
+    search_roots = _resolved_candidate_search_roots(
+        candidate_root, candidate_search_roots
+    )
     intended = candidate_root / f"{safe_label}-{revision[:12]}"
-    matches = _registered_candidate_worktrees(repository, candidate_root, revision)
+    matches = _registered_candidate_worktrees(repository, search_roots, revision)
     if intended in matches:
         worktree = intended
     elif matches:
@@ -667,6 +690,7 @@ def materialize_matrix_candidates(
     spec: dict[str, Any],
     *,
     jobs: int,
+    candidate_search_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Resolve candidate ``ref`` entries into the existing immutable binary schema.
 
@@ -739,13 +763,18 @@ def materialize_matrix_candidates(
             )
             if key in candidate
         }
+        materialize_options: dict[str, Any] = {
+            "jobs": jobs,
+            "build_environment": build_environment,
+        }
+        if candidate_search_roots:
+            materialize_options["candidate_search_roots"] = candidate_search_roots
         materialized = materialize_candidate(
             repository,
             candidate_root,
             label,
             ref,
-            jobs=jobs,
-            build_environment=build_environment,
+            **materialize_options,
         )
         materialized.update(passthrough)
         candidates[index] = materialized
@@ -2508,6 +2537,18 @@ def build_parser() -> argparse.ArgumentParser:
             "specs (default: .worktrees/benchmark-candidates)."
         ),
     )
+    parser.add_argument(
+        "--candidate-search-root",
+        dest="candidate_search_roots",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "Additional existing root containing registered candidate worktrees. "
+            "Repeat in preferred search order; new worktrees and metadata remain "
+            "under --candidate-root."
+        ),
+    )
     parser.add_argument("--build-jobs", type=int, default=2)
     parser.add_argument(
         "--allow-temporary-experiment-root",
@@ -2625,6 +2666,7 @@ def prepare_automatic_experiment(
             label,
             ref,
             jobs=args.build_jobs,
+            candidate_search_roots=args.candidate_search_roots,
         )
         for label, ref in effective_candidate_refs
     ]
@@ -2712,6 +2754,7 @@ def main(argv: list[str] | None = None) -> int:
                 candidate_root,
                 spec,
                 jobs=args.build_jobs,
+                candidate_search_roots=args.candidate_search_roots,
             )
             runset = automatic_runset_identity(spec)
             declared_runset = spec.get("runset_id")

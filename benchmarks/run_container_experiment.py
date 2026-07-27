@@ -28,6 +28,7 @@ DOCKERFILE = ROOT / "test-infrastructure" / "Dockerfile"
 OWNED_RUNNER_FLAGS = frozenset(
     {
         "--candidate-root",
+        "--candidate-search-root",
         "--experiment-root",
         "--matrix-spec",
         "--plan",
