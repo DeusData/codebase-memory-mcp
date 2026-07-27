@@ -69,6 +69,42 @@ TEST(store_search_by_label) {
     PASS();
 }
 
+TEST(store_search_summary_returns_exact_facets_without_node_rows) {
+    int64_t ids[3];
+    cbm_store_t *s = setup_search_store(ids);
+
+    cbm_search_params_t params = {
+        .project = "test",
+        .min_degree = -1,
+        .max_degree = -1,
+        .summary_only = true,
+        /* Summary aggregation is independent of node-page controls. */
+        .limit = 1,
+        .offset = 2,
+    };
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.total, 3);
+    ASSERT_EQ(out.count, 0);
+    ASSERT_NULL(out.results);
+
+    ASSERT_EQ(out.label_facet_count, 2);
+    ASSERT_STR_EQ(out.label_facets[0].value, "Function");
+    ASSERT_EQ(out.label_facets[0].count, 2);
+    ASSERT_STR_EQ(out.label_facets[1].value, "Class");
+    ASSERT_EQ(out.label_facets[1].count, 1);
+
+    ASSERT_EQ(out.file_facet_count, 2);
+    ASSERT_STR_EQ(out.file_facets[0].value, "service.go");
+    ASSERT_EQ(out.file_facets[0].count, 2);
+    ASSERT_STR_EQ(out.file_facets[1].value, "main.go");
+    ASSERT_EQ(out.file_facets[1].count, 1);
+
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Search by name pattern ─────────────────────────────────────── */
 
 TEST(store_search_by_name_pattern) {
@@ -1682,6 +1718,7 @@ TEST(store_find_nodes_rejects_null_store_without_ub) {
 
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
+    RUN_TEST(store_search_summary_returns_exact_facets_without_node_rows);
     RUN_TEST(store_search_by_name_pattern);
     RUN_TEST(store_search_empty_label_ignored);
     RUN_TEST(store_search_by_file_pattern);

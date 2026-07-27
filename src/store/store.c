@@ -10940,6 +10940,117 @@ static int search_execute_sql(cbm_store_t *s, const char *sql, const char *count
     return CBM_STORE_OK;
 }
 
+static void search_bind_statement(sqlite3_stmt *stmt, search_bind_t *binds, int bind_idx) {
+    for (int i = 0; i < bind_idx; i++) {
+        bind_text(stmt, i + SKIP_ONE, binds[i].text);
+    }
+}
+
+static int search_collect_summary_facets(cbm_store_t *s, const char *source_sql,
+                                         const char *column, int row_limit,
+                                         search_bind_t *binds, int bind_idx,
+                                         cbm_search_facet_t **out_facets, int *out_count,
+                                         const char *op) {
+    *out_facets = NULL;
+    *out_count = 0;
+    size_t sql_cap = strlen(source_sql) + CBM_SZ_512;
+    char *sql = malloc(sql_cap);
+    if (!sql) {
+        store_set_error(s, "search summary SQL out of memory");
+        return CBM_STORE_ERR;
+    }
+    int written = snprintf(
+        sql, sql_cap,
+        "SELECT COALESCE(NULLIF(%s, ''), '(unknown)') AS facet, COUNT(*) AS facet_count "
+        "FROM (%s) summary_nodes "
+        "GROUP BY COALESCE(NULLIF(%s, ''), '(unknown)') "
+        "ORDER BY facet_count DESC, facet ASC%s",
+        column, source_sql, column,
+        row_limit > 0 ? " LIMIT ?" : "");
+    if (written < 0 || (size_t)written >= sql_cap) {
+        free(sql);
+        store_set_error(s, "search summary SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        free(sql);
+        store_set_error_sqlite(s, op);
+        return CBM_STORE_ERR;
+    }
+    free(sql);
+    search_bind_statement(stmt, binds, bind_idx);
+    if (row_limit > 0) {
+        sqlite3_bind_int(stmt, bind_idx + SKIP_ONE, row_limit);
+    }
+
+    int cap = ST_INIT_CAP_16;
+    int count = 0;
+    cbm_search_facet_t *facets = calloc((size_t)cap, sizeof(*facets));
+    if (!facets) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "search summary facets out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (count >= cap &&
+            store_grow_array(s, (void **)&facets, &cap, sizeof(*facets),
+                             "search summary facets out of memory", true) != CBM_STORE_OK) {
+            step_rc = SQLITE_NOMEM;
+            break;
+        }
+        facets[count].value =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        if (!facets[count].value) {
+            store_set_error(s, "search summary facet text out of memory");
+            step_rc = SQLITE_NOMEM;
+            break;
+        }
+        facets[count].count = sqlite3_column_int(stmt, SKIP_ONE);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE) {
+        for (int i = 0; i < count; i++) {
+            safe_str_free(&facets[i].value);
+        }
+        free(facets);
+        if (step_rc != SQLITE_NOMEM) {
+            store_set_error_sqlite(s, op);
+        }
+        return CBM_STORE_ERR;
+    }
+
+    *out_facets = facets;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+static int search_execute_summary_sql(cbm_store_t *s, const char *source_sql,
+                                      search_bind_t *binds, int bind_idx,
+                                      search_like_pool_t *like_pool,
+                                      cbm_search_output_t *out) {
+    if (search_collect_summary_facets(s, source_sql, "label", 0, binds, bind_idx,
+                                      &out->label_facets, &out->label_facet_count,
+                                      "search summary labels") != CBM_STORE_OK ||
+        search_collect_summary_facets(s, source_sql, "file_path",
+                                      CBM_SEARCH_SUMMARY_TOP_FILES, binds, bind_idx,
+                                      &out->file_facets, &out->file_facet_count,
+                                      "search summary files") != CBM_STORE_OK) {
+        like_pool_free(like_pool);
+        cbm_store_search_free(out);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < out->label_facet_count; i++) {
+        out->total += out->label_facets[i].count;
+    }
+    like_pool_free(like_pool);
+    return CBM_STORE_OK;
+}
+
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out) {
     memset(out, 0, sizeof(*out));
     if (!s || !s->db) {
@@ -11064,6 +11175,26 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM nodes n WHERE %s", where);
     } else {
         snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM nodes n");
+    }
+
+    if (params->summary_only) {
+        char summary_sql[CBM_SZ_4K];
+        int written;
+        if (has_degree_filter) {
+            written = snprintf(summary_sql, sizeof(summary_sql), "%s", sql);
+        } else if (nparams > 0) {
+            written = snprintf(summary_sql, sizeof(summary_sql),
+                               "SELECT n.label, n.file_path FROM nodes n WHERE %s", where);
+        } else {
+            written = snprintf(summary_sql, sizeof(summary_sql),
+                               "SELECT n.label, n.file_path FROM nodes n");
+        }
+        if (written < 0 || (size_t)written >= sizeof(summary_sql)) {
+            like_pool_free(&like_pool);
+            store_set_error(s, "search summary source SQL truncated");
+            return CBM_STORE_ERR;
+        }
+        return search_execute_summary_sql(s, summary_sql, binds, bind_idx, &like_pool, out);
     }
 
     /* Add ORDER BY + LIMIT */
@@ -11249,6 +11380,27 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
         snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM (%s)", sql);
     }
 
+    if (params->summary_only) {
+        char summary_sql[ST_SQL_BUF];
+        int written;
+        if (has_degree_filter) {
+            written = snprintf(summary_sql, sizeof(summary_sql), "%s", sql);
+        } else if (nparams > 0) {
+            written = snprintf(summary_sql, sizeof(summary_sql),
+                               "%sSELECT n.label, n.file_path FROM active_nodes n WHERE %s",
+                               active_cte, where);
+        } else {
+            written = snprintf(summary_sql, sizeof(summary_sql),
+                               "%sSELECT n.label, n.file_path FROM active_nodes n", active_cte);
+        }
+        if (written < 0 || (size_t)written >= sizeof(summary_sql)) {
+            like_pool_free(&like_pool);
+            store_set_error(s, "search overlay summary source SQL truncated");
+            return CBM_STORE_ERR;
+        }
+        return search_execute_summary_sql(s, summary_sql, binds, bind_idx, &like_pool, out);
+    }
+
     int limit = params->limit > 0 ? params->limit : CBM_DEFAULT_SEARCH_LIMIT;
     int offset = params->offset;
     const char *name_col = has_degree_filter ? "name" : "n.name";
@@ -11317,6 +11469,14 @@ void cbm_store_search_free(cbm_search_output_t *out) {
         free(r->connected_names);
     }
     free(out->results);
+    for (int i = 0; i < out->label_facet_count; i++) {
+        safe_str_free(&out->label_facets[i].value);
+    }
+    free(out->label_facets);
+    for (int i = 0; i < out->file_facet_count; i++) {
+        safe_str_free(&out->file_facets[i].value);
+    }
+    free(out->file_facets);
     memset(out, 0, sizeof(*out));
 }
 
