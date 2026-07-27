@@ -286,16 +286,31 @@ class BenchmarkExperimentTest(unittest.TestCase):
     ) -> None:
         quick = EXPERIMENT.parse_arguments([])
         full = EXPERIMENT.parse_arguments(["--full"])
+        full_cli = EXPERIMENT.parse_arguments(["--full", "--transport", "cli"])
         explicit = EXPERIMENT.parse_arguments(
             ["--matrix-spec", "legacy-spec.json", "--experiment-root", "legacy-results"]
         )
 
         self.assertEqual(quick.preset, "quick")
+        self.assertEqual(quick.transport, "mcp")
         self.assertEqual(full.preset, "full")
+        self.assertEqual(full.transport, "mcp")
+        self.assertEqual(full_cli.transport, "cli")
         self.assertIsNone(explicit.preset)
         self.assertEqual(explicit.matrix_spec, Path("legacy-spec.json"))
         with self.assertRaises(SystemExit):
             EXPERIMENT.parse_arguments(["--full", "--matrix-spec", "spec.json"])
+        with self.assertRaises(SystemExit):
+            EXPERIMENT.parse_arguments(
+                [
+                    "--matrix-spec",
+                    "legacy-spec.json",
+                    "--experiment-root",
+                    "legacy-results",
+                    "--transport",
+                    "cli",
+                ]
+            )
 
     def test_default_candidates_use_current_upstream_stable_run_premerge_and_head(
         self,
@@ -362,9 +377,13 @@ class BenchmarkExperimentTest(unittest.TestCase):
             full = EXPERIMENT.build_automatic_spec(
                 root, benchmark, candidates, preset="full"
             )
+            full_cli = EXPERIMENT.build_automatic_spec(
+                root, benchmark, candidates, preset="full", transport="cli"
+            )
 
             self.assertEqual(quick["repetitions"], 1)
             self.assertEqual(quick["index_mode"], "fast")
+            self.assertEqual(quick["transports"], ["mcp"])
             self.assertIn("commit_datetime", quick["repository_background"])
             self.assertEqual(
                 [item["label"] for item in quick["profiles"]],
@@ -403,6 +422,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             )
             self.assertEqual(full["repetitions"], 3)
             self.assertEqual(full["index_mode"], "moderate")
+            self.assertEqual(full_cli["transports"], ["cli"])
             self.assertEqual(
                 [item["label"] for item in full["profiles"]],
                 [
