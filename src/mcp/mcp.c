@@ -12446,6 +12446,20 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     return result;
 }
 
+static bool index_status_is_published(const char *status) {
+    return status && (strcmp(status, "indexed") == 0 || strcmp(status, "degraded") == 0);
+}
+
+static bool index_payload_is_published(const char *payload) {
+    yyjson_doc *document = payload ? yyjson_read(payload, strlen(payload), 0) : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *status_value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "status") : NULL;
+    const char *status = status_value ? yyjson_get_str(status_value) : NULL;
+    bool published = index_status_is_published(status);
+    yyjson_doc_free(document);
+    return published;
+}
+
 bool cbm_mcp_index_response_published(const char *response) {
     if (!response) {
         return false;
@@ -12458,11 +12472,7 @@ bool cbm_mcp_index_response_published(const char *response) {
     yyjson_val *item = content && yyjson_is_arr(content) ? yyjson_arr_get(content, 0) : NULL;
     yyjson_val *text_value = item ? yyjson_obj_get(item, "text") : NULL;
     const char *text = text_value ? yyjson_get_str(text_value) : NULL;
-    yyjson_doc *inner = text ? yyjson_read(text, strlen(text), 0) : NULL;
-    yyjson_val *status_value = inner ? yyjson_obj_get(yyjson_doc_get_root(inner), "status") : NULL;
-    const char *status = status_value ? yyjson_get_str(status_value) : NULL;
-    bool published = status && (strcmp(status, "indexed") == 0 || strcmp(status, "degraded") == 0);
-    yyjson_doc_free(inner);
+    bool published = index_payload_is_published(text);
     yyjson_doc_free(outer);
     return published;
 }
@@ -16985,8 +16995,30 @@ static void release_request_store(cbm_mcp_server_t *srv) {
  * Handlers remain responsible only for their own payload. Rebuilding the
  * standard one-block MCP result also keeps text, structuredContent, isError,
  * and token metadata consistent after JSON or TOON augmentation. */
-static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char *args_json,
-                                               char *result) {
+static bool copy_published_index_result_project(const char *payload, char *project,
+                                                size_t project_size) {
+    if (!payload || !project || project_size == 0) {
+        return false;
+    }
+    yyjson_doc *document = yyjson_read(payload, strlen(payload), 0);
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *status_value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "status") : NULL;
+    yyjson_val *value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "project") : NULL;
+    const char *status =
+        status_value && yyjson_is_str(status_value) ? yyjson_get_str(status_value) : NULL;
+    const char *name = value && yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
+    size_t name_length = name ? strlen(name) : 0;
+    bool copied =
+        index_status_is_published(status) && name_length > 0 && name_length < project_size;
+    if (copied) {
+        memcpy(project, name, name_length + 1);
+    }
+    yyjson_doc_free(document);
+    return copied;
+}
+
+static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char *tool_name,
+                                               const char *args_json, char *result) {
     if (!srv || !result) {
         return result;
     }
@@ -17005,10 +17037,24 @@ static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char
         return result;
     }
 
+    char context_project_copy[sizeof(srv->session_project)] = {0};
+    bool first_context_needed =
+        srv->response_context && !srv->context_injected &&
+        cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
     const char *project = srv->current_project && srv->current_project[0]
                               ? srv->current_project
                               : (srv->session_project[0] ? srv->session_project : NULL);
-    char context_project_copy[sizeof(srv->session_project)] = {0};
+    /* A coordinated/supervised index runs in another process, so the parent
+     * has no current_project handle even though the returned publication is
+     * ready. The successful result's project key is the publication authority:
+     * use it for the one-shot context instead of emitting the unrelated caller
+     * session's not_indexed state. Parse only this first index response; all
+     * ordinary graph calls retain the existing request-scoped store fast path. */
+    if (first_context_needed && tool_name && strcmp(tool_name, "index_repository") == 0 &&
+        copy_published_index_result_project(text, context_project_copy,
+                                            sizeof(context_project_copy))) {
+        project = context_project_copy;
+    }
     bool json_requested =
         cbm_mcp_response_format(srv, args_json) == CBM_MCP_OUTPUT_JSON;
     cbm_store_t *context_store =
@@ -17021,13 +17067,12 @@ static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char
      * enabled context and only when no explicit tool project was resolved, so
      * later calls and explicit missing-project errors add no duplicate lookup.
      * release_request_store below closes the handle on every return path. */
-    bool first_context_needed =
-        srv->response_context && !srv->context_injected &&
-        cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
     if (!context_store && first_context_needed && !srv->autoindex_active &&
         (!srv->current_project || !srv->current_project[0]) && project && project[0]) {
-        snprintf(context_project_copy, sizeof(context_project_copy), "%s", project);
-        project = context_project_copy;
+        if (project != context_project_copy) {
+            snprintf(context_project_copy, sizeof(context_project_copy), "%s", project);
+            project = context_project_copy;
+        }
         context_store = resolve_store(srv, project);
     }
     /* Try the JSON-object path once. The serializer already parses and rejects
@@ -17061,7 +17106,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return cbm_mcp_text_result("request cancellation scope unavailable", true);
     }
     char *result = dispatch_tool(srv, tool_name, args_json);
-    result = mcp_tool_result_with_context_once(srv, args_json, result);
+    result = mcp_tool_result_with_context_once(srv, tool_name, args_json, result);
     if (srv) {
         cbm_mcp_server_request_scope_end(srv);
     }
