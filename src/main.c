@@ -3,7 +3,7 @@
  *
  * Modes:
  *   (default)       Run as MCP server on stdin/stdout (JSON-RPC 2.0)
- *   cli <tool> <json>  Run a single tool call and print result
+ *   cli <tool> [flags] Run a single tool call and print result
  *   --version       Print version and exit
  *   --help          Print usage and exit
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
@@ -476,7 +476,8 @@ static bool client_start_parent_watchdog(pid_t initial_ppid) {
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
+#define CLI_USAGE                                                                            \
+    "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [--flag value ...]\n"
 
 static bool cli_args_request_help(int argc, char **argv) {
     for (int i = 0; i < argc; i++) {
@@ -499,8 +500,9 @@ static void print_cli_help(void) {
     fputs("  --json       Print the raw MCP tool-result JSON envelope\n", stdout);
     fputs("  --progress   Print progress diagnostics to stderr during tool execution\n", stdout);
     fputs("\nExamples:\n", stdout);
-    fputs("  codebase-memory-mcp cli search_graph '{\"query\":\"handler\"}'\n", stdout);
-    fputs("  codebase-memory-mcp cli --json trace_path '{\"function_name\":\"main\"}'\n", stdout);
+    fputs("  codebase-memory-mcp cli search_graph --query handler\n", stdout);
+    fputs("  codebase-memory-mcp cli --json trace_path --function-name main\n", stdout);
+    fputs("  echo '{\"query\":\"handler\"}' | codebase-memory-mcp cli search_graph\n", stdout);
     fputs("\nRun `codebase-memory-mcp --help` for the default and advanced tool lists.\n", stdout);
 }
 

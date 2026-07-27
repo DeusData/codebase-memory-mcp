@@ -14075,7 +14075,6 @@ int cbm_cli_print_tool_help(const char *tool_name) {
     printf("  codebase-memory-mcp cli %s --flag value [--flag2 value2 ...]\n", tool_name);
     printf("  codebase-memory-mcp cli %s --args-file <path-to-json>\n", tool_name);
     printf("  echo '<json>' | codebase-memory-mcp cli %s\n", tool_name);
-    printf("  codebase-memory-mcp cli %s '<raw-json-args>'\n", tool_name);
 
     printf("\nFlags:\n");
     if (props && yyjson_is_obj(props)) {
@@ -14125,7 +14124,7 @@ void cbm_cli_print_main_help(void) {
     printf("codebase-memory-mcp %s\n\n", cbm_cli_get_version());
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
-    printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
+    printf("  codebase-memory-mcp cli <tool> [--flag value ...]  Run a single tool\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");

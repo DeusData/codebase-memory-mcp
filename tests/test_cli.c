@@ -11753,9 +11753,39 @@ TEST(cli_build_args_json_bad_positional_errors_issue680) {
     PASS();
 }
 
-/* Per-tool --help returns 0 for a known tool, -1 for an unknown one. */
+/* Per-tool --help returns 0 for a known tool, -1 for an unknown one, and
+ * teaches only the preferred argument forms. Inline JSON remains accepted for
+ * compatibility, but advertising a deprecated form makes the CLI easy to use
+ * incorrectly. */
 TEST(cli_print_tool_help_issue680) {
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    ASSERT_TRUE(saved_stdout >= 0);
+    int fds[2];
+    ASSERT_EQ(cbm_pipe(fds), 0);
+    dup2(fds[1], STDOUT_FILENO);
+    close(fds[1]);
+
     ASSERT_EQ(cbm_cli_print_tool_help("index_repository"), 0);
+
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    static char help_buf[8192];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(help_buf) - 1 &&
+           (n = read(fds[0], help_buf + used, sizeof(help_buf) - 1 - used)) > 0) {
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    help_buf[used] = '\0';
+
+    ASSERT_NOT_NULL(strstr(help_buf, "--flag value"));
+    ASSERT_NOT_NULL(strstr(help_buf, "--args-file"));
+    ASSERT_NOT_NULL(strstr(help_buf, "echo '<json>'"));
+    ASSERT_NULL(strstr(help_buf, "raw-json-args"));
     ASSERT_EQ(cbm_cli_print_tool_help("nope_not_a_tool"), -1);
     PASS();
 }
@@ -13461,6 +13491,10 @@ TEST(cli_main_help_lists_config_preset_subcommand) {
     ASSERT_NOT_NULL(strstr(help_buf, "config preset <list|apply>"));
     /* Installed evidence guidance names this advanced tool, so help must too. */
     ASSERT_NOT_NULL(strstr(help_buf, "check_index_coverage"));
+    /* Prefer the schema-derived flag form; deprecated inline JSON must not be
+     * the generic top-level contract. */
+    ASSERT_NOT_NULL(strstr(help_buf, "cli <tool> [--flag value ...]"));
+    ASSERT_NULL(strstr(help_buf, "cli <tool> [json]"));
     PASS();
 }
 
