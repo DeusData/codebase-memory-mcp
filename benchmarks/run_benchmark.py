@@ -324,6 +324,17 @@ SELF_DOGFOOD_SCENARIOS_DEFAULT = (
 SELF_DOGFOOD_MARKER_PREFIX = "cbm_pan4_oracle"
 SELF_DOGFOOD_REPO_SUBDIR = "repo"
 SELF_DOGFOOD_CACHE_SUBDIR = "cache"
+SELF_DOGFOOD_SCENARIO_PATHS = {
+    "noop": (),
+    "one_source_file": ("src/pipeline/pipeline_internal.h",),
+    "route_handler": ("src/ui/http_server.c",),
+    "c_new_leaf": ("src/cbm_benchmark_leaf.c",),
+    "store_pipeline_batch": (
+        "src/store/store.h",
+        "src/pipeline/pipeline_internal.h",
+    ),
+    "multi_file_small": ("src/mcp/mcp.c", "tests/test_mcp.c"),
+}
 FASTAPI_PROBE_REL_PATH = "fastapi/routing.py"
 FASTAPI_PROBE_INSERT_BEFORE = "\n    def add_api_route(\n"
 FASTAPI_PROBE_RETURN_VALUE = 64
@@ -524,6 +535,9 @@ def report_capability_manifest(
 
 
 def report_scope_manifest(report: dict[str, Any]) -> dict[str, Any]:
+    recorded = report.get("scope")
+    if isinstance(recorded, dict):
+        return recorded
     parameters = report.get("parameters")
     parameters = parameters if isinstance(parameters, dict) else {}
     background = report.get("repository_background")
@@ -560,10 +574,10 @@ def report_scope_manifest(report: dict[str, Any]) -> dict[str, Any]:
 def report_cache_manifest(
     report: dict[str, Any], imported_report: bool
 ) -> dict[str, Any]:
+    recorded = report.get("cache")
+    if isinstance(recorded, dict):
+        return recorded
     if imported_report:
-        recorded = report.get("cache")
-        if isinstance(recorded, dict):
-            return recorded
         return {
             "process": unknown_fact(
                 "imported_report_did_not_record_process_cache_state"
@@ -4877,18 +4891,7 @@ def create_c_marker_file(repo_dir: Path, rel_path: str, marker: str, value: int)
 def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
     marker = self_dogfood_marker(name)
     changed: list[str] = []
-    scenario_paths = {
-        "noop": [],
-        "one_source_file": ["src/pipeline/pipeline_internal.h"],
-        "route_handler": ["src/ui/http_server.c"],
-        "c_new_leaf": ["src/cbm_benchmark_leaf.c"],
-        "store_pipeline_batch": [
-            "src/store/store.h",
-            "src/pipeline/pipeline_internal.h",
-        ],
-        "multi_file_small": ["src/mcp/mcp.c", "tests/test_mcp.c"],
-    }
-    paths = scenario_paths.get(name)
+    paths = SELF_DOGFOOD_SCENARIO_PATHS.get(name)
     if paths is None:
         raise ValueError(f"unknown self-dogfood scenario: {name}")
     before_hashes = {
@@ -6620,6 +6623,82 @@ def run_self_dogfood_case(
     return result
 
 
+def self_dogfood_scope_manifest(
+    source_revision: str,
+    source_tree: str,
+    scenarios: list[str],
+) -> dict[str, Any]:
+    return {
+        "workload": "self_dogfood",
+        "input_tree": {
+            "revision": source_revision,
+            "tree": source_tree,
+            "identity_source": "git_commit_and_tree_objects",
+        },
+        "mutation_policy": {
+            "kind": "deterministic_named_mutations",
+            "source": "mutate_self_dogfood_scenario",
+            "scenarios": [
+                {
+                    "name": scenario,
+                    "changed_paths": list(SELF_DOGFOOD_SCENARIO_PATHS[scenario]),
+                }
+                for scenario in scenarios
+            ],
+        },
+        "functions_per_file": {
+            "status": "not_applicable",
+            "reason": "real_repository_workload",
+        },
+        "generated_source_policy": {
+            "kind": "exact_git_tree_plus_deterministic_mutation",
+            "source": "create_self_dogfood_worktree_and_mutate_self_dogfood_scenario",
+        },
+    }
+
+
+def self_dogfood_cache_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    dependency_state = (
+        "disabled_by_explicit_config"
+        if args.config_overrides.get("auto_index_deps") == "false"
+        else "isolated_under_harness_cache_root"
+    )
+    return {
+        "process": {
+            "state": (
+                "persistent_within_lifecycle"
+                if args.transport == "mcp"
+                else "new_per_tool_call"
+            ),
+            "source": "transport_contract",
+        },
+        "repository_graph": {
+            "initial_state": "empty_harness_owned_cache",
+            "reset_procedure": "remove_project_dbs_before_clean_rebuild",
+        },
+        "dependency_artifacts": {
+            "state": dependency_state,
+            "cache_scope": "isolated_per_benchmark_case",
+        },
+        "os_page_cache": {
+            "state": "uncontrolled_by_harness",
+            "measurement_policy": "record_and_compare_only_on_identical_host_manifest",
+        },
+        "sqlite_page_cache": {
+            "state": "candidate_process_local_default",
+            "database_reset": "project_db_files_removed_before_clean_rebuild",
+        },
+        "parser_compiler_cache": {
+            "state": "not_applicable",
+            "reason": "tree_sitter_parsers_are_compiled_into_candidate_binary",
+        },
+        "fixture_cache": {
+            "state": "not_applicable",
+            "reason": "fresh_detached_git_worktree_per_case",
+        },
+    }
+
+
 def run_self_dogfood(
     args: argparse.Namespace, binary: Path
 ) -> tuple[dict[str, Any], int]:
@@ -6644,6 +6723,18 @@ def run_self_dogfood(
     scenarios = [
         item.strip() for item in args.self_dogfood_scenarios.split(",") if item.strip()
     ]
+    for scenario in scenarios:
+        if scenario not in SELF_DOGFOOD_SCENARIO_PATHS:
+            raise ValueError(f"unknown self-dogfood scenario: {scenario}")
+    repository_background = {
+        "repo": str(source_repo),
+        "revision": source_revision,
+        "tree": source_tree,
+        "source_dirty_status_short": command_stdout(
+            ["git", "status", "--short"], args.timeout, source_repo
+        ),
+        "copy_policy": "detached_worktree_from_exact_commit",
+    }
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
@@ -6651,16 +6742,14 @@ def run_self_dogfood(
         "work_root": str(work_root),
         "source_repo": str(source_repo),
         "source_git": git_metadata(source_repo, args.timeout),
-        "repository_background": {
-            "repo": str(source_repo),
-            "revision": source_revision,
-            "tree": source_tree,
-            "source_dirty_status_short": command_stdout(
-                ["git", "status", "--short"], args.timeout, source_repo
-            ),
-            "copy_policy": "detached_worktree_from_exact_commit",
-        },
+        "repository_background": repository_background,
         "mode": "self_dogfood",
+        "scope": self_dogfood_scope_manifest(
+            source_revision,
+            source_tree,
+            scenarios,
+        ),
+        "cache": self_dogfood_cache_manifest(args),
         "parameters": {
             "rank_refresh": args.rank_refresh,
             "rank_refresh_override_applied": (
