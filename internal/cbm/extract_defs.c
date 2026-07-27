@@ -1994,12 +1994,98 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
+typedef struct {
+    const char *start;
+    const char *end;
+} rust_cfg_span_t;
+
+/* Accept only a direct #[cfg(...)] attribute. cfg_attr may contain a nested
+ * cfg token, but it has different conditional semantics and must not be
+ * mistaken for an unconditional identity predicate. */
+static bool rust_direct_cfg_span(TSNode attr, const char *source, rust_cfg_span_t *span) {
+    uint32_t start = ts_node_start_byte(attr);
+    uint32_t end = ts_node_end_byte(attr);
+    if (!source || !span || end <= start) {
+        return false;
+    }
+    const char *p = source + start;
+    const char *attr_end = source + end;
+    while (p < attr_end && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (p >= attr_end || *p++ != '#') {
+        return false;
+    }
+    while (p < attr_end && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (p >= attr_end || *p++ != '[') {
+        return false;
+    }
+    while (p < attr_end && isspace((unsigned char)*p)) {
+        p++;
+    }
+    const char *cfg = p;
+    const size_t cfg_name_len = sizeof("cfg") - SKIP_ONE;
+    if ((size_t)(attr_end - p) < cfg_name_len || memcmp(p, "cfg", cfg_name_len) != 0) {
+        return false;
+    }
+    p += cfg_name_len;
+    while (p < attr_end && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (p >= attr_end || *p != '(') {
+        return false;
+    }
+    const char *cfg_end = attr_end;
+    while (cfg_end > p && cfg_end[-SKIP_ONE] != ')') {
+        cfg_end--;
+    }
+    if (cfg_end <= p) {
+        return false;
+    }
+    span->start = cfg;
+    span->end = cfg_end;
+    return true;
+}
+
+/* Copy a stable predicate spelling, removing only insignificant whitespace
+ * outside quoted values. Keeping quotes and in-string spaces prevents
+ * feature="a b" from colliding with feature="ab". */
+static size_t rust_compact_cfg_span(char *dst, rust_cfg_span_t span) {
+    size_t out = 0;
+    char quote = '\0';
+    bool escaped = false;
+    for (const char *p = span.start; p < span.end; p++) {
+        bool keep = quote || !isspace((unsigned char)*p);
+        if (keep && dst) {
+            dst[out] = *p;
+        }
+        if (keep) {
+            out++;
+        }
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (*p == '\\') {
+                escaped = true;
+            } else if (*p == quote) {
+                quote = '\0';
+            }
+        } else if (*p == '"' || *p == '\'') {
+            quote = *p;
+        }
+    }
+    return out;
+}
+
 const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode node, const char *source,
                                         const char *base_qn) {
     if (!a || !source || !base_qn) {
         return base_qn;
     }
     const CBMLangSpec *spec = cbm_lang_spec(CBM_LANG_RUST);
+    TSNode first = node;
     TSNode prev = ts_node_prev_sibling(node);
     while (!ts_node_is_null(prev)) {
         if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
@@ -2009,34 +2095,53 @@ const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode node, const char *so
             prev = ts_node_prev_sibling(prev);
             continue;
         }
-        uint32_t start = ts_node_start_byte(prev);
-        uint32_t end = ts_node_end_byte(prev);
-        if (end <= start) {
-            prev = ts_node_prev_sibling(prev);
-            continue;
-        }
-        const char *cfg = cbm_memmem(source + start, (size_t)(end - start), "cfg(", 4);
-        if (!cfg) {
-            prev = ts_node_prev_sibling(prev);
-            continue;
-        }
-        /* Build a compact predicate suffix from the cfg(...) text, dropping
-         * whitespace and quotes so the QN stays readable and stable. Read the
-         * source span directly: call-scope tracking must not allocate a second
-         * decorator array for every Rust function. */
-        char buf[CBM_SZ_256];
-        size_t bi = 0;
-        const char *limit = source + end;
-        for (const char *p = cfg; p < limit && bi + 1 < sizeof(buf); p++) {
-            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
-                continue;
-            }
-            buf[bi++] = *p;
-        }
-        buf[bi] = '\0';
-        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
+        first = prev;
+        prev = ts_node_prev_sibling(prev);
     }
-    return base_qn;
+
+    size_t base_len = strlen(base_qn);
+    size_t result_len = base_len;
+    bool found = false;
+    for (TSNode attr = first; !ts_node_is_null(attr) && !ts_node_eq(attr, node);
+         attr = ts_node_next_sibling(attr)) {
+        if (!cbm_kind_in_set(attr, spec->decorator_node_types)) {
+            continue;
+        }
+        rust_cfg_span_t span;
+        if (!rust_direct_cfg_span(attr, source, &span)) {
+            continue;
+        }
+        size_t compact_len = rust_compact_cfg_span(NULL, span);
+        if (result_len >= SIZE_MAX || compact_len > SIZE_MAX - result_len - SKIP_ONE) {
+            return base_qn;
+        }
+        result_len += SKIP_ONE + compact_len;
+        found = true;
+    }
+    if (!found || result_len == SIZE_MAX) {
+        return base_qn;
+    }
+
+    char *result = cbm_arena_alloc(a, result_len + SKIP_ONE);
+    if (!result) {
+        return base_qn;
+    }
+    memcpy(result, base_qn, base_len);
+    size_t out = base_len;
+    for (TSNode attr = first; !ts_node_is_null(attr) && !ts_node_eq(attr, node);
+         attr = ts_node_next_sibling(attr)) {
+        if (!cbm_kind_in_set(attr, spec->decorator_node_types)) {
+            continue;
+        }
+        rust_cfg_span_t span;
+        if (!rust_direct_cfg_span(attr, source, &span)) {
+            continue;
+        }
+        result[out++] = '#';
+        out += rust_compact_cfg_span(result + out, span);
+    }
+    result[out] = '\0';
+    return result;
 }
 
 // Extract base class name text from a single base_class child node.

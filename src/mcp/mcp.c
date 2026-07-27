@@ -721,9 +721,6 @@ enum {
 #define CBM_MCP_UPDATE_CHECK_TIMEOUT_S 5
 #define CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S "update_check_timeout_s"
 
-/* Config key: comma-separated glob patterns to exclude from key_functions.
- * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
-#define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
 /* Bound on the key_functions summary PUSHED in the first-response _context
  * header (closes the codebase://architecture pull-only gap). Smaller than the
  * get_architecture default (25) to keep first-response token cost modest. */
@@ -4833,25 +4830,56 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
     yyjson_mut_obj_add_val(doc, ctx, "edge_types", type_arr);
     cbm_store_schema_free(&schema);
+
+    bool rank_enabled = cbm_config_get_bool(srv->config, CBM_CONFIG_RANK_ENABLED, true);
+    const char *configured_rank_refresh =
+        cbm_config_get(srv->config, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFAULT);
+    if (!configured_rank_refresh || !configured_rank_refresh[0]) {
+        configured_rank_refresh = CBM_RANK_REFRESH_DEFAULT;
+    }
+    /* cbm_config_get returns TLS scratch storage; copy before reading the
+     * key-functions filter below so the reported policy cannot be overwritten. */
+    char rank_refresh[CBM_SZ_128];
+    snprintf(rank_refresh, sizeof(rank_refresh), "%s", configured_rank_refresh);
+
+    yyjson_mut_val *architecture = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, architecture, "rank_enabled", rank_enabled);
+    yyjson_mut_obj_add_strcpy(doc, architecture, "rank_refresh", rank_refresh);
     if (!store || !graph_ready) {
+        yyjson_mut_obj_add_bool(doc, architecture, "key_functions_available", false);
+        yyjson_mut_obj_add_str(doc, architecture, "status", "unavailable");
+        yyjson_mut_obj_add_str(
+            doc, architecture, "detail",
+            "Architecture summaries require a ready graph; PageRank and key_functions are "
+            "unavailable until the indexing state above is resolved.");
+        yyjson_mut_obj_add_str(
+            doc, architecture, "action",
+            "Resolve _context.action_required, then retry a graph tool to receive architecture "
+            "metadata automatically.");
+        yyjson_mut_obj_add_val(doc, ctx, "architecture", architecture);
         yyjson_mut_obj_add_val(doc, root, "_context", ctx);
         return;
     }
 
-    /* PageRank stats */
+    /* Architecture availability is a first-response contract, not an inference
+     * from missing key_functions. Reuse the configured rank policy and derived
+     * freshness authority so disabled, stale, and absent ranks remain
+     * distinguishable and actionable in every output format. */
     sqlite3 *db = cbm_store_get_db(store);
     bool pagerank_stale =
         proj && cbm_store_derived_view_is_stale(store, proj, CBM_STORE_DERIVED_VIEW_PAGERANK);
-    if (db && proj && !pagerank_stale) {
+    int ranked_nodes = 0;
+    int key_functions_count = 0;
+    if (db && proj && rank_enabled && !pagerank_stale) {
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(db,
                 "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
                 -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
-                int ranked = sqlite3_column_int(stmt, 0);
-                if (ranked > 0) {
-                    yyjson_mut_obj_add_int(doc, ctx, "ranked_nodes", ranked);
+                ranked_nodes = sqlite3_column_int(stmt, 0);
+                if (ranked_nodes > 0) {
+                    yyjson_mut_obj_add_int(doc, ctx, "ranked_nodes", ranked_nodes);
                     const char *ts = (const char *)sqlite3_column_text(stmt, 1);
                     if (ts) yyjson_mut_obj_add_strcpy(doc, ctx, "pagerank_computed_at", ts);
                 }
@@ -4866,7 +4894,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
      * reliable delivery channel into the model is this _context header). Honors
      * key_functions_exclude (config). Bounded by the configured context limit
      * to keep the first-response token cost modest. */
-    if (db && proj && !pagerank_stale) {
+    if (db && proj && rank_enabled && !pagerank_stale && ranked_nodes > 0) {
         const char *kf_exclude = srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
             : "";
@@ -4891,6 +4919,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                     }
                     add_pagerank_val(doc, kf, sqlite3_column_double(kf_stmt, 4));
                     yyjson_mut_arr_add_val(kf_arr, kf);
+                    key_functions_count++;
                 }
                 sqlite3_finalize(kf_stmt);
                 yyjson_mut_obj_add_val(doc, ctx, "key_functions", kf_arr);
@@ -4898,6 +4927,63 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
             free(kf_sql);
         }
     }
+
+    yyjson_mut_obj_add_bool(doc, architecture, "key_functions_available", key_functions_count > 0);
+    char rank_action[CBM_SZ_1K];
+    char index_action[CBM_SZ_512];
+    if (!rank_enabled) {
+        mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+        yyjson_mut_obj_add_str(doc, architecture, "status", "disabled");
+        snprintf(rank_action, sizeof(rank_action),
+                 "%s=false; PageRank and key_functions are intentionally not computed.",
+                 CBM_CONFIG_RANK_ENABLED);
+        yyjson_mut_obj_add_strcpy(doc, architecture, "detail", rank_action);
+        snprintf(rank_action, sizeof(rank_action),
+                 "Run codebase-memory-mcp config set %s true, then %s", CBM_CONFIG_RANK_ENABLED,
+                 index_action);
+        yyjson_mut_obj_add_strcpy(doc, architecture, "action", rank_action);
+    } else if (pagerank_stale) {
+        mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+        yyjson_mut_obj_add_str(doc, architecture, "status", "stale");
+        yyjson_mut_obj_add_str(
+            doc, architecture, "detail",
+            "PageRank is stale; key_functions and rank values were omitted rather than returning "
+            "misleading architecture.");
+        snprintf(
+            rank_action, sizeof(rank_action),
+            "%s=%s permits deferred rank refresh after some incremental publications. %s "
+            "To refresh at every future publication, run codebase-memory-mcp config set %s %s.",
+            CBM_CONFIG_RANK_REFRESH, rank_refresh, index_action, CBM_CONFIG_RANK_REFRESH,
+            CBM_RANK_REFRESH_AT_PUBLISH);
+        yyjson_mut_obj_add_strcpy(doc, architecture, "action", rank_action);
+        add_stale_derived_view_warning(doc, ctx, CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                       "pagerank derived view is stale; key_functions and stale "
+                                       "PageRank values were omitted.");
+    } else if (ranked_nodes <= 0) {
+        mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+        yyjson_mut_obj_add_str(doc, architecture, "status", "unavailable");
+        yyjson_mut_obj_add_str(
+            doc, architecture, "detail",
+            "PageRank is enabled, but no current rank rows are available; key_functions could "
+            "not be selected.");
+        snprintf(rank_action, sizeof(rank_action),
+                 "%s If indexing is already ready and rank rows remain absent, inspect indexing "
+                 "diagnostics.",
+                 index_action);
+        yyjson_mut_obj_add_strcpy(doc, architecture, "action", rank_action);
+    } else {
+        yyjson_mut_obj_add_str(doc, architecture, "status", "available");
+        if (key_functions_count == 0) {
+            yyjson_mut_obj_add_str(
+                doc, architecture, "detail",
+                "PageRank is current and usable, but no key-function preview rows were produced.");
+            snprintf(rank_action, sizeof(rank_action),
+                     "Review %s if a key_functions preview is expected, then retry.",
+                     CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE);
+            yyjson_mut_obj_add_strcpy(doc, architecture, "action", rank_action);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, ctx, "architecture", architecture);
 
     yyjson_mut_obj_add_val(doc, root, "_context", ctx);
 }
@@ -5054,6 +5140,18 @@ static void toon_append_context_model(cbm_sb_t *sb, yyjson_mut_val *root) {
         toon_append_mut_bool(sb, coverage, "hash_records_complete",
                              "_context_coverage_hash_records_complete");
         toon_append_mut_string(sb, coverage, "action", "_context_coverage_action");
+    }
+    yyjson_mut_val *architecture = yyjson_mut_obj_get(ctx, "architecture");
+    if (architecture && yyjson_mut_is_obj(architecture)) {
+        toon_append_mut_string(sb, architecture, "status", "_context_architecture_status");
+        toon_append_mut_bool(sb, architecture, "rank_enabled",
+                             "_context_architecture_rank_enabled");
+        toon_append_mut_string(sb, architecture, "rank_refresh",
+                               "_context_architecture_rank_refresh");
+        toon_append_mut_bool(sb, architecture, "key_functions_available",
+                             "_context_architecture_key_functions_available");
+        toon_append_mut_string(sb, architecture, "detail", "_context_architecture_detail");
+        toon_append_mut_string(sb, architecture, "action", "_context_architecture_action");
     }
     toon_append_context_warnings(sb, ctx);
 }
@@ -17545,7 +17643,7 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
 }
 
-/* CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE defined in constants section at top of file */
+/* CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE is shared with the config registry via cli.h. */
 
 /* Build a key_functions SQL query with optional exclude patterns.
  * exclude_csv: comma-separated globs from config, or NULL.

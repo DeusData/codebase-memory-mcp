@@ -3014,6 +3014,7 @@ TEST(tool_search_graph_overlay_tokenless_query_uses_graph_filters) {
 }
 
 TEST(tool_output_byte_budgets) {
+    enum { FIRST_RESPONSE_WITH_CONTEXT_BUDGET = 1200 };
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -3026,6 +3027,23 @@ TEST(tool_output_byte_budgets) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NOT_NULL(strstr(inner, "_context_architecture_status:"));
+    ASSERT_LT((int)strlen(inner), FIRST_RESPONSE_WITH_CONTEXT_BUDGET);
+    free(inner);
+    free(resp);
+
+    /* The one-shot context has its own bounded budget above. Keep the original
+     * recurring search payload ceiling unchanged on an otherwise identical
+     * second call. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":461,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{\"project\":\"test-project\","
+             "\"label\":\"Function\",\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NULL(strstr(inner, "_context_architecture_status:"));
     ASSERT_LT((int)strlen(inner), 600);
     free(inner);
     free(resp);

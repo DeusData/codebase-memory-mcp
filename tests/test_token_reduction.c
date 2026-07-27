@@ -10,7 +10,10 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
+#include "test_helpers.h"
+#include <cli/cli.h>
 #include <mcp/mcp.h>
+#include <pagerank/pagerank.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
@@ -1797,6 +1800,13 @@ TEST(first_graph_tool_response_always_includes_project_context) {
         ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(coverage, "status")), "unavailable");
         ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(coverage, "action")),
                                "check_index_coverage"));
+        yyjson_val *architecture = yyjson_obj_get(context, "architecture");
+        ASSERT_NOT_NULL(architecture);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "status")), "unavailable");
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(architecture, "rank_enabled")));
+        ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(architecture, "key_functions_available")));
+        ASSERT_NOT_NULL(
+            strstr(yyjson_get_str(yyjson_obj_get(architecture, "action")), "index_repository"));
         yyjson_doc_free(doc);
         free(text);
 
@@ -1816,6 +1826,153 @@ TEST(first_graph_tool_response_always_includes_project_context) {
         cbm_mcp_server_free(srv);
     }
 
+    PASS();
+}
+
+TEST(first_graph_tool_response_reports_available_architecture) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_session_project(srv, "sp-test");
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO pagerank(project,node_id,rank,computed_at) VALUES"
+                                    "('sp-test',1,0.9,'2026-07-27T00:00:00Z'),"
+                                    "('sp-test',2,0.8,'2026-07-27T00:00:00Z'),"
+                                    "('sp-test',3,0.7,'2026-07-27T00:00:00Z')"),
+              CBM_STORE_OK);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\",\"limit\":1,\"format\":\"json\"}");
+    char *text = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *context = yyjson_obj_get(yyjson_doc_get_root(doc), "_context");
+    ASSERT_NOT_NULL(context);
+    yyjson_val *architecture = yyjson_obj_get(context, "architecture");
+    ASSERT_NOT_NULL(architecture);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "status")), "available");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(architecture, "rank_enabled")));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(architecture, "key_functions_available")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(context, "ranked_nodes")), 3);
+    yyjson_val *key_functions = yyjson_obj_get(context, "key_functions");
+    ASSERT_NOT_NULL(key_functions);
+    ASSERT_TRUE(yyjson_arr_size(key_functions) > 0);
+
+    yyjson_doc_free(doc);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(first_graph_tool_response_explains_stale_architecture) {
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_session_project(srv, "sp-test");
+    const char *stale_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK};
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(
+                  store, "sp-test", CBM_STORE_DERIVED_GENERATION_UNKNOWN, stale_views,
+                  (int)(sizeof(stale_views) / sizeof(stale_views[0]))),
+              CBM_STORE_OK);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\",\"limit\":1,\"format\":\"json\"}");
+    char *text = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *context = yyjson_obj_get(yyjson_doc_get_root(doc), "_context");
+    ASSERT_NOT_NULL(context);
+    yyjson_val *architecture = yyjson_obj_get(context, "architecture");
+    ASSERT_NOT_NULL(architecture);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "status")), "stale");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(architecture, "rank_enabled")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "rank_refresh")),
+                  CBM_RANK_REFRESH_DEFAULT);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(architecture, "key_functions_available")));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "detail")), "key_functions"));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "action")), CBM_CONFIG_RANK_REFRESH));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "action")), "index_repository"));
+    ASSERT_NOT_NULL(yyjson_obj_get(context, "warnings"));
+    ASSERT_NOT_NULL(yyjson_obj_get(context, "freshness"));
+    ASSERT_NULL(yyjson_obj_get(context, "key_functions"));
+    yyjson_doc_free(doc);
+    free(text);
+    cbm_mcp_server_free(srv);
+
+    srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_session_project(srv, "sp-test");
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(
+                  store, "sp-test", CBM_STORE_DERIVED_GENERATION_UNKNOWN, stale_views,
+                  (int)(sizeof(stale_views) / sizeof(stale_views[0]))),
+              CBM_STORE_OK);
+    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"project\":\"sp-test\",\"limit\":1}");
+    text = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "_context_architecture_status: stale"));
+    ASSERT_NOT_NULL(strstr(text, "_context_architecture_rank_enabled: true"));
+    ASSERT_NOT_NULL(strstr(text, "_context_architecture_key_functions_available: false"));
+    ASSERT_NOT_NULL(strstr(text, "_context_architecture_action:"));
+    ASSERT_NOT_NULL(strstr(text, CBM_CONFIG_RANK_REFRESH));
+    ASSERT_NOT_NULL(strstr(text, "_context_warnings"));
+    ASSERT_NOT_NULL(strstr(text, "_context_freshness_state: stale_with_warning"));
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(first_graph_tool_response_explains_disabled_architecture) {
+    char *config_dir = th_mktempdir("cbm_context_rank_disabled");
+    ASSERT_NOT_NULL(config_dir);
+    char config_dir_copy[CBM_PATH_MAX];
+    ASSERT_TRUE(snprintf(config_dir_copy, sizeof(config_dir_copy), "%s", config_dir) > 0);
+    cbm_config_t *config = cbm_config_open(config_dir_copy);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_RANK_ENABLED, "false"), 0);
+
+    cbm_mcp_server_t *srv = setup_sp_server();
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+    cbm_mcp_server_set_session_project(srv, "sp-test");
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"sp-test\",\"limit\":1,\"format\":\"json\"}");
+    char *text = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *context = yyjson_obj_get(yyjson_doc_get_root(doc), "_context");
+    ASSERT_NOT_NULL(context);
+    yyjson_val *architecture = yyjson_obj_get(context, "architecture");
+    ASSERT_NOT_NULL(architecture);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "status")), "disabled");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(architecture, "rank_enabled")));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(architecture, "key_functions_available")));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "detail")), CBM_CONFIG_RANK_ENABLED));
+    char expected_action[CBM_SZ_128];
+    ASSERT_TRUE(snprintf(expected_action, sizeof(expected_action), "config set %s true",
+                         CBM_CONFIG_RANK_ENABLED) > 0);
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "action")), expected_action));
+    ASSERT_NULL(yyjson_obj_get(context, "key_functions"));
+
+    yyjson_doc_free(doc);
+    free(text);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    th_cleanup(config_dir_copy);
     PASS();
 }
 
@@ -1842,6 +1999,14 @@ TEST(first_graph_tool_response_reports_empty_store_actionably) {
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(context, "nodes")), 0);
     ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(context, "action_required")),
                            "index_repository"));
+    yyjson_val *architecture = yyjson_obj_get(context, "architecture");
+    ASSERT_NOT_NULL(architecture);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "status")), "unavailable");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(architecture, "rank_enabled")));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(architecture, "key_functions_available")));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(architecture, "detail")), "ready graph"));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "action")), "_context.action_required"));
 
     yyjson_doc_free(doc);
     free(text);
@@ -1866,6 +2031,14 @@ TEST(first_tool_response_distinguishes_unresolved_project_from_empty_store) {
     ASSERT_NULL(yyjson_obj_get(context, "nodes"));
     ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(context, "action_required")),
                            "project=\"/path/to/repo\""));
+    yyjson_val *architecture = yyjson_obj_get(context, "architecture");
+    ASSERT_NOT_NULL(architecture);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(architecture, "status")), "unavailable");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(architecture, "rank_enabled")));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(architecture, "key_functions_available")));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(architecture, "detail")), "ready graph"));
+    ASSERT_NOT_NULL(
+        strstr(yyjson_get_str(yyjson_obj_get(architecture, "action")), "_context.action_required"));
 
     yyjson_doc_free(doc);
     free(text);
@@ -2177,6 +2350,9 @@ SUITE(token_reduction) {
     /* 2.0 JSON Output Minification */
     RUN_TEST(all_mcp_responses_default_to_toon);
     RUN_TEST(first_graph_tool_response_always_includes_project_context);
+    RUN_TEST(first_graph_tool_response_reports_available_architecture);
+    RUN_TEST(first_graph_tool_response_explains_stale_architecture);
+    RUN_TEST(first_graph_tool_response_explains_disabled_architecture);
     RUN_TEST(first_graph_tool_response_reports_empty_store_actionably);
     RUN_TEST(first_tool_response_distinguishes_unresolved_project_from_empty_store);
 
