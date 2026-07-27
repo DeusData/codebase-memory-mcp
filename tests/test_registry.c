@@ -900,9 +900,10 @@ TEST(resolve_cfg_gated_twins_by_source_name) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
     cbm_registry_add(r, "has_permission",
-                     "proj.scripts.helpers.has_permission#cfg(target_os=macos)]", "Function");
+                     "proj.scripts.helpers.has_permission#cfg(target_os=\"macos\")", "Function");
     cbm_registry_add(r, "has_permission",
-                     "proj.scripts.helpers.has_permission#cfg(not(target_os=macos))]", "Function");
+                     "proj.scripts.helpers.has_permission#cfg(not(target_os=\"macos\"))",
+                     "Function");
     cbm_registry_add(r, "has_permission", "proj.engine.permissions.has_permission", "Function");
 
     cbm_resolution_t res =

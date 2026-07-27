@@ -212,6 +212,7 @@ TEST(repro_issue495_cfg_gated_twins_distinct) {
 TEST(repro_issue495_cfg_gated_call_uses_definition_qn) {
     static const char *src = "fn target() {}\n"
                              "#[cfg(target_os = \"macos\")]\n"
+                             "#[cfg(any(feature = \"a b\", feature = \"c\"))]\n"
                              "fn caller() { target(); }\n";
 
     CBMFileResult *r = rx(src, "t", "src.rs");
@@ -227,7 +228,8 @@ TEST(repro_issue495_cfg_gated_call_uses_definition_qn) {
         }
     }
     ASSERT_NOT_NULL(caller_def_qn);
-    ASSERT_NOT_NULL(strstr(caller_def_qn, "#cfg("));
+    ASSERT_STR_EQ(caller_def_qn, "t.src.caller#cfg(target_os=\"macos\")"
+                                 "#cfg(any(feature=\"a b\",feature=\"c\"))");
 
     const CBMCall *target_call = NULL;
     for (int i = 0; i < r->calls.count; i++) {
@@ -243,8 +245,52 @@ TEST(repro_issue495_cfg_gated_call_uses_definition_qn) {
     PASS();
 }
 
+/* Predicate text is graph identity, so a storage optimization must never
+ * silently truncate it. Two valid predicates with a common prefix longer than
+ * the old fixed buffer must remain distinct. */
+TEST(repro_issue495_long_cfg_predicates_remain_distinct) {
+    enum { CFG_FEATURE_LEN = 300, CFG_SOURCE_CAP = 768 };
+    char feature_a[CFG_FEATURE_LEN + 1];
+    char feature_b[CFG_FEATURE_LEN + 1];
+    memset(feature_a, 'a', CFG_FEATURE_LEN);
+    memset(feature_b, 'a', CFG_FEATURE_LEN);
+    feature_a[CFG_FEATURE_LEN] = '\0';
+    feature_b[CFG_FEATURE_LEN - 1] = 'b';
+    feature_b[CFG_FEATURE_LEN] = '\0';
+
+    char src[CFG_SOURCE_CAP];
+    int written = snprintf(src, sizeof(src),
+                           "#[cfg(feature = \"%s\")]\n"
+                           "fn gated() {}\n"
+                           "#[cfg(feature = \"%s\")]\n"
+                           "fn gated() {}\n",
+                           feature_a, feature_b);
+    ASSERT_TRUE(written > 0);
+    ASSERT_TRUE((size_t)written < sizeof(src));
+
+    CBMFileResult *r = rx(src, "t", "src.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    CBMDefinition *d0 = nth_def_named(r, "Function", "gated", 0);
+    CBMDefinition *d1 = nth_def_named(r, "Function", "gated", 1);
+    ASSERT_NOT_NULL(d0);
+    ASSERT_NOT_NULL(d1);
+    ASSERT_NOT_NULL(d0->qualified_name);
+    ASSERT_NOT_NULL(d1->qualified_name);
+    ASSERT_STR_NEQ(d0->qualified_name, d1->qualified_name);
+    ASSERT_TRUE(strlen(d0->qualified_name) > CFG_FEATURE_LEN);
+    ASSERT_TRUE(strlen(d1->qualified_name) > CFG_FEATURE_LEN);
+    ASSERT_TRUE(d0->qualified_name[strlen(d0->qualified_name) - 1] == ')');
+    ASSERT_TRUE(d1->qualified_name[strlen(d1->qualified_name) - 1] == ')');
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ────────────────────────────────────────────────────────── */
 SUITE(repro_issue495) {
     RUN_TEST(repro_issue495_cfg_gated_twins_distinct);
     RUN_TEST(repro_issue495_cfg_gated_call_uses_definition_qn);
+    RUN_TEST(repro_issue495_long_cfg_predicates_remain_distinct);
 }

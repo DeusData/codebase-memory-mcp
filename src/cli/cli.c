@@ -14449,7 +14449,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "0-1000000",
      CBM_DEFAULT_SNIPPET_MAX_LINES_STR
      " lines covers most functions. Set 0 for unlimited to get full file contents."},
-    {"key_functions_exclude", "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
+    {CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
      "Comma-separated glob patterns to exclude from architecture key functions",
      "glob patterns, e.g. graph-ui/**,tests/**",
      "Use to remove UI, generated code, or test helpers from the architecture view. "

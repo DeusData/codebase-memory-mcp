@@ -428,6 +428,7 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_CONFIG_KEY_FUNCTIONS_COUNT "key_functions_count"
 #define CBM_DEFAULT_KEY_FUNCTIONS_COUNT 25
 #define CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR "25"
+#define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
 #define CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT "context_key_functions_limit"
 #define CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT 10
 #define CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR "10"

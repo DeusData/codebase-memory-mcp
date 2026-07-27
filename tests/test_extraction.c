@@ -835,6 +835,82 @@ TEST(rust_struct) {
     PASS();
 }
 
+TEST(rust_cfg_identity_preserves_predicates_and_call_scope) {
+    CBMFileResult *r = extract("fn target() {}\n"
+                               "#[cfg_attr(cfg(feature = \"nested\"), inline)]\n"
+                               "#[cfg(target_os = \"macos\")]\n"
+                               "#[cfg(any(feature = \"a b\", feature = \"c\"))]\n"
+                               "fn caller() { target(); }\n",
+                               CBM_LANG_RUST, "t", "src.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const char *caller_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "caller") == 0) {
+            caller_qn = r->defs.items[i].qualified_name;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(caller_qn);
+    ASSERT_STR_EQ(caller_qn, "t.src.caller#cfg(target_os=\"macos\")"
+                             "#cfg(any(feature=\"a b\",feature=\"c\"))");
+
+    const CBMCall *target_call = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, "target") == 0) {
+            target_call = &r->calls.items[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(target_call);
+    ASSERT_STR_EQ(target_call->enclosing_func_qn, caller_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_cfg_identity_retains_long_distinguishing_suffix) {
+    enum { CFG_FEATURE_LEN = 300, CFG_SOURCE_CAP = 768 };
+    char feature_a[CFG_FEATURE_LEN + 1];
+    char feature_b[CFG_FEATURE_LEN + 1];
+    memset(feature_a, 'a', CFG_FEATURE_LEN);
+    memset(feature_b, 'a', CFG_FEATURE_LEN);
+    feature_a[CFG_FEATURE_LEN] = '\0';
+    feature_b[CFG_FEATURE_LEN - 1] = 'b';
+    feature_b[CFG_FEATURE_LEN] = '\0';
+
+    char src[CFG_SOURCE_CAP];
+    int written = snprintf(src, sizeof(src),
+                           "#[cfg(feature = \"%s\")]\n"
+                           "fn gated() {}\n"
+                           "#[cfg(feature = \"%s\")]\n"
+                           "fn gated() {}\n",
+                           feature_a, feature_b);
+    ASSERT_TRUE(written > 0);
+    ASSERT_TRUE((size_t)written < sizeof(src));
+
+    CBMFileResult *r = extract(src, CBM_LANG_RUST, "t", "src.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *qualified_names[2] = {0};
+    int found = 0;
+    for (int i = 0; i < r->defs.count && found < 2; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "gated") == 0) {
+            qualified_names[found++] = r->defs.items[i].qualified_name;
+        }
+    }
+    ASSERT_EQ(found, 2);
+    ASSERT_NOT_NULL(qualified_names[0]);
+    ASSERT_NOT_NULL(qualified_names[1]);
+    ASSERT_STR_NEQ(qualified_names[0], qualified_names[1]);
+    ASSERT_TRUE(strlen(qualified_names[0]) > CFG_FEATURE_LEN);
+    ASSERT_TRUE(strlen(qualified_names[1]) > CFG_FEATURE_LEN);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Go --- */
 TEST(go_function) {
     CBMFileResult *r = extract("package main\nfunc Greet(name string) string { return \"Hello, \" "
@@ -5701,6 +5777,8 @@ SUITE(extraction) {
     /* Systems */
     RUN_TEST(rust_function);
     RUN_TEST(rust_struct);
+    RUN_TEST(rust_cfg_identity_preserves_predicates_and_call_scope);
+    RUN_TEST(rust_cfg_identity_retains_long_distinguishing_suffix);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);
