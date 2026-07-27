@@ -57,7 +57,7 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
          * closes the `->` arrow (preceded by '-'); a bare '>' closes a template
          * argument list ("identity<int>") and must NOT split, else the segment
          * would be the empty string after the trailing '>'. */
-        if (*p == '.' || *p == ':' || (*p == '>' && p != name && p[-1] == '-')) {
+        if (*p == '.' || *p == ':' || (*p == '>' && p != name && p[-SKIP_ONE] == '-')) {
             seg = p + SKIP_ONE;
         }
     }
@@ -81,7 +81,7 @@ static inline const char *cbm_pipeline_qn_class_method_tail(const char *qn) {
             if (second == qn) {
                 return qn;
             }
-            return second + 1;
+            return second + SKIP_ONE;
         }
     }
     return qn;
@@ -108,6 +108,39 @@ static inline bool cbm_pipeline_lsp_allow_tail_match(CBMLanguage lang) {
 static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {
     const char *qt = cbm_pipeline_qn_class_method_tail(qn);
     return qt && tail && strcmp(qt, tail) == 0;
+}
+
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_tail(
+    const CBMResolvedCallArray *arr, const CBMCall *call) {
+    const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
+    if (!call_tail) {
+        return NULL;
+    }
+
+    const CBMResolvedCall *best_tail = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (!rc->caller_qn || !rc->callee_qn) {
+            continue;
+        }
+        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+            continue;
+        }
+        const char *short_name = strrchr(rc->callee_qn, '.');
+        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
+        const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
+        if (!call_leaf || strcmp(short_name, call_leaf) != 0) {
+            continue;
+        }
+        if (!cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail)) {
+            continue;
+        }
+        if (best_tail) {
+            return NULL;
+        }
+        best_tail = rc;
+    }
+    return best_tail;
 }
 
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
@@ -191,36 +224,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
     if (!allow_tail_match) {
         return NULL;
     }
-
-    const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
-    if (!call_tail) {
-        return NULL;
-    }
-
-    const CBMResolvedCall *best_tail = NULL;
-    for (int i = 0; i < arr->count; i++) {
-        const CBMResolvedCall *rc = &arr->items[i];
-        if (!rc->caller_qn || !rc->callee_qn) {
-            continue;
-        }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
-            continue;
-        }
-        const char *short_name = strrchr(rc->callee_qn, '.');
-        short_name = short_name ? short_name + SKIP_ONE : rc->callee_qn;
-        const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
-        if (!call_leaf || strcmp(short_name, call_leaf) != 0) {
-            continue;
-        }
-        if (!cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail)) {
-            continue;
-        }
-        if (best_tail) {
-            return NULL;
-        }
-        best_tail = rc;
-    }
-    return best_tail;
+    return cbm_pipeline_find_lsp_resolution_tail(arr, call);
 }
 
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.
@@ -237,34 +241,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
  *      tail.
  *
  * Returns the matching node, or NULL if neither lookup hits. */
-static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf_t *gbuf,
-                                                                  const char *project_name,
-                                                                  const char *callee_qn,
-                                                                  bool allow_tail_match) {
-    if (!gbuf || !callee_qn) {
-        return NULL;
-    }
-    const cbm_gbuf_node_t *direct = cbm_gbuf_find_by_qn(gbuf, callee_qn);
-    if (direct) {
-        return direct;
-    }
-    if (project_name && project_name[0]) {
-        size_t proj_len = strlen(project_name);
-        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
-            char buf[CBM_SZ_1K];
-            int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
-            if (written > 0 && (size_t)written < sizeof(buf)) {
-                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
-                if (prefixed) {
-                    return prefixed;
-                }
-            }
-        }
-    }
-    if (!allow_tail_match) {
-        return NULL;
-    }
-
+static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_tail_match(const cbm_gbuf_t *gbuf,
+                                                                        const char *callee_qn) {
     const char *short_name = strrchr(callee_qn, '.');
     short_name = short_name ? short_name + SKIP_ONE : callee_qn;
     const char *callee_tail = cbm_pipeline_qn_class_method_tail(callee_qn);
@@ -295,6 +273,36 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
         match = cand;
     }
     return match;
+}
+
+static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf_t *gbuf,
+                                                                  const char *project_name,
+                                                                  const char *callee_qn,
+                                                                  bool allow_tail_match) {
+    if (!gbuf || !callee_qn) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *direct = cbm_gbuf_find_by_qn(gbuf, callee_qn);
+    if (direct) {
+        return direct;
+    }
+    if (project_name && project_name[0]) {
+        size_t proj_len = strlen(project_name);
+        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
+            char buf[CBM_SZ_1K];
+            int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
+            if (written > 0 && (size_t)written < sizeof(buf)) {
+                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
+                if (prefixed) {
+                    return prefixed;
+                }
+            }
+        }
+    }
+    if (!allow_tail_match) {
+        return NULL;
+    }
+    return cbm_pipeline_lsp_target_tail_match(gbuf, callee_qn);
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

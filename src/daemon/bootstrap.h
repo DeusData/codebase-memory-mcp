@@ -49,9 +49,11 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime
  * directly (never through a shell), with exactly argv[0] plus the one hidden
  * internal argument. It is detached from the launching client's lifetime and
  * inherits no standard handles; logical client leases govern its lifetime. */
+#include "../foundation/constants.h"
+
 typedef struct {
     const char *executable_path;
-    const char *argv[CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC + 1U];
+    const char *argv[CBM_DAEMON_BOOTSTRAP_LAUNCH_ARGC + SKIP_ONE];
     size_t argc;
     bool detached;
     bool inherit_standard_handles;
