@@ -264,6 +264,8 @@ int cbm_store_prepare_path_for_replace(const char *path);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
+#define CBM_SEARCH_SUMMARY_TOP_FILES 20
+
 typedef struct {
     const char *project;          /* exact or prefix match */
     const char *project_pattern;  /* LIKE pattern (from glob), mutually exclusive with project */
@@ -293,6 +295,9 @@ typedef struct {
     bool disable_dep_ranking;
     const char **exclude_labels;  /* NULL-terminated array, or NULL */
     const char **exclude_paths;   /* NULL-terminated array of glob patterns to exclude by file_path */
+    /* Return exact aggregate facets without materializing node rows. The
+     * filters above still apply; pagination and result ordering do not. */
+    bool summary_only;
 } cbm_search_params_t;
 
 typedef struct {
@@ -306,9 +311,18 @@ typedef struct {
 } cbm_search_result_t;
 
 typedef struct {
+    const char *value;
+    int count;
+} cbm_search_facet_t;
+
+typedef struct {
     cbm_search_result_t *results;
     int count;
     int total; /* total before pagination */
+    cbm_search_facet_t *label_facets;
+    int label_facet_count;
+    cbm_search_facet_t *file_facets;
+    int file_facet_count;
     bool pagerank_stale;
     bool linkrank_stale;
     bool node_degree_stale;

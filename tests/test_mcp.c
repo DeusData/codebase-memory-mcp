@@ -2405,7 +2405,7 @@ TEST(tool_search_graph_uses_overlay_active_node_rows) {
     cbm_mcp_server_set_project(srv, proj);
 
     cbm_node_t old_main = {.project = proj,
-                           .label = "Function",
+                           .label = "OldFunction",
                            .name = "old_main",
                            .qualified_name = "search.overlay.old_main",
                            .file_path = "main.c",
@@ -2423,7 +2423,7 @@ TEST(tool_search_graph_uses_overlay_active_node_rows) {
     ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
               CBM_STORE_OK);
     cbm_node_t newer_main = {.project = proj,
-                             .label = "Function",
+                             .label = "NewFunction",
                              .name = "newer_main",
                              .qualified_name = "search.overlay.newer_main",
                              .file_path = "main.c",
@@ -2451,6 +2451,26 @@ TEST(tool_search_graph_uses_overlay_active_node_rows) {
     ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
     ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":1"));
     ASSERT_NOT_NULL(strstr(inner, "graph mode used overlay active node rows"));
+
+    free(inner);
+    free(resp);
+
+    /* Default TOON summary must use the same active-node authority as full
+     * JSON search. Distinct labels make a canonical-row regression observable
+     * even though summary mode intentionally suppresses node names. */
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":148,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\","
+                                   "\"arguments\":{\"project\":\"search-overlay-active\","
+                                   "\"pattern\":\"main|stable\",\"mode\":\"summary\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "by_label"));
+    ASSERT_NOT_NULL(strstr(inner, "\n  NewFunction,1\n"));
+    ASSERT_NOT_NULL(strstr(inner, "\n  Function,1\n"));
+    ASSERT_NULL(strstr(inner, "OldFunction"));
+    ASSERT_NOT_NULL(strstr(inner, "results_suppressed: true"));
 
     free(inner);
     free(resp);

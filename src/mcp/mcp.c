@@ -17,6 +17,7 @@ enum {
     MCP_COL_2 = 2,
     MCP_COL_3 = 3,
     MCP_COL_4 = 4,
+    MCP_COL_6 = 6,
     MCP_COL_7 = 7,
     MCP_COL_10 = 10,
     MCP_COL_16 = 16,
@@ -7057,6 +7058,31 @@ static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *ou
     cbm_toon_scalar_bool(sb, "has_more", out->total > offset + out->count);
 }
 
+static void emit_search_summary_toon(cbm_sb_t *sb, const cbm_search_output_t *out) {
+    static const char *const facet_columns[] = {"value", "count"};
+    static const char *const result_columns[] = {"qn", "label", "file", "lines", "in", "out"};
+    cbm_toon_scalar_int(sb, "total", out->total);
+    cbm_toon_table_header(sb, "by_label", out->label_facet_count, facet_columns, MCP_COL_2);
+    for (int i = 0; i < out->label_facet_count; i++) {
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, out->label_facets[i].value, true);
+        cbm_toon_cell_int(sb, out->label_facets[i].count, false);
+        cbm_toon_row_end(sb);
+    }
+    cbm_toon_table_header(sb, "by_file_top20", out->file_facet_count, facet_columns, MCP_COL_2);
+    for (int i = 0; i < out->file_facet_count; i++) {
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, out->file_facets[i].value, true);
+        cbm_toon_cell_int(sb, out->file_facets[i].count, false);
+        cbm_toon_row_end(sb);
+    }
+    cbm_toon_table_header(sb, "results", 0, result_columns, MCP_COL_6);
+    cbm_toon_scalar_bool(sb, "results_suppressed", true);
+    cbm_toon_scalar_str(
+        sb, "hint",
+        "mode='summary' returns counts only. Use mode='full' with compact=true for node records.");
+}
+
 static void emit_semantic_results_toon(cbm_sb_t *sb,
                                        const cbm_vector_result_t *results, int result_count) {
     static const char *const columns[] = {"qn", "label", "file", "score"};
@@ -7401,9 +7427,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool cfg_inc_deps = cbm_config_get_bool(srv->config, "default_include_dependencies", true);
     bool include_dependencies = cbm_mcp_get_bool_arg_default(args, "include_dependencies", cfg_inc_deps);
 
-    /* Summary mode needs all results for accurate aggregation */
+    /* Summary mode delegates exact aggregation to the store. It does not
+     * materialize or paginate individual node records. */
     bool is_summary = search_mode && strcmp(search_mode, "summary") == 0;
-    int effective_limit = is_summary ? 10000 : limit;
 
     cbm_search_params_t params = {0};
     fill_project_params(&pe, &params);
@@ -7429,12 +7455,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     params.disable_dep_ranking = srv->config
         ? cbm_config_get_bool(srv->config, CBM_CONFIG_SEARCH_DISABLE_DEP_RANKING, false)
         : false;
-    params.limit = effective_limit;
+    params.limit = limit;
     params.offset = offset;
     params.min_degree = min_degree;
     params.max_degree = max_degree;
     params.exclude_entry_points = exclude_entry_points;
     params.include_connected = include_connected;
+    params.summary_only = is_summary;
     int exclude_count = 0;
     char **exclude = cbm_mcp_get_string_array_arg(args, "exclude", &exclude_count);
     if (exclude_count < 0) {
@@ -7470,10 +7497,27 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_sb_t sb;
             cbm_sb_init(&sb);
             cbm_search_output_t tout = {0};
+            bool toon_search_failed = false;
             if (!semantic_only) {
-                cbm_store_search(store, &params, &tout);
-                emit_search_results_toon(&sb, &tout, offset, fields, nfields);
-                if (tout.total == 0) {
+                cbm_store_overlay_node_view_summary_t toon_overlay_summary = {0};
+                bool toon_overlay_ready =
+                    project && project[0] &&
+                    cbm_store_get_overlay_node_view_summary(
+                        store, project, &toon_overlay_summary) == CBM_STORE_OK &&
+                    cbm_store_overlay_node_view_has_ready_rows(&toon_overlay_summary);
+                int search_rc =
+                    is_summary && toon_overlay_ready
+                        ? cbm_store_search_overlay_view(store, &params, &tout)
+                        : cbm_store_search(store, &params, &tout);
+                if (search_rc != CBM_STORE_OK) {
+                    toon_search_failed = true;
+                    cbm_toon_scalar_str(&sb, "error", cbm_store_error(store));
+                } else if (is_summary) {
+                    emit_search_summary_toon(&sb, &tout);
+                } else {
+                    emit_search_results_toon(&sb, &tout, offset, fields, nfields);
+                }
+                if (!toon_search_failed && tout.total == 0) {
                     if (name_pattern && label) {
                         cbm_toon_scalar_str(&sb, "hint",
                                             "No results. Try removing the label filter or "
@@ -7520,7 +7564,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             toon_append_context_once(&sb, srv, store, project);
             free(project);
             char *text = cbm_sb_finish(&sb);
-            char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
+            char *result =
+                cbm_mcp_text_result(text ? text : "out of memory",
+                                    text == NULL || toon_search_failed);
             free(text);
             return result;
         }
@@ -7568,17 +7614,26 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         (sort_by && (strcmp(sort_by, "degree") == 0 || strcmp(sort_by, "calls") == 0 ||
                      strcmp(sort_by, "linkrank") == 0));
     bool overlay_search_used = overlay_ready_for_nodes;
+    int graph_search_rc = CBM_STORE_OK;
     if (!semantic_only) {
         if (overlay_search_used) {
-            cbm_store_search_overlay_view(store, &params, &out);
+            graph_search_rc = cbm_store_search_overlay_view(store, &params, &out);
         } else {
-            cbm_store_search(store, &params, &out);
+            graph_search_rc = cbm_store_search(store, &params, &out);
         }
     }
+    bool graph_search_failed = graph_search_rc != CBM_STORE_OK;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    if (graph_search_failed) {
+        yyjson_mut_obj_add_strcpy(doc, root, "error", cbm_store_error(store));
+        yyjson_mut_obj_add_str(
+            doc, root, "hint",
+            "The graph search could not be completed exactly. Retry after reindexing or narrow "
+            "the filters; no partial result is being presented as complete.");
+    }
 
     yyjson_doc **props_docs = NULL;
     int props_doc_count = 0;
@@ -7610,54 +7665,19 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (is_summary) {
-        /* Summary mode: aggregate counts by label and file (top 20) */
+        /* Exact filtered facets come from the store without materializing node
+         * records. This keeps output memory bounded by distinct labels and the
+         * documented top-file count instead of the number of matching nodes. */
         yyjson_mut_obj_add_int(doc, root, "total", out.total);
         yyjson_mut_val *by_label = yyjson_mut_obj(doc);
         yyjson_mut_val *by_file = yyjson_mut_obj(doc);
-
-        /* Simple aggregation — 64 slots for labels (CBM defines ~12 label types),
-         * 20 slots for top files. Excess entries are silently capped. */
-        const char *labels[64] = {0};
-        int label_counts[64] = {0};
-        int label_n = 0;
-        const char *files[20] = {0};
-        int file_counts[20] = {0};
-        int file_n = 0;
-
-        for (int i = 0; i < out.count; i++) {
-            cbm_search_result_t *sr = &out.results[i];
-            /* Count by label */
-            const char *lbl = sr->node.label ? sr->node.label : "(unknown)";
-            int found = -1;
-            for (int j = 0; j < label_n; j++) {
-                if (strcmp(labels[j], lbl) == 0) { found = j; break; }
-            }
-            if (found >= 0) {
-                label_counts[found]++;
-            } else if (label_n < 64) {
-                labels[label_n] = lbl;
-                label_counts[label_n] = 1;
-                label_n++;
-            }
-            /* Count by file (top 20 only) */
-            const char *fp = sr->node.file_path ? sr->node.file_path : "(unknown)";
-            found = -1;
-            for (int j = 0; j < file_n; j++) {
-                if (strcmp(files[j], fp) == 0) { found = j; break; }
-            }
-            if (found >= 0) {
-                file_counts[found]++;
-            } else if (file_n < 20) {
-                files[file_n] = fp;
-                file_counts[file_n] = 1;
-                file_n++;
-            }
+        for (int i = 0; i < out.label_facet_count; i++) {
+            yyjson_mut_obj_add_int(doc, by_label, out.label_facets[i].value,
+                                   out.label_facets[i].count);
         }
-        for (int i = 0; i < label_n; i++) {
-            yyjson_mut_obj_add_int(doc, by_label, labels[i], label_counts[i]);
-        }
-        for (int i = 0; i < file_n; i++) {
-            yyjson_mut_obj_add_int(doc, by_file, files[i], file_counts[i]);
+        for (int i = 0; i < out.file_facet_count; i++) {
+            yyjson_mut_obj_add_int(doc, by_file, out.file_facets[i].value,
+                                   out.file_facets[i].count);
         }
         yyjson_mut_obj_add_val(doc, root, "by_label", by_label);
         yyjson_mut_obj_add_val(doc, root, "by_file_top20", by_file);
@@ -7672,7 +7692,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     /* When searching for dep projects returns nothing, explain why.
      * Heuristic: dep search if expanded value ends with ".dep" (from "dep"/"deps" shorthand)
      * or project_pattern contains ".dep." — both indicate a dependency project query. */
-    if (out.total == 0) {
+    if (!graph_search_failed && out.total == 0) {
         bool is_dep_search = false;
         if (pe.mode == MATCH_PREFIX && pe.value) {
             size_t n = strlen(pe.value);
@@ -7774,7 +7794,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(sort_by);
     free_string_array(exclude);
 
-    char *result = cbm_mcp_text_result(json, false);
+    char *result = cbm_mcp_text_result(json, graph_search_failed);
     free(json);
     return result;
 }

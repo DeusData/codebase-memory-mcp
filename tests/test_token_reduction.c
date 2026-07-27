@@ -655,6 +655,189 @@ TEST(search_graph_summary_mode) {
     PASS();
 }
 
+TEST(search_graph_summary_counts_every_matching_node) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    /* The former implementation materialized only the first 10,000 matches.
+     * Keep the decisive label last in stable name order so a sampled summary
+     * cannot accidentally pass. One transaction keeps this scale canary fast. */
+    ASSERT_EQ(cbm_store_begin(st), CBM_STORE_OK);
+    for (int i = 0; i < 10004; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "summary_%05d", i);
+        snprintf(qn, sizeof(qn), "limit-test.summary.%05d", i);
+        cbm_node_t node = {
+            .project = "limit-test",
+            .label = "SummaryBaseCanary",
+            .name = name,
+            .qualified_name = qn,
+            .file_path = "summary/base.c",
+        };
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+    cbm_node_t tail = {
+        .project = "limit-test",
+        .label = "SummaryTailCanary",
+        .name = "zz_summary_tail",
+        .qualified_name = "limit-test.summary.zz_tail",
+        .file_path = "summary/tail.c",
+    };
+    ASSERT_GT(cbm_store_upsert_node(st, &tail), 0);
+    ASSERT_EQ(cbm_store_commit(st), CBM_STORE_OK);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"project\":\"limit-test\","
+                                    "\"mode\":\"summary\",\"format\":\"json\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *total = yyjson_obj_get(root, "total");
+    yyjson_val *by_label = yyjson_obj_get(root, "by_label");
+    yyjson_val *context = yyjson_obj_get(root, "_context");
+    ASSERT_NOT_NULL(total);
+    ASSERT_NOT_NULL(by_label);
+    ASSERT_NOT_NULL(context);
+    ASSERT_NOT_NULL(yyjson_obj_get(context, "node_labels"));
+    ASSERT_NOT_NULL(yyjson_obj_get(context, "edge_types"));
+    ASSERT_TRUE(yyjson_is_obj(by_label));
+    ASSERT_EQ(yyjson_get_int(total), 10086);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(by_label, "SummaryBaseCanary")), 10004);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(by_label, "SummaryTailCanary")), 1);
+
+    int64_t summarized = 0;
+    size_t idx, max;
+    yyjson_val *key, *value;
+    yyjson_obj_foreach(by_label, idx, max, key, value) {
+        (void)key;
+        summarized += yyjson_get_sint(value);
+    }
+    ASSERT_EQ(summarized, yyjson_get_sint(total));
+
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_limit_test_dir(tmp);
+    PASS();
+}
+
+TEST(search_graph_summary_ranks_top_files_after_filtering) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    /* Twenty singleton files sort before popular.c. A first-distinct-files
+     * implementation therefore omits the actual highest-frequency file. */
+    ASSERT_EQ(cbm_store_begin(st), CBM_STORE_OK);
+    for (int i = 0; i < 20; i++) {
+        char name[32], qn[64], file[32];
+        snprintf(name, sizeof(name), "a_singleton_%02d", i);
+        snprintf(qn, sizeof(qn), "limit-test.file.singleton_%02d", i);
+        snprintf(file, sizeof(file), "singleton_%02d.c", i);
+        cbm_node_t node = {
+            .project = "limit-test",
+            .label = "SummaryFileCanary",
+            .name = name,
+            .qualified_name = qn,
+            .file_path = file,
+        };
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+    for (int i = 0; i < 6; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "z_popular_%02d", i);
+        snprintf(qn, sizeof(qn), "limit-test.file.popular_%02d", i);
+        cbm_node_t node = {
+            .project = "limit-test",
+            .label = "SummaryFileCanary",
+            .name = name,
+            .qualified_name = qn,
+            .file_path = "popular.c",
+        };
+        ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_commit(st), CBM_STORE_OK);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"limit-test\",\"label\":\"SummaryFileCanary\","
+        "\"mode\":\"summary\",\"format\":\"json\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *by_file = yyjson_obj_get(root, "by_file_top20");
+    ASSERT_NOT_NULL(by_file);
+    ASSERT_TRUE(yyjson_is_obj(by_file));
+    ASSERT_EQ(yyjson_obj_size(by_file), 20);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(by_file, "popular.c")), 6);
+    const char *popular_pos = strstr(resp, "\"popular.c\":6");
+    const char *singleton_pos = strstr(resp, "\"singleton_00.c\":1");
+    ASSERT_NOT_NULL(popular_pos);
+    ASSERT_NOT_NULL(singleton_pos);
+    ASSERT_TRUE(popular_pos < singleton_pos);
+
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_limit_test_dir(tmp);
+    PASS();
+}
+
+TEST(search_graph_summary_default_format_suppresses_node_rows) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "limit-test");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"limit-test\",\"mode\":\"summary\"}");
+    char *resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "by_label"));
+    ASSERT_NOT_NULL(strstr(resp, "by_file_top20"));
+    ASSERT_NOT_NULL(strstr(resp, "results_suppressed"));
+    ASSERT_NULL(strstr(resp, "limit-test.many.func_000"));
+    ASSERT_NOT_NULL(strstr(resp, "session_project: limit-test"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_status"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_project: limit-test"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_nodes: 81"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_edges: 3"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_node_labels"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_edge_types"));
+
+    free(resp);
+
+    raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"limit-test\",\"mode\":\"summary\"}");
+    resp = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "_context_status"));
+    ASSERT_NOT_NULL(strstr(resp, "session_project"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_limit_test_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  1.5 TRACE EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -1839,6 +2022,9 @@ SUITE(token_reduction) {
 
     /* 1.4 Summary Mode */
     RUN_TEST(search_graph_summary_mode);
+    RUN_TEST(search_graph_summary_counts_every_matching_node);
+    RUN_TEST(search_graph_summary_ranks_top_files_after_filtering);
+    RUN_TEST(search_graph_summary_default_format_suppresses_node_rows);
 
     /* 1.5 Trace Edge Cases */
     RUN_TEST(trace_ambiguous_function_returns_suggestions);
