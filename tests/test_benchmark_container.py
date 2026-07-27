@@ -15,6 +15,7 @@ from unittest import mock
 SCRIPT = (
     Path(__file__).resolve().parents[1] / "benchmarks" / "run_container_experiment.py"
 )
+DOCKERFILE = Path(__file__).resolve().parents[1] / "test-infrastructure" / "Dockerfile"
 SPEC = importlib.util.spec_from_file_location("run_container_experiment", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 CONTAINER = importlib.util.module_from_spec(SPEC)
@@ -22,6 +23,15 @@ SPEC.loader.exec_module(CONTAINER)
 
 
 class BenchmarkContainerContractTest(unittest.TestCase):
+    def test_image_provides_clang_18_and_keeps_standalone_ci_command_on_gcc(
+        self,
+    ) -> None:
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn("gcc g++ make", dockerfile)
+        self.assertIn("clang-18", dockerfile)
+        self.assertIn('CMD ["CC=gcc", "CXX=g++"]', dockerfile)
+
     def test_environment_manifest_name_is_content_addressed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -170,16 +180,42 @@ class BenchmarkContainerContractTest(unittest.TestCase):
 
             self.assertEqual(digest, CONTAINER.file_sha256(effective))
             self.assertEqual(
-                json.loads(effective.read_text(encoding="utf-8"))[
-                    "product_environment"
-                ],
+                json.loads(effective.read_text(encoding="utf-8"))["product_environment"],
                 {"CBM_WORKERS": "4"},
+            )
+            self.assertEqual(
+                json.loads(effective.read_text(encoding="utf-8"))["build_environment"],
+                {"CC": "clang-18", "CXX": "clang++-18"},
             )
             source.write_text(
                 '{"product_environment": {"CBM_WORKERS": "8"}}\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "conflicts"):
+                CONTAINER.materialize_container_matrix_spec(source, effective, 4)
+
+    def test_matrix_can_explicitly_select_gcc_but_requires_a_compiler_pair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source.json"
+            effective = root / "effective.json"
+            source.write_text(
+                '{"build_environment": {"CC": "gcc", "CXX": "g++"}}\n',
+                encoding="utf-8",
+            )
+
+            CONTAINER.materialize_container_matrix_spec(source, effective, 4)
+            self.assertEqual(
+                json.loads(effective.read_text(encoding="utf-8"))["build_environment"],
+                {"CC": "gcc", "CXX": "g++"},
+            )
+
+            source.write_text(
+                '{"build_environment": {"CC": "gcc"}}\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "CC and CXX together"):
                 CONTAINER.materialize_container_matrix_spec(source, effective, 4)
 
     def test_measured_command_uses_only_named_volumes(self) -> None:
@@ -215,6 +251,8 @@ class BenchmarkContainerContractTest(unittest.TestCase):
         self.assertIn("/results/runsets/abc123", command)
         self.assertNotIn("--candidate-root", command)
         self.assertIn("d" * 20, command)
+        self.assertIn("CC=clang-18", command)
+        self.assertIn("CXX=clang++-18", command)
 
     def test_repository_snapshot_identity_ignores_bundle_byte_order(self) -> None:
         heads = [

@@ -336,6 +336,11 @@ The coordinator is intentionally smaller than the benchmark engine:
    are excluded from benchmark input.
 2. It builds or identifies the digest-pinned
    `test-infrastructure/Dockerfile` image and rejects emulated architectures.
+   Docker benchmark runs default to Clang 18.1.3; the image also retains GCC for
+   portability and explicit compiler-ablation cohorts. A custom matrix overrides
+   the default with a complete pair such as
+   `"build_environment": {"CC": "gcc", "CXX": "g++"}`. Resolved candidate
+   records retain the actual C/C++ compiler identities and flags.
 3. It requires explicit CPU, memory, and worker budgets. Workers may not exceed the
    container CPU budget.
 4. It copies the bundle and optional matrix spec into labeled Docker volumes.
@@ -392,6 +397,13 @@ same-resource relative comparison. Its Linux kernel, compiler, libc, Docker VM, 
 storage environment differ from native macOS, so do not join absolute container
 latencies or RSS values to native-host series. Use a small scheduled native
 confirmation to establish whether the direction and ranking generalize.
+
+For a Clang-versus-GCC ablation, run two otherwise byte-identical named matrices
+and change only the complete `CC`/`CXX` pair. Keep compiler comparisons in distinct
+histories so they cannot masquerade as product-revision effects. The compiler
+identity, expanded flags, source tree, and binary hash in each resolved candidate
+provide the audit join. Do not add that compiler axis to an unrelated product
+regression experiment.
 
 Set top-level `"accepted_exit_codes": [0, 1]` when the matrix benchmark uses exit
 code 1 for a completed measurement that missed a correctness or quality gate. The

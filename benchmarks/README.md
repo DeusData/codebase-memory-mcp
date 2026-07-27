@@ -97,6 +97,12 @@ remains in the manifest. A different snapshot, spec, or resource budget cannot b
 misreported as an unplanned cell in the current runset.
 Container numbers are controlled Linux relative comparisons, not absolute macOS
 latency. See [Container isolation](../docs/BENCHMARK_EXPERIMENTS.md#container-isolation).
+Docker benchmarks default to Clang 18.1.3. The pinned image also provides GCC for
+explicit portability or compiler-ablation cohorts; override both `CC` and `CXX`
+together in `build_environment`. Run Clang and GCC as distinct named histories
+with otherwise identical specs, and never infer cross-cohort comparability from a
+shared OS image alone. Native execution retains its existing configurable compiler
+selection.
 
 `schema/` contains schemas for records emitted by current tooling.
 `terminology.json` defines every normative fact, step, join, and formula identifier.
