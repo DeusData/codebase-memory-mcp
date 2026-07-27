@@ -57,6 +57,27 @@ workload flags. Candidate, profile, and scenario scopes can add new branches,
 capabilities, and controlled sweeps without editing the built-in dated presets.
 See [the complete matrix example](../docs/BENCHMARK_EXPERIMENTS.md#reusable-ref-based-matrices).
 
+For cross-build measurements while the host daemon remains active, use the native
+container coordinator. It creates an exact Git bundle, runs the same experiment
+runner with no host bind mounts, and exports immutable results back to the named
+history:
+
+```sh
+uv run python benchmarks/run_container_experiment.py \
+  --matrix-spec /absolute/path/development-comparison.json \
+  --experiment-root /durable/ignored/path/development-comparison \
+  --cpus 4 --memory 8g --workers 4
+```
+
+CPU, memory, and worker budgets are required rather than guessed. Candidate builds,
+Git worktrees, caches, daemon state, and result generation remain on two labeled
+Docker volumes; the coordinator prints their exact names and retains them for
+auditable resume. Rerun the same source spec and experiment root to resume, or remove
+the printed volumes after exported results are verified. The measured container is
+always native `arm64` or `amd64`, resource bounded, and removed on success or failure.
+Container numbers are controlled Linux relative comparisons, not absolute macOS
+latency. See [Container isolation](../docs/BENCHMARK_EXPERIMENTS.md#container-isolation).
+
 `schema/` contains schemas for records emitted by current tooling.
 `terminology.json` defines every normative fact, step, join, and formula identifier.
 The generated human view remains in `docs/BENCHMARK_TERMINOLOGY.md`, and the full

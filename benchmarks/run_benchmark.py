@@ -60,15 +60,18 @@ BENCHMARK_TERMINOLOGY_MARKDOWN_PATH = (
 
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
 BENCHMARK_RUN_CONTEXT_ENV = "CBM_BENCHMARK_RUN_CONTEXT"
+BENCHMARK_ENVIRONMENT_POLICY_PATH = Path(__file__).with_name(
+    "environment-policy-v1.json"
+)
+with BENCHMARK_ENVIRONMENT_POLICY_PATH.open(encoding="utf-8") as stream:
+    BENCHMARK_ENVIRONMENT_POLICY = json.load(stream)
+if BENCHMARK_ENVIRONMENT_POLICY.get("schema_version") != 1:
+    raise RuntimeError(
+        f"unsupported benchmark environment policy: {BENCHMARK_ENVIRONMENT_POLICY_PATH}"
+    )
+PRODUCT_ENVIRONMENT_PREFIX = BENCHMARK_ENVIRONMENT_POLICY["product_environment_prefix"]
 HARNESS_OWNED_PRODUCT_ENV = frozenset(
-    {
-        "CBM_AUTO_INDEX",
-        "CBM_BENCHMARK_ARTIFACT_DIR",
-        "CBM_BENCHMARK_RUN_CONTEXT",
-        "CBM_CACHE_DIR",
-        "CBM_CONTEXT_INJECTION",
-        "CBM_PROFILE",
-    }
+    BENCHMARK_ENVIRONMENT_POLICY["harness_owned_keys"]
 )
 DAEMON_LOG_RELATIVE_PATH = Path("logs") / "cbm-daemon.log"
 BENCHMARK_FACT_SCHEMA_VERSION = 2
@@ -3334,9 +3337,10 @@ def validate_product_environment(
     values: dict[str, str],
 ) -> dict[str, str]:
     for key in values:
-        if not key.startswith("CBM_"):
+        if not key.startswith(PRODUCT_ENVIRONMENT_PREFIX):
             raise SystemExit(
-                f"error: --product-env key must start with CBM_, got {key!r}"
+                "error: --product-env key must start with "
+                f"{PRODUCT_ENVIRONMENT_PREFIX}, got {key!r}"
             )
         if key in HARNESS_OWNED_PRODUCT_ENV:
             raise SystemExit(

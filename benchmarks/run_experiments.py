@@ -49,6 +49,20 @@ DERIVED_RESULTS_AT_PUBLISH_OVERRIDE = CONFIG_OVERRIDE_SPELLINGS[
     "incremental_derived_results_refresh_at_publish"
 ]["canonical"]
 
+BENCHMARK_ENVIRONMENT_POLICY_PATH = Path(__file__).with_name(
+    "environment-policy-v1.json"
+)
+with BENCHMARK_ENVIRONMENT_POLICY_PATH.open(encoding="utf-8") as stream:
+    BENCHMARK_ENVIRONMENT_POLICY = json.load(stream)
+if BENCHMARK_ENVIRONMENT_POLICY.get("schema_version") != 1:
+    raise RuntimeError(
+        f"unsupported benchmark environment policy: {BENCHMARK_ENVIRONMENT_POLICY_PATH}"
+    )
+PRODUCT_ENVIRONMENT_PREFIX = BENCHMARK_ENVIRONMENT_POLICY["product_environment_prefix"]
+HARNESS_OWNED_PRODUCT_ENV = frozenset(
+    BENCHMARK_ENVIRONMENT_POLICY["harness_owned_keys"]
+)
+
 
 SCHEMA_VERSION = 1
 EXPERIMENT_DEFINITION_VERSION = 1
@@ -640,7 +654,7 @@ def materialize_matrix_candidates(
                 "cannot infer branch capabilities safely"
             )
         _string_map(candidate.get("environment"), f"candidates[{index}].environment")
-        _string_map(
+        validate_product_environment(
             candidate.get("product_environment"),
             f"candidates[{index}].product_environment",
         )
@@ -792,6 +806,7 @@ def build_automatic_spec(
     *,
     preset: str,
     transport: str = "mcp",
+    product_environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical safe quick or repeated full capability matrix."""
     if preset not in {"quick", "full"}:
@@ -922,7 +937,7 @@ def build_automatic_spec(
                 },
             )
         )
-    return {
+    spec = {
         "schema_version": SCHEMA_VERSION,
         "experiment_version": experiment_version(),
         "identity_version": 2,
@@ -949,6 +964,12 @@ def build_automatic_spec(
         "profiles": profiles,
         "scenarios": [{"name": "c_new_leaf"}],
     }
+    explicit_product_environment = validate_product_environment(
+        product_environment, "product_environment"
+    )
+    if explicit_product_environment:
+        spec["product_environment"] = explicit_product_environment
+    return spec
 
 
 def identity_document(cell: dict[str, Any]) -> dict[str, Any]:
@@ -1078,6 +1099,28 @@ def _string_map(value: Any, field: str) -> dict[str, str]:
     ):
         raise ValueError(f"{field} must be a string-to-string object")
     return dict(value)
+
+
+def validate_product_environment(value: Any, field: str) -> dict[str, str]:
+    values = _string_map(value, field)
+    for key in values:
+        if not key.startswith(PRODUCT_ENVIRONMENT_PREFIX):
+            raise ValueError(
+                f"{field} key must start with {PRODUCT_ENVIRONMENT_PREFIX}: {key!r}"
+            )
+        if key in HARNESS_OWNED_PRODUCT_ENV:
+            raise ValueError(f"{field} key is owned by the benchmark harness: {key}")
+    return values
+
+
+def parse_product_environment_arguments(items: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for item in items:
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value:
+            raise ValueError(f"--product-env must be key=value, got {item!r}")
+        values[key] = value
+    return validate_product_environment(values, "--product-env")
 
 
 def validate_benchmark_args(value: Any, field: str) -> list[str]:
@@ -1267,7 +1310,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if not all(isinstance(item, str) and item for item in transports):
         raise ValueError("transports must contain non-empty strings")
     common_environment = _string_map(spec.get("environment"), "environment")
-    common_product_environment = _string_map(
+    common_product_environment = validate_product_environment(
         spec.get("product_environment"), "product_environment"
     )
     common_benchmark_args = validate_benchmark_args(
@@ -1310,7 +1353,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         candidate_environment = _string_map(
             candidate.get("environment"), f"candidates[{candidate_index}].environment"
         )
-        candidate_product_environment = _string_map(
+        candidate_product_environment = validate_product_environment(
             candidate.get("product_environment"),
             f"candidates[{candidate_index}].product_environment",
         )
@@ -1388,7 +1431,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             profile_environment = _string_map(
                 profile.get("environment"), f"profiles[{profile_index}].environment"
             )
-            profile_product_environment = _string_map(
+            profile_product_environment = validate_product_environment(
                 profile.get("product_environment"),
                 f"profiles[{profile_index}].product_environment",
             )
@@ -1403,7 +1446,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 scenario_name = scenario.get("name")
                 if not isinstance(scenario_name, str) or not scenario_name:
                     raise ValueError(f"scenarios[{scenario_index}].name is invalid")
-                scenario_product_environment = _string_map(
+                scenario_product_environment = validate_product_environment(
                     scenario.get("product_environment"),
                     f"scenarios[{scenario_index}].product_environment",
                 )
@@ -2426,6 +2469,17 @@ def build_parser() -> argparse.ArgumentParser:
             "account-wide CBM daemon; mcp requires one compatible build."
         ),
     )
+    parser.add_argument(
+        "--product-env",
+        action="append",
+        default=[],
+        metavar="CBM_KEY=VALUE",
+        help=(
+            "Explicit candidate environment for automatic --quick/--full runs. "
+            "Repeat for controlled resource sweeps; harness-owned isolation keys "
+            "are rejected."
+        ),
+    )
     parser.add_argument("--minimum-free-gb", type=float, default=2.0)
     parser.add_argument("--stale-lock-hours", type=float, default=6.0)
     parser.add_argument("--audit-only", action="store_true")
@@ -2459,6 +2513,12 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--candidate-ref only applies to --quick/--full")
     if args.transport != "mcp" and args.preset is None:
         parser.error("--transport only applies to --quick/--full")
+    if args.product_env and args.preset is None:
+        parser.error("--product-env only applies to --quick/--full")
+    try:
+        args.product_environment = parse_product_environment_arguments(args.product_env)
+    except ValueError as error:
+        parser.error(str(error))
     args.candidate_ref = candidate_ref_overrides
     return args
 
@@ -2502,6 +2562,7 @@ def prepare_automatic_experiment(
         candidates,
         preset=args.preset,
         transport=args.transport,
+        product_environment=args.product_environment,
     )
     revision = spec["repository_background"]["revision"]
     tree = spec["repository_background"]["tree"]
