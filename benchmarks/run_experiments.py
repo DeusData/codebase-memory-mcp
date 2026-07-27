@@ -475,25 +475,54 @@ def materialize_candidate(
     build_log = (
         log_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.log"
     )
+    clean_command = ["make", "-f", "Makefile.cbm", "clean-c"]
     command = ["make", f"-j{jobs}", "-f", "Makefile.cbm", "cbm"]
+    clean_returncode: int | None = None
+    build_returncode: int | None = None
     with build_log.open("w", encoding="utf-8") as stream:
         stream.write(f"started_at_utc={utc_now()}\n")
         stream.write(f"revision={revision}\n")
+        if binary.parent.exists():
+            # Make does not normally encode compiler, flags, or environment in
+            # object prerequisites. Once cache identity validation says this is
+            # a different build, retaining build/c can silently link stale
+            # objects into a binary whose metadata claims the new toolchain.
+            stream.write(f"clean_command={' '.join(clean_command)}\n")
+            stream.flush()
+            clean_process = subprocess.run(
+                clean_command,
+                cwd=worktree,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            clean_returncode = clean_process.returncode
+            stream.write(f"clean_exit_code={clean_returncode}\n")
+            stream.flush()
         stream.write(f"command={' '.join(command)}\n")
-        stream.flush()
-        process = subprocess.run(
-            command,
-            cwd=worktree,
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        if clean_returncode in {None, 0}:
+            stream.flush()
+            process = subprocess.run(
+                command,
+                cwd=worktree,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            build_returncode = process.returncode
         stream.write(f"finished_at_utc={utc_now()}\n")
-        stream.write(f"exit_code={process.returncode}\n")
-    if process.returncode != 0:
+        stream.write(
+            f"exit_code={build_returncode if build_returncode is not None else clean_returncode}\n"
+        )
+    if clean_returncode not in {None, 0}:
         raise RuntimeError(
-            f"candidate production build failed ({process.returncode}); see {build_log}"
+            f"candidate build cleanup failed ({clean_returncode}); see {build_log}"
+        )
+    if build_returncode != 0:
+        raise RuntimeError(
+            f"candidate production build failed ({build_returncode}); see {build_log}"
         )
     if not binary.is_file():
         raise RuntimeError(f"candidate build did not produce {binary}; see {build_log}")
