@@ -4543,6 +4543,13 @@ static void mcp_index_recovery_hint(cbm_mcp_server_t *srv, char *out, size_t out
     }
     char index_action[CBM_SZ_512];
     mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+    if (srv && srv->autoindex_failed) {
+        snprintf(out, out_size,
+                 "Automatic indexing failed. Inspect indexing diagnostics and project read "
+                 "permissions, then %s",
+                 index_action);
+        return;
+    }
     switch (srv ? srv->autoindex_block : MCP_AUTOINDEX_BLOCK_NONE) {
     case MCP_AUTOINDEX_BLOCK_DISABLED:
         snprintf(out, out_size,
@@ -4591,7 +4598,8 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
     char buf[ERR_BUF_SZ];
     if (total_count > 0) {
         snprintf(buf, sizeof(buf),
-                 "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
+                 "{\"status\":\"not_indexed\",\"error\":\"%s\","
+                 "\"hint\":\"Use list_projects to see all indexed projects, "
                  "then pass one as the \\\"project\\\" argument.\","
                  "\"available_projects\":[%s],\"count\":%d%s,"
                  "\"action_required\":\"%s\"}",
@@ -4604,7 +4612,11 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
             }
         }
     } else {
-        snprintf(buf, sizeof(buf), "{\"error\":\"%s\",\"hint\":\"%s\"}", reason, recovery_hint);
+        snprintf(buf, sizeof(buf),
+                 "{\"status\":\"not_indexed\",\"error\":\"%s\","
+                 "\"hint\":\"No indexed project is currently readable.\","
+                 "\"action_required\":\"%s\"}",
+                 reason, recovery_hint);
     }
     return heap_strdup(buf);
 }
@@ -4639,12 +4651,11 @@ static char *build_project_list_error(const char *reason) {
             }                                                                                     \
             if (srv->autoindex_failed) {                                                          \
                 free(project);                                                                    \
-                return cbm_mcp_text_result(                                                       \
-                    "{\"error\":\"auto-indexing failed for this project\","                        \
-                    "\"detail\":\"The pipeline failed. Check file permissions and project size.\"," \
-                    "\"fix\":\"Enable classic tools: set env CBM_TOOL_MODE=classic then call index_repository. " \
-                    "Or retry by passing project=\\\"/path/to/repo\\\" or project=\\\"~/path\\\" explicitly.\"}", \
-                    true);                                                                        \
+                char *_err = build_project_list_error_srv(                                        \
+                    srv, "auto-indexing failed for this project");                                \
+                char *_res = cbm_mcp_text_result(_err, true);                                     \
+                free(_err);                                                                       \
+                return _res;                                                                      \
             }                                                                                     \
             free(project);                                                                        \
             {                                                                                     \
