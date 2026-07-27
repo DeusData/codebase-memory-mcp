@@ -60,6 +60,16 @@ BENCHMARK_TERMINOLOGY_MARKDOWN_PATH = (
 
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
 BENCHMARK_RUN_CONTEXT_ENV = "CBM_BENCHMARK_RUN_CONTEXT"
+HARNESS_OWNED_PRODUCT_ENV = frozenset(
+    {
+        "CBM_AUTO_INDEX",
+        "CBM_BENCHMARK_ARTIFACT_DIR",
+        "CBM_BENCHMARK_RUN_CONTEXT",
+        "CBM_CACHE_DIR",
+        "CBM_CONTEXT_INJECTION",
+        "CBM_PROFILE",
+    }
+)
 DAEMON_LOG_RELATIVE_PATH = Path("logs") / "cbm-daemon.log"
 BENCHMARK_FACT_SCHEMA_VERSION = 2
 BENCHMARK_FACT_SCHEMA = "benchmarks/schema/facts-v2.schema.json"
@@ -2614,7 +2624,7 @@ def run_mcp_surface_parity(
     }
     exit_code = 1
     try:
-        base_env = build_env(work_root / "cache")
+        base_env = build_env(work_root / "cache", args.product_environment)
         base_env["CBM_AUTO_INDEX"] = "false"
 
         classic_env = dict(base_env)
@@ -2736,7 +2746,7 @@ def run_list_projects_scaling(
     exit_code = 1
     try:
         create_repo(seed_repo, 1, 1)
-        env = build_env(cache_dir)
+        env = build_env(cache_dir, args.product_environment)
         env.pop("CBM_PROFILE", None)
         apply_config_overrides(
             binary, env, CONFIG_PROFILES[CONFIG_PROFILE_MINIMAL_INDEXING], args.timeout
@@ -2908,7 +2918,7 @@ def run_search_projection(
         file_count = min(4, args.search_projection_results)
         funcs_per_file = math.ceil(args.search_projection_results / file_count)
         create_repo(repo_dir, file_count, funcs_per_file)
-        env = build_env(cache_dir)
+        env = build_env(cache_dir, args.product_environment)
         env.pop("CBM_PROFILE", None)
         apply_config_overrides(
             binary, env, CONFIG_PROFILES[CONFIG_PROFILE_MINIMAL_INDEXING], args.timeout
@@ -3306,14 +3316,39 @@ def run_config_set(
         raise command_failure(f"config_set_{key}", cmd, env, proc, elapsed_ms)
 
 
-def parse_config_overrides(items: list[str]) -> dict[str, str]:
-    overrides: dict[str, str] = {}
+def parse_key_value_arguments(items: list[str], option: str) -> dict[str, str]:
+    values: dict[str, str] = {}
     for item in items:
         key, sep, value = item.partition("=")
         if not sep or not key or not value:
-            raise SystemExit(f"error: --config must be key=value, got {item!r}")
-        overrides[key] = value
-    return overrides
+            raise SystemExit(f"error: {option} must be key=value, got {item!r}")
+        values[key] = value
+    return values
+
+
+def parse_config_overrides(items: list[str]) -> dict[str, str]:
+    return parse_key_value_arguments(items, "--config")
+
+
+def validate_product_environment(
+    values: dict[str, str],
+) -> dict[str, str]:
+    for key in values:
+        if not key.startswith("CBM_"):
+            raise SystemExit(
+                f"error: --product-env key must start with CBM_, got {key!r}"
+            )
+        if key in HARNESS_OWNED_PRODUCT_ENV:
+            raise SystemExit(
+                f"error: --product-env {key} is owned by the benchmark harness"
+            )
+    return dict(values)
+
+
+def parse_product_environment(items: list[str]) -> dict[str, str]:
+    return validate_product_environment(
+        parse_key_value_arguments(items, "--product-env")
+    )
 
 
 def resolve_config_overrides(profile: str, items: list[str]) -> dict[str, str]:
@@ -4520,11 +4555,17 @@ def validate_isolated_cache_dir(cache_dir: Path) -> Path:
     return resolved
 
 
-def build_env(cache_dir: Path) -> dict[str, str]:
+def build_env(
+    cache_dir: Path, product_environment: dict[str, str] | None = None
+) -> dict[str, str]:
     isolated_cache = validate_isolated_cache_dir(cache_dir)
     env = {
         key: value for key, value in os.environ.items() if not key.startswith("CBM_")
     }
+    explicit_product_environment = validate_product_environment(
+        product_environment or {}
+    )
+    env.update(explicit_product_environment)
     env["CBM_CACHE_DIR"] = str(isolated_cache)
     env["CBM_AUTO_INDEX"] = "false"
     env["CBM_CONTEXT_INJECTION"] = "false"
@@ -4534,17 +4575,28 @@ def build_env(cache_dir: Path) -> dict[str, str]:
     return env
 
 
-def benchmark_environment_policy() -> dict[str, Any]:
-    return {
+def benchmark_environment_policy(
+    product_environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    explicit_product_environment = dict(sorted((product_environment or {}).items()))
+    workers = explicit_product_environment.get("CBM_WORKERS")
+    policy = {
         "inherited_product_environment": "remove_all_CBM_prefix_variables",
         "harness_overrides": {
             "CBM_AUTO_INDEX": "false",
             "CBM_CONTEXT_INJECTION": "false",
             "CBM_PROFILE": "1",
         },
-        "worker_selection": "candidate_default_with_CBM_WORKERS_unset",
+        "worker_selection": (
+            f"explicit_CBM_WORKERS={workers}"
+            if workers is not None
+            else "candidate_default_with_CBM_WORKERS_unset"
+        ),
         "cache_scope": "isolated_per_benchmark_case",
     }
+    if explicit_product_environment:
+        policy["explicit_product_environment"] = explicit_product_environment
+    return policy
 
 
 def prepare_matrix_scenario(
@@ -5993,7 +6045,7 @@ def run_pair_quality_lifecycle(
 
     fresh_cache = work_root / "fresh-cache"
     fresh_cache.mkdir(parents=True, exist_ok=True)
-    fresh_env = build_env(fresh_cache)
+    fresh_env = build_env(fresh_cache, args.product_environment)
     apply_rank_refresh_override(binary, fresh_env, args.rank_refresh, args.timeout)
     apply_config_overrides(binary, fresh_env, args.config_overrides, args.timeout)
     if args.transport == "mcp":
@@ -6092,7 +6144,7 @@ def run_capability_quality(
     cache_dir = work_root / "cache"
     repo_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    case_env = build_env(cache_dir)
+    case_env = build_env(cache_dir, args.product_environment)
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
@@ -6111,7 +6163,9 @@ def run_capability_quality(
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
-            "configuration_environment": benchmark_environment_policy(),
+            "configuration_environment": benchmark_environment_policy(
+                args.product_environment
+            ),
             "transport": args.transport,
             "timeout": args.timeout,
             "quality_background_repo": args.quality_background_repo or None,
@@ -6418,7 +6472,9 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
-            "configuration_environment": benchmark_environment_policy(),
+            "configuration_environment": benchmark_environment_policy(
+                args.product_environment
+            ),
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
@@ -6431,7 +6487,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
     }
     exit_code = 1
     try:
-        base_env = build_env(work_root / "cache-base")
+        base_env = build_env(work_root / "cache-base", args.product_environment)
         for scenario in scenarios:
             case = run_matrix_case(
                 scenario, binary, base_env, work_root / scenario, args
@@ -6466,7 +6522,7 @@ def run_self_dogfood_case(
     repo_dir = create_self_dogfood_worktree(
         source_repo, case_root, args.timeout, revision
     )
-    case_env = build_env(cache_dir)
+    case_env = build_env(cache_dir, args.product_environment)
     cleanup: dict[str, Any] = {"requested": not args.keep_work_root, "removed": False}
     result: dict[str, Any] | None = None
     try:
@@ -6761,7 +6817,9 @@ def run_self_dogfood(
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
-            "configuration_environment": benchmark_environment_policy(),
+            "configuration_environment": benchmark_environment_policy(
+                args.product_environment
+            ),
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
@@ -6908,6 +6966,17 @@ def parse_args() -> argparse.Namespace:
         default=[],
         metavar="KEY=VALUE",
         help="Additional config override; repeat to set multiple keys. Applied after built-in settings.",
+    )
+    parser.add_argument(
+        "--product-env",
+        action="append",
+        default=[],
+        metavar="CBM_KEY=VALUE",
+        help=(
+            "Explicit candidate process environment; repeat for controlled worker or "
+            "memory sweeps. Keys must start with CBM_. Cache, profiling, auto-index, "
+            "and run-context variables remain owned by the benchmark harness."
+        ),
     )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--keep-work-root", action="store_true")
@@ -7068,6 +7137,7 @@ def parse_args() -> argparse.Namespace:
     else:
         args.build_metadata = {}
     args.config_overrides = resolve_config_overrides(args.config_profile, args.config)
+    args.product_environment = parse_product_environment(args.product_env)
     return args
 
 
@@ -7193,7 +7263,9 @@ def main() -> int:
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
-            "configuration_environment": benchmark_environment_policy(),
+            "configuration_environment": benchmark_environment_policy(
+                args.product_environment
+            ),
             "timeout": args.timeout,
             "transport": args.transport,
             "overhead_probes": args.overhead_probes,
@@ -7208,7 +7280,7 @@ def main() -> int:
     exit_code = 1
     try:
         create_repo(repo_dir, args.files, args.functions_per_file)
-        env = build_env(cache_dir)
+        env = build_env(cache_dir, args.product_environment)
         run_config_set(binary, env, "incremental_reindex", "always", args.timeout)
         apply_rank_refresh_override(binary, env, args.rank_refresh, args.timeout)
         apply_config_overrides(binary, env, args.config_overrides, args.timeout)

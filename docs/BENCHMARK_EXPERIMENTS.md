@@ -144,6 +144,14 @@ This preserves parallel implementations without pretending their overlapping wor
 was serial. Future low-overhead instrumentation can populate the same fields without
 changing the fact-table contract.
 
+For index results, `elapsed_ms` is the user-visible tool-call boundary.
+`worker_elapsed_ms` is the supervised worker lifetime when that marker exists, and
+`process_overhead_ms` is the non-negative difference between those two recorded
+boundaries. `indexed_work_elapsed_ms` is the narrower full or incremental pipeline
+marker inside the worker. These are nested observations: do not add worker and
+indexed-work durations to the user lifecycle, and do not describe
+`process_overhead_ms` as indexing algorithm time.
+
 ## Plan format
 
 ```json
@@ -189,6 +197,90 @@ For compact `--matrix-spec` grids, each scenario requires `frontier_files` and
 `null` to preserve each candidate's configured/default
 `incremental_exact_max_affected_paths`; the generated cell is labelled
 `capdefault` and does not inject a config override.
+
+### Reusable ref-based matrices
+
+A compact matrix may name arbitrary Git refs instead of embedding candidate binary
+paths. This is the preferred long-lived interface for comparing new branches,
+capabilities, configuration values, worker counts, memory budgets, and workload
+flags after the built-in dated presets become irrelevant:
+
+```json
+{
+  "schema_version": 1,
+  "identity_version": 2,
+  "harness_version": "development-comparison-v1",
+  "benchmark_script": "benchmarks/run_benchmark.py",
+  "cwd": ".",
+  "repetitions": 3,
+  "execution_order": "paired_interleaved",
+  "transports": ["mcp"],
+  "candidates": [
+    {
+      "label": "baseline",
+      "ref": "main",
+      "capability_support": {"rank": true, "dependencies": true}
+    },
+    {
+      "label": "candidate",
+      "ref": "feature/new-design",
+      "capability_support": {"rank": true, "dependencies": true}
+    }
+  ],
+  "profiles": [
+    {
+      "label": "default-workers",
+      "config_profile": "candidate_native_configuration",
+      "capabilities": {}
+    },
+    {
+      "label": "four-workers",
+      "config_profile": "candidate_native_configuration",
+      "capabilities": {},
+      "product_environment": {"CBM_WORKERS": "4"},
+      "benchmark_args": ["--overhead-probes", "3"]
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "go_modify_1",
+      "frontier_files": [4, 64],
+      "exact_caps": [null]
+    }
+  ]
+}
+```
+
+Run it from a repository checkout:
+
+```sh
+uv run python benchmarks/run_experiments.py \
+  --matrix-spec /absolute/path/development-comparison.json \
+  --experiment-root /durable/ignored/path/development-comparison
+```
+
+The source spec is archived by SHA-256. Each `ref` is resolved to a full commit,
+built in a detached worktree, and replaced in a separate resolved spec by the
+existing `revision`, `binary`, `binary_sha256`, compiler, flags, tree, and commit
+metadata. The source object is not modified. A ref entry cannot also claim a
+prebuilt binary or revision.
+
+Use the existing axes rather than adding branch-specific code:
+
+| Need | Matrix field | Behavior |
+|---|---|---|
+| Product configuration | `config_overrides` | Passed through the versioned config-spelling compatibility path |
+| Process/resource knob | `product_environment` | Explicit `CBM_*` variables only; inherited product variables remain removed |
+| New optional benchmark workload flag | `benchmark_args` | Additive arguments; experiment-owned identity, output, transport, config, and scenario flags are rejected |
+| Candidate compatibility | `capability_support` | Records which correctness gates apply without pretending unsupported features exist |
+| Branch-specific ablation | `candidate_labels` on a profile | Applies a profile only to named compatible candidates |
+
+Top-level product environment is overridden by candidate, then profile, then
+scenario values. Benchmark arguments are appended in that same order.
+`CBM_CACHE_DIR`, `CBM_PROFILE`, auto-index isolation, and run-context variables stay
+harness-owned so a matrix cannot redirect live data or suppress measurement logs.
+Fully resolved historical specs remain valid, and specs that omit these new fields
+retain their previous cell shape and identity.
 
 Set top-level `"accepted_exit_codes": [0, 1]` when the matrix benchmark uses exit
 code 1 for a completed measurement that missed a correctness or quality gate. The
@@ -372,9 +464,11 @@ The lowest-cost indexing baseline also disables installed-package indexing and i
 profile name and the fully expanded requested/effective override maps for
 auditability. Each benchmark case removes inherited `CBM_*` product variables,
 uses an isolated cache, and records that worker selection follows the candidate's
-native default with `CBM_WORKERS` unset. Candidate-native profiles record effective
-configuration as unknown instead of inferring defaults that an older binary did not
-report.
+native default with `CBM_WORKERS` unset unless the matrix explicitly declares
+`product_environment`. Explicit values are recorded in the cell identity and report
+environment policy before being applied to the candidate process. Candidate-native
+profiles record effective configuration as unknown instead of inferring defaults
+that an older binary did not report.
 
 Only apply gates a candidate revision actually supports. Record unsupported
 combinations as compatibility findings rather than silently treating them as the
@@ -454,10 +548,10 @@ comparison point.
 
 Automatic presets use MCP transport by default. That is appropriate when the
 benchmark owns an isolated account/runtime or all candidates are compatible with
-the active account-wide CBM daemon. It is not a valid cross-build setup when another
-CBM build is already serving that account: the daemon correctly rejects a candidate
-with a different build identity before the benchmark can configure its isolated
-cache.
+the active account-wide CBM daemon. Neither MCP nor CLI is a valid cross-build setup
+when another CBM build is serving that account: current one-shot `config`, index,
+and query CLI commands enforce the same exact-build cohort and correctly reject a
+different candidate before the benchmark can use its isolated cache.
 
 Select CLI transport explicitly in that situation:
 
@@ -468,11 +562,13 @@ uv run python benchmarks/run_experiments.py --full --transport cli \
 ```
 
 CLI transport runs the same candidate binaries, profiles, scenarios, repetitions,
-quality gates, and isolated caches without routing them through the account-wide
-daemon. The runner never silently falls back between CLI and MCP. Use MCP when
-measuring protocol/daemon overhead and CLI when comparing candidate indexing and
-query implementations without disrupting an active daemon. The benchmark runs
-directly on the host and does not require Docker.
+quality gates, and isolated caches without MCP framing, but it still participates in
+account-wide exact-build coordination. Run a cross-build CLI matrix in a dedicated
+OS account/runtime or after quiescing that account's daemon, and restore normal
+dogfooding afterward. Changing `CBM_CACHE_DIR`, the Git worktree, or the experiment
+root is not daemon isolation. The runner never silently falls back between CLI and
+MCP. Use MCP to measure protocol/daemon overhead and CLI to isolate framing cost.
+The benchmark runs directly on the host and does not require Docker.
 
 Candidate labels are stable comparison roles. In the example,
 `upstream-main` still appears as the role label even though it resolves the local

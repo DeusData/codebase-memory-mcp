@@ -24,12 +24,12 @@ multi-candidate, repeated-run entry point; automatic modes store durable ignored
 state under `.worktrees/benchmark-campaign/`. Explicit runs should use an ignored
 `benchmark-results/` root or another durable path outside the checkout.
 
-The automatic `--quick` and `--full` matrices default to MCP transport. Use
-`--transport cli` for a cross-build comparison when an account-wide CBM daemon is
-already active: each cell then invokes its candidate directly, so a candidate with
-a different build identity cannot conflict with the active daemon. MCP cells require
-an isolated account/runtime or an active daemon compatible with every candidate;
-the runner does not silently change transports. Neither entry point requires Docker.
+The automatic `--quick` and `--full` matrices default to MCP transport. Cross-build
+CLI matrices require a dedicated OS account/runtime or a quiescent account-wide CBM
+daemon: current one-shot CLI commands enforce the same exact-build cohort as MCP and
+correctly reject a candidate that differs from an active daemon. MCP matrices require
+an isolated account/runtime or one active daemon compatible with every candidate.
+The runner does not silently change transports. Neither entry point requires Docker.
 
 For example, this runs the full repeated matrix against the exact local `main` ref:
 
@@ -39,9 +39,23 @@ uv run python benchmarks/run_experiments.py --full --transport cli \
   --experiment-root /durable/path/full-head-vs-main
 ```
 
+Run that command only after verifying that its OS account has no active CBM daemon,
+or from a dedicated benchmark account. Merely changing `CBM_CACHE_DIR`, the Git
+worktree, or the experiment root does not create a separate daemon cohort.
+
 `upstream-main` is the stable candidate role used by the report schema. Overriding
 its ref does not rename the role, so cite the resolved ref and commit recorded in the
 expanded plan when describing results.
+
+For ongoing development, a compact `--matrix-spec` may use arbitrary candidate
+`{"label": "...", "ref": "branch-or-commit"}` entries. The runner resolves,
+production-builds, hashes, and archives those candidates before expanding the
+existing immutable plan schema. Profiles remain the reusable configuration axis:
+use `config_overrides` for product config keys, `product_environment` for explicit
+`CBM_*` process knobs such as `CBM_WORKERS`, and `benchmark_args` for additive
+workload flags. Candidate, profile, and scenario scopes can add new branches,
+capabilities, and controlled sweeps without editing the built-in dated presets.
+See [the complete matrix example](../docs/BENCHMARK_EXPERIMENTS.md#reusable-ref-based-matrices).
 
 `schema/` contains schemas for records emitted by current tooling.
 `terminology.json` defines every normative fact, step, join, and formula identifier.
