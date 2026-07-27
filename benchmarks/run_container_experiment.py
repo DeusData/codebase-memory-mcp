@@ -355,10 +355,13 @@ def copy_to_volume(
     docker: str,
     image: str,
     volume: str,
-    destination: str,
+    volume_destination: str,
     source: Path,
     container_name: str,
+    *,
+    copy_destination: str | None = None,
 ) -> None:
+    destination = copy_destination or volume_destination
     copy_source = f"{source}{os.sep}." if source.is_dir() else str(source)
     remove_container(docker, container_name)
     try:
@@ -369,12 +372,15 @@ def copy_to_volume(
                 "--name",
                 container_name,
                 "--mount",
-                volume_mount(volume, destination),
+                volume_mount(volume, volume_destination),
                 "--entrypoint",
-                "/bin/true",
+                "/bin/mkdir",
                 image,
+                "-p",
+                destination,
             ]
         )
+        run_command([docker, "start", "--attach", container_name])
         run_command([docker, "cp", copy_source, f"{container_name}:{destination}"])
     finally:
         remove_container(docker, container_name)
@@ -681,9 +687,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.docker,
                 image,
                 results_volume,
-                "/results/manifests",
+                "/results",
                 manifest_path.parent,
                 seed_name,
+                copy_destination="/results/manifests",
             )
 
             uid = os.getuid() if hasattr(os, "getuid") else None
