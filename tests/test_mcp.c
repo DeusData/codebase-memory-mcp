@@ -1537,6 +1537,112 @@ TEST(tool_list_projects_first_context_resolves_session_store) {
     PASS();
 }
 
+typedef struct {
+    const char *project;
+    const char *status;
+    bool graph_published;
+} coordinated_index_result_spec_t;
+
+static char *coordinated_index_target_result(void *context, const char *repo_path,
+                                             const char *args_json) {
+    (void)repo_path;
+    (void)args_json;
+    const coordinated_index_result_spec_t *spec = context;
+    char payload[CBM_SZ_512];
+    (void)snprintf(payload, sizeof(payload),
+                   "{\"project\":\"%s\",\"status\":\"%s\","
+                   "\"graph_published\":%s}",
+                   spec->project, spec->status, spec->graph_published ? "true" : "false");
+    return cbm_mcp_text_result(payload, false);
+}
+
+TEST(tool_index_repository_first_context_uses_published_target_project) {
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-index-context-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *project = "coordinated-index-target";
+    char db_path[CBM_SZ_512];
+    ASSERT_TRUE(snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project) > 0);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Project",
+                       .name = project,
+                       .qualified_name = project,
+                       .file_path = ""};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    cbm_store_close(store);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "caller-session-project");
+    coordinated_index_result_spec_t result_spec = {
+        .project = project,
+        .status = "indexed",
+        .graph_published = true,
+    };
+    cbm_mcp_server_set_index_executor(srv, coordinated_index_target_result, &result_spec);
+
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/tmp\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"session_project\":\"caller-session-project\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"project\":\"coordinated-index-target\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"_context\":{\"project\":\"coordinated-index-target\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"ready\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"nodes\":1"));
+    ASSERT_NULL(strstr(inner, "\"action_required\""));
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_remove_db_sidecars(db_path);
+    cbm_unlink(db_path);
+    th_rmtree(cache);
+    PASS();
+}
+
+TEST(tool_index_repository_unpublished_result_keeps_session_context) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "caller-session-project");
+    coordinated_index_result_spec_t result_spec = {
+        .project = "coordinated-index-target",
+        .status = "queued",
+        .graph_published = false,
+    };
+    cbm_mcp_server_set_index_executor(srv, coordinated_index_target_result, &result_spec);
+
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/tmp\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"project\":\"coordinated-index-target\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"queued\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"_context\":{\"project\":\"caller-session-project\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"not_indexed\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"action_required\""));
+    ASSERT_NULL(strstr(inner, "\"_context\":{\"project\":\"coordinated-index-target\""));
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(response_context_disabled_does_not_consume_first_delivery) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -16410,6 +16516,8 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
     RUN_TEST(tool_list_projects_first_context_resolves_session_store);
+    RUN_TEST(tool_index_repository_first_context_uses_published_target_project);
+    RUN_TEST(tool_index_repository_unpublished_result_keeps_session_context);
     RUN_TEST(response_context_disabled_does_not_consume_first_delivery);
     RUN_TEST(tool_list_projects_paginates_with_explicit_full_compatibility);
     RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
