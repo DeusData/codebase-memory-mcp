@@ -18108,6 +18108,54 @@ TEST(pipeline_semantic_edges_tokenize_complete_long_metadata) {
     PASS();
 }
 
+TEST(pipeline_semantic_edges_tokenize_escaped_json_metadata) {
+    /* Faithful shape from scripts/test_mcp_interactive.py::read_json_lines:
+     * quoted type annotations become JSON escapes in signature/param_types,
+     * and square brackets inside the quoted values are data, not array ends. */
+    const char props[] =
+        "{\"signature\":\"(stream: BinaryIO, responses: "
+        "\\\"queue.Queue[dict[str, Any]]\\\", sig_tail_canary)\","
+        "\"return_type\":\"None\","
+        "\"param_types\":[\"BinaryIO\",\"\\\"queue.Queue[dict[str, Any]]\\\"\","
+        "\"array_tail_canary\"],"
+        "\"docstring\":\"semantic_after_escaped_quote\","
+        "\"bt\":\"array_after_escaped_quote\"}";
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-escaped", "/tmp/sem-escaped");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "read_json_lines",
+                                   "sem-escaped.read_json_lines", "interactive.py", 1, 12, props),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "peer", "sem-escaped.peer", "peer.py", 1, 2,
+                                   "{\"docstring\":\"peer\"}"),
+              0);
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "sem-escaped",
+        .repo_path = "/tmp/sem-escaped",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+
+    pipeline_capture_logs_start();
+    int rc = cbm_pipeline_pass_semantic_edges(&ctx);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(strstr(logs, "pass.semantic.tokenize_failed"));
+    const char *marker = strstr(logs, "pass.semantic.token_vectors count=");
+    ASSERT_NOT_NULL(marker);
+    marker += strlen("pass.semantic.token_vectors count=");
+    char *end = NULL;
+    long token_count = strtol(marker, &end, 10);
+    ASSERT_TRUE(end != marker);
+    /* Escaped quotes must not truncate the signature at responses, and the
+     * first ']' inside dict[str, Any] must not terminate param_types. */
+    ASSERT_GTE(token_count, 23);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results) {
     enum {
         SEM_NOISY_BUCKET_FUNCTIONS = 205,
@@ -19204,6 +19252,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_corpus_accepts_nonuniform_docs_beyond_legacy_stride);
     RUN_TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids);
     RUN_TEST(pipeline_semantic_edges_tokenize_complete_long_metadata);
+    RUN_TEST(pipeline_semantic_edges_tokenize_escaped_json_metadata);
     RUN_TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results);
     RUN_TEST(pipeline_semantic_candidate_rank_prefers_band_evidence_canonically);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
