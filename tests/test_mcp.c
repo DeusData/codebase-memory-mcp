@@ -10383,6 +10383,7 @@ TEST(first_search_reports_automatic_index_block_reason) {
     char *response = request_missing_index_with_mode(config, 65, false);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_TRUE(response_text_field_contains(response, "status", "not_indexed"));
     ASSERT_TRUE(response_text_field_contains(response, "action_required", "auto_index=false"));
     ASSERT_NOT_NULL(strstr(response, "auto_index=false"));
     ASSERT_NOT_NULL(strstr(response, "_hidden_tools"));
@@ -10431,6 +10432,21 @@ TEST(first_search_reports_automatic_index_block_reason) {
     ASSERT_NOT_NULL(strstr(response, "repo_path"));
     ASSERT_NULL(strstr(response, "_hidden_tools"));
     ASSERT_NULL(strstr(response, "refresh tools/list"));
+    free(response);
+
+    /* An empty cache must retain the same machine-readable recovery contract.
+     * Previously this branch put the instruction only in a generic "hint" and
+     * omitted status, so automated callers had to parse prose or guess whether
+     * retrying could succeed. */
+    cbm_remove_db_sidecars(decoy_db_path);
+    ASSERT_EQ(cbm_unlink(decoy_db_path), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC), 0);
+    response = request_missing_index_with_mode(config, 73, false);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_TRUE(response_text_field_contains(response, "status", "not_indexed"));
+    ASSERT_TRUE(response_text_field_contains(response, "action_required", "call index_repository"));
+    ASSERT_NOT_NULL(strstr(response, "repo_path"));
     free(response);
 
     cbm_config_close(config);
