@@ -818,6 +818,10 @@ TEST(search_graph_summary_default_format_suppresses_node_rows) {
     ASSERT_NOT_NULL(strstr(resp, "_context_project: limit-test"));
     ASSERT_NOT_NULL(strstr(resp, "_context_nodes: 81"));
     ASSERT_NOT_NULL(strstr(resp, "_context_edges: 3"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_count_read_model: canonical_only"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_coverage_status: unavailable"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_coverage_action:"));
+    ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
     ASSERT_NOT_NULL(strstr(resp, "_context_node_labels"));
     ASSERT_NOT_NULL(strstr(resp, "_context_edge_types"));
 
@@ -1744,6 +1748,127 @@ TEST(all_mcp_responses_default_to_toon) {
     PASS();
 }
 
+TEST(first_graph_tool_response_always_includes_project_context) {
+    const char *tools[] = {
+        "search_graph",
+        "query_graph",
+        "search_code",
+        "trace_path",
+        "get_code",
+    };
+    const char *args[] = {
+        "{\"project\":\"sp-test\",\"limit\":1,\"format\":\"json\"}",
+        "{\"project\":\"sp-test\",\"query\":\"MATCH (n) RETURN n.name LIMIT 1\","
+        "\"format\":\"json\"}",
+        "{\"project\":\"sp-test\",\"pattern\":\"main\",\"format\":\"json\"}",
+        "{\"project\":\"sp-test\",\"function_name\":\"main\",\"format\":\"json\"}",
+        "{\"project\":\"sp-test\",\"qualified_name\":\"sp-test.main.main\","
+        "\"format\":\"json\"}",
+    };
+
+    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
+        cbm_mcp_server_t *srv = setup_sp_server();
+        ASSERT_NOT_NULL(srv);
+        cbm_mcp_server_set_session_project(srv, "sp-test");
+
+        char *raw = cbm_mcp_handle_tool(srv, tools[i], args[i]);
+        char *text = extract_text_content_tr(raw);
+        free(raw);
+        ASSERT_NOT_NULL(text);
+
+        yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "session_project")), "sp-test");
+        yyjson_val *context = yyjson_obj_get(root, "_context");
+        ASSERT_NOT_NULL(context);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(context, "status")), "ready");
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(context, "project")), "sp-test");
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(context, "nodes")), 3);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(context, "edges")), 2);
+        ASSERT_NOT_NULL(yyjson_obj_get(context, "node_labels"));
+        ASSERT_NOT_NULL(yyjson_obj_get(context, "edge_types"));
+        yyjson_val *coverage = yyjson_obj_get(context, "coverage");
+        ASSERT_NOT_NULL(coverage);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(coverage, "status")), "unavailable");
+        ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(coverage, "action")),
+                               "check_index_coverage"));
+        yyjson_doc_free(doc);
+        free(text);
+
+        raw = cbm_mcp_handle_tool(
+            srv, "search_graph",
+            "{\"project\":\"sp-test\",\"limit\":1,\"format\":\"json\"}");
+        text = extract_text_content_tr(raw);
+        free(raw);
+        ASSERT_NOT_NULL(text);
+        doc = yyjson_read(text, strlen(text), 0);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "session_project")), "sp-test");
+        ASSERT_NULL(yyjson_obj_get(root, "_context"));
+        yyjson_doc_free(doc);
+        free(text);
+        cbm_mcp_server_free(srv);
+    }
+
+    PASS();
+}
+
+TEST(first_graph_tool_response_reports_empty_store_actionably) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "empty-project", "/tmp"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "empty-project");
+    cbm_mcp_server_set_session_project(srv, "empty-project");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"empty-project\",\"function_name\":\"missing\",\"format\":\"json\"}");
+    char *text = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *context = yyjson_obj_get(yyjson_doc_get_root(doc), "_context");
+    ASSERT_NOT_NULL(context);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(context, "status")), "empty");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(context, "nodes")), 0);
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(context, "action_required")),
+                           "index_repository"));
+
+    yyjson_doc_free(doc);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(first_tool_response_distinguishes_unresolved_project_from_empty_store) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "not-yet-indexed");
+
+    char *raw = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    char *text = extract_text_content_tr(raw);
+    free(raw);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *context = yyjson_obj_get(yyjson_doc_get_root(doc), "_context");
+    ASSERT_NOT_NULL(context);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(context, "status")), "not_indexed");
+    ASSERT_NULL(yyjson_obj_get(context, "nodes"));
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(context, "action_required")),
+                           "project=\"/path/to/repo\""));
+
+    yyjson_doc_free(doc);
+    free(text);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  2.1 trace_path FIELD OMISSION (TDD)
  *  Candidates block uses empty-string fallback for file_path (mcp.c:2116).
@@ -2047,6 +2172,9 @@ SUITE(token_reduction) {
 
     /* 2.0 JSON Output Minification */
     RUN_TEST(all_mcp_responses_default_to_toon);
+    RUN_TEST(first_graph_tool_response_always_includes_project_context);
+    RUN_TEST(first_graph_tool_response_reports_empty_store_actionably);
+    RUN_TEST(first_tool_response_distinguishes_unresolved_project_from_empty_store);
 
     /* 2.1 trace_path Field Omission */
     RUN_TEST(trace_path_candidates_omits_empty_file_path);

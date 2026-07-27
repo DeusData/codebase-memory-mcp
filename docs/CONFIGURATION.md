@@ -89,7 +89,7 @@ for any registry key):
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register indexed projects for automatic background Git-change refresh. |
 | `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
-| `context_injection` | `true` | Include codebase schema and stats automatically in the first `search_graph` response. |
+| `context_injection` | `true` | Include bounded project/index status, recovery guidance, freshness, coverage, schema, and graph stats automatically in the first tool response; later responses include only `session_project`. |
 | `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
 | `auto_index_deps` | `false` | Automatically index installed dependency source for cross-package search and tracing. |
 | `auto_dep_limit` | `20` | Import-ranked automatic dependency package cap; `0` is unlimited. |

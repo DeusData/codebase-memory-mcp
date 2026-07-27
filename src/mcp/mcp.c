@@ -4459,7 +4459,9 @@ static void mcp_index_recovery_action(cbm_mcp_server_t *srv, char *out, size_t o
         return;
     }
     bool allowed = !srv || mcp_tool_allowed(srv->tool_profile, "index_repository");
-    bool visible = allowed && (!srv || cbm_mcp_advanced_tool_visible(srv, "index_repository"));
+    bool visible =
+        allowed && (!srv || cbm_mcp_tool_mode_is_classic(srv) ||
+                    cbm_mcp_advanced_tool_visible(srv, "index_repository"));
     if (visible) {
         snprintf(out, out_size, "call index_repository with repo_path='/absolute/path/to/repo'.");
     } else if (allowed) {
@@ -4474,6 +4476,42 @@ static void mcp_index_recovery_action(cbm_mcp_server_t *srv, char *out, size_t o
     }
 }
 
+static void mcp_index_recovery_hint(cbm_mcp_server_t *srv, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    char index_action[CBM_SZ_512];
+    mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+    switch (srv ? srv->autoindex_block : MCP_AUTOINDEX_BLOCK_NONE) {
+    case MCP_AUTOINDEX_BLOCK_DISABLED:
+        snprintf(out, out_size,
+                 "Automatic indexing is disabled (auto_index=false). Set auto_index=true and "
+                 "retry, or %s",
+                 index_action);
+        break;
+    case MCP_AUTOINDEX_BLOCK_FILE_COUNT:
+        snprintf(out, out_size,
+                 "Automatic indexing could not count project files safely. Check project read "
+                 "permissions, then retry; %s",
+                 index_action);
+        break;
+    case MCP_AUTOINDEX_BLOCK_FILE_LIMIT:
+        snprintf(out, out_size,
+                 "Automatic indexing found at least %d indexable files, exceeding "
+                 "auto_index_limit=%d. Check available memory before raising the limit and "
+                 "retrying; if the larger run is intentional, %s",
+                 srv->autoindex_observed_files, srv->autoindex_file_limit, index_action);
+        break;
+    case MCP_AUTOINDEX_BLOCK_NONE:
+    default:
+        snprintf(out, out_size,
+                 "No published index is readable. Pass the repository path as project to use "
+                 "configured automatic indexing, or %s",
+                 index_action);
+        break;
+    }
+}
+
 /* Build a helpful error listing available projects. Caller must free() result. */
 static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *reason) {
     char dir_path[1024];
@@ -4485,60 +4523,8 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
     int total_count = collect_db_project_names(dir_path, projects, sizeof(projects),
                                                &listed_count, &projects_truncated);
 
-    char index_action[CBM_SZ_512];
-    mcp_index_recovery_action(srv, index_action, sizeof(index_action));
     char recovery_hint[CBM_SZ_1K];
-    switch (srv ? srv->autoindex_block : MCP_AUTOINDEX_BLOCK_NONE) {
-    case MCP_AUTOINDEX_BLOCK_DISABLED:
-        snprintf(recovery_hint, sizeof(recovery_hint),
-                 "Automatic indexing is disabled (auto_index=false). Set auto_index=true and "
-                 "retry, or %s",
-                 index_action);
-        break;
-    case MCP_AUTOINDEX_BLOCK_FILE_COUNT:
-        snprintf(recovery_hint, sizeof(recovery_hint),
-                 "Automatic indexing could not count project files safely. Check project read "
-                 "permissions, then retry; %s",
-                 index_action);
-        break;
-    case MCP_AUTOINDEX_BLOCK_FILE_LIMIT:
-        snprintf(recovery_hint, sizeof(recovery_hint),
-                 "Automatic indexing found at least %d indexable files, exceeding "
-                 "auto_index_limit=%d. Check available memory before raising the limit and "
-                 "retrying; if the larger run is intentional, %s",
-                 srv->autoindex_observed_files, srv->autoindex_file_limit, index_action);
-        break;
-    case MCP_AUTOINDEX_BLOCK_NONE:
-    default:
-        snprintf(recovery_hint, sizeof(recovery_hint),
-                 "No published index is readable. Pass the repository path as project to use "
-                 "configured automatic indexing, or %s",
-                 index_action);
-        break;
-    }
-
-    /* Optional: session_project and _context fields for richer error context */
-    char session_frag[256] = "";
-    char context_frag[CBM_SZ_2K] = "";
-    const char *context_hint =
-        total_count == 0
-            ? recovery_hint
-            : "The requested project has no readable published index. Use list_projects and "
-              "pass the intended project explicitly.";
-    if (srv && srv->session_project[0]) {
-        snprintf(session_frag, sizeof(session_frag),
-                 ",\"session_project\":\"%s\"", srv->session_project);
-        /* Include a minimal _context so clients can identify session state */
-        bool ctx_enabled =
-            cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
-        if (ctx_enabled && !srv->context_injected) {
-            snprintf(context_frag, sizeof(context_frag),
-                     ",\"_context\":{\"status\":\"not_indexed\","
-                     "\"hint\":\"%s\"}",
-                     context_hint);
-            srv->context_injected = true;  /* one-shot: suppress from future successful responses */
-        }
-    }
+    mcp_index_recovery_hint(srv, recovery_hint, sizeof(recovery_hint));
 
     enum { ERR_BUF_SZ = 6144 };
     char buf[ERR_BUF_SZ];
@@ -4546,10 +4532,9 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
                  "then pass one as the \\\"project\\\" argument.\","
-                 "\"available_projects\":[%s],\"count\":%d%s%s%s}",
+                 "\"available_projects\":[%s],\"count\":%d%s}",
                  reason, projects, listed_count,
-                 projects_truncated ? ",\"available_projects_truncated\":true" : "",
-                 session_frag, context_frag);
+                 projects_truncated ? ",\"available_projects_truncated\":true" : "");
         if (projects_truncated) {
             size_t len = strlen(buf);
             if (len > 0 && buf[len - 1] == '}') {
@@ -4558,8 +4543,7 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
             }
         }
     } else {
-        snprintf(buf, sizeof(buf), "{\"error\":\"%s\",\"hint\":\"%s\"%s%s}", reason, recovery_hint,
-                 session_frag, context_frag);
+        snprintf(buf, sizeof(buf), "{\"error\":\"%s\",\"hint\":\"%s\"}", reason, recovery_hint);
     }
     return heap_strdup(buf);
 }
@@ -4614,7 +4598,145 @@ static char *build_project_list_error(const char *reason) {
 /* Convenience alias for handlers with no extra locals to free. */
 #define REQUIRE_STORE(store, project) REQUIRE_STORE_EX(store, project, (void)0)
 
-/* ── Auto-context injection (Phase 9) ─────────────────────────── */
+/* ── Automatic first-response context ─────────────────────────── */
+
+/* Add the bounded project/index state shared by the automatic first-response
+ * context and codebase://status. This is the single authority for status,
+ * canonical graph counts, dirty/overlay visibility, coverage-generation
+ * metadata, and actionable recovery. It performs a fixed number of indexed
+ * lookups and never scans source files or coverage rows. */
+static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                       cbm_mcp_server_t *srv, cbm_store_t *store,
+                                       const char *project) {
+    char index_action[CBM_SZ_512];
+    mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+
+    if (project && project[0]) {
+        yyjson_mut_obj_add_str(doc, root, "project", project);
+    }
+
+    if (srv->autoindex_active) {
+        yyjson_mut_obj_add_str(doc, root, "status", "indexing");
+        yyjson_mut_obj_add_str(
+            doc, root, "action_required",
+            "Wait for indexing to finish, then retry the tool call. Use index_status for progress.");
+        return false;
+    }
+
+    if (!store) {
+        yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
+        if (srv->autoindex_failed) {
+            yyjson_mut_obj_add_str(
+                doc, root, "detail",
+                "Automatic indexing failed; graph results are unavailable until indexing succeeds.");
+            char action[CBM_SZ_1K];
+            snprintf(action, sizeof(action),
+                     "Automatic recovery failed; %s Inspect the returned error before retrying.",
+                     index_action);
+            yyjson_mut_obj_add_strcpy(doc, root, "action_required", action);
+        } else if (srv->session_root[0]) {
+            char action[CBM_SZ_1K];
+            mcp_index_recovery_hint(srv, action, sizeof(action));
+            yyjson_mut_obj_add_strcpy(doc, root, "action_required", action);
+        } else {
+            yyjson_mut_obj_add_str(
+                doc, root, "action_required",
+                "Pass project=\"/path/to/repo\" or project=\"~/path/to/repo\" to a graph tool.");
+        }
+        return false;
+    }
+
+    int nodes = cbm_store_count_nodes(store, project);
+    int edges = cbm_store_count_edges(store, project);
+    bool ready = nodes > 0;
+    yyjson_mut_obj_add_str(doc, root, "status", ready ? "ready" : "empty");
+    yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
+    yyjson_mut_obj_add_int(doc, root, "edges", edges);
+    yyjson_mut_obj_add_str(doc, root, "count_read_model",
+                           CBM_MCP_FRESHNESS_READ_MODEL_CANONICAL_ONLY);
+    if (!ready) {
+        char action[CBM_SZ_1K];
+        snprintf(action, sizeof(action),
+                 "The project store has no graph nodes. Verify the repository contains supported "
+                 "source files, then %s",
+                 index_action);
+        yyjson_mut_obj_add_strcpy(doc, root, "action_required", action);
+    }
+
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        if (dirty_pending > 0 || dirty_overlay_ready > 0) {
+            add_response_warning(
+                doc, root,
+                "Canonical counts exclude pending dirty-file graph changes; overlay_read_view "
+                "reports newer visible node rows where ready.");
+        }
+    }
+    add_overlay_node_read_view_summary(
+        doc, root, store, project,
+        "nodes and edges are canonical counts; overlay_read_view reports newer visible node rows "
+        "used by overlay-aware tools.");
+
+    cbm_project_t project_info = {0};
+    bool have_project =
+        project && cbm_store_get_project(store, project, &project_info) == CBM_STORE_OK;
+    cbm_coverage_meta_t coverage_meta = {0};
+    bool have_coverage =
+        project && cbm_store_coverage_meta_get(store, project, &coverage_meta) == CBM_STORE_OK;
+    bool generation_matches =
+        have_project && have_coverage && project_info.indexed_at && coverage_meta.generation &&
+        strcmp(project_info.indexed_at, coverage_meta.generation) == 0;
+    yyjson_mut_val *coverage = yyjson_mut_obj(doc);
+    const char *recording_status =
+        have_coverage && coverage_meta.recording_status ? coverage_meta.recording_status : "unknown";
+    const char *coverage_status =
+        !have_coverage                                    ? "unavailable"
+        : !generation_matches                             ? "stale"
+        : strcmp(recording_status, "complete") == 0       ? "current"
+                                                          : "partial";
+    yyjson_mut_obj_add_str(doc, coverage, "status", coverage_status);
+    if (have_coverage) {
+        yyjson_mut_obj_add_strcpy(doc, coverage, "recording_status", recording_status);
+        yyjson_mut_obj_add_bool(doc, coverage, "generation_matches", generation_matches);
+        yyjson_mut_obj_add_bool(doc, coverage, "hash_records_complete",
+                                coverage_meta.hash_records_complete);
+    }
+    bool coverage_visible =
+        mcp_tool_allowed(srv->tool_profile, "check_index_coverage") &&
+        (cbm_mcp_tool_mode_is_classic(srv) ||
+         cbm_mcp_advanced_tool_visible(srv, "check_index_coverage"));
+    yyjson_mut_obj_add_str(
+        doc, coverage, "action",
+        coverage_visible
+            ? "Call check_index_coverage(paths=[...]) before negative/exhaustive claims."
+            : "Use _hidden_tools; refresh tools/list; call "
+              "check_index_coverage(paths=[...]) before negative/exhaustive claims.");
+    yyjson_mut_obj_add_val(doc, root, "coverage", coverage);
+
+    const char *context_root = have_project ? project_info.root_path : NULL;
+    if (!context_root && srv->session_root[0] &&
+        (!project || (srv->session_project[0] &&
+                      strcmp(project, srv->session_project) == 0))) {
+        context_root = srv->session_root;
+    }
+    if (context_root && context_root[0]) {
+        cbm_pkg_manager_t ecosystem = cbm_detect_ecosystem(context_root);
+        if (ecosystem != CBM_PKG_COUNT) {
+            yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
+                                   cbm_pkg_manager_str(ecosystem));
+        }
+    }
+
+    if (have_coverage) {
+        cbm_store_coverage_meta_clear(&coverage_meta);
+    }
+    if (have_project) {
+        cbm_project_free_fields(&project_info);
+    }
+    return ready;
+}
 
 /* Inject _context header into the FIRST tool response after session starts.
  * Contains architecture, schema, status — eliminates the need for separate
@@ -4649,7 +4771,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 cbm_mcp_server_t *srv, cbm_store_t *store,
                                 const char *context_project) {
     /* Always include session_project */
-    if (srv->session_project[0])
+    if (srv->session_project[0] && !yyjson_mut_obj_get(root, "session_project"))
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
     if (srv->context_injected) return;
@@ -4668,40 +4790,14 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
     srv->context_injected = true;
 
-    yyjson_mut_val *ctx = yyjson_mut_obj(doc);
-
-    if (!store) {
-        if (srv->session_root[0]) {
-            yyjson_mut_obj_add_str(doc, ctx, "status", "auto_indexing");
-            yyjson_mut_obj_add_str(doc, ctx, "hint",
-                "Auto-indexing your project; retry this query in a moment. "
-                "Pass project='/path/to/repo' or project='~/path/to/repo' explicitly to trigger immediately.");
-        } else {
-            yyjson_mut_obj_add_str(doc, ctx, "status", "not_indexed");
-            yyjson_mut_obj_add_str(doc, ctx, "hint",
-                "No project path detected. Pass project='/path/to/repo' or project='~/path/to/repo' to index and search.");
-        }
-        yyjson_mut_obj_add_val(doc, root, "_context", ctx);
-        return;
-    }
-
-    yyjson_mut_obj_add_str(doc, ctx, "status", "ready");
-
     /* The session project identifies the server CWD, while context_project
      * identifies the graph that supplied this response.  They intentionally
      * differ when a caller searches an explicit project from another CWD. */
     const char *proj = context_project && context_project[0]
                            ? context_project
                            : (srv->session_project[0] ? srv->session_project : NULL);
-    if (proj) {
-        yyjson_mut_obj_add_str(doc, ctx, "project", proj);
-    }
-
-    /* Node/edge counts */
-    int nodes = cbm_store_count_nodes(store, proj);
-    int edges = cbm_store_count_edges(store, proj);
-    yyjson_mut_obj_add_int(doc, ctx, "nodes", nodes);
-    yyjson_mut_obj_add_int(doc, ctx, "edges", edges);
+    yyjson_mut_val *ctx = yyjson_mut_obj(doc);
+    bool graph_ready = add_project_status_summary(doc, ctx, srv, store, proj);
 
     /* Schema: node labels + edge types. Counts-only: this context never emits
      * property keys, and the full variant's json_each discovery is O(total
@@ -4709,10 +4805,15 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
      * Overlay-aware via the shared selector so the first response can never
      * advertise vocabulary query_graph would then contradict. */
     cbm_schema_info_t schema = {0};
-    mcp_get_current_schema(store, proj, MCP_CYPHER_MATCH_VOCABULARY, &schema, NULL, NULL,
-                           NULL);
+    if (store) {
+        mcp_get_current_schema(store, proj, MCP_CYPHER_MATCH_VOCABULARY, &schema, NULL, NULL,
+                               NULL);
+    }
     yyjson_mut_val *label_arr = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.node_label_count; i++) {
+        if (!schema.node_labels[i].label || !schema.node_labels[i].label[0]) {
+            continue;
+        }
         yyjson_mut_val *lbl = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_strcpy(doc, lbl, "label", schema.node_labels[i].label);
         yyjson_mut_obj_add_int(doc, lbl, "count", schema.node_labels[i].count);
@@ -4722,6 +4823,9 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
     yyjson_mut_val *type_arr = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.edge_type_count; i++) {
+        if (!schema.edge_types[i].type || !schema.edge_types[i].type[0]) {
+            continue;
+        }
         yyjson_mut_val *et = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_strcpy(doc, et, "type", schema.edge_types[i].type);
         yyjson_mut_obj_add_int(doc, et, "count", schema.edge_types[i].count);
@@ -4729,6 +4833,10 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
     yyjson_mut_obj_add_val(doc, ctx, "edge_types", type_arr);
     cbm_store_schema_free(&schema);
+    if (!store || !graph_ready) {
+        yyjson_mut_obj_add_val(doc, root, "_context", ctx);
+        return;
+    }
 
     /* PageRank stats */
     sqlite3 *db = cbm_store_get_db(store);
@@ -4790,25 +4898,6 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
             free(kf_sql);
         }
     }
-
-    /* Detected ecosystem. Resolve the queried project's registered root
-     * instead of reporting the session CWD's package manager. */
-    cbm_project_t context_info = {0};
-    const char *context_root = NULL;
-    if (proj && cbm_store_get_project(store, proj, &context_info) == CBM_STORE_OK) {
-        context_root = context_info.root_path;
-    } else if ((!proj || (srv->session_project[0] && strcmp(proj, srv->session_project) == 0)) &&
-               srv->session_root[0]) {
-        context_root = srv->session_root;
-    }
-    if (context_root && context_root[0]) {
-        cbm_pkg_manager_t eco = cbm_detect_ecosystem(context_root);
-        if (eco != CBM_PKG_COUNT) {
-            yyjson_mut_obj_add_str(doc, ctx, "detected_ecosystem",
-                                   cbm_pkg_manager_str(eco));
-        }
-    }
-    cbm_project_free_fields(&context_info);
 
     yyjson_mut_obj_add_val(doc, root, "_context", ctx);
 }
@@ -4884,6 +4973,32 @@ static void toon_append_context_key_functions(cbm_sb_t *sb, yyjson_mut_val *ctx)
     }
 }
 
+static void toon_append_mut_bool(cbm_sb_t *sb, yyjson_mut_val *obj, const char *json_key,
+                                 const char *toon_key) {
+    yyjson_mut_val *value = yyjson_mut_obj_get(obj, json_key);
+    if (value && yyjson_mut_is_bool(value)) {
+        cbm_toon_scalar_bool(sb, toon_key, yyjson_mut_get_bool(value));
+    }
+}
+
+static void toon_append_context_warnings(cbm_sb_t *sb, yyjson_mut_val *ctx) {
+    yyjson_mut_val *warnings = yyjson_mut_obj_get(ctx, "warnings");
+    if (!warnings || !yyjson_mut_is_arr(warnings)) {
+        return;
+    }
+    const char *columns[] = {"message"};
+    cbm_toon_table_header(sb, "_context_warnings", (int)yyjson_mut_arr_size(warnings), columns,
+                          SKIP_ONE);
+    yyjson_mut_arr_iter iter;
+    yyjson_mut_arr_iter_init(warnings, &iter);
+    yyjson_mut_val *warning = NULL;
+    while ((warning = yyjson_mut_arr_iter_next(&iter))) {
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, yyjson_mut_is_str(warning) ? yyjson_mut_get_str(warning) : "", false);
+        cbm_toon_row_end(sb);
+    }
+}
+
 /* Serialize the format-neutral JSON context model as native TOON. Keeping
  * construction in inject_context_once preserves one fact authority; this
  * function owns only the TOON field mapping. */
@@ -4895,9 +5010,12 @@ static void toon_append_context_model(cbm_sb_t *sb, yyjson_mut_val *root) {
     }
     toon_append_mut_string(sb, ctx, "status", "_context_status");
     toon_append_mut_string(sb, ctx, "hint", "_context_hint");
+    toon_append_mut_string(sb, ctx, "detail", "_context_detail");
+    toon_append_mut_string(sb, ctx, "action_required", "_context_action_required");
     toon_append_mut_string(sb, ctx, "project", "_context_project");
     toon_append_mut_int(sb, ctx, "nodes", "_context_nodes");
     toon_append_mut_int(sb, ctx, "edges", "_context_edges");
+    toon_append_mut_string(sb, ctx, "count_read_model", "_context_count_read_model");
     toon_append_mut_int(sb, ctx, "ranked_nodes", "_context_ranked_nodes");
     toon_append_mut_string(sb, ctx, "pagerank_computed_at",
                            "_context_pagerank_computed_at");
@@ -4905,14 +5023,44 @@ static void toon_append_context_model(cbm_sb_t *sb, yyjson_mut_val *root) {
     toon_append_context_count_table(sb, ctx, "node_labels", "_context_node_labels", "label");
     toon_append_context_count_table(sb, ctx, "edge_types", "_context_edge_types", "type");
     toon_append_context_key_functions(sb, ctx);
+    yyjson_mut_val *freshness = yyjson_mut_obj_get(ctx, CBM_MCP_FRESHNESS_KEY);
+    if (freshness && yyjson_mut_is_obj(freshness)) {
+        toon_append_mut_string(sb, freshness, CBM_MCP_FRESHNESS_STATE_KEY,
+                               "_context_freshness_state");
+        toon_append_mut_string(sb, freshness, CBM_MCP_FRESHNESS_STALE_SCOPE_KEY,
+                               "_context_freshness_stale_scope");
+        toon_append_mut_int(sb, freshness, CBM_MCP_FRESHNESS_DIRTY_PENDING_KEY,
+                            "_context_dirty_files_pending");
+        toon_append_mut_int(sb, freshness, CBM_MCP_FRESHNESS_DIRTY_OVERLAY_READY_KEY,
+                            "_context_dirty_files_overlay_ready");
+    }
+    yyjson_mut_val *overlay = yyjson_mut_obj_get(ctx, "overlay_read_view");
+    if (overlay && yyjson_mut_is_obj(overlay)) {
+        toon_append_mut_string(sb, overlay, "state", "_context_overlay_state");
+        toon_append_mut_int(sb, overlay, "overlay_ready_generations",
+                            "_context_overlay_ready_generations");
+        toon_append_mut_int(sb, overlay, "active_file_tombstones",
+                            "_context_active_file_tombstones");
+        toon_append_mut_int(sb, overlay, "total_nodes_visible",
+                            "_context_total_nodes_visible");
+    }
+    yyjson_mut_val *coverage = yyjson_mut_obj_get(ctx, "coverage");
+    if (coverage && yyjson_mut_is_obj(coverage)) {
+        toon_append_mut_string(sb, coverage, "status", "_context_coverage_status");
+        toon_append_mut_string(sb, coverage, "recording_status",
+                               "_context_coverage_recording_status");
+        toon_append_mut_bool(sb, coverage, "generation_matches",
+                             "_context_coverage_generation_matches");
+        toon_append_mut_bool(sb, coverage, "hash_records_complete",
+                             "_context_coverage_hash_records_complete");
+        toon_append_mut_string(sb, coverage, "action", "_context_coverage_action");
+    }
+    toon_append_context_warnings(sb, ctx);
 }
 
-/* TOON-path context delivery: the TOON early-returns in handle_search_graph
- * bypass the yyjson response doc, which silently dropped the one-shot
- * `_context` header and `session_project` — the only reliable push channel
- * into the model (see the delivery-channel note above inject_context_once).
- * Build the facts once with inject_context_once, then serialize the mutable
- * model as native TOON; never append the scratch JSON document verbatim. */
+/* Build the format-neutral context model and serialize it as native TOON.
+ * This is used only by the centralized post-dispatch wrapper, so every tool
+ * shares the same first-response and later session_project contract. */
 static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_store_t *store,
                                      const char *context_project) {
     if (!sb || !srv) {
@@ -4931,10 +5079,8 @@ static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_st
     yyjson_mut_doc_free(cdoc);
 }
 
-/* Same delivery for TOON payloads built as plain heap strings (the BM25 path
- * builds its table inside bm25_search and returns a finished string). Returns
- * a new heap string with the context line appended, or NULL when nothing needs
- * appending (caller keeps using the original). */
+/* Add context to a completed TOON payload. Returns a new heap string, or NULL
+ * when no context/session field needs appending. */
 static char *toon_payload_with_context_once(const char *payload, cbm_mcp_server_t *srv,
                                             cbm_store_t *store, const char *context_project) {
     if (!payload) {
@@ -4958,9 +5104,7 @@ static char *toon_payload_with_context_once(const char *payload, cbm_mcp_server_
     return cbm_sb_finish(&out);
 }
 
-/* BM25 builds JSON as a completed heap string and returns before the regular
- * search_graph yyjson builder. Parse that bounded response once so JSON and
- * TOON both deliver session_project and the one-shot queried-project context. */
+/* Add context to a completed JSON object payload. */
 static char *json_payload_with_context_once(const char *payload, cbm_mcp_server_t *srv,
                                             cbm_store_t *store, const char *context_project) {
     if (!payload || !srv) {
@@ -4982,6 +5126,22 @@ static char *json_payload_with_context_once(const char *payload, cbm_mcp_server_
         return NULL;
     }
     yyjson_mut_doc_set_root(doc, root);
+    inject_context_once(doc, root, srv, store, context_project);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static char *json_text_payload_with_context_once(const char *payload, bool is_error,
+                                                 cbm_mcp_server_t *srv, cbm_store_t *store,
+                                                 const char *context_project) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, is_error ? "error" : "text", payload ? payload : "");
     inject_context_once(doc, root, srv, store, context_project);
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -7310,14 +7470,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             const char *payload_json = composed_json ? composed_json : bm25_json;
             char *fresh_json = add_dirty_file_freshness_to_json(payload_json, store, project);
             const char *payload_final = fresh_json ? fresh_json : payload_json;
-            /* BM25 returns before the regular graph-mode response builder, so
-             * append context here for both output formats. */
-            char *ctx_payload =
-                q_require_json
-                    ? json_payload_with_context_once(payload_final, srv, store, project)
-                    : toon_payload_with_context_once(payload_final, srv, store, project);
-            char *result = cbm_mcp_text_result(ctx_payload ? ctx_payload : payload_final, false);
-            free(ctx_payload);
+            char *result = cbm_mcp_text_result(payload_final, false);
             free(fresh_json);
             free(pe.value);
             free(composed_json);
@@ -7559,9 +7712,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             free(sort_by);
             free(search_mode);
             free_string_array(exclude);
-            /* One-shot _context/session_project delivery on the TOON path —
-             * the early return here previously skipped inject_context_once. */
-            toon_append_context_once(&sb, srv, store, project);
             free(project);
             char *text = cbm_sb_finish(&sb);
             char *result =
@@ -7647,9 +7797,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                             srv->session_project, args, &props_docs, &props_doc_count);
     }
 
-    /* Auto-context: first response gets full architecture/schema/_context header.
-     * Subsequent responses just get session_project. */
-    inject_context_once(doc, root, srv, store, project);
     add_derived_freshness_warnings(doc, root, out.pagerank_stale, out.linkrank_stale,
                                    out.node_degree_stale);
     add_dirty_file_freshness(doc, root, store, project);
@@ -14168,6 +14315,7 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
 static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep_match_t *raw,
                                          int raw_count, int gm_count, int limit,
                                          const char *project, bool warn_literal_pipe,
+                                         const char *mode_warning,
                                          uint64_t elapsed_ms) {
     enum { MAX_RAW = 20, SEARCH_SLOW_MS = 5000 };
     cbm_sb_t sb;
@@ -14249,6 +14397,9 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
                             "(not as alternation). Pass regex=true for 'foo|bar' to mean "
                             "'foo OR bar'.");
     }
+    if (mode_warning && mode_warning[0]) {
+        cbm_toon_scalar_str(&sb, "mode_warning", mode_warning);
+    }
     if (elapsed_ms >= SEARCH_SLOW_MS) {
         cbm_toon_scalar_str(&sb, "warning_slow",
                             "search was slow; narrow file_pattern/path_filter or use a more "
@@ -14261,7 +14412,8 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path, const char *project,
-                                    bool warn_literal_pipe, uint64_t elapsed_ms,
+                                    bool warn_literal_pipe, const char *mode_warning,
+                                    uint64_t elapsed_ms,
                                     const char *search_scope, int dirty_pending,
                                     int dirty_overlay_ready, const char *dirty_warning,
                                     const cbm_store_overlay_node_view_summary_t *overlay_summary) {
@@ -14359,6 +14511,9 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     }
     if (yyjson_mut_arr_size(warnings) > 0) {
         yyjson_mut_obj_add_val(doc, root_obj, "warnings", warnings);
+    }
+    if (mode_warning && mode_warning[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "mode_warning", mode_warning);
     }
     cbm_mcp_add_dirty_file_freshness_counts(doc, root_obj, dirty_pending, dirty_overlay_ready,
                                             dirty_warning);
@@ -15176,15 +15331,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (mode == MODE_COMPACT && !sc_legacy_json && !needs_freshness_json) {
         char *toon_text =
             assemble_search_output_toon(sr, sr_count, raw, raw_count, gm_count, limit, project,
-                                        pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
+                                        pat_has_pipe && !use_regex,
+                                        mode_warning ? mode_warning_msg : NULL,
+                                        cbm_now_ms() - search_t0);
         result = cbm_mcp_text_result(toon_text ? toon_text : "out of memory",
                                      toon_text == NULL);
         free(toon_text);
     } else {
         result = assemble_search_output(
             sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines, root_path, project,
-            pat_has_pipe && !use_regex, cbm_now_ms() - search_t0, search_scope, dirty_pending,
-            dirty_overlay_ready,
+            pat_has_pipe && !use_regex, mode_warning ? mode_warning_msg : NULL,
+            cbm_now_ms() - search_t0, search_scope, dirty_pending, dirty_overlay_ready,
             overlay_ready_for_code
                 ? "search_code reads live source files and uses active overlay graph annotations "
                   "where ready; pending dirty files may still lack graph metadata until overlay "
@@ -15203,34 +15360,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     free(file_pattern);
     if (has_path_filter) {
         cbm_regfree(&path_regex);
-    }
-
-    /* Inject mode warning into the result JSON if an unsupported mode was passed */
-    if (mode_warning && result) {
-        /* result is a JSON object like {"matches":[...],"count":N}
-         * Inject "mode_warning":"..." by appending before the closing brace */
-        size_t rlen = strlen(result);
-        /* Locate the last '}' to insert before it */
-        if (rlen > 0 && result[rlen - 1] == '}') {
-            size_t needed = rlen + strlen(mode_warning_msg) + 32;
-            char *warned = (char *)malloc(needed);
-            if (warned) {
-                /* Chop the closing brace, add warning field, re-close */
-                memcpy(warned, result, rlen - 1);
-                warned[rlen - 1] = '\0';
-                /* Check if the existing JSON object has any fields */
-                bool has_fields = strchr(result, ':') != NULL;
-                if (has_fields) {
-                    snprintf(warned + rlen - 1, needed - rlen + 1,
-                             ",\"mode_warning\":\"%s\"}", mode_warning_msg);
-                } else {
-                    snprintf(warned + rlen - 1, needed - rlen + 1,
-                             "\"mode_warning\":\"%s\"}", mode_warning_msg);
-                }
-                free(result);
-                result = warned;
-            }
-        }
     }
 
     return result;
@@ -16644,6 +16773,61 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     srv->current_project = NULL;
 }
 
+/* Apply the one-shot context contract after every tool dispatcher returns.
+ * Handlers remain responsible only for their own payload. Rebuilding the
+ * standard one-block MCP result also keeps text, structuredContent, isError,
+ * and token metadata consistent after JSON or TOON augmentation. */
+static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char *args_json,
+                                               char *result) {
+    if (!srv || !result) {
+        return result;
+    }
+    yyjson_doc *envelope = yyjson_read(result, strlen(result), 0);
+    yyjson_val *root = envelope ? yyjson_doc_get_root(envelope) : NULL;
+    yyjson_val *content = root ? yyjson_obj_get(root, "content") : NULL;
+    yyjson_val *item = content && yyjson_is_arr(content) ? yyjson_arr_get(content, 0) : NULL;
+    yyjson_val *text_value = item ? yyjson_obj_get(item, "text") : NULL;
+    const char *text = text_value && yyjson_is_str(text_value) ? yyjson_get_str(text_value) : NULL;
+    yyjson_val *error_value = root ? yyjson_obj_get(root, "isError") : NULL;
+    bool is_error = error_value && yyjson_is_bool(error_value) && yyjson_get_bool(error_value);
+    if (!text) {
+        if (envelope) {
+            yyjson_doc_free(envelope);
+        }
+        return result;
+    }
+
+    const char *project = srv->current_project && srv->current_project[0]
+                              ? srv->current_project
+                              : (srv->session_project[0] ? srv->session_project : NULL);
+    bool json_requested =
+        cbm_mcp_response_format(srv, args_json) == CBM_MCP_OUTPUT_JSON;
+    cbm_store_t *context_store =
+        srv->current_project && srv->current_project[0] ? srv->store : NULL;
+    /* Try the JSON-object path once. The serializer already parses and rejects
+     * non-object payloads, avoiding a second full response parse on every JSON
+     * tool call while keeping transient memory O(response bytes). */
+    char *augmented = json_payload_with_context_once(text, srv, context_store, project);
+    if (!augmented) {
+        augmented =
+            json_requested
+                ? json_text_payload_with_context_once(text, is_error, srv, context_store, project)
+                : toon_payload_with_context_once(text, srv, context_store, project);
+    }
+    yyjson_doc_free(envelope);
+    if (!augmented) {
+        return result;
+    }
+
+    char *replacement = cbm_mcp_text_result(augmented, is_error);
+    free(augmented);
+    if (!replacement) {
+        return result;
+    }
+    free(result);
+    return replacement;
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     bool request_scope = !srv || cbm_mcp_server_request_scope_begin(srv);
     if (!request_scope) {
@@ -16651,6 +16835,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return cbm_mcp_text_result("request cancellation scope unavailable", true);
     }
     char *result = dispatch_tool(srv, tool_name, args_json);
+    result = mcp_tool_result_with_context_once(srv, args_json, result);
     if (srv) {
         cbm_mcp_server_request_scope_end(srv);
     }
@@ -17578,53 +17763,9 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   cbm_mcp_server_t *srv) {
     cbm_store_t *store = resolve_resource_store(srv);
     const char *proj = active_project_name(srv);
-
-    if (proj) yyjson_mut_obj_add_str(doc, root, "project", proj);
-
-    /* IX-2: Check for indexing-in-progress BEFORE checking store contents */
-    if (srv->autoindex_active) {
-        yyjson_mut_obj_add_str(doc, root, "status", "indexing");
-        yyjson_mut_obj_add_str(doc, root, "hint",
-            "Indexing is in progress. Results will be available when status changes to 'ready'. "
-            "This typically takes 5-30 seconds depending on project size.");
+    if (!add_project_status_summary(doc, root, srv, store, proj)) {
         return;
     }
-
-    if (!store) {
-        yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
-        /* IX-1: Report if auto-index was attempted and failed */
-        if (srv->autoindex_failed) {
-            yyjson_mut_obj_add_str(doc, root, "detail",
-                "Auto-indexing was attempted but failed. Run index_repository explicitly for detailed errors.");
-        } else {
-            yyjson_mut_obj_add_str(doc, root, "action_required",
-                "Call index_repository with repo_path to index this project.");
-        }
-        return;
-    }
-
-    int nodes = cbm_store_count_nodes(store, proj);
-    int edges = cbm_store_count_edges(store, proj);
-    yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
-    if (nodes == 0 && !srv->autoindex_failed) {
-        yyjson_mut_obj_add_str(doc, root, "hint",
-            "Project store exists but is empty. This may happen if the project has no recognized source files, "
-            "or if indexing hasn't completed yet. Try index_repository for explicit indexing.");
-    }
-    yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
-    yyjson_mut_obj_add_int(doc, root, "edges", edges);
-    int dirty_pending = 0;
-    int dirty_overlay_ready = 0;
-    if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
-        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_response_warning(doc, root,
-                             "codebase://status counts canonical graph rows; dirty file changes "
-                             "may be absent until overlay or reindex completes.");
-    }
-    add_overlay_node_read_view_summary(
-        doc, root, store, proj,
-        "codebase://status includes overlay_read_view counts, but nodes/edges are canonical "
-        "counts while overlay-aware tools may read active overlay rows.");
 
     /* PageRank stats */
     struct sqlite3 *db = cbm_store_get_db(store);
@@ -17644,14 +17785,6 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
             }
             sqlite3_finalize(stmt);
         }
-    }
-
-    /* Detected ecosystem */
-    if (srv->session_root[0]) {
-        cbm_pkg_manager_t eco = cbm_detect_ecosystem(srv->session_root);
-        if (eco != CBM_PKG_COUNT)
-            yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
-                                   cbm_pkg_manager_str(eco));
     }
 
     /* Dependencies — query projects table for dep entries */

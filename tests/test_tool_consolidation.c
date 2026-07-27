@@ -2301,7 +2301,9 @@ TEST(resource_status_and_architecture_report_dirty_metadata) {
              "\"params\":{\"uri\":\"codebase://status\"}}");
     ASSERT_NOT_NULL(status_resp);
     ASSERT_NOT_NULL(strstr(status_resp, "dirty_files_pending"));
-    ASSERT_NOT_NULL(strstr(status_resp, "codebase://status counts canonical graph rows"));
+    ASSERT_NOT_NULL(
+        strstr(status_resp, "Canonical counts exclude pending dirty-file graph changes"));
+    ASSERT_NOT_NULL(strstr(status_resp, "overlay_read_view"));
     free(status_resp);
 
     char *arch_resp = cbm_mcp_server_handle(
@@ -3422,18 +3424,22 @@ TEST(source_grep_mode_summary_warns) {
     cbm_store_upsert_project(s, "_tc_sm_test_", proj_dir);
     cbm_store_close(s);
 
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-
-    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+    const char *requests[] = {
         "{\"search_in\":\"source\",\"pattern\":\"foo\","
-        "\"project\":\"_tc_sm_test_\",\"mode\":\"summary\"}");
-    ASSERT_NOT_NULL(resp);
-    /* After fix: response must contain "mode_warning" key */
-    ASSERT_NOT_NULL(strstr(resp, "mode_warning"));
-    free(resp);
-
-    cbm_mcp_server_free(srv);
+        "\"project\":\"_tc_sm_test_\",\"mode\":\"summary\"}",
+        "{\"search_in\":\"source\",\"pattern\":\"foo\","
+        "\"project\":\"_tc_sm_test_\",\"mode\":\"summary\",\"format\":\"json\"}",
+    };
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        char *resp = cbm_mcp_handle_tool(srv, "search_code", requests[i]);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "mode_warning"));
+        ASSERT_NOT_NULL(strstr(resp, "mode='summary' is only valid"));
+        free(resp);
+        cbm_mcp_server_free(srv);
+    }
     cbm_unlink(src_path);
     cbm_rmdir(proj_dir);
     (void)cbm_unlink(db_path);
