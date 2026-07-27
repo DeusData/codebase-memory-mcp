@@ -291,6 +291,14 @@ class BenchmarkExperimentTest(unittest.TestCase):
         full_workers = EXPERIMENT.parse_arguments(
             ["--full", "--product-env", "CBM_WORKERS=4"]
         )
+        moved_candidates = EXPERIMENT.parse_arguments(
+            [
+                "--candidate-search-root",
+                "/archive/one",
+                "--candidate-search-root",
+                "/archive/two",
+            ]
+        )
         explicit = EXPERIMENT.parse_arguments(
             ["--matrix-spec", "legacy-spec.json", "--experiment-root", "legacy-results"]
         )
@@ -301,6 +309,10 @@ class BenchmarkExperimentTest(unittest.TestCase):
         self.assertEqual(full.transport, "mcp")
         self.assertEqual(full_cli.transport, "cli")
         self.assertEqual(full_workers.product_environment, {"CBM_WORKERS": "4"})
+        self.assertEqual(
+            moved_candidates.candidate_search_roots,
+            [Path("/archive/one"), Path("/archive/two")],
+        )
         self.assertIn(
             "isolated OS account/runtime",
             " ".join(EXPERIMENT.build_parser().format_help().split()),
@@ -590,6 +602,29 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 sorted((candidate_root / "build-logs").glob("*.log")),
                 build_logs_after_first,
             )
+            new_primary_root = base / "new-candidates"
+            empty_search_root = base / "empty-candidates"
+            empty_search_root.mkdir()
+            moved = EXPERIMENT.materialize_candidate(
+                repo,
+                new_primary_root,
+                "stable-candidate",
+                "stable",
+                jobs=1,
+                candidate_search_roots=[empty_search_root, candidate_root],
+            )
+            self.assertEqual(moved["binary"], first["binary"])
+            self.assertFalse(
+                (
+                    new_primary_root / f"stable-candidate-{expected_revision[:12]}"
+                ).exists()
+            )
+            with self.assertRaisesRegex(
+                ValueError, "candidate search root is not a directory"
+            ):
+                EXPERIMENT._resolved_candidate_search_roots(
+                    new_primary_root, [base / "missing-candidates"]
+                )
             Path(second["binary"]).write_bytes(b"tampered")
             (Path(second["binary"]).parent / "stale-object").write_text(
                 "objects from the invalidated build identity\n", encoding="utf-8"

@@ -58,6 +58,12 @@ capabilities, and controlled sweeps without editing the built-in dated presets.
 Top-level `build_environment` is shared across candidates and accepts only `CC`,
 `CXX`, `EXTRA_CFLAGS`, and `EXTRA_CXXFLAGS`; probes and builds retain those values
 in candidate identity, and arbitrary environment keys are rejected.
+New candidate worktrees default to `<repo>/.worktrees/benchmark-candidates`.
+Use one `--candidate-root` to select a different writable primary and repeat
+`--candidate-search-root` to reuse exact, clean, registered worktrees from moved
+locations. Search roots are checked in argument order and never receive new
+worktrees or harness metadata; a selected existing worktree may have its ordinary
+`build/` output refreshed to verify the requested toolchain identity.
 See [the complete matrix example](../docs/BENCHMARK_EXPERIMENTS.md#reusable-ref-based-matrices).
 
 For cross-build measurements while the host daemon remains active, use the native

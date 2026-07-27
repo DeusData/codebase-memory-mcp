@@ -289,6 +289,29 @@ harness-owned so a matrix cannot redirect live data or suppress measurement logs
 Fully resolved historical specs remain valid, and specs that omit these new fields
 retain their previous cell shape and identity.
 
+Candidate source/build locations are execution settings rather than matrix
+semantics. New worktrees use `<repo>/.worktrees/benchmark-candidates` unless
+`--candidate-root` selects another writable primary. Repeat
+`--candidate-search-root` to search moved existing roots in preferred order:
+
+```sh
+uv run python benchmarks/run_experiments.py \
+  --matrix-spec /absolute/path/development-comparison.json \
+  --experiment-root /durable/ignored/path/development-comparison \
+  --candidate-root /fast-storage/cbm-candidates \
+  --candidate-search-root /archive/previous-candidates \
+  --candidate-search-root /mounted/team-candidates
+```
+
+Only clean worktrees registered to the current Git repository and pinned to the
+exact candidate commit are eligible. The runner creates worktrees, build logs,
+and cache metadata only under the primary root. A selected existing worktree may
+have its ordinary `build/` directory cleaned and rebuilt so the recorded compiler,
+flags, and binary hash are trustworthy. A missing search root fails with its
+resolved path instead of silently falling back. Resolved candidate records retain
+the selected binary path and SHA-256, so moved-root reuse remains auditable without
+embedding machine-specific paths in the reusable source matrix.
+
 ### Container isolation
 
 `benchmarks/run_container_experiment.py` is a thin isolation coordinator around the
