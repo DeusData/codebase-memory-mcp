@@ -316,8 +316,10 @@ The coordinator is intentionally smaller than the benchmark engine:
 3. It requires explicit CPU, memory, and worker budgets. Workers may not exceed the
    container CPU budget.
 4. It copies the bundle and optional matrix spec into labeled Docker volumes.
-   Candidate worktrees, builds, fixture data, caches, daemon state, plans, and reports
-   stay off host bind mounts during measurement.
+   The cloned repository retains the experiment runner's normal
+   `<repo>/.worktrees/benchmark-candidates` default. Candidate builds, fixture data,
+   caches, daemon state, plans, and reports stay off host bind mounts during
+   measurement.
 5. It invokes the existing experiment runner with `CBM_WORKERS` as an explicit product
    environment value. The shared `benchmarks/environment-policy-v1.json` registry
    prevents that value from replacing cache, profiling, auto-index, or run-context
@@ -331,11 +333,14 @@ The coordinator is intentionally smaller than the benchmark engine:
 8. On a candidate-build failure, it exports the work volume's build logs to
    `container-failures/<source-commit>/build-logs/`. If Docker cannot export them,
    the returned error names the retained volume and in-volume path for inspection.
-9. It derives a 24-hexadecimal run key from the exact source revision, Git bundle,
-   effective matrix, resource budget, and measurement arguments. Each cohort runs
-   under `runsets/<run-key>/`; `--audit-only` deliberately retains the same key.
-   Valid older cohorts therefore remain reloadable without being confused with
-   genuinely unplanned cell directories in the current cohort.
+9. It derives a stable repository snapshot identity from the source revision and
+   sorted Git ref/commit heads, independently of nondeterministic bundle pack bytes.
+   The 24-hexadecimal run key combines that snapshot with the effective matrix,
+   resource budget, and measurement arguments. The exact bundle SHA-256 remains in
+   the environment manifest. Each cohort runs under `runsets/<run-key>/`;
+   `--audit-only` deliberately retains the same key. Valid older cohorts therefore
+   remain reloadable without being confused with genuinely unplanned cell
+   directories in the current cohort.
 10. It removes every transient coordinator and measured container in a `finally`
    path. The two labeled volumes remain for resume and their exact names are printed.
 
