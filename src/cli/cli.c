@@ -14484,9 +14484,11 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {CBM_CONFIG_CONTEXT_INJECTION, "true", "CBM_CONTEXT_INJECTION", "Tools",
      "Inject codebase schema and stats into the first tool response so the AI starts informed",
      "true|false",
-     "When true (default), the first search_graph response includes a "
-     "_context object: node/edge counts, node labels, edge types, PageRank status, and "
-     "detected language ecosystem. Delivered once per MCP server process; later calls are unaffected. "
+     "When true (default), the first tool response includes a "
+     "_context object with project/index status, actionable recovery when results are unavailable, "
+     "canonical node/edge counts, dirty/overlay freshness, coverage state, schema, PageRank status, "
+     "and detected language ecosystem. Delivered once per MCP server process; later calls include "
+     "only session_project. "
      "Why enable: the MCP client gets codebase structure upfront without needing to call "
      "get_architecture or get_graph_schema separately. Useful for code exploration, "
      "refactoring, debugging, and codebase-understanding tasks. "

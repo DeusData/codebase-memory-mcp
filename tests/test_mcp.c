@@ -1865,6 +1865,9 @@ TEST(first_response_context_uses_ready_overlay_schema) {
     ASSERT_NOT_NULL(strstr(resp, "HANDLES"));
     ASSERT_NULL(strstr(resp, "\\\"label\\\":\\\"Function\\\""));
     ASSERT_NULL(strstr(resp, "CALLS"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"overlay_read_view\\\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"state\\\":\\\"overlay_ready\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"count_read_model\\\":\\\"canonical_only\\\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -4539,6 +4542,57 @@ static int write_coverage_meta(cbm_store_t *store, const char *generation,
         .hash_records_complete = true,
     };
     return cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta);
+}
+
+TEST(first_response_and_status_resource_share_coverage_generation_state) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_session_project(srv, "test-project");
+
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    ASSERT_EQ(write_coverage_meta(store, project.indexed_at, "complete"), CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+        "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"coverage\":{\"status\":\"current\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recording_status\":\"complete\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"generation_matches\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"hash_records_complete\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "check_index_coverage"));
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":451,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\\\"coverage\\\":{\\\"status\\\":\\\"current\\\""));
+    ASSERT_NOT_NULL(strstr(response, "\\\"generation_matches\\\":true"));
+    ASSERT_NOT_NULL(strstr(response, "\\\"count_read_model\\\":\\\"canonical_only\\\""));
+    free(response);
+
+    ASSERT_EQ(write_coverage_meta(store, "stale-generation", "complete"), CBM_STORE_OK);
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":452,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\\\"coverage\\\":{\\\"status\\\":\\\"stale\\\""));
+    ASSERT_NOT_NULL(strstr(response, "\\\"generation_matches\\\":false"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
 }
 
 TEST(tool_check_index_coverage_rejects_stale_generation) {
@@ -7217,10 +7271,15 @@ TEST(search_code_reports_resolved_project_for_empty_json_and_toon_results) {
         ASSERT_NOT_NULL(inner);
         if (strcmp(formats[i], "json") == 0) {
             ASSERT_NOT_NULL(strstr(inner, "\"project\":\"test-project\""));
+            ASSERT_NOT_NULL(
+                strstr(inner, "\"session_project\":\"different-session-project\""));
+            ASSERT_NOT_NULL(strstr(inner, "\"_context\""));
+            ASSERT_NOT_NULL(strstr(inner, "\"project\":\"test-project\""));
         } else {
             ASSERT_NOT_NULL(strstr(inner, "project: test-project"));
+            ASSERT_NOT_NULL(strstr(inner, "session_project: different-session-project"));
+            ASSERT_NULL(strstr(inner, "_context_status"));
         }
-        ASSERT_NULL(strstr(inner, "different-session-project"));
         free(inner);
         free(resp);
     }
@@ -16130,6 +16189,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
+    RUN_TEST(first_response_and_status_resource_share_coverage_generation_state);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
