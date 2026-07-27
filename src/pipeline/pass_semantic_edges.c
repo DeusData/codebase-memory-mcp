@@ -465,6 +465,23 @@ static bool token_capacity_for_node(const cbm_gbuf_node_t *node, const cbm_gbuf_
     return true;
 }
 
+/* Find the closing quote of a JSON string without treating an escaped quote as
+ * a terminator. This is a single pass with no allocation; the semantic pass
+ * calls it only on already-validated properties JSON in a hot indexing path. */
+static const char *json_string_end(const char *start) {
+    bool escaped = false;
+    for (const char *cursor = start; cursor && *cursor; cursor++) {
+        if (escaped) {
+            escaped = false;
+        } else if (*cursor == '\\') {
+            escaped = true;
+        } else if (*cursor == '"') {
+            return cursor;
+        }
+    }
+    return NULL;
+}
+
 /* Extract a JSON string value by key (simple strstr-based, no full parse). */
 static bool json_str_span(const char *json, const char *key, const char **out_start,
                           size_t *out_len) {
@@ -478,7 +495,7 @@ static bool json_str_span(const char *json, const char *key, const char **out_st
         return false;
     }
     start += strlen(search);
-    const char *end = strchr(start, '"');
+    const char *end = json_string_end(start);
     if (!end) {
         return false;
     }
@@ -503,7 +520,18 @@ static bool json_array_span(const char *json, const char *key, const char **out_
         return false;
     }
     start += strlen(search);
-    const char *end = strchr(start, ']');
+    const char *end = NULL;
+    for (const char *cursor = start; *cursor; cursor++) {
+        if (*cursor == '"') {
+            cursor = json_string_end(cursor + SKIP_ONE);
+            if (!cursor) {
+                return false;
+            }
+        } else if (*cursor == ']') {
+            end = cursor;
+            break;
+        }
+    }
     if (!end) {
         return false;
     }
@@ -546,7 +574,7 @@ static int json_str_array(const char *json, const char *key, char **out, int max
     while (*start && *start != ']' && count < max_out) {
         if (*start == '"') {
             start++;
-            const char *end = strchr(start, '"');
+            const char *end = json_string_end(start);
             if (!end) {
                 break;
             }
@@ -600,21 +628,20 @@ static bool tokenize_json_array_field(const char *json, const char *key, char **
     if (*count >= max_tokens) {
         return false;
     }
-    char search[CBM_SZ_64];
-    snprintf(search, sizeof(search), "\"%s\":[", key);
-    const char *cursor = strstr(json, search);
-    if (!cursor) {
+    const char *cursor = NULL;
+    size_t array_len = 0;
+    if (!json_array_span(json, key, &cursor, &array_len)) {
         return true;
     }
-    cursor += strlen(search);
-    while (*cursor && *cursor != ']') {
+    const char *array_end = cursor + array_len;
+    while (cursor < array_end) {
         if (*cursor != '"') {
             cursor++;
             continue;
         }
         const char *start = ++cursor;
-        const char *end = strchr(start, '"');
-        if (!end) {
+        const char *end = json_string_end(start);
+        if (!end || end > array_end) {
             return false;
         }
         size_t len = (size_t)(end - start);
@@ -815,11 +842,16 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
         int capacity = 0;
         if (!token_capacity_for_node(n, tc->gbuf, tc->project_name, outbound_names,
                                      &outbound_count, inbound_names, &inbound_count, &capacity)) {
+            cbm_log_error("pass.semantic.tokenize_failed", "reason", "capacity", "function",
+                          n->qualified_name ? n->qualified_name : n->name);
             atomic_store_explicit(&tc->alloc_failed, true, memory_order_relaxed);
             continue;
         }
         char **dst = malloc((size_t)capacity * sizeof(*dst));
         if (!dst) {
+            cbm_log_error("pass.semantic.tokenize_failed", "reason", "token_array_allocation",
+                          "function", n->qualified_name ? n->qualified_name : n->name, "capacity",
+                          itoa_log(capacity));
             atomic_store_explicit(&tc->alloc_failed, true, memory_order_relaxed);
             continue;
         }
@@ -857,6 +889,9 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
         tc->doc_tokens[f] = dst;
         tc->token_counts[f] = count;
         if (!complete) {
+            cbm_log_error("pass.semantic.tokenize_failed", "reason", "incomplete_metadata",
+                          "function", n->qualified_name ? n->qualified_name : n->name, "capacity",
+                          itoa_log(capacity));
             atomic_store_explicit(&tc->alloc_failed, true, memory_order_relaxed);
         }
     }
