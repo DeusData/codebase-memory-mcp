@@ -424,31 +424,53 @@ bool cbm_registry_strategy_is_import_map(const char *strategy) {
     return strategy && strcmp(strategy, "import_map") == 0;
 }
 
-/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
- * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
- * could not resolve the receiver type — type-resolved calls win via lsp_*
- * strategies before the registry runs. Binding such a call to a project symbol
- * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
- * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
+/* Type-aware analogue of the Perl guard above (#592/#606 direction; precedent
+ * #477). A member call `x.foo()` reaches the weak textual cascade only when the
+ * language-specific LSP could not resolve its receiver. TS/JS/TSX reject every
+ * such weak match, preserving the established guard. Rust rejects an ambiguous
+ * name-only match but retains a sole project-wide candidate and the existing
+ * receiver-assisted field hint: the Rust cross-file LSP still misses valid
+ * typed calls in manifest-free source sets, and deleting those edges regresses
+ * the method/trait/field probe contract. Rust `macro!()` syntax is separate:
+ * the extractor records it explicitly, so a weak textual match to an ordinary
+ * Function/Method is always a category error (`matches!` != Method.matches).
+ *
  * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
  * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
  * default-drop) because the parallel resolver runs lsp_* strategies through the
- * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
- * + side-effect-free so the contract is unit-testable without a full pipeline. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
-    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+ * same guard variable — a default-drop would silently kill lsp_ts_method or
+ * lsp_method_dispatch. Pure and side-effect-free so the contract is unit-testable
+ * without a full pipeline. */
+bool cbm_suppress_weak_call_match(CBMLanguage language, bool is_member, bool is_macro_invocation,
+                                  int candidate_count, const char *strategy) {
+    if (!strategy || !strategy[0]) {
         return false;
     }
-    /* Weak short-name strategies that actually reach the call-resolution guards:
-     * the registry's suffix_match / unique_name and the parallel field_type_hint.
+    bool weak_strategy = strcmp(strategy, "suffix_match") == 0 ||
+                         strcmp(strategy, "unique_name") == 0 ||
+                         strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+    if (language == CBM_LANG_JAVASCRIPT || language == CBM_LANG_TYPESCRIPT ||
+        language == CBM_LANG_TSX) {
+        return is_member && weak_strategy;
+    }
+    if (language == CBM_LANG_RUST && is_macro_invocation) {
+        return weak_strategy;
+    }
+    if (language != CBM_LANG_RUST || !is_member || candidate_count <= SKIP_ONE) {
+        return false;
+    }
+    /* Weak strategies that actually reach the call-resolution guards:
+     * the registry's suffix_match / unique_name and field_type_hint. The latter
+     * capitalizes a receiver variable name and is not proof of its declared type.
      * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
      * is not wired into the sequential/parallel resolvers today, so it never
      * reaches this helper, but naming it keeps a future wiring from silently
-     * reintroducing the noise. Everything else — same_module / import_map /
-     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
-     * lsp_* — is a receiver- or import-aware match and is KEPT. */
+     * reintroducing the noise. Rust retains field_type_hint because it is the
+     * current receiver-assisted fallback for cross-file trait dispatch. Everything
+     * else — same_module / import_map / import_map_suffix / qualified_suffix /
+     * callee_suffix / service_pattern / lsp_* — is receiver- or import-aware. */
     return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
-           strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+           strcmp(strategy, "fuzzy") == 0;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */

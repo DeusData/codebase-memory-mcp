@@ -566,20 +566,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* TS/JS/TSX weak-method suppression (#592/#606). A member call x.foo() only
-     * reaches the registry when the TS-LSP could not resolve the receiver type
-     * (the LSP block above already returned for type-resolved calls, including
-     * the "resolved but target out of gbuf" fall-through). Binding such a call
-     * by a weak short-name strategy fabricates an edge (`re.test()` -> a project
-     * `test`). Rather than drop it here — which would also skip the service
-     * bypasses below and emit_classified_edge's route/HTTP/CONFIG branches —
-     * defer to emit_classified_edge and suppress ONLY the plain-CALLS
-     * fall-through, so every service edge stays main-identical. res.strategy may
-     * be lsp_* here; the helper's explicit drop-list leaves lsp_* untouched. */
-    bool is_tsjs =
-        lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
-    bool tsjs_drop_plain_call =
-        cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+    /* Type-aware LSP weak-method suppression. TS/JS/TSX and Rust member calls
+     * reach the generic registry only when receiver resolution failed. A weak
+     * short-name fallback can then fabricate a project CALLS edge. Defer the
+     * drop to the classified emit path so route/HTTP/CONFIG edges still run,
+     * and suppress only the plain-CALLS fall-through. Typed lsp_* resolutions
+     * remain because the shared helper uses an explicit weak-strategy list. */
+    bool is_member_call = cbm_pipeline_call_is_member(call, lang);
+    bool drop_weak_plain_call = cbm_suppress_weak_call_match(
+        lang, is_member_call, call->is_macro_invocation, res.candidate_count, res.strategy);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -609,7 +604,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                             imp_vals, imp_count, tsjs_drop_plain_call) &&
+                             imp_vals, imp_count, drop_weak_plain_call) &&
         !cbm_service_pattern_is_global_fetch(call->callee_name)) {
         /* Do not let the generic URL-argument fallback reclassify a resolved
          * local fetch as the global HTTP API (#856). */
