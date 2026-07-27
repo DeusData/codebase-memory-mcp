@@ -474,21 +474,18 @@ static cbm_cli_activation_ops_t cli_activation_fake_ops(cli_activation_fake_t *f
     return ops;
 }
 
-/* Every install/update/uninstall in this suite dispatches through here. On
- * Windows a test that has not installed its own activation ops gets a default
- * fake for the duration of the command: without the seam, the portable-payload
- * gate (correctly) refuses managed mutations before the shared agent-config
- * logic these tests verify ever runs. POSIX behavior is untouched — tests
- * without ops keep exercising the real activation machinery. */
+/* Ordinary install/update/uninstall tests dispatch through here. A test that
+ * has not installed activation ops gets a successful default fake for the
+ * duration of the command, keeping agent-config assertions independent of a
+ * real dogfood daemon using the developer's cache. Tests of production cohort
+ * behavior call cbm_cmd_* directly or install explicit ops. On Windows the
+ * same seam also selects the test-only portable flow; release gates keep
+ * direct calls so the managed-launcher fail-closed contract remains covered. */
 static cli_activation_fake_t g_cli_test_seam_fake;
 static cbm_cli_activation_ops_t g_cli_test_seam_ops;
 
 static int cli_test_cmd_dispatch(int (*command)(int, char **), int argc, char **argv) {
-#ifdef _WIN32
     bool engage = !cbm_cli_activation_test_ops_installed();
-#else
-    bool engage = false;
-#endif
     if (engage) {
         memset(&g_cli_test_seam_fake, 0, sizeof(g_cli_test_seam_fake));
         g_cli_test_seam_fake.mutation_reserve_result = 1;
@@ -652,7 +649,10 @@ TEST(cli_activation_refuses_when_cohort_does_not_drain) {
     ASSERT_EQ(fake.mutation_count, 0);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_FALSE(fake.mutation_lease_held);
-    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "automatic stop request timed out"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "Close or restart"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "retry the same command"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "no executable, configuration, or index mutation"));
     PASS();
 }
 
@@ -672,7 +672,10 @@ TEST(cli_activation_refuses_unsafe_cohort_reservation) {
     ASSERT_EQ(fake.mutation_count, 0);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_FALSE(fake.mutation_lease_held);
-    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "could not prove exclusive activation safety"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "owner-only and writable"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "retry the same command"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "no executable, configuration, or index mutation"));
     PASS();
 }
 
@@ -884,7 +887,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = child_ready ? cbm_cmd_install(4, install_argv) : -1;
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -12180,7 +12183,7 @@ TEST(cli_uninstall_dry_run_preserves_indexes) {
     cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
 
     char *args[] = {"--dry-run", "-y"};
-    ASSERT_EQ(cbm_cmd_uninstall(2, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(2, args), 0);
 
     struct stat st;
     ASSERT_EQ(stat(project_db, &st), 0);
@@ -12216,7 +12219,7 @@ TEST(cli_uninstall_removes_codex_json_hook_only) {
     ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
     cbm_setenv("HOME", tmpdir, 1);
     char *args[] = {"-n"};
-    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
 
     const char *contents = read_test_file(hooks_path);
     ASSERT_NOT_NULL(contents);
@@ -12264,7 +12267,7 @@ TEST(cli_uninstall_removes_owned_claude_hook_scripts) {
     for (size_t i = 0; i < 3; i++)
         ASSERT_EQ(stat(paths[i], &st), 0);
     char *args[] = {"-n"};
-    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
 
     for (size_t i = 0; i < 3; i++)
         ASSERT_NEQ(stat(paths[i], &st), 0);
@@ -12301,7 +12304,7 @@ TEST(cli_uninstall_removes_vscode_profile_mcp_only) {
     ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
     cbm_setenv("HOME", tmpdir, 1);
     char *args[] = {"-n"};
-    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
 
     const char *contents = read_test_file(profile_mcp);
     ASSERT_NOT_NULL(contents);
@@ -12360,7 +12363,7 @@ TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries) {
     ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
     cbm_setenv("HOME", tmpdir, 1);
     char *args[] = {"-n"};
-    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
     cli_env_restore(&home);
 
     const char *contents = read_test_file(config_path);
@@ -12498,7 +12501,7 @@ TEST(cli_claude_desktop_plan_and_uninstall_preserve_foreign_entries) {
     ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
     cbm_setenv("HOME", tmpdir, 1);
     char *args[] = {"-n"};
-    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
     cli_env_restore(&home);
 
     const char *contents = read_test_file(config_path);
@@ -12548,7 +12551,7 @@ TEST(cli_reference_harnesses_uninstall_owned_entries_only) {
     ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
     cbm_setenv("HOME", tmpdir, 1);
     char *args[] = {"-n"};
-    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
 
     for (size_t i = 0; i < 2; i++) {
         const char *contents = read_test_file(config_paths[i]);
