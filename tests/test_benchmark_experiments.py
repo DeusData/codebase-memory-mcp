@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "run_experiments.py"
@@ -296,6 +297,10 @@ class BenchmarkExperimentTest(unittest.TestCase):
         self.assertEqual(full.preset, "full")
         self.assertEqual(full.transport, "mcp")
         self.assertEqual(full_cli.transport, "cli")
+        self.assertIn(
+            "isolated OS account/runtime",
+            " ".join(EXPERIMENT.build_parser().format_help().split()),
+        )
         self.assertIsNone(explicit.preset)
         self.assertEqual(explicit.matrix_spec, Path("legacy-spec.json"))
         with self.assertRaises(SystemExit):
@@ -732,6 +737,8 @@ class BenchmarkExperimentTest(unittest.TestCase):
             self.assertEqual(first["binary_sha256"], EXPERIMENT.file_sha256(binary))
             self.assertEqual(first["parameters"]["frontier_files"], 4)
             self.assertEqual(first["parameters"]["exact_cap"], 4)
+            self.assertNotIn("product_environment", first["parameters"])
+            self.assertNotIn("benchmark_args", first["parameters"])
             self.assertEqual(first["accepted_exit_codes"], [0, 1])
             self.assertEqual(
                 first["capability_support"], {"dependencies": True, "rank": True}
@@ -929,7 +936,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 "profiles": [
                     {
                         "label": "default",
-                        "config_profile": "default",
+                        "config_profile": "candidate_native_configuration",
                         "capabilities": {},
                     },
                     {
@@ -954,6 +961,208 @@ class BenchmarkExperimentTest(unittest.TestCase):
                     "latest.rank-disabled.cli.go_modify_1.f4.capdefault",
                 ],
             )
+
+    def test_ref_candidates_materialize_without_mutating_reusable_matrix_spec(
+        self,
+    ) -> None:
+        source = {
+            "schema_version": 1,
+            "candidates": [
+                {
+                    "label": "new-design",
+                    "ref": "feature/new-design",
+                    "capability_support": {"rank": True, "dependencies": False},
+                    "environment": {"BENCHMARK_VARIANT": "new"},
+                }
+            ],
+        }
+        original = copy.deepcopy(source)
+        built = {
+            "label": "new-design",
+            "revision": "a" * 40,
+            "binary": "/candidate/codebase-memory-mcp",
+            "binary_sha256": "b" * 64,
+            "build": {"target": "make cbm", "cflags": "-O2"},
+            "capability_support": {"rank": True, "dependencies": True},
+        }
+
+        with mock.patch.object(
+            EXPERIMENT, "materialize_candidate", return_value=built
+        ) as materialize:
+            resolved = EXPERIMENT.materialize_matrix_candidates(
+                Path("/repository"),
+                Path("/candidate-root"),
+                source,
+                jobs=6,
+            )
+
+        self.assertEqual(source, original)
+        materialize.assert_called_once_with(
+            Path("/repository"),
+            Path("/candidate-root"),
+            "new-design",
+            "feature/new-design",
+            jobs=6,
+        )
+        self.assertNotIn("ref", resolved["candidates"][0])
+        self.assertEqual(
+            resolved["candidates"][0]["capability_support"],
+            {"rank": True, "dependencies": False},
+        )
+        self.assertEqual(
+            resolved["candidates"][0]["environment"],
+            {"BENCHMARK_VARIANT": "new"},
+        )
+
+    def test_ref_candidate_rejects_ambiguous_prebuilt_identity(self) -> None:
+        spec = {
+            "schema_version": 1,
+            "candidates": [
+                {
+                    "label": "ambiguous",
+                    "ref": "HEAD",
+                    "binary": "/tmp/already-built",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "cannot combine ref with binary"):
+            EXPERIMENT.materialize_matrix_candidates(
+                Path("/repository"), Path("/candidate-root"), spec, jobs=1
+            )
+
+    def test_ref_candidate_preflight_rejects_unknown_support_before_build(self) -> None:
+        spec = {
+            "schema_version": 1,
+            "candidates": [{"label": "future", "ref": "feature/future"}],
+        }
+
+        with (
+            mock.patch.object(EXPERIMENT, "materialize_candidate") as materialize,
+            self.assertRaisesRegex(
+                ValueError, "cannot infer branch capabilities safely"
+            ),
+        ):
+            EXPERIMENT.materialize_matrix_candidates(
+                Path("/repository"), Path("/candidate-root"), spec, jobs=1
+            )
+
+        materialize.assert_not_called()
+
+    def test_ref_candidate_preflight_rejects_duplicate_labels_before_build(
+        self,
+    ) -> None:
+        spec = {
+            "schema_version": 1,
+            "candidates": [
+                {
+                    "label": "candidate",
+                    "ref": "main",
+                    "capability_support": {},
+                },
+                {
+                    "label": "candidate",
+                    "ref": "feature",
+                    "capability_support": {},
+                },
+            ],
+        }
+
+        with (
+            mock.patch.object(EXPERIMENT, "materialize_candidate") as materialize,
+            self.assertRaisesRegex(ValueError, "label is duplicated"),
+        ):
+            EXPERIMENT.materialize_matrix_candidates(
+                Path("/repository"), Path("/candidate-root"), spec, jobs=1
+            )
+
+        materialize.assert_not_called()
+
+    def test_matrix_spec_layers_explicit_product_environment_and_runner_arguments(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            binary = root / "cbm"
+            binary.write_bytes(b"optimized-binary")
+            benchmark = root / "run_benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "future-capability-v1",
+                "benchmark_script": str(benchmark),
+                "cwd": str(root),
+                "repetitions": 1,
+                "transports": ["mcp"],
+                "product_environment": {"CBM_WORKERS": "1"},
+                "benchmark_args": ["--overhead-probes", "2"],
+                "candidates": [
+                    {
+                        "label": "candidate",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "build": {"cflags": "-O2"},
+                        "product_environment": {"CBM_WORKERS": "2"},
+                    }
+                ],
+                "profiles": [
+                    {
+                        "label": "worker-sweep",
+                        "config_profile": "candidate_native_configuration",
+                        "capabilities": {},
+                        "product_environment": {"CBM_WORKERS": "4"},
+                        "benchmark_args": ["--functions-per-file", "20"],
+                    }
+                ],
+                "scenarios": [
+                    {
+                        "name": "go_modify_1",
+                        "frontier_files": [4],
+                        "exact_caps": [None],
+                        "product_environment": {"CBM_MEM_BUDGET_MB": "512"},
+                    }
+                ],
+            }
+
+            plan = EXPERIMENT.expand_matrix_spec(spec)
+
+        first = plan["cells"][0]
+        self.assertEqual(
+            first["parameters"]["product_environment"],
+            {"CBM_MEM_BUDGET_MB": "512", "CBM_WORKERS": "4"},
+        )
+        self.assertEqual(
+            first["parameters"]["benchmark_args"],
+            [
+                "--overhead-probes",
+                "2",
+                "--functions-per-file",
+                "20",
+            ],
+        )
+        self.assertEqual(
+            [
+                first["command"][index + 1]
+                for index, token in enumerate(first["command"][:-1])
+                if token == "--product-env"
+            ],
+            ["CBM_MEM_BUDGET_MB=512", "CBM_WORKERS=4"],
+        )
+        self.assertIn("--overhead-probes", first["command"])
+        self.assertIn("--functions-per-file", first["command"])
+
+    def test_matrix_spec_rejects_runner_arguments_owned_by_experiment_harness(
+        self,
+    ) -> None:
+        for arguments in (
+            ["--out", "/tmp/replace-result.json"],
+            ["--out=/tmp/replace-result.json"],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                self.assertRaisesRegex(ValueError, "benchmark_args.*--out"),
+            ):
+                EXPERIMENT.validate_benchmark_args(arguments, "benchmark_args")
 
     def test_matrix_spec_expands_pinned_self_dogfood_repository_workload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

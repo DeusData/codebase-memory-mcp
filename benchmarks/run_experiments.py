@@ -9,6 +9,7 @@ records use "experiment" consistently.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import suppress
 import hashlib
 import json
@@ -89,6 +90,33 @@ IDENTITY_FIELDS = (
     "parameters",
     "timeout_seconds",
     "accepted_exit_codes",
+)
+BENCHMARK_ARGS_RESERVED_FLAGS = frozenset(
+    {
+        "--binary",
+        "--build-metadata-json",
+        "--capability-quality",
+        "--candidate-revision",
+        "--config",
+        "--config-profile",
+        "--facts-dir",
+        "--frontier-files",
+        "--include-logs",
+        "--index-mode",
+        "--matrix",
+        "--matrix-scenarios",
+        "--out",
+        "--product-env",
+        "--quality-background-repo",
+        "--quality-background-revision",
+        "--repo-root",
+        "--repo-revision",
+        "--self-dogfood",
+        "--self-dogfood-scenarios",
+        "--timeout",
+        "--transport",
+        "--work-root",
+    }
 )
 
 
@@ -561,6 +589,100 @@ def materialize_candidate(
     return candidate
 
 
+def materialize_matrix_candidates(
+    repository: Path,
+    candidate_root: Path,
+    spec: dict[str, Any],
+    *,
+    jobs: int,
+) -> dict[str, Any]:
+    """Resolve candidate ``ref`` entries into the existing immutable binary schema.
+
+    A reusable matrix spec may name arbitrary branches, tags, or commits without
+    embedding worktree-specific binary paths. Already resolved candidate entries
+    remain value-equivalent after the defensive deep copy.
+    """
+    resolved = copy.deepcopy(spec)
+    candidates = _nonempty_list(resolved.get("candidates"), "candidates")
+    labels: set[str] = set()
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"candidates[{index}] must be an object")
+        label = candidate.get("label")
+        if not isinstance(label, str) or not label:
+            raise ValueError(f"candidates[{index}].label is invalid")
+        _candidate_slug(label)
+        if label in labels:
+            raise ValueError(f"candidates[{index}].label is duplicated: {label!r}")
+        labels.add(label)
+        ref = candidate.get("ref")
+        if ref is None:
+            continue
+        if not isinstance(ref, str) or not ref:
+            raise ValueError(f"candidates[{index}].ref must be a non-empty string")
+        conflicting = sorted(
+            key
+            for key in ("binary", "binary_sha256", "revision", "build")
+            if key in candidate
+        )
+        if conflicting:
+            raise ValueError(
+                f"candidates[{index}] cannot combine ref with " + ", ".join(conflicting)
+            )
+        capability_support = candidate.get("capability_support")
+        if not isinstance(capability_support, dict) or not all(
+            isinstance(key, str) and key and isinstance(value, bool)
+            for key, value in capability_support.items()
+        ):
+            raise ValueError(
+                f"candidates[{index}].capability_support must explicitly declare "
+                "string-to-boolean support for a ref-based candidate; the runner "
+                "cannot infer branch capabilities safely"
+            )
+        _string_map(candidate.get("environment"), f"candidates[{index}].environment")
+        _string_map(
+            candidate.get("product_environment"),
+            f"candidates[{index}].product_environment",
+        )
+        validate_benchmark_args(
+            candidate.get("benchmark_args"),
+            f"candidates[{index}].benchmark_args",
+        )
+
+    for index, candidate in enumerate(candidates):
+        ref = candidate.get("ref")
+        if ref is None:
+            continue
+        label = candidate["label"]
+        passthrough = {
+            key: copy.deepcopy(candidate[key])
+            for key in (
+                "benchmark_args",
+                "capability_support",
+                "environment",
+                "product_environment",
+            )
+            if key in candidate
+        }
+        materialized = materialize_candidate(
+            repository,
+            candidate_root,
+            label,
+            ref,
+            jobs=jobs,
+        )
+        materialized.update(passthrough)
+        candidates[index] = materialized
+    return resolved
+
+
+def matrix_spec_has_candidate_refs(spec: dict[str, Any]) -> bool:
+    candidates = spec.get("candidates")
+    return isinstance(candidates, list) and any(
+        isinstance(candidate, dict) and "ref" in candidate for candidate in candidates
+    )
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -958,6 +1080,26 @@ def _string_map(value: Any, field: str) -> dict[str, str]:
     return dict(value)
 
 
+def validate_benchmark_args(value: Any, field: str) -> list[str]:
+    """Validate additive workload arguments without surrendering harness ownership."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ValueError(f"{field} must be a string array")
+    reserved = sorted(
+        item
+        for item in value
+        if item.partition("=")[0] in BENCHMARK_ARGS_RESERVED_FLAGS
+    )
+    if reserved:
+        raise ValueError(
+            f"{field} cannot override experiment-owned flags: " + ", ".join(reserved)
+        )
+    return list(value)
+
+
 def _is_json_integer(value: Any) -> bool:
     """Return whether a decoded JSON value is an integer rather than a boolean."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -1125,6 +1267,12 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if not all(isinstance(item, str) and item for item in transports):
         raise ValueError("transports must contain non-empty strings")
     common_environment = _string_map(spec.get("environment"), "environment")
+    common_product_environment = _string_map(
+        spec.get("product_environment"), "product_environment"
+    )
+    common_benchmark_args = validate_benchmark_args(
+        spec.get("benchmark_args"), "benchmark_args"
+    )
 
     cells: list[dict[str, Any]] = []
     for candidate_index, candidate in enumerate(candidates):
@@ -1161,6 +1309,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             )
         candidate_environment = _string_map(
             candidate.get("environment"), f"candidates[{candidate_index}].environment"
+        )
+        candidate_product_environment = _string_map(
+            candidate.get("product_environment"),
+            f"candidates[{candidate_index}].product_environment",
+        )
+        candidate_benchmark_args = validate_benchmark_args(
+            candidate.get("benchmark_args"),
+            f"candidates[{candidate_index}].benchmark_args",
         )
         candidate_support = candidate.get("capability_support")
         if candidate_support is not None and (
@@ -1232,6 +1388,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             profile_environment = _string_map(
                 profile.get("environment"), f"profiles[{profile_index}].environment"
             )
+            profile_product_environment = _string_map(
+                profile.get("product_environment"),
+                f"profiles[{profile_index}].product_environment",
+            )
+            profile_benchmark_args = validate_benchmark_args(
+                profile.get("benchmark_args"),
+                f"profiles[{profile_index}].benchmark_args",
+            )
 
             for scenario_index, scenario in enumerate(scenarios):
                 if not isinstance(scenario, dict):
@@ -1239,6 +1403,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 scenario_name = scenario.get("name")
                 if not isinstance(scenario_name, str) or not scenario_name:
                     raise ValueError(f"scenarios[{scenario_index}].name is invalid")
+                scenario_product_environment = _string_map(
+                    scenario.get("product_environment"),
+                    f"scenarios[{scenario_index}].product_environment",
+                )
+                scenario_benchmark_args = validate_benchmark_args(
+                    scenario.get("benchmark_args"),
+                    f"scenarios[{scenario_index}].benchmark_args",
+                )
                 if capability_quality is not None or workload == "self_dogfood":
                     frontier_values: list[int | None] = [None]
                     cap_values: list[int | None] = [None]
@@ -1344,6 +1516,21 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 cap_label = str(exact_cap)
                             for key, value in sorted(overrides.items()):
                                 command.extend(("--config", f"{key}={value}"))
+                            product_environment = {
+                                **common_product_environment,
+                                **candidate_product_environment,
+                                **profile_product_environment,
+                                **scenario_product_environment,
+                            }
+                            for key, value in sorted(product_environment.items()):
+                                command.extend(("--product-env", f"{key}={value}"))
+                            benchmark_args = [
+                                *common_benchmark_args,
+                                *candidate_benchmark_args,
+                                *profile_benchmark_args,
+                                *scenario_benchmark_args,
+                            ]
+                            command.extend(benchmark_args)
                             if (
                                 capability_quality is not None
                                 or workload == "self_dogfood"
@@ -1363,6 +1550,12 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 "benchmark_script_sha256": benchmark_sha256,
                                 "index_mode": index_mode,
                             }
+                            if product_environment:
+                                parameters["product_environment"] = dict(
+                                    sorted(product_environment.items())
+                                )
+                            if benchmark_args:
+                                parameters["benchmark_args"] = benchmark_args
                             if capability_quality is not None:
                                 parameters["capability_quality"] = capability_quality
                                 if quality_background is not None:
@@ -2154,7 +2347,7 @@ def write_manifest(
     return path
 
 
-def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
@@ -2195,7 +2388,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--candidate-root",
         type=Path,
         help=(
-            "Automatic candidate worktree/build root (default: .worktrees/benchmark-candidates)."
+            "Candidate worktree/build root for automatic presets and ref-based matrix "
+            "specs (default: .worktrees/benchmark-candidates)."
         ),
     )
     parser.add_argument("--build-jobs", type=int, default=2)
@@ -2228,8 +2422,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default="mcp",
         help=(
             "Transport for automatic --quick/--full cells (default: mcp). "
-            "Use cli for cross-build comparisons while an account-wide CBM daemon is "
-            "active; mcp requires an isolated account/runtime or one compatible build."
+            "Cross-build cli cells require an isolated OS account/runtime or a quiescent "
+            "account-wide CBM daemon; mcp requires one compatible build."
         ),
     )
     parser.add_argument("--minimum-free-gb", type=float, default=2.0)
@@ -2240,6 +2434,11 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Generated Markdown path (default: versioned runset report under EXPERIMENT_ROOT/reports).",
     )
+    return parser
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.plan is None and args.matrix_spec is None and args.preset is None:
         args.preset = "quick"
@@ -2357,6 +2556,53 @@ def main(argv: list[str] | None = None) -> int:
     if args.matrix_spec:
         spec_path = args.matrix_spec.expanduser().resolve()
         spec = read_json_object(spec_path)
+        if matrix_spec_has_candidate_refs(spec):
+            repository = Path(__file__).resolve().parents[1]
+            ensure_clean_tracked_worktree(
+                repository, "ref-based benchmark source worktree"
+            )
+            candidate_root = (
+                args.candidate_root.expanduser().resolve()
+                if args.candidate_root
+                else repository / ".worktrees" / "benchmark-candidates"
+            )
+            ensure_disk_space(candidate_root, minimum_free_bytes)
+            source_spec_sha256 = file_sha256(spec_path)
+            source_archive = (
+                experiment_root / "specs" / f"source-{source_spec_sha256}.json"
+            )
+            if not source_archive.exists():
+                atomic_write_bytes(source_archive, spec_path.read_bytes())
+            spec = materialize_matrix_candidates(
+                repository,
+                candidate_root,
+                spec,
+                jobs=args.build_jobs,
+            )
+            runset = automatic_runset_identity(spec)
+            declared_runset = spec.get("runset_id")
+            if declared_runset is not None and declared_runset != runset:
+                raise ValueError(
+                    "ref-based matrix spec runset_id does not match its resolved "
+                    f"candidates: declared={declared_runset} resolved={runset}"
+                )
+            spec["runset_id"] = runset
+            spec["source_matrix_spec_sha256"] = source_spec_sha256
+            resolved_payload = (
+                json.dumps(spec, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            spec_path = (
+                experiment_root
+                / "inputs"
+                / f"spec-{experiment_version()}-custom-runset-{runset}.json"
+            )
+            if spec_path.exists():
+                if spec_path.read_bytes() != resolved_payload:
+                    raise RuntimeError(
+                        f"resolved matrix spec path contains different bytes: {spec_path}"
+                    )
+            else:
+                atomic_write_bytes(spec_path, resolved_payload)
         plan = expand_matrix_spec(spec)
         plan["matrix_spec_sha256"] = file_sha256(spec_path)
         archived_spec = experiment_root / "specs" / f"{file_sha256(spec_path)}.json"

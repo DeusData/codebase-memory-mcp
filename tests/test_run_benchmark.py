@@ -1792,6 +1792,38 @@ class RunBenchmarkTest(unittest.TestCase):
             },
         )
 
+    def test_explicit_product_environment_reaches_candidate_after_isolation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = BENCHMARK.build_env(
+                Path(tmpdir) / "candidate-cache",
+                {"CBM_WORKERS": "4", "CBM_MEM_BUDGET_MB": "512"},
+            )
+
+        self.assertEqual(env["CBM_WORKERS"], "4")
+        self.assertEqual(env["CBM_MEM_BUDGET_MB"], "512")
+        self.assertEqual(env["CBM_AUTO_INDEX"], "false")
+        self.assertEqual(env["CBM_CONTEXT_INJECTION"], "false")
+        self.assertEqual(env["CBM_PROFILE"], "1")
+        self.assertEqual(
+            BENCHMARK.benchmark_environment_policy(
+                {"CBM_WORKERS": "4", "CBM_MEM_BUDGET_MB": "512"}
+            )["worker_selection"],
+            "explicit_CBM_WORKERS=4",
+        )
+
+    def test_product_environment_rejects_non_product_and_harness_owned_keys(
+        self,
+    ) -> None:
+        for item, expected in (
+            ("PATH=/tmp/bin", "must start with CBM_"),
+            ("CBM_CACHE_DIR=/tmp/live", "owned by the benchmark harness"),
+            ("CBM_PROFILE=0", "owned by the benchmark harness"),
+        ):
+            with self.subTest(item=item), self.assertRaisesRegex(SystemExit, expected):
+                BENCHMARK.parse_product_environment([item])
+
     def test_tool_result_separates_default_payload_quality_json_and_transport(
         self,
     ) -> None:
