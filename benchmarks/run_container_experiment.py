@@ -44,7 +44,7 @@ bundle_name=$2
 source_key=$3
 shift 3
 export HOME=/benchmark/home
-mkdir -p "$HOME" /benchmark/sources
+mkdir -p "$HOME" /benchmark/sources /benchmark/candidates/build-logs
 repository=/benchmark/sources/$source_key
 if [ ! -d "$repository/.git" ]; then
   git clone --quiet "/benchmark/$bundle_name" "$repository"
@@ -69,6 +69,35 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def write_container_manifest(
+    experiment_root: Path,
+    source_revision: str,
+    bundle_sha256: str,
+    manifest: dict[str, Any],
+) -> Path:
+    """Write an immutable, content-addressed environment record."""
+    payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    manifest_sha = hashlib.sha256(payload).hexdigest()
+    path = (
+        experiment_root
+        / "manifests"
+        / (
+            f"container-environment-{source_revision[:12]}-{bundle_sha256[:12]}-"
+            f"{manifest_sha[:12]}.json"
+        )
+    )
+    if path.exists() and path.read_bytes() != payload:
+        raise RuntimeError(f"manifest hash collision at {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return path
+
+
+def failure_log_export_root(experiment_root: Path, source_revision: str) -> Path:
+    """Return the commit-keyed destination for failed candidate build logs."""
+    return experiment_root / "container-failures" / source_revision[:12] / "build-logs"
 
 
 def native_linux_platform(machine: str) -> str:
@@ -330,6 +359,7 @@ def copy_to_volume(
     source: Path,
     container_name: str,
 ) -> None:
+    copy_source = f"{source}{os.sep}." if source.is_dir() else str(source)
     remove_container(docker, container_name)
     try:
         run_command(
@@ -345,7 +375,7 @@ def copy_to_volume(
                 image,
             ]
         )
-        run_command([docker, "cp", str(source), f"{container_name}:{destination}/"])
+        run_command([docker, "cp", copy_source, f"{container_name}:{destination}"])
     finally:
         remove_container(docker, container_name)
 
@@ -378,6 +408,42 @@ def export_results(
                 ]
             )
             run_command([docker, "cp", f"{container_name}:/results/.", str(staging)])
+        finally:
+            remove_container(docker, container_name)
+        merge_exported_tree(staging, destination)
+
+
+def export_volume_subtree(
+    docker: str,
+    image: str,
+    volume: str,
+    volume_destination: str,
+    subtree: str,
+    destination: Path,
+    container_name: str,
+) -> None:
+    """Export one named-volume subtree through the immutable history merge."""
+    remove_container(docker, container_name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".cbm-container-subtree-export-", dir=destination.parent
+    ) as tmpdir:
+        staging = Path(tmpdir)
+        try:
+            run_command(
+                [
+                    docker,
+                    "create",
+                    "--name",
+                    container_name,
+                    "--mount",
+                    volume_mount(volume, volume_destination),
+                    "--entrypoint",
+                    "/bin/true",
+                    image,
+                ]
+            )
+            run_command([docker, "cp", f"{container_name}:{subtree}/.", str(staging)])
         finally:
             remove_container(docker, container_name)
         merge_exported_tree(staging, destination)
@@ -605,19 +671,18 @@ def main(argv: list[str] | None = None) -> int:
                 "volumes_retained_for_resume": True,
                 "runner_arguments": runner_arguments,
             }
-            manifest_path = input_root / (
-                f"container-environment-{source_revision[:12]}-{bundle_sha[:12]}.json"
-            )
-            manifest_path.write_text(
-                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+            manifest_path = write_container_manifest(
+                input_root,
+                source_revision,
+                bundle_sha,
+                manifest,
             )
             copy_to_volume(
                 args.docker,
                 image,
                 results_volume,
-                "/results",
-                manifest_path,
+                "/results/manifests",
+                manifest_path.parent,
                 seed_name,
             )
 
@@ -665,10 +730,32 @@ def main(argv: list[str] | None = None) -> int:
                 export_name,
             )
             if measured_process.returncode != 0:
+                failure_logs = failure_log_export_root(
+                    args.experiment_root, source_revision
+                )
+                try:
+                    export_volume_subtree(
+                        args.docker,
+                        image,
+                        work_volume,
+                        "/benchmark",
+                        "/benchmark/candidates/build-logs",
+                        failure_logs,
+                        export_name,
+                    )
+                    failure_log_detail = (
+                        f"; candidate build logs exported to {failure_logs}"
+                    )
+                except RuntimeError as log_error:
+                    failure_log_detail = (
+                        "; candidate build logs could not be exported automatically "
+                        f"({log_error}); inspect {work_volume} at "
+                        "/benchmark/candidates/build-logs"
+                    )
                 raise RuntimeError(
                     "container benchmark failed with exit "
                     f"{measured_process.returncode}; partial immutable results were "
-                    f"exported to {args.experiment_root}"
+                    f"exported to {args.experiment_root}{failure_log_detail}"
                 )
     except Exception as error:
         raise RuntimeError(

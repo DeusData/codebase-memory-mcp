@@ -318,7 +318,13 @@ The coordinator is intentionally smaller than the benchmark engine:
 6. It exports results through a staging directory. Existing history bytes may be
    reused, but different bytes at an existing path fail loudly rather than being
    overwritten.
-7. It removes every transient coordinator and measured container in a `finally`
+7. It stores each container-environment record under the established `manifests/`
+   output directory with a content-derived suffix. Repeating identical bytes is
+   idempotent; changed arguments or timestamps retain a distinct audit record.
+8. On a candidate-build failure, it exports the work volume's build logs to
+   `container-failures/<source-commit>/build-logs/`. If Docker cannot export them,
+   the returned error names the retained volume and in-volume path for inspection.
+9. It removes every transient coordinator and measured container in a `finally`
    path. The two labeled volumes remain for resume and their exact names are printed.
 
 The experiment root is the human-selected history name; content-addressed source
