@@ -387,8 +387,12 @@ TEST(snippet_signature_mode) {
     ASSERT_NOT_NULL(strstr(resp, "def large_function(arg1, arg2, arg3)"));
     /* Should NOT contain full source body */
     ASSERT_NULL(strstr(resp, "step_050"));
-    /* Should indicate total size */
-    ASSERT_NOT_NULL(strstr(resp, "\"total_lines\""));
+    /* Signature is a complete requested representation, not clipped source.
+     * Retain size context without telling callers to repair a non-problem. */
+    ASSERT_NOT_NULL(strstr(resp, "\"total_lines\":300"));
+    ASSERT_NULL(strstr(resp, "\"truncated\":true"));
+    ASSERT_NULL(strstr(resp, "\"source_clipped\":true"));
+    ASSERT_NULL(strstr(resp, "\"clipped_at_lines\""));
 
     free(resp);
     cbm_mcp_server_free(srv);

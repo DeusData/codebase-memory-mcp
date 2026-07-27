@@ -908,6 +908,40 @@ TEST(c_function) {
     PASS();
 }
 
+TEST(c_function_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r =
+        extract("static const char *text_end(const char *text) { return text; }\n"
+                "char **table(void) { return 0; }\n"
+                "int scalar(void) { return 0; }\n",
+                CBM_LANG_C, "t", "returns.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *text_end = NULL;
+    const CBMDefinition *table = NULL;
+    const CBMDefinition *scalar = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        if (strcmp(def->name, "text_end") == 0) {
+            text_end = def;
+        } else if (strcmp(def->name, "table") == 0) {
+            table = def;
+        } else if (strcmp(def->name, "scalar") == 0) {
+            scalar = def;
+        }
+    }
+
+    ASSERT_NOT_NULL(text_end);
+    ASSERT_NOT_NULL(table);
+    ASSERT_NOT_NULL(scalar);
+    ASSERT_STR_EQ(text_end->return_type, "const char *");
+    ASSERT_STR_EQ(table->return_type, "char **");
+    ASSERT_STR_EQ(scalar->return_type, "int");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(c_struct) {
     CBMFileResult *r =
         extract("struct Point { int x; int y; };\nvoid init_point(struct Point *p) { p->x = 0; }\n",
@@ -928,6 +962,36 @@ TEST(cpp_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Widget"));
     ASSERT(has_def(r, "Method", "draw"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r =
+        extract("class Text {\n"
+                "public:\n"
+                "    const char *end() { return nullptr; }\n"
+                "    char **table() { return nullptr; }\n"
+                "};\n",
+                CBM_LANG_CPP, "t", "text.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *end = NULL;
+    const CBMDefinition *table = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        if (strcmp(def->name, "end") == 0) {
+            end = def;
+        } else if (strcmp(def->name, "table") == 0) {
+            table = def;
+        }
+    }
+    ASSERT_NOT_NULL(end);
+    ASSERT_NOT_NULL(table);
+    ASSERT_STR_EQ(end->return_type, "const char *");
+    ASSERT_STR_EQ(table->return_type, "char **");
+
     cbm_free_result(r);
     PASS();
 }
@@ -5643,8 +5707,10 @@ SUITE(extraction) {
     RUN_TEST(dlang_struct);
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
+    RUN_TEST(c_function_return_type_preserves_pointer_and_qualifier);
     RUN_TEST(c_struct);
     RUN_TEST(cpp_class);
+    RUN_TEST(cpp_method_return_type_preserves_pointer_and_qualifier);
 
     /* Scripting */
     RUN_TEST(python_function);

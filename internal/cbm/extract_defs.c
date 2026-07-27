@@ -3151,6 +3151,122 @@ static TSNode find_c_params(TSNode func_node) {
     return null_node;
 }
 
+static bool c_return_type_size_add(size_t *total, size_t addition) {
+    if (addition > SIZE_MAX - *total) {
+        return false;
+    }
+    *total += addition;
+    return true;
+}
+
+/* C-family grammars split a function's declared return type across sibling
+ * type/type_qualifier nodes and the declarator chain.  Preserve the exact base
+ * spelling, leading qualifiers, and every pointer layer without imposing a
+ * depth cap: the walk follows one strict child chain, so runtime is O(D) and
+ * temporary memory is O(return-type bytes), where D is declarator depth. */
+static char *c_declarator_return_type_text(CBMExtractCtx *ctx, TSNode func_node, TSNode type_node) {
+    uint32_t base_start = ts_node_start_byte(type_node);
+    uint32_t base_end = ts_node_end_byte(type_node);
+    if (base_end <= base_start) {
+        return cbm_node_text(ctx->arena, type_node, ctx->source);
+    }
+
+    TSNode declarator = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    if (ts_node_is_null(declarator)) {
+        return cbm_node_text(ctx->arena, type_node, ctx->source);
+    }
+
+    size_t pointer_count = 0;
+    for (TSNode node = declarator; !ts_node_is_null(node);
+         node = ts_node_child_by_field_name(node, TS_FIELD("declarator"))) {
+        if (strcmp(ts_node_type(node), "pointer_declarator") == 0) {
+            if (pointer_count == SIZE_MAX) {
+                ctx->result->has_error = true;
+                ctx->result->error_msg =
+                    cbm_arena_strdup(ctx->arena, "C return-type pointer depth exceeds size limit");
+                return cbm_node_text(ctx->arena, type_node, ctx->source);
+            }
+            pointer_count++;
+        }
+    }
+
+    uint32_t declarator_start = ts_node_start_byte(declarator);
+    size_t qualifier_bytes = 0;
+    size_t qualifier_count = 0;
+    uint32_t child_count = ts_node_named_child_count(func_node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode child = ts_node_named_child(func_node, i);
+        if (strcmp(ts_node_type(child), "type_qualifier") != 0 ||
+            ts_node_end_byte(child) > declarator_start) {
+            continue;
+        }
+        uint32_t start = ts_node_start_byte(child);
+        uint32_t end = ts_node_end_byte(child);
+        if (end > start) {
+            size_t len = (size_t)(end - start);
+            if (len > SIZE_MAX - qualifier_bytes || qualifier_count == SIZE_MAX) {
+                ctx->result->has_error = true;
+                ctx->result->error_msg =
+                    cbm_arena_strdup(ctx->arena, "C return-type qualifier size exceeds limit");
+                return cbm_node_text(ctx->arena, type_node, ctx->source);
+            }
+            qualifier_bytes += len;
+            qualifier_count++;
+        }
+    }
+
+    if (pointer_count == 0 && qualifier_count == 0) {
+        return cbm_node_text(ctx->arena, type_node, ctx->source);
+    }
+
+    size_t base_len = (size_t)(base_end - base_start);
+    size_t result_len = base_len;
+    if (!c_return_type_size_add(&result_len, qualifier_bytes) ||
+        !c_return_type_size_add(&result_len, qualifier_count) ||
+        (pointer_count > 0 && !c_return_type_size_add(&result_len, SKIP_ONE)) ||
+        !c_return_type_size_add(&result_len, pointer_count) ||
+        !c_return_type_size_add(&result_len, NULL_TERM)) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg =
+            cbm_arena_strdup(ctx->arena, "C return-type metadata exceeds addressable size");
+        return cbm_node_text(ctx->arena, type_node, ctx->source);
+    }
+    char *result = cbm_arena_alloc(ctx->arena, result_len);
+    if (!result) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg =
+            cbm_arena_strdup(ctx->arena, "C return-type metadata allocation failed");
+        return cbm_node_text(ctx->arena, type_node, ctx->source);
+    }
+
+    size_t pos = 0;
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode child = ts_node_named_child(func_node, i);
+        if (strcmp(ts_node_type(child), "type_qualifier") != 0 ||
+            ts_node_end_byte(child) > declarator_start) {
+            continue;
+        }
+        uint32_t start = ts_node_start_byte(child);
+        uint32_t end = ts_node_end_byte(child);
+        if (end <= start) {
+            continue;
+        }
+        size_t len = (size_t)(end - start);
+        memcpy(result + pos, ctx->source + start, len);
+        pos += len;
+        result[pos++] = ' ';
+    }
+    memcpy(result + pos, ctx->source + base_start, base_len);
+    pos += base_len;
+    if (pointer_count > 0) {
+        result[pos++] = ' ';
+        memset(result + pos, '*', pointer_count);
+        pos += pointer_count;
+    }
+    result[pos] = '\0';
+    return result;
+}
+
 // C++: resolve trailing return type (auto f() -> Type) on a declarator node.
 // Updates def->return_type and def->return_types if trailing type found.
 static void resolve_cpp_trailing_return(CBMArena *a, TSNode func_node, const char *source,
@@ -3304,7 +3420,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     for (const char **f = rt_fields; *f; f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
-            def.return_type = cbm_node_text(a, rt, ctx->source);
+            def.return_type = c_declarator_return_type_text(ctx, func_node, rt);
             def.return_types = extract_return_types(ctx, rt);
             break;
         }
@@ -4311,7 +4427,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         for (const char **f = rt_fields; *f; f++) {
             TSNode rt = ts_node_child_by_field_name(child, *f, (uint32_t)strlen(*f));
             if (!ts_node_is_null(rt)) {
-                def.return_type = cbm_node_text(a, rt, ctx->source);
+                def.return_type = c_declarator_return_type_text(ctx, child, rt);
                 break;
             }
         }

@@ -13540,6 +13540,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
     int total_lines = end - start + 1;
     bool truncated = false;
+    bool signature_mode = mode && strcmp(mode, "signature") == 0;
     char *source = NULL;
     char *source_tail = NULL;
 
@@ -13555,8 +13556,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         bool path_ok = path_len >= 0 && (size_t)path_len < apsz &&
                        cbm_path_within_root(root_path, abs_path);
         if (path_ok) {
-            if (mode && strcmp(mode, "signature") == 0) {
-                truncated = true;
+            if (signature_mode) {
+                /* Source omission is the requested representation, not truncation. */
             } else if (mode && strcmp(mode, "head_tail") == 0 && max_lines > 0 &&
                        total_lines > max_lines) {
                 int head_count = (max_lines * CBM_SNIPPET_HEAD_PERCENT) /
@@ -13600,7 +13601,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
 
-    if (mode && strcmp(mode, "signature") == 0) {
+    if (signature_mode) {
         /* Signature mode: source omitted; signature comes from properties below */
     } else if (mode && strcmp(mode, "head_tail") == 0 && source && source_tail) {
         /* Combine head + marker + tail */
@@ -13641,6 +13642,10 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         yyjson_mut_obj_add_bool(doc, root_obj, "source_clipped", true);
         yyjson_mut_obj_add_int(doc, root_obj, "clipped_at_lines", max_lines);
         yyjson_mut_obj_add_int(doc, root_obj, "total_lines", total_lines);
+    } else if (signature_mode) {
+        /* Preserve useful size context without claiming requested source was
+         * clipped or suggesting max_lines=0 is needed to repair the result. */
+        yyjson_mut_obj_add_int(doc, root_obj, "total_lines", total_lines);
     }
 
     /* match_method — omitted for exact matches */
@@ -13652,7 +13657,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
      * props_doc is freed AFTER serialization since yyjson_mut_obj_add_str
      * stores pointers into it (zero-copy). */
     yyjson_doc *props_doc = NULL;
-    bool include_properties = !compact || (mode && strcmp(mode, "signature") == 0);
+    bool include_properties = !compact || signature_mode;
     if (include_properties && node->properties_json && node->properties_json[0] != '\0') {
         props_doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
         if (props_doc) {
