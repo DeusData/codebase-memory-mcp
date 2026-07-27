@@ -6308,6 +6308,97 @@ TEST(resource_architecture_uses_ready_overlay_summaries) {
     PASS();
 }
 
+TEST(resources_report_stale_architecture_and_omit_rank_values) {
+    char config_dir[CBM_PATH_MAX];
+    ASSERT_TRUE(snprintf(config_dir, sizeof(config_dir), "/tmp/cbm-mcp-resource-stale-XXXXXX") > 0);
+    ASSERT_NOT_NULL(cbm_mkdtemp(config_dir));
+    cbm_config_t *config = cbm_config_open(config_dir);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_AT_PUBLISH), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "resource-arch-stale";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/resource-arch-stale"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t fn = {.project = proj,
+                     .label = "Function",
+                     .name = "StaleRank",
+                     .qualified_name = "resource.arch.StaleRank",
+                     .file_path = "src/main.c"};
+    int64_t node_id = cbm_store_upsert_node(st, &fn);
+    ASSERT_GT(node_id, 0);
+    char rank_sql[CBM_SZ_512];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('%s',%lld,0.99,'2026-07-27T00:00:00Z')",
+             proj, (long long)node_id);
+    ASSERT_EQ(cbm_store_exec(st, rank_sql), CBM_STORE_OK);
+    const char *stale_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                 CBM_STORE_DERIVED_VIEW_ARCHITECTURE};
+    ASSERT_EQ(cbm_store_mark_derived_views_stale(
+                  st, proj, CBM_STORE_DERIVED_GENERATION_UNKNOWN, stale_views,
+                  (int)(sizeof(stale_views) / sizeof(stale_views[0]))),
+              CBM_STORE_OK);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"resources/read\","
+                                   "\"params\":{\"uri\":\"codebase://architecture\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "pagerank derived view is stale"));
+    ASSERT_NOT_NULL(strstr(resp, "architecture derived view is stale"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"freshness\\\":{\\\"state\\\":\\\"stale_with_warning\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"action_required\\\""));
+    ASSERT_NOT_NULL(strstr(resp, CBM_CONFIG_RANK_REFRESH));
+    ASSERT_NOT_NULL(strstr(resp, "index_repository"));
+    ASSERT_NOT_NULL(strstr(resp, "requires rank refresh during publication"));
+    ASSERT_NULL(strstr(resp, "permits deferred"));
+    ASSERT_NULL(strstr(resp, "\\\"key_functions\\\""));
+    ASSERT_NULL(strstr(resp, "0.99"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":103,\"method\":\"resources/read\","
+                                   "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "pagerank derived view is stale"));
+    ASSERT_NOT_NULL(strstr(resp, "architecture derived view is stale"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"freshness\\\":{\\\"state\\\":\\\"stale_with_warning\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"action_required\\\""));
+    ASSERT_NOT_NULL(strstr(resp, CBM_CONFIG_RANK_REFRESH));
+    ASSERT_NOT_NULL(strstr(resp, "index_repository"));
+    ASSERT_NOT_NULL(strstr(resp, "requires rank refresh during publication"));
+    ASSERT_NULL(strstr(resp, "permits deferred"));
+    ASSERT_NULL(strstr(resp, "\\\"ranked_nodes\\\""));
+    ASSERT_NULL(strstr(resp, "\\\"pagerank_computed_at\\\""));
+    free(resp);
+
+    ASSERT_EQ(th_set_raw_config_value(config_dir, CBM_CONFIG_RANK_REFRESH, "invalid-policy"), 0);
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":104,\"method\":\"resources/read\","
+                                   "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "rank_refresh=invalid-policy is invalid"));
+    ASSERT_NOT_NULL(strstr(resp, "falls back to at_publish"));
+    ASSERT_NOT_NULL(strstr(resp, "config set rank_refresh at_publish"));
+    ASSERT_NULL(strstr(resp, "\\\"ranked_nodes\\\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    char config_path[CBM_PATH_MAX];
+    ASSERT_TRUE(snprintf(config_path, sizeof(config_path), "%s/_config.db", config_dir) > 0);
+    cbm_remove_db_sidecars(config_path);
+    cbm_unlink(config_path);
+    cbm_rmdir(config_dir);
+    PASS();
+}
+
 TEST(resource_schema_uses_ready_overlay_counts) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -16286,6 +16377,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_uses_overlay_active_routes);
     RUN_TEST(tool_get_architecture_uses_overlay_active_file_summaries);
     RUN_TEST(resource_architecture_uses_ready_overlay_summaries);
+    RUN_TEST(resources_report_stale_architecture_and_omit_rank_values);
     RUN_TEST(resource_schema_uses_ready_overlay_counts);
     RUN_TEST(resource_arch_rel_patterns_use_ready_overlay);
     RUN_TEST(tool_trace_call_path_depth_clamped);
