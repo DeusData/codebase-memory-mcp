@@ -185,6 +185,14 @@ static inline bool cbm_pipeline_should_suppress_python_super_init_suffix_match(
            strcmp(resolution->strategy, CBM_REGISTRY_STRATEGY_SUFFIX_MATCH) == 0;
 }
 
+/* Normalize the extractor's cross-language member-call signal for resolver
+ * guards. TS/JS sets is_method; Rust retains receiver.method in callee_name
+ * without setting that flag. Rust `::` qualified free calls are not members. */
+static inline bool cbm_pipeline_call_is_member(const CBMCall *call, CBMLanguage language) {
+    return call && (call->is_method || (language == CBM_LANG_RUST && call->callee_name &&
+                                        strchr(call->callee_name, '.') != NULL));
+}
+
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
  * cbm_lang_module_is_dir) a file's module QN equals its directory QN, so an

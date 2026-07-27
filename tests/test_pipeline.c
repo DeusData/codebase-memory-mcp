@@ -674,6 +674,20 @@ TEST(pipeline_weak_call_target_suppression) {
     PASS();
 }
 
+TEST(pipeline_member_call_normalization) {
+    CBMCall call = {.callee_name = "receiver.matches"};
+    ASSERT_TRUE(cbm_pipeline_call_is_member(&call, CBM_LANG_RUST));
+    ASSERT_FALSE(cbm_pipeline_call_is_member(&call, CBM_LANG_GO));
+
+    call.callee_name = "module::matches";
+    ASSERT_FALSE(cbm_pipeline_call_is_member(&call, CBM_LANG_RUST));
+
+    call.is_method = true;
+    ASSERT_TRUE(cbm_pipeline_call_is_member(&call, CBM_LANG_TYPESCRIPT));
+    ASSERT_FALSE(cbm_pipeline_call_is_member(NULL, CBM_LANG_RUST));
+    PASS();
+}
+
 TEST(pipeline_sequential_call_edges_preserve_eighth_arg) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -1221,8 +1235,9 @@ TEST(pipeline_calls_resolution) {
 
 /* True iff a CALLS edge exists from a node named src_name to a node named
  * tgt_name. Used to assert cross-file call resolution survives a reindex. */
-static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
-                                   const char *tgt_name) {
+static bool cross_file_call_with_strategy_exists(cbm_store_t *s, const char *project,
+                                                 const char *src_name, const char *tgt_name,
+                                                 const char *strategy) {
     cbm_node_t *srcs = NULL;
     cbm_node_t *tgts = NULL;
     int sc = 0;
@@ -1236,7 +1251,9 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
         cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
         for (int j = 0; j < ec && !found; j++) {
             for (int k = 0; k < tc; k++) {
-                if (edges[j].target_id == tgts[k].id) {
+                if (edges[j].target_id == tgts[k].id &&
+                    (!strategy ||
+                     (edges[j].properties_json && strstr(edges[j].properties_json, strategy)))) {
                     found = true;
                     break;
                 }
@@ -1253,6 +1270,11 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
         cbm_store_free_nodes(tgts, tc);
     }
     return found;
+}
+
+static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name) {
+    return cross_file_call_with_strategy_exists(s, project, src_name, tgt_name, NULL);
 }
 
 static cbm_config_t *incremental_test_config(const char *cache_dir);
@@ -1485,6 +1507,92 @@ TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
+    PASS();
+}
+
+/* Rust also resolves typed receivers through its LSP before the generic
+ * registry. An unresolved member receiver must not fall back to an unrelated
+ * project method by weak suffix matching, while a typed receiver must retain
+ * its real lsp_method_dispatch CALLS edge. The unresolved receiver is intentionally a
+ * semantic error: extraction must remain conservative when type lookup fails.
+ * RED before the fix:
+ * check_unknown->matches exists via suffix_match. */
+static int pipeline_rust_receiver_suppression_case(bool force_parallel) {
+    enum { RUST_RECEIVER_PARALLEL_PAD_FILES = 52 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+
+    write_temp_file(tmp, "src/query.rs",
+                    "pub struct CompiledProcessQuery;\n"
+                    "impl CompiledProcessQuery {\n"
+                    "    pub fn matches(&self) -> bool { true }\n"
+                    "}\n"
+                    "pub struct OtherQuery;\n"
+                    "impl OtherQuery {\n"
+                    "    pub fn matches(&self) -> bool { false }\n"
+                    "}\n"
+                    "pub fn check_typed(query: &CompiledProcessQuery) -> bool {\n"
+                    "    query.matches()\n"
+                    "}\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "mod query;\n"
+                    "mod unknown;\n");
+    write_temp_file(tmp, "src/unknown.rs",
+                    "pub fn check_unknown(value: UnknownReceiver) -> bool {\n"
+                    "    value.matches()\n"
+                    "}\n"
+                    "pub fn check_macro(value: bool) -> bool {\n"
+                    "    matches!(value, true)\n"
+                    "}\n");
+    if (force_parallel) {
+        for (int i = 0; i < RUST_RECEIVER_PARALLEL_PAD_FILES; i++) {
+            char name[CBM_SZ_64];
+            char body[CBM_SZ_128];
+            snprintf(name, sizeof(name), "src/pad_%02d.rs", i);
+            snprintf(body, sizeof(body), "pub fn pad_%02d() -> i32 { %d }\n", i, i);
+            write_temp_file(tmp, name, body);
+        }
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    cbm_store_t *s = NULL;
+    int ok = p && cbm_pipeline_run(p) == 0;
+    const char *project = ok ? cbm_pipeline_project_name(p) : NULL;
+    if (ok) {
+        s = cbm_store_open_path(db_path);
+        bool unknown_edge = s && cross_file_call_exists(s, project, "check_unknown", "matches");
+        bool macro_edge = s && cross_file_call_exists(s, project, "check_macro", "matches");
+        bool typed_edge = s && cross_file_call_with_strategy_exists(
+                                   s, project, "check_typed", "matches", "lsp_method_dispatch");
+        ok = s && !unknown_edge && !macro_edge && typed_edge;
+        if (!ok) {
+            fprintf(stderr,
+                    "  [RUST-RECEIVER] parallel=%d unknown_edge=%d macro_edge=%d typed_edge=%d "
+                    "db=%s\n",
+                    force_parallel, unknown_edge, macro_edge, typed_edge, db_path);
+        }
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (ok) {
+        th_rmtree(tmp);
+    }
+    return ok;
+}
+
+TEST(pipeline_rust_receiver_suppresses_weak_method_edge) {
+    ASSERT_TRUE(pipeline_rust_receiver_suppression_case(false));
+    PASS();
+}
+
+TEST(pipeline_rust_receiver_parallel_suppresses_weak_method_edge) {
+    ASSERT_TRUE(pipeline_rust_receiver_suppression_case(true));
     PASS();
 }
 
@@ -19333,6 +19441,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_mode_global_semantic_edges_policy);
     RUN_TEST(pipeline_call_edge_props_include_args_and_line);
     RUN_TEST(pipeline_weak_call_target_suppression);
+    RUN_TEST(pipeline_member_call_normalization);
     RUN_TEST(pipeline_sequential_call_edges_preserve_eighth_arg);
     RUN_TEST(pipeline_fast_mode);
     /* Definitions pass */
@@ -19354,6 +19463,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_full_and_incremental_persist_file_state);
     RUN_TEST(pipeline_incremental_full_index_rebuilds_owner_metadata);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_rust_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_rust_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_full_url_call_joins_canonical_route);
     RUN_TEST(pipeline_route_discovery_uses_canonical_identities_sequential);
     RUN_TEST(pipeline_route_discovery_uses_canonical_identities_parallel);

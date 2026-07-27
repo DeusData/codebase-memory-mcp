@@ -825,10 +825,10 @@ TEST(tsjs_suppress_drops_weak_method_matches) {
      * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
      * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
      * resolvers today) so a future wiring cannot silently reintroduce it. */
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "suffix_match"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "unique_name"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "field_type_hint"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "fuzzy"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 1, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_JAVASCRIPT, true, false, 1, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_TSX, true, false, 2, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "fuzzy"));
     PASS();
 }
 
@@ -848,23 +848,42 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
      * enumerates the resolver's non-weak strategies: registry
      * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
      * {callee_suffix, service_pattern}, and lsp_*. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "same_module"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "qualified_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "callee_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "service_pattern"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_method"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_cross"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_local"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "import_map"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "import_map_suffix"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "qualified_suffix"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "callee_suffix"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "service_pattern"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "lsp_ts_method"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "lsp_method_dispatch"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "lsp_ts_local"));
     /* A bare call (is_method=false) is a free-function call → never suppressed. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "unique_name"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, false, false, 2, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, false, 2, "suffix_match"));
     /* Non-TS/JS languages are never affected. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(false, true, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_GO, true, false, 2, "suffix_match"));
     /* No match (NULL/empty strategy) → nothing to suppress. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, NULL));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, ""));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, ""));
+    PASS();
+}
+
+TEST(rust_suppress_drops_only_ambiguous_weak_member_matches) {
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "fuzzy"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "field_type_hint"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 1, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 1, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, true, 1, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, true, 2, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, true, 2, "lsp_macro"));
     PASS();
 }
 
@@ -990,4 +1009,5 @@ SUITE(registry) {
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
     RUN_TEST(registry_strategy_identifies_direct_import_map);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(rust_suppress_drops_only_ambiguous_weak_member_matches);
 }

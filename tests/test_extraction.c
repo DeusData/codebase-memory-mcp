@@ -4437,6 +4437,31 @@ TEST(extract_js_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_rust_macro_invocation_is_not_an_ordinary_call) {
+    CBMFileResult *r = extract("fn matches(_v: bool) -> bool { true }\n"
+                               "fn run(v: bool) -> bool { matches!(v, true) && matches(v) }\n",
+                               CBM_LANG_RUST, "t", "x.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int macro_calls = 0;
+    int ordinary_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *call = &r->calls.items[i];
+        if (!call->callee_name || strcmp(call->callee_name, "matches") != 0) {
+            continue;
+        }
+        if (call->is_macro_invocation) {
+            macro_calls++;
+        } else {
+            ordinary_calls++;
+        }
+    }
+    ASSERT_EQ(macro_calls, 1);
+    ASSERT_EQ(ordinary_calls, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #961: a C function whose body braces are split across #ifdef/#else
  * branches (one open brace per branch, a single shared close) parses with
  * an ERROR region on the raw source — both branches are present at once —
@@ -5700,6 +5725,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
+    RUN_TEST(extract_rust_macro_invocation_is_not_an_ordinary_call);
 
     /* InterSystems ObjectScript (UDL / routine / Export XML). */
     RUN_TEST(objectscript_udl_class);

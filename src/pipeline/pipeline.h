@@ -424,13 +424,16 @@ bool cbm_registry_strategy_is_import_map(const char *strategy);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
-/* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
- * drop (#592/#606): true only for TS/JS, only for a member call with a
- * non-this/super receiver (is_method), and only when the match used a weak
- * short-name strategy (suffix_match / unique_name / field_type_hint / fuzzy).
- * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
- * Pure; unit-tested in test_registry.c. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+/* Decide whether a resolved call edge is weak-strategy noise to drop.
+ * TS/JS/TSX reject every weak receiver fallback, matching the established
+ * guard. Rust rejects only ambiguous name-only matches: its cross-file resolver
+ * can still miss a valid sole candidate or receiver-assisted field hint in
+ * manifest-free source sets. Rust macro syntax also rejects every weak textual
+ * match because `matches!` is not a call to a project method named `matches`.
+ * The explicit language-specific drop-list keeps every lsp_* / import /
+ * same-module / qualified match. Pure and unit-tested in test_registry.c. */
+bool cbm_suppress_weak_call_match(CBMLanguage language, bool is_member, bool is_macro_invocation,
+                                  int candidate_count, const char *strategy);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
