@@ -464,6 +464,13 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "tools"));
     ASSERT_NOT_NULL(strstr(json, "\"listChanged\":true"));
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
+    /* The default tool mode is streamlined, where get_code is visible and
+     * get_code_snippet is hidden until _hidden_tools reveals it. Initialization
+     * must not direct a client to a tool it cannot call yet. */
+    ASSERT_NOT_NULL(strstr(json, "get_code for exact source"));
+    ASSERT_NULL(strstr(json, "get_code_snippet for exact source"));
+    ASSERT_NOT_NULL(strstr(json, "first graph or source call automatically resolves"));
+    ASSERT_NOT_NULL(strstr(json, "follow action_required when automation cannot complete"));
     free(json);
 
     /* Client requests a supported version: server echoes it */
@@ -1020,9 +1027,31 @@ TEST(server_handle_initialize) {
     ASSERT_NOT_NULL(strstr(resp, "\"id\":1"));
     ASSERT_NOT_NULL(strstr(resp, "codebase-memory-mcp"));
     ASSERT_NOT_NULL(strstr(resp, "capabilities"));
+    ASSERT_NOT_NULL(strstr(resp, "get_code for exact source"));
+    ASSERT_NULL(strstr(resp, "get_code_snippet for exact source"));
+    ASSERT_NOT_NULL(strstr(resp, "first graph or source call automatically resolves"));
+    ASSERT_NOT_NULL(strstr(resp, "follow action_required when automation cannot complete"));
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_initialize_names_classic_source_tool) {
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                                   "\"params\":{\"capabilities\":{}}}");
+    cbm_mcp_server_free(srv);
+    cbm_unsetenv("CBM_TOOL_MODE");
+
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "get_code_snippet for exact source"));
+    ASSERT_NULL(strstr(resp, "get_code for exact source"));
+    ASSERT_NOT_NULL(strstr(resp, "first graph or source call automatically resolves"));
+    ASSERT_NOT_NULL(strstr(resp, "follow action_required when automation cannot complete"));
+    free(resp);
     PASS();
 }
 
@@ -16351,6 +16380,7 @@ SUITE(mcp) {
 
     /* Server protocol handling */
     RUN_TEST(server_handle_initialize);
+    RUN_TEST(server_handle_initialize_names_classic_source_tool);
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
     RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
