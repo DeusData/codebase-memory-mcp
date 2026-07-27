@@ -4529,14 +4529,14 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
         snprintf(buf, sizeof(buf),
                  "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
                  "then pass one as the \\\"project\\\" argument.\","
-                 "\"available_projects\":[%s],\"count\":%d%s}",
+                 "\"available_projects\":[%s],\"count\":%d%s,"
+                 "\"action_required\":\"%s\"}",
                  reason, projects, listed_count,
-                 projects_truncated ? ",\"available_projects_truncated\":true" : "");
+                 projects_truncated ? ",\"available_projects_truncated\":true" : "", recovery_hint);
         if (projects_truncated) {
             size_t len = strlen(buf);
             if (len > 0 && buf[len - 1] == '}') {
-                snprintf(buf + len - 1, sizeof(buf) - len + 1, ",\"total_count\":%d}",
-                         total_count);
+                snprintf(buf + len - 1, sizeof(buf) - len + 1, ",\"total_count\":%d}", total_count);
             }
         }
     } else {
