@@ -282,6 +282,70 @@ harness-owned so a matrix cannot redirect live data or suppress measurement logs
 Fully resolved historical specs remain valid, and specs that omit these new fields
 retain their previous cell shape and identity.
 
+### Container isolation
+
+`benchmarks/run_container_experiment.py` is a thin isolation coordinator around the
+same `run_experiments.py` entry point. Use it when several exact builds must exercise
+their real daemon-backed CLI or MCP paths without joining the host account's active
+exact-build cohort:
+
+```sh
+uv run python benchmarks/run_container_experiment.py \
+  --matrix-spec /absolute/path/development-comparison.json \
+  --experiment-root /durable/ignored/path/development-comparison \
+  --cpus 4 \
+  --memory 8g \
+  --workers 4 \
+  -- --minimum-free-gb 4
+```
+
+The coordinator is intentionally smaller than the benchmark engine:
+
+1. It refuses tracked source changes and bundles exact `HEAD`, branch, tag, and
+   remote refs without moving them. Stash and other non-branch/tag/remote namespaces
+   are excluded from benchmark input.
+2. It builds or identifies the digest-pinned
+   `test-infrastructure/Dockerfile` image and rejects emulated architectures.
+3. It requires explicit CPU, memory, and worker budgets. Workers may not exceed the
+   container CPU budget.
+4. It copies the bundle and optional matrix spec into labeled Docker volumes.
+   Candidate worktrees, builds, fixture data, caches, daemon state, plans, and reports
+   stay off host bind mounts during measurement.
+5. It invokes the existing experiment runner with `CBM_WORKERS` as an explicit product
+   environment value. The shared `benchmarks/environment-policy-v1.json` registry
+   prevents that value from replacing cache, profiling, auto-index, or run-context
+   isolation.
+6. It exports results through a staging directory. Existing history bytes may be
+   reused, but different bytes at an existing path fail loudly rather than being
+   overwritten.
+7. It removes every transient coordinator and measured container in a `finally`
+   path. The two labeled volumes remain for resume and their exact names are printed.
+
+The experiment root is the human-selected history name; content-addressed source
+specs, resolved specs, plans, cells, reports, environment snapshots, binary hashes,
+and the container environment manifest remain the audit identities beneath it.
+Rerunning the same source spec and root resumes completed cells. A failed candidate
+still exports partial immutable evidence before the coordinator returns an error.
+
+After the export is verified and no resume is required, remove only the two exact
+volume names printed by the coordinator:
+
+```sh
+docker volume rm cbm-benchmark-work-<history-id>
+docker volume rm cbm-benchmark-results-<history-id>
+```
+
+The coordinator never stops the Docker backend because that could disrupt unrelated
+containers. After all benchmark work is complete, separately verify that no
+`cbm-benchmark-*` container remains and stop Docker Desktop or the host Docker service
+using the platform's normal administration command.
+
+Interpretation boundary: the container matrix is a controlled same-image,
+same-resource relative comparison. Its Linux kernel, compiler, libc, Docker VM, and
+storage environment differ from native macOS, so do not join absolute container
+latencies or RSS values to native-host series. Use a small scheduled native
+confirmation to establish whether the direction and ranking generalize.
+
 Set top-level `"accepted_exit_codes": [0, 1]` when the matrix benchmark uses exit
 code 1 for a completed measurement that missed a correctness or quality gate. The
 expanded cells retain that policy in their identities. Result parsing, binary-hash

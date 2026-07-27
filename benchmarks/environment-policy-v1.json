@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "product_environment_prefix": "CBM_",
+  "harness_owned_keys": [
+    "CBM_AUTO_INDEX",
+    "CBM_BENCHMARK_ARTIFACT_DIR",
+    "CBM_BENCHMARK_RUN_CONTEXT",
+    "CBM_CACHE_DIR",
+    "CBM_CONTEXT_INJECTION",
+    "CBM_PROFILE"
+  ]
+}

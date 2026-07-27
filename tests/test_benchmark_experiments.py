@@ -288,6 +288,9 @@ class BenchmarkExperimentTest(unittest.TestCase):
         quick = EXPERIMENT.parse_arguments([])
         full = EXPERIMENT.parse_arguments(["--full"])
         full_cli = EXPERIMENT.parse_arguments(["--full", "--transport", "cli"])
+        full_workers = EXPERIMENT.parse_arguments(
+            ["--full", "--product-env", "CBM_WORKERS=4"]
+        )
         explicit = EXPERIMENT.parse_arguments(
             ["--matrix-spec", "legacy-spec.json", "--experiment-root", "legacy-results"]
         )
@@ -297,6 +300,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
         self.assertEqual(full.preset, "full")
         self.assertEqual(full.transport, "mcp")
         self.assertEqual(full_cli.transport, "cli")
+        self.assertEqual(full_workers.product_environment, {"CBM_WORKERS": "4"})
         self.assertIn(
             "isolated OS account/runtime",
             " ".join(EXPERIMENT.build_parser().format_help().split()),
@@ -315,6 +319,21 @@ class BenchmarkExperimentTest(unittest.TestCase):
                     "--transport",
                     "cli",
                 ]
+            )
+        with self.assertRaises(SystemExit):
+            EXPERIMENT.parse_arguments(
+                [
+                    "--matrix-spec",
+                    "legacy-spec.json",
+                    "--experiment-root",
+                    "legacy-results",
+                    "--product-env",
+                    "CBM_WORKERS=4",
+                ]
+            )
+        with self.assertRaises(SystemExit):
+            EXPERIMENT.parse_arguments(
+                ["--full", "--product-env", "CBM_CACHE_DIR=/tmp/not-isolated"]
             )
 
     def test_default_candidates_use_current_upstream_stable_run_premerge_and_head(
@@ -385,6 +404,13 @@ class BenchmarkExperimentTest(unittest.TestCase):
             full_cli = EXPERIMENT.build_automatic_spec(
                 root, benchmark, candidates, preset="full", transport="cli"
             )
+            full_workers = EXPERIMENT.build_automatic_spec(
+                root,
+                benchmark,
+                candidates,
+                preset="full",
+                product_environment={"CBM_WORKERS": "4"},
+            )
 
             self.assertEqual(quick["repetitions"], 1)
             self.assertEqual(quick["index_mode"], "fast")
@@ -428,6 +454,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             self.assertEqual(full["repetitions"], 3)
             self.assertEqual(full["index_mode"], "moderate")
             self.assertEqual(full_cli["transports"], ["cli"])
+            self.assertEqual(full_workers["product_environment"], {"CBM_WORKERS": "4"})
             self.assertEqual(
                 [item["label"] for item in full["profiles"]],
                 [
