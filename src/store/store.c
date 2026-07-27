@@ -14029,12 +14029,11 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
     return CBM_STORE_OK;
 }
 
-enum { CBM_ARCH_HOTSPOT_DEFAULT_LIMIT = 25 };
-
 static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
                          cbm_architecture_info_t *out, int limit) {
     /* DF-1 Site 7: Use precomputed calls_in when available. HC-6: fallback to edge COUNT. */
-    if (limit <= 0) limit = CBM_ARCH_HOTSPOT_DEFAULT_LIMIT;
+    if (limit <= 0)
+        limit = CBM_DEFAULT_ARCH_HOTSPOT_LIMIT;
     char norm[CBM_SZ_512];
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
@@ -16906,7 +16905,7 @@ int cbm_store_get_architecture_scoped_with_options(cbm_store_t *s, const char *p
                                                    int aspect_count, cbm_architecture_info_t *out,
                                                    const cbm_architecture_options_t *options) {
     int hotspot_limit = options ? options->hotspot_limit : 0;
-    double leiden_resolution = options ? options->leiden_resolution : 1.0;
+    double leiden_resolution = options ? options->leiden_resolution : CBM_DEFAULT_ARCH_RESOLUTION;
     int cluster_node_budget =
         options ? options->cluster_node_budget : CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET;
     if (cluster_node_budget < CBM_MIN_ARCH_CLUSTER_NODE_BUDGET ||
@@ -16917,7 +16916,7 @@ int cbm_store_get_architecture_scoped_with_options(cbm_store_t *s, const char *p
      * clusters; <1 → larger. Reject NaN/non-positive (config-tunable since the
      * value flows in from CBM_CONFIG_ARCH_RESOLUTION). Default 1.0. */
     if (!(leiden_resolution > 0.0)) {
-        leiden_resolution = 1.0;
+        leiden_resolution = CBM_DEFAULT_ARCH_RESOLUTION;
     }
     memset(out, 0, sizeof(*out));
     int rc;
@@ -16948,7 +16947,7 @@ int cbm_store_get_architecture_scoped_with_options(cbm_store_t *s, const char *p
     }
     if (want_aspect(aspects, aspect_count, "hotspots")) {
         rc = arch_hotspots(s, project, path, out,
-                           hotspot_limit > 0 ? hotspot_limit : CBM_ARCH_HOTSPOT_DEFAULT_LIMIT);
+                           hotspot_limit > 0 ? hotspot_limit : CBM_DEFAULT_ARCH_HOTSPOT_LIMIT);
         if (rc != CBM_STORE_OK) {
             goto fail;
         }

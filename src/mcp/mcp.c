@@ -721,14 +721,6 @@ enum {
 #define CBM_MCP_UPDATE_CHECK_TIMEOUT_S 5
 #define CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S "update_check_timeout_s"
 
-/* Bound on the key_functions summary PUSHED in the first-response _context
- * header (closes the codebase://architecture pull-only gap). Smaller than the
- * get_architecture default (25) to keep first-response token cost modest. */
-/* Config-tunable override for the _context key_functions push bound.
- * <=0 falls back to CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT from cli.h. */
-#define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
-#define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
-
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
 
@@ -2480,7 +2472,10 @@ void cbm_mcp_server_request_stop(cbm_mcp_server_t *srv) {
 static void reap_stale_store(cbm_mcp_server_t *srv);
 
 static bool cbm_mcp_tool_mode_is_classic(cbm_mcp_server_t *srv) {
-    /* Env var keeps script/test overrides independent from the persisted config. */
+    /* The environment override keeps a directly hosted server plus scripts and
+     * tests independent from persisted config. A daemon-backed client inherits
+     * the already-running daemon's environment, so user-facing guidance points
+     * to the live persisted config path below. */
     char tool_mode_buf[CBM_SZ_64];
     const char *tool_mode = cbm_safe_getenv("CBM_TOOL_MODE", tool_mode_buf,
                                             sizeof(tool_mode_buf), NULL);
@@ -3226,7 +3221,7 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
                 "its project through the same auto-indexing path and then searches source files. "
                 "Call this tool to reveal these tools in tools/list for clients that "
                 "only allow discovered tools. "
-                "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
+                "Enable all: run codebase-memory-mcp config set tool_mode classic. "
                 "Enable one: config set tool_<name> true (e.g. tool_index_repository true). "
                 "Resources: codebase://schema (labels, edge types, Cypher examples), "
                 "codebase://architecture (key functions, graph overview), "
@@ -9971,13 +9966,15 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_architecture_info_t arch = {0};
     int arch_hotspot_limit = srv && srv->config
-        ? cbm_config_get_int(srv->config, CBM_CONFIG_ARCH_HOTSPOT_LIMIT, 0)
-        : 0;
+                                 ? cbm_config_get_int(srv->config, CBM_CONFIG_ARCH_HOTSPOT_LIMIT,
+                                                      CBM_DEFAULT_ARCH_HOTSPOT_LIMIT)
+                                 : CBM_DEFAULT_ARCH_HOTSPOT_LIMIT;
     /* Leiden resolution (gamma) — cluster granularity, tunable via config.
      * Default 1.0; >1 → smaller/more clusters, <1 → larger/fewer. */
-    double arch_leiden_resolution = srv && srv->config
-        ? cbm_config_get_double(srv->config, CBM_CONFIG_ARCH_RESOLUTION, 1.0)
-        : 1.0;
+    double arch_leiden_resolution =
+        srv && srv->config ? cbm_config_get_double(srv->config, CBM_CONFIG_ARCH_RESOLUTION,
+                                                   CBM_DEFAULT_ARCH_RESOLUTION)
+                           : CBM_DEFAULT_ARCH_RESOLUTION;
     int arch_cluster_node_budget =
         srv && srv->config ? cbm_config_get_int(srv->config, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET,
                                                 CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET)
@@ -16746,7 +16743,7 @@ static char *build_hidden_tools_payload(cbm_mcp_server_t *srv) {
     yyjson_mut_obj_add_str(doc, root, "next_step",
                            "call tools/list again; hidden tools are now advertised for this MCP server process");
     yyjson_mut_obj_add_str(doc, root, "enable_all",
-                           "set env CBM_TOOL_MODE=classic or config set tool_mode classic");
+                           "codebase-memory-mcp config set tool_mode classic");
     yyjson_mut_obj_add_str(doc, root, "enable_one",
                            "config set tool_<name> true (e.g. tool_index_repository true)");
 

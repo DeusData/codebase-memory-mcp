@@ -429,12 +429,17 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_DEFAULT_KEY_FUNCTIONS_COUNT 25
 #define CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR "25"
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
+/* Bound the key_functions preview pushed in the automatic first-response
+ * context. Non-positive values fall back to this smaller orientation default;
+ * get_architecture retains its independently configurable full preview. */
 #define CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT "context_key_functions_limit"
 #define CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT 10
 #define CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR "10"
 #define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
 #define CBM_CONFIG_QUERY_MAX_WORKING_ROWS "query_max_working_rows"
 #define CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES "query_max_output_bytes"
+#define CBM_CONFIG_ARCH_HOTSPOT_LIMIT "arch_hotspot_limit"
+#define CBM_CONFIG_ARCH_RESOLUTION "architecture_resolution"
 #define CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET "arch_cluster_node_budget"
 #define CBM_CONFIG_TOOL_MODE "tool_mode"
 #define CBM_CONFIG_TOOL_MODE_STREAMLINED "streamlined"

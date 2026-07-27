@@ -13211,6 +13211,26 @@ TEST(cli_config_registry_search_previews_use_shared_definitions) {
               CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT);
     PASS();
 }
+TEST(cli_config_registry_architecture_defaults_use_shared_definitions) {
+    const cbm_config_entry_t *hotspots = NULL;
+    const cbm_config_entry_t *resolution = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        const cbm_config_entry_t *entry = &CBM_CONFIG_REGISTRY[i];
+        if (strcmp(entry->key, CBM_CONFIG_ARCH_HOTSPOT_LIMIT) == 0) {
+            hotspots = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_ARCH_RESOLUTION) == 0) {
+            resolution = entry;
+        }
+    }
+
+    ASSERT_NOT_NULL(hotspots);
+    ASSERT_STR_EQ(hotspots->default_val, CBM_DEFAULT_ARCH_HOTSPOT_LIMIT_STR);
+    ASSERT_EQ(atoi(hotspots->default_val), CBM_DEFAULT_ARCH_HOTSPOT_LIMIT);
+    ASSERT_NOT_NULL(resolution);
+    ASSERT_STR_EQ(resolution->default_val, CBM_DEFAULT_ARCH_RESOLUTION_STR);
+    ASSERT_TRUE(atof(resolution->default_val) == CBM_DEFAULT_ARCH_RESOLUTION);
+    PASS();
+}
 TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -13879,6 +13899,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_registry_includes_query_max_rows);
     RUN_TEST(cli_config_registry_query_limits_use_shared_definitions);
     RUN_TEST(cli_config_registry_search_previews_use_shared_definitions);
+    RUN_TEST(cli_config_registry_architecture_defaults_use_shared_definitions);
     RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
     RUN_TEST(cli_config_registry_auto_index_deps_defaults_disabled);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);

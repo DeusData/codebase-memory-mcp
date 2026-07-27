@@ -101,7 +101,14 @@ enum { CBM_DEFAULT_SEARCH_LIMIT = 50 };
 #define CBM_DEFAULT_QUERY_MAX_ROWS_STR CBM_STRINGIFY(CBM_DEFAULT_QUERY_MAX_ROWS)
 #define CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR CBM_STRINGIFY(CBM_DEFAULT_QUERY_MAX_WORKING_ROWS)
 
-/* ── Architecture working budgets ───────────────────────────── */
+/* ── Architecture defaults and working budgets ──────────────── */
+/* User-visible architecture defaults are shared by config/help, MCP request
+ * handling, and the store fallback. Keep string twins for registry text. */
+#define CBM_DEFAULT_ARCH_HOTSPOT_LIMIT 25
+#define CBM_DEFAULT_ARCH_HOTSPOT_LIMIT_STR CBM_STRINGIFY(CBM_DEFAULT_ARCH_HOTSPOT_LIMIT)
+#define CBM_DEFAULT_ARCH_RESOLUTION 1.0
+#define CBM_DEFAULT_ARCH_RESOLUTION_STR "1.0"
+
 /* Leiden community detection has graph-sized runtime and memory cost. Keep a
  * conservative default until cross-parent benchmarks justify changing it, but
  * let operators select a much wider deliberate budget. Exhaustion must omit
