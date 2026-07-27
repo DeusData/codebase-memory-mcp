@@ -398,7 +398,12 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with its tools listed (a streamlined subset by default; set `CBM_TOOL_MODE=classic` for all 16).
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with
+its tools listed. The streamlined subset is the default; run
+`codebase-memory-mcp config set tool_mode classic` for all 16. Persisted
+configuration changes the live shared daemon, while a process environment
+override applies only when it is present in the daemon process that serves the
+session.
 
 </details>
 

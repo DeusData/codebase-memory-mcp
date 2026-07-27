@@ -1298,13 +1298,16 @@ TEST(null_tool_name_returns_error) {
 
 TEST(streamlined_mode_has_hidden_tools_hint) {
     /* Streamlined tool list should include _hidden_tools entry
-     * that tells the AI what tools are available and how to enable them. */
+     * that tells the AI what tools are available and how to enable them.
+     * The persisted config path changes a live shared daemon. A client-process
+     * environment override cannot replace an already-running daemon's
+     * environment, so it must not be advertised as the equivalent default. */
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "_hidden_tools"));
-    ASSERT_NOT_NULL(strstr(json, "CBM_TOOL_MODE"));
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
-    ASSERT_NOT_NULL(strstr(json, "tool_mode"));
+    ASSERT_NOT_NULL(strstr(json, "config set tool_mode classic"));
+    ASSERT_NULL(strstr(json, "set env CBM_TOOL_MODE=classic"));
     free(json);
     PASS();
 }

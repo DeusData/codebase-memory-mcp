@@ -14674,14 +14674,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Default preserves the historical 5-second bound. Set 0 for offline, hermetic, or privacy-sensitive "
      "MCP deployments where the server must not make background network requests."},
     /* ── Architecture ── */
-    {"arch_hotspot_limit", "25", NULL, "Architecture",
+    {CBM_CONFIG_ARCH_HOTSPOT_LIMIT, CBM_DEFAULT_ARCH_HOTSPOT_LIMIT_STR, NULL, "Architecture",
      "Max hotspot functions shown in the classic get_architecture tool's hotspots section",
      "1-10000",
      "Hotspots are functions ranked by how many times they are directly called (calls_in count). "
      "They identify the most-invoked code — good candidates for optimization and risk assessment. "
      "25 is enough for orientation; raise to 100 for exhaustive call-density analysis. "
      "Only applies to the classic 'get_architecture' tool (tool_mode=classic)."},
-    {"architecture_resolution", "1.0", NULL, "Architecture",
+    {CBM_CONFIG_ARCH_RESOLUTION, CBM_DEFAULT_ARCH_RESOLUTION_STR, NULL, "Architecture",
      "Leiden community-detection resolution for architecture clusters",
      "0.0001-10.0",
      "1.0 is the standard Leiden default. Higher (2.0-5.0) splits code into more, finer-grained "
