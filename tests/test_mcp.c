@@ -9994,6 +9994,18 @@ static bool response_has_structured_content(const char *response) {
     return found;
 }
 
+static bool response_text_field_contains(const char *response, const char *field,
+                                         const char *needle) {
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *value = root ? yyjson_obj_get(root, field) : NULL;
+    bool found = value && yyjson_is_str(value) && strstr(yyjson_get_str(value), needle) != NULL;
+    yyjson_doc_free(doc);
+    free(inner);
+    return found;
+}
+
 TEST(first_search_reports_automatic_index_block_reason) {
     char repo[CBM_SZ_256];
     char cache[CBM_SZ_256];
@@ -10005,6 +10017,16 @@ TEST(first_search_reports_automatic_index_block_reason) {
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* Keep one unrelated readable project in the cache. Recovery metadata
+     * must not disappear merely because build_project_list_error_srv() can
+     * also offer an indexed-project alternative. */
+    char decoy_db_path[CBM_SZ_512];
+    snprintf(decoy_db_path, sizeof(decoy_db_path), "%s/decoy.db", cache);
+    cbm_store_t *decoy_store = cbm_store_open_path(decoy_db_path);
+    ASSERT_NOT_NULL(decoy_store);
+    ASSERT_EQ(cbm_store_upsert_project(decoy_store, "decoy-indexed-project", cache), CBM_STORE_OK);
+    cbm_store_close(decoy_store);
 
     char source_path[CBM_SZ_512];
     snprintf(source_path, sizeof(source_path), "%s/blocked.py", repo);
@@ -10030,6 +10052,7 @@ TEST(first_search_reports_automatic_index_block_reason) {
     char *response = request_missing_index_with_mode(config, 65, false);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_TRUE(response_text_field_contains(response, "action_required", "auto_index=false"));
     ASSERT_NOT_NULL(strstr(response, "auto_index=false"));
     ASSERT_NOT_NULL(strstr(response, "_hidden_tools"));
     ASSERT_NOT_NULL(strstr(response, "tools/list"));
@@ -10043,6 +10066,7 @@ TEST(first_search_reports_automatic_index_block_reason) {
     response = request_missing_index_with_mode(config, 67, false);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_TRUE(response_text_field_contains(response, "action_required", "auto_index_limit=1"));
     ASSERT_NOT_NULL(strstr(response, "auto_index_limit"));
     /* The bounded counter reports the first rejected cardinality, not the
      * saturated configured limit. This also proves the MCP resolve path uses
@@ -10061,6 +10085,7 @@ TEST(first_search_reports_automatic_index_block_reason) {
     response = request_missing_index_with_mode(config, 69, false);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_TRUE(response_text_field_contains(response, "action_required", "call index_repository"));
     ASSERT_NOT_NULL(strstr(response, "call index_repository"));
     ASSERT_NOT_NULL(strstr(response, "repo_path"));
     ASSERT_NULL(strstr(response, "_hidden_tools"));
@@ -10070,6 +10095,7 @@ TEST(first_search_reports_automatic_index_block_reason) {
     response = request_missing_index_with_mode(config, 71, true);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_TRUE(response_text_field_contains(response, "action_required", "call index_repository"));
     ASSERT_NOT_NULL(strstr(response, "call index_repository"));
     ASSERT_NOT_NULL(strstr(response, "repo_path"));
     ASSERT_NULL(strstr(response, "_hidden_tools"));
