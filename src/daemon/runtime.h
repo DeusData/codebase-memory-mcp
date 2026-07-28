@@ -254,6 +254,8 @@ bool cbm_daemon_runtime_request_activation_shutdown(
     cbm_daemon_runtime_activation_action_t action, uint32_t timeout_ms,
     cbm_daemon_runtime_activation_result_t *result_out);
 
+#define CBM_DAEMON_SEMVER_SIZE 12U
+
 typedef struct {
     bool permanent;
     bool stopping;
@@ -262,7 +264,7 @@ typedef struct {
     uint8_t client_count; /* entries in client_pids, capped at the wire limit */
     uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    char semantic_version[12];
+    char semantic_version[CBM_DAEMON_SEMVER_SIZE];
 } cbm_daemon_runtime_status_t;
 
 typedef struct {

@@ -16,6 +16,7 @@
 
 #define CBM_WINDOWS_CURRENT_V1_SIZE 128U
 #define CBM_WINDOWS_RELEASE_DESCRIPTOR_V1_SIZE 128U
+#define CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN 65U
 #ifndef CBM_WINDOWS_LAUNCHER_ABI_CURRENT
 #define CBM_WINDOWS_LAUNCHER_ABI_CURRENT 1U
 #endif
@@ -37,7 +38,7 @@ typedef struct {
     uint32_t launcher_abi_min;
     uint32_t launcher_abi_max;
     uint64_t payload_size;
-    char payload_sha256[65];
+    char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN];
 } cbm_windows_current_v1_t;
 
 typedef struct {
@@ -45,7 +46,7 @@ typedef struct {
     uint32_t payload_launcher_abi_min;
     uint32_t payload_launcher_abi_max;
     uint64_t payload_size;
-    char payload_sha256[65];
+    char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN];
 } cbm_windows_release_descriptor_v1_t;
 
 typedef enum {
@@ -77,17 +78,19 @@ cbm_windows_transition_plan_t cbm_windows_transition_plan(
 /* Resolve the immutable generation pair using the canonical launcher's
  * directory.  A managed generation contains exactly these two executables:
  * the payload and the launcher's hard-link backing. */
-bool cbm_windows_generation_payload_path(const wchar_t *canonical_launcher_path,
-                                         const char payload_sha256[65], wchar_t *path_out,
-                                         size_t path_capacity);
-bool cbm_windows_generation_launcher_path(const wchar_t *canonical_launcher_path,
-                                          const char payload_sha256[65], wchar_t *path_out,
-                                          size_t path_capacity);
+bool cbm_windows_generation_payload_path(
+    const wchar_t *canonical_launcher_path,
+    const char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN], wchar_t *path_out,
+    size_t path_capacity);
+bool cbm_windows_generation_launcher_path(
+    const wchar_t *canonical_launcher_path,
+    const char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN], wchar_t *path_out,
+    size_t path_capacity);
 /* Derive the race-free retired state sibling shared by the uninstall payload
  * (its own PID) and supervising launcher (the authenticated child PID). */
 bool cbm_windows_retired_state_path(const wchar_t *canonical_launcher_path,
-                                    const char payload_sha256[65], uint32_t payload_pid,
-                                    wchar_t *path_out, size_t path_capacity);
+                                    const char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN],
+                                    uint32_t payload_pid, wchar_t *path_out, size_t path_capacity);
 
 /* Match main's top-level dispatch.  Tokens after a mode selector (cli,
  * install, config, hook-augment, help/version) are opaque user input. */
@@ -104,7 +107,7 @@ typedef struct {
     bool private_activation;
     cbm_windows_launcher_action_t action;
     uint64_t payload_size;
-    char expected_payload_sha256[65];
+    char expected_payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN];
     wchar_t canonical_launcher_path[CBM_WINDOWS_LAUNCHER_PATH_CAP];
     /* Opaque one-shot authority retained only until startup validation has
      * completed.  Callers must use context_complete, never inspect it. */
@@ -144,13 +147,13 @@ bool cbm_windows_launcher_replace_atomic(const wchar_t *target_path, const wchar
 bool cbm_windows_launcher_remove_posix(const wchar_t *target_path, char *error, size_t error_size);
 /* Retire .cbm to its generation/PID-qualified sibling, then unlink canonical
  * as the final uninstall commit.  A failed unlink restores .cbm. */
-bool cbm_windows_launcher_uninstall_commit(const wchar_t *canonical_launcher_path,
-                                           const char payload_sha256[65], char *error,
-                                           size_t error_size);
-bool cbm_windows_generation_rollback_if_unreferenced(const wchar_t *canonical_launcher_path,
-                                                     const char payload_sha256[65],
-                                                     bool created_by_activation, char *error,
-                                                     size_t error_size);
+bool cbm_windows_launcher_uninstall_commit(
+    const wchar_t *canonical_launcher_path,
+    const char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN], char *error, size_t error_size);
+bool cbm_windows_generation_rollback_if_unreferenced(
+    const wchar_t *canonical_launcher_path,
+    const char payload_sha256[CBM_WINDOWS_PAYLOAD_SHA256_BUF_LEN], bool created_by_activation,
+    char *error, size_t error_size);
 bool cbm_windows_generations_prune(const wchar_t *canonical_launcher_path, size_t *removed_out,
                                    char *error, size_t error_size);
 
