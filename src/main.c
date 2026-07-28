@@ -1192,6 +1192,15 @@ static bool main_local_cli_feedback_enabled(int argc, char **argv) {
     return cbm_cli_progress_enabled(requested, cli_isatty(2) != 0);
 }
 
+static FILE *main_local_cli_prepare_feedback(int argc, char **argv) {
+    FILE *feedback = main_local_cli_feedback_enabled(argc, argv) ? stderr : NULL;
+    if (feedback) {
+        (void)fputs("Preparing one-shot local CBM command...\n", feedback);
+        (void)fflush(feedback);
+    }
+    return feedback;
+}
+
 static int main_local_transition_acquire(const cbm_daemon_ipc_endpoint_t *endpoint, FILE *feedback,
                                          cbm_daemon_ipc_local_transition_t **transition_out) {
     uint64_t deadline = main_deadline_after(MAIN_STARTUP_TIMEOUT_MS);
@@ -1429,15 +1438,19 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
     char *result = NULL;
     uint8_t *response = NULL;
     uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t application_status =
+        CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
     bool context_ok =
         main_session_context(NULL, session_root, allowed_root, &allowed_root_ptr) &&
         main_set_client_context(bootstrap.client, session_root, CBM_MCP_TOOL_PROFILE_ALL, NULL,
                                 NULL, MAIN_CONNECT_TIMEOUT_MS);
-    if (context_ok &&
-        cbm_daemon_application_client_tool(bootstrap.client, tool_name, args_json, &response,
-                                           &response_length, MAIN_REQUEST_TIMEOUT_MS) ==
-            CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-        response && response_length > 0) {
+    if (context_ok) {
+        application_status =
+            cbm_daemon_application_client_tool(bootstrap.client, tool_name, args_json, &response,
+                                               &response_length, MAIN_REQUEST_TIMEOUT_MS);
+    }
+    if (application_status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response &&
+        response_length > 0) {
         result = malloc((size_t)response_length + 1U);
         if (result) {
             memcpy(result, response, response_length);
@@ -1446,7 +1459,18 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
     }
     free(response);
     if (!result) {
-        (void)fprintf(stderr, "error: daemon-backed CLI execution failed\n");
+        if (application_status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
+            (void)fprintf(stderr, "codebase-memory-mcp: active CLI command is stopping for "
+                                  "install/update/uninstall\n");
+        } else if (application_status == CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR ||
+                   application_status == CBM_DAEMON_RUNTIME_APPLICATION_UNAVAILABLE) {
+            (void)fprintf(stderr,
+                          "error: the daemon connection closed while this CLI request was active; "
+                          "install/update/uninstall may be stopping CBM. Retry after activation "
+                          "completes.\n");
+        } else {
+            (void)fprintf(stderr, "error: daemon-backed CLI execution failed\n");
+        }
     }
     (void)cbm_daemon_runtime_client_close(bootstrap.client, MAIN_CLOSE_TIMEOUT_MS);
     return result;
@@ -1869,13 +1893,21 @@ int main(int argc, char **argv) {
         return result >= 0 ? result : EXIT_FAILURE;
     }
 
+    if (role == CBM_DAEMON_PROCESS_DAEMON_CLI) {
+        /* Ordinary tool calls are daemon clients. Do not wrap them in the
+         * legacy process-wide local-transition guard: the daemon already
+         * provides exact-build admission, request cancellation, and
+         * per-project mutation leases. Keeping the outer guard would
+         * serialize independent CLI requests before they reached those
+         * finer-grained controls, adding O(sum request latency) wall time
+         * without reducing memory or strengthening ownership. */
+        (void)main_local_cli_prepare_feedback(argc, argv);
+        int result = handle_subcommand(argc, argv, NULL, NULL);
+        return result >= 0 ? result : EXIT_FAILURE;
+    }
+
     if (role == CBM_DAEMON_PROCESS_LOCAL_CLI) {
-        bool feedback_enabled = main_local_cli_feedback_enabled(argc, argv);
-        FILE *feedback = feedback_enabled ? stderr : NULL;
-        if (feedback) {
-            (void)fputs("Preparing one-shot local CBM command...\n", feedback);
-            (void)fflush(feedback);
-        }
+        FILE *feedback = main_local_cli_prepare_feedback(argc, argv);
         cbm_daemon_ipc_endpoint_t *local_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
         char local_executable[MAIN_PATH_CAP];
         cbm_daemon_build_identity_t local_identity;
