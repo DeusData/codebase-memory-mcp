@@ -79,7 +79,11 @@ uv run python benchmarks/run_container_experiment.py \
 ```
 
 CPU, memory, and worker budgets are required rather than guessed. Candidate builds
-and the repository-relative `.worktrees/benchmark-candidates` default, caches,
+use the complete declared CPU budget by default (`--cpus 16` runs `make -j16`);
+fractional CPU budgets round up to avoid leaving an available execution slot idle.
+Use `--build-jobs N` only when build-memory pressure requires a smaller positive
+override. The resolved value is part of the run identity and environment manifest.
+The repository-relative `.worktrees/benchmark-candidates` default, build outputs, caches,
 daemon state, and result generation remain on two labeled Docker volumes; the
 coordinator prints their exact names and retains them for auditable resume. Rerun
 the same source spec and experiment root to resume, or remove the printed volumes

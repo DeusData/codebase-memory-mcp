@@ -342,7 +342,10 @@ The coordinator is intentionally smaller than the benchmark engine:
    `"build_environment": {"CC": "gcc", "CXX": "g++"}`. Resolved candidate
    records retain the actual C/C++ compiler identities and flags.
 3. It requires explicit CPU, memory, and worker budgets. Workers may not exceed the
-   container CPU budget.
+   container CPU budget. Candidate builds default to the complete declared CPU
+   capacity (`--cpus 16` selects `make -j16`); fractional budgets round up.
+   `--build-jobs N` provides an explicit positive override for memory-constrained
+   builds, and the resolved value is recorded in the run identity and manifest.
 4. It copies the bundle and optional matrix spec into labeled Docker volumes.
    The cloned repository retains the experiment runner's normal
    `<repo>/.worktrees/benchmark-candidates` default. Candidate builds, fixture data,
