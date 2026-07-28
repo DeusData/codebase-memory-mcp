@@ -4740,7 +4740,7 @@ TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
         cbm_mcp_handle_tool(srv, "check_index_coverage",
                             "{\"project\":\"test-project\","
                             "\"paths\":[\"main.go\",\"generated/pkg/a.c\",\"../escape.c\"],"
-                            "\"scopes\":[\".\"]}");
+                            "\"scopes\":[\"src\",\"generated\"]}");
     ASSERT_NOT_NULL(coverage);
     char *inner = extract_text_content(coverage);
     ASSERT_NOT_NULL(inner);
@@ -4754,6 +4754,8 @@ TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
     ASSERT_NOT_NULL(strstr(inner, "outside_project"));
     ASSERT_NOT_NULL(strstr(inner, "src/skip.c"));
     ASSERT_NOT_NULL(strstr(inner, "file exceeds cap"));
+    ASSERT_NOT_NULL(strstr(inner, "\"requested_scope\":\"src\",\"scope\":\"src\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"requested_scope\":\"generated\",\"scope\":\"generated\""));
     ASSERT_NOT_NULL(strstr(inner, "best_effort"));
 
     free(inner);
