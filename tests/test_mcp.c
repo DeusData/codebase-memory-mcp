@@ -47,6 +47,8 @@
 extern char **environ;
 #endif
 
+enum { MCP_REQUEST_TEST_TIMEOUT_SECONDS = 5 };
+
 static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
     yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
@@ -10422,7 +10424,139 @@ TEST(server_handle_unknown_tool_preserves_string_id) {
     PASS();
 }
 
-TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context) {
+typedef struct {
+    cbm_mcp_server_t *server;
+    atomic_int done;
+    char *response;
+} mcp_startup_search_request_t;
+
+static void *mcp_startup_search_request(void *opaque) {
+    mcp_startup_search_request_t *request = opaque;
+    request->response = cbm_mcp_server_handle(
+        request->server,
+        "{\"jsonrpc\":\"2.0\",\"id\":59,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+        "\"name_pattern\":\"deferred_first_response_target\",\"format\":\"json\"}}}");
+    atomic_store_explicit(&request->done, 1, memory_order_release);
+    return NULL;
+}
+
+TEST(first_graph_call_reports_retryable_startup_index_without_consuming_ready_context) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "%s/cbm-first-retry-repo-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-first-retry-cache-XXXXXX", cbm_tmpdir());
+    bool repo_created = cbm_mkdtemp(repo) != NULL;
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    if (cache_created) {
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    }
+
+    char source_path[CBM_SZ_512];
+    snprintf(source_path, sizeof(source_path), "%s/deferred_first.py", repo);
+    FILE *source = repo_created ? fopen(source_path, "w") : NULL;
+    if (source) {
+        fputs("def deferred_first_response_target():\n    return 42\n", source);
+        fclose(source);
+    }
+
+    char old_cwd[CBM_SZ_1K];
+    bool cwd_saved = cbm_getcwd(old_cwd, sizeof(old_cwd)) != NULL;
+    bool cwd_changed = cwd_saved && repo_created && cbm_chdir(repo) == 0;
+    cbm_config_t *config = cache_created ? cbm_config_open(cache) : NULL;
+    if (config) {
+        (void)cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true");
+        (void)cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false");
+    }
+    cbm_mcp_server_t *srv = config && cwd_changed ? cbm_mcp_server_new(NULL) : NULL;
+    if (srv) {
+        cbm_mcp_server_set_config(srv, config);
+    }
+
+    mcp_startup_search_request_t request = {
+        .server = srv,
+        .response = NULL,
+    };
+    atomic_init(&request.done, 0);
+    cbm_thread_t request_thread;
+    bool request_started = false;
+    char *initialize = NULL;
+
+    /* Hold the existing pipeline lock so the startup worker is provably live.
+     * The tool request must return retry metadata while this owner retains the
+     * lock; the pre-fix unbounded join cannot do so. */
+    cbm_pipeline_lock();
+    if (srv) {
+        initialize = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":58,\"method\":\"initialize\",\"params\":{}}");
+        request_started =
+            cbm_thread_create(&request_thread, 0, mcp_startup_search_request, &request) == 0;
+    }
+    uint64_t deadline = cbm_now_ms() + MCP_REQUEST_TEST_TIMEOUT_SECONDS * CBM_MSEC_PER_SEC;
+    while (request_started && atomic_load_explicit(&request.done, memory_order_acquire) == 0 &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(CBM_USEC_PER_SEC / CBM_MSEC_PER_SEC);
+    }
+    bool returned_while_index_live =
+        request_started && atomic_load_explicit(&request.done, memory_order_acquire) != 0;
+    cbm_pipeline_unlock();
+    if (request_started) {
+        (void)cbm_thread_join(&request_thread);
+    }
+    if (srv) {
+        (void)cbm_mcp_server_join_autoindex(srv);
+    }
+
+    char *retry =
+        srv ? cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\","
+                                         "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+                                         "\"name_pattern\":\"deferred_first_response_target\","
+                                         "\"format\":\"json\"}}}")
+            : NULL;
+
+    bool retryable = request.response && strstr(request.response, "\"isError\":true") &&
+                     response_contains_json_fragment(request.response, "\"status\":\"indexing\"") &&
+                     response_contains_json_fragment(request.response, "\"retryable\":true") &&
+                     strstr(request.response, "retry this same tool call");
+    bool retry_exact_and_ready = retry && strstr(retry, "deferred_first_response_target") &&
+                                 response_contains_json_fragment(retry, "\"status\":\"ready\"") &&
+                                 response_contains_json_fragment(retry, "\"architecture\"");
+
+    free(initialize);
+    free(request.response);
+    free(retry);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    if (cwd_changed) {
+        (void)cbm_chdir(old_cwd);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    if (source) {
+        (void)cbm_unlink(source_path);
+    }
+    if (cache_created) {
+        th_rmtree(cache);
+    }
+    if (repo_created) {
+        (void)cbm_rmdir(repo);
+    }
+
+    ASSERT_TRUE(repo_created);
+    ASSERT_TRUE(cache_created);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_NOT_NULL(initialize);
+    ASSERT_TRUE(returned_while_index_live);
+    ASSERT_TRUE(retryable);
+    ASSERT_TRUE(retry_exact_and_ready);
+    PASS();
+}
+
+TEST(first_graph_call_is_ready_or_retryable_until_startup_index_publishes) {
     char repo[CBM_SZ_256];
     char cache[CBM_SZ_256];
     snprintf(repo, sizeof(repo), "/tmp/cbm-first-call-repo-XXXXXX");
@@ -10453,23 +10587,40 @@ TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context) {
     ASSERT_NOT_NULL(srv);
     cbm_mcp_server_set_config(srv, config);
 
-    /* initialize starts the background index. The immediately following
-     * graph call must join it rather than consume the one-shot context with
-     * status=auto_indexing and force the model to poll. */
+    /* initialize starts the background index. Depending on scheduling, the
+     * immediately following call either observes its publication or receives
+     * an actionable retry without consuming the one-shot ready context. */
     char *initialize = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"initialize\",\"params\":{}}");
     ASSERT_NOT_NULL(initialize);
     free(initialize);
 
-    char *response = cbm_mcp_server_handle(
+    char *first_response = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
              "\"name_pattern\":\"first_response_target\",\"format\":\"json\"}}}");
-    ASSERT_NOT_NULL(response);
-    ASSERT_NOT_NULL(strstr(response, "first_response_target"));
-    ASSERT_TRUE(response_contains_json_fragment(response, "\"status\":\"ready\""));
-    ASSERT_FALSE(response_contains_json_fragment(response, "\"status\":\"auto_indexing\""));
-    free(response);
+    ASSERT_NOT_NULL(first_response);
+    bool first_ready = strstr(first_response, "first_response_target") &&
+                       response_contains_json_fragment(first_response, "\"status\":\"ready\"");
+    bool first_retryable =
+        response_contains_json_fragment(first_response, "\"status\":\"indexing\"") &&
+        response_contains_json_fragment(first_response, "\"retryable\":true") &&
+        strstr(first_response, "retry this same tool call");
+    ASSERT_TRUE(first_ready || first_retryable);
+
+    ASSERT_EQ(cbm_mcp_server_join_autoindex(srv), 0);
+    char *published_response =
+        first_ready ? cbm_strdup(first_response)
+                    : cbm_mcp_server_handle(
+                          srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+                               "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+                               "\"name_pattern\":\"first_response_target\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(published_response);
+    ASSERT_NOT_NULL(strstr(published_response, "first_response_target"));
+    ASSERT_TRUE(response_contains_json_fragment(published_response, "\"status\":\"ready\""));
+    ASSERT_TRUE(response_contains_json_fragment(published_response, "\"architecture\""));
+    free(first_response);
+    free(published_response);
 
     cbm_mcp_server_free(srv);
     cbm_config_close(config);
@@ -10482,7 +10633,7 @@ TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context) {
     PASS();
 }
 
-TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_indexed) {
+TEST(first_search_code_call_is_ready_or_retryable_until_startup_index_publishes) {
     char repo[CBM_SZ_256];
     char cache[CBM_SZ_256];
     snprintf(repo, sizeof(repo), "/tmp/cbm-first-source-call-repo-XXXXXX");
@@ -10518,14 +10669,31 @@ TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_ind
     ASSERT_NOT_NULL(initialize);
     free(initialize);
 
-    char *response = cbm_mcp_server_handle(
+    char *first_response = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_code\",\"arguments\":{"
              "\"pattern\":\"first_source_response_target\",\"format\":\"json\"}}}");
-    ASSERT_NOT_NULL(response);
-    ASSERT_NULL(strstr(response, "project not found or not indexed"));
-    ASSERT_NOT_NULL(strstr(response, "first_source_response_target"));
-    free(response);
+    ASSERT_NOT_NULL(first_response);
+    bool first_ready = strstr(first_response, "first_source_response_target") != NULL;
+    bool first_retryable =
+        response_contains_json_fragment(first_response, "\"status\":\"indexing\"") &&
+        response_contains_json_fragment(first_response, "\"retryable\":true") &&
+        strstr(first_response, "retry this same tool call");
+    ASSERT_TRUE(first_ready || first_retryable);
+    ASSERT_NULL(strstr(first_response, "project not found or not indexed"));
+
+    ASSERT_EQ(cbm_mcp_server_join_autoindex(srv), 0);
+    char *published_response =
+        first_ready
+            ? cbm_strdup(first_response)
+            : cbm_mcp_server_handle(
+                  srv, "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                       "\"pattern\":\"first_source_response_target\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(published_response);
+    ASSERT_NOT_NULL(strstr(published_response, "first_source_response_target"));
+    free(first_response);
+    free(published_response);
 
     cbm_mcp_server_free(srv);
     cbm_config_close(config);
@@ -10718,8 +10886,6 @@ TEST(first_search_reports_automatic_index_block_reason) {
 /* ══════════════════════════════════════════════════════════════════
  *  POLL/GETLINE FILE* BUFFERING FIX
  * ══════════════════════════════════════════════════════════════════ */
-
-enum { MCP_REQUEST_TEST_TIMEOUT_SECONDS = 5 };
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -16836,8 +17002,9 @@ SUITE(mcp) {
     RUN_TEST(server_handle_tools_call_missing_name);
     RUN_TEST(server_handle_tools_call_rejects_non_object_arguments);
     RUN_TEST(server_handle_unknown_tool_preserves_string_id);
-    RUN_TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context);
-    RUN_TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_indexed);
+    RUN_TEST(first_graph_call_reports_retryable_startup_index_without_consuming_ready_context);
+    RUN_TEST(first_graph_call_is_ready_or_retryable_until_startup_index_publishes);
+    RUN_TEST(first_search_code_call_is_ready_or_retryable_until_startup_index_publishes);
     RUN_TEST(first_search_reports_automatic_index_block_reason);
 
     /* Tool handlers */
