@@ -16,6 +16,7 @@
 #include "pipeline/pass_lsp_cross.h"
 #include "store/store.h"
 #include "cli/cli.h"
+#include "git/git_command.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
 #include "foundation/log.h"
@@ -17845,6 +17846,91 @@ TEST(pipeline_disabled_capabilities_skip_expensive_passes) {
     PASS();
 }
 
+TEST(pipeline_githistory_compute_overlaps_independent_postpasses) {
+    enum { PIPELINE_GITHISTORY_SYNCHRONOUS_WORKERS = 1, PIPELINE_GITHISTORY_THREADED_WORKERS = 2 };
+    pipeline_env_snapshot_t workers_env = pipeline_env_save("CBM_WORKERS");
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create Git-history overlap repo");
+    }
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.invalid", NULL};
+    const char *const name_args[] = {"config", "user.name", "CBM Test", NULL};
+    const char *const add_args[] = {"add", "main.go", "pkg/service.go", NULL};
+    const char *const initial_commit_args[] = {"commit", "-q", "-m", "initial", NULL};
+    const char *const changed_commit_args[] = {"commit", "-q", "-m", "changed", NULL};
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, init_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, email_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, name_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, initial_commit_args), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"changed\") }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "pkg/service.go"),
+                            "package pkg\n\nfunc Serve() { println(\"changed\") }\n"),
+              0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, changed_commit_args), 0);
+    /* Meet the production evidence floor so both schedules publish an edge. */
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"changed again\") }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "pkg/service.go"),
+                            "package pkg\n\nfunc Serve() { println(\"changed again\") }\n"),
+              0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, changed_commit_args), 0);
+
+    char synchronous_db[CBM_PATH_MAX];
+    char threaded_db[CBM_PATH_MAX];
+    int n =
+        snprintf(synchronous_db, sizeof(synchronous_db), "%s/githistory-synchronous.db", g_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(synchronous_db));
+    n = snprintf(threaded_db, sizeof(threaded_db), "%s/githistory-threaded.db", g_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(threaded_db));
+
+    char *project = NULL;
+    int synchronous_rc = pipeline_run_with_worker_count(
+        g_tmpdir, synchronous_db, PIPELINE_GITHISTORY_SYNCHRONOUS_WORKERS, &project);
+    pipeline_capture_logs_start();
+    int threaded_rc = pipeline_run_with_worker_count(g_tmpdir, threaded_db,
+                                                     PIPELINE_GITHISTORY_THREADED_WORKERS, NULL);
+    const char *logs = pipeline_capture_logs_end();
+    const char *history_start = strstr(logs, "msg=pass.start pass=githistory execution=threaded");
+    const char *http_done = strstr(logs, "msg=pass.timing pass=httplinks");
+    const char *history_done = strstr(logs, "msg=pass.done pass=githistory");
+    bool scheduling_order_is_valid = history_start && http_done && history_done &&
+                                     history_start < http_done && http_done < history_done;
+
+    pipeline_env_restore(&workers_env);
+    ASSERT_EQ(synchronous_rc, 0);
+    ASSERT_EQ(threaded_rc, 0);
+    ASSERT_NOT_NULL(project);
+    ASSERT_TRUE(scheduling_order_is_valid);
+
+    char *main_qn = cbm_pipeline_fqn_compute(project, "main.go", "__file__");
+    char *service_qn = cbm_pipeline_fqn_compute(project, "pkg/service.go", "__file__");
+    ASSERT_NOT_NULL(main_qn);
+    ASSERT_NOT_NULL(service_qn);
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(synchronous_db, project, main_qn,
+                                                    "FILE_CHANGES_WITH", service_qn));
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(threaded_db, project, main_qn,
+                                                    "FILE_CHANGES_WITH", service_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = cbm_test_compare_canonical_graphs(synchronous_db, threaded_db, project, diff_err,
+                                                    sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [githistory:scheduling-diff] %s\n", diff_err);
+    }
+    free(main_qn);
+    free(service_qn);
+    free(project);
+    teardown_test_repo();
+    ASSERT_EQ(diff_rc, 0);
+    PASS();
+}
+
 TEST(pipeline_capability_combinations_have_unique_fingerprints) {
     enum { PIPELINE_CAPABILITY_COMBINATIONS = 16 };
     char fingerprints[PIPELINE_CAPABILITY_COMBINATIONS][CBM_SZ_256];
@@ -19351,6 +19437,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
     RUN_TEST(pipeline_capability_gates_default_enabled);
     RUN_TEST(pipeline_disabled_capabilities_skip_expensive_passes);
+    RUN_TEST(pipeline_githistory_compute_overlaps_independent_postpasses);
     RUN_TEST(pipeline_capability_combinations_have_unique_fingerprints);
     RUN_TEST(pipeline_exact_delta_limits_keep_safe_defaults);
     RUN_TEST(pipeline_semantic_edges_independent_of_call_insertion_order);
