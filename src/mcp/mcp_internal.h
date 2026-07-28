@@ -30,8 +30,6 @@ bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv);
  * On success replaces and frees *response_io; on failure it is unchanged. */
 bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice);
 
-enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
-
 /* Count indexable files with the pipeline's native full-mode discovery policy,
  * without retaining per-file results. A false result means the count exceeded
  * file_limit or could not be established before the bounded deadline; every

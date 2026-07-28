@@ -1924,7 +1924,10 @@ static bool app_wait_for_update_notice(const cbm_daemon_runtime_application_call
  * one physical worker but retain one subscription per live session. */
 TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     app_env_backup_t cache_environment;
+    app_env_backup_t auto_index_environment;
     bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool auto_index_saved = app_env_backup_capture(&auto_index_environment, "CBM_AUTO_INDEX");
+    bool auto_index_unset = auto_index_saved && cbm_unsetenv("CBM_AUTO_INDEX") == 0;
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, false);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -1933,11 +1936,14 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     (void)snprintf(root, sizeof(root), "%s/cbm-app-auto-index-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-index-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool cache_set =
+        dirs_ok && cache_saved && auto_index_unset && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
-    bool config_ready = stored_config &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    /* Leave auto_index unset in both the stored and environment layers:
+     * daemon session-start admission must use the registry's true default,
+     * exactly like synchronous first-use indexing. */
+    bool config_ready =
+        stored_config && cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -2032,8 +2038,11 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     (void)th_rmtree(root);
     (void)th_rmtree(cache);
     bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool auto_index_restored = app_env_backup_restore(&auto_index_environment);
 
     ASSERT_TRUE(cache_saved);
+    ASSERT_TRUE(auto_index_saved);
+    ASSERT_TRUE(auto_index_unset);
     ASSERT_TRUE(dirs_ok);
     ASSERT_TRUE(cache_set);
     ASSERT_TRUE(config_ready);
@@ -2054,6 +2063,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_EQ(atomic_load(&update.destroys), 1);
     ASSERT_TRUE(stopped);
     ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(auto_index_restored);
     PASS();
 }
 
