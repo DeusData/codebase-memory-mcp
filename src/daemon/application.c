@@ -2037,12 +2037,16 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
      * terminal state. */
     (void)application_update_reap(application, false, 0);
     bool db_exists = application_regular_db_exists(project);
-    bool auto_index = application->config &&
-                      cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_INDEX, false);
-    int auto_index_limit =
-        application->config ? cbm_config_get_int(application->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
-                                                 CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT)
-                            : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
+    /* Resolve the same stored/environment/default layers as synchronous MCP
+     * first use and hook augmentation. This is O(1) time and memory; keeping
+     * admission here lets the existing daemon worker overlap indexing with
+     * later requests instead of putting O(repository) work on the first graph
+     * call's latency path. */
+    bool default_auto_index = application->config != NULL;
+    bool auto_index = cbm_config_get_effective_bool(application->config, CBM_CONFIG_AUTO_INDEX,
+                                                    default_auto_index);
+    int auto_index_limit = cbm_config_get_effective_int(
+        application->config, CBM_CONFIG_AUTO_INDEX_LIMIT, CBM_DEFAULT_AUTO_INDEX_LIMIT);
     int tracked_files = -1;
     bool auto_index_candidate = auto_index && !db_exists;
     /* Configured value, so the registry's "0 = no limit, index everything"
