@@ -2220,6 +2220,9 @@ TEST(tool_search_graph_basic) {
 /* Forward declarations for helpers defined later in this file */
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
+static cbm_mcp_server_t *setup_prefilter_server(char *tmp, size_t tmp_sz, char *src_path,
+                                                size_t src_sz, char *vendor_path, size_t vendor_sz);
+static void cleanup_prefilter_dir(const char *tmp, const char *src_path, const char *vendor_path);
 static char *extract_text_content(const char *mcp_result);
 
 /* callers_total/callees_total must count what the caller can enumerate: with
@@ -5020,6 +5023,8 @@ TEST(first_response_and_status_resource_share_coverage_generation_state) {
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"coverage\":{\"status\":\"current\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status_scope\":\"published_generation\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"live_source_freshness\":\"not_evaluated\""));
     ASSERT_NOT_NULL(strstr(inner, "\"recording_status\":\"complete\""));
     ASSERT_NOT_NULL(strstr(inner, "\"generation_matches\":true"));
     ASSERT_NOT_NULL(strstr(inner, "\"hash_records_complete\":true"));
@@ -5032,6 +5037,8 @@ TEST(first_response_and_status_resource_share_coverage_generation_state) {
              "\"params\":{\"uri\":\"codebase://status\"}}");
     ASSERT_NOT_NULL(response);
     ASSERT_NOT_NULL(strstr(response, "\\\"coverage\\\":{\\\"status\\\":\\\"current\\\""));
+    ASSERT_NOT_NULL(strstr(response, "\\\"status_scope\\\":\\\"published_generation\\\""));
+    ASSERT_NOT_NULL(strstr(response, "\\\"live_source_freshness\\\":\\\"not_evaluated\\\""));
     ASSERT_NOT_NULL(strstr(response, "\\\"generation_matches\\\":true"));
     ASSERT_NOT_NULL(strstr(response, "\\\"count_read_model\\\":\\\"canonical_only\\\""));
     free(response);
@@ -5086,6 +5093,23 @@ TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed) {
     cbm_project_free_fields(&project);
     ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", 0, 0),
               CBM_STORE_OK);
+
+    /* A complete coverage recording is internally current for its published
+     * generation even when the live file has changed before watcher
+     * observation. The automatic context must scope that claim explicitly;
+     * the requested-path audit below then detects the live metadata change. */
+    char *status_response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+                            "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(status_response);
+    char *status_inner = extract_text_content(status_response);
+    ASSERT_NOT_NULL(status_inner);
+    ASSERT_NOT_NULL(strstr(status_inner, "\"coverage\":{\"status\":\"current\""));
+    ASSERT_NOT_NULL(strstr(status_inner, "\"status_scope\":\"published_generation\""));
+    ASSERT_NOT_NULL(strstr(status_inner, "\"live_source_freshness\":\"not_evaluated\""));
+    free(status_inner);
+    free(status_response);
 
     char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
                                          "{\"project\":\"test-project\",\"paths\":[\"main.go\"]}");
@@ -8031,6 +8055,42 @@ TEST(search_code_limit_zero_uses_config_default) {
     free(resp);
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_code_files_mode_names_each_summary_count_unit) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":191,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"mode\":\"files\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *files = yyjson_obj_get(root, "files");
+    ASSERT_TRUE(yyjson_is_arr(files));
+    ASSERT_EQ(yyjson_arr_size(files), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned_file_count")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total_grep_matches")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "correlated_symbol_count")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "uncorrelated_source_match_count")), 0);
+    /* Backward-compatible counters retain their existing values. */
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total_results")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "raw_match_count")), 0);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -17132,6 +17192,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches);
     RUN_TEST(search_code_uses_overlay_active_nodes_for_graph_annotations);
     RUN_TEST(search_code_limit_zero_uses_config_default);
+    RUN_TEST(search_code_files_mode_names_each_summary_count_unit);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
