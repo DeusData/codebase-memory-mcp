@@ -14331,6 +14331,17 @@ static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name) {
  * substantially narrower and churns unrelated entries. */
 // clang-format off
 const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
+    /* ── Runtime security ── */
+    {CBM_CONFIG_BUILD_FINGERPRINT_MODE, CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT,
+     "CBM_BUILD_FINGERPRINT_MODE", "Runtime",
+     "Exact executable fingerprint verification cost policy",
+     CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT "|"
+     CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH,
+     "'cached_exact' (default) reuses a checksummed SHA-256 only while the kernel-bound native "
+     "file identity and strong change metadata remain unchanged; any ambiguity falls back to an "
+     "exact full-image hash. 'always_rehash' hashes the full process image at every process "
+     "startup. Installer/update candidates and Windows launcher payloads always use full exact "
+     "hashes regardless of this setting."},
     /* ── Indexing ── */
     {"auto_index", "true", "CBM_AUTO_INDEX", "Indexing",
      "Auto-index the MCP server CWD or explicit repo paths on startup/first use",

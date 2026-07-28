@@ -1041,6 +1041,7 @@ typedef enum {
     MAIN_BUILD_IDENTITY_CACHE_CANONICALIZE,
     MAIN_BUILD_IDENTITY_CACHE_PRIVATE,
     MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT,
+    MAIN_BUILD_IDENTITY_FINGERPRINT_CONFIG,
 } main_build_identity_status_t;
 
 static const char *main_build_identity_status_name(main_build_identity_status_t status) {
@@ -1059,20 +1060,23 @@ static const char *main_build_identity_status_name(main_build_identity_status_t 
         return "cache-private";
     case MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT:
         return "cache-environment";
+    case MAIN_BUILD_IDENTITY_FINGERPRINT_CONFIG:
+        return "build-fingerprint-mode";
     }
     return "identity-unknown";
+}
+
+static const char *main_build_identity_status_guidance(main_build_identity_status_t status) {
+    return status == MAIN_BUILD_IDENTITY_FINGERPRINT_CONFIG
+               ? "; build_fingerprint_mode must be cached_exact or always_rehash; run "
+                 "`codebase-memory-mcp config reset build_fingerprint_mode` or correct "
+                 "CBM_BUILD_FINGERPRINT_MODE"
+               : "";
 }
 
 static main_build_identity_status_t main_build_identity(cbm_daemon_build_identity_t *identity) {
     if (!identity) {
         return MAIN_BUILD_IDENTITY_INVALID_OUTPUT;
-    }
-    if (!cbm_index_supervisor_capture_build_fingerprint()) {
-        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
-    }
-    const char *fingerprint = cbm_index_supervisor_build_fingerprint();
-    if (!fingerprint) {
-        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
     }
     const char *cache = cbm_resolve_cache_dir();
     char canonical_cache[MAIN_PATH_CAP];
@@ -1108,6 +1112,43 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * while the process still advertises the old canonical root. */
     if (cbm_setenv("CBM_CACHE_DIR", canonical_cache, 1) != 0) {
         return MAIN_BUILD_IDENTITY_CACHE_ENVIRONMENT;
+    }
+    /* Read policy without creating or migrating config state before exact-build
+     * admission. The persisted cache never substitutes a weaker identity: both
+     * modes produce the same SHA-256, while cached_exact reduces unchanged
+     * startup work from O(executable bytes) to O(1) metadata and record I/O. */
+    cbm_config_t *config = cbm_config_open_readonly(canonical_cache);
+    const char *fingerprint_mode =
+        cbm_config_get_effective(config, CBM_CONFIG_BUILD_FINGERPRINT_MODE,
+                                 CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT);
+    bool cached_exact =
+        fingerprint_mode &&
+        strcmp(fingerprint_mode, CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT) == 0;
+    bool always_rehash =
+        fingerprint_mode &&
+        strcmp(fingerprint_mode, CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH) == 0;
+    cbm_config_close(config);
+    if (!cached_exact && !always_rehash) {
+        return MAIN_BUILD_IDENTITY_FINGERPRINT_CONFIG;
+    }
+
+    char fingerprint_cache_path[MAIN_PATH_CAP];
+    int fingerprint_cache_written =
+        snprintf(fingerprint_cache_path, sizeof(fingerprint_cache_path), "%s/%s", canonical_cache,
+                 CBM_DAEMON_BUILD_FINGERPRINT_CACHE_BASENAME);
+    bool cache_path_ready =
+        fingerprint_cache_written > 0 &&
+        fingerprint_cache_written < (int)sizeof(fingerprint_cache_path);
+    bool fingerprint_ready =
+        cached_exact && cache_path_ready
+            ? cbm_index_supervisor_capture_build_fingerprint_cached(fingerprint_cache_path, true)
+            : cbm_index_supervisor_capture_build_fingerprint();
+    if (!fingerprint_ready) {
+        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
+    }
+    const char *fingerprint = cbm_index_supervisor_build_fingerprint();
+    if (!fingerprint) {
+        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
     }
     cbm_sha256_hex(canonical_cache, strlen(canonical_cache), cache_fingerprint);
     *identity = (cbm_daemon_build_identity_t){
@@ -1854,8 +1895,9 @@ int main(int argc, char **argv) {
         }
         if (coordination_failure) {
             (void)fprintf(
-                stderr, "codebase-memory-mcp: secure CLI coordination could not be created (%s)\n",
-                coordination_failure);
+                stderr,
+                "codebase-memory-mcp: secure CLI coordination could not be created (%s)%s\n",
+                coordination_failure, main_build_identity_status_guidance(local_identity_status));
             goto local_cli_cleanup;
         }
         cbm_http_server_set_binary_path(local_executable);
@@ -1965,9 +2007,10 @@ int main(int argc, char **argv) {
         const char *validation_detail = cbm_daemon_ipc_validation_detail();
         (void)fprintf(stderr,
                       "codebase-memory-mcp: exact executable identity could not be verified "
-                      "(%s)%s%s\n",
+                      "(%s)%s%s%s\n",
                       main_build_identity_status_name(identity_status),
-                      validation_detail[0] ? " - " : "", validation_detail);
+                      validation_detail[0] ? " - " : "", validation_detail,
+                      main_build_identity_status_guidance(identity_status));
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     cbm_http_server_set_binary_path(executable_path);

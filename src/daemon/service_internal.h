@@ -21,6 +21,23 @@
 bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
                                               char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+/* Reuse an exact digest only when cache_path contains a complete, checksummed
+ * record for the same open file identity, size, and nanosecond change
+ * metadata. The owner-private directory containing cache_path is a caller
+ * precondition. Cache I/O or validation failures fall back to hashing the
+ * native file and never weaken the exact digest. */
+bool cbm_daemon_build_fingerprint_native_file_cached(
+    uintptr_t native_file, const char *cache_path, bool allow_cache,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Path-opening test seam for the native-file cache contract. Production
+ * process identity remains bound to a kernel process-image handle. */
+bool cbm_daemon_build_fingerprint_file_cached_for_testing(
+    const char *path, const char *cache_path, bool allow_cache,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out);
+#endif
+
 typedef enum {
     CBM_DAEMON_CONFLICT_LOG_BEFORE_SERIALIZATION_LOCK = 1,
     CBM_DAEMON_CONFLICT_LOG_AFTER_SERIALIZATION_LOCK,

@@ -13148,6 +13148,36 @@ TEST(cli_config_get_effective_env_overrides_db) {
     test_rmdir_r(tmpdir);
     PASS();
 }
+TEST(cli_config_build_fingerprint_mode_is_exact_and_configurable) {
+    const cbm_config_entry_t *entry = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_BUILD_FINGERPRINT_MODE) == 0) {
+            entry = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT);
+    ASSERT_STR_EQ(entry->env_var, "CBM_BUILD_FINGERPRINT_MODE");
+    ASSERT_STR_EQ(entry->range, "cached_exact|always_rehash");
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-fingerprint-config-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_MODE,
+                             CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH),
+              0);
+    ASSERT_STR_EQ(cbm_config_get_effective(cfg, CBM_CONFIG_BUILD_FINGERPRINT_MODE,
+                                           CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT),
+                  CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH);
+    ASSERT(cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_MODE, "metadata_only") != 0);
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
 TEST(cli_config_registry_includes_dep_ranking_toggle) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -13933,6 +13963,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_session_hooks_all_lifecycle_matchers);
     RUN_TEST(cli_upsert_gemini_hook_replaces_previous_json_guidance);
     RUN_TEST(cli_config_get_effective_env_overrides_db);
+    RUN_TEST(cli_config_build_fingerprint_mode_is_exact_and_configurable);
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_registry_includes_query_max_rows);
     RUN_TEST(cli_config_registry_query_limits_use_shared_definitions);

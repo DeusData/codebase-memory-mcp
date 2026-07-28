@@ -243,6 +243,57 @@ TEST(daemon_build_fingerprint_hashes_exact_executable_bytes) {
     PASS();
 }
 
+TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char image_path[VERSION_TEST_PATH_CAP] = {0};
+    char cache_path[VERSION_TEST_PATH_CAP] = {0};
+    char initial[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char cached[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char strict[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char changed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char recovered[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    bool cache_hit = true;
+    bool setup_ok = version_test_temp_dir(dir, "fingerprint-cache") &&
+                    version_test_child_path(image_path, dir, "build.bin") &&
+                    version_test_child_path(cache_path, dir, "fingerprint.cache") &&
+                    version_test_write_file(image_path, "same-version-build-a");
+    if (!setup_ok) {
+        version_test_cleanup(dir, image_path, cache_path, NULL);
+        FAIL("could not create fingerprint-cache fixtures");
+    }
+
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, initial, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_TRUE(version_test_is_sha256(initial));
+    ASSERT_GT(version_test_file_size(cache_path), 0);
+
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, cached, &cache_hit));
+    ASSERT_TRUE(cache_hit);
+    ASSERT_STR_EQ(initial, cached);
+
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, false, strict, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_EQ(initial, strict);
+
+    ASSERT_TRUE(version_test_write_file(image_path, "same-version-build-z"));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, changed, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_NEQ(initial, changed);
+
+    ASSERT_TRUE(version_test_write_file(cache_path, "corrupt"));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, recovered, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_EQ(changed, recovered);
+
+    version_test_cleanup(dir, image_path, cache_path, NULL);
+    PASS();
+}
+
 TEST(daemon_hello_accepts_only_the_exact_active_build_identity) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
     cbm_daemon_build_identity_t exact = version_test_identity("2.4.0", BUILD_A);
@@ -611,6 +662,7 @@ TEST(daemon_conflict_log_windows_concurrent_appends_are_not_dropped) {
 SUITE(daemon_version) {
     RUN_TEST(daemon_rendezvous_key_is_stable_and_version_independent);
     RUN_TEST(daemon_build_fingerprint_hashes_exact_executable_bytes);
+    RUN_TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);

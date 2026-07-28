@@ -86,7 +86,7 @@ size_t cbm_index_worker_memory_budget_bytes(void) {
 
 static bool worker_fingerprint_valid(const char *fingerprint);
 
-bool cbm_index_supervisor_capture_build_fingerprint(void) {
+static bool supervisor_capture_build_fingerprint(const char *cache_path, bool allow_cache) {
     if (g_build_fingerprint_capture_attempted) {
         return g_build_fingerprint[0] != '\0';
     }
@@ -109,11 +109,25 @@ bool cbm_index_supervisor_capture_build_fingerprint(void) {
     }
 #endif
     char captured[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE] = {0};
-    if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)worker_getpid(), captured)) {
+    bool captured_ok =
+        cache_path
+            ? cbm_daemon_runtime_process_build_fingerprint_cached(
+                  (uint64_t)worker_getpid(), cache_path, allow_cache, captured, NULL)
+            : cbm_daemon_runtime_process_build_fingerprint((uint64_t)worker_getpid(), captured);
+    if (!captured_ok) {
         return false;
     }
     (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", captured);
     return true;
+}
+
+bool cbm_index_supervisor_capture_build_fingerprint(void) {
+    return supervisor_capture_build_fingerprint(NULL, false);
+}
+
+bool cbm_index_supervisor_capture_build_fingerprint_cached(const char *cache_path,
+                                                           bool allow_cache) {
+    return supervisor_capture_build_fingerprint(cache_path, allow_cache);
 }
 
 const char *cbm_index_supervisor_build_fingerprint(void) {
