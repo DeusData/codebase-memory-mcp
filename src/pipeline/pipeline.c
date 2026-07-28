@@ -1302,14 +1302,26 @@ typedef struct {
     cbm_githistory_result_t *result;
     double min_coupling_score;
     int max_couplings;
+    struct timespec started_at;
+    int elapsed_ms;
 } gh_compute_arg_t;
 
 static void *gh_compute_thread_fn(void *arg) {
     gh_compute_arg_t *a = arg;
     cbm_pipeline_githistory_compute_with_limits(a->repo_path, a->result, a->min_coupling_score,
                                                 a->max_couplings);
+    a->elapsed_ms = (int)elapsed_ms(a->started_at);
     return NULL;
 }
+
+typedef struct {
+    cbm_githistory_result_t result;
+    gh_compute_arg_t arg;
+    cbm_thread_t thread;
+    struct timespec started_at;
+    bool active;
+    bool threaded;
+} gh_compute_task_t;
 
 /* Extract Route nodes from URL strings found in config files (YAML, HCL, TOML).
  * These are infrastructure-defined endpoints (Cloud Scheduler, Terraform). */
@@ -2279,77 +2291,106 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
 /* mtime conversion is shared with incremental and exact-delta metadata so
  * file_hash classification cannot drift by platform path. */
 
-/* Run githistory pass. */
-static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+static void githistory_task_release(gh_compute_task_t *task) {
+    if (!task || !task->active) {
+        return;
+    }
+    if (task->threaded) {
+        int join_rc = cbm_thread_join(&task->thread);
+        if (join_rc != 0) {
+            cbm_log_error("pipeline.err", "phase", "githistory_join", "rc", itoa_buf(join_rc));
+            return;
+        }
+        task->threaded = false;
+    }
+    cbm_change_coupling_paths_free(task->result.couplings, task->result.count);
+    free(task->result.couplings);
+    cbm_file_temporal_free(task->result.file_temporal, task->result.file_temporal_count);
+    memset(task, 0, sizeof(*task));
+}
+
+/* Begin the read-only Git-history scan before independent post-passes. The
+ * scan is O(commits + changed paths + retained couplings), and overlapping it
+ * does not increase its asymptotic memory bound. Graph mutation remains on the
+ * pipeline thread in githistory_task_finish(), after the worker is joined. */
+static int githistory_task_start(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                 gh_compute_task_t *task) {
+    if (!task) {
+        return CBM_NOT_FOUND;
+    }
+    memset(task, 0, sizeof(*task));
     if (!p->githistory_enabled) {
         cbm_log_info("pass.skip", "pass", "githistory", "reason", "disabled");
         cbm_log_info("pass.done", "pass", "githistory", "commits", "0", "edges", "0");
         return 0;
     }
-    struct timespec t_gh;
-    cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
+    if (p->mode == CBM_MODE_FAST) {
+        cbm_log_info("pass.skip", "pass", "githistory", "reason", "fast_mode");
+        cbm_log_info("pass.done", "pass", "githistory", "commits", "0", "edges", "0");
+        return 0;
+    }
 
-    cbm_githistory_result_t gh_result = {0};
-    cbm_thread_t gh_thread;
-    bool gh_threaded = false;
-    gh_compute_arg_t gh_arg = {
+    task->active = true;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &task->started_at);
+    task->arg = (gh_compute_arg_t){
         .repo_path = ctx->repo_path,
-        .result = &gh_result,
+        .result = &task->result,
         .min_coupling_score = ctx->githistory_min_coupling,
         .max_couplings = ctx->githistory_max_couplings,
+        .started_at = task->started_at,
     };
 
-    if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
-            if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
-                gh_threaded = true;
-            }
+    if (effective_worker_count(true) > SKIP_ONE) {
+        if (cbm_thread_create(&task->thread, 0, gh_compute_thread_fn, &task->arg) == 0) {
+            task->threaded = true;
+            cbm_log_info("pass.start", "pass", "githistory", "execution", "threaded");
+            return 0;
         }
-        if (!gh_threaded) {
-            cbm_pipeline_githistory_compute_with_limits(ctx->repo_path, &gh_result,
-                                                        ctx->githistory_min_coupling,
-                                                        ctx->githistory_max_couplings);
-            cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
-                         itoa_buf((int)elapsed_ms(t_gh)));
-        }
-    } else {
-        cbm_log_info("pass.skip", "pass", "githistory", "reason", "fast_mode");
     }
 
-    if (gh_threaded) {
-        cbm_thread_join(&gh_thread);
-        cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(t_gh)));
-    }
+    cbm_log_info("pass.start", "pass", "githistory", "execution", "synchronous");
+    (void)gh_compute_thread_fn(&task->arg);
+    return 0;
+}
 
+static int githistory_task_finish(cbm_pipeline_ctx_t *ctx, gh_compute_task_t *task) {
+    if (!task || !task->active) {
+        return 0;
+    }
+    if (task->threaded) {
+        int join_rc = cbm_thread_join(&task->thread);
+        if (join_rc != 0) {
+            cbm_log_error("pipeline.err", "phase", "githistory_join", "rc", itoa_buf(join_rc));
+            return CBM_NOT_FOUND;
+        }
+        task->threaded = false;
+    }
+    cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
+                 itoa_buf(task->arg.elapsed_ms));
     int gh_edges = 0;
-    if (gh_result.count > 0 || gh_result.file_temporal_count > 0) {
-        gh_edges = cbm_pipeline_githistory_apply(ctx, &gh_result);
+    if (task->result.count > 0 || task->result.file_temporal_count > 0) {
+        gh_edges = cbm_pipeline_githistory_apply(ctx, &task->result);
     }
-    cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_buf(gh_result.commit_count),
+    cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_buf(task->result.commit_count),
                  "edges", itoa_buf(gh_edges));
-    cbm_change_coupling_paths_free(gh_result.couplings, gh_result.count);
-    free(gh_result.couplings);
-    cbm_file_temporal_free(gh_result.file_temporal, gh_result.file_temporal_count);
+    if (cbm_profile_active) {
+        cbm_profile_log_elapsed("pipeline", "pass_githistory", &task->started_at, 0);
+    }
+    githistory_task_release(task);
     return 0;
 }
 
 /* ── Pipeline run ────────────────────────────────────────────────── */
 
-/* Run tests + git history. Returns 0 on success. */
-static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
-                                 const cbm_file_info_t *files, int file_count) {
+/* Run test-edge discovery before independent post-passes. */
+static int run_tests(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                     int file_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_tests);
     int rc = cbm_pipeline_pass_tests(ctx, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_tests", t_tests, file_count);
     cbm_log_info("pass.timing", "pass", "tests", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
-    if (rc == 0 && !check_cancel(p)) {
-        CBM_PROF_START(t_gh);
-        rc = run_githistory(p, ctx);
-        CBM_PROF_END("pipeline", "pass_githistory", t_gh);
-    }
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
@@ -2400,6 +2441,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
+    gh_compute_task_t githistory_task = {0};
 
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
@@ -2504,15 +2546,17 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         goto cleanup;
     }
 
-    /* Post-extraction phase. Upstream factors tests+githistory into
-     * run_tests_and_history() and the decorator/configlink/route/similarity/
-     * semantic_edges/complexity passes into run_predump_passes(); both are
-     * dump-free, so we call them here and then run the fork-only httplinks and
-     * normalize passes before the fork's dump block (which carries the
-     * flush_store branch the dep-index path needs). We intentionally do NOT
-     * call upstream run_post_extraction()/dump_and_persist_hashes(): they have
-     * no flush_store branch and would double-dump the sqlite path. */
-    rc = run_tests_and_history(p, &ctx, files, file_count);
+    /* Post-extraction phase. The Git-history scan reads only repository state,
+     * so start it after test-edge discovery and overlap it with independent
+     * graph passes. Publication remains serialized below before normalize and
+     * dump. Total work stays O(G+P), while multi-core latency approaches
+     * max(G,P) instead of G+P. Threaded, single-core, and thread-create
+     * fallback schedules publish identical graph results. */
+    rc = run_tests(p, &ctx, files, file_count);
+    if (rc != 0) {
+        goto cleanup;
+    }
+    rc = githistory_task_start(p, &ctx, &githistory_task);
     if (rc != 0) {
         goto cleanup;
     }
@@ -2544,6 +2588,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         }
     } else if (!check_cancel(p)) {
         cbm_log_info("pass.skip", "pass", "httplinks", "reason", "disabled");
+    }
+
+    if (check_cancel(p)) {
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
+    rc = githistory_task_finish(&ctx, &githistory_task);
+    if (rc != 0) {
+        goto cleanup;
     }
 
     /* Normalization: enforce structural invariants (I2: Method->Class,
@@ -2657,6 +2710,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
 
 cleanup:
+    githistory_task_release(&githistory_task);
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     cbm_discover_free(files, file_count);
