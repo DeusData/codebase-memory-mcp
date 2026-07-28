@@ -1674,8 +1674,9 @@ static const char MCP_STREAMLINED_SERVER_INSTRUCTIONS[] =
     "or source call automatically resolves and, when enabled, indexes its project, then returns "
     "available session, index, freshness, coverage, and architecture context; follow "
     "action_required when automation cannot complete. Watched projects refresh automatically; "
-    "reveal check_index_coverage with _hidden_tools before relying on negative or exhaustive "
-    "claims. Coverage is best-effort. Paginate when has_more or nextCursor is present.";
+    "use check_index_coverage before relying on negative or exhaustive claims; if it is not "
+    "listed, reveal it with _hidden_tools first. Coverage is best-effort. Paginate when has_more "
+    "or nextCursor is present.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
     "This is the analysis tool profile; graph and index mutation tools are unavailable. Use "
@@ -1690,6 +1691,39 @@ static const char MCP_SCOUT_SERVER_INSTRUCTIONS[] =
     "trace_path, get_code_snippet, and get_architecture calls. Call check_index_coverage for cited "
     "paths. Do not make absence or exhaustive-impact claims; ask the parent agent to refresh "
     "stale data.";
+
+/* initialize.clientInfo also carries a version, but MCP currently defines no
+ * client capability for refreshing tools/list after a list-changed
+ * notification, and Codex has no published first-fixed version to compare.
+ * Do not guess a version cutoff: narrow this compatibility path only when a
+ * capability or a verified Codex release boundary can be tested here. */
+static const char MCP_CODEX_CLIENT_NAME[] = "codex-mcp-client";
+
+static bool mcp_client_requires_static_tool_catalog(const char *params_json) {
+    if (!params_json) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(params_json, strlen(params_json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *client_info = root && yyjson_is_obj(root)
+                                  ? yyjson_obj_get(root, "clientInfo")
+                                  : NULL;
+    yyjson_val *name = client_info && yyjson_is_obj(client_info)
+                           ? yyjson_obj_get(client_info, "name")
+                           : NULL;
+    const char *client_name = name && yyjson_is_str(name) ? yyjson_get_str(name) : NULL;
+    /* Codex identifies itself with this exact protocol name. Its RMCP
+     * on_tool_list_changed callback logs the notification without relisting,
+     * while its tool planner defers the startup MCP catalog behind tool_search.
+     * Exact matching avoids changing other clients that implement MCP dynamic
+     * list refresh and benefit from the smaller streamlined startup catalog. */
+    bool required = client_name && strcmp(client_name, MCP_CODEX_CLIENT_NAME) == 0;
+    yyjson_doc_free(doc);
+    return required;
+}
 
 static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
                                                      cbm_mcp_tool_profile_t profile,
@@ -2422,6 +2456,12 @@ struct cbm_mcp_server {
      * never depends on delivery (query_graph_no_rows_hint self-heals). */
     atomic_bool tools_list_changed_pending;
     bool hidden_tools_revealed; /* true after _hidden_tools requests real tools/list exposure */
+    /* Codex snapshots tools/list at startup and currently only logs
+     * notifications/tools/list_changed. Its model layer independently defers
+     * the complete startup catalog behind tool_search, so listing every
+     * canonical tool preserves compact model context while retaining each
+     * tool's own schema, annotations, filters, and approval identity. */
+    bool client_requires_static_tool_catalog;
     FILE *out_stream;          /* protocol output stream for notifications (set in server_run) */
     bool out_content_length_framed; /* true while handling Content-Length-framed requests */
     cbm_mutex_t overlay_compaction_lock;
@@ -2530,7 +2570,7 @@ static bool cbm_mcp_advanced_tool_visible(cbm_mcp_server_t *srv, const char *too
     if (cbm_mcp_tool_mode_is_classic(srv)) {
         return true;
     }
-    return (srv && srv->hidden_tools_revealed) ||
+    return (srv && (srv->hidden_tools_revealed || srv->client_requires_static_tool_catalog)) ||
            cbm_mcp_tool_config_enabled(srv, tool_name);
 }
 
@@ -3144,7 +3184,9 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
      * the selected profile; do not hide required diagnostics behind reveal. */
     bool curated_profile = srv && srv->tool_profile != CBM_MCP_TOOL_PROFILE_ALL;
     bool classic = curated_profile || cbm_mcp_tool_mode_is_classic(srv);
-    bool reveal_hidden = (!classic && srv && srv->hidden_tools_revealed);
+    bool reveal_hidden =
+        (!classic && srv &&
+         (srv->hidden_tools_revealed || srv->client_requires_static_tool_catalog));
     mcp_tool_page_t page = {
         .offset = offset > 0 ? offset : 0,
         .limit = limit > 0 ? limit : MCP_TOOLS_PAGE_SIZE,
@@ -16990,7 +17032,8 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
 
     /* _hidden_tools: informational pseudo-tool for progressive disclosure */
     if (strcmp(tool_name, "_hidden_tools") == 0) {
-        bool changed = srv && !srv->hidden_tools_revealed;
+        bool changed = srv && !srv->hidden_tools_revealed &&
+                       !srv->client_requires_static_tool_catalog;
         char *payload = build_hidden_tools_payload(srv);
         if (srv) {
             srv->hidden_tools_revealed = true;
@@ -18291,6 +18334,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
+        srv->client_requires_static_tool_catalog =
+            mcp_client_requires_static_tool_catalog(req.params_raw);
         result_json = cbm_mcp_initialize_response_for_profile(
             req.params_raw, srv->tool_profile, cbm_mcp_tool_mode_is_classic(srv));
         detect_session(srv);

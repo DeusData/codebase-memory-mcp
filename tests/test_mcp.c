@@ -10706,6 +10706,61 @@ TEST(mcp_hidden_tools_reveal_sends_list_changed) {
     PASS();
 }
 
+TEST(mcp_codex_static_catalog_needs_no_reveal_notification) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    const char *msgs =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+        "\"clientInfo\":{\"name\":\"codex-mcp-client\",\"version\":\"1.2.3\"}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_EQ(written, (ssize_t)strlen(msgs));
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    ASSERT_EQ(nread, (size_t)out_len);
+    buf[nread] = '\0';
+
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
+    ASSERT_NOT_NULL(strstr(buf, "\"name\":\"check_index_coverage\""));
+    ASSERT_NOT_NULL(strstr(buf, "\"name\":\"index_repository\""));
+    ASSERT_NULL(strstr(buf, "notifications/tools/list_changed"));
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
 TEST(mcp_hidden_tools_reveal_frames_list_changed) {
     int fds[2];
     ASSERT_EQ(pipe(fds), 0);
@@ -16760,6 +16815,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_server_run_rapid_messages);
     RUN_TEST(mcp_stdio_output_has_only_jsonrpc_messages);
     RUN_TEST(mcp_hidden_tools_reveal_sends_list_changed);
+    RUN_TEST(mcp_codex_static_catalog_needs_no_reveal_notification);
     RUN_TEST(mcp_hidden_tools_reveal_frames_list_changed);
     RUN_TEST(mcp_notify_index_published_sends_list_changed_once);
     RUN_TEST(mcp_published_schema_refreshes_description_once);

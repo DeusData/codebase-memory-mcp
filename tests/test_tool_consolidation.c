@@ -864,6 +864,72 @@ TEST(hidden_tools_reveal_discoverable_tools) {
     PASS();
 }
 
+TEST(codex_client_initial_catalog_exposes_advanced_tools) {
+    char *saved_mode = save_tool_mode();
+    cbm_setenv("CBM_TOOL_MODE", "streamlined", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Version is intentionally not a compatibility boundary until Codex has a
+     * verified first-fixed release or MCP exposes a client refresh capability. */
+    char *initialize = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+             "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+             "\"clientInfo\":{\"name\":\"codex-mcp-client\",\"version\":\"1.2.3\"}}}");
+    ASSERT_NOT_NULL(initialize);
+    free(initialize);
+
+    char *tools = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(tools);
+    ASSERT(tool_list_has_exact_name(tools, "search_graph"));
+    ASSERT(tool_list_has_exact_name(tools, "get_code"));
+    ASSERT(tool_list_has_exact_name(tools, "check_index_coverage"));
+    ASSERT(tool_list_has_exact_name(tools, "index_repository"));
+    ASSERT(tool_list_has_exact_name(tools, "delete_project"));
+    ASSERT(tool_list_has_exact_name(tools, "_hidden_tools"));
+    ASSERT_EQ(18, tool_list_exact_count(tools));
+    free(tools);
+
+    char *hint = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(hint);
+    char *text = extract_tool_text(hint);
+    ASSERT_NOT_NULL(text);
+    ASSERT(json_array_has_string(text, "already_visible_tools", "check_index_coverage"));
+    ASSERT(!json_array_has_string(text, "hidden_tools", "check_index_coverage"));
+    free(text);
+    free(hint);
+
+    cbm_mcp_server_free(srv);
+    restore_tool_mode(saved_mode);
+    PASS();
+}
+
+TEST(non_codex_client_initial_catalog_remains_streamlined) {
+    char *saved_mode = save_tool_mode();
+    cbm_setenv("CBM_TOOL_MODE", "streamlined", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *initialize = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+             "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+             "\"clientInfo\":{\"name\":\"codex-mcp-client-compatible\","
+             "\"version\":\"1.0\"}}}");
+    ASSERT_NOT_NULL(initialize);
+    free(initialize);
+
+    char *tools = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(tools);
+    ASSERT_EQ(6, tool_list_exact_count(tools));
+    ASSERT(!tool_list_has_exact_name(tools, "check_index_coverage"));
+    ASSERT(!tool_list_has_exact_name(tools, "index_repository"));
+    free(tools);
+
+    cbm_mcp_server_free(srv);
+    restore_tool_mode(saved_mode);
+    PASS();
+}
+
 TEST(hidden_tools_payload_excludes_already_visible_configured_tools) {
     char *saved_mode = save_tool_mode();
     cbm_setenv("CBM_TOOL_MODE", "streamlined", 1);
@@ -3506,6 +3572,8 @@ SUITE(tool_consolidation) {
     RUN_TEST(api_surface_classic_regression_gate);
     RUN_TEST(tool_mode_config_switches_live_server_surface);
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
+    RUN_TEST(codex_client_initial_catalog_exposes_advanced_tools);
+    RUN_TEST(non_codex_client_initial_catalog_remains_streamlined);
     RUN_TEST(hidden_tools_payload_excludes_already_visible_configured_tools);
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
     RUN_TEST(query_graph_input_schema_identical_across_modes);
