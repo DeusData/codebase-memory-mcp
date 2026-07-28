@@ -1054,7 +1054,7 @@ static bool runtime_worker_send_status(cbm_daemon_runtime_worker_t *worker,
 
 static bool runtime_application_status_is_callback_result(
     cbm_daemon_runtime_application_status_t status) {
-    return status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||
+    return cbm_daemon_runtime_application_status_is_success(status) ||
            status == CBM_DAEMON_RUNTIME_APPLICATION_REJECTED ||
            status == CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR ||
            status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
@@ -1066,7 +1066,7 @@ static bool runtime_worker_send_application_response(
     uint32_t response_length, bool suppress_when_disconnecting) {
     if (!worker || request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID ||
         status <= CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR ||
-        status > CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED ||
+        status > CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED ||
         response_length > CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX ||
         (response_length > 0 && !response)) {
         return false;
@@ -1292,10 +1292,13 @@ static void *runtime_application_worker(void *opaque) {
         worker->application_request_length, &response, &response_length);
 
     bool valid_status = runtime_application_status_is_callback_result(status);
-    bool valid_response =
-        response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
-        (response_length == 0 || response != NULL) &&
-        (status == CBM_DAEMON_RUNTIME_APPLICATION_OK || (response == NULL && response_length == 0));
+    bool valid_response = response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
+                          (response_length == 0 || response != NULL) &&
+                          ((status == CBM_DAEMON_RUNTIME_APPLICATION_OK) ||
+                           (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+                            response && response_length > 0) ||
+                           (!cbm_daemon_runtime_application_status_is_success(status) &&
+                            response == NULL && response_length == 0));
     if (!valid_status || !valid_response) {
         free(response);
         response = NULL;
@@ -3040,12 +3043,15 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
         cbm_daemon_runtime_application_token_t response_token = runtime_get_u64(payload);
         status = (cbm_daemon_runtime_application_status_t)runtime_get_u32(payload + 8);
         response_length = runtime_get_u32(payload + 12);
-        protocol_valid = response_token == request_token &&
-                         status >= CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-                         status <= CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED &&
-                         response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
-                         frame.length == APPLICATION_RESPONSE_PREFIX_SIZE + response_length &&
-                         (status == CBM_DAEMON_RUNTIME_APPLICATION_OK || response_length == 0);
+        protocol_valid =
+            response_token == request_token && status >= CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+            status <= CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+            response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
+            frame.length == APPLICATION_RESPONSE_PREFIX_SIZE + response_length &&
+            (status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||
+             (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+              response_length > 0) ||
+             (!cbm_daemon_runtime_application_status_is_success(status) && response_length == 0));
     }
 
     uint8_t *response_copy = NULL;

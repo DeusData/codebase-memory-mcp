@@ -22,6 +22,10 @@ typedef struct yyjson_mut_val yyjson_mut_val;   /* from yyjson.h */
 struct cbm_watcher;                         /* from watcher/watcher.h */
 struct cbm_config;                          /* from cli/cli.h */
 
+#define CBM_MCP_TOOLS_LIST_CHANGED_METHOD "notifications/tools/list_changed"
+#define CBM_MCP_TOOLS_LIST_CHANGED_JSON \
+    "{\"jsonrpc\":\"2.0\",\"method\":\"" CBM_MCP_TOOLS_LIST_CHANGED_METHOD "\"}"
+
 typedef enum {
     CBM_MCP_TOOL_PROFILE_ALL = 0,
     /* Restricted agent surfaces advertise and execute only inspection tools.

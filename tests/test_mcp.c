@@ -11136,9 +11136,12 @@ TEST(mcp_hidden_tools_reveal_sends_list_changed) {
     buf[nread] = '\0';
 
     ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
-    ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    const char *reveal_response = strstr(buf, "\"id\":2");
     ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
-    ASSERT_NOT_NULL(strstr(buf, "notifications/tools/list_changed"));
+    const char *list_changed = strstr(buf, "notifications/tools/list_changed");
+    ASSERT_NOT_NULL(reveal_response);
+    ASSERT_NOT_NULL(list_changed);
+    ASSERT_TRUE(reveal_response < list_changed);
     ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"index_repository\""), 1);
     ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"get_architecture\""), 1);
 
@@ -11254,7 +11257,11 @@ TEST(mcp_hidden_tools_reveal_frames_list_changed) {
     buf[nread] = '\0';
 
     ASSERT_EQ(count_substr_mcp(buf, "Content-Length:"), 4);
-    ASSERT_NOT_NULL(strstr(buf, "notifications/tools/list_changed"));
+    const char *reveal_response = strstr(buf, "\"id\":2");
+    const char *list_changed = strstr(buf, "notifications/tools/list_changed");
+    ASSERT_NOT_NULL(reveal_response);
+    ASSERT_NOT_NULL(list_changed);
+    ASSERT_TRUE(reveal_response < list_changed);
     ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"index_repository\""), 1);
     ASSERT_EQ(count_substr_mcp(buf, "\"name\":\"get_architecture\""), 1);
 

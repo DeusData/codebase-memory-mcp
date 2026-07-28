@@ -2489,8 +2489,10 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
         *response_out = (uint8_t *)response;
         *response_length_out = (uint32_t)response_length;
     }
+    bool tools_list_changed = response && cbm_mcp_server_tools_list_changed_pending(session->mcp);
     application_refresh_watch(session);
-    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    return tools_list_changed ? CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED
+                              : CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
 static cbm_daemon_runtime_application_status_t application_tool_request(
@@ -2673,12 +2675,12 @@ static cbm_daemon_runtime_application_status_t application_request(
         session->request_cancel_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     }
     bool activate_background =
-        !cancelled && status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+        !cancelled && cbm_daemon_runtime_application_status_is_success(status) &&
         (session->pending_background_initialize ||
          (session->background_eligible &&
           (session->auto_index_retry_pending ||
            (!application->update_generation_started && !session->update_owner))));
-    if (!cancelled && status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+    if (!cancelled && cbm_daemon_runtime_application_status_is_success(status) &&
         session->pending_update_notice) {
         session->update_notice_delivered = true;
     }
@@ -2690,6 +2692,13 @@ static cbm_daemon_runtime_application_status_t application_request(
         *response_out = NULL;
         *response_length_out = 0;
         return CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
+    }
+    if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+        !cbm_mcp_server_take_tools_list_changed(session->mcp)) {
+        /* Only this session's request thread consumes the flag. Treat a
+         * defensive mismatch as ordinary success rather than emitting a
+         * notification that no publication/reveal requested. */
+        status = CBM_DAEMON_RUNTIME_APPLICATION_OK;
     }
     if (activate_background) {
         application_background_initialize(session);
@@ -3089,7 +3098,7 @@ static cbm_daemon_runtime_application_status_t application_client_exchange_tagge
                                                                    request_length, &response,
                                                                    &response_length, timeout_ms);
     free(request);
-    if (status != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+    if (!cbm_daemon_runtime_application_status_is_success(status)) {
         free(response);
         return status;
     }

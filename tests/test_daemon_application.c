@@ -618,6 +618,101 @@ TEST(daemon_application_mcp_notification_has_no_response) {
     PASS();
 }
 
+/* The daemon application has no stdio stream of its own. Preserve the
+ * response-before-notification contract as an explicit success disposition so
+ * the thin frontend can frame the notification for the client's transport.
+ * Repeated reveal and Codex's static catalog must remain ordinary successes. */
+TEST(daemon_application_reports_hidden_tool_catalog_change_once) {
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *generic = app_test_open(&callbacks, 20);
+    cbm_daemon_runtime_application_session_t *codex = app_test_open(&callbacks, 21);
+    char root[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-hidden-tools-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+
+    static const char *const generic_messages[] = {
+        ("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+         "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+         "\"clientInfo\":{\"name\":\"generic-client\",\"version\":\"1.0\"}}}"),
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+        ("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+         "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"),
+        ("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+         "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"),
+    };
+    static const char *const codex_messages[] = {
+        ("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"initialize\","
+         "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+         "\"clientInfo\":{\"name\":\"codex-mcp-client\",\"version\":\"1.0\"}}}"),
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/list\",\"params\":{}}",
+        ("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\","
+         "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"),
+    };
+    cbm_daemon_runtime_application_status_t generic_statuses[4] = {0};
+    cbm_daemon_runtime_application_status_t codex_statuses[3] = {0};
+    bool responses_ok = application && generic && codex && root_ok;
+
+    for (int session_index = 0; responses_ok && session_index < 2; session_index++) {
+        cbm_daemon_runtime_application_session_t *session = session_index == 0 ? generic : codex;
+        uint8_t *context = NULL;
+        uint32_t context_length = 0;
+        responses_ok = app_test_context_request(root, root, &context, &context_length);
+        uint8_t *response = NULL;
+        uint32_t response_length = 0;
+        if (responses_ok) {
+            responses_ok =
+                app_test_request(&callbacks, session, context, context_length, &response,
+                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                response == NULL && response_length == 0;
+        }
+        free(context);
+        free(response);
+
+        const char *const *messages = session_index == 0 ? generic_messages : codex_messages;
+        int message_count = session_index == 0 ? 4 : 3;
+        cbm_daemon_runtime_application_status_t *statuses =
+            session_index == 0 ? generic_statuses : codex_statuses;
+        for (int index = 0; responses_ok && index < message_count; index++) {
+            uint8_t *request = NULL;
+            uint32_t request_length = 0;
+            response = NULL;
+            response_length = 0;
+            responses_ok = app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                                                 messages[index], &request, &request_length);
+            if (responses_ok) {
+                statuses[index] = app_test_request(&callbacks, session, request, request_length,
+                                                   &response, &response_length);
+                responses_ok = response && response_length > 0;
+            }
+            free(request);
+            free(response);
+        }
+    }
+
+    if (generic) {
+        callbacks.session_close(callbacks.context, generic);
+    }
+    if (codex) {
+        callbacks.session_close(callbacks.context, codex);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    (void)cbm_rmdir(root);
+
+    ASSERT_TRUE(responses_ok);
+    ASSERT_EQ(generic_statuses[0], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(generic_statuses[1], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(generic_statuses[2], CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED);
+    ASSERT_EQ(generic_statuses[3], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(codex_statuses[0], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(codex_statuses[1], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(codex_statuses[2], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 static int app_test_index_noop(const char *project_name, const char *root_path, void *context) {
     (void)project_name;
     (void)root_path;
@@ -4893,6 +4988,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
+    RUN_TEST(daemon_application_reports_hidden_tool_catalog_change_once);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);

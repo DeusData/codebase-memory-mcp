@@ -18,6 +18,14 @@ void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command
  * this immediately before publication so idle sessions retain no SQLite DB. */
 bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv);
 
+/* Inspect, then atomically consume, one coalesced tools/list_changed
+ * notification after a response is ready. Daemon dispatch peeks before its
+ * cancellation linearization point and consumes only after the request wins;
+ * direct stdio consumes after writing its response. Both are O(1) time/memory,
+ * and no background thread writes a protocol stream. */
+bool cbm_mcp_server_tools_list_changed_pending(cbm_mcp_server_t *srv);
+bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv);
+
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
  * On success replaces and frees *response_io; on failure it is unchanged. */
 bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice);

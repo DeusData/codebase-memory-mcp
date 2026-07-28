@@ -444,12 +444,18 @@ static void *frontend_worker(void *opaque) {
             if (status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
                 failed = !frontend_write_cancelled_response(state->out, &item);
             } else {
-                failed = status != CBM_DAEMON_RUNTIME_APPLICATION_OK;
+                failed = !cbm_daemon_runtime_application_status_is_success(status);
             }
-            if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK && !failed && response &&
+            if (cbm_daemon_runtime_application_status_is_success(status) && !failed && response &&
                 response_length > 0) {
                 failed = !frontend_write_response(state->out, response, response_length,
                                                   item.content_length_framed);
+            }
+            if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED && !failed) {
+                failed = !frontend_write_response(
+                    state->out, (const uint8_t *)CBM_MCP_TOOLS_LIST_CHANGED_JSON,
+                    (uint32_t)(sizeof(CBM_MCP_TOOLS_LIST_CHANGED_JSON) - 1U),
+                    item.content_length_framed);
             }
         }
         free(response);
