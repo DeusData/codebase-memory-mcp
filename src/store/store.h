@@ -192,6 +192,9 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
 /* Find nodes whose qualified_name ends with the given suffix (dot-boundary). */
 int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
                                       cbm_node_t **out, int *count);
+int cbm_store_find_nodes_by_qn_suffix_overlay_view(cbm_store_t *s, const char *project,
+                                                   const char *suffix, cbm_node_t **out,
+                                                   int *count);
 
 /* Edge direction constants used by qn-keyed active-overlay edge helpers. */
 #define CBM_STORE_EDGE_DIR_OUTBOUND 0
@@ -232,6 +235,13 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
  * and the arrays themselves. */
 int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, char ***out_callers,
                                   int *caller_count, char ***out_callees, int *callee_count);
+/* Active-overlay equivalent keyed by qualified name because overlay nodes do
+ * not have canonical node ids. Results retain the canonical API's behavioral
+ * edge types and are independently bounded to limit names per direction. */
+int cbm_store_active_node_neighbor_names_by_qn(cbm_store_t *s, const char *project,
+                                               const char *qualified_name, int limit,
+                                               char ***out_callers, int *caller_count,
+                                               char ***out_callees, int *callee_count);
 
 /* Batch count in/out degree for multiple nodes.
  * edge_type: filter by edge type (e.g. "CALLS"), or NULL/"" for all types.

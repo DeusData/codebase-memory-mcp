@@ -9503,24 +9503,61 @@ int cbm_store_active_node_degree_by_qn(cbm_store_t *s, const char *project,
     if (out_deg) {
         *out_deg = 0;
     }
-    if (!in_deg || !out_deg) {
+    if (!s || !s->db || !project || !project[0] || !qualified_name ||
+        !qualified_name[0] || !in_deg || !out_deg) {
+        if (s) {
+            store_set_error(s, "active_node_degree_by_qn: invalid argument");
+        }
         return CBM_STORE_ERR;
     }
-    int in_count = 0;
-    int out_count = 0;
-    int rc = active_edge_count_by_qn(s, project, qualified_name, NULL,
-                                     CBM_STORE_EDGE_DIR_INBOUND, &in_count);
-    if (rc != CBM_STORE_OK) {
-        return rc;
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "active_node_degree_by_qn active CTE SQL truncated");
+        return CBM_STORE_ERR;
     }
-    rc = active_edge_count_by_qn(s, project, qualified_name, NULL,
-                                 CBM_STORE_EDGE_DIR_OUTBOUND, &out_count);
-    if (rc != CBM_STORE_OK) {
-        return rc;
+
+    /* The prior implementation materialized and scanned the complete active
+     * graph once per direction. A single conditional aggregate preserves
+     * self-loop semantics while halving active-view construction latency and
+     * retaining O(1) result memory. */
+    char sql[ST_SQL_BUF];
+    int n = snprintf(
+        sql, sizeof(sql),
+        "%s"
+        "SELECT"
+        " COALESCE(SUM(CASE WHEN e.target_qn = ?4 THEN 1 ELSE 0 END), 0),"
+        " COALESCE(SUM(CASE WHEN e.source_qn = ?4 THEN 1 ELSE 0 END), 0)"
+        " FROM active_edges e"
+        " JOIN active_nodes n ON n.project = ?3 AND n.qualified_name = ?4"
+        " WHERE e.type != 'INHERITS'"
+        "   AND (e.source_qn = ?4 OR e.target_qn = ?4)",
+        active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "active_node_degree_by_qn SQL truncated");
+        return CBM_STORE_ERR;
     }
-    *in_deg = in_count;
-    *out_deg = out_count;
-    return CBM_STORE_OK;
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "active_node_degree_by_qn prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, qualified_name);
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        *in_deg = sqlite3_column_int(stmt, 0);
+        *out_deg = sqlite3_column_int(stmt, 1);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "active_node_degree_by_qn step");
+    return CBM_STORE_ERR;
 }
 
 int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
@@ -9824,6 +9861,121 @@ int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, ch
         node_id, limit, out_callees, callee_count);
 
     return 0;
+}
+
+int cbm_store_active_node_neighbor_names_by_qn(cbm_store_t *s, const char *project,
+                                               const char *qualified_name, int limit,
+                                               char ***out_callers, int *caller_count,
+                                               char ***out_callees, int *callee_count) {
+    if (out_callers) {
+        *out_callers = NULL;
+    }
+    if (caller_count) {
+        *caller_count = 0;
+    }
+    if (out_callees) {
+        *out_callees = NULL;
+    }
+    if (callee_count) {
+        *callee_count = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !qualified_name ||
+        !qualified_name[0] || limit <= 0 || !out_callers || !caller_count ||
+        !out_callees || !callee_count) {
+        if (s) {
+            store_set_error(s, "active_node_neighbor_names_by_qn: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "active_node_neighbor_names_by_qn active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    /* Materialize the active graph once, deduplicate names in SQL, and rank
+     * each direction before applying the caller's bound. Runtime follows the
+     * active-view CTE plus O(K log K) ordering for incident behavioral names;
+     * returned heap memory is O(limit), never O(all incident edges). */
+    char sql[ST_SQL_BUF];
+    int n = snprintf(
+        sql, sizeof(sql),
+        "%s"
+        ", neighbor_names(direction, name) AS ("
+        "  SELECT 0, n.name"
+        "  FROM active_edges e"
+        "  JOIN active_nodes n ON n.project = ?3 AND n.qualified_name = e.source_qn"
+        "  WHERE e.target_qn = ?4"
+        "    AND e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS')"
+        "  UNION"
+        "  SELECT 1, n.name"
+        "  FROM active_edges e"
+        "  JOIN active_nodes n ON n.project = ?3 AND n.qualified_name = e.target_qn"
+        "  WHERE e.source_qn = ?4"
+        "    AND e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS')"
+        "), ranked_neighbor_names AS ("
+        "  SELECT direction, name,"
+        "         ROW_NUMBER() OVER (PARTITION BY direction ORDER BY name) AS rn"
+        "  FROM neighbor_names"
+        ")"
+        "SELECT direction, name FROM ranked_neighbor_names"
+        " WHERE rn <= ?5 ORDER BY direction, name",
+        active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "active_node_neighbor_names_by_qn SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "active_node_neighbor_names_by_qn prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, qualified_name);
+    sqlite3_bind_int(stmt, ST_COL_5, limit);
+
+    int caller_cap = 0;
+    int callee_cap = 0;
+    char **callers = NULL;
+    char **callees = NULL;
+    int callers_len = 0;
+    int callees_len = 0;
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int direction = sqlite3_column_int(stmt, 0);
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+        if (!name) {
+            continue;
+        }
+        char ***names = direction == 0 ? &callers : &callees;
+        int *names_len = direction == 0 ? &callers_len : &callees_len;
+        int *names_cap = direction == 0 ? &caller_cap : &callee_cap;
+        if (store_append_text(names, names_len, names_cap, name) != CBM_STORE_OK) {
+            store_free_text_array(callers, callers_len);
+            store_free_text_array(callees, callees_len);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "active_node_neighbor_names_by_qn out of memory");
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE) {
+        store_free_text_array(callers, callers_len);
+        store_free_text_array(callees, callees_len);
+        store_set_error_sqlite(s, "active_node_neighbor_names_by_qn step");
+        return CBM_STORE_ERR;
+    }
+
+    *out_callers = callers;
+    *caller_count = callers_len;
+    *out_callees = callees;
+    *callee_count = callees_len;
+    return CBM_STORE_OK;
 }
 
 static int count_degrees_direction(cbm_store_t *s, const int64_t *node_ids, int id_count,
@@ -10654,6 +10806,61 @@ int cbm_store_find_node_by_qn_overlay_view(cbm_store_t *s, const char *project,
     }
     sqlite3_finalize(stmt);
     return CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_find_nodes_by_qn_suffix_overlay_view(cbm_store_t *s, const char *project,
+                                                   const char *suffix, cbm_node_t **out,
+                                                   int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project || !suffix) {
+        return CBM_STORE_ERR;
+    }
+
+    char like_pattern[CBM_SZ_512];
+    int pattern_len = snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
+    if (pattern_len < 0 || (size_t)pattern_len >= sizeof(like_pattern)) {
+        store_set_error(s, "find_nodes_by_qn_suffix_overlay pattern too long");
+        return CBM_STORE_ERR;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "find_nodes_by_qn_suffix_overlay active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                     "n.file_path, n.start_line, n.end_line, n.properties "
+                     "FROM active_nodes n "
+                     "WHERE n.project = ?3 "
+                     "AND (n.qualified_name LIKE ?4 OR n.qualified_name = ?5) "
+                     "ORDER BY n.qualified_name",
+                     active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "find_nodes_by_qn_suffix_overlay SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_nodes_by_qn_suffix_overlay prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, like_pattern);
+    bind_text(stmt, ST_COL_5, suffix);
+    int rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_qn_suffix_overlay", out, count);
+    sqlite3_finalize(stmt);
+    return rc;
 }
 
 int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *project,
