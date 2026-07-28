@@ -2970,6 +2970,45 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     ASSERT_EQ(active_name_count, 0);
     cbm_store_free_nodes(active_names, active_name_count);
 
+    cbm_node_t *active_suffix = NULL;
+    int active_suffix_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix_overlay_view(
+                  live, "test", "new_main", &active_suffix, &active_suffix_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_suffix_count, 1);
+    ASSERT_STR_EQ(active_suffix[0].qualified_name, "test.new_main");
+    cbm_store_free_nodes(active_suffix, active_suffix_count);
+    active_suffix = NULL;
+    active_suffix_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix_overlay_view(
+                  live, "test", "old_main", &active_suffix, &active_suffix_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_suffix_count, 0);
+    cbm_store_free_nodes(active_suffix, active_suffix_count);
+
+    int active_in_degree = 0;
+    int active_out_degree = 0;
+    ASSERT_EQ(cbm_store_active_node_degree_by_qn(live, "test", "test.new_main",
+                                                 &active_in_degree, &active_out_degree),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_in_degree, 0);
+    ASSERT_EQ(active_out_degree, 1);
+
+    char **active_callers = NULL;
+    int active_caller_count = 0;
+    char **active_callees = NULL;
+    int active_callee_count = 0;
+    ASSERT_EQ(cbm_store_active_node_neighbor_names_by_qn(
+                  live, "test", "test.new_main", 1, &active_callers,
+                  &active_caller_count, &active_callees, &active_callee_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_caller_count, 0);
+    ASSERT_EQ(active_callee_count, 1);
+    ASSERT_STR_EQ(active_callees[0], "stable");
+    free(active_callers);
+    free(active_callees[0]);
+    free(active_callees);
+
     cbm_node_t *active_functions = NULL;
     int active_function_count = 0;
     ASSERT_EQ(cbm_store_find_nodes_by_label_overlay_view(live, "test", "Function",
