@@ -2452,9 +2452,13 @@ struct cbm_mcp_server {
     cbm_mcp_command_test_hook_fn command_test_hook;
     void *command_test_context;
     cbm_thread_t autoindex_tid;
-    bool autoindex_active; /* true if auto-index thread was started */
-    bool autoindex_failed; /* IX-1: true if last auto-index attempt failed */
-    bool just_autoindexed; /* IX-3: true after auto-index completes, reset on next search */
+    /* The request thread owns autoindex_active and the join. The worker publishes
+     * only atomic outcome state, so checking a running index is O(1) time/O(1)
+     * memory and never needs a non-portable try-join or a source/Git scan. */
+    bool autoindex_active;
+    atomic_bool autoindex_finished;
+    atomic_bool autoindex_failed; /* IX-1: last auto-index attempt failed */
+    atomic_bool just_autoindexed; /* IX-3: last auto-index attempt published */
     /* Request-thread-owned reason startup indexing did not start. This reports
      * only this server's decision; it never guesses sibling-process liveness
      * from temp files or other crash-stale filesystem artifacts. */
@@ -2876,7 +2880,7 @@ static bool cbm_mcp_run_sync_auto_index(cbm_mcp_server_t *srv, const char *root_
     cbm_pipeline_t *pipeline = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!pipeline) {
         if (srv) {
-            srv->autoindex_failed = true;
+            atomic_store_explicit(&srv->autoindex_failed, true, memory_order_release);
         }
         cbm_log_error("autoindex.create_failed", "root", root_path ? root_path : "");
         return false;
@@ -2888,8 +2892,8 @@ static bool cbm_mcp_run_sync_auto_index(cbm_mcp_server_t *srv, const char *root_
     cbm_pipeline_free(pipeline);
 
     if (srv) {
-        srv->autoindex_failed = (rc != 0);
-        srv->just_autoindexed = (rc == 0);
+        atomic_store_explicit(&srv->autoindex_failed, rc != 0, memory_order_release);
+        atomic_store_explicit(&srv->just_autoindexed, rc == 0, memory_order_release);
         if (rc == 0) {
             /* One publication authority: store_stale + description_stale +
              * pending list_changed together, not a handler-local flag. */
@@ -3369,6 +3373,9 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     cbm_mutex_init(&srv->active_request_lock);
     cbm_mutex_init(&srv->request_scope_mutex);
     atomic_init(&srv->pipeline_cancel_requested, 0);
+    atomic_init(&srv->autoindex_finished, true);
+    atomic_init(&srv->autoindex_failed, false);
+    atomic_init(&srv->just_autoindexed, false);
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
@@ -3640,6 +3647,21 @@ int cbm_mcp_server_join_autoindex(cbm_mcp_server_t *srv) {
     int rc = cbm_thread_join(&srv->autoindex_tid);
     srv->autoindex_active = false;
     return rc;
+}
+
+/* Reap only a terminal startup worker. A false result means the worker is
+ * genuinely still running; callers must return retryable state rather than
+ * holding an ordinary MCP request open past a client-controlled timeout. */
+static bool mcp_autoindex_reap_if_finished(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->autoindex_active) {
+        return true;
+    }
+    if (!atomic_load_explicit(&srv->autoindex_finished, memory_order_acquire)) {
+        return false;
+    }
+    (void)cbm_thread_join(&srv->autoindex_tid);
+    srv->autoindex_active = false;
+    return true;
 }
 
 /* ── Idle store eviction ──────────────────────────────────────── */
@@ -4595,7 +4617,7 @@ static void mcp_index_recovery_hint(cbm_mcp_server_t *srv, char *out, size_t out
     }
     char index_action[CBM_SZ_512];
     mcp_index_recovery_action(srv, index_action, sizeof(index_action));
-    if (srv && srv->autoindex_failed) {
+    if (srv && atomic_load_explicit(&srv->autoindex_failed, memory_order_acquire)) {
         snprintf(out, out_size,
                  "Automatic indexing failed. Inspect indexing diagnostics and project read "
                  "permissions, then %s",
@@ -4677,46 +4699,88 @@ static char *build_project_list_error(const char *reason) {
     return build_project_list_error_srv(NULL, reason);
 }
 
+/* Ordinary MCP tool calls are not durable jobs. Return control while the
+ * initialize-triggered index continues, with enough machine-readable state for
+ * the model to retry successfully. MCP Tasks can replace this fallback only
+ * after both peers negotiate task-augmented tools/call support. */
+static char *mcp_autoindex_in_progress_result(cbm_mcp_server_t *srv, const char *project) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return cbm_mcp_text_result("automatic indexing is still running; retry this tool call",
+                                   true);
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "indexing");
+    yyjson_mut_obj_add_bool(doc, root, "retryable", true);
+    const char *effective_project =
+        project && project[0] ? project
+                              : (srv && srv->session_project[0] ? srv->session_project : NULL);
+    if (effective_project) {
+        yyjson_mut_obj_add_strcpy(doc, root, "project", effective_project);
+    }
+    yyjson_mut_obj_add_str(
+        doc, root, "detail",
+        "Automatic indexing started during MCP initialization and is still running; no published "
+        "graph is readable for this project yet.");
+    yyjson_mut_obj_add_str(
+        doc, root, "action_required",
+        "Continue other work and retry this same tool call after indexing publishes. Read "
+        "codebase://status if the client exposes MCP resources.");
+    char *payload = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!payload) {
+        return cbm_mcp_text_result("automatic indexing is still running; retry this tool call",
+                                   true);
+    }
+    char *result = cbm_mcp_text_result(payload, true);
+    free(payload);
+    return result;
+}
+
 /* REQUIRE_STORE_EX: like REQUIRE_STORE but runs _pre_free_cleanup before freeing
  * project and returning.  resolve_project_store owns first-use auto-indexing;
- * this macro only joins an in-flight startup index and reports missing stores.
+ * this macro reaps a completed startup index or reports retryable running state.
  * Use this in handlers that allocate extra heap locals (e.g. qn, snippet_mode)
  * that must also be freed on the early-return paths. */
-#define REQUIRE_STORE_EX(store, project, _pre_free_cleanup)                                       \
-    do {                                                                                          \
-        if (!(store) && srv->session_root[0] && cbm_is_dir(srv->session_root)) {                     \
-            if (srv->autoindex_active) {                                                          \
-                /* Background thread running — wait for it to complete */                         \
-                cbm_thread_join(&srv->autoindex_tid);                                              \
-                srv->autoindex_active = false;                                                    \
-                /* Re-resolve store after background index finished */                            \
-                store = resolve_store(srv, project);                                              \
-            }                                                                                     \
-        }                                                                                         \
-        if (!(store)) {                                                                           \
-            _pre_free_cleanup;                                                                    \
-            if (!(project)) {                                                                      \
-                char *_err = build_missing_project_error();                                        \
-                char *_res = cbm_mcp_text_result(_err, true);                                      \
-                free(_err);                                                                        \
-                return _res;                                                                       \
-            }                                                                                     \
-            if (srv->autoindex_failed) {                                                          \
-                free(project);                                                                    \
-                char *_err = build_project_list_error_srv(                                        \
-                    srv, "auto-indexing failed for this project");                                \
-                char *_res = cbm_mcp_text_result(_err, true);                                     \
-                free(_err);                                                                       \
-                return _res;                                                                      \
-            }                                                                                     \
-            free(project);                                                                        \
-            {                                                                                     \
-                char *_err = build_project_list_error_srv(srv, "project not found or not indexed");              \
-                char *_res = cbm_mcp_text_result(_err, true);                                     \
-                free(_err);                                                                       \
-                return _res;                                                                      \
-            }                                                                                     \
-        }                                                                                         \
+#define REQUIRE_STORE_EX(store, project, _pre_free_cleanup)                                     \
+    do {                                                                                        \
+        if (!(store) && srv->session_root[0] && cbm_is_dir(srv->session_root)) {                \
+            if (srv->autoindex_active) {                                                        \
+                if (!mcp_autoindex_reap_if_finished(srv)) {                                     \
+                    _pre_free_cleanup;                                                          \
+                    char *_res = mcp_autoindex_in_progress_result(srv, project);                \
+                    free(project);                                                              \
+                    return _res;                                                                \
+                }                                                                               \
+                store = resolve_store(srv, project);                                            \
+            }                                                                                   \
+        }                                                                                       \
+        if (!(store)) {                                                                         \
+            _pre_free_cleanup;                                                                  \
+            if (!(project)) {                                                                   \
+                char *_err = build_missing_project_error();                                     \
+                char *_res = cbm_mcp_text_result(_err, true);                                   \
+                free(_err);                                                                     \
+                return _res;                                                                    \
+            }                                                                                   \
+            if (atomic_load_explicit(&srv->autoindex_failed, memory_order_acquire)) {           \
+                free(project);                                                                  \
+                char *_err =                                                                    \
+                    build_project_list_error_srv(srv, "auto-indexing failed for this project"); \
+                char *_res = cbm_mcp_text_result(_err, true);                                   \
+                free(_err);                                                                     \
+                return _res;                                                                    \
+            }                                                                                   \
+            free(project);                                                                      \
+            {                                                                                   \
+                char *_err =                                                                    \
+                    build_project_list_error_srv(srv, "project not found or not indexed");      \
+                char *_res = cbm_mcp_text_result(_err, true);                                   \
+                free(_err);                                                                     \
+                return _res;                                                                    \
+            }                                                                                   \
+        }                                                                                       \
     } while (0)
 
 /* Convenience alias for handlers with no extra locals to free. */
@@ -4732,6 +4796,7 @@ static char *build_project_list_error(const char *reason) {
 static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                        cbm_mcp_server_t *srv, cbm_store_t *store,
                                        const char *project) {
+    (void)mcp_autoindex_reap_if_finished(srv);
     char index_action[CBM_SZ_512];
     mcp_index_recovery_action(srv, index_action, sizeof(index_action));
 
@@ -4741,15 +4806,17 @@ static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root
 
     if (srv->autoindex_active) {
         yyjson_mut_obj_add_str(doc, root, "status", "indexing");
+        yyjson_mut_obj_add_bool(doc, root, "retryable", true);
         yyjson_mut_obj_add_str(
             doc, root, "action_required",
-            "Wait for indexing to finish, then retry the tool call. Use index_status for progress.");
+            "Continue other work and retry the same tool call after indexing publishes. Read "
+            "codebase://status if the client exposes MCP resources.");
         return false;
     }
 
     if (!store) {
         yyjson_mut_obj_add_str(doc, root, "status", "not_indexed");
-        if (srv->autoindex_failed) {
+        if (atomic_load_explicit(&srv->autoindex_failed, memory_order_acquire)) {
             yyjson_mut_obj_add_str(
                 doc, root, "detail",
                 "Automatic indexing failed; graph results are unavailable until indexing succeeds.");
@@ -4916,8 +4983,6 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
         cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
     if (!inject_enabled) return;
 
-    srv->context_injected = true;
-
     /* The session project identifies the server CWD, while context_project
      * identifies the graph that supplied this response.  They intentionally
      * differ when a caller searches an explicit project from another CWD. */
@@ -4926,6 +4991,13 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
                            : (srv->session_project[0] ? srv->session_project : NULL);
     yyjson_mut_val *ctx = yyjson_mut_obj(doc);
     bool graph_ready = add_project_status_summary(doc, ctx, srv, store, proj);
+    /* A transient indexing result is useful immediately but is not the promised
+     * one-shot architecture delivery. Preserve that delivery for the first
+     * successful retry after publication. Terminal ready/not-indexed/empty
+     * states remain one-shot to avoid repeated token cost. */
+    if (!srv->autoindex_active) {
+        srv->context_injected = true;
+    }
 
     /* Schema: node labels + edge types. Counts-only: this context never emits
      * property keys, and the full variant's json_each discovery is O(total
@@ -6423,6 +6495,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
     bool session_store_selected = db_project && srv->session_project[0] &&
                                   strcmp(db_project, srv->session_project) == 0;
     bool may_use_session_root = !raw_project_explicit || session_store_selected;
+    bool startup_index_running = false;
 
     /* Auto-index on first use (same enablement as REQUIRE_STORE). Explicit
      * non-path project names are authoritative: a missing slug must report
@@ -6430,11 +6503,12 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
     if (!store && may_use_session_root && srv->session_root[0] &&
         cbm_is_dir(srv->session_root)) {
         if (srv->autoindex_active) {
-            cbm_thread_join(&srv->autoindex_tid);
-            srv->autoindex_active = false;
-            store = resolve_store(srv, db_project);
+            startup_index_running = !mcp_autoindex_reap_if_finished(srv);
+            if (!startup_index_running) {
+                store = resolve_store(srv, db_project);
+            }
         }
-        if (!store && !_raw_path && cbm_mcp_auto_index_enabled(srv) &&
+        if (!store && !startup_index_running && !_raw_path && cbm_mcp_auto_index_enabled(srv) &&
             cbm_mcp_auto_index_within_limit(srv, srv->session_root)) {
             if (cbm_mcp_run_sync_auto_index(srv, srv->session_root, "autoindex.sync", "project",
                                             srv->session_project)) {
@@ -6462,7 +6536,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
      *   project="/path/to/react-grid-layout" (in ~/myapp/.gitignore)
      * session_root stays ~/myapp; react-grid-layout is never indexed by the block
      * above.  This block catches that case and indexes the exact requested path. */
-    if (!store && _raw_path && cbm_mcp_auto_index_enabled(srv)) {
+    if (!store && !startup_index_running && _raw_path && cbm_mcp_auto_index_enabled(srv)) {
         if (cbm_is_dir(_raw_path) && cbm_mcp_auto_index_within_limit(srv, _raw_path)) {
             if (cbm_mcp_run_sync_auto_index(srv, _raw_path, "autoindex.path", "path", _raw_path)) {
                 store = resolve_store(srv, db_project);
@@ -17182,6 +17256,10 @@ static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char
     if (!srv || !result) {
         return result;
     }
+    /* A worker may have completed between dispatch and context construction.
+     * Reap only that terminal worker so informational tools can attach the
+     * newly published graph without ever blocking on live indexing. */
+    (void)mcp_autoindex_reap_if_finished(srv);
     yyjson_doc *envelope = yyjson_read(result, strlen(result), 0);
     yyjson_val *root = envelope ? yyjson_doc_get_root(envelope) : NULL;
     yyjson_val *content = root ? yyjson_obj_get(root, "content") : NULL;
@@ -17347,13 +17425,16 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
     cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
 }
 
-/* Background auto-index thread function */
-static void autoindex_thread_release_caches(void) {
+/* Background auto-index thread terminal boundary. Publish completion only after
+ * all result state and thread-local cleanup are visible to a request-thread
+ * acquire load; that request can then join without waiting. */
+static void autoindex_thread_finish(cbm_mcp_server_t *srv) {
     /* Sequential extraction builds a thread-local syntax-kind bitset cache on
      * the calling thread. Worker-pool threads release the same cache at their
      * exit boundary; the auto-index owner must do likewise on every return. */
     cbm_kind_in_set_free_cache();
     cbm_mem_collect();
+    atomic_store_explicit(&srv->autoindex_finished, true, memory_order_release);
 }
 
 static void *autoindex_thread(void *arg) {
@@ -17373,14 +17454,14 @@ static void *autoindex_thread(void *arg) {
             free(resp);
             if (atomic_load(&srv->stop_requested)) {
                 cbm_log_info("autoindex.cancelled", "project", srv->session_project);
-                autoindex_thread_release_caches();
+                autoindex_thread_finish(srv);
                 return NULL;
             }
-            srv->autoindex_failed = !published;
-            srv->just_autoindexed = published;
+            atomic_store_explicit(&srv->autoindex_failed, !published, memory_order_release);
+            atomic_store_explicit(&srv->just_autoindexed, published, memory_order_release);
             if (!published) {
                 cbm_log_warn("autoindex.err", "msg", "supervised_index_failed");
-                autoindex_thread_release_caches();
+                autoindex_thread_finish(srv);
                 return NULL;
             }
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
@@ -17389,26 +17470,29 @@ static void *autoindex_thread(void *arg) {
              * `if (srv->watcher)` would register even when the user set
              * `config set auto_watch false`, since srv->watcher is always set. */
             register_watcher_if_enabled(srv);
-            autoindex_thread_release_caches();
+            autoindex_thread_finish(srv);
             return NULL;
         }
+        atomic_store_explicit(&srv->autoindex_failed, true, memory_order_release);
+        atomic_store_explicit(&srv->just_autoindexed, false, memory_order_release);
         cbm_log_error("autoindex.supervision_failed", "project", srv->session_project, "action",
                       "fail_closed");
+        autoindex_thread_finish(srv);
         return NULL;
     }
 
     if (atomic_load(&srv->stop_requested)) {
         cbm_log_info("autoindex.cancelled", "project", srv->session_project);
-        autoindex_thread_release_caches();
+        autoindex_thread_finish(srv);
         return NULL;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
-        srv->autoindex_failed = true;
-        srv->just_autoindexed = false;
+        atomic_store_explicit(&srv->autoindex_failed, true, memory_order_release);
+        atomic_store_explicit(&srv->just_autoindexed, false, memory_order_release);
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
-        autoindex_thread_release_caches();
+        autoindex_thread_finish(srv);
         return NULL;
     }
     cbm_pipeline_apply_config(p, srv->config);
@@ -17423,8 +17507,8 @@ static void *autoindex_thread(void *arg) {
 
     cbm_pipeline_free(p);
 
-    srv->autoindex_failed = (rc != 0);
-    srv->just_autoindexed = (rc == 0);
+    atomic_store_explicit(&srv->autoindex_failed, rc != 0, memory_order_release);
+    atomic_store_explicit(&srv->just_autoindexed, rc == 0, memory_order_release);
 
     if (rc == 0) {
         /* Re-index dependencies after fresh dump.
@@ -17465,7 +17549,7 @@ static void *autoindex_thread(void *arg) {
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
     }
-    autoindex_thread_release_caches();
+    autoindex_thread_finish(srv);
     return NULL;
 }
 
@@ -17656,9 +17740,13 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 
     /* Launch auto-index in background */
+    atomic_store_explicit(&srv->autoindex_finished, false, memory_order_relaxed);
+    atomic_store_explicit(&srv->autoindex_failed, false, memory_order_relaxed);
+    atomic_store_explicit(&srv->just_autoindexed, false, memory_order_relaxed);
     if (cbm_thread_create(&srv->autoindex_tid, 0, autoindex_thread, srv) == 0) {
         srv->autoindex_active = true;
     } else {
+        atomic_store_explicit(&srv->autoindex_finished, true, memory_order_release);
         /* Do not turn a transient thread-launch failure into a user task. The
          * first store-backed request runs the existing synchronous first-use
          * path before REQUIRE_STORE_EX can build an error. */
