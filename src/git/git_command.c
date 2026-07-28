@@ -247,6 +247,7 @@ int cbm_git_run_argv(const char *repo_path, const char *const git_args[],
 
     bool cancel_sent = false;
     cbm_proc_poll_t state;
+    uint64_t poll_started_ms = cbm_now_ms();
     for (;;) {
         if (!cancel_sent && opts && opts->cancel_requested &&
             opts->cancel_requested(opts->cancel_context)) {
@@ -259,7 +260,10 @@ int cbm_git_run_argv(const char *repo_path, const char *const git_args[],
         if (state == CBM_PROC_POLL_ERROR) {
             cancel_sent = cbm_subprocess_request_cancel(process) || cancel_sent;
         }
-        cbm_usleep(10000);
+        int interval_ms =
+            cbm_subprocess_poll_interval_ms(cbm_now_ms() - poll_started_ms,
+                                            CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL);
+        cbm_usleep(interval_ms * (unsigned int)CBM_USEC_PER_MSEC);
     }
     bool contained = result->tree_quiesced && !result->supervision_failed;
     cbm_subprocess_destroy(process);
@@ -278,13 +282,13 @@ int cbm_git_run_argv(const char *repo_path, const char *const git_args[],
     return 0;
 }
 
-static void git_trim_newlines(char *s) {
-    if (!s) {
+void cbm_git_trim_newlines(char *line) {
+    if (!line) {
         return;
     }
-    size_t n = strlen(s);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
-        s[--n] = '\0';
+    size_t length = strlen(line);
+    while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+        line[--length] = '\0';
     }
 }
 
@@ -311,7 +315,7 @@ int cbm_git_capture_first_line_buf(const char *repo_path, const char *const git_
     bool got_line = fgets(out, (int)out_size, fp) != NULL;
     size_t len = got_line ? strlen(out) : 0;
     bool truncated = got_line && len > 0 && out[len - 1] != '\n' && !feof(fp);
-    git_trim_newlines(out);
+    cbm_git_trim_newlines(out);
 
     int rc = fclose(fp);
     cbm_git_output_cleanup(&output);
@@ -359,7 +363,7 @@ int cbm_git_run_first_line_buf(const char *repo_path, const char *const git_args
     bool truncated = got_line && line_len > 0 && line[line_len - 1] != '\n' && !feof(fp);
     bool output_fits = true;
     if (got_line) {
-        git_trim_newlines(line);
+        cbm_git_trim_newlines(line);
         size_t value_len = strlen(line);
         if (value_len >= out_size) {
             output_fits = false;
