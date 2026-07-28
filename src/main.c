@@ -1044,6 +1044,11 @@ typedef enum {
     MAIN_BUILD_IDENTITY_FINGERPRINT_CONFIG,
 } main_build_identity_status_t;
 
+typedef struct {
+    char path[MAIN_PATH_CAP];
+    bool enabled;
+} main_build_fingerprint_cache_t;
+
 static const char *main_build_identity_status_name(main_build_identity_status_t status) {
     switch (status) {
     case MAIN_BUILD_IDENTITY_OK:
@@ -1074,9 +1079,13 @@ static const char *main_build_identity_status_guidance(main_build_identity_statu
                : "";
 }
 
-static main_build_identity_status_t main_build_identity(cbm_daemon_build_identity_t *identity) {
+static main_build_identity_status_t main_build_identity(
+    cbm_daemon_build_identity_t *identity, main_build_fingerprint_cache_t *fingerprint_cache_out) {
     if (!identity) {
         return MAIN_BUILD_IDENTITY_INVALID_OUTPUT;
+    }
+    if (fingerprint_cache_out) {
+        memset(fingerprint_cache_out, 0, sizeof(*fingerprint_cache_out));
     }
     const char *cache = cbm_resolve_cache_dir();
     char canonical_cache[MAIN_PATH_CAP];
@@ -1139,6 +1148,11 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
     bool cache_path_ready =
         fingerprint_cache_written > 0 &&
         fingerprint_cache_written < (int)sizeof(fingerprint_cache_path);
+    if (fingerprint_cache_out && cached_exact && cache_path_ready) {
+        memcpy(fingerprint_cache_out->path, fingerprint_cache_path,
+               (size_t)fingerprint_cache_written + 1U);
+        fingerprint_cache_out->enabled = true;
+    }
     bool fingerprint_ready =
         cached_exact && cache_path_ready
             ? cbm_index_supervisor_capture_build_fingerprint_cached(fingerprint_cache_path, true)
@@ -1381,7 +1395,7 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
     bool prepared =
         endpoint &&
         cbm_http_server_resolve_binary_path(NULL, executable_path, sizeof(executable_path)) &&
-        main_build_identity(&identity) == MAIN_BUILD_IDENTITY_OK;
+        main_build_identity(&identity, NULL) == MAIN_BUILD_IDENTITY_OK;
     if (!prepared) {
         (void)fprintf(stderr, "error: daemon-backed CLI coordination could not be prepared\n");
         cbm_daemon_ipc_endpoint_free(endpoint);
@@ -1889,7 +1903,7 @@ int main(int argc, char **argv) {
             coordination_failure = "version-cohort";
         } else if (!main_resolve_executable(argv[0], local_executable)) {
             coordination_failure = "executable-path";
-        } else if ((local_identity_status = main_build_identity(&local_identity)) !=
+        } else if ((local_identity_status = main_build_identity(&local_identity, NULL)) !=
                    MAIN_BUILD_IDENTITY_OK) {
             coordination_failure = main_build_identity_status_name(local_identity_status);
         }
@@ -1996,13 +2010,15 @@ int main(int argc, char **argv) {
 
     char executable_path[MAIN_PATH_CAP];
     cbm_daemon_build_identity_t identity;
+    main_build_fingerprint_cache_t fingerprint_cache;
     if (!main_resolve_executable(argv[0], executable_path)) {
         (void)fprintf(stderr,
                       "codebase-memory-mcp: exact executable identity could not be verified "
                       "(executable-path)\n");
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
-    main_build_identity_status_t identity_status = main_build_identity(&identity);
+    main_build_identity_status_t identity_status =
+        main_build_identity(&identity, &fingerprint_cache);
     if (identity_status != MAIN_BUILD_IDENTITY_OK) {
         const char *validation_detail = cbm_daemon_ipc_validation_detail();
         (void)fprintf(stderr,
@@ -2153,6 +2169,9 @@ int main(int argc, char **argv) {
             .endpoint = endpoint,
             .identity = identity,
             .executable_path = executable_path,
+            .build_fingerprint_cache_path =
+                fingerprint_cache.enabled ? fingerprint_cache.path : NULL,
+            .build_fingerprint_cache_enabled = fingerprint_cache.enabled,
             .stop_requested = &g_shutdown,
             /* The role classifier already enforced the byte-exact grammar:
              * argc==3 can only be the permanent spawn shape. */

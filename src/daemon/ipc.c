@@ -2874,6 +2874,13 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
     return -1;
 }
 
+int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    /* The POSIX endpoint probe already observes only the published socket.
+     * A zero timeout preserves its fail-closed pending/busy classification
+     * without waiting for a transport that has not been published. */
+    return cbm_daemon_ipc_endpoint_probe(endpoint, 0);
+}
+
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
                                                     uint32_t timeout_ms) {
     if (!endpoint_runtime_still_valid(endpoint)) {
@@ -5413,6 +5420,13 @@ static int win_current_generation_transport_probe(const cbm_daemon_ipc_endpoint_
         return 1;
     }
     return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 0 : -1;
+}
+
+int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    if (!endpoint) {
+        return -1;
+    }
+    return win_current_generation_transport_probe(endpoint);
 }
 
 int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uint32_t timeout_ms) {

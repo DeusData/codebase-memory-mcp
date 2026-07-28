@@ -179,6 +179,15 @@ enum { CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL = 0 };
  * claiming cross-platform execution. */
 int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms);
 
+#ifndef _WIN32
+/* Pre-exec descriptor hygiene shared by every POSIX child launcher. Resolve the
+ * finite fallback bound before fork, then close descriptors in the child.
+ * Linux close_range and F_CLOSEM platforms use O(1) user-space calls and O(1)
+ * memory; other POSIX targets retain the bounded O(max_fd) fallback. */
+long cbm_subprocess_posix_fd_close_limit(void);
+void cbm_subprocess_posix_close_nonstdio(long max_fd);
+#endif
+
 /* Build a Windows CreateProcess command line from a NULL-terminated argv, applying
  * the Microsoft C runtime quoting rules (quote-wrap + escape embedded quotes and
  * their preceding backslashes) so the spawned child re-parses byte-identical argv.

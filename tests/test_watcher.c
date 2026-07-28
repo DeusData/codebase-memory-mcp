@@ -919,6 +919,59 @@ TEST(watcher_stop_flag) {
     PASS();
 }
 
+typedef struct {
+    cbm_watcher_t *watcher;
+    int run_status;
+} watcher_run_context_t;
+
+static void *watcher_run_for_stop_test(void *opaque) {
+    watcher_run_context_t *context = opaque;
+    enum { WATCHER_TEST_LONG_POLL_MS = 5000 };
+    context->run_status =
+        cbm_watcher_run(context->watcher, WATCHER_TEST_LONG_POLL_MS, WATCHER_TEST_LONG_POLL_MS);
+    return NULL;
+}
+
+TEST(watcher_stop_wakes_parked_run_loop) {
+    enum {
+        WATCHER_TEST_WAIT_READY_MS = 5000,
+        /* A synchronized condition wake is normally sub-millisecond. This is
+         * deliberately a coarse hang detector: it remains tolerant of loaded
+         * sanitizer/Windows runners while rejecting the former 500 ms polling
+         * sleep that delayed every retiring daemon. */
+        WATCHER_TEST_STOP_WAKE_MAX_MS = 400,
+    };
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    watcher_run_context_t context = {
+        .watcher = watcher,
+        .run_status = CBM_NOT_FOUND,
+    };
+    cbm_thread_t thread = {0};
+    int create_status = watcher ? cbm_thread_create(&thread, 0, watcher_run_for_stop_test, &context)
+                                : CBM_NOT_FOUND;
+    uint64_t ready_deadline = cbm_now_ms() + WATCHER_TEST_WAIT_READY_MS;
+    while (create_status == 0 && cbm_watcher_waiter_count_for_test(watcher) == 0 &&
+           cbm_now_ms() < ready_deadline) {
+        cbm_usleep(CBM_USEC_PER_MSEC);
+    }
+    bool parked = create_status == 0 && cbm_watcher_waiter_count_for_test(watcher) == 1;
+    uint64_t stop_started_ms = cbm_now_ms();
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+    }
+    int join_status = create_status == 0 ? cbm_thread_join(&thread) : CBM_NOT_FOUND;
+    uint64_t stop_elapsed_ms = cbm_now_ms() - stop_started_ms;
+
+    ASSERT_TRUE(parked);
+    ASSERT_EQ(join_status, 0);
+    ASSERT_EQ(context.run_status, 0);
+    ASSERT_TRUE(stop_elapsed_ms <= WATCHER_TEST_STOP_WAKE_MAX_MS);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    PASS();
+}
+
 /* test_main turns an exact private-path alias named git/git.exe into a
  * deterministic child that publishes its PID and ignores graceful shutdown.
  * This reproduces the production failure where popen() left watcher shutdown
@@ -3747,6 +3800,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_root_restore_resets_prune_streak);
     RUN_TEST(watcher_poll_this_repo);
     RUN_TEST(watcher_stop_flag);
+    RUN_TEST(watcher_stop_wakes_parked_run_loop);
     RUN_TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop);
 
     /* Git change detection */

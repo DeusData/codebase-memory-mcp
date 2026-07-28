@@ -82,6 +82,15 @@ struct cbm_watcher {
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
     cbm_mutex_t projects_lock;
+    /* The run loop parks on this condition between polls. stop publishes its
+     * predicate and broadcasts under the same mutex, eliminating lost wakeups
+     * and the former O(poll-chunk) shutdown delay. This adds O(1) memory and
+     * O(1) wake work without periodic CPU polling on every platform. */
+    cbm_mutex_t wait_lock;
+    cbm_thread_condition_t wait_condition;
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+    atomic_int waiters;
+#endif
     /* Serializes callback replacement with the entire destructive prune
      * transaction so a borrowed daemon context cannot be freed mid-callback. */
     cbm_mutex_t coordination_lock;
@@ -119,9 +128,6 @@ struct cbm_watcher {
  * sustained-absence grace window measured from the streak's first miss. */
 #define MISSING_ROOT_DELETE_AFTER 3
 #define PRUNE_GRACE_DEFAULT_S 600 /* 10 min; override: CBM_WATCHER_PRUNE_GRACE_S */
-
-/* Sleep chunk for responsive shutdown (ms) */
-#define SLEEP_CHUNK_MS 500
 
 /* Git is external and repository-controlled configuration may activate slow
  * helpers (for example fsmonitor). Every invocation therefore has both a hard
@@ -939,8 +945,19 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
         return NULL;
     }
     cbm_mutex_init(&w->projects_lock);
+    cbm_mutex_init(&w->wait_lock);
+    if (cbm_thread_condition_init(&w->wait_condition) != 0) {
+        cbm_mutex_destroy(&w->wait_lock);
+        cbm_mutex_destroy(&w->projects_lock);
+        cbm_ht_free(w->projects);
+        free(w);
+        return NULL;
+    }
     cbm_mutex_init(&w->coordination_lock);
     atomic_init(&w->stopped, 0);
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+    atomic_init(&w->waiters, 0);
+#endif
     return w;
 }
 
@@ -963,6 +980,8 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     cbm_mutex_unlock(&w->coordination_lock);
     cbm_mutex_destroy(&w->projects_lock);
     cbm_mutex_destroy(&w->coordination_lock);
+    cbm_thread_condition_destroy(&w->wait_condition);
+    cbm_mutex_destroy(&w->wait_lock);
     free(w);
 }
 
@@ -1513,7 +1532,10 @@ static void cancel_active_git_entry(const char *key, void *value, void *user_dat
 
 void cbm_watcher_stop(cbm_watcher_t *w) {
     if (w) {
+        cbm_mutex_lock(&w->wait_lock);
         atomic_store_explicit(&w->stopped, 1, memory_order_release);
+        cbm_thread_condition_broadcast(&w->wait_condition);
+        cbm_mutex_unlock(&w->wait_lock);
         cbm_mutex_lock(&w->projects_lock);
         cbm_ht_foreach(w->projects, cancel_active_git_entry, NULL);
         for (int i = 0; i < w->pending_free_count; i++) {
@@ -1540,21 +1562,40 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms) {
 
     cbm_log_info("watcher.start", "interval_ms", base_interval_ms > 999 ? "multi-sec" : "fast");
 
+    int run_status = 0;
     while (!atomic_load(&w->stopped)) {
         cbm_watcher_poll_once(w);
 
-        /* Sleep in small increments to allow responsive shutdown */
-        int slept = 0;
-        while (slept < base_interval_ms && !atomic_load(&w->stopped)) {
-            int chunk = base_interval_ms - slept;
-            if (chunk > SLEEP_CHUNK_MS) {
-                chunk = SLEEP_CHUNK_MS;
+        uint64_t wait_deadline_ms = cbm_now_ms() + (uint64_t)base_interval_ms;
+        cbm_mutex_lock(&w->wait_lock);
+        while (!atomic_load_explicit(&w->stopped, memory_order_acquire) &&
+               cbm_now_ms() < wait_deadline_ms) {
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+            (void)atomic_fetch_add_explicit(&w->waiters, 1, memory_order_release);
+#endif
+            cbm_thread_condition_wait_status_t wait_status = cbm_thread_condition_wait_until(
+                &w->wait_condition, &w->wait_lock, wait_deadline_ms);
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+            (void)atomic_fetch_sub_explicit(&w->waiters, 1, memory_order_release);
+#endif
+            if (wait_status == CBM_THREAD_CONDITION_WAIT_ERROR) {
+                cbm_log_error("watcher.wait_failed", "action", "stop");
+                run_status = CBM_NOT_FOUND;
+                break;
             }
-            cbm_usleep((unsigned)chunk * CBM_MSEC_PER_SEC);
-            slept += chunk;
+        }
+        cbm_mutex_unlock(&w->wait_lock);
+        if (run_status != 0) {
+            break;
         }
     }
 
     cbm_log_info("watcher.stop");
-    return 0;
+    return run_status;
 }
+
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+int cbm_watcher_waiter_count_for_test(const cbm_watcher_t *w) {
+    return w ? atomic_load_explicit(&w->waiters, memory_order_acquire) : 0;
+}
+#endif

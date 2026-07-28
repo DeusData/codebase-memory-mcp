@@ -1,13 +1,14 @@
 /*
  * compat_thread.h — Portable threading: pthreads on POSIX, Win32 threads on Windows.
  *
- * Provides: thread create/join, mutex, aligned allocation.
+ * Provides: thread create/join, mutex, condition variable, aligned allocation.
  * All have zero overhead on POSIX (thin inlines or macros).
  */
 #ifndef CBM_COMPAT_THREAD_H
 #define CBM_COMPAT_THREAD_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* ── Thread ───────────────────────────────────────────────────── */
 
@@ -62,6 +63,43 @@ void cbm_mutex_init(cbm_mutex_t *m);
 void cbm_mutex_lock(cbm_mutex_t *m);
 void cbm_mutex_unlock(cbm_mutex_t *m);
 void cbm_mutex_destroy(cbm_mutex_t *m);
+
+/* ── Condition variable ───────────────────────────────────────── */
+
+#ifdef _WIN32
+
+typedef struct {
+    CONDITION_VARIABLE condition;
+} cbm_thread_condition_t;
+
+#else
+
+typedef struct {
+    pthread_cond_t condition;
+} cbm_thread_condition_t;
+
+#endif
+
+typedef enum {
+    CBM_THREAD_CONDITION_WAIT_ERROR = -1,
+    CBM_THREAD_CONDITION_WAIT_SIGNALED = 0,
+    CBM_THREAD_CONDITION_WAIT_TIMEOUT = 1,
+} cbm_thread_condition_wait_status_t;
+
+/* Initialize/destroy a condition variable associated with caller-owned
+ * cbm_mutex_t instances. init returns 0 on success. */
+int cbm_thread_condition_init(cbm_thread_condition_t *condition);
+void cbm_thread_condition_destroy(cbm_thread_condition_t *condition);
+
+/* Wake every waiter. The caller must hold the mutex used by those waiters so
+ * predicate publication and wakeup form one indivisible state transition. */
+void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition);
+
+/* Atomically release mutex and wait until broadcast or an absolute monotonic
+ * deadline from cbm_now_ms(). Reacquires mutex before returning. Callers must
+ * loop on their predicate because condition variables may wake spuriously. */
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
+    cbm_thread_condition_t *condition, cbm_mutex_t *mutex, uint64_t deadline_ms);
 
 /* ── Aligned allocation ───────────────────────────────────────── */
 

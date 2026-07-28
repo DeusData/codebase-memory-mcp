@@ -246,19 +246,24 @@ TEST(daemon_build_fingerprint_hashes_exact_executable_bytes) {
 TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
     char dir[VERSION_TEST_PATH_CAP] = {0};
     char image_path[VERSION_TEST_PATH_CAP] = {0};
+    char second_image_path[VERSION_TEST_PATH_CAP] = {0};
     char cache_path[VERSION_TEST_PATH_CAP] = {0};
     char initial[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char cached[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char retained[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char strict[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char changed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char recovered[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     bool cache_hit = true;
     bool setup_ok = version_test_temp_dir(dir, "fingerprint-cache") &&
                     version_test_child_path(image_path, dir, "build.bin") &&
+                    version_test_child_path(second_image_path, dir, "second-build.bin") &&
                     version_test_child_path(cache_path, dir, "fingerprint.cache") &&
-                    version_test_write_file(image_path, "same-version-build-a");
+                    version_test_write_file(image_path, "same-version-build-a") &&
+                    version_test_write_file(second_image_path, "other-native-image");
     if (!setup_ok) {
-        version_test_cleanup(dir, image_path, cache_path, NULL);
+        version_test_cleanup(dir, image_path, cache_path, second_image_path);
         FAIL("could not create fingerprint-cache fixtures");
     }
 
@@ -272,6 +277,18 @@ TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
         image_path, cache_path, true, cached, &cache_hit));
     ASSERT_TRUE(cache_hit);
     ASSERT_STR_EQ(initial, cached);
+
+    /* A managed daemon copy and its invoking CLI have different native file
+     * identities even when their bytes match. Retain both fixed-size records:
+     * alternating between the two steady images must not turn every process
+     * start back into O(executable bytes) hashing. */
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(second_image_path, cache_path,
+                                                                     true, second, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(image_path, cache_path, true,
+                                                                     retained, &cache_hit));
+    ASSERT_TRUE(cache_hit);
+    ASSERT_STR_EQ(initial, retained);
 
     ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
         image_path, cache_path, false, strict, &cache_hit));
@@ -290,7 +307,7 @@ TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
     ASSERT_FALSE(cache_hit);
     ASSERT_STR_EQ(changed, recovered);
 
-    version_test_cleanup(dir, image_path, cache_path, NULL);
+    version_test_cleanup(dir, image_path, cache_path, second_image_path);
     PASS();
 }
 

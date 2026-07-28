@@ -218,6 +218,37 @@ TEST(platform_now_ms) {
     PASS();
 }
 
+TEST(platform_thread_condition_uses_monotonic_deadline) {
+    enum {
+        CONDITION_TEST_TIMEOUT_MS = 20,
+        /* A deadline can be observed late under load, but an incorrect clock
+         * domain must not park the suite indefinitely. */
+        CONDITION_TEST_HANG_BOUND_MS = 5000,
+    };
+    cbm_mutex_t mutex;
+    cbm_thread_condition_t condition;
+    cbm_mutex_init(&mutex);
+    int init_status = cbm_thread_condition_init(&condition);
+    cbm_mutex_lock(&mutex);
+    uint64_t started_ms = cbm_now_ms();
+    cbm_thread_condition_wait_status_t wait_status =
+        init_status == 0 ? cbm_thread_condition_wait_until(&condition, &mutex,
+                                                           started_ms + CONDITION_TEST_TIMEOUT_MS)
+                         : CBM_THREAD_CONDITION_WAIT_ERROR;
+    uint64_t elapsed_ms = cbm_now_ms() - started_ms;
+    cbm_mutex_unlock(&mutex);
+    if (init_status == 0) {
+        cbm_thread_condition_destroy(&condition);
+    }
+    cbm_mutex_destroy(&mutex);
+
+    ASSERT_EQ(init_status, 0);
+    ASSERT_EQ(wait_status, CBM_THREAD_CONDITION_WAIT_TIMEOUT);
+    ASSERT_TRUE(elapsed_ms >= CONDITION_TEST_TIMEOUT_MS);
+    ASSERT_TRUE(elapsed_ms <= CONDITION_TEST_HANG_BOUND_MS);
+    PASS();
+}
+
 TEST(platform_nprocs) {
     int n = cbm_nprocs();
     ASSERT_GT(n, 0);
@@ -766,6 +797,7 @@ SUITE(platform) {
     RUN_TEST(platform_now_ns_concurrent_first_call);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
+    RUN_TEST(platform_thread_condition_uses_monotonic_deadline);
     RUN_TEST(platform_nprocs);
     RUN_TEST(platform_system_info); /* restored from merge base */
     RUN_TEST(platform_file_exists);

@@ -951,7 +951,15 @@ static void cbm_posix_reset_child_signals(void) {
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
-static void cbm_posix_close_nonstdio(long max_fd) {
+long cbm_subprocess_posix_fd_close_limit(void) {
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0 || max_fd > CBM_PROC_POSIX_OPEN_MAX_CEILING) {
+        max_fd = CBM_PROC_POSIX_OPEN_MAX_FALLBACK;
+    }
+    return max_fd;
+}
+
+void cbm_subprocess_posix_close_nonstdio(long max_fd) {
     /*
      * A high RLIMIT_NOFILE must not turn every spawn into hundreds of
      * thousands of failed close() syscalls. Use an atomic kernel range close
@@ -1005,7 +1013,7 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     if (error_output > STDERR_FILENO && error_output != output) {
         (void)close(error_output);
     }
-    cbm_posix_close_nonstdio(max_fd);
+    cbm_subprocess_posix_close_nonstdio(max_fd);
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
      * still has execvp's exact-path semantics because it contains '/'. */
@@ -1154,10 +1162,7 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     bool spawned = false;
 #endif
     if (!spawned) {
-        long max_fd = sysconf(_SC_OPEN_MAX);
-        if (max_fd < 0 || max_fd > CBM_PROC_POSIX_OPEN_MAX_CEILING) {
-            max_fd = CBM_PROC_POSIX_OPEN_MAX_FALLBACK;
-        }
+        long max_fd = cbm_subprocess_posix_fd_close_limit();
         pid = fork();
         if (pid == 0) {
             cbm_posix_child_exec(process, input, output, error_output, max_fd);

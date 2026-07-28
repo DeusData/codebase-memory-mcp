@@ -109,4 +109,9 @@ int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms);
  * for direct unit testing with injected errno values. */
 bool cbm_watcher_root_missing_errno(int err);
 
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+/* Number of run-loop threads currently parked between poll cycles. */
+int cbm_watcher_waiter_count_for_test(const cbm_watcher_t *w);
+#endif
+
 #endif /* CBM_WATCHER_H */

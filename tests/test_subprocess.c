@@ -939,6 +939,17 @@ TEST(subprocess_posix_child_closes_unrelated_descriptors) {
 #endif
 }
 
+TEST(subprocess_posix_fd_close_limit_is_finite) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX descriptor-close bound");
+#else
+    long close_limit = cbm_subprocess_posix_fd_close_limit();
+    ASSERT_TRUE(close_limit > STDERR_FILENO);
+    ASSERT_TRUE(close_limit <= INT_MAX);
+    PASS();
+#endif
+}
+
 TEST(subprocess_posix_child_resets_signal_disposition_and_mask) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX signal disposition/mask probe");
@@ -1323,6 +1334,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_posix_fd_close_limit_is_finite);
     RUN_TEST(subprocess_posix_child_resets_signal_disposition_and_mask);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(win_cmdline_index_worker_json);

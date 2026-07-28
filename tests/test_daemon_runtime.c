@@ -119,6 +119,7 @@ typedef struct {
     char log_path[RUNTIME_TEST_PATH_CAP];
     char rotated_log_path[RUNTIME_TEST_PATH_CAP];
     char lock_log_path[RUNTIME_TEST_PATH_CAP];
+    char fingerprint_cache_path[RUNTIME_TEST_PATH_CAP];
     cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_runtime_service_t *service;
 } runtime_test_fixture_t;
@@ -1245,7 +1246,7 @@ static bool runtime_test_fixture_permanent = false;
 static bool runtime_test_fixture_start_configured(
     runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
     uint32_t max_clients, uint64_t lease_timeout_ms,
-    const cbm_daemon_runtime_application_callbacks_t *application) {
+    const cbm_daemon_runtime_application_callbacks_t *application, bool fingerprint_cache_enabled) {
     memset(fixture, 0, sizeof(*fixture));
     if (!th_secure_runtime_parent_new(fixture->parent, sizeof(fixture->parent), tag)) {
         return runtime_test_fixture_start_failed(tag, "temporary-directory",
@@ -1280,12 +1281,34 @@ static bool runtime_test_fixture_start_configured(
     if (lock_written <= 0 || lock_written >= (int)sizeof(fixture->lock_log_path)) {
         return runtime_test_fixture_start_failed(tag, "lock-log-path", lock_written);
     }
+    int cache_written =
+        fingerprint_cache_enabled
+            ? snprintf(fixture->fingerprint_cache_path, sizeof(fixture->fingerprint_cache_path),
+                       "%s/fingerprints.cache", fixture->parent)
+            : 0;
+    if (fingerprint_cache_enabled &&
+        (cache_written <= 0 || cache_written >= (int)sizeof(fixture->fingerprint_cache_path))) {
+        return runtime_test_fixture_start_failed(tag, "fingerprint-cache-path", cache_written);
+    }
+    if (fingerprint_cache_enabled) {
+        char warmed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+        bool cache_hit = true;
+        if (!cbm_daemon_runtime_process_build_fingerprint_cached(runtime_test_process_id(),
+                                                                 fixture->fingerprint_cache_path,
+                                                                 true, warmed, &cache_hit) ||
+            cache_hit || strcmp(warmed, identity->build_fingerprint) != 0) {
+            return runtime_test_fixture_start_failed(tag, "fingerprint-cache-warm", cache_hit);
+        }
+    }
 
     cbm_daemon_runtime_service_config_t config = {
         .endpoint = fixture->endpoint,
         .identity = *identity,
         .conflict_log_path = fixture->log_path,
         .conflict_log_cap_bytes = 64U * 1024U,
+        .build_fingerprint_cache_path =
+            fingerprint_cache_enabled ? fixture->fingerprint_cache_path : NULL,
+        .build_fingerprint_cache_enabled = fingerprint_cache_enabled,
         .max_clients = max_clients,
         .lease_timeout_ms = lease_timeout_ms,
         .request_timeout_ms = RUNTIME_TEST_TIMEOUT_MS,
@@ -1312,7 +1335,8 @@ static bool runtime_test_fixture_start_configured(
 static bool runtime_test_fixture_start_limited(runtime_test_fixture_t *fixture, const char *tag,
                                                const cbm_daemon_build_identity_t *identity,
                                                uint32_t max_clients) {
-    return runtime_test_fixture_start_configured(fixture, tag, identity, max_clients, 5000, NULL);
+    return runtime_test_fixture_start_configured(fixture, tag, identity, max_clients, 5000, NULL,
+                                                 false);
 }
 
 static bool runtime_test_fixture_start(runtime_test_fixture_t *fixture, const char *tag,
@@ -1354,7 +1378,8 @@ static bool runtime_test_fixture_start_application(runtime_test_fixture_t *fixtu
                                                    const cbm_daemon_build_identity_t *identity,
                                                    runtime_application_context_t *context) {
     cbm_daemon_runtime_application_callbacks_t application = runtime_application_callbacks(context);
-    return runtime_test_fixture_start_configured(fixture, tag, identity, 8, 5000, &application);
+    return runtime_test_fixture_start_configured(fixture, tag, identity, 8, 5000, &application,
+                                                 false);
 }
 
 static void runtime_test_fixture_finish(runtime_test_fixture_t *fixture) {
@@ -1382,6 +1407,7 @@ static void runtime_test_fixture_finish(runtime_test_fixture_t *fixture) {
     (void)cbm_unlink(fixture->rotated_log_path);
     (void)cbm_unlink(fixture->log_path);
     (void)cbm_unlink(fixture->lock_log_path);
+    (void)cbm_unlink(fixture->fingerprint_cache_path);
     (void)cbm_rmdir(fixture->runtime_dir);
     (void)cbm_rmdir(fixture->parent);
     memset(fixture, 0, sizeof(*fixture));
@@ -2530,8 +2556,8 @@ TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_test_fixture_t fixture;
-    bool started =
-        runtime_test_fixture_start_configured(&fixture, "idle-connection", &identity, 8, 20, NULL);
+    bool started = runtime_test_fixture_start_configured(&fixture, "idle-connection", &identity, 8,
+                                                         20, NULL, false);
     cbm_daemon_runtime_connect_result_t result = {0};
     cbm_daemon_runtime_client_t *client = NULL;
     bool remained_connected = false;
@@ -3544,7 +3570,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     runtime_test_fixture_t fixture = {0};
     bool started =
         application && runtime_test_fixture_start_configured(&fixture, "non-index-child-cancel",
-                                                             &identity, 8, 5000, &callbacks);
+                                                             &identity, 8, 5000, &callbacks, false);
     cbm_daemon_runtime_connect_result_t first_result = {0};
     cbm_daemon_runtime_connect_result_t second_result = {0};
     cbm_daemon_runtime_client_t *first =
@@ -4207,6 +4233,50 @@ TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed)
     PASS();
 }
 
+TEST(daemon_runtime_copied_image_peer_fingerprint_reuses_exact_cache_record) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    runtime_test_fixture_permanent = true;
+    bool started = runtime_test_fixture_start_configured(&fixture, "copied-peer-cache", &identity,
+                                                         8, 5000, NULL, true);
+    runtime_test_fixture_permanent = false;
+    char image_path[RUNTIME_TEST_PATH_CAP] = {0};
+    int image_path_written =
+        started
+#ifdef _WIN32
+            ? snprintf(image_path, sizeof(image_path), "%s/client-copy.exe", fixture.parent)
+#else
+            ? snprintf(image_path, sizeof(image_path), "%s/client-copy", fixture.parent)
+#endif
+            : -1;
+    bool copied = image_path_written > 0 && image_path_written < (int)sizeof(image_path) &&
+                  runtime_test_copy_self_image(image_path);
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool exact_bytes = copied && cbm_daemon_build_fingerprint_file(image_path, fingerprint) &&
+                       strcmp(fingerprint, identity.build_fingerprint) == 0;
+    int first_exit = -1;
+    bool first_ran =
+        exact_bytes && runtime_test_run_hello_image(image_path, &fixture, &identity, &first_exit);
+    int repeated_exit = -1;
+    bool repeated_ran =
+        first_ran && first_exit == 0 &&
+        runtime_test_run_hello_image(image_path, &fixture, &identity, &repeated_exit);
+    uint64_t cache_hits = cbm_daemon_runtime_service_peer_cache_hits_for_testing(fixture.service);
+    (void)cbm_unlink(image_path);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(copied);
+    ASSERT_TRUE(exact_bytes);
+    ASSERT_TRUE(first_ran);
+    ASSERT_EQ(first_exit, 0);
+    ASSERT_TRUE(repeated_ran);
+    ASSERT_EQ(repeated_exit, 0);
+    ASSERT_EQ(cache_hits, 1);
+    PASS();
+}
+
 #ifdef _WIN32
 TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     char directory[RUNTIME_TEST_PATH_CAP] = {0};
@@ -4468,6 +4538,20 @@ TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop) {
     PASS();
 }
 
+TEST(daemon_runtime_service_reuses_cached_active_image_fingerprint) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_configured(&fixture, "active-image-cache", &identity,
+                                                         8, 5000, NULL, true);
+    bool cache_hit =
+        started && cbm_daemon_runtime_service_active_image_cache_hit_for_testing(fixture.service);
+    runtime_test_fixture_finish(&fixture);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(cache_hit);
+    PASS();
+}
+
 TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
@@ -4511,6 +4595,8 @@ TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
 }
 
 SUITE(daemon_runtime) {
+    RUN_TEST(daemon_runtime_service_reuses_cached_active_image_fingerprint);
+    RUN_TEST(daemon_runtime_copied_image_peer_fingerprint_reuses_exact_cache_record);
     RUN_TEST(daemon_runtime_permanent_service_survives_last_disconnect_until_stop);
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);

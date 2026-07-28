@@ -175,6 +175,12 @@ struct cbm_daemon_runtime_service {
     cbm_daemon_build_identity_t identity;
     runtime_process_image_reference_t active_image;
     char *conflict_log_path;
+    char *build_fingerprint_cache_path;
+    bool build_fingerprint_cache_enabled;
+#if defined(CBM_CLI_ENABLE_TEST_API)
+    bool active_image_fingerprint_cache_hit;
+    atomic_uint_fast64_t peer_fingerprint_cache_hits;
+#endif
     size_t conflict_log_cap_bytes;
     uint64_t lease_timeout_ms;
     uint32_t request_timeout_ms;
@@ -842,6 +848,44 @@ static bool runtime_process_image_reference_matches_process(
 #endif
 }
 
+/* Fingerprint the already-retained process image, then prove that the process
+ * still maps that exact native object. A cache hit remains exact because the
+ * native-file cache brackets identity/size/change metadata around lookup and
+ * this function revalidates the process mapping afterward. Unchanged startup
+ * is O(1) time and memory; a miss remains O(executable bytes) time with O(1)
+ * auxiliary memory. */
+static bool runtime_process_image_reference_fingerprint_cached(
+    const runtime_process_image_reference_t *reference, uint64_t process_id, const char *cache_path,
+    bool allow_cache, char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out) {
+    if (!reference || !reference->held || process_id == 0 || !out) {
+        return false;
+    }
+    out[0] = '\0';
+    if (cache_hit_out) {
+        *cache_hit_out = false;
+    }
+#ifdef _WIN32
+    uintptr_t native_file = (uintptr_t)reference->file;
+#elif defined(__APPLE__) || defined(__linux__)
+    uintptr_t native_file = (uintptr_t)reference->fd;
+#else
+    uintptr_t native_file = 0;
+    (void)cache_path;
+    (void)allow_cache;
+    return false;
+#endif
+    bool ok = cbm_daemon_build_fingerprint_native_file_cached(native_file, cache_path, allow_cache,
+                                                              out, cache_hit_out) &&
+              runtime_process_image_reference_matches_process(reference, process_id);
+    if (!ok) {
+        out[0] = '\0';
+        if (cache_hit_out) {
+            *cache_hit_out = false;
+        }
+    }
+    return ok;
+}
+
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
                                                   char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     if (!out) {
@@ -874,18 +918,8 @@ bool cbm_daemon_runtime_process_build_fingerprint_cached(
     runtime_process_image_reference_init(&reference);
     bool ok = runtime_process_image_reference_acquire(process_id, &reference, NULL);
     if (ok) {
-#ifdef _WIN32
-        uintptr_t native_file = (uintptr_t)reference.file;
-#elif defined(__APPLE__) || defined(__linux__)
-        uintptr_t native_file = (uintptr_t)reference.fd;
-#else
-        uintptr_t native_file = 0;
-        ok = false;
-#endif
-        ok = ok &&
-             cbm_daemon_build_fingerprint_native_file_cached(
-                 native_file, cache_path, allow_cache, out, cache_hit_out) &&
-             runtime_process_image_reference_matches_process(&reference, process_id);
+        ok = runtime_process_image_reference_fingerprint_cached(&reference, process_id, cache_path,
+                                                                allow_cache, out, cache_hit_out);
     }
     if (!runtime_process_image_reference_release(&reference)) {
         ok = false;
@@ -1760,8 +1794,20 @@ static void *runtime_connection_worker(void *opaque) {
     bool peer_image_fingerprinted = false;
     if (!peer_image_verified) {
         char peer_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+        bool peer_cache_hit = false;
         peer_image_fingerprinted =
-            cbm_daemon_runtime_process_build_fingerprint(worker->peer_process_id, peer_fingerprint);
+            service->build_fingerprint_cache_enabled
+                ? cbm_daemon_runtime_process_build_fingerprint_cached(
+                      worker->peer_process_id, service->build_fingerprint_cache_path, true,
+                      peer_fingerprint, &peer_cache_hit)
+                : cbm_daemon_runtime_process_build_fingerprint(worker->peer_process_id,
+                                                               peer_fingerprint);
+        if (peer_cache_hit) {
+#if defined(CBM_CLI_ENABLE_TEST_API)
+            atomic_fetch_add_explicit(&service->peer_fingerprint_cache_hits, 1,
+                                      memory_order_relaxed);
+#endif
+        }
         peer_image_verified = peer_image_fingerprinted &&
                               strcmp(peer_fingerprint, requested_build) == 0 &&
                               strcmp(peer_fingerprint, service->identity.build_fingerprint) == 0;
@@ -2139,6 +2185,7 @@ static void runtime_service_destroy_unstarted(cbm_daemon_runtime_service_t *serv
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
     free(service->conflict_log_path);
+    free(service->build_fingerprint_cache_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
     }
@@ -2152,10 +2199,13 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io) {
     uint8_t validation[CBM_DAEMON_RENDEZVOUS_REQUEST_SIZE];
     char active_process_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    bool active_image_fingerprint_cache_hit = false;
     runtime_process_image_reference_t active_image;
     runtime_process_image_reference_init(&active_image);
     if (!reservation_io || !*reservation_io || !config || !config->endpoint ||
         !config->conflict_log_path || config->conflict_log_cap_bytes == 0 ||
+        (config->build_fingerprint_cache_enabled &&
+         (!config->build_fingerprint_cache_path || !config->build_fingerprint_cache_path[0])) ||
         config->max_clients == 0 || config->max_clients > RUNTIME_MAX_CLIENTS_HARD ||
         config->lease_timeout_ms == 0 || config->request_timeout_ms == 0 ||
         config->request_timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER ||
@@ -2170,8 +2220,12 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
      * because its invocation defines no host OS macro. Production compilers
      * select one of the Windows/macOS/Linux native-image implementations. */
     // cppcheck-suppress knownConditionTrueFalse
-    if (!runtime_process_image_reference_acquire(runtime_current_process_id(), &active_image,
-                                                 active_process_fingerprint) ||
+    uint64_t active_process_id = runtime_current_process_id();
+    if (!runtime_process_image_reference_acquire(active_process_id, &active_image, NULL) ||
+        !runtime_process_image_reference_fingerprint_cached(
+            &active_image, active_process_id, config->build_fingerprint_cache_path,
+            config->build_fingerprint_cache_enabled, active_process_fingerprint,
+            &active_image_fingerprint_cache_hit) ||
         strcmp(active_process_fingerprint, config->identity.build_fingerprint) != 0) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "active_image_identity");
         (void)runtime_process_image_reference_release(&active_image);
@@ -2188,6 +2242,12 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     runtime_process_image_reference_init(&active_image);
     cbm_mutex_init(&service->mutex);
     atomic_init(&service->accept_thread_done, false);
+#if defined(CBM_CLI_ENABLE_TEST_API)
+    service->active_image_fingerprint_cache_hit = active_image_fingerprint_cache_hit;
+    atomic_init(&service->peer_fingerprint_cache_hits, 0);
+#else
+    (void)active_image_fingerprint_cache_hit;
+#endif
     service->worker_capacity = config->max_clients;
     service->workers = calloc(service->worker_capacity, sizeof(*service->workers));
     service->coordinator = cbm_daemon_coordinator_new(config->lease_timeout_ms);
@@ -2196,6 +2256,11 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     }
     service->conflict_log_path =
         runtime_string_copy_bounded(config->conflict_log_path, RUNTIME_PATH_CAP);
+    if (config->build_fingerprint_cache_enabled) {
+        service->build_fingerprint_cache_path =
+            runtime_string_copy_bounded(config->build_fingerprint_cache_path, RUNTIME_PATH_CAP);
+    }
+    service->build_fingerprint_cache_enabled = config->build_fingerprint_cache_enabled;
     size_t version_length = 0;
     size_t build_length = 0;
     bool copied_identity =
@@ -2221,6 +2286,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->state = CBM_DAEMON_RUNTIME_SERVICE_STARTING;
 
     if (!service->workers || !service->coordinator || !service->conflict_log_path ||
+        (service->build_fingerprint_cache_enabled && !service->build_fingerprint_cache_path) ||
         !copied_identity) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "service_initialization");
         runtime_service_destroy_unstarted(service);
@@ -2414,6 +2480,20 @@ bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service
     return service && cbm_daemon_job_reaped(service->coordinator, project_key, cbm_now_ms());
 }
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+bool cbm_daemon_runtime_service_active_image_cache_hit_for_testing(
+    const cbm_daemon_runtime_service_t *service) {
+    return service && service->active_image_fingerprint_cache_hit;
+}
+
+uint64_t cbm_daemon_runtime_service_peer_cache_hits_for_testing(
+    const cbm_daemon_runtime_service_t *service) {
+    return service
+               ? atomic_load_explicit(&service->peer_fingerprint_cache_hits, memory_order_relaxed)
+               : 0;
+}
+#endif
+
 bool cbm_daemon_runtime_service_stop(cbm_daemon_runtime_service_t *service, uint32_t timeout_ms) {
     if (!service) {
         return false;
@@ -2458,6 +2538,7 @@ bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service) {
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
     free(service->conflict_log_path);
+    free(service->build_fingerprint_cache_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
     }
