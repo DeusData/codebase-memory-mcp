@@ -9,13 +9,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define CBM_SHA256_BLOCK_LEN 64  /* FIPS 180-4 message block bytes */
 #define CBM_SHA256_DIGEST_LEN 32 /* raw digest bytes */
 #define CBM_SHA256_HEX_LEN 64    /* lowercase hex chars (no NUL) */
 
 typedef struct {
     uint32_t state[8];
     uint64_t bitlen;
-    uint8_t buf[64];
+    uint8_t buf[CBM_SHA256_BLOCK_LEN];
     size_t buflen;
 } cbm_sha256_ctx;
 
