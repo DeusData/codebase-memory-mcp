@@ -445,9 +445,9 @@ static void add_overlay_active_schema_freshness(
     }
 }
 
-static void add_overlay_active_search_code_freshness(
+static void add_overlay_active_source_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
-    const cbm_store_overlay_node_view_summary_t *summary) {
+    const cbm_store_overlay_node_view_summary_t *summary, const char *warning) {
     if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
@@ -467,11 +467,26 @@ static void add_overlay_active_search_code_freshness(
                            summary->overlay_owned_nodes_visible);
     yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
                            summary->total_nodes_visible);
-    add_response_warning(
-        doc, root,
+    add_response_warning(doc, root, warning);
+}
+
+static void add_overlay_active_search_code_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    add_overlay_active_source_freshness(
+        doc, root, summary,
         "search_code read live source files and used active overlay node rows for graph "
         "annotations where ready; raw matches remain live-source-only when no graph node "
         "contains the match line.");
+}
+
+static void add_overlay_active_snippet_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    add_overlay_active_source_freshness(
+        doc, root, summary,
+        "get_code used the active overlay node span to read the current source file; canonical "
+        "rows hidden by changed-file tombstones were not used.");
 }
 
 static bool add_overlay_active_architecture_freshness(
@@ -13801,8 +13816,10 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
             snprintf(note, sizeof(note),
                      "This file was only PARTIALLY indexed — line range(s) %s could not be "
                      "parsed, so constructs there may be missing from the graph (callers/callees "
-                     "and search results can under-report this file). The source above is ground "
-                     "truth. (best-effort signal)",
+                     "and search results can under-report this file). The returned source bytes "
+                     "were read from the current file using the selected node span; consult "
+                     "freshness because a dirty canonical span can lag live edits. "
+                     "(best-effort signal)",
                      rows[i].detail && rows[i].detail[0] ? rows[i].detail : "?");
             yyjson_mut_obj_add_strcpy(doc, root_obj, "coverage_note", note);
             break;
@@ -13814,7 +13831,8 @@ static void add_snippet_coverage_note(yyjson_mut_doc *doc, yyjson_mut_val *root_
 static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     const char *match_method, bool include_neighbors,
                                     cbm_node_t *alternatives, int alt_count,
-                                    int max_lines, const char *mode, bool compact) {
+                                    int max_lines, const char *mode, bool compact,
+                                    const cbm_store_overlay_node_view_summary_t *overlay_summary) {
     char *root_path = get_project_root(srv, node->project);
 
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
@@ -13992,19 +14010,44 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     cbm_store_t *store = srv->store;
     int in_deg = 0;
     int out_deg = 0;
-    cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
+    if (cbm_store_overlay_node_view_has_ready_rows(overlay_summary)) {
+        (void)cbm_store_active_node_degree_by_qn(store, node->project, node->qualified_name,
+                                                 &in_deg, &out_deg);
+    } else {
+        cbm_store_node_degree(store, node->id, &in_deg, &out_deg);
+    }
     yyjson_mut_obj_add_int(doc, root_obj, "callers", in_deg);
     yyjson_mut_obj_add_int(doc, root_obj, "callees", out_deg);
 
     add_snippet_coverage_note(doc, root_obj, store, node);
+    if (cbm_store_overlay_node_view_has_ready_rows(overlay_summary)) {
+        add_overlay_active_snippet_freshness(doc, root_obj, overlay_summary);
+    }
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, node->project, &dirty_pending, &dirty_overlay_ready)) {
+        cbm_mcp_add_dirty_file_freshness_counts(
+            doc, root_obj, dirty_pending, dirty_overlay_ready,
+            cbm_store_overlay_node_view_has_ready_rows(overlay_summary)
+                ? "get_code used ready active-overlay spans where available; pending dirty files "
+                  "may still be absent until overlay extraction or reindex completes."
+                : "get_code used canonical node spans against the current source file; dirty "
+                  "edits can shift those spans until overlay extraction or reindex completes.");
+    }
 
     char **nb_callers = NULL;
     int nb_caller_count = 0;
     char **nb_callees = NULL;
     int nb_callee_count = 0;
     if (include_neighbors) {
-        cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
-                                      &nb_caller_count, &nb_callees, &nb_callee_count);
+        if (cbm_store_overlay_node_view_has_ready_rows(overlay_summary)) {
+            (void)cbm_store_active_node_neighbor_names_by_qn(
+                store, node->project, node->qualified_name, MCP_DEFAULT_LIMIT, &nb_callers,
+                &nb_caller_count, &nb_callees, &nb_callee_count);
+        } else {
+            cbm_store_node_neighbor_names(store, node->id, MCP_DEFAULT_LIMIT, &nb_callers,
+                                          &nb_caller_count, &nb_callees, &nb_callee_count);
+        }
         add_string_array(doc, root_obj, "caller_names", nb_callers, nb_caller_count);
         add_string_array(doc, root_obj, "callee_names", nb_callees, nb_callee_count);
     }
@@ -14107,14 +14150,34 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     REQUIRE_STORE_EX(store, project, (free(qn), free(snippet_mode), qn = NULL, snippet_mode = NULL));
 
     /* eff_project already set via resolve_project_store + QN extraction fallback */
+    cbm_store_overlay_node_view_summary_t overlay_summary = {0};
+    int ready_overlay_generations = 0;
+    bool ready_overlay_exists =
+        eff_project && eff_project[0] &&
+        cbm_store_count_overlay_generations(store, eff_project, CBM_STORE_OVERLAY_STATUS_READY,
+                                            &ready_overlay_generations) == CBM_STORE_OK &&
+        ready_overlay_generations > 0;
+    /* Preserve the clean-graph fast path established by 26905794: the indexed
+     * generation lookup is a constant-result gate, while the full summary
+     * counts canonical nodes and materializes ownership only when a ready
+     * overlay can change the selected source span. */
+    bool overlay_ready_for_snippet =
+        ready_overlay_exists &&
+        cbm_store_get_overlay_node_view_summary(store, eff_project, &overlay_summary) ==
+            CBM_STORE_OK &&
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
+    const cbm_store_overlay_node_view_summary_t *active_summary =
+        overlay_ready_for_snippet ? &overlay_summary : NULL;
 
     /* Tier 1: Exact QN match */
     cbm_node_t node = {0};
-    int rc = cbm_store_find_node_by_qn(store, eff_project, qn, &node);
+    int rc = overlay_ready_for_snippet
+                 ? cbm_store_find_node_by_qn_overlay_view(store, eff_project, qn, &node)
+                 : cbm_store_find_node_by_qn(store, eff_project, qn, &node);
     if (rc == CBM_STORE_OK) {
         char *result =
             build_snippet_response(srv, &node, NULL /*exact*/, include_neighbors, NULL, 0,
-                                      max_lines, snippet_mode, compact);
+                                   max_lines, snippet_mode, compact, active_summary);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -14126,12 +14189,17 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
      * and short names ("ProcessOrder") via LIKE '%.X'. */
     cbm_node_t *suffix_nodes = NULL;
     int suffix_count = 0;
-    cbm_store_find_nodes_by_qn_suffix(store, eff_project, qn, &suffix_nodes, &suffix_count);
+    if (overlay_ready_for_snippet) {
+        cbm_store_find_nodes_by_qn_suffix_overlay_view(store, eff_project, qn, &suffix_nodes,
+                                                       &suffix_count);
+    } else {
+        cbm_store_find_nodes_by_qn_suffix(store, eff_project, qn, &suffix_nodes, &suffix_count);
+    }
     if (suffix_count == 1) {
         copy_node(&suffix_nodes[0], &node);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         char *result = build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0,
-                                                     max_lines, snippet_mode, compact);
+                                              max_lines, snippet_mode, compact, active_summary);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -14142,13 +14210,18 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     /* Tier 3: Short name match */
     cbm_node_t *name_nodes = NULL;
     int name_count = 0;
-    cbm_store_find_nodes_by_name(store, eff_project, qn, &name_nodes, &name_count);
+    if (overlay_ready_for_snippet) {
+        cbm_store_find_nodes_by_name_overlay_view(store, eff_project, qn, &name_nodes,
+                                                  &name_count);
+    } else {
+        cbm_store_find_nodes_by_name(store, eff_project, qn, &name_nodes, &name_count);
+    }
     if (name_count == 1) {
         copy_node(&name_nodes[0], &node);
         cbm_store_free_nodes(name_nodes, name_count);
         cbm_store_free_nodes(suffix_nodes, suffix_count);
         char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0,
-                                                     max_lines, snippet_mode, compact);
+                                              max_lines, snippet_mode, compact, active_summary);
         free_node_contents(&node);
         free(qn);
         free(project);
@@ -14156,10 +14229,12 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
-    /* Ambiguous: collect candidates from suffix + name tiers (dedup by id) */
+    /* Ambiguous: collect candidates from suffix + name tiers. Overlay nodes
+     * deliberately share CBM_STORE_NO_NODE_ID, so qualified_name—not row id—is
+     * the stable identity across canonical and active read models. */
     int total_cand = suffix_count + name_count;
     if (total_cand > 0) {
-        /* Dedup by node ID */
+        /* Deduplicate by qualified-name identity. */
         cbm_node_t *candidates = calloc((size_t)total_cand, sizeof(cbm_node_t));
         int cand_count = 0;
 
@@ -14169,7 +14244,8 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         for (int i = 0; i < name_count; i++) {
             bool dup = false;
             for (int j = 0; j < cand_count; j++) {
-                if (candidates[j].id == name_nodes[i].id) {
+                if (candidates[j].qualified_name && name_nodes[i].qualified_name &&
+                    strcmp(candidates[j].qualified_name, name_nodes[i].qualified_name) == 0) {
                     dup = true;
                     break;
                 }
@@ -14188,7 +14264,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             free_node_contents(&candidates[0]);
             free(candidates);
             char *result = build_snippet_response(srv, &node, "name", include_neighbors, NULL, 0,
-                                                         max_lines, snippet_mode, compact);
+                                                  max_lines, snippet_mode, compact, active_summary);
             free_node_contents(&node);
             free(qn);
             free(project);
@@ -14205,7 +14281,12 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
             for (int i = 0; i < cand_count; i++) {
                 int in_d = 0;
                 int out_d = 0;
-                cbm_store_node_degree(store, candidates[i].id, &in_d, &out_d);
+                if (overlay_ready_for_snippet) {
+                    (void)cbm_store_active_node_degree_by_qn(
+                        store, eff_project, candidates[i].qualified_name, &in_d, &out_d);
+                } else {
+                    cbm_store_node_degree(store, candidates[i].id, &in_d, &out_d);
+                }
                 int deg = in_d + out_d;
                 bool is_test =
                     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
@@ -14240,7 +14321,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
             char *result =
                 build_snippet_response(srv, &node, "auto_best", include_neighbors, alts, alt_count,
-                                          max_lines, snippet_mode, compact);
+                                       max_lines, snippet_mode, compact, active_summary);
             free_node_contents(&node);
             for (int i = 0; i < alt_count; i++) {
                 free_node_contents(&alts[i]);

@@ -2697,6 +2697,223 @@ TEST(tool_search_graph_uses_overlay_active_node_rows) {
     PASS();
 }
 
+typedef struct {
+    bool saw_active_node_candidates;
+    bool saw_direct_canonical_count;
+} snippet_overlay_sql_trace_t;
+
+static int snippet_overlay_sql_trace(unsigned trace_type, void *context, void *statement,
+                                     void *sql_text) {
+    (void)statement;
+    if (trace_type != SQLITE_TRACE_STMT || !context || !sql_text) {
+        return 0;
+    }
+    snippet_overlay_sql_trace_t *trace = context;
+    const char *sql = sql_text;
+    if (strstr(sql, "active_node_candidates")) {
+        trace->saw_active_node_candidates = true;
+    }
+    if (strstr(sql, "SELECT COUNT(*) FROM nodes WHERE project")) {
+        trace->saw_direct_canonical_count = true;
+    }
+    return 0;
+}
+
+TEST(tool_get_code_clean_path_skips_overlay_summary_and_warns_when_dirty) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    sqlite3 *db = cbm_store_get_db(st);
+    ASSERT_NOT_NULL(db);
+
+    /* Consume the required automatic first-response architecture context
+     * before isolating the steady-state snippet SQL contract. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "get_code",
+        "{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\"}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    snippet_overlay_sql_trace_t trace = {0};
+    ASSERT_EQ(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, snippet_overlay_sql_trace, &trace),
+              SQLITE_OK);
+    resp = cbm_mcp_handle_tool(
+        srv, "get_code",
+        "{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest() error"));
+    ASSERT_FALSE(trace.saw_active_node_candidates);
+    ASSERT_FALSE(trace.saw_direct_canonical_count);
+    ASSERT_EQ(sqlite3_trace_v2(db, 0, NULL, NULL), SQLITE_OK);
+    free(inner);
+    free(resp);
+
+    cbm_dirty_file_state_t dirty = {
+        .project = "test-project",
+        .rel_path = "main.go",
+        .observed_hash = "live-edit-without-ready-overlay",
+        .observed_generation = 2,
+        .source = CBM_STORE_DIRTY_SOURCE_GIT_STATUS,
+        .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, "test-project", "main.go",
+                                         "canonical-main-hash", 1, 1),
+              CBM_STORE_OK);
+    cbm_coverage_row_t coverage = {
+        .rel_path = "main.go", .kind = "parse_partial", .detail = "3-5"};
+    ASSERT_EQ(cbm_store_coverage_replace(st, "test-project", &coverage, 1), CBM_STORE_OK);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+    ASSERT_NOT_NULL(strstr(inner, "canonical node spans"));
+    ASSERT_NOT_NULL(strstr(inner, "until overlay extraction or reindex completes"));
+    ASSERT_NOT_NULL(strstr(inner, "returned source bytes"));
+    ASSERT_NOT_NULL(strstr(inner, "dirty canonical span can lag live edits"));
+    ASSERT_NULL(strstr(inner, "source above is ground truth"));
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_code_uses_overlay_active_symbol_span) {
+    enum { BASE_GENERATION = 1 };
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    char src_path[512];
+    int n = snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(src_path));
+    ASSERT_EQ(th_write_file(src_path,
+                            "package main\n"
+                            "\n"
+                            "// canonical span no longer names the function\n"
+                            "\n"
+                            "// shifted by a live edit\n"
+                            "func HandleRequest() error {\n"
+                            "\treturn nil\n"
+                            "}\n"),
+              0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, "test-project", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_nodes[] = {
+        {.project = "test-project",
+         .label = "Function",
+         .name = "HandleRequest",
+         .qualified_name = "test-project.cmd.server.main.HandleRequest",
+         .file_path = "main.go",
+         .start_line = 6,
+         .end_line = 8,
+         .properties_json = "{\"signature\":\"func HandleRequest() error\"}"},
+        {.project = "test-project",
+         .label = "Function",
+         .name = "ProcessOrder",
+         .qualified_name = "test-project.cmd.server.main.ProcessOrder",
+         .file_path = "main.go",
+         .start_line = 0,
+         .end_line = 0,
+         .properties_json = "{}"},
+        {.project = "test-project",
+         .label = "Function",
+         .name = "Run",
+         .qualified_name = "test-project.cmd.server.Run",
+         .file_path = "main.go",
+         .start_line = 0,
+         .end_line = 0,
+         .properties_json = "{}"},
+        {.project = "test-project",
+         .label = "Function",
+         .name = "Caller",
+         .qualified_name = "test-project.cmd.server.Caller",
+         .file_path = "main.go",
+         .start_line = 0,
+         .end_line = 0,
+         .properties_json = "{}"}};
+    cbm_store_delta_edge_t fresh_edges[] = {
+        {.source_qn = "test-project.cmd.server.main.HandleRequest",
+         .target_qn = "test-project.cmd.server.main.ProcessOrder",
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT},
+        {.source_qn = "test-project.cmd.server.main.HandleRequest",
+         .target_qn = "test-project.cmd.server.Run",
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT},
+        {.source_qn = "test-project.cmd.server.Caller",
+         .target_qn = "test-project.cmd.server.main.HandleRequest",
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_store_file_delta_t delta = {.project = "test-project",
+                                    .rel_path = "main.go",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = fresh_nodes,
+                                    .node_count = CBM_SZ_4,
+                                    .edges = fresh_edges,
+                                    .edge_count = CBM_SZ_3};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    const char *tool_names[] = {"get_code", "get_code_snippet"};
+    const char *qualified_names[] = {"test-project.cmd.server.main.HandleRequest",
+                                     "main.HandleRequest"};
+    for (size_t i = 0; i < sizeof(tool_names) / sizeof(tool_names[0]); i++) {
+        char args[CBM_SZ_512];
+        n = snprintf(args, sizeof(args),
+                     "{\"project\":\"test-project\","
+                     "\"qualified_name\":\"%s\","
+                     "\"include_neighbors\":true,"
+                     "\"mode\":\"full\"}",
+                     qualified_names[i]);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(args));
+        char *resp = cbm_mcp_handle_tool(srv, tool_names[i], args);
+        ASSERT_NOT_NULL(resp);
+        char *inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"start_line\":6"));
+        ASSERT_NOT_NULL(strstr(inner, "\"end_line\":8"));
+        ASSERT_NOT_NULL(strstr(inner, "func HandleRequest() error"));
+        ASSERT_NULL(strstr(inner, "canonical span no longer names the function"));
+        ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"callers\":1"));
+        ASSERT_NOT_NULL(strstr(inner, "\"callees\":2"));
+        ASSERT_NOT_NULL(strstr(inner, "\"caller_names\""));
+        ASSERT_NOT_NULL(strstr(inner, "Caller"));
+        ASSERT_NOT_NULL(strstr(inner, "\"callee_names\""));
+        ASSERT_NOT_NULL(strstr(inner, "ProcessOrder"));
+        ASSERT_NOT_NULL(strstr(inner, "Run"));
+        free(inner);
+        free(resp);
+    }
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_uses_overlay_active_relationship_rows) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -16650,6 +16867,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_warns_on_stale_route_view);
     RUN_TEST(tool_search_graph_reports_dirty_metadata_without_hiding_canonical_rows);
     RUN_TEST(tool_search_graph_uses_overlay_active_node_rows);
+    RUN_TEST(tool_get_code_clean_path_skips_overlay_summary_and_warns_when_dirty);
+    RUN_TEST(tool_get_code_uses_overlay_active_symbol_span);
     RUN_TEST(tool_search_graph_uses_overlay_active_relationship_rows);
     RUN_TEST(tool_search_graph_uses_overlay_active_inbound_relationship_rows);
     RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
