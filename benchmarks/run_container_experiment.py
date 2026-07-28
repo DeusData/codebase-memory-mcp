@@ -279,6 +279,10 @@ def build_measured_command(
         docker,
         "run",
         "--rm",
+        # Candidate CLIs can detach supervised workers. Docker's init forwards
+        # stop signals and reaps each exited descendant in O(children) total
+        # work, preventing earlier cells from polluting later process tables.
+        "--init",
         "--name",
         container_name,
         "--platform",
