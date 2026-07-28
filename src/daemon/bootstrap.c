@@ -171,7 +171,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
             if (bootstrap_has_help_after(argc, argv, arg + 1)) {
                 return CBM_DAEMON_PROCESS_STATELESS;
             }
-            return CBM_DAEMON_PROCESS_LOCAL_CLI;
+            return CBM_DAEMON_PROCESS_DAEMON_CLI;
         }
         if (bootstrap_arg_is(argv[arg], "hook-augment")) {
             return CBM_DAEMON_PROCESS_HOOK_CLIENT;
@@ -181,7 +181,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
                                                                  : CBM_DAEMON_PROCESS_LOCAL_CLI;
         }
         /* Placed after the `cli` check on purpose: `cbm cli search "daemon
-         * start"` is opaque tool input and must stay LOCAL_CLI. */
+         * start"` is opaque tool input and must stay DAEMON_CLI. */
         if (bootstrap_arg_is(argv[arg], "daemon")) {
             return bootstrap_has_help_after(argc, argv, arg + 1) ? CBM_DAEMON_PROCESS_STATELESS
                                                                  : CBM_DAEMON_PROCESS_DAEMON_CTL;
