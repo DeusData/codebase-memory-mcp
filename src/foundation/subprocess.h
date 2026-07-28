@@ -169,10 +169,14 @@ cbm_proc_outcome_t cbm_proc_classify(bool exited_normally, int exit_code, int te
 /* Stable lowercase name for an outcome (for structured logs / skip reasons). */
 const char *cbm_proc_outcome_str(cbm_proc_outcome_t o);
 
+enum { CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL = 0 };
+
 /* Select the child-reap polling interval. Short-lived workers are polled more
- * frequently during a bounded startup window; after that window the caller's
- * platform-specific steady interval is preserved. Exposed as a pure function
- * so both policies are testable without claiming cross-platform execution. */
+ * frequently during a bounded startup window. After that window, a positive
+ * steady_interval_ms preserves a caller-specific cadence;
+ * CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL selects the shared platform
+ * cadence. Exposed as a pure function so both policies are testable without
+ * claiming cross-platform execution. */
 int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms);
 
 /* Build a Windows CreateProcess command line from a NULL-terminated argv, applying

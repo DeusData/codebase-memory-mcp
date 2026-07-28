@@ -238,19 +238,23 @@ static void accumulate_data_flow(TSNode node, const char *kind, uint32_t child_c
  * condition field. Treating the entire control statement as condition context
  * would misclassify identifiers in its body.
  */
-static bool starts_condition_scope(TSNode node) {
+static bool starts_condition_scope(const TSTreeCursor *cursor, TSNode node) {
+    /*
+     * The cursor already resolved the current node's field while traversing.
+     * Most AST nodes are not condition fields, so reject them before asking
+     * Tree-sitter to reconstruct the parent and search its field map. This
+     * preserves one O(N) walk while avoiding two parent/field lookups per node.
+     */
+    const char *field = ts_tree_cursor_current_field_name(cursor);
+    if (!field || strcmp(field, "condition") != 0) {
+        return false;
+    }
     TSNode parent = ts_node_parent(node);
     if (ts_node_is_null(parent)) {
         return false;
     }
     const char *parent_kind = ts_node_type(parent);
-    if (!is_control_if(parent_kind) && !is_control_while(parent_kind)) {
-        return false;
-    }
-    static const char condition_field[] = "condition";
-    TSNode condition =
-        ts_node_child_by_field_name(parent, condition_field, sizeof(condition_field) - SKIP_ONE);
-    return !ts_node_is_null(condition) && ts_node_eq(condition, node);
+    return is_control_if(parent_kind) || is_control_while(parent_kind);
 }
 
 bool cbm_ast_profile_compute(TSNode func_body, const char *source, const char **param_names,
@@ -284,7 +288,7 @@ bool cbm_ast_profile_compute(TSNode func_body, const char *source, const char **
         TSNode node = ts_tree_cursor_current_node(&cursor);
         uint32_t child_count = ts_node_child_count(node);
         const char *kind = ts_node_type(node);
-        bool condition_root = starts_condition_scope(node);
+        bool condition_root = starts_condition_scope(&cursor, node);
 
         if (!ts_node_is_named(node) && child_count == 0) {
             /* Anonymous leaf (punctuation, keywords) — skip. */
@@ -326,7 +330,7 @@ bool cbm_ast_profile_compute(TSNode func_body, const char *source, const char **
             if (is_return(ts_node_type(exited_parent))) {
                 return_scope_depth--;
             }
-            if (starts_condition_scope(exited_parent)) {
+            if (starts_condition_scope(&cursor, exited_parent)) {
                 condition_scope_depth--;
             }
             if (ts_tree_cursor_goto_next_sibling(&cursor)) {

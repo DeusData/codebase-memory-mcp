@@ -118,6 +118,11 @@ TEST(subprocess_short_child_uses_fast_reap_window) {
     ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 100), 100);
     ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 200), 200);
 #ifdef _WIN32
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL), 200);
+#else
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL), 100);
+#endif
+#ifdef _WIN32
     SKIP_PLATFORM("POSIX /bin/sh latency canary; poll policy assertions ran");
 #elif defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
     SKIP_PLATFORM("wall-clock fork/exec canary is invalid under TSan; poll policy assertions ran");
@@ -934,6 +939,39 @@ TEST(subprocess_posix_child_closes_unrelated_descriptors) {
 #endif
 }
 
+TEST(subprocess_posix_child_resets_signal_disposition_and_mask) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX signal disposition/mask probe");
+#else
+    struct sigaction ignored = {0};
+    struct sigaction original_action;
+    ignored.sa_handler = SIG_IGN;
+    ASSERT_EQ(sigemptyset(&ignored.sa_mask), 0);
+    ASSERT_EQ(sigaction(SIGTERM, &ignored, &original_action), 0);
+    sigset_t blocked;
+    sigset_t original_mask;
+    ASSERT_EQ(sigemptyset(&blocked), 0);
+    ASSERT_EQ(sigaddset(&blocked, SIGTERM), 0);
+    ASSERT_EQ(sigprocmask(SIG_BLOCK, &blocked, &original_mask), 0);
+
+    const char *argv[] = {"/bin/sh", "-c", "kill -TERM $$; exit 42", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    cbm_proc_result_t result = {0};
+    int run_rc = cbm_subprocess_run(&opts, &result);
+
+    int mask_restore = sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    int action_restore = sigaction(SIGTERM, &original_action, NULL);
+    ASSERT_EQ(mask_restore, 0);
+    ASSERT_EQ(action_restore, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_KILLED);
+    ASSERT_EQ(result.term_signal, SIGTERM);
+    PASS();
+#endif
+}
+
 TEST(subprocess_root_exit_drains_surviving_descendant) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group descendant probe; native Windows coverage pending");
@@ -1285,6 +1323,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_posix_child_resets_signal_disposition_and_mask);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);

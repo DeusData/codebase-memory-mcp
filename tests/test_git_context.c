@@ -290,6 +290,9 @@ TEST(current_branch_resolves_attached_detached_unborn_and_non_git) {
                            cbm_git_drain_command(non_git, unborn_ref_args) == 0;
     int unborn_rc =
         unborn_setup_ok ? cbm_git_current_branch(non_git, &unborn) : CBM_NOT_FOUND;
+    cbm_git_context_t unborn_context = {0};
+    int unborn_context_rc =
+        unborn_setup_ok ? cbm_git_context_resolve(non_git, &unborn_context) : CBM_NOT_FOUND;
     char plain_dir[256];
     raw = th_mktempdir("cbm_branch_plain_after_unborn");
     bool plain_setup_ok = raw != NULL;
@@ -302,12 +305,18 @@ TEST(current_branch_resolves_attached_detached_unborn_and_non_git) {
                                detached_context.branch &&
                                strcmp(detached_context.branch, "DETACHED") == 0;
     bool unborn_ok = unborn_rc == 0 && unborn && strcmp(unborn, "unborn-probe") == 0;
+    bool unborn_context_ok = unborn_context_rc == 0 && unborn_context.is_git &&
+                             !unborn_context.is_detached && unborn_context.branch &&
+                             strcmp(unborn_context.branch, "unborn-probe") == 0 &&
+                             unborn_context.head_sha && unborn_context.head_sha[0] == '\0' &&
+                             unborn_context.base_sha && unborn_context.base_sha[0] == '\0';
     bool plain_ok = plain_rc == CBM_NOT_FOUND && plain == NULL;
     free(attached);
     free(detached);
     free(unborn);
     free(plain);
     cbm_git_context_free(&detached_context);
+    cbm_git_context_free(&unborn_context);
     if (plain_setup_ok) th_rmtree(plain_dir);
     th_rmtree(non_git);
     th_rmtree(repo);
@@ -320,6 +329,7 @@ TEST(current_branch_resolves_attached_detached_unborn_and_non_git) {
     ASSERT_TRUE(detached_ok);
     ASSERT_TRUE(detached_context_ok);
     ASSERT_TRUE(unborn_ok);
+    ASSERT_TRUE(unborn_context_ok);
     ASSERT_TRUE(plain_ok);
     PASS();
 }

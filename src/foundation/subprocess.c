@@ -7,6 +7,7 @@
 
 #include "compat.h" /* cbm_nanosleep */
 #include "compat_fs.h"
+#include "constants.h"
 #include "log.h"
 #include "platform.h" /* cbm_now_ms */
 #include "platform_internal.h"
@@ -24,10 +25,18 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <spawn.h>
+extern char **environ;
+#endif
 #endif
 
 /* NTSTATUS severity ERROR (top two bits set) covers the Windows crash exception
@@ -102,6 +111,8 @@ enum {
     CBM_PROC_FAST_REAP_POLL_MS = 5,
     CBM_PROC_POSIX_STEADY_POLL_MS = 100,
     CBM_PROC_WIN_STEADY_POLL_MS = 200,
+    CBM_PROC_POSIX_OPEN_MAX_CEILING = 1024 * 1024,
+    CBM_PROC_POSIX_OPEN_MAX_FALLBACK = 64 * 1024,
 };
 
 #ifdef _WIN32
@@ -114,7 +125,7 @@ int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms)
     if (elapsed_ms < CBM_PROC_FAST_REAP_WINDOW_MS) {
         return CBM_PROC_FAST_REAP_POLL_MS;
     }
-    return steady_interval_ms > 0 ? steady_interval_ms : CBM_PROC_POSIX_STEADY_POLL_MS;
+    return steady_interval_ms > 0 ? steady_interval_ms : CBM_PROC_STEADY_POLL_MS;
 }
 
 typedef enum {
@@ -940,6 +951,36 @@ static void cbm_posix_reset_child_signals(void) {
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
+static void cbm_posix_close_nonstdio(long max_fd) {
+    /*
+     * A high RLIMIT_NOFILE must not turn every spawn into hundreds of
+     * thousands of failed close() syscalls. Use an atomic kernel range close
+     * where the platform exposes one; fcntl(F_CLOSEM) provides the same
+     * close-from operation on platforms that define it. The bounded POSIX
+     * loop remains the portable fallback for older kernels/libcs. The range
+     * paths use O(1) user-space calls and O(1) memory; the fallback uses
+     * O(max_fd) close calls and O(1) memory.
+     *
+     * These operations run after fork and before exec, so keep this helper to
+     * direct descriptor operations and stack-only state. Linux's raw
+     * close_range syscall avoids libc allocation/locking; the portable fallback
+     * uses POSIX close().
+     */
+#if defined(__linux__) && defined(SYS_close_range)
+    if (syscall(SYS_close_range, (unsigned int)(STDERR_FILENO + 1), UINT_MAX, 0U) == 0) {
+        return;
+    }
+#endif
+#ifdef F_CLOSEM
+    if (fcntl(STDERR_FILENO + 1, F_CLOSEM, 0) == 0) {
+        return;
+    }
+#endif
+    for (long fd = STDERR_FILENO + 1; fd < max_fd && fd <= INT_MAX; fd++) {
+        (void)close((int)fd);
+    }
+}
+
 static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int output,
                                  int error_output, long max_fd) {
     if (setpgid(0, 0) < 0) {
@@ -964,9 +1005,7 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     if (error_output > STDERR_FILENO && error_output != output) {
         (void)close(error_output);
     }
-    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
-        (void)close(fd);
-    }
+    cbm_posix_close_nonstdio(max_fd);
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
      * still has execvp's exact-path semantics because it contains '/'. */
@@ -989,6 +1028,66 @@ static int cbm_posix_fd_at_least_three(int fd) {
     (void)close(fd);
     return duplicate;
 }
+
+#ifdef __APPLE__
+static bool cbm_darwin_spawn_managed(cbm_subprocess_t *process, int input, int output,
+                                     int error_output, pid_t *out_pid) {
+    /*
+     * Darwin exposes no public close_range()/closefrom() API, while OPEN_MAX is
+     * commonly near one million. Reuse the daemon launcher's kernel-backed
+     * close-on-exec policy instead of issuing O(OPEN_MAX) close() calls.
+     * File-action and attribute storage is O(1); posix_spawnp preserves PATH
+     * lookup, starts a new child-PID process group, resets inherited signal
+     * state, and leaves cbm_subprocess_t's parent-side supervision unchanged.
+     *
+     * Any setup or spawn error falls back to fork/exec below. Besides retaining
+     * compatibility, that preserves the existing exec-failure result: a missing
+     * binary is reaped as exit 127 rather than reported as a spawn failure.
+     */
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        return false;
+    }
+    bool actions_ready =
+        posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO) == 0 &&
+        posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) == 0 &&
+        posix_spawn_file_actions_adddup2(&actions, error_output, STDERR_FILENO) == 0 &&
+        posix_spawn_file_actions_addclose(&actions, input) == 0 &&
+        posix_spawn_file_actions_addclose(&actions, output) == 0 &&
+        (error_output == output || posix_spawn_file_actions_addclose(&actions, error_output) == 0);
+    if (!actions_ready) {
+        (void)posix_spawn_file_actions_destroy(&actions);
+        return false;
+    }
+
+    posix_spawnattr_t attributes;
+    if (posix_spawnattr_init(&attributes) != 0) {
+        (void)posix_spawn_file_actions_destroy(&actions);
+        return false;
+    }
+    sigset_t defaults;
+    sigset_t empty;
+    (void)sigemptyset(&defaults);
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (sig != SIGKILL && sig != SIGSTOP) {
+            (void)sigaddset(&defaults, sig);
+        }
+    }
+    (void)sigemptyset(&empty);
+    short flags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF |
+                  POSIX_SPAWN_SETSIGMASK;
+    bool attributes_ready = posix_spawnattr_setpgroup(&attributes, 0) == 0 &&
+                            posix_spawnattr_setsigdefault(&attributes, &defaults) == 0 &&
+                            posix_spawnattr_setsigmask(&attributes, &empty) == 0 &&
+                            posix_spawnattr_setflags(&attributes, flags) == 0;
+    int spawn_status = attributes_ready ? posix_spawnp(out_pid, process->bin, &actions, &attributes,
+                                                       process->argv, environ)
+                                        : EINVAL;
+    (void)posix_spawnattr_destroy(&attributes);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    return spawn_status == 0;
+}
+#endif
 
 static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     int input_flags = O_RDONLY;
@@ -1048,12 +1147,22 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
         return -1;
     }
 
-    long max_fd = sysconf(_SC_OPEN_MAX);
-    if (max_fd < 0 || max_fd > 1048576L) {
-        max_fd = 65536L;
+    pid_t pid = -1;
+#ifdef __APPLE__
+    bool spawned = cbm_darwin_spawn_managed(process, input, output, error_output, &pid);
+#else
+    bool spawned = false;
+#endif
+    if (!spawned) {
+        long max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd < 0 || max_fd > CBM_PROC_POSIX_OPEN_MAX_CEILING) {
+            max_fd = CBM_PROC_POSIX_OPEN_MAX_FALLBACK;
+        }
+        pid = fork();
+        if (pid == 0) {
+            cbm_posix_child_exec(process, input, output, error_output, max_fd);
+        }
     }
-
-    pid_t pid = fork();
     if (pid < 0) {
         (void)close(input);
         (void)close(output);
@@ -1062,18 +1171,15 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
         }
         return -1;
     }
-    if (pid == 0) {
-        cbm_posix_child_exec(process, input, output, error_output, max_fd);
-    }
     (void)close(input);
     (void)close(output);
     if (error_output != output) {
         (void)close(error_output);
     }
 
-    /* Parent and child both establish the group, removing scheduler-order races.
-     * If the child won and already execed, EACCES is accepted only after proving
-     * that its process group is the expected isolated one. */
+    /* The Darwin spawn attribute or fork child establishes the group before
+     * exec; the parent repeats it to remove fork scheduler-order races. EACCES
+     * is accepted only after proving the expected isolated process group. */
     bool contained = setpgid(pid, pid) == 0;
     if (!contained && (errno == EACCES || errno == EPERM || errno == ESRCH)) {
         contained = getpgid(pid) == pid;
@@ -1324,7 +1430,10 @@ int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         int interval_ms =
             cbm_subprocess_poll_interval_ms(cbm_now_ms() - poll_started_ms,
                                             CBM_PROC_STEADY_POLL_MS);
-        const struct timespec delay = {interval_ms / 1000, (long)(interval_ms % 1000) * 1000000L};
+        const struct timespec delay = {
+            interval_ms / (int)CBM_MSEC_PER_SEC,
+            (long)(interval_ms % (int)CBM_MSEC_PER_SEC) * (long)CBM_NSEC_PER_MSEC,
+        };
         (void)cbm_nanosleep(&delay, NULL);
     }
 }
