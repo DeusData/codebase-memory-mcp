@@ -33,6 +33,7 @@ OWNED_RUNNER_FLAGS = frozenset(
     {
         "--candidate-root",
         "--candidate-search-root",
+        "--build-jobs",
         "--experiment-root",
         "--matrix-spec",
         "--plan",
@@ -178,6 +179,15 @@ def validate_resources(cpus: float, memory: str, workers: int) -> dict[str, Any]
     return {"cpus": cpus, "memory": memory.lower(), "workers": workers}
 
 
+def resolve_build_jobs(cpus: float, requested: int | None) -> int:
+    """Use the container's complete declared CPU capacity unless overridden."""
+    if requested is not None:
+        if requested <= 0:
+            raise ValueError("benchmark build jobs must be greater than zero")
+        return requested
+    return max(1, math.ceil(cpus))
+
+
 def validate_forwarded_arguments(arguments: list[str]) -> list[str]:
     values = list(arguments)
     if values[:1] == ["--"]:
@@ -238,9 +248,7 @@ def materialize_container_matrix_spec(
         key for key in DEFAULT_BUILD_ENVIRONMENT if key in build_environment
     }
     if declared_compilers and declared_compilers != set(DEFAULT_BUILD_ENVIRONMENT):
-        raise ValueError(
-            "container matrix specs must declare CC and CXX together"
-        )
+        raise ValueError("container matrix specs must declare CC and CXX together")
     document["build_environment"] = {
         **DEFAULT_BUILD_ENVIRONMENT,
         **build_environment,
@@ -548,6 +556,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpus", type=float, required=True)
     parser.add_argument("--memory", required=True)
     parser.add_argument("--workers", type=int, required=True)
+    parser.add_argument(
+        "--build-jobs",
+        type=int,
+        help=(
+            "candidate build parallelism; defaults to the complete --cpus budget "
+            "rounded up"
+        ),
+    )
     parser.add_argument("--image")
     parser.add_argument("--docker", default="docker")
     parser.add_argument(
@@ -565,6 +581,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         args.quick = True
     try:
         args.resources = validate_resources(args.cpus, args.memory, args.workers)
+        args.build_jobs = resolve_build_jobs(args.cpus, args.build_jobs)
         args.runner_arguments = validate_forwarded_arguments(args.runner_arguments)
         args.platform = native_linux_platform(platform.machine())
     except ValueError as error:
@@ -716,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--product-env",
                     f"CBM_WORKERS={args.resources['workers']}",
                 ]
+            runner_arguments.extend(("--build-jobs", str(args.build_jobs)))
             runner_arguments.extend(args.runner_arguments)
             run_key = container_run_key(
                 source_revision=source_revision,
@@ -753,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "platform": args.platform,
                 "resources": args.resources,
+                "build_jobs": args.build_jobs,
                 "default_build_environment": DEFAULT_BUILD_ENVIRONMENT,
                 "work_volume": work_volume,
                 "results_volume": results_volume,

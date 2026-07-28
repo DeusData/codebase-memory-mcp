@@ -149,6 +149,38 @@ class BenchmarkContainerContractTest(unittest.TestCase):
             ):
                 CONTAINER.validate_resources(cpus, memory, workers)
 
+    def test_build_jobs_default_uses_the_complete_cpu_budget(self) -> None:
+        self.assertEqual(CONTAINER.resolve_build_jobs(4.0, None), 4)
+        self.assertEqual(CONTAINER.resolve_build_jobs(3.5, None), 4)
+        self.assertEqual(CONTAINER.resolve_build_jobs(0.25, None), 1)
+
+    def test_build_jobs_accepts_positive_override_and_rejects_nonpositive(self) -> None:
+        self.assertEqual(CONTAINER.resolve_build_jobs(4.0, 2), 2)
+        for requested in (0, -1):
+            with (
+                self.subTest(requested=requested),
+                self.assertRaisesRegex(ValueError, "build jobs"),
+            ):
+                CONTAINER.resolve_build_jobs(4.0, requested)
+
+    def test_container_arguments_resolve_build_jobs_from_each_cpu_budget(self) -> None:
+        common = [
+            "--experiment-root",
+            "/tmp/cbm-benchmark-history",
+            "--memory",
+            "16g",
+            "--workers",
+            "8",
+        ]
+        with mock.patch.object(CONTAINER.platform, "machine", return_value="arm64"):
+            automatic = CONTAINER.parse_arguments([*common, "--cpus", "16", "--quick"])
+            constrained = CONTAINER.parse_arguments(
+                [*common, "--cpus", "16", "--build-jobs", "6", "--quick"]
+            )
+
+        self.assertEqual(automatic.build_jobs, 16)
+        self.assertEqual(constrained.build_jobs, 6)
+
     def test_bundle_excludes_stash_and_recovery_namespaces(self) -> None:
         arguments = CONTAINER.bundle_revision_arguments()
         self.assertEqual(arguments, ["HEAD", "--branches", "--tags", "--remotes"])
@@ -162,6 +194,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
             ["--candidate-search-root=/tmp/other"],
             ["--matrix-spec", "/tmp/other.json"],
             ["--product-env=CBM_WORKERS=99"],
+            ["--build-jobs=99"],
         ):
             with (
                 self.subTest(arguments=arguments),
@@ -180,7 +213,9 @@ class BenchmarkContainerContractTest(unittest.TestCase):
 
             self.assertEqual(digest, CONTAINER.file_sha256(effective))
             self.assertEqual(
-                json.loads(effective.read_text(encoding="utf-8"))["product_environment"],
+                json.loads(effective.read_text(encoding="utf-8"))[
+                    "product_environment"
+                ],
                 {"CBM_WORKERS": "4"},
             )
             self.assertEqual(
