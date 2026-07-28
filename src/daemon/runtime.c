@@ -860,6 +860,45 @@ bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
     return ok;
 }
 
+bool cbm_daemon_runtime_process_build_fingerprint_cached(
+    uint64_t process_id, const char *cache_path, bool allow_cache,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out) {
+    if (!out) {
+        return false;
+    }
+    out[0] = '\0';
+    if (cache_hit_out) {
+        *cache_hit_out = false;
+    }
+    runtime_process_image_reference_t reference;
+    runtime_process_image_reference_init(&reference);
+    bool ok = runtime_process_image_reference_acquire(process_id, &reference, NULL);
+    if (ok) {
+#ifdef _WIN32
+        uintptr_t native_file = (uintptr_t)reference.file;
+#elif defined(__APPLE__) || defined(__linux__)
+        uintptr_t native_file = (uintptr_t)reference.fd;
+#else
+        uintptr_t native_file = 0;
+        ok = false;
+#endif
+        ok = ok &&
+             cbm_daemon_build_fingerprint_native_file_cached(
+                 native_file, cache_path, allow_cache, out, cache_hit_out) &&
+             runtime_process_image_reference_matches_process(&reference, process_id);
+    }
+    if (!runtime_process_image_reference_release(&reference)) {
+        ok = false;
+    }
+    if (!ok) {
+        out[0] = '\0';
+        if (cache_hit_out) {
+            *cache_hit_out = false;
+        }
+    }
+    return ok;
+}
+
 static bool runtime_hello_response_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE],
                                           const cbm_daemon_runtime_connect_result_t *result) {
     if (!out || !result) {

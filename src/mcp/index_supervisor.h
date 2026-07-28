@@ -53,6 +53,8 @@ size_t cbm_index_worker_memory_budget_bytes(void);
  * before any worker can be launched. Repeated calls return the original capture
  * and never re-hash a pathname that an installer may since have replaced. */
 bool cbm_index_supervisor_capture_build_fingerprint(void);
+bool cbm_index_supervisor_capture_build_fingerprint_cached(const char *cache_path,
+                                                           bool allow_cache);
 const char *cbm_index_supervisor_build_fingerprint(void);
 
 typedef struct {

@@ -85,6 +85,7 @@ for any registry key):
 
 | Key | Default | Meaning |
 |---|---|---|
+| `build_fingerprint_mode` | `cached_exact` | Exact-build verification cost policy: reuse a checksummed SHA-256 only for an unchanged kernel-bound native file (`cached_exact`), or hash the complete process image at every startup (`always_rehash`). Installer/update and Windows launcher payload verification always rehash. |
 | `auto_index` | `true` | Automatically index new projects at MCP startup or first graph use. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register indexed projects for automatic background Git-change refresh. |

@@ -243,6 +243,14 @@ bool cbm_daemon_runtime_hello_request_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_R
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
                                                   char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+/* Resolve the same kernel-bound process image as the strict helper above, but
+ * permit a checksummed exact-digest cache keyed by that native file object's
+ * strong change metadata. Cache misses, corruption, I/O failure, replacement,
+ * or a process-image race fall back to hashing or fail closed. */
+bool cbm_daemon_runtime_process_build_fingerprint_cached(
+    uint64_t process_id, const char *cache_path, bool allow_cache,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out);
+
 /* Ask any current daemon generation to drain before install/update/uninstall.
  * This is not a normal HELLO and never creates an application session. The
  * kernel-authenticated peer image must match identity->build_fingerprint, but
