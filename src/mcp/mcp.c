@@ -2405,7 +2405,6 @@ static void free_counted_string_array(char **arr, int count) {
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Forward declarations for functions defined after first use */
-static void send_notification(cbm_mcp_server_t *srv, const char *method);
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit,
                                      bool path_scoped);
 static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms);
@@ -17213,7 +17212,10 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
             srv->hidden_tools_revealed = true;
         }
         if (changed) {
-            send_notification(srv, "notifications/tools/list_changed");
+            /* Queue rather than write inside dispatch: the request owner drains
+             * this only after its response is complete. Daemon sessions carry
+             * the same O(1) disposition to their thin frontend. */
+            atomic_store(&srv->tools_list_changed_pending, true);
         }
         char *result = cbm_mcp_text_result(payload, false);
         free(payload);
@@ -17918,22 +17920,14 @@ static void write_protocol_json(FILE *out, const char *json, bool content_length
                  prof_mcp_write);
 }
 
-/* Send a JSON-RPC notification (no id) to the client's protocol stream.
- * Must match the active transport framing: raw JSON lines for line mode, or
- * Content-Length frames after the client uses Content-Length framing. */
-static void send_notification(cbm_mcp_server_t *srv, const char *method) {
-    if (!srv || !srv->out_stream) return;
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
-    yyjson_mut_obj_add_str(doc, root, "method", method);
-    char *json = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    if (json) {
-        write_protocol_json(srv->out_stream, json, srv->out_content_length_framed);
-        free(json);
-    }
+/* Send the fixed catalog-change notification on the request-owned output
+ * stream. Reusing the daemon frontend's canonical bytes avoids a second JSON
+ * representation and needs O(1) time/memory with no temporary document. */
+static void send_tools_list_changed_notification(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->out_stream)
+        return;
+    write_protocol_json(srv->out_stream, CBM_MCP_TOOLS_LIST_CHANGED_JSON,
+                        srv->out_content_length_framed);
 }
 
 /* Handle resources/list — return 3 resource URIs. */
@@ -18698,13 +18692,21 @@ static bool mcp_tools_list_already_served(const cbm_mcp_server_t *srv) {
  * write so notification and response bytes never interleave (single-
  * threaded writes preserved: background publication threads only ever set
  * the flag via cbm_mcp_server_notify_index_published; only the request
- * thread reaches this drain and calls send_notification). The
+ * thread reaches this drain and writes the notification). The
  * atomic_exchange coalesces any burst of publications into one
  * notification, and a client relist does not itself re-set the flag. */
+bool cbm_mcp_server_tools_list_changed_pending(cbm_mcp_server_t *srv) {
+    return mcp_tools_list_already_served(srv) && atomic_load(&srv->tools_list_changed_pending);
+}
+
+bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv) {
+    return mcp_tools_list_already_served(srv) &&
+           atomic_exchange(&srv->tools_list_changed_pending, false);
+}
+
 static void mcp_drain_tools_list_changed(cbm_mcp_server_t *srv) {
-    if (mcp_tools_list_already_served(srv) &&
-        atomic_exchange(&srv->tools_list_changed_pending, false)) {
-        send_notification(srv, "notifications/tools/list_changed");
+    if (cbm_mcp_server_take_tools_list_changed(srv)) {
+        send_tools_list_changed_notification(srv);
     }
 }
 
@@ -19013,9 +19015,8 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
             break;
         }
 
-        /* Publish the framing mode before handling: send_notification frames
-         * notifications from srv->out_content_length_framed, so it must match
-         * the response it will follow. */
+        /* Publish the framing mode before handling so any response-following
+         * catalog notification uses the same transport framing. */
         srv->out_content_length_framed = content_length_framed;
         char *resp = cbm_mcp_server_handle(srv, message);
         free(message);

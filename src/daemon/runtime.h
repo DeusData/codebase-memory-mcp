@@ -20,7 +20,7 @@
  * stable endpoint HELLO: an exact executable fingerprint already selects this
  * layout, while conflicting generations must remain able to diagnose each
  * other even when this value and every detailed payload have changed. */
-#define CBM_DAEMON_RUNTIME_WIRE_ABI 1U
+#define CBM_DAEMON_RUNTIME_WIRE_ABI 2U
 
 /* Permanent account-wide rendezvous envelope, generation zero. These numeric
  * capacities and byte sizes are frozen independently of service/runtime data
@@ -121,7 +121,17 @@ typedef enum {
     CBM_DAEMON_RUNTIME_APPLICATION_REJECTED = 4,
     CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR = 5,
     CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED = 6,
+    /* The response is successful and must be written before one coalesced
+     * tools/list_changed notification. This is daemon-internal response
+     * metadata, not a JSON-RPC status exposed to the client. */
+    CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED = 7,
 } cbm_daemon_runtime_application_status_t;
+
+static inline bool cbm_daemon_runtime_application_status_is_success(
+    cbm_daemon_runtime_application_status_t status) {
+    return status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||
+           status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED;
+}
 
 typedef uint64_t cbm_daemon_runtime_application_token_t;
 #define CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID UINT64_C(0)
@@ -137,10 +147,13 @@ typedef void cbm_daemon_runtime_application_session_t;
 typedef cbm_daemon_runtime_application_session_t *(*cbm_daemon_runtime_application_session_open_fn)(
     void *context, cbm_daemon_client_id_t client_id, uint64_t authenticated_process_id);
 
-/* For OK, response_out may receive a malloc-owned binary buffer which the
- * runtime frees after sending; NULL is valid only for a zero-length response.
- * Non-OK results must leave an empty response. The request buffer is an owned
- * runtime copy and remains valid only for the duration of this callback. */
+/* For successful statuses, response_out may receive a malloc-owned binary
+ * buffer which the runtime frees after sending; NULL is valid only for an
+ * ordinary OK with a zero-length response. OK_TOOLS_LIST_CHANGED requires
+ * response bytes so a frontend can preserve response-before-notification
+ * ordering. Non-success results must leave an empty response. The request
+ * buffer is an owned runtime copy and remains valid only for the duration of
+ * this callback. */
 typedef cbm_daemon_runtime_application_status_t (*cbm_daemon_runtime_application_request_fn)(
     void *context, cbm_daemon_runtime_application_session_t *session,
     cbm_daemon_runtime_application_token_t request_token, const uint8_t *request,

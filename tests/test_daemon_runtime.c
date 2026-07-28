@@ -137,6 +137,7 @@ typedef struct {
     atomic_bool block_second_open;
     atomic_bool second_open_started;
     atomic_bool release_second_open;
+    atomic_bool tools_list_changed;
 } runtime_application_context_t;
 
 typedef struct {
@@ -880,7 +881,9 @@ static cbm_daemon_runtime_application_status_t runtime_application_request(
     memcpy(response, request, request_length);
     *response_out = response;
     *response_length_out = request_length;
-    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    return atomic_load_explicit(&context->tools_list_changed, memory_order_acquire)
+               ? CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED
+               : CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
 static void *runtime_application_client_request_thread(void *opaque) {
@@ -1003,6 +1006,7 @@ static void runtime_application_context_init(runtime_application_context_t *cont
     atomic_init(&context->block_second_open, false);
     atomic_init(&context->second_open_started, false);
     atomic_init(&context->release_second_open, false);
+    atomic_init(&context->tools_list_changed, false);
 }
 
 static bool runtime_test_wait_atomic_bool(atomic_bool *value, uint32_t timeout_ms) {
@@ -2786,6 +2790,44 @@ TEST(daemon_runtime_application_response_roundtrip_is_byte_exact) {
     ASSERT_EQ(atomic_load(&context.request_cancels), 0);
     ASSERT_EQ(atomic_load(&context.cancelled), 1);
     ASSERT_EQ(atomic_load(&context.closed), 1);
+    PASS();
+}
+
+TEST(daemon_runtime_application_transports_tools_list_changed_disposition) {
+    static const uint8_t response_fixture[] = "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}";
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_application_context_t context;
+    runtime_application_context_init(&context, false);
+    atomic_store_explicit(&context.tools_list_changed, true, memory_order_release);
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_application(
+        &fixture, "application-tools-list-changed", &identity, &context);
+    cbm_daemon_runtime_connect_result_t result = {0};
+    cbm_daemon_runtime_client_t *client =
+        started ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                    RUNTIME_TEST_TIMEOUT_MS, &result)
+                : NULL;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t status =
+        client ? cbm_daemon_runtime_client_application_request(
+                     client, response_fixture, (uint32_t)(sizeof(response_fixture) - 1U), &response,
+                     &response_length, RUNTIME_TEST_TIMEOUT_MS)
+               : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED && response &&
+                 response_length == sizeof(response_fixture) - 1U &&
+                 memcmp(response, response_fixture, response_length) == 0;
+    free(response);
+    bool closed = client && cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+    bool exited =
+        started && cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(closed);
+    ASSERT_TRUE(exited);
     PASS();
 }
 
@@ -4636,6 +4678,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal);
     RUN_TEST(daemon_runtime_rejects_forged_identity_extension);
     RUN_TEST(daemon_runtime_application_response_roundtrip_is_byte_exact);
+    RUN_TEST(daemon_runtime_application_transports_tools_list_changed_disposition);
     RUN_TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session);
     RUN_TEST(daemon_runtime_request_cancel_is_exact_and_session_remains_usable);
     RUN_TEST(daemon_runtime_presend_request_cancel_is_sticky_and_nonterminal);
