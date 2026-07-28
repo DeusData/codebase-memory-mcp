@@ -1125,16 +1125,44 @@ TEST(test_trace_results_have_source_field) {
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t caller = {.project = "dep-query-test",
+                         .label = "Function",
+                         .name = "process_data",
+                         .qualified_name = "dep-query-test.app.process_data",
+                         .file_path = "app.py",
+                         .start_line = 3,
+                         .end_line = 5,
+                         .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t callee = {.project = "dep-query-test",
+                         .label = "Function",
+                         .name = "normalize_data",
+                         .qualified_name = "dep-query-test.app.normalize_data",
+                         .file_path = "app.py",
+                         .start_line = 7,
+                         .end_line = 8,
+                         .properties_json = "{\"is_exported\":false}"};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    int64_t callee_id = cbm_store_upsert_node(store, &callee);
+    ASSERT_GT(caller_id, 0);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {.project = "dep-query-test",
+                       .source_id = caller_id,
+                       .target_id = callee_id,
+                       .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"process_data\","
-                                    "\"project\":\"dep-query-test\"}");
+                                    "\"project\":\"dep-query-test\","
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_di(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    if (strstr(resp, "callees") && strstr(resp, "source")) {
-        ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
-    }
+    ASSERT_NOT_NULL(strstr(resp, "\"callees\":[{"));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\":\"project\""));
 
     free(resp);
     cbm_mcp_server_free(srv);

@@ -4888,6 +4888,13 @@ static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root
         : strcmp(recording_status, "complete") == 0       ? "current"
                                                           : "partial";
     yyjson_mut_obj_add_str(doc, coverage, "status", coverage_status);
+    /* "current" means the coverage rows and hashes belong to the published
+     * graph generation. It cannot prove that the live working tree has no
+     * change that the watcher has not observed yet. Keep this O(1) in graph and
+     * repository size; an explicit path coverage check performs the bounded
+     * live metadata comparison when freshness matters. */
+    yyjson_mut_obj_add_str(doc, coverage, "status_scope", "published_generation");
+    yyjson_mut_obj_add_str(doc, coverage, "live_source_freshness", "not_evaluated");
     if (have_coverage) {
         yyjson_mut_obj_add_strcpy(doc, coverage, "recording_status", recording_status);
         yyjson_mut_obj_add_bool(doc, coverage, "generation_matches", generation_matches);
@@ -4901,9 +4908,11 @@ static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root
     yyjson_mut_obj_add_str(
         doc, coverage, "action",
         coverage_visible
-            ? "Call check_index_coverage(paths=[...]) before negative/exhaustive claims."
+            ? "Call check_index_coverage(paths=[...]) to compare stored metadata with live source "
+              "before freshness-sensitive, negative, or exhaustive claims."
             : "Use _hidden_tools; refresh tools/list; call "
-              "check_index_coverage(paths=[...]) before negative/exhaustive claims.");
+              "check_index_coverage(paths=[...]) to compare stored metadata with live source "
+              "before freshness-sensitive, negative, or exhaustive claims.");
     yyjson_mut_obj_add_val(doc, root, "coverage", coverage);
 
     const char *context_root = have_project ? project_info.root_path : NULL;
@@ -14841,6 +14850,9 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
     cbm_toon_scalar_int(&sb, "total_grep_matches", gm_count);
     cbm_toon_scalar_int(&sb, "total_results", sr_count);
     cbm_toon_scalar_int(&sb, "raw_match_count", raw_count);
+    /* Compatibility aliases name each count's unit explicitly. */
+    cbm_toon_scalar_int(&sb, "correlated_symbol_count", sr_count);
+    cbm_toon_scalar_int(&sb, "uncorrelated_source_match_count", raw_count);
     cbm_toon_scalar_int(&sb, "elapsed_ms", (long long)elapsed_ms);
     if (warn_literal_pipe) {
         cbm_toon_scalar_str(&sb, "warning",
@@ -14886,8 +14898,10 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     int output_count = sr_count < limit ? sr_count : limit;
 
     if (mode == MODE_FILES) {
-        yyjson_mut_obj_add_val(doc, root_obj, "files",
-                               build_dedup_files_array(doc, sr, output_count, raw, raw_count));
+        yyjson_mut_val *files = build_dedup_files_array(doc, sr, output_count, raw, raw_count);
+        yyjson_mut_obj_add_int(doc, root_obj, "returned_file_count",
+                               (int)yyjson_mut_arr_size(files));
+        yyjson_mut_obj_add_val(doc, root_obj, "files", files);
     } else {
         yyjson_mut_val *results_arr = yyjson_mut_arr(doc);
         for (int ri = 0; ri < output_count; ri++) {
@@ -14932,6 +14946,11 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_obj_add_int(doc, root_obj, "total_grep_matches", gm_count);
     yyjson_mut_obj_add_int(doc, root_obj, "total_results", sr_count);
     yyjson_mut_obj_add_int(doc, root_obj, "raw_match_count", raw_count);
+    /* Preserve the original counters while making their heterogeneous units
+     * explicit. Computing these aliases and returned_file_count is O(1) after
+     * the existing classification/deduplication work. */
+    yyjson_mut_obj_add_int(doc, root_obj, "correlated_symbol_count", sr_count);
+    yyjson_mut_obj_add_int(doc, root_obj, "uncorrelated_source_match_count", raw_count);
     yyjson_mut_obj_add_int(doc, root_obj, "elapsed_ms", (int)elapsed_ms);
     yyjson_mut_obj_add_str(doc, root_obj, "search_scope",
                            search_scope ? search_scope : "project_recursive");
