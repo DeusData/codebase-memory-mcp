@@ -73,14 +73,38 @@ void cbm_sha256_init(cbm_sha256_ctx *c) {
 }
 
 void cbm_sha256_update(cbm_sha256_ctx *c, const void *data, size_t len) {
+    if (len == 0) {
+        return;
+    }
     const uint8_t *p = (const uint8_t *)data;
-    for (size_t i = 0; i < len; i++) {
-        c->buf[c->buflen++] = p[i];
-        if (c->buflen == 64) {
+
+    if (c->buflen > 0) {
+        size_t needed = CBM_SHA256_BLOCK_LEN - c->buflen;
+        size_t copied = len < needed ? len : needed;
+        memcpy(c->buf + c->buflen, p, copied);
+        c->buflen += copied;
+        p += copied;
+        len -= copied;
+        if (c->buflen == CBM_SHA256_BLOCK_LEN) {
             sha256_transform(c, c->buf);
-            c->bitlen += 512;
+            c->bitlen += CBM_SHA256_BLOCK_LEN * 8U;
             c->buflen = 0;
         }
+    }
+
+    /* Process caller-owned complete blocks directly. This preserves O(B)
+     * digest work for B bytes while avoiding B byte-at-a-time buffer copies
+     * and branches. Auxiliary memory remains O(1), and the tail is retained
+     * in the context for an exactly equivalent later update/final call. */
+    while (len >= CBM_SHA256_BLOCK_LEN) {
+        sha256_transform(c, p);
+        c->bitlen += CBM_SHA256_BLOCK_LEN * 8U;
+        p += CBM_SHA256_BLOCK_LEN;
+        len -= CBM_SHA256_BLOCK_LEN;
+    }
+    if (len > 0) {
+        memcpy(c->buf, p, len);
+        c->buflen = len;
     }
 }
 
@@ -90,7 +114,7 @@ void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
     size_t i = c->buflen;
     c->buf[i++] = 0x80; /* append the '1' bit + zero padding */
     if (i > 56) {
-        while (i < 64) {
+        while (i < CBM_SHA256_BLOCK_LEN) {
             c->buf[i++] = 0;
         }
         sha256_transform(c, c->buf);

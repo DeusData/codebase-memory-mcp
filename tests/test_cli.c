@@ -20,6 +20,7 @@
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/platform.h>
+#include <foundation/sha256.h>
 #include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
@@ -11932,6 +11933,42 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+TEST(cli_sha256_fragmented_updates_match_one_shot_digest) {
+    uint8_t input[CBM_SHA256_BLOCK_LEN * 4 + 17];
+    for (size_t i = 0; i < sizeof(input); i++) {
+        input[i] = (uint8_t)(i * 37U + 11U);
+    }
+
+    uint8_t expected[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_ctx one_shot;
+    cbm_sha256_init(&one_shot);
+    cbm_sha256_update(&one_shot, input, sizeof(input));
+    cbm_sha256_final(&one_shot, expected);
+
+    static const size_t chunk_sizes[] = {
+        1U, CBM_SHA256_BLOCK_LEN - 1U, CBM_SHA256_BLOCK_LEN, CBM_SHA256_BLOCK_LEN + 1U, 7U,
+    };
+    uint8_t observed[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_ctx fragmented;
+    cbm_sha256_init(&fragmented);
+    size_t offset = 0;
+    size_t chunk = 0;
+    while (offset < sizeof(input)) {
+        size_t available = sizeof(input) - offset;
+        size_t length = chunk_sizes[chunk % (sizeof(chunk_sizes) / sizeof(chunk_sizes[0]))];
+        if (length > available) {
+            length = available;
+        }
+        cbm_sha256_update(&fragmented, input + offset, length);
+        offset += length;
+        chunk++;
+    }
+    cbm_sha256_final(&fragmented, observed);
+
+    ASSERT_EQ(memcmp(expected, observed, sizeof(expected)), 0);
+    PASS();
+}
+
 #ifdef _WIN32
 /* The fail-closed release contract, asserted with the activation seam OFF:
  * these calls take the exact dispatch a release binary ships (the portable
@@ -13525,6 +13562,7 @@ SUITE(cli) {
     RUN_TEST(cli_progress_sink_accepts_worker_json_logs);
     RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_sha256_fragmented_updates_match_one_shot_digest);
     RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
     RUN_TEST(cli_checksum_manifest_rejects_invalid_missing_and_conflicting_digest);
     RUN_TEST(cli_checksum_manifest_rejects_oversized_input);
