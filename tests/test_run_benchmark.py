@@ -21,6 +21,49 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class RunBenchmarkTest(unittest.TestCase):
+    def test_find_project_db_ignores_dependency_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            primary = cache / "primary.db"
+            primary.touch()
+            (cache / "primary.dep.mimalloc.db").touch()
+            (cache / "primary.dep.tree-sitter.db").touch()
+            (cache / BENCHMARK.CONFIG_DB_NAME).touch()
+
+            self.assertEqual(BENCHMARK.find_project_db(cache), primary)
+
+    def test_find_project_db_accepts_dotted_primary_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            primary = cache / "project.config.db"
+            primary.touch()
+
+            self.assertEqual(BENCHMARK.find_project_db(cache), primary)
+
+    def test_find_project_db_rejects_missing_primary_with_dependency_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            (cache / "primary.dep.mimalloc.db").touch()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"expected one primary project DB.*found 0.*primary\.dep\.mimalloc\.db",
+            ):
+                BENCHMARK.find_project_db(cache)
+
+    def test_find_project_db_rejects_ambiguous_primary_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            (cache / "first.db").touch()
+            (cache / "second.db").touch()
+            (cache / "first.dep.mimalloc.db").touch()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"expected one primary project DB.*found 2.*first\.db, second\.db",
+            ):
+                BENCHMARK.find_project_db(cache)
+
     def test_build_env_rejects_inherited_live_cache_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             live_cache = Path(tmpdir) / "live-cache"
