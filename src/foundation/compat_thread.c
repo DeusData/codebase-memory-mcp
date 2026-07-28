@@ -6,7 +6,9 @@
  */
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
+#include "foundation/platform.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -139,6 +141,87 @@ void cbm_mutex_unlock(cbm_mutex_t *m) {
 
 void cbm_mutex_destroy(cbm_mutex_t *m) {
     pthread_mutex_destroy(&m->mtx);
+}
+
+#endif
+
+/* ── Condition variable ───────────────────────────────────────── */
+
+#ifdef _WIN32
+
+int cbm_thread_condition_init(cbm_thread_condition_t *condition) {
+    InitializeConditionVariable(&condition->condition);
+    return 0;
+}
+
+void cbm_thread_condition_destroy(cbm_thread_condition_t *condition) {
+    (void)condition; /* Win32 condition variables require no destruction. */
+}
+
+void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition) {
+    WakeAllConditionVariable(&condition->condition);
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
+    cbm_thread_condition_t *condition, cbm_mutex_t *mutex, uint64_t deadline_ms) {
+    uint64_t now_ms = cbm_now_ms();
+    uint64_t remaining_ms = deadline_ms > now_ms ? deadline_ms - now_ms : 0;
+    DWORD timeout_ms =
+        remaining_ms < (uint64_t)INFINITE ? (DWORD)remaining_ms : (DWORD)(INFINITE - 1U);
+    if (SleepConditionVariableCS(&condition->condition, &mutex->cs, timeout_ms)) {
+        return CBM_THREAD_CONDITION_WAIT_SIGNALED;
+    }
+    return GetLastError() == ERROR_TIMEOUT ? CBM_THREAD_CONDITION_WAIT_TIMEOUT
+                                           : CBM_THREAD_CONDITION_WAIT_ERROR;
+}
+
+#else /* POSIX */
+
+int cbm_thread_condition_init(cbm_thread_condition_t *condition) {
+#ifdef __APPLE__
+    return pthread_cond_init(&condition->condition, NULL);
+#else
+    pthread_condattr_t attributes;
+    int status = pthread_condattr_init(&attributes);
+    if (status != 0) {
+        return status;
+    }
+    status = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&condition->condition, &attributes);
+    }
+    (void)pthread_condattr_destroy(&attributes);
+    return status;
+#endif
+}
+
+void cbm_thread_condition_destroy(cbm_thread_condition_t *condition) {
+    (void)pthread_cond_destroy(&condition->condition);
+}
+
+void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition) {
+    (void)pthread_cond_broadcast(&condition->condition);
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
+    cbm_thread_condition_t *condition, cbm_mutex_t *mutex, uint64_t deadline_ms) {
+    struct timespec timeout;
+#ifdef __APPLE__
+    uint64_t now_ms = cbm_now_ms();
+    uint64_t remaining_ms = deadline_ms > now_ms ? deadline_ms - now_ms : 0;
+    timeout.tv_sec = (time_t)(remaining_ms / CBM_MSEC_PER_SEC);
+    timeout.tv_nsec = (long)((remaining_ms % CBM_MSEC_PER_SEC) * CBM_NSEC_PER_MSEC);
+    int status = pthread_cond_timedwait_relative_np(&condition->condition, &mutex->mtx, &timeout);
+#else
+    timeout.tv_sec = (time_t)(deadline_ms / CBM_MSEC_PER_SEC);
+    timeout.tv_nsec = (long)((deadline_ms % CBM_MSEC_PER_SEC) * CBM_NSEC_PER_MSEC);
+    int status = pthread_cond_timedwait(&condition->condition, &mutex->mtx, &timeout);
+#endif
+    if (status == 0) {
+        return CBM_THREAD_CONDITION_WAIT_SIGNALED;
+    }
+    return status == ETIMEDOUT ? CBM_THREAD_CONDITION_WAIT_TIMEOUT
+                               : CBM_THREAD_CONDITION_WAIT_ERROR;
 }
 
 #endif

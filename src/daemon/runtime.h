@@ -180,6 +180,11 @@ typedef struct {
     cbm_daemon_build_identity_t identity;
     const char *conflict_log_path;
     size_t conflict_log_cap_bytes;
+    /* cached_exact supplies the owner-private cache path used for both daemon
+     * self identity and kernel-bound peer admission. A NULL path with false
+     * preserves always_rehash. Cache failures remain exact full-hash misses. */
+    const char *build_fingerprint_cache_path;
+    bool build_fingerprint_cache_enabled;
     /* Hard cap on accepted connection threads, including sockets that have not
      * completed HELLO. request_timeout_ms bounds every unauthenticated slot
      * and therefore must be finite, not CBM_DAEMON_IPC_WAIT_FOREVER. */
@@ -341,6 +346,13 @@ bool cbm_daemon_runtime_service_wait_exited(cbm_daemon_runtime_service_t *servic
  * API. The service cannot exit while a cancelled job remains unreaped. */
 bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service,
                                            const char *project_key);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+bool cbm_daemon_runtime_service_active_image_cache_hit_for_testing(
+    const cbm_daemon_runtime_service_t *service);
+uint64_t cbm_daemon_runtime_service_peer_cache_hits_for_testing(
+    const cbm_daemon_runtime_service_t *service);
+#endif
 
 /* Emergency/test teardown only. Normal lifetime is connection-owned: the
  * final disconnect makes STOPPING terminal, drains/reaps within the configured

@@ -23,14 +23,25 @@
 enum {
     DAEMON_SERVICE_PATH_CAP = 4096,
     DAEMON_SERVICE_IO_CAP = 64 * 1024,
-    DAEMON_SERVICE_FINGERPRINT_CACHE_CAP = CBM_SZ_512,
+    DAEMON_SERVICE_FINGERPRINT_RECORD_CAP = CBM_SZ_512,
+    /* A fixed 2 KiB file retains the ordinary installed client, managed-daemon
+     * copy, supervised worker, and adjacent-generation snapshots with room for
+     * another image. Lookup and storage therefore remain O(1); an arbitrary
+     * number of copied images cannot grow persistent state without bound. */
+    DAEMON_SERVICE_FINGERPRINT_CACHE_CAP = CBM_SZ_2K,
     DAEMON_SERVICE_ESCAPED_VERSION_CAP = (CBM_DAEMON_VERSION_TEXT_SIZE - 1) * 6 + 1,
     DAEMON_SERVICE_LOG_RECORD_CAP = 1536,
 };
 
 typedef struct {
-    uint64_t field[7];
+    uint64_t field[CBM_SZ_7];
 } daemon_fingerprint_snapshot_t;
+
+enum {
+    DAEMON_FINGERPRINT_SNAPSHOT_FIELDS = sizeof(((daemon_fingerprint_snapshot_t *)0)->field) /
+                                         sizeof(((daemon_fingerprint_snapshot_t *)0)->field[0]),
+    DAEMON_FINGERPRINT_FIELD_HEX_CHARS = sizeof(uint64_t) * CBM_SZ_2,
+};
 
 static cbm_daemon_conflict_log_test_hook_fn g_conflict_log_test_hook;
 static void *g_conflict_log_test_context;
@@ -1079,22 +1090,85 @@ static bool daemon_fingerprint_snapshot_equal(const daemon_fingerprint_snapshot_
 }
 
 static bool daemon_fingerprint_cache_prefix(const daemon_fingerprint_snapshot_t *snapshot,
-                                            char out[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP],
+                                            char out[DAEMON_SERVICE_FINGERPRINT_RECORD_CAP],
                                             size_t *length_out) {
     if (!snapshot || !out || !length_out) {
         return false;
     }
-    int written = snprintf(
-        out, DAEMON_SERVICE_FINGERPRINT_CACHE_CAP,
-        "cbm-build-fingerprint-v1\n%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64
-        ":%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64 "\n",
-        snapshot->field[0], snapshot->field[1], snapshot->field[2], snapshot->field[3],
-        snapshot->field[4], snapshot->field[5], snapshot->field[6]);
-    if (written <= 0 || written >= DAEMON_SERVICE_FINGERPRINT_CACHE_CAP) {
+    int written =
+        snprintf(out, DAEMON_SERVICE_FINGERPRINT_RECORD_CAP,
+                 "cbm-build-fingerprint-v1\n%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64
+                 ":%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64 "\n",
+                 snapshot->field[0], snapshot->field[1], snapshot->field[2], snapshot->field[3],
+                 snapshot->field[4], snapshot->field[5], snapshot->field[6]);
+    if (written <= 0 || written >= DAEMON_SERVICE_FINGERPRINT_RECORD_CAP) {
         return false;
     }
     *length_out = (size_t)written;
     return true;
+}
+
+static bool daemon_fingerprint_cache_load(const char *cache_path,
+                                          char out[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP],
+                                          size_t *length_out) {
+    if (!cache_path || !cache_path[0] || !out || !length_out) {
+        return false;
+    }
+    *length_out = 0;
+    FILE *file = cbm_fopen(cache_path, "rb");
+    if (!file) {
+        return false;
+    }
+    size_t length = fread(out, 1, DAEMON_SERVICE_FINGERPRINT_CACHE_CAP, file);
+    int extra = length == DAEMON_SERVICE_FINGERPRINT_CACHE_CAP ? fgetc(file) : EOF;
+    bool read_ok = !ferror(file) && extra == EOF;
+    bool close_ok = fclose(file) == 0;
+    if (!read_ok || !close_ok) {
+        return false;
+    }
+    *length_out = length;
+    return true;
+}
+
+static bool daemon_fingerprint_cache_record_valid(
+    const char *record, size_t record_length, size_t prefix_length,
+    char digest_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    static const char header[] = "cbm-build-fingerprint-v1\n";
+    size_t header_length = sizeof(header) - 1U;
+    size_t expected_prefix_length =
+        header_length + DAEMON_FINGERPRINT_SNAPSHOT_FIELDS * DAEMON_FINGERPRINT_FIELD_HEX_CHARS +
+        (DAEMON_FINGERPRINT_SNAPSHOT_FIELDS - 1U) + 1U;
+    if (!record || !digest_out ||
+        record_length != prefix_length + CBM_SHA256_HEX_LEN + 1U + CBM_SHA256_HEX_LEN + 1U ||
+        prefix_length != expected_prefix_length || memcmp(record, header, header_length) != 0 ||
+        record[prefix_length + CBM_SHA256_HEX_LEN] != '\n' || record[record_length - 1U] != '\n') {
+        return false;
+    }
+    size_t position = header_length;
+    for (size_t field = 0; field < DAEMON_FINGERPRINT_SNAPSHOT_FIELDS; field++) {
+        for (size_t digit = 0; digit < DAEMON_FINGERPRINT_FIELD_HEX_CHARS; digit++) {
+            char ch = record[position++];
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+                return false;
+            }
+        }
+        char separator = field + 1U == DAEMON_FINGERPRINT_SNAPSHOT_FIELDS ? '\n' : ':';
+        if (record[position++] != separator) {
+            return false;
+        }
+    }
+    if (position != prefix_length) {
+        return false;
+    }
+    memcpy(digest_out, record + prefix_length, CBM_SHA256_HEX_LEN);
+    digest_out[CBM_SHA256_HEX_LEN] = '\0';
+    if (!fingerprint_valid(digest_out)) {
+        return false;
+    }
+    char expected_checksum[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    size_t checksum_input_length = prefix_length + CBM_SHA256_HEX_LEN + 1U;
+    cbm_sha256_hex(record, checksum_input_length, expected_checksum);
+    return memcmp(record + checksum_input_length, expected_checksum, CBM_SHA256_HEX_LEN) == 0;
 }
 
 static bool daemon_fingerprint_cache_read(const char *cache_path,
@@ -1103,39 +1177,29 @@ static bool daemon_fingerprint_cache_read(const char *cache_path,
     if (!cache_path || !cache_path[0] || !snapshot || !out) {
         return false;
     }
-    FILE *file = cbm_fopen(cache_path, "rb");
-    if (!file) {
-        return false;
-    }
-    char record[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
-    size_t length = fread(record, 1, sizeof(record), file);
-    int extra = length == sizeof(record) ? fgetc(file) : EOF;
-    bool read_ok = !ferror(file) && extra == EOF;
-    bool close_ok = fclose(file) == 0;
-    bool ok = read_ok && close_ok;
-    char prefix[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
+    char cache[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
+    size_t cache_length = 0;
+    char prefix[DAEMON_SERVICE_FINGERPRINT_RECORD_CAP];
     size_t prefix_length = 0;
-    if (!ok || !daemon_fingerprint_cache_prefix(snapshot, prefix, &prefix_length) ||
-        length != prefix_length + CBM_SHA256_HEX_LEN + 1U + CBM_SHA256_HEX_LEN + 1U ||
-        memcmp(record, prefix, prefix_length) != 0 ||
-        record[prefix_length + CBM_SHA256_HEX_LEN] != '\n' ||
-        record[length - 1U] != '\n') {
+    if (!daemon_fingerprint_cache_load(cache_path, cache, &cache_length) ||
+        !daemon_fingerprint_cache_prefix(snapshot, prefix, &prefix_length)) {
         return false;
     }
-    char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    memcpy(digest, record + prefix_length, CBM_SHA256_HEX_LEN);
-    digest[CBM_SHA256_HEX_LEN] = '\0';
-    if (!fingerprint_valid(digest)) {
+    size_t record_length = prefix_length + CBM_SHA256_HEX_LEN + 1U + CBM_SHA256_HEX_LEN + 1U;
+    if (record_length > DAEMON_SERVICE_FINGERPRINT_RECORD_CAP ||
+        cache_length % record_length != 0) {
         return false;
     }
-    char expected_checksum[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    cbm_sha256_hex(record, prefix_length + CBM_SHA256_HEX_LEN + 1U, expected_checksum);
-    const char *stored_checksum = record + prefix_length + CBM_SHA256_HEX_LEN + 1U;
-    if (memcmp(stored_checksum, expected_checksum, CBM_SHA256_HEX_LEN) != 0) {
-        return false;
+    for (size_t offset = 0; offset < cache_length; offset += record_length) {
+        char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+        if (memcmp(cache + offset, prefix, prefix_length) == 0 &&
+            daemon_fingerprint_cache_record_valid(cache + offset, record_length, prefix_length,
+                                                  digest)) {
+            memcpy(out, digest, sizeof(digest));
+            return true;
+        }
     }
-    memcpy(out, digest, sizeof(digest));
-    return true;
+    return false;
 }
 
 static void daemon_fingerprint_cache_write(const char *cache_path,
@@ -1144,7 +1208,7 @@ static void daemon_fingerprint_cache_write(const char *cache_path,
     if (!cache_path || !cache_path[0] || !snapshot || !fingerprint_valid(digest)) {
         return;
     }
-    char record[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
+    char record[DAEMON_SERVICE_FINGERPRINT_RECORD_CAP];
     size_t prefix_length = 0;
     if (!daemon_fingerprint_cache_prefix(snapshot, record, &prefix_length)) {
         return;
@@ -1157,7 +1221,33 @@ static void daemon_fingerprint_cache_write(const char *cache_path,
     memcpy(record + checksum_input_length, checksum, CBM_SHA256_HEX_LEN);
     size_t record_length = checksum_input_length + CBM_SHA256_HEX_LEN;
     record[record_length++] = '\n';
-    (void)cbm_write_file_atomic(cache_path, record, record_length, NULL);
+    if (record_length > sizeof(record)) {
+        return;
+    }
+
+    char previous[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
+    size_t previous_length = 0;
+    bool previous_valid = daemon_fingerprint_cache_load(cache_path, previous, &previous_length) &&
+                          previous_length % record_length == 0;
+    char cache[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
+    size_t cache_length = 0;
+    memcpy(cache, record, record_length);
+    cache_length += record_length;
+    if (previous_valid) {
+        for (size_t offset = 0;
+             offset < previous_length && cache_length <= sizeof(cache) - record_length;
+             offset += record_length) {
+            char previous_digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+            const char *previous_record = previous + offset;
+            if (memcmp(previous_record, record, prefix_length) != 0 &&
+                daemon_fingerprint_cache_record_valid(previous_record, record_length, prefix_length,
+                                                      previous_digest)) {
+                memcpy(cache + cache_length, previous_record, record_length);
+                cache_length += record_length;
+            }
+        }
+    }
+    (void)cbm_write_file_atomic(cache_path, cache, cache_length, NULL);
 }
 
 bool cbm_daemon_build_fingerprint_native_file_cached(

@@ -1018,6 +1018,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         .identity = config->identity,
         .conflict_log_path = conflict_log,
         .conflict_log_cap_bytes = HOST_CONFLICT_LOG_CAP,
+        .build_fingerprint_cache_path = config->build_fingerprint_cache_path,
+        .build_fingerprint_cache_enabled = config->build_fingerprint_cache_enabled,
         .max_clients = HOST_MAX_CLIENTS,
         .lease_timeout_ms = HOST_LEASE_TIMEOUT_MS,
         .request_timeout_ms = HOST_REQUEST_TIMEOUT_MS,
