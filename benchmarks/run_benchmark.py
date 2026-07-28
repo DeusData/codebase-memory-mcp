@@ -220,6 +220,10 @@ CONFIG_PROFILES: dict[str, dict[str, str]] = {
 INDEX_MODES = ("fast", "moderate", "full")
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
+# Keep benchmark cache discovery aligned with CBM_DEP_SEPARATOR in
+# src/depindex/depindex.h. Dependency indexes are separate project databases,
+# not ambiguous candidates for the benchmark workload's primary database.
+DEPENDENCY_PROJECT_SEPARATOR = ".dep."
 LOG_TAIL_LINES = 24
 FAILURE_TAIL_LINES = 80
 FAILURE_ARTIFACT_DIRNAME = "failures"
@@ -3901,12 +3905,18 @@ def find_project_db(cache_dir: Path) -> Path:
         and path.name != CONFIG_DB_NAME
         and path.name.endswith(PROJECT_DB_SUFFIX)
     )
-    if len(dbs) != 1:
-        names = ", ".join(path.name for path in dbs)
+    primary_dbs = [
+        path for path in dbs if DEPENDENCY_PROJECT_SEPARATOR not in path.stem
+    ]
+    if len(primary_dbs) != 1:
+        primary_names = ", ".join(path.name for path in primary_dbs) or "(none)"
+        all_names = ", ".join(path.name for path in dbs) or "(none)"
         raise RuntimeError(
-            f"expected one project DB in {cache_dir}, found {len(dbs)}: {names}"
+            f"expected one primary project DB in {cache_dir}, "
+            f"found {len(primary_dbs)}: {primary_names}; "
+            f"all project DBs: {all_names}"
         )
-    return dbs[0]
+    return primary_dbs[0]
 
 
 def remove_sqlite_sidecars(path: Path) -> None:
