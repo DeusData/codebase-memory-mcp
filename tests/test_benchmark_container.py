@@ -278,6 +278,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
         )
 
         self.assertIn("--rm", command)
+        self.assertIn("--init", command)
         self.assertIn("type=volume,src=cbm-benchmark-work-abc,dst=/benchmark", command)
         self.assertIn("type=volume,src=cbm-benchmark-results-abc,dst=/results", command)
         self.assertIn("CBM_WORKERS=4", command)
