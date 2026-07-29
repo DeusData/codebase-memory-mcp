@@ -409,26 +409,36 @@ require(
 )
 
 # On Windows subprocess supervision receives a non-NULL lpApplicationName, so a
-# literal `git` would not use PATH. Resolve only git.exe beneath inherited
-# absolute PATH entries and never permit the current-directory search implied by
-# empty or relative entries. POSIX retains execvp via argv[0].
+# literal `git` would not use PATH. The shared Git runner owns the resolver after
+# 4c371b0a removed the watcher's duplicate implementation. Verify both halves of
+# that boundary: the watcher must delegate to the shared resolver, and the
+# resolver must accept only git.exe beneath inherited absolute PATH entries,
+# never the current-directory search implied by empty or relative entries.
+# POSIX retains execvp via argv[0].
 watcher_source = read("src/watcher/watcher.c")
+git_command_source = read("src/git/git_command.c")
 require(
     all(
         needle in watcher_source
         for needle in (
-            "watcher_resolve_git_executable",
+            "cbm_git_resolve_executable",
+            ".bin = git_executable",
+            ".bin = argv[0]",
+        )
+    )
+    and all(
+        needle in git_command_source
+        for needle in (
             'GetEnvironmentVariableW(L"PATH"',
             'L"%ls\\\\git.exe"',
             "GetFullPathNameW",
-            "watcher_windows_path_absolute",
+            "git_windows_path_absolute",
             "FILE_FLAG_OPEN_REPARSE_POINT",
-            ".bin = git_executable",
-            ".bin = argv[0]",
-            "empty/relative entries",
+            "entry_length == 0U",
         )
     )
-    and "popen(" not in watcher_source,
+    and "popen(" not in watcher_source
+    and "popen(" not in git_command_source,
     "Windows watcher Git commands must resolve an explicit absolute git.exe without cwd "
     "search while POSIX retains literal argv supervision",
 )
