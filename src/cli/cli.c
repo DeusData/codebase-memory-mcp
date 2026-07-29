@@ -14130,6 +14130,7 @@ void cbm_cli_print_main_help(void) {
     printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp config preset <list|apply>\n");
+    printf("  codebase-memory-mcp daemon <start|stop|status>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
     printf("\nUI options:\n");
