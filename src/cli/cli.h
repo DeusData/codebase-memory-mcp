@@ -231,8 +231,6 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
-bool cbm_path_dir_supported_for_platform_for_testing(const char *bin_dir, const char *os,
-                                                     const char *arch);
 int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
                                              const char *os, const char *arch);
 #endif

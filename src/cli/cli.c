@@ -5721,44 +5721,38 @@ static bool cli_path_is_directory(const char *path, const char *directory) {
     return path_len == directory_len && strncmp(path, directory, directory_len) == 0;
 }
 
-static bool cli_path_dir_supported_for_platform(const char *bin_dir, const char *os,
-                                                const char *arch) {
-    if (!bin_dir || !os || !arch) {
-        return false;
-    }
+static const char *cli_stale_owned_homebrew_path(const char *bin_dir, const char *os,
+                                                 const char *arch) {
     if (strcmp(os, "darwin") != 0) {
-        return true;
+        return NULL;
     }
-    bool arm64 = strcmp(arch, "arm64") == 0;
-    bool amd64 = strcmp(arch, "amd64") == 0 || strcmp(arch, "x86_64") == 0;
-    if (arm64 && cli_path_is_directory(bin_dir, "/usr/local/bin")) {
-        return false;
+    if (cli_path_is_directory(bin_dir, "/usr/local/bin")) {
+        return "/opt/homebrew/bin";
     }
-    if (amd64 && cli_path_is_directory(bin_dir, "/opt/homebrew/bin")) {
-        return false;
+    if (cli_path_is_directory(bin_dir, "/opt/homebrew/bin")) {
+        return "/usr/local/bin";
     }
-    return true;
+    if (strcmp(arch, "arm64") == 0) {
+        return "/usr/local/bin";
+    }
+    if (strcmp(arch, "amd64") == 0 || strcmp(arch, "x86_64") == 0) {
+        return "/opt/homebrew/bin";
+    }
+    return NULL;
 }
 
-static int cli_validate_path_dir_for_platform(const char *bin_dir, const char *os,
-                                              const char *arch) {
-    if (cli_path_dir_supported_for_platform(bin_dir, os, arch)) {
+static int cli_remove_opposite_owned_path(const char *bin_dir, const char *rc_file, bool dry_run,
+                                          const char *os, const char *arch) {
+    const char *stale_path = cli_stale_owned_homebrew_path(bin_dir, os, arch);
+    if (!stale_path) {
         return CLI_OK;
     }
-    const char *expected = strcmp(arch, "arm64") == 0 ? "/opt/homebrew/bin" : "/usr/local/bin";
-    (void)fprintf(stderr,
-                  "error: refusing wrong-architecture Homebrew path %s on macOS/%s; "
-                  "use %s or omit --dir for ~/.local/bin\n",
-                  bin_dir, arch, expected);
-    return CLI_ERR;
+    return cbm_remove_owned_path(stale_path, rc_file, dry_run);
 }
 
 static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file, bool dry_run,
                                         const char *os, const char *arch) {
     if (!bin_dir || !rc_file || !os || !arch) {
-        return CLI_ERR;
-    }
-    if (cli_validate_path_dir_for_platform(bin_dir, os, arch) != CLI_OK) {
         return CLI_ERR;
     }
 
@@ -5783,12 +5777,8 @@ static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file
         while (fgets(buf, sizeof(buf), f)) {
             if (strstr(buf, line)) {
                 (void)fclose(f);
-                int cleanup_rc = CLI_OK;
-                if (strcmp(os, "darwin") == 0) {
-                    const char *opposite =
-                        strcmp(arch, "arm64") == 0 ? "/usr/local/bin" : "/opt/homebrew/bin";
-                    cleanup_rc = cbm_remove_owned_path(opposite, rc_file, dry_run);
-                }
+                int cleanup_rc =
+                    cli_remove_opposite_owned_path(bin_dir, rc_file, dry_run, os, arch);
                 return cleanup_rc == CLI_OK ? CLI_TRUE : CLI_ERR; /* already present */
             }
         }
@@ -5809,14 +5799,12 @@ static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file
         return CLI_ERR;
     }
 
-    /* A legacy install may have added the opposite Homebrew prefix. Remove
-     * only our exact managed block after the replacement line is durable; a
-     * failure leaves the new executable reachable and is reported upstream. */
-    if (strcmp(os, "darwin") == 0) {
-        const char *opposite = strcmp(arch, "arm64") == 0 ? "/usr/local/bin" : "/opt/homebrew/bin";
-        if (cbm_remove_owned_path(opposite, rc_file, dry_run) != CLI_OK) {
-            return CLI_ERR;
-        }
+    /* A legacy automatic install may have added the opposite Homebrew prefix.
+     * Remove only our exact managed block after the replacement line is
+     * durable, but never remove bin_dir itself: an explicit --dir remains
+     * authoritative even when it names the other architecture's prefix. */
+    if (cli_remove_opposite_owned_path(bin_dir, rc_file, dry_run, os, arch) != CLI_OK) {
+        return CLI_ERR;
     }
     return CLI_OK;
 }
@@ -5871,11 +5859,6 @@ int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run
 }
 
 #ifdef CBM_CLI_ENABLE_TEST_API
-bool cbm_path_dir_supported_for_platform_for_testing(const char *bin_dir, const char *os,
-                                                     const char *arch) {
-    return cli_path_dir_supported_for_platform(bin_dir, os, arch);
-}
-
 int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
                                              const char *os, const char *arch) {
     return cbm_ensure_path_for_platform(bin_dir, rc_file, dry_run, os, arch);
@@ -11201,9 +11184,6 @@ int cbm_cmd_install(int argc, char **argv) {
         return CLI_TRUE;
     }
     cbm_normalize_path_sep(bin_dir);
-    if (cli_validate_path_dir_for_platform(bin_dir, detect_os(), detect_arch()) != CLI_OK) {
-        return CLI_TRUE;
-    }
     char bin_target[CLI_BUF_1K];
 #ifdef _WIN32
     int target_length =
