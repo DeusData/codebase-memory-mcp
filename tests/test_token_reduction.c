@@ -977,6 +977,11 @@ TEST(query_graph_max_output_bytes_truncates) {
     ASSERT_NOT_NULL(strstr(resp, "\"truncated\":true"));
     ASSERT_NOT_NULL(strstr(resp, "Narrow returned fields, add LIMIT when appropriate, or raise "
                                  "max_output_bytes"));
+    /* The reply carries no rows, so it must not claim rows were returned:
+     * rows_materialized counts rows the engine produced before the byte cap,
+     * and rows_returned states the zero rows actually present in this reply. */
+    ASSERT_NOT_NULL(strstr(resp, "\"rows_materialized\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\"rows_returned\":0"));
     /* Response body should be near the byte limit */
     ASSERT_TRUE(strlen(resp) <= 2048); /* some slack for metadata */
 

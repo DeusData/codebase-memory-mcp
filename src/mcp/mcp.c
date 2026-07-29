@@ -8679,9 +8679,12 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         size_t json_len = strlen(json);
         if (json_len > (size_t)max_output_bytes) {
             char trunc_json[CBM_SZ_256];
+            /* rows_materialized counts rows the engine produced before the
+             * byte cap; rows_returned is the zero rows in this reply, so a
+             * consumer cannot mistake the discarded rows for delivered ones. */
             snprintf(trunc_json, sizeof(trunc_json),
                      "{\"truncated\":true,\"total_bytes\":%lu,"
-                     "\"rows_returned\":%d,"
+                     "\"rows_materialized\":%d,\"rows_returned\":0,"
                      "\"hint\":\"Narrow returned fields, add LIMIT when appropriate, or raise "
                      "max_output_bytes\"}",
                      (unsigned long)json_len, total_rows);
