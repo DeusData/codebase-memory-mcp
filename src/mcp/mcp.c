@@ -5285,7 +5285,7 @@ static void toon_append_context_warnings(cbm_sb_t *sb, yyjson_mut_val *ctx) {
     yyjson_mut_val *warning = NULL;
     while ((warning = yyjson_mut_arr_iter_next(&iter))) {
         cbm_toon_row_begin(sb);
-        cbm_toon_cell_str(sb, yyjson_mut_is_str(warning) ? yyjson_mut_get_str(warning) : "", false);
+        cbm_toon_cell_str(sb, yyjson_mut_is_str(warning) ? yyjson_mut_get_str(warning) : "", true);
         cbm_toon_row_end(sb);
     }
 }

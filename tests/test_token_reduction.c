@@ -1930,7 +1930,9 @@ TEST(first_graph_tool_response_explains_stale_architecture) {
     ASSERT_NOT_NULL(strstr(text, "_context_architecture_key_functions_available: false"));
     ASSERT_NOT_NULL(strstr(text, "_context_architecture_action:"));
     ASSERT_NOT_NULL(strstr(text, CBM_CONFIG_RANK_REFRESH));
-    ASSERT_NOT_NULL(strstr(text, "_context_warnings"));
+    ASSERT_NOT_NULL(strstr(text, "_context_warnings[1]{message}:\n"
+                                 "  \"pagerank derived view is stale;"));
+    ASSERT_NULL(strstr(text, "_context_warnings[1]{message}:\n  ,"));
     ASSERT_NOT_NULL(strstr(text, "_context_freshness_state: stale_with_warning"));
     free(text);
     cbm_mcp_server_free(srv);
