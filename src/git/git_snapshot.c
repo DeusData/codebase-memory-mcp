@@ -80,6 +80,10 @@ static int git_capture_command(const char *repo_path, const char *const git_args
     return 0;
 }
 
+#if !defined(_WIN32)
+/* Recursive submodule status currently uses Git's POSIX foreach command
+ * string and is intentionally excluded on Windows. Keep its streaming helper
+ * under the same guard so -Werror builds every supported target cleanly. */
 static int git_hash_command_output(const char *repo_path, const char *const git_args[],
                                    uint64_t *hash, int *bytes_read) {
     cbm_git_output_t output;
@@ -113,6 +117,7 @@ static int git_hash_command_output(const char *repo_path, const char *const git_
     }
     return rc == 0 && !read_error ? 0 : CBM_NOT_FOUND;
 }
+#endif
 
 bool cbm_git_snapshot_path_supported(const char *repo_path) {
     return cbm_git_validate_repo_path(repo_path);

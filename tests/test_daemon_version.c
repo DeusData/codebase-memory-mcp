@@ -7,6 +7,7 @@
  * tests.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 
 #include "daemon/daemon.h"
 #include "daemon/service.h"
@@ -266,6 +267,8 @@ TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
         version_test_cleanup(dir, image_path, cache_path, second_image_path);
         FAIL("could not create fingerprint-cache fixtures");
     }
+    ASSERT_TRUE(th_backdate_file_for_cache_test(image_path));
+    ASSERT_TRUE(th_backdate_file_for_cache_test(second_image_path));
 
     ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
         image_path, cache_path, true, initial, &cache_hit));

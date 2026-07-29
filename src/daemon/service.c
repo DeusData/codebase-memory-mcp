@@ -9,6 +9,7 @@
 #endif
 
 #include "foundation/compat_fs.h"
+#include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/sha256.h"
 
@@ -41,6 +42,10 @@ enum {
     DAEMON_FINGERPRINT_SNAPSHOT_FIELDS = sizeof(((daemon_fingerprint_snapshot_t *)0)->field) /
                                          sizeof(((daemon_fingerprint_snapshot_t *)0)->field[0]),
     DAEMON_FINGERPRINT_FIELD_HEX_CHARS = sizeof(uint64_t) * CBM_SZ_2,
+    DAEMON_FINGERPRINT_VOLUME_FIELD = 0,
+    DAEMON_FINGERPRINT_POSIX_WRITE_SEC_FIELD = 3,
+    DAEMON_FINGERPRINT_POSIX_WRITE_NSEC_FIELD = 4,
+    DAEMON_FINGERPRINT_WINDOWS_WRITE_TIME_FIELD = 4,
 };
 
 static cbm_daemon_conflict_log_test_hook_fn g_conflict_log_test_hook;
@@ -1089,6 +1094,61 @@ static bool daemon_fingerprint_snapshot_equal(const daemon_fingerprint_snapshot_
     return true;
 }
 
+static bool daemon_fingerprint_cache_file_snapshot(
+    FILE *file, daemon_fingerprint_snapshot_t *snapshot) {
+    if (!file || !snapshot) {
+        return false;
+    }
+#ifdef _WIN32
+    intptr_t native_handle = _get_osfhandle(cbm_fileno(file));
+    return native_handle != -1 &&
+           daemon_fingerprint_native_snapshot((uintptr_t)native_handle, snapshot);
+#else
+    int descriptor = cbm_fileno(file);
+    return descriptor >= 0 && fd_regular_current_user(descriptor, NULL) &&
+           daemon_fingerprint_native_snapshot((uintptr_t)descriptor, snapshot);
+#endif
+}
+
+/* A cached digest is authoritative only when its cache file was written after
+ * the image on the same native volume and is not future-dated. Equal/coarse
+ * timestamps, clock rollback, and cross-volume resolution differences are
+ * deliberately ambiguous and fall back to exact O(image bytes) hashing. A
+ * settled installed image retains O(1) cache admission time and memory. */
+static bool daemon_fingerprint_cache_newer_than_image(
+    const daemon_fingerprint_snapshot_t *cache,
+    const daemon_fingerprint_snapshot_t *image) {
+    if (!cache || !image ||
+        cache->field[DAEMON_FINGERPRINT_VOLUME_FIELD] !=
+            image->field[DAEMON_FINGERPRINT_VOLUME_FIELD]) {
+        return false;
+    }
+#ifdef _WIN32
+    FILETIME now_file_time;
+    GetSystemTimeAsFileTime(&now_file_time);
+    uint64_t now = windows_file_time(now_file_time);
+    uint64_t cache_time = cache->field[DAEMON_FINGERPRINT_WINDOWS_WRITE_TIME_FIELD];
+    uint64_t image_time = image->field[DAEMON_FINGERPRINT_WINDOWS_WRITE_TIME_FIELD];
+    return image_time < cache_time && cache_time <= now;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0) {
+        return false;
+    }
+    uint64_t cache_sec = cache->field[DAEMON_FINGERPRINT_POSIX_WRITE_SEC_FIELD];
+    uint64_t cache_nsec = cache->field[DAEMON_FINGERPRINT_POSIX_WRITE_NSEC_FIELD];
+    uint64_t image_sec = image->field[DAEMON_FINGERPRINT_POSIX_WRITE_SEC_FIELD];
+    uint64_t image_nsec = image->field[DAEMON_FINGERPRINT_POSIX_WRITE_NSEC_FIELD];
+    uint64_t now_sec = (uint64_t)now.tv_sec;
+    uint64_t now_nsec = (uint64_t)now.tv_nsec;
+    bool image_before_cache =
+        image_sec < cache_sec || (image_sec == cache_sec && image_nsec < cache_nsec);
+    bool cache_not_future =
+        cache_sec < now_sec || (cache_sec == now_sec && cache_nsec <= now_nsec);
+    return image_before_cache && cache_not_future;
+#endif
+}
+
 static bool daemon_fingerprint_cache_prefix(const daemon_fingerprint_snapshot_t *snapshot,
                                             char out[DAEMON_SERVICE_FINGERPRINT_RECORD_CAP],
                                             size_t *length_out) {
@@ -1109,6 +1169,7 @@ static bool daemon_fingerprint_cache_prefix(const daemon_fingerprint_snapshot_t 
 }
 
 static bool daemon_fingerprint_cache_load(const char *cache_path,
+                                          const daemon_fingerprint_snapshot_t *image_snapshot,
                                           char out[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP],
                                           size_t *length_out) {
     if (!cache_path || !cache_path[0] || !out || !length_out) {
@@ -1119,9 +1180,16 @@ static bool daemon_fingerprint_cache_load(const char *cache_path,
     if (!file) {
         return false;
     }
+    daemon_fingerprint_snapshot_t before;
+    daemon_fingerprint_snapshot_t after;
+    bool before_ok = daemon_fingerprint_cache_file_snapshot(file, &before);
     size_t length = fread(out, 1, DAEMON_SERVICE_FINGERPRINT_CACHE_CAP, file);
     int extra = length == DAEMON_SERVICE_FINGERPRINT_CACHE_CAP ? fgetc(file) : EOF;
-    bool read_ok = !ferror(file) && extra == EOF;
+    bool read_ok = before_ok && !ferror(file) && extra == EOF &&
+                   daemon_fingerprint_cache_file_snapshot(file, &after) &&
+                   daemon_fingerprint_snapshot_equal(&before, &after) &&
+                   (!image_snapshot ||
+                    daemon_fingerprint_cache_newer_than_image(&after, image_snapshot));
     bool close_ok = fclose(file) == 0;
     if (!read_ok || !close_ok) {
         return false;
@@ -1181,7 +1249,7 @@ static bool daemon_fingerprint_cache_read(const char *cache_path,
     size_t cache_length = 0;
     char prefix[DAEMON_SERVICE_FINGERPRINT_RECORD_CAP];
     size_t prefix_length = 0;
-    if (!daemon_fingerprint_cache_load(cache_path, cache, &cache_length) ||
+    if (!daemon_fingerprint_cache_load(cache_path, snapshot, cache, &cache_length) ||
         !daemon_fingerprint_cache_prefix(snapshot, prefix, &prefix_length)) {
         return false;
     }
@@ -1227,7 +1295,8 @@ static void daemon_fingerprint_cache_write(const char *cache_path,
 
     char previous[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
     size_t previous_length = 0;
-    bool previous_valid = daemon_fingerprint_cache_load(cache_path, previous, &previous_length) &&
+    bool previous_valid =
+        daemon_fingerprint_cache_load(cache_path, NULL, previous, &previous_length) &&
                           previous_length % record_length == 0;
     char cache[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
     size_t cache_length = 0;
