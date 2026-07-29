@@ -13576,6 +13576,9 @@ TEST(cli_main_help_lists_config_preset_subcommand) {
     ASSERT_NOT_NULL(strstr(help_buf, "config <list|get|set|reset>"));
     /* ... and the preset subcommand is advertised beside it. */
     ASSERT_NOT_NULL(strstr(help_buf, "config preset <list|apply>"));
+    /* Daemon lifecycle control is implemented (main_run_daemon_ctl) and named
+     * by runtime guidance, so top-level help must advertise it too. */
+    ASSERT_NOT_NULL(strstr(help_buf, "daemon <start|stop|status>"));
     /* Installed evidence guidance names this advanced tool, so help must too. */
     ASSERT_NOT_NULL(strstr(help_buf, "check_index_coverage"));
     /* Prefer the schema-derived flag form; deprecated inline JSON must not be
