@@ -306,6 +306,24 @@ require(
 )
 smoke_test = read("scripts/smoke-test.sh")
 require(
+    'get_graph_schema --project "$PROJECT" --format json' in smoke_test
+    and r'\"format\":\"json\"' in smoke_test,
+    "JSON-parsed schema assertions must request JSON independently of the configured default",
+)
+require(
+    r"rows\[[0-9][0-9]*\]" in smoke_test
+    and r"clusters\[\([0-9]*\)\]" in smoke_test
+    and r"semantic\[[0-9]+\]" in smoke_test,
+    "TOON assertions must recognize current table[N]{columns}: headers",
+)
+require(
+    "sleep 300 |" not in smoke_test
+    and 'mkfifo "$UI_INPUT"' in smoke_test
+    and 'exec 7>"$UI_INPUT"' in smoke_test
+    and "smoke_ui_stop" in smoke_test,
+    "Phase 15 must own and close its UI stdin FIFO instead of leaving a timer child",
+)
+require(
     "MSYS2_ARG_CONV_EXCL='*'" in smoke_test
     and 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File' in smoke_test
     and "& $args[1]" not in smoke_test,

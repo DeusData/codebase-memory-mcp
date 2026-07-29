@@ -10,6 +10,7 @@ bin/
 # Test artifacts
 *.test
 *.out
+*.log
 coverage.txt
 # Clang static analyzer (make -f Makefile.cbm test-analyze) per-file reports
 *.plist
@@ -73,7 +74,6 @@ CHANGELOG.md
 
 # Local memory/soak outputs (uploaded as CI artifacts, never committed)
 memlab-*.jsonl
-memlab-*.log
 soak-results/
 soak-results-query-leak/
 
