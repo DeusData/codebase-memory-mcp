@@ -110,8 +110,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     if (!cbm_service_pattern_is_http_route_literal(route_path, call->callee_name)) {
         return;
     }
-    int64_t route_id = cbm_pipeline_upsert_service_route(
-        ctx->gbuf, route_path, CBM_SVC_HTTP, method, NULL, NULL, NULL);
+    int64_t route_id = cbm_pipeline_upsert_service_route(ctx->gbuf, route_path, CBM_SVC_HTTP,
+                                                         method, NULL, NULL, NULL);
     if (route_id == 0) {
         return;
     }
@@ -125,9 +125,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
     if (handler_ref != NULL && handler_ref[0] != '\0') {
-        cbm_resolution_t hres =
-            cbm_registry_resolve(ctx->registry, handler_ref, module_qn, imp_keys, imp_vals,
-                                 imp_count);
+        cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, handler_ref, module_qn,
+                                                     imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler == NULL) {
@@ -210,8 +209,8 @@ static bool emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         (svc == CBM_SVC_HTTP) ? cbm_service_pattern_http_method(call->callee_name) : NULL;
     const char *broker =
         (svc == CBM_SVC_ASYNC) ? cbm_service_pattern_broker(res->qualified_name) : NULL;
-    int64_t route_id = cbm_pipeline_upsert_service_route(ctx->gbuf, url_or_topic, svc, method,
-                                                         broker, NULL, NULL);
+    int64_t route_id =
+        cbm_pipeline_upsert_service_route(ctx->gbuf, url_or_topic, svc, method, broker, NULL, NULL);
     if (route_id == 0) {
         return false;
     }
@@ -312,8 +311,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     return src;
 }
 
-static const cbm_gbuf_node_t *calls_lsp_target_node(cbm_pipeline_ctx_t *ctx,
-                                                    const char *callee_qn,
+static const cbm_gbuf_node_t *calls_lsp_target_node(cbm_pipeline_ctx_t *ctx, const char *callee_qn,
                                                     bool allow_tail_match) {
     const cbm_gbuf_node_t *direct = cbm_pipeline_find_node_by_qn(ctx, callee_qn);
     if (direct || !ctx || !ctx->project_name || !callee_qn) {
@@ -336,8 +334,7 @@ static const cbm_gbuf_node_t *calls_lsp_target_node(cbm_pipeline_ctx_t *ctx,
     }
     /* Add the ambiguity-safe Class.method fallback only for languages whose
      * caller explicitly enables it. Exact store-backed lookup remains first. */
-    return cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, callee_qn,
-                                        allow_tail_match);
+    return cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, callee_qn, allow_tail_match);
 }
 
 static bool calls_suppress_python_file_weak_dotted_match(const cbm_gbuf_node_t *source,
@@ -360,13 +357,12 @@ static cbm_resolution_t calls_refresh_reexport_resolution(
     const cbm_pipeline_ctx_t *ctx, const CBMCall *call, const char *source_path,
     const char *module_qn, const char **imp_keys, const char **imp_vals, int imp_count,
     const cbm_gbuf_node_t *lsp_target, cbm_resolution_t lsp_resolution) {
-    if (!ctx || !ctx->store_backed_node_lookup || !ctx->registry || !call ||
-        !call->callee_name || !lsp_target || !lsp_target->qualified_name || imp_count <= 0) {
+    if (!ctx || !ctx->store_backed_node_lookup || !ctx->registry || !call || !call->callee_name ||
+        !lsp_target || !lsp_target->qualified_name || imp_count <= 0) {
         return lsp_resolution;
     }
-    cbm_resolution_t registry_resolution =
-        cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
-                             imp_count);
+    cbm_resolution_t registry_resolution = cbm_registry_resolve(
+        ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count);
     if (registry_resolution.qualified_name &&
         cbm_registry_strategy_is_import_map(registry_resolution.strategy) &&
         strcmp(registry_resolution.qualified_name, lsp_target->qualified_name) == 0 &&
@@ -394,9 +390,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * Unique-tail fallbacks are JVM-only. Retain the O(1) exact index and the
      * configured confidence floor; only an allowed indexed miss scans tails. */
     bool allow_tail_match = cbm_pipeline_lsp_allow_tail_match(lang);
-    const CBMResolvedCall *lsp =
-        cbm_lsp_resolution_index_find(lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor,
-                                      allow_tail_match);
+    const CBMResolvedCall *lsp = cbm_lsp_resolution_index_find(
+        lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor, allow_tail_match);
     bool lsp_target_unindexed = false;
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
@@ -411,8 +406,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.candidate_count = 1;
             res = calls_refresh_reexport_resolution(ctx, call, rel, module_qn, imp_keys, imp_vals,
                                                     imp_count, target_node, res);
-            if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn,
-                                     imp_keys, imp_vals, imp_count, false) &&
+            if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
+                                     imp_vals, imp_count, false) &&
                 !cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* A resolved bare fetch is a local/imported shadow. Global
                  * fetch is classified only after resolution misses (#856). */
@@ -438,10 +433,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
         const char *handler_ref = NULL;
         const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
-        if (route_path &&
-            ((handler_ref && handler_ref[0] != '\0') ||
-             cbm_service_pattern_is_php_route_facade(call->callee_name) ||
-             cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
+        if (route_path && ((handler_ref && handler_ref[0] != '\0') ||
+                           cbm_service_pattern_is_php_route_facade(call->callee_name) ||
+                           cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
             handle_route_registration(ctx, call, source_node, route_path, handler_ref, module_qn,
                                       imp_keys, imp_vals, imp_count);
             return SKIP_ONE;
@@ -545,8 +539,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         !cbm_registry_is_import_reachable(res.qualified_name, imp_vals, imp_count)) {
         return 0;
     }
-    if (calls_suppress_python_file_weak_dotted_match(source_node, call, &res, imp_vals,
-                                                     imp_count, lang)) {
+    if (calls_suppress_python_file_weak_dotted_match(source_node, call, &res, imp_vals, imp_count,
+                                                     lang)) {
         return 0;
     }
 
@@ -701,11 +695,11 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file_with_options_ex(
-        src, slen, fi->language, ctx->project_name, fi->rel_path,
-        cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
-        cbm_pipeline_mode_extracts_macro_nodes(ctx->mode), ctx->macro_table,
-        ctx->return_type_table);
+    CBMFileResult *r =
+        cbm_extract_file_with_options_ex(src, slen, fi->language, ctx->project_name, fi->rel_path,
+                                         cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                                         cbm_pipeline_mode_extracts_macro_nodes(ctx->mode),
+                                         ctx->macro_table, ctx->return_type_table);
     free(src);
     if (r) {
         *owned = true;

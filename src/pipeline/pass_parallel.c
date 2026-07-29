@@ -651,10 +651,9 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
     if (def->route_path && def->route_path[0] != '\0' &&
         cbm_service_pattern_is_http_route_literal(def->route_path, NULL)) {
         const char *rm = def->route_method ? def->route_method : CBM_ROUTE_DEFAULT_METHOD;
-        int64_t route_id =
-            cbm_pipeline_upsert_service_route(ws->local_gbuf, def->route_path, CBM_SVC_HTTP, rm,
-                                              NULL, "decorator",
-                                              def->file_path ? def->file_path : fi->rel_path);
+        int64_t route_id = cbm_pipeline_upsert_service_route(
+            ws->local_gbuf, def->route_path, CBM_SVC_HTTP, rm, NULL, "decorator",
+            def->file_path ? def->file_path : fi->rel_path);
         if (route_id == 0) {
             return;
         }
@@ -973,8 +972,7 @@ static int merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_ent
         }
         CBMHashTable *old_map = cbm_pipeline_get_pkgmap();
         if (entry_count > 0) {
-            CBMHashTable *new_map =
-                cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name);
+            CBMHashTable *new_map = cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name);
             if (new_map) {
                 cbm_pipeline_set_pkgmap(new_map);
                 cbm_pkgmap_free(old_map);
@@ -1799,9 +1797,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         bool php_route_facade = cbm_service_pattern_is_php_route_facade(call->callee_name);
         bool handlerless_http_client =
             cbm_service_pattern_is_handlerless_http_client(call->callee_name);
-        if (route_path &&
-            (!suffix_only_route_reg || has_route_handler || handlerless_route_api ||
-             php_route_facade)) {
+        if (route_path && (!suffix_only_route_reg || has_route_handler || handlerless_route_api ||
+                           php_route_facade)) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);
             return;
@@ -2002,9 +1999,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
-                emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &fake_res,
-                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false, rel, lang);
+                emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &fake_res, module_qn,
+                                  rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count, false,
+                                  rel, lang);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level

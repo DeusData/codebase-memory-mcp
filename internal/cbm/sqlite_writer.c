@@ -1152,8 +1152,8 @@ static int get_varint(const uint8_t *buf, uint64_t *out) {
 // If an index cell's payload exceeds X, rewrite it to spill the tail to
 // overflow pages: varint(payload_len) + payload[0..local) + u32(first_ovfl).
 // Returns the (possibly new, malloc'd) cell; frees the original when replaced.
-static uint8_t *overflowize_index_cell(FILE *fp, uint32_t *next_page, uint8_t *cell,
-                                       int *cell_len, bool *ok) {
+static uint8_t *overflowize_index_cell(FILE *fp, uint32_t *next_page, uint8_t *cell, int *cell_len,
+                                       bool *ok) {
     if (!*ok) {
         return cell;
     }
@@ -1498,6 +1498,9 @@ struct sqlite_sort_ctx {
 };
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+/* qsort_r fixes this callback ABI; changing ctx to pointer-to-const would make
+ * the function type incompatible even though the callback treats it as const. */
+// cppcheck-suppress constParameterCallback
 static int cmp_perm_ctx_bsd(void *ctx, const void *a, const void *b) {
     const sqlite_sort_ctx_t *sort_ctx = (const sqlite_sort_ctx_t *)ctx;
     int ia = *(const int *)a;
@@ -1505,6 +1508,8 @@ static int cmp_perm_ctx_bsd(void *ctx, const void *a, const void *b) {
     return sort_ctx->cmp ? sort_ctx->cmp(sort_ctx, ia, ib) : 0;
 }
 #elif defined(__GLIBC__) || defined(__linux__)
+/* GNU qsort_r likewise requires a mutable void * callback parameter. */
+// cppcheck-suppress constParameterCallback
 static int cmp_perm_ctx_gnu(const void *a, const void *b, void *ctx) {
     const sqlite_sort_ctx_t *sort_ctx = (const sqlite_sort_ctx_t *)ctx;
     int ia = *(const int *)a;
@@ -1568,6 +1573,10 @@ static int *make_sorted_perm(int n, const sqlite_sort_ctx_t *ctx, sort_cmp_fn cm
     for (int i = 0; i < n; i++) {
         perm[i] = i;
     }
+    /* BSD/GNU qsort_r cannot fail; the portable fallback allocates SortItem
+     * storage and can return ERR_SORT_FAILED. Preserve that cross-platform
+     * failure path even when cppcheck evaluates only a native qsort_r branch. */
+    // cppcheck-suppress knownConditionTrueFalse
     if (sort_perm_with_ctx(perm, n, ctx, cmp) != 0) {
         free(perm);
         return NULL;
@@ -1602,7 +1611,8 @@ static int cmp_node_by_file(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
 }
 
 static int cmp_node_by_qn(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
-    int c = strcmp(safe_str(ctx->nodes[ia].qualified_name), safe_str(ctx->nodes[ib].qualified_name));
+    int c =
+        strcmp(safe_str(ctx->nodes[ia].qualified_name), safe_str(ctx->nodes[ib].qualified_name));
     if (c) {
         return c;
     }
@@ -2094,7 +2104,8 @@ static void write_sqlite_file_header(uint8_t *page1, uint32_t total_pages) {
 
 /* Build master records, write page 1 B-tree + file header. */
 static int write_master_page1(FILE *fp, MasterEntry *master, int master_count, uint32_t next_page) {
-    const uint8_t **master_records = (const uint8_t **)calloc((size_t)master_count, sizeof(uint8_t *));
+    const uint8_t **master_records =
+        (const uint8_t **)calloc((size_t)master_count, sizeof(uint8_t *));
     int *master_lens = (int *)calloc((size_t)master_count, sizeof(int));
     int64_t *master_rowids = (int64_t *)calloc((size_t)master_count, sizeof(int64_t));
     int rc = 0;
@@ -2313,7 +2324,8 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     uint32_t file_hashes_root = 0;
     uint32_t summaries_root = 0;
     uint32_t sqlite_seq_root = 0;
-    rc = write_metadata_tables(w, &projects_root, &file_hashes_root, &summaries_root, &sqlite_seq_root);
+    rc = write_metadata_tables(w, &projects_root, &file_hashes_root, &summaries_root,
+                               &sqlite_seq_root);
     uint32_t next_page = w->next_page;
     CBM_PROF_END("write_db", "2_metadata_tables", t_meta);
     if (rc != 0) {
@@ -2598,7 +2610,6 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     }
     if (err != 0 && !nodes_pb_done) {
         pb_free(&w->nodes_pb);
-        nodes_pb_done = true;
     }
     w->wc.project = project;
     w->wc.root_path = root_path;

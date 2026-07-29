@@ -911,9 +911,9 @@ static char *extract_nasm_callee(CBMArena *a, TSNode node, const char *source, c
         return NULL;
     }
     char *m = cbm_node_text(a, mnem, source);
-    if (!m || (strcasecmp(m, "call") != 0 && strcasecmp(m, "jmp") != 0 &&
-               strcasecmp(m, "je") != 0 && strcasecmp(m, "jne") != 0 &&
-               strcasecmp(m, "jz") != 0 && strcasecmp(m, "jnz") != 0)) {
+    if (!m ||
+        (strcasecmp(m, "call") != 0 && strcasecmp(m, "jmp") != 0 && strcasecmp(m, "je") != 0 &&
+         strcasecmp(m, "jne") != 0 && strcasecmp(m, "jz") != 0 && strcasecmp(m, "jnz") != 0)) {
         return NULL;
     }
     TSNode ops = ts_node_child_by_field_name(node, TS_FIELD("operands"));
@@ -2182,9 +2182,8 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             TSNode args = find_call_arguments_node(node);
             /* ObjectScript stores arguments under oref_method/method_args,
              * not the generic arguments field used by most grammars. */
-            if (ts_node_is_null(args) &&
-                (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
-                 ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
+            if (ts_node_is_null(args) && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
+                                          ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
                 TSNode oref = cbm_find_child_by_kind(node, "oref_method");
                 if (!ts_node_is_null(oref)) {
                     args = cbm_find_child_by_kind(oref, "method_args");

@@ -28,12 +28,15 @@
 /* Derive parent QN by stripping last dot-segment.
  * Returns heap-allocated string. Caller must free. Returns NULL if no dot. */
 static char *derive_parent_qn(const char *qn) {
-    if (!qn) return NULL;
+    if (!qn)
+        return NULL;
     const char *dot = strrchr(qn, '.');
-    if (!dot || dot == qn) return NULL;
+    if (!dot || dot == qn)
+        return NULL;
     size_t len = (size_t)(dot - qn);
     char *parent = malloc(len + 1);
-    if (!parent) return NULL;
+    if (!parent)
+        return NULL;
     memcpy(parent, qn, len);
     parent[len] = '\0';
     return parent;
@@ -41,27 +44,28 @@ static char *derive_parent_qn(const char *qn) {
 
 /* Resolve parent container for a child node (Method→Class, Field→Class).
  * Step 1: exact QN prefix lookup. Step 2: HC-1 shared helper. */
-static const cbm_gbuf_node_t *resolve_parent(
-    const cbm_gbuf_t *gb, const char *child_qn, const char *child_file,
-    const char **parent_labels, int label_count)
-{
+static const cbm_gbuf_node_t *resolve_parent(const cbm_gbuf_t *gb, const char *child_qn,
+                                             const char *child_file, const char **parent_labels,
+                                             int label_count) {
     char *parent_qn = derive_parent_qn(child_qn);
-    if (!parent_qn) return NULL;
+    if (!parent_qn)
+        return NULL;
 
     /* Step 1: exact QN lookup — O(1) hash */
     const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(gb, parent_qn);
 
     /* Step 2: HC-1 shared helper (name + label + file) — O(1) hash + O(k) filter */
     if (!parent) {
-        parent = cbm_gbuf_resolve_by_name_in_file(gb, parent_qn, child_file,
-                                                    parent_labels, label_count);
+        parent =
+            cbm_gbuf_resolve_by_name_in_file(gb, parent_qn, child_file, parent_labels, label_count);
     }
     free(parent_qn);
     return parent;
 }
 
 void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb) {
-    if (!gb) return;
+    if (!gb)
+        return;
 
     static const char *class_labels[] = {"Class", "Interface", "Enum"};
     static const char *class_or_enum[] = {"Class", "Enum"};
@@ -76,17 +80,18 @@ void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb) {
 
     for (int i = 0; i < method_count; i++) {
         const cbm_gbuf_node_t *m = methods[i];
-        if (!m->qualified_name || m->id <= 0) continue;
+        if (!m->qualified_name || m->id <= 0)
+            continue;
 
         /* Check if DEFINES_METHOD already exists — O(1) hash */
         const cbm_gbuf_edge_t **existing = NULL;
         int existing_count = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, m->id, "DEFINES_METHOD",
-                                            &existing, &existing_count);
-        if (existing_count > 0) continue;
+        cbm_gbuf_find_edges_by_target_type(gb, m->id, "DEFINES_METHOD", &existing, &existing_count);
+        if (existing_count > 0)
+            continue;
 
-        const cbm_gbuf_node_t *parent = resolve_parent(
-            gb, m->qualified_name, m->file_path, class_labels, 3);
+        const cbm_gbuf_node_t *parent =
+            resolve_parent(gb, m->qualified_name, m->file_path, class_labels, 3);
 
         if (parent) {
             cbm_gbuf_insert_edge(gb, parent->id, m->id, "DEFINES_METHOD", "{}");
@@ -104,16 +109,17 @@ void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb) {
 
     for (int i = 0; i < field_count; i++) {
         const cbm_gbuf_node_t *f = fields[i];
-        if (!f->qualified_name || f->id <= 0) continue;
+        if (!f->qualified_name || f->id <= 0)
+            continue;
 
         const cbm_gbuf_edge_t **existing = NULL;
         int existing_count = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, f->id, "HAS_FIELD",
-                                            &existing, &existing_count);
-        if (existing_count > 0) continue;
+        cbm_gbuf_find_edges_by_target_type(gb, f->id, "HAS_FIELD", &existing, &existing_count);
+        if (existing_count > 0)
+            continue;
 
-        const cbm_gbuf_node_t *parent = resolve_parent(
-            gb, f->qualified_name, f->file_path, class_or_enum, 2);
+        const cbm_gbuf_node_t *parent =
+            resolve_parent(gb, f->qualified_name, f->file_path, class_or_enum, 2);
 
         if (parent) {
             cbm_gbuf_insert_edge(gb, parent->id, f->id, "HAS_FIELD", "{}");
@@ -129,7 +135,6 @@ void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb) {
     snprintf(om, sizeof(om), "%d", orphan_methods);
     snprintf(fr, sizeof(fr), "%d", fields_repaired);
     snprintf(of, sizeof(of), "%d", orphan_fields);
-    cbm_log_info("pass.done", "pass", "normalize",
-                 "methods_repaired", mr, "orphan_methods", om,
+    cbm_log_info("pass.done", "pass", "normalize", "methods_repaired", mr, "orphan_methods", om,
                  "fields_repaired", fr, "orphan_fields", of);
 }

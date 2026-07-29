@@ -168,10 +168,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
  * Storage grows geometrically instead of imposing working-set caps.  Common
  * manifests allocate only the pairs they contain; total memory is O(R + L),
  * where R is the number of Resources and L is their total label pairs. */
-enum {
-    K8S_INITIAL_PAIR_CAPACITY = CBM_SZ_4,
-    K8S_INITIAL_RECORD_CAPACITY = CBM_SZ_32
-};
+enum { K8S_INITIAL_PAIR_CAPACITY = CBM_SZ_4, K8S_INITIAL_RECORD_CAPACITY = CBM_SZ_32 };
 
 typedef struct {
     char *key;
@@ -288,9 +285,8 @@ static void k8s_record_array_free(k8s_record_array_t *records) {
 
 static bool k8s_record_array_append(k8s_record_array_t *records, k8s_record_t *record) {
     if (!records || !record ||
-        !k8s_reserve_items((void **)&records->items, &records->cap,
-                           records->count + SKIP_ONE, sizeof(*records->items),
-                           K8S_INITIAL_RECORD_CAPACITY)) {
+        !k8s_reserve_items((void **)&records->items, &records->cap, records->count + SKIP_ONE,
+                           sizeof(*records->items), K8S_INITIAL_RECORD_CAPACITY)) {
         return false;
     }
     records->items[records->count++] = *record;
@@ -422,8 +418,8 @@ static bool k8s_scan_labels(const char *source, k8s_record_t *rec) {
                             return false;
                         }
                     } else if (under_labels) {
-                        if (!k8s_add_pair(&rec->labels, &rec->label_count,
-                                          &rec->label_capacity, key, val)) {
+                        if (!k8s_add_pair(&rec->labels, &rec->label_count, &rec->label_capacity,
+                                          key, val)) {
                             return false;
                         }
                     }
@@ -461,16 +457,14 @@ static bool k8s_workload_has_key(const k8s_record_t *workload, const char *key) 
     return lo < workload->label_count && strcmp(workload->labels[lo].key, key) == 0;
 }
 
-static bool k8s_workload_has_pair(const k8s_record_t *workload,
-                                  const k8s_label_pair_t *selector) {
+static bool k8s_workload_has_pair(const k8s_record_t *workload, const k8s_label_pair_t *selector) {
     if (workload->label_count > 0 &&
         bsearch(selector, workload->labels, (size_t)workload->label_count,
                 sizeof(*workload->labels), k8s_pair_compare)) {
         return true;
     }
     return strcmp(selector->key, "app") == 0 && !k8s_workload_has_key(workload, "app") &&
-           workload->name[0] &&
-           strcmp(selector->value, workload->name) == 0;
+           workload->name[0] && strcmp(selector->value, workload->name) == 0;
 }
 
 /* True only if every service selector requirement matches the workload. */
@@ -497,8 +491,8 @@ static int k8s_label_ref_compare(const void *lhs, const void *rhs) {
     return (a->record_index > b->record_index) - (a->record_index < b->record_index);
 }
 
-static bool k8s_label_ref_append(k8s_label_ref_array_t *refs, const char *key,
-                                 const char *value, int record_index) {
+static bool k8s_label_ref_append(k8s_label_ref_array_t *refs, const char *key, const char *value,
+                                 int record_index) {
     if (!k8s_reserve_items((void **)&refs->items, &refs->cap, refs->count + SKIP_ONE,
                            sizeof(*refs->items), K8S_INITIAL_RECORD_CAPACITY)) {
         return false;
@@ -530,8 +524,7 @@ static int k8s_label_ref_bound(const k8s_label_ref_array_t *refs, const char *ke
     return lo;
 }
 
-static bool k8s_build_workload_index(k8s_record_array_t *records,
-                                     k8s_label_ref_array_t *refs) {
+static bool k8s_build_workload_index(k8s_record_array_t *records, k8s_label_ref_array_t *refs) {
     for (int i = 0; i < records->count; i++) {
         k8s_record_t *record = &records->items[i];
         if (!record->is_workload || record->node_id <= 0) {
@@ -582,10 +575,10 @@ static bool k8s_link_selectors(cbm_pipeline_ctx_t *ctx, k8s_record_array_t *recs
         int candidate_hi = 0;
         int candidate_count = INT_MAX;
         for (int s = 0; s < svc->selector_count; s++) {
-            int lo = k8s_label_ref_bound(&refs, svc->selectors[s].key,
-                                         svc->selectors[s].value, false);
-            int hi = k8s_label_ref_bound(&refs, svc->selectors[s].key,
-                                         svc->selectors[s].value, true);
+            int lo =
+                k8s_label_ref_bound(&refs, svc->selectors[s].key, svc->selectors[s].value, false);
+            int hi =
+                k8s_label_ref_bound(&refs, svc->selectors[s].key, svc->selectors[s].value, true);
             if (hi - lo < candidate_count) {
                 candidate_lo = lo;
                 candidate_hi = hi;

@@ -71,18 +71,15 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
 
 static inline bool cbm_lsp_reason_join_strategy(const char *strategy) {
     return strategy &&
-           (strcmp(strategy, "lsp_func_ptr") == 0 ||
-            strcmp(strategy, "lsp_dll_resolve") == 0 ||
+           (strcmp(strategy, "lsp_func_ptr") == 0 || strcmp(strategy, "lsp_dll_resolve") == 0 ||
             strcmp(strategy, "lsp_method_ref_ctor") == 0 ||
             strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
             strcmp(strategy, "lsp_dict_dispatch") == 0 ||
-            strcmp(strategy, "lsp_import_alias") == 0 ||
-            strcmp(strategy, "lsp_destructor") == 0 ||
+            strcmp(strategy, "lsp_import_alias") == 0 || strcmp(strategy, "lsp_destructor") == 0 ||
             strcmp(strategy, "php_method_dynamic") == 0);
 }
 
-static inline bool cbm_lsp_resolution_matches_call(const CBMResolvedCall *rc,
-                                                   const CBMCall *call) {
+static inline bool cbm_lsp_resolution_matches_call(const CBMResolvedCall *rc, const CBMCall *call) {
     const char *call_short = cbm_lsp_bare_segment(call->callee_name);
     const char *resolved_short = cbm_lsp_bare_segment(rc->callee_qn);
     if (strcmp(resolved_short, call_short) == 0) {
@@ -157,8 +154,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
-    double floor =
-        confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
+    double floor = confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
     const CBMResolvedCall *best_exact = NULL;
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
@@ -233,8 +229,7 @@ static inline void cbm_lsp_resolution_index_free_key(const char *key, void *valu
 }
 
 static inline void cbm_lsp_resolution_index_store(cbm_lsp_resolution_index_t *idx,
-                                                  const char *caller_qn,
-                                                  const char *callee_short,
+                                                  const char *caller_qn, const char *callee_short,
                                                   CBMResolvedCall *rc) {
     if (!idx || !idx->entries || !caller_qn || !callee_short || !rc) {
         if (idx) {
@@ -243,8 +238,8 @@ static inline void cbm_lsp_resolution_index_store(cbm_lsp_resolution_index_t *id
         return;
     }
     char key[CBM_SZ_1K];
-    int written = snprintf(key, sizeof(key), "%s%c%s", caller_qn,
-                           CBM_LSP_RESOLUTION_KEY_SEP, callee_short);
+    int written =
+        snprintf(key, sizeof(key), "%s%c%s", caller_qn, CBM_LSP_RESOLUTION_KEY_SEP, callee_short);
     if (written <= 0 || (size_t)written >= sizeof(key)) {
         idx->complete = false;
         return;
@@ -281,8 +276,7 @@ static inline void cbm_lsp_resolution_index_store(cbm_lsp_resolution_index_t *id
  * `complete` is cleared. A later miss then falls back to the linear helper so
  * correctness is preserved even when the optimization cannot cover every row. */
 static inline void cbm_lsp_resolution_index_build(cbm_lsp_resolution_index_t *idx,
-                                                  const CBMResolvedCallArray *arr,
-                                                  int call_count,
+                                                  const CBMResolvedCallArray *arr, int call_count,
                                                   double confidence_floor) {
     if (!idx) {
         return;
@@ -299,18 +293,16 @@ static inline void cbm_lsp_resolution_index_build(cbm_lsp_resolution_index_t *id
     }
     idx->complete = true;
 
-    double floor =
-        confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
+    double floor = confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
     for (int i = 0; i < arr->count; i++) {
         CBMResolvedCall *rc = &arr->items[i];
         if (!rc->caller_qn || !rc->callee_qn || (double)rc->confidence < floor) {
             continue;
         }
-        cbm_lsp_resolution_index_store(idx, rc->caller_qn,
-                                       cbm_lsp_bare_segment(rc->callee_qn), rc);
+        cbm_lsp_resolution_index_store(idx, rc->caller_qn, cbm_lsp_bare_segment(rc->callee_qn), rc);
         if (rc->reason && cbm_lsp_reason_join_strategy(rc->strategy)) {
-            cbm_lsp_resolution_index_store(idx, rc->caller_qn,
-                                           cbm_lsp_bare_segment(rc->reason), rc);
+            cbm_lsp_resolution_index_store(idx, rc->caller_qn, cbm_lsp_bare_segment(rc->reason),
+                                           rc);
         }
     }
 }
@@ -324,8 +316,7 @@ static inline const CBMResolvedCall *cbm_lsp_resolution_index_find(
     if (idx && idx->entries) {
         char key[CBM_SZ_1K];
         int written = snprintf(key, sizeof(key), "%s%c%s", call->enclosing_func_qn,
-                               CBM_LSP_RESOLUTION_KEY_SEP,
-                               cbm_lsp_bare_segment(call->callee_name));
+                               CBM_LSP_RESOLUTION_KEY_SEP, cbm_lsp_bare_segment(call->callee_name));
         if (written > 0 && (size_t)written < sizeof(key)) {
             const CBMResolvedCall *hit = (const CBMResolvedCall *)cbm_ht_get(idx->entries, key);
             if (hit || (idx->complete && !allow_tail_match)) {

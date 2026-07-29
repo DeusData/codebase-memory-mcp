@@ -259,8 +259,7 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     finish_line(line_buf, sizeof(line_buf), pos);
     emit_line(line_buf);
-    if (g_log_sink && g_log_sink_mode == CBM_LOG_SINK_REPLACE && msg &&
-        strcmp(msg, "prof") == 0 &&
+    if (g_log_sink && g_log_sink_mode == CBM_LOG_SINK_REPLACE && msg && strcmp(msg, "prof") == 0 &&
         atomic_load_explicit(&g_profile_stderr_mirror, memory_order_relaxed)) {
         (void)fprintf(stderr, "%s\n", line_buf);
     }

@@ -148,8 +148,8 @@ static const char *best_by_import_distance(const char **candidates, int count,
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
         int score = candidate_score(candidates[i], module_qn);
-        if (score > best_score || (score == best_score && best &&
-                                   strcmp(candidates[i], best) < 0)) {
+        if (score > best_score ||
+            (score == best_score && best && strcmp(candidates[i], best) < 0)) {
             best_score = score;
             best = candidates[i];
         }
@@ -412,8 +412,7 @@ bool cbm_registry_strategy_is_weak_short_name(const char *strategy) {
     if (!strategy || !strategy[0]) {
         return false;
     }
-    if (strcmp(strategy, "same_module") == 0 ||
-        cbm_registry_strategy_is_import_map(strategy) ||
+    if (strcmp(strategy, "same_module") == 0 || cbm_registry_strategy_is_import_map(strategy) ||
         strcmp(strategy, "import_map_suffix") == 0) {
         return false;
     }

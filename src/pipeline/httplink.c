@@ -1005,8 +1005,8 @@ int cbm_extract_go_routes(const char *name, const char *qn, const char *source,
             if (i < src_len && source[i] == '{') {
                 brace_depth++;
                 if (pending && chi_top < 32) {
-                    cbm_str_copy(chi_stack[chi_top].prefix,
-                                 sizeof(chi_stack[chi_top].prefix), pending_prefix);
+                    cbm_str_copy(chi_stack[chi_top].prefix, sizeof(chi_stack[chi_top].prefix),
+                                 pending_prefix);
                     chi_stack[chi_top].depth = brace_depth;
                     chi_top++;
                     pending = false;
@@ -1461,7 +1461,8 @@ static char *cbm_join_source_path(const char *root_dir, const char *rel_path) {
 
     size_t root_len = strlen(root_dir);
     size_t rel_len = strlen(rel_path);
-    bool root_has_sep = root_len > 0 && (root_dir[root_len - 1] == '/' || root_dir[root_len - 1] == '\\');
+    bool root_has_sep =
+        root_len > 0 && (root_dir[root_len - 1] == '/' || root_dir[root_len - 1] == '\\');
     bool rel_has_sep = rel_len > 0 && (rel_path[0] == '/' || rel_path[0] == '\\');
     size_t sep_len = (!root_has_sep && !rel_has_sep) ? 1 : 0;
     if (root_len > SIZE_MAX - rel_len || root_len + rel_len > SIZE_MAX - sep_len - 1) {

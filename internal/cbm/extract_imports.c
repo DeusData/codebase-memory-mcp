@@ -989,8 +989,7 @@ static void parse_kotlin_imports(CBMExtractCtx *ctx) {
             for (uint32_t j = 0; j < nc; j++) {
                 TSNode child = ts_node_child(node, j);
                 const char *child_kind = ts_node_type(child);
-                if (strcmp(child_kind, "import") == 0 ||
-                    strcmp(child_kind, "import_header") == 0) {
+                if (strcmp(child_kind, "import") == 0 || strcmp(child_kind, "import_header") == 0) {
                     extract_one_import_header(ctx, child);
                 }
             }

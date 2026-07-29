@@ -1553,8 +1553,7 @@ static bool push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         }
     } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
         TSNode prev = ts_node_prev_sibling(node);
-        while (!ts_node_is_null(prev) &&
-               strcmp(ts_node_type(prev), "function_signature") != 0 &&
+        while (!ts_node_is_null(prev) && strcmp(ts_node_type(prev), "function_signature") != 0 &&
                strcmp(ts_node_type(prev), "method_signature") != 0) {
             prev = ts_node_prev_sibling(prev);
         }

@@ -34,8 +34,8 @@ typedef struct {
     const char **decorator_node_types;
     const char **env_access_functions;       // NULL-terminated (NULL if none)
     const char **env_access_member_patterns; // NULL-terminated (NULL if none)
-    const char **section_node_types;         // B11: config/markup containers (→ Section label, NOT Class)
-    const TSLanguage *(*ts_factory)(void);   // Tree-sitter grammar factory (NULL if shared)
+    const char **section_node_types; // B11: config/markup containers (→ Section label, NOT Class)
+    const TSLanguage *(*ts_factory)(void); // Tree-sitter grammar factory (NULL if shared)
     // NULL-terminated list of embedded sub-languages (NULL if host grammar has
     // no embedded content to re-parse). The terminator is an entry whose
     // script_node_type is NULL.

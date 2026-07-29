@@ -543,12 +543,10 @@ static const method_suffix_t method_suffixes[] = {
 /* ── Matching implementation ───────────────────────────────────── */
 
 static bool qn_token_char(char ch) {
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-           (ch >= '0' && ch <= '9');
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
 }
 
-static bool qn_pattern_occurrence_matches(const char *qn, const char *hit,
-                                          const char *pattern) {
+static bool qn_pattern_occurrence_matches(const char *qn, const char *hit, const char *pattern) {
     size_t plen = strlen(pattern);
     if (plen == 0) {
         return false;
@@ -680,10 +678,9 @@ static bool has_filesystem_extension(const char *path) {
     ext[ext_len] = '\0';
 
     static const char *const hard_file_exts[] = {
-        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".log",         ".md",   ".pdf",        ".pem",
-        ".pid",  ".properties", ".rst",     ".service", ".sock",    ".socket",
-        ".sqlite", ".toml", ".txt",         NULL};
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",  ".env",        ".ini", ".key",
+        ".log",  ".md",     ".pdf",         ".pem",  ".pid", ".properties", ".rst", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", ".txt", NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
@@ -919,8 +916,8 @@ bool cbm_service_pattern_route_suffix_allows_no_handler(const char *callee_name)
 bool cbm_service_pattern_is_php_route_facade(const char *callee_name) {
     static const char php_route_facade_prefix[] = "Route::";
     return callee_name != NULL &&
-           strncmp(callee_name, php_route_facade_prefix,
-                   sizeof(php_route_facade_prefix) - 1) == 0 &&
+           strncmp(callee_name, php_route_facade_prefix, sizeof(php_route_facade_prefix) - 1) ==
+               0 &&
            cbm_service_pattern_route_method(callee_name) != NULL;
 }
 

@@ -434,11 +434,10 @@ static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *t
         return 0;
     }
     sqlite3_stmt *s = NULL;
-    if (sqlite3_prepare_v2(
-            db,
-            "SELECT qualified_name FROM nodes "
-            "WHERE project = ?1 AND label = 'Route' ORDER BY id",
-            CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db,
+                           "SELECT qualified_name FROM nodes "
+                           "WHERE project = ?1 AND label = 'Route' ORDER BY id",
+                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
         *failed = true;
         return 0;
     }
@@ -608,10 +607,9 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         cbm_route_canon_path(route_path, canonical_path, sizeof(canonical_path));
         char route_qn[CBM_ROUTE_QN_SIZE];
         char route_props[CBM_SZ_256];
-        if (!cbm_pipeline_build_service_route_identity(route_path, CBM_SVC_HTTP,
-                                                       method[0] ? method : NULL, NULL, NULL,
-                                                       route_qn, sizeof(route_qn), route_props,
-                                                       sizeof(route_props))) {
+        if (!cbm_pipeline_build_service_route_identity(
+                route_path, CBM_SVC_HTTP, method[0] ? method : NULL, NULL, NULL, route_qn,
+                sizeof(route_qn), route_props, sizeof(route_props))) {
             continue;
         }
 
@@ -623,9 +621,9 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
                                handler_file, sizeof(handler_file), &query_failed);
         if (!query_failed && handler_id == 0) {
             /* Try without method (ANY) */
-            if (!cbm_pipeline_build_service_route_identity(
-                    route_path, CBM_SVC_HTTP, NULL, NULL, NULL, route_qn, sizeof(route_qn),
-                    route_props, sizeof(route_props))) {
+            if (!cbm_pipeline_build_service_route_identity(route_path, CBM_SVC_HTTP, NULL, NULL,
+                                                           NULL, route_qn, sizeof(route_qn),
+                                                           route_props, sizeof(route_props))) {
                 continue;
             }
             handler_id = find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
@@ -711,10 +709,9 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
 
         char route_qn[CBM_ROUTE_QN_SIZE];
         char route_props[CBM_SZ_256];
-        if (!cbm_pipeline_build_service_route_identity(url_path, CBM_SVC_ASYNC, NULL,
-                                                       broker[0] ? broker : NULL, NULL, route_qn,
-                                                       sizeof(route_qn), route_props,
-                                                       sizeof(route_props))) {
+        if (!cbm_pipeline_build_service_route_identity(
+                url_path, CBM_SVC_ASYNC, NULL, broker[0] ? broker : NULL, NULL, route_qn,
+                sizeof(route_qn), route_props, sizeof(route_props))) {
             continue;
         }
 
@@ -1277,7 +1274,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
 
         /* Counted as missing in the resolve loop above; skip it here so the
          * remaining targets still run. */
-        if (strcmp(tgt, project) != 0 && !cr_project_exists(tgt)) {
+        if (!cr_project_exists(tgt)) {
             continue;
         }
 

@@ -1544,9 +1544,8 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     }
     const char *dot = fn_text ? strrchr(fn_text, '.') : NULL;
     bool has_receiver = dot && dot[SKIP_CHAR] != '\0';
-    bool is_generic_route = fn_text &&
-                            (strcmp(dot ? dot + SKIP_CHAR : fn_text, "route") == 0 ||
-                             strcmp(dot ? dot + SKIP_CHAR : fn_text, "api_route") == 0);
+    bool is_generic_route = fn_text && (strcmp(dot ? dot + SKIP_CHAR : fn_text, "route") == 0 ||
+                                        strcmp(dot ? dot + SKIP_CHAR : fn_text, "api_route") == 0);
 
     TSNode args = find_decorator_args(dchild);
     if (!ts_node_is_null(args)) {
@@ -2027,7 +2026,14 @@ static bool rust_direct_cfg_span(TSNode attr, const char *source, rust_cfg_span_
     }
     const char *cfg = p;
     const size_t cfg_name_len = sizeof("cfg") - SKIP_ONE;
-    if ((size_t)(attr_end - p) < cfg_name_len || memcmp(p, "cfg", cfg_name_len) != 0) {
+    /* Tree-sitter's attribute span extends through the closing bracket.
+     * cppcheck 2.20 loses that relation after the whitespace loop and
+     * incorrectly treats every remaining span as shorter than "cfg". */
+    // cppcheck-suppress knownConditionTrueFalse
+    if ((size_t)(attr_end - p) < cfg_name_len) {
+        return false;
+    }
+    if (memcmp(p, "cfg", cfg_name_len) != 0) {
         return false;
     }
     p += cfg_name_len;
@@ -6904,17 +6910,15 @@ static bool kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end
 
     uint32_t i = colon + 1;
     while (i < header_end) {
-        while (i < header_end &&
-               (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' ||
-                source[i] == '\n' || source[i] == ',')) {
+        while (i < header_end && (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' ||
+                                  source[i] == '\n' || source[i] == ',')) {
             i++;
         }
         if (i >= header_end || !kotlin_source_ident_start(source[i])) {
             break;
         }
         uint32_t name_start = i;
-        while (i < header_end &&
-               (kotlin_source_ident_continue(source[i]) || source[i] == '.')) {
+        while (i < header_end && (kotlin_source_ident_continue(source[i]) || source[i] == '.')) {
             i++;
         }
         char *base = cbm_arena_strndup(ctx->arena, source + name_start, (size_t)(i - name_start));
@@ -7027,8 +7031,7 @@ static void recover_kotlin_error_source(CBMExtractCtx *ctx, TSNode err_node) {
             continue;
         }
         while (i < end &&
-               (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' ||
-                source[i] == '\n')) {
+               (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' || source[i] == '\n')) {
             i++;
         }
         if (i >= end || !kotlin_source_ident_start(source[i])) {
@@ -7051,10 +7054,10 @@ static void recover_kotlin_error_source(CBMExtractCtx *ctx, TSNode err_node) {
         CBMDefinition def;
         memset(&def, 0, sizeof(def));
         def.name = name;
-        def.qualified_name = ctx->enclosing_class_qn
-                                 ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn,
-                                                     name)
-                                 : cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+        def.qualified_name =
+            ctx->enclosing_class_qn
+                ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn, name)
+                : cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
         def.label = label;
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(err_node).row + TS_LINE_OFFSET;

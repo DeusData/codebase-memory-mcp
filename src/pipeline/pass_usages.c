@@ -159,8 +159,7 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        const cbm_gbuf_node_t *src =
-            thr->enclosing_func_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, thr->enclosing_func_qn) : NULL;
+        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(ctx->gbuf, thr->enclosing_func_qn);
         if (!cbm_pipeline_node_is_callable_scope(src)) {
             continue;
         }

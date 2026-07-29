@@ -272,11 +272,11 @@ typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
-    bool star;             /* RETURN * */
+    bool star; /* RETURN * */
     cbm_order_item_t *order_items;
     int order_count;
-    int skip;              /* SKIP N, 0 = none */
-    int limit;             /* -1 = no LIMIT clause; 0 = explicit LIMIT 0 */
+    int skip;  /* SKIP N, 0 = none */
+    int limit; /* -1 = no LIMIT clause; 0 = explicit LIMIT 0 */
 } cbm_return_clause_t;
 
 /* Full query AST */

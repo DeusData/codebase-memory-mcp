@@ -19,17 +19,17 @@ struct cbm_config;
 
 /* ── Algorithm defaults (config-overridable) ──────────────── */
 
-#define CBM_PAGERANK_DAMPING    0.85   /* Standard Google PageRank damping */
-#define CBM_PAGERANK_EPSILON    1e-6   /* L2 convergence threshold */
-#define CBM_PAGERANK_MAX_ITER   20     /* Max power iterations */
+#define CBM_PAGERANK_DAMPING 0.85 /* Standard Google PageRank damping */
+#define CBM_PAGERANK_EPSILON 1e-6 /* L2 convergence threshold */
+#define CBM_PAGERANK_MAX_ITER 20  /* Max power iterations */
 
 /* Config keys for runtime tuning */
 #define CBM_CONFIG_PAGERANK_MAX_ITER "pagerank_max_iter"
-#define CBM_CONFIG_PAGERANK_DAMPING  "pagerank_damping"
-#define CBM_CONFIG_PAGERANK_EPSILON  "pagerank_epsilon"
-#define CBM_CONFIG_RANK_SCOPE        "rank_scope"
-#define CBM_CONFIG_RANK_REFRESH      "rank_refresh"
-#define CBM_CONFIG_RANK_ENABLED      "rank_enabled"
+#define CBM_CONFIG_PAGERANK_DAMPING "pagerank_damping"
+#define CBM_CONFIG_PAGERANK_EPSILON "pagerank_epsilon"
+#define CBM_CONFIG_RANK_SCOPE "rank_scope"
+#define CBM_CONFIG_RANK_REFRESH "rank_refresh"
+#define CBM_CONFIG_RANK_ENABLED "rank_enabled"
 
 #define CBM_RANK_REFRESH_AT_PUBLISH "at_publish"
 #define CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES "defer_exact_delta_reindexes"
@@ -44,38 +44,37 @@ typedef enum {
     CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK = 4,
 } cbm_rank_refresh_publish_t;
 
-cbm_rank_refresh_publish_t
-cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind,
-                                       bool incremental_fallback);
+cbm_rank_refresh_publish_t cbm_rank_refresh_publish_from_pipeline(
+    cbm_pipeline_publish_kind_t publish_kind, bool incremental_fallback);
 
 /* Config keys for edge type weights (all doubles, override via `config set`) */
-#define CBM_CONFIG_EDGE_WEIGHT_CALLS          "edge_weight_calls"
-#define CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD  "edge_weight_defines_method"
-#define CBM_CONFIG_EDGE_WEIGHT_DEFINES         "edge_weight_defines"
-#define CBM_CONFIG_EDGE_WEIGHT_IMPORTS         "edge_weight_imports"
-#define CBM_CONFIG_EDGE_WEIGHT_USAGE           "edge_weight_usage"
-#define CBM_CONFIG_EDGE_WEIGHT_CONFIGURES      "edge_weight_configures"
-#define CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS      "edge_weight_http_calls"
-#define CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS     "edge_weight_async_calls"
-#define CBM_CONFIG_EDGE_WEIGHT_TESTS            "edge_weight_tests"
-#define CBM_CONFIG_EDGE_WEIGHT_WRITES           "edge_weight_writes"
-#define CBM_CONFIG_EDGE_WEIGHT_DECORATES        "edge_weight_decorates"
-#define CBM_CONFIG_EDGE_WEIGHT_DEFAULT          "edge_weight_default"
-#define CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF       "edge_weight_member_of"
+#define CBM_CONFIG_EDGE_WEIGHT_CALLS "edge_weight_calls"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD "edge_weight_defines_method"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFINES "edge_weight_defines"
+#define CBM_CONFIG_EDGE_WEIGHT_IMPORTS "edge_weight_imports"
+#define CBM_CONFIG_EDGE_WEIGHT_USAGE "edge_weight_usage"
+#define CBM_CONFIG_EDGE_WEIGHT_CONFIGURES "edge_weight_configures"
+#define CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS "edge_weight_http_calls"
+#define CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS "edge_weight_async_calls"
+#define CBM_CONFIG_EDGE_WEIGHT_TESTS "edge_weight_tests"
+#define CBM_CONFIG_EDGE_WEIGHT_WRITES "edge_weight_writes"
+#define CBM_CONFIG_EDGE_WEIGHT_DECORATES "edge_weight_decorates"
+#define CBM_CONFIG_EDGE_WEIGHT_DEFAULT "edge_weight_default"
+#define CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF "edge_weight_member_of"
 
 /* ── Internal tuning constants ────────────────────────────── */
 
-#define CBM_PAGERANK_INITIAL_CAP  256  /* Initial array capacity for nodes/edges */
-#define CBM_ISO_TIMESTAMP_LEN      32  /* ISO-8601 timestamp buffer size */
-#define CBM_LOG_INT_BUF            16  /* int->string buffer for logging */
-#define CBM_HASHMAP_LOAD_FACTOR     2  /* Hash map capacity = N * factor + 1 */
+#define CBM_PAGERANK_INITIAL_CAP 256 /* Initial array capacity for nodes/edges */
+#define CBM_ISO_TIMESTAMP_LEN 32     /* ISO-8601 timestamp buffer size */
+#define CBM_LOG_INT_BUF 16           /* int->string buffer for logging */
+#define CBM_HASHMAP_LOAD_FACTOR 2    /* Hash map capacity = N * factor + 1 */
 
 /* ── Scope control ────────────────────────────────────────── */
 
 typedef enum {
-    CBM_RANK_SCOPE_PROJECT = 0,  /* project nodes only */
-    CBM_RANK_SCOPE_FULL    = 1,  /* project + all deps (default) */
-    CBM_RANK_SCOPE_DEPS    = 2,  /* deps only */
+    CBM_RANK_SCOPE_PROJECT = 0, /* project nodes only */
+    CBM_RANK_SCOPE_FULL = 1,    /* project + all deps (default) */
+    CBM_RANK_SCOPE_DEPS = 2,    /* deps only */
 } cbm_rank_scope_t;
 
 #define CBM_DEFAULT_RANK_SCOPE CBM_RANK_SCOPE_FULL
@@ -83,18 +82,18 @@ typedef enum {
 /* ── Edge type weights ────────────────────────────────────── */
 
 typedef struct {
-    double calls;           /* CALLS — direct function/method calls */
-    double defines_method;  /* DEFINES_METHOD — class defines method (structural) */
-    double defines;         /* DEFINES — module/file defines symbol (structural, low signal) */
-    double imports;         /* IMPORTS — module imports */
-    double usage;           /* USAGE — type references, attribute access, isinstance (high for Python) */
-    double configures;      /* CONFIGURES — config file links */
-    double http_calls;      /* HTTP_CALLS — cross-service calls */
-    double async_calls;     /* ASYNC_CALLS — async function calls */
-    double tests;           /* TESTS — test function tests production code (dampened) */
-    double writes;          /* WRITES — function writes to variable/file */
-    double decorates;       /* DECORATES — decorator applied to function */
-    double default_weight;  /* Fallback for unknown edge types */
+    double calls;          /* CALLS — direct function/method calls */
+    double defines_method; /* DEFINES_METHOD — class defines method (structural) */
+    double defines;        /* DEFINES — module/file defines symbol (structural, low signal) */
+    double imports;        /* IMPORTS — module imports */
+    double usage;      /* USAGE — type references, attribute access, isinstance (high for Python) */
+    double configures; /* CONFIGURES — config file links */
+    double http_calls; /* HTTP_CALLS — cross-service calls */
+    double async_calls;        /* ASYNC_CALLS — async function calls */
+    double tests;              /* TESTS — test function tests production code (dampened) */
+    double writes;             /* WRITES — function writes to variable/file */
+    double decorates;          /* DECORATES — decorator applied to function */
+    double default_weight;     /* Fallback for unknown edge types */
     double member_rank_factor; /* Fraction of member rank aggregated to parent class (0=disabled) */
 } cbm_edge_weights_t;
 
@@ -109,10 +108,8 @@ extern const cbm_edge_weights_t CBM_DEFAULT_EDGE_WEIGHTS;
  * Runtime:  O(max_iter * (V + E)), typically 20 * (V + E).
  * Memory:   O(V) for rank arrays + O(E) for edge list.
  * Returns:  number of nodes ranked, or -1 on error. */
-int cbm_pagerank_compute(cbm_store_t *store, const char *project,
-                         double damping, double epsilon, int max_iter,
-                         const cbm_edge_weights_t *weights,
-                         cbm_rank_scope_t scope);
+int cbm_pagerank_compute(cbm_store_t *store, const char *project, double damping, double epsilon,
+                         int max_iter, const cbm_edge_weights_t *weights, cbm_rank_scope_t scope);
 
 /* Convenience: compute with defaults (FULL scope, d=0.85, eps=1e-6, 20 iter) */
 int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
@@ -133,14 +130,13 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
  * may be NULL (uses defaults). */
 int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
                                        struct cbm_config *cfg, bool graph_changed,
-                                       int deps_reindexed,
-                                       cbm_rank_refresh_publish_t publish_kind);
+                                       int deps_reindexed, cbm_rank_refresh_publish_t publish_kind);
 
 /* Backwards-compatible wrapper for older callers: exact_incremental_publish=true
  * maps to CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT, false maps to FULL. */
-int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
-                                   struct cbm_config *cfg, bool graph_changed,
-                                   int deps_reindexed, bool exact_incremental_publish);
+int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project, struct cbm_config *cfg,
+                                   bool graph_changed, int deps_reindexed,
+                                   bool exact_incremental_publish);
 
 /* True only when PageRank, LinkRank, and node_degree derived views are all
  * recorded complete for the project. Missing rows return false so callers

@@ -867,8 +867,7 @@ bool cbm_sem_corpus_add_doc_arrays_with_workers(cbm_sem_corpus_t *corpus, char *
         return false;
     }
     for (int d = 0; d < doc_count; d++) {
-        if (token_counts[d] < 0 ||
-            (size_t)token_counts[d] > SIZE_MAX / sizeof(int) ||
+        if (token_counts[d] < 0 || (size_t)token_counts[d] > SIZE_MAX / sizeof(int) ||
             (token_counts[d] > 0 && !doc_tokens[d])) {
             return false;
         }
@@ -876,9 +875,8 @@ bool cbm_sem_corpus_add_doc_arrays_with_workers(cbm_sem_corpus_t *corpus, char *
 
     /* Phase A (SEQUENTIAL): discover tokens, allocate doc arrays, then
      * canonicalize token IDs before Phase B writes doc_token_ids. */
-    if (doc_count > INT_MAX - corpus->doc_count) {
-        return false;
-    }
+    /* The entry precondition requires an empty corpus, so positive int
+     * doc_count cannot overflow corpus->doc_count + doc_count below. */
     if (corpus->doc_cap < corpus->doc_count + doc_count) {
         int new_cap = corpus->doc_count + doc_count;
         if (!corpus_reserve_doc_arrays(corpus, new_cap)) {

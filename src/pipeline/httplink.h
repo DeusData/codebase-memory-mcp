@@ -49,8 +49,7 @@ enum {
     /* Module-level route discovery reads full files. Keep the cap explicit and
      * local to httplink so generated or bundled files cannot dominate this pass. */
     CBM_HTTPLINK_FULL_SOURCE_MAX_MIB = 10,
-    CBM_HTTPLINK_FULL_SOURCE_MAX_BYTES =
-        CBM_HTTPLINK_FULL_SOURCE_MAX_MIB * CBM_SZ_1K * CBM_SZ_1K,
+    CBM_HTTPLINK_FULL_SOURCE_MAX_BYTES = CBM_HTTPLINK_FULL_SOURCE_MAX_MIB * CBM_SZ_1K * CBM_SZ_1K,
 };
 
 /* ── Similarity functions ──────────────────────────────────────── */

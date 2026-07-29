@@ -439,7 +439,7 @@ struct cbm_subprocess {
     int quiet_timeout_ms;
     int cancel_grace_ms;
     bool delete_log_on_exit;
-    bool discard_stderr; /* child stderr -> null device; only stdout is captured */
+    bool discard_stderr;         /* child stderr -> null device; only stdout is captured */
     _Atomic long *child_pid_out; /* borrowed from opts; NULL when unused */
 
     long tail_pos;
@@ -989,8 +989,8 @@ void cbm_subprocess_posix_close_nonstdio(long max_fd) {
     }
 }
 
-static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int output,
-                                 int error_output, long max_fd) {
+static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int output, int error_output,
+                                 long max_fd) {
     if (setpgid(0, 0) < 0) {
         _exit(127);
     }
@@ -1432,9 +1432,8 @@ int cbm_subprocess_run(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
          * children are reaped promptly by the startup window, while a long
          * worker settles onto the platform steady interval instead of spinning
          * at a fixed high rate for its whole lifetime. */
-        int interval_ms =
-            cbm_subprocess_poll_interval_ms(cbm_now_ms() - poll_started_ms,
-                                            CBM_PROC_STEADY_POLL_MS);
+        int interval_ms = cbm_subprocess_poll_interval_ms(cbm_now_ms() - poll_started_ms,
+                                                          CBM_PROC_STEADY_POLL_MS);
         const struct timespec delay = {
             interval_ms / (int)CBM_MSEC_PER_SEC,
             (long)(interval_ms % (int)CBM_MSEC_PER_SEC) * (long)CBM_NSEC_PER_MSEC,

@@ -3,25 +3,26 @@
 #define CBM_PROFILE_TERMS_GENERATED_H
 
 #define CBM_BENCHMARK_TERMINOLOGY_VERSION "1.1.0"
-#define CBM_BENCHMARK_TERMINOLOGY_SHA256 "04b73a6474ea9f257448ff09f136b0ed675452afee5c75bfd7d21a7b9bdc6bee"
+#define CBM_BENCHMARK_TERMINOLOGY_SHA256 \
+    "04b73a6474ea9f257448ff09f136b0ed675452afee5c75bfd7d21a7b9bdc6bee"
 
-#define CBM_BENCHMARK_STEP_IDS(X) \
-    X(STARTUP, "startup") \
-    X(PROJECT_DISCOVERY, "project_discovery") \
-    X(CHANGE_CLASSIFICATION, "change_classification") \
-    X(PARSE_EXTRACT, "parse_extract") \
-    X(EXACT_DELTA, "exact_delta") \
-    X(SEMANTIC_VECTORS, "semantic_vectors") \
-    X(SEMANTIC_LSH, "semantic_lsh") \
-    X(SEMANTIC_PAIRS, "semantic_pairs") \
-    X(GRAPH_PUBLISH_DELETE, "graph_publish_delete") \
-    X(GRAPH_PUBLISH_UPSERT, "graph_publish_upsert") \
-    X(GRAPH_PUBLISH_INDEXES, "graph_publish_indexes") \
-    X(DEPENDENCY_DISCOVERY, "dependency_discovery") \
+#define CBM_BENCHMARK_STEP_IDS(X)                           \
+    X(STARTUP, "startup")                                   \
+    X(PROJECT_DISCOVERY, "project_discovery")               \
+    X(CHANGE_CLASSIFICATION, "change_classification")       \
+    X(PARSE_EXTRACT, "parse_extract")                       \
+    X(EXACT_DELTA, "exact_delta")                           \
+    X(SEMANTIC_VECTORS, "semantic_vectors")                 \
+    X(SEMANTIC_LSH, "semantic_lsh")                         \
+    X(SEMANTIC_PAIRS, "semantic_pairs")                     \
+    X(GRAPH_PUBLISH_DELETE, "graph_publish_delete")         \
+    X(GRAPH_PUBLISH_UPSERT, "graph_publish_upsert")         \
+    X(GRAPH_PUBLISH_INDEXES, "graph_publish_indexes")       \
+    X(DEPENDENCY_DISCOVERY, "dependency_discovery")         \
     X(DEPENDENCY_PACKAGE_INDEX, "dependency_package_index") \
-    X(PAGERANK, "pagerank") \
-    X(LINKRANK, "linkrank") \
-    X(FIRST_CORE_QUERY, "first_core_query") \
+    X(PAGERANK, "pagerank")                                 \
+    X(LINKRANK, "linkrank")                                 \
+    X(FIRST_CORE_QUERY, "first_core_query")                 \
     X(FIRST_ALL_FRESH_QUERY, "first_all_fresh_query")
 
 #endif /* CBM_PROFILE_TERMS_GENERATED_H */

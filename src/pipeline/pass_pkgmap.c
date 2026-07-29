@@ -1347,8 +1347,8 @@ static bool is_c_family_source(const char *source_rel) {
 }
 
 static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
-                                                       const char *file_path,
-                                                       const char *source_file_qn) {
+                                                      const char *file_path,
+                                                      const char *source_file_qn) {
     if (!ctx || !file_path || !file_path[0]) {
         return NULL;
     }
@@ -1401,9 +1401,9 @@ static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *
 }
 
 static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
-                                                      const char *source_rel,
-                                                      const char *source_file_qn,
-                                                      const char *module_path) {
+                                                     const char *source_rel,
+                                                     const char *source_file_qn,
+                                                     const char *module_path) {
     if (!is_c_family_source(source_rel) || !is_header_include(module_path)) {
         return NULL;
     }
@@ -1548,10 +1548,9 @@ static bool import_edge_local_name_span(const cbm_gbuf_edge_t *edge, const char 
 }
 
 static char *import_edge_local_name_dup_json(const cbm_gbuf_edge_t *edge) {
-    yyjson_doc *doc =
-        edge && edge->properties_json
-            ? yyjson_read(edge->properties_json, strlen(edge->properties_json), 0)
-            : NULL;
+    yyjson_doc *doc = edge && edge->properties_json
+                          ? yyjson_read(edge->properties_json, strlen(edge->properties_json), 0)
+                          : NULL;
     if (!doc) {
         return NULL;
     }
@@ -1603,9 +1602,10 @@ static bool import_map_target_can_own_reexports(const cbm_gbuf_node_t *target) {
            (strcmp(target->label, "Folder") == 0 || strcmp(target->label, "Module") == 0);
 }
 
-static const cbm_gbuf_node_t *
-resolve_import_map_reexport_target(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source_file,
-                                   const cbm_gbuf_node_t *target, const char *local_name) {
+static const cbm_gbuf_node_t *resolve_import_map_reexport_target(const cbm_gbuf_t *gbuf,
+                                                                 const cbm_gbuf_node_t *source_file,
+                                                                 const cbm_gbuf_node_t *target,
+                                                                 const char *local_name) {
     if (!gbuf || !source_file || !target || !target->qualified_name || !local_name ||
         !local_name[0] || strcmp(local_name, "*") == 0) {
         return NULL;
@@ -1623,8 +1623,8 @@ resolve_import_map_reexport_target(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
 
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
-    int rc = cbm_gbuf_find_edges_by_source_type(gbuf, owner_file->id, "IMPORTS", &edges,
-                                                &edge_count);
+    int rc =
+        cbm_gbuf_find_edges_by_source_type(gbuf, owner_file->id, "IMPORTS", &edges, &edge_count);
     if (rc != 0 || edge_count <= 0 || !edges) {
         return NULL;
     }
@@ -1655,23 +1655,20 @@ static const cbm_gbuf_node_t *import_map_source_file(const cbm_gbuf_t *gbuf,
     return file_node;
 }
 
-bool cbm_pipeline_import_map_entry_is_reexport(const cbm_gbuf_t *gbuf,
-                                               const char *project_name,
-                                               const char *rel_path,
-                                               const char *local_name,
+bool cbm_pipeline_import_map_entry_is_reexport(const cbm_gbuf_t *gbuf, const char *project_name,
+                                               const char *rel_path, const char *local_name,
                                                const char *resolved_qn) {
     if (!local_name || !resolved_qn) {
         return false;
     }
-    const cbm_gbuf_node_t *source_file =
-        import_map_source_file(gbuf, project_name, rel_path);
+    const cbm_gbuf_node_t *source_file = import_map_source_file(gbuf, project_name, rel_path);
     if (!source_file) {
         return false;
     }
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
-    if (cbm_gbuf_find_edges_by_source_type(gbuf, source_file->id, "IMPORTS", &edges,
-                                           &edge_count) != 0) {
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source_file->id, "IMPORTS", &edges, &edge_count) !=
+        0) {
         return false;
     }
     for (int i = 0; i < edge_count; i++) {
@@ -1712,8 +1709,8 @@ int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char 
 
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
-    int rc = cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
-                                                &edge_count);
+    int rc =
+        cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count);
     if (rc != 0 || edge_count <= 0 || !edges) {
         return 0;
     }
@@ -1792,8 +1789,7 @@ static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbu
     for (int i = 0; i < file_count; i++) {
         const cbm_gbuf_node_t *node = files[i];
         const char *qn = node ? node->qualified_name : NULL;
-        if (!qn || !cbm_str_starts_with(qn, qn_prefix) ||
-            !cbm_str_ends_with(qn, file_qn_suffix)) {
+        if (!qn || !cbm_str_starts_with(qn, qn_prefix) || !cbm_str_ends_with(qn, file_qn_suffix)) {
             continue;
         }
         size_t qn_len = strlen(qn);
@@ -1801,7 +1797,7 @@ static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbu
             best = node;
             best_len = qn_len;
             best_ambiguous = false;
-        } else if (qn_len == best_len && best) {
+        } else if (qn_len == best_len) {
             best_ambiguous = true;
         }
     }
@@ -1811,8 +1807,7 @@ static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbu
 static const cbm_gbuf_node_t *resolve_reexported_symbol(cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
-                                                        const char *owner,
-                                                        const char *local_name) {
+                                                        const char *owner, const char *local_name) {
     if (!ctx || !owner || !owner[0] || !local_name || !local_name[0] ||
         strcmp(local_name, "*") == 0) {
         return NULL;
@@ -2205,7 +2200,8 @@ int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
         return 0;
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
-    if (!root || !yyjson_mut_obj_add_strcpy(doc, root, "local_name", local_name ? local_name : "")) {
+    if (!root ||
+        !yyjson_mut_obj_add_strcpy(doc, root, "local_name", local_name ? local_name : "")) {
         yyjson_mut_doc_free(doc);
         return 0;
     }
@@ -2217,15 +2213,14 @@ int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
         return 0;
     }
 
-    int emitted = cbm_gbuf_insert_edge(ctx->gbuf, source_id, target->id, "IMPORTS", props) > 0 ? 1 : 0;
+    int emitted =
+        cbm_gbuf_insert_edge(ctx->gbuf, source_id, target->id, "IMPORTS", props) > 0 ? 1 : 0;
     free(props);
     return emitted;
 }
 
-int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx,
-                                              const CBMFileResult *result,
-                                              const char *rel_path,
-                                              CBMHashTable *namespace_map) {
+int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                              const char *rel_path, CBMHashTable *namespace_map) {
     if (!ctx || !ctx->gbuf || !result || !rel_path) {
         return 0;
     }
