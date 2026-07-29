@@ -14894,6 +14894,7 @@ int mcp_test_idxfailclosed_supervisor_start_check(const char *repo_dir, const ch
     return result;
 }
 
+#ifndef _WIN32 /* helpers used only by the POSIX fork/spawn tests below */
 static bool idxfailclosed_self_path(char out[CBM_SZ_4K]) {
 #ifdef __APPLE__
     int length = proc_pidpath(getpid(), out, CBM_SZ_4K);
@@ -15007,6 +15008,7 @@ static int idxcanon_supervised_session_path_check(const char *session_root, cons
     }
     return code;
 }
+#endif /* !_WIN32 */
 
 /* ── Tests carried over from upstream main ──────────────────────────
  * Upstream-only coverage: cross-repo mutation guards and lease cancellation,
