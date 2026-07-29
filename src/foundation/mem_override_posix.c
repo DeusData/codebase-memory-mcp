@@ -25,7 +25,14 @@
 #include <mimalloc.h>
 #include <stddef.h>
 
-#if defined(__linux__)
+#if (defined(__linux__) || defined(__FreeBSD__)) && !defined(CBM_SANITIZED_BUILD)
+
+void *__real_realloc(void *block, size_t size);
+void __real_free(void *block);
+
+static inline bool mem_override_is_ours(const void *block) {
+    return mi_is_in_heap_region(block);
+}
 
 void *__wrap_malloc(size_t size) {
     void *block = mi_malloc(size);
@@ -40,22 +47,30 @@ void *__wrap_calloc(size_t count, size_t size) {
 }
 
 void *__wrap_realloc(void *block, size_t size) {
-    if (block) {
-        cbm_mem_profile_free(block);
+    if (!block) {
+        void *grown = mi_malloc(size);
+        cbm_mem_profile_alloc(grown, size);
+        return grown;
     }
-    void *grown = mi_realloc(block, size);
-    cbm_mem_profile_alloc(grown, size);
-    return grown;
+    if (mem_override_is_ours(block)) {
+        cbm_mem_profile_free(block);
+        void *grown = mi_realloc(block, size);
+        cbm_mem_profile_alloc(grown, size);
+        return grown;
+    }
+    return __real_realloc(block, size);
 }
 
 void __wrap_free(void *block) {
     if (!block) {
         return;
     }
-    /* Unlike Windows there is no foreign-allocator hazard to route around:
-     * every malloc in this image is already mimalloc's. */
-    cbm_mem_profile_free(block);
-    mi_free(block);
+    if (mem_override_is_ours(block)) {
+        cbm_mem_profile_free(block);
+        mi_free(block);
+    } else {
+        __real_free(block);
+    }
 }
 
 char *__wrap_strdup(const char *text) {
@@ -66,4 +81,4 @@ char *__wrap_strdup(const char *text) {
     return copy;
 }
 
-#endif /* __linux__ */
+#endif /* (defined(__linux__) || defined(__FreeBSD__)) && !defined(CBM_SANITIZED_BUILD) */

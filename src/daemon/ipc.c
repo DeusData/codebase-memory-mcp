@@ -1336,12 +1336,13 @@ static bool private_log_base_name_valid(const char *base_name) {
 }
 
 static char *private_log_directory_path_copy(const char *directory_path) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
     /* Darwin exposes the trusted top-level aliases /tmp -> /private/tmp and
-     * /var -> /private/var.  Resolve only those root-owned aliases before the
+     * /var -> /private/var. FreeBSD exposes /home -> /usr/home (or usr/home).
+     * Resolve only those root-owned aliases before the
      * component-wise O_NOFOLLOW walk.  Canonicalizing the complete caller path
      * would follow an attacker-controlled cache/log symlink and is forbidden. */
-    static const char *const aliases[] = {"/tmp", "/var"};
+    static const char *const aliases[] = {"/tmp", "/var", "/home"};
     for (size_t index = 0; index < sizeof(aliases) / sizeof(aliases[0]); index++) {
         const char *alias = aliases[index];
         size_t alias_length = strlen(alias);
