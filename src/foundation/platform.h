@@ -114,6 +114,14 @@ cbm_system_info_t cbm_system_info(void);
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
 int cbm_default_worker_count(bool initial);
 
+/* Set a cap for worker-count decisions made by the current controller thread.
+ * A non-positive value clears the cap. Returns the previous value so callers
+ * can restore nested scopes. */
+int cbm_worker_limit_set_for_thread(int max_workers);
+
+/* Available bytes on the filesystem containing an existing path. */
+bool cbm_disk_free_bytes(const char *path, uint64_t *bytes_out);
+
 /* ── Environment variables ──────────────────────────────────────── */
 
 /* Thread-safe getenv: copies the value into a caller-provided buffer.

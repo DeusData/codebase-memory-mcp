@@ -3989,6 +3989,7 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
     cbm_daemon_application_config_t config = {
         .worker_ops = &worker_ops,
         .project_locks = locks_ready ? locks.daemon_locks : NULL,
+        .physical_job_limit = 2,
     };
     cbm_daemon_application_t *application =
         locks_ready ? cbm_daemon_application_new(&config) : NULL;
@@ -4737,7 +4738,7 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
     PASS();
 }
 
-TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
+TEST(daemon_application_explicit_limit_admits_four_and_rejects_fifth) {
     enum { DEFAULT_CAP_RUNNING = 4, DEFAULT_CAP_TOTAL = 5 };
     const size_t aggregate_budget = 4099;
     app_fake_worker_context_t fake;
@@ -4753,6 +4754,7 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
     cbm_daemon_application_config_t config = {
         .worker_ops = &worker_ops,
         .aggregate_memory_budget_bytes = aggregate_budget,
+        .physical_job_limit = DEFAULT_CAP_RUNNING,
     };
     cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
     char roots[DEFAULT_CAP_TOTAL][APP_TEST_PATH_CAP];
@@ -4811,6 +4813,37 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
         assigned_budget += fake.memory_budgets[i];
     }
     ASSERT_TRUE(assigned_budget <= aggregate_budget);
+    PASS();
+}
+
+TEST(daemon_application_resource_policy_defaults_to_one_job) {
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    ASSERT_NOT_NULL(application);
+    ASSERT_EQ(cbm_daemon_application_physical_job_limit(application), 1);
+    cbm_daemon_application_free(application);
+    PASS();
+}
+
+TEST(daemon_application_resource_policy_loads_configured_job_limit) {
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-resource-config-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    cbm_config_t *stored_config = cbm_config_open(cache);
+    ASSERT_NOT_NULL(stored_config);
+    ASSERT_EQ(cbm_config_set(stored_config, "index_concurrent_jobs", "3"), 0);
+
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .aggregate_memory_budget_bytes = 9000,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    ASSERT_NOT_NULL(application);
+    ASSERT_EQ(cbm_daemon_application_physical_job_limit(application), 3);
+    ASSERT_EQ(cbm_daemon_application_worker_memory_budget_bytes(application), 3000);
+
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    th_rmtree(cache);
     PASS();
 }
 
@@ -4915,7 +4948,9 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_cancellation_between_recovery_attempts_stops_retry);
     RUN_TEST(daemon_application_thread_start_failure_rolls_back_job_reservation);
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
-    RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
+    RUN_TEST(daemon_application_explicit_limit_admits_four_and_rejects_fifth);
+    RUN_TEST(daemon_application_resource_policy_defaults_to_one_job);
+    RUN_TEST(daemon_application_resource_policy_loads_configured_job_limit);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
 }

@@ -42,8 +42,7 @@ TEST(platform_file_apis_survive_max_path_overflow) {
     ASSERT_NOT_NULL(cbm_mkdtemp(base));
 
     enum { LONG_SEGMENTS = 5 };
-    static const char segment[] =
-        "segment-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnop";
+    static const char segment[] = "segment-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnop";
     char deep[CBM_SZ_1K];
     written = snprintf(deep, sizeof(deep), "%s", base);
     ASSERT_TRUE(written > 0 && written < (int)sizeof(deep));
@@ -431,6 +430,61 @@ TEST(platform_default_workers_env_unset) {
     PASS();
 }
 
+TEST(platform_worker_limit_caps_environment_override_and_restores) {
+    cbm_setenv("CBM_WORKERS", "32", 1);
+
+    int previous = cbm_worker_limit_set_for_thread(3);
+    ASSERT_EQ(cbm_default_worker_count(true), 3);
+    ASSERT_EQ(cbm_default_worker_count(false), 3);
+
+    ASSERT_EQ(cbm_worker_limit_set_for_thread(previous), 3);
+    ASSERT_EQ(cbm_default_worker_count(true), 32);
+    cbm_unsetenv("CBM_WORKERS");
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(platform_directory_size_is_bounded_and_does_not_follow_symlinks) {
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-dir-size-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char first[CBM_SZ_1K];
+    char second[CBM_SZ_1K];
+    char loop[CBM_SZ_1K];
+    written = snprintf(first, sizeof(first), "%s/first", base);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(first));
+    written = snprintf(second, sizeof(second), "%s/second", base);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(second));
+    written = snprintf(loop, sizeof(loop), "%s/loop", base);
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(loop));
+
+    FILE *file = cbm_fopen(first, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(fwrite("1234", 1, 4, file), 4);
+    ASSERT_EQ(fclose(file), 0);
+    file = cbm_fopen(second, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(fwrite("123456", 1, 6, file), 6);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(symlink(base, loop), 0);
+
+    uint64_t complete = 0;
+    uint64_t bounded = 0;
+    ASSERT_TRUE(cbm_directory_size_bounded(base, UINT64_MAX, &complete));
+    ASSERT_TRUE(cbm_directory_size_bounded(base, 3, &bounded));
+
+    ASSERT_EQ(cbm_unlink(loop), 0);
+    ASSERT_EQ(cbm_unlink(first), 0);
+    ASSERT_EQ(cbm_unlink(second), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    ASSERT_EQ(complete, 10);
+    ASSERT_GT(bounded, 3);
+    PASS();
+}
+#endif
+
 TEST(platform_system_info) {
     cbm_system_info_t info = cbm_system_info();
     ASSERT_GT(info.total_cores, 0);
@@ -633,6 +687,10 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(platform_worker_limit_caps_environment_override_and_restores);
+#ifndef _WIN32
+    RUN_TEST(platform_directory_size_is_bounded_and_does_not_follow_symlinks);
+#endif
     RUN_TEST(platform_system_info);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);

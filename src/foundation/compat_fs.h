@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 /* ── Directory iteration ──────────────────────────────────────── */
@@ -21,6 +22,7 @@ typedef struct cbm_dir cbm_dir_t;
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
     bool is_dir;
+    bool is_symlink;
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
 } cbm_dirent_t;
 
@@ -33,6 +35,10 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d);
 
 /* Close directory handle. */
 void cbm_closedir(cbm_dir_t *d);
+
+/* Recursively sum regular files below path without following links or
+ * junctions. Stops once the total exceeds stop_after. */
+bool cbm_directory_size_bounded(const char *path, uint64_t stop_after, uint64_t *bytes_out);
 
 /* ── Portable popen/pclose ────────────────────────────────────── */
 

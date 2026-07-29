@@ -8,6 +8,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/index_limits.h"
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
@@ -50,7 +51,6 @@ enum {
     APPLICATION_JOB_THREAD_STACK = 256 * 1024,
     APPLICATION_JOB_POLL_US = 10000,
     APPLICATION_COORDINATION_CLEANUP_MS = 500,
-    APPLICATION_DEFAULT_PHYSICAL_JOB_LIMIT = 4,
     APPLICATION_DEFAULT_MAX_RESTARTS = 100,
     APPLICATION_MARKER_MAX_BYTES = 64 * 1024 * 1024,
     APPLICATION_MAX_SUSPECTS = 65536,
@@ -178,6 +178,10 @@ struct cbm_daemon_application {
     cbm_project_lock_manager_t *project_locks;
     size_t physical_job_limit;
     size_t worker_memory_budget_bytes;
+    size_t worker_memory_limit_bytes;
+    uint64_t worker_task_temp_limit_bytes;
+    uint64_t worker_max_duration_ms;
+    bool worker_low_priority;
     size_t active_mutations;
     size_t update_owners;
     cbm_daemon_application_update_worker_t update_worker;
@@ -297,10 +301,18 @@ static int application_worker_start_default(void *context, const char *args_json
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
-    (void)context;
+    cbm_daemon_application_t *application = context;
     cbm_index_worker_handle_t *worker = NULL;
     int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
                                         quarantine_file, &worker);
+    if (result == 0 && worker && application) {
+        cbm_index_worker_set_memory_limit(worker, application->worker_memory_limit_bytes);
+        cbm_index_worker_set_task_temp_limit(worker, application->worker_task_temp_limit_bytes);
+        cbm_index_worker_set_max_duration(worker, application->worker_max_duration_ms);
+        if (!cbm_index_worker_set_low_priority(worker, application->worker_low_priority)) {
+            cbm_log_warn("daemon.index.priority_not_lowered", "action", "continue");
+        }
+    }
     *worker_out = worker;
     return result;
 }
@@ -1129,6 +1141,14 @@ static char *application_job_failure_response(const cbm_index_worker_result_t *r
         (void)snprintf(message, sizeof(message),
                        "index worker containment failed (%s); inspect log: %s",
                        cbm_proc_outcome_str(result->outcome), log_path ? log_path : "unavailable");
+    } else if (result && result->resource_limit != CBM_INDEX_RESOURCE_LIMIT_NONE) {
+        (void)snprintf(
+            message, sizeof(message),
+            "index resource limit exceeded: %s observed=%llu limit=%llu; the contained worker "
+            "tree was terminated",
+            cbm_index_resource_limit_name(result->resource_limit),
+            (unsigned long long)result->resource_observed,
+            (unsigned long long)result->resource_limit_value);
     } else if (result) {
         (void)snprintf(message, sizeof(message),
                        "index worker ended with %s (exit=%d, signal=%d); inspect log: %s",
@@ -2731,7 +2751,22 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         return NULL;
     }
     cbm_mutex_init(&application->mutex);
-    application->physical_job_limit = APPLICATION_DEFAULT_PHYSICAL_JOB_LIMIT;
+    cbm_index_limits_t index_limits;
+    char index_limits_error[256] = {0};
+    bool index_limits_valid =
+        cbm_config_load_index_limits(config ? config->config : NULL, &index_limits,
+                                     index_limits_error, sizeof(index_limits_error));
+    if (!index_limits_valid) {
+        cbm_index_limits_defaults(&index_limits);
+        cbm_log_warn("daemon.index.config_invalid", "reason", index_limits_error);
+    }
+    application->physical_job_limit = (size_t)index_limits.concurrent_jobs;
+    application->worker_memory_limit_bytes = index_limits.memory_limit_bytes > SIZE_MAX
+                                                 ? SIZE_MAX
+                                                 : (size_t)index_limits.memory_limit_bytes;
+    application->worker_task_temp_limit_bytes = index_limits.max_task_temp_bytes;
+    application->worker_max_duration_ms = index_limits.max_duration_ms;
+    application->worker_low_priority = index_limits.low_priority;
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
     if (config) {
         application->watcher = config->watcher;
@@ -2762,9 +2797,12 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         application->worker_memory_budget_bytes =
             aggregate_memory_budget_bytes / application->physical_job_limit;
     }
+    application->worker_memory_limit_bytes =
+        (size_t)cbm_index_effective_memory_limit((uint64_t)application->worker_memory_limit_bytes,
+                                                 (uint64_t)application->worker_memory_budget_bytes);
     if (!application->worker_ops.start) {
         application->worker_ops = (cbm_daemon_application_worker_ops_t){
-            .context = NULL,
+            .context = application,
             .start = application_worker_start_default,
             .poll = application_worker_poll_default,
             .cancel = application_worker_cancel_default,

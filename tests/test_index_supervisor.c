@@ -10,6 +10,7 @@
 #include "foundation/profile.h"
 #include "mcp/index_supervisor.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -762,6 +763,150 @@ TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained) {
     PASS();
 }
 
+TEST(index_supervisor_memory_limit_terminates_contained_worker_tree) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-memory-limit-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"hang-tree\"}", 1, false, NULL,
+                                          NULL, &handle);
+    cbm_index_worker_set_memory_limit(handle, 1);
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool memory_limited = terminal && result &&
+                          result->resource_limit == CBM_INDEX_RESOURCE_LIMIT_MEMORY &&
+                          result->resource_observed > result->resource_limit_value &&
+                          result->resource_limit_value == 1 && !result->cancellation_requested &&
+                          result->tree_quiesced && !result->supervision_failed && !result->response;
+
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(memory_limited);
+    PASS();
+}
+
+TEST(index_supervisor_duration_limit_terminates_contained_worker_tree) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-duration-limit-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"hang-tree\"}", 0, false, NULL,
+                                          NULL, &handle);
+    cbm_index_worker_set_max_duration(handle, 1);
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool duration_limited =
+        terminal && result && result->resource_limit == CBM_INDEX_RESOURCE_LIMIT_DURATION &&
+        result->resource_observed > result->resource_limit_value &&
+        result->resource_limit_value == 1 && !result->cancellation_requested &&
+        result->tree_quiesced && !result->supervision_failed && !result->response;
+
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(duration_limited);
+    PASS();
+}
+
+TEST(index_supervisor_task_temp_limit_contains_oversized_worker_output) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-task-temp-limit-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"oversize\"}", 0, false, NULL,
+                                          NULL, &handle);
+    cbm_index_worker_set_task_temp_limit(handle, 1);
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool task_temp_limited = terminal && result &&
+                             result->resource_limit == CBM_INDEX_RESOURCE_LIMIT_TASK_TEMP &&
+                             result->resource_observed > result->resource_limit_value &&
+                             result->resource_limit_value == 1 && !result->cancellation_requested &&
+                             result->tree_quiesced && !result->supervision_failed &&
+                             !result->response && !result->response_rejected;
+
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(task_temp_limited);
+    PASS();
+}
+
+TEST(index_supervisor_can_lower_worker_scheduling_priority) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-low-priority-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"hang-tree\"}", 0, false, NULL,
+                                          NULL, &handle);
+    bool priority_lowered = cbm_index_worker_set_low_priority(handle, true);
+    int priority_error = errno;
+    bool cancel_accepted = handle && cbm_index_worker_request_cancel(handle);
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+#ifndef _WIN32
+    if (!priority_lowered && (priority_error == EPERM || priority_error == EACCES)) {
+        SKIP_PLATFORM("process-priority changes are blocked by this test sandbox");
+    }
+#endif
+    ASSERT_TRUE(priority_lowered);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(terminal);
+    PASS();
+}
+
 SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
@@ -769,4 +914,8 @@ SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling);
     RUN_TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback);
     RUN_TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained);
+    RUN_TEST(index_supervisor_memory_limit_terminates_contained_worker_tree);
+    RUN_TEST(index_supervisor_duration_limit_terminates_contained_worker_tree);
+    RUN_TEST(index_supervisor_task_temp_limit_contains_oversized_worker_output);
+    RUN_TEST(index_supervisor_can_lower_worker_scheduling_priority);
 }

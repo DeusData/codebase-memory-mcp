@@ -125,6 +125,16 @@ cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t
  * performs signal delivery/escalation. */
 bool cbm_subprocess_request_cancel(cbm_subprocess_t *process);
 
+/* Return the resident bytes owned by the contained process tree. On Windows
+ * this is the Job Object's peak committed memory; on macOS/Linux it is the
+ * current summed RSS of processes in the owned process group. */
+bool cbm_subprocess_memory_bytes(cbm_subprocess_t *process, size_t *bytes_out);
+
+/* Lower the contained worker's scheduling priority when enabled. false is a
+ * no-op that succeeds. This is intentionally separate from spawn so callers
+ * can apply a resolved per-request policy before their first poll. */
+bool cbm_subprocess_set_low_priority(cbm_subprocess_t *process, bool low_priority);
+
 /* Release a terminal handle. This never waits or implicitly cancels; passing a
  * still-running handle violates the API contract. NULL is a no-op. */
 void cbm_subprocess_destroy(cbm_subprocess_t *process);

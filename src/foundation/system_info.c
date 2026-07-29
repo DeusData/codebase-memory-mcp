@@ -11,6 +11,7 @@
  * Results are cached after first call (immutable hardware properties).
  */
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 
 enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
 #include "foundation/log.h"
@@ -263,6 +264,7 @@ static cbm_system_info_t detect_system_windows(void) {
 
 static int info_cached = 0;
 static cbm_system_info_t cached_info;
+static CBM_TLS int worker_limit;
 
 cbm_system_info_t cbm_system_info(void) {
     if (!info_cached) {
@@ -287,20 +289,34 @@ int cbm_default_worker_count(bool initial) {
      * Same precedence shape as other CBM_* env overrides:
      * explicit override > implicit detection. */
     char buf[CBM_SZ_32];
+    int workers = 0;
     if (cbm_safe_getenv("CBM_WORKERS", buf, sizeof(buf), NULL) != NULL) {
         long n = strtol(buf, NULL, CBM_DECIMAL_BASE);
         if (n >= MIN_WORKERS && n <= CBM_WORKERS_MAX) {
-            return (int)n;
+            workers = (int)n;
+        } else {
+            cbm_log_warn("workers.env.invalid", "value", buf, "fallback", "sysconf");
         }
-        cbm_log_warn("workers.env.invalid", "value", buf, "fallback", "sysconf");
     }
 
-    cbm_system_info_t info = cbm_system_info();
-    if (initial) {
-        /* Use all cores for initial indexing — user is waiting */
-        return info.total_cores;
+    if (workers == 0) {
+        cbm_system_info_t info = cbm_system_info();
+        if (initial) {
+            /* Use all cores for initial indexing — user is waiting */
+            workers = info.total_cores;
+        } else {
+            /* Incremental: leave headroom for user's apps */
+            workers = info.perf_cores - SKIP_ONE;
+            if (workers < MIN_WORKERS) {
+                workers = MIN_WORKERS;
+            }
+        }
     }
-    /* Incremental: leave headroom for user's apps */
-    int workers = info.perf_cores - SKIP_ONE;
-    return workers > 0 ? workers : MIN_WORKERS;
+    return worker_limit > 0 && workers > worker_limit ? worker_limit : workers;
+}
+
+int cbm_worker_limit_set_for_thread(int max_workers) {
+    int previous = worker_limit;
+    worker_limit = max_workers > 0 ? max_workers : 0;
+    return previous;
 }
