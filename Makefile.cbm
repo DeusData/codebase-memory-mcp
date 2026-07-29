@@ -149,6 +149,31 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
+# Route Windows allocations through mimalloc (#581). mimalloc's own static
+# override is gated on _MSC_VER, which clang/MinGW never defines, so it
+# compiled out and the CRT won the link: ordinary malloc went to the CRT heap,
+# which keeps freed pages committed, leaving every allocator tuning in
+# cbm_mem_init POSIX-only. --wrap redirects the same population of allocations
+# that link-order override captures on POSIX, so the purge configuration
+# finally applies here too. src/foundation/mem_override_win.c supplies the
+# wrappers; its deallocating paths check mi_is_in_heap_region so a CRT-owned
+# pointer can never reach mi_free (#424).
+MIMALLOC_WRAP_SYMS := malloc calloc realloc free strdup strndup _msize \
+                      _aligned_malloc _aligned_free
+MIMALLOC_WRAP_FLAGS :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WRAP_FLAGS := $(foreach sym,$(MIMALLOC_WRAP_SYMS),-Wl,--wrap=$(sym))
+endif
+# Linux wraps a smaller set for MEASUREMENT only (see mem_override_posix.c):
+# allocations already reach mimalloc here, but the profiler needs the same
+# observation point as Windows or the platform comparison is not like-for-like.
+# macOS ld has no --wrap, so it stays census-only.
+IS_LINUX := $(shell uname -s 2>/dev/null | grep -q Linux && echo yes || echo no)
+MIMALLOC_WRAP_SYMS_POSIX := malloc calloc realloc free strdup
+MIMALLOC_WRAP_FLAGS_POSIX :=
+ifeq ($(IS_LINUX),yes)
+MIMALLOC_WRAP_FLAGS_POSIX := $(foreach sym,$(MIMALLOC_WRAP_SYMS_POSIX),-Wl,--wrap=$(sym))
+endif
 ifeq ($(IS_MINGW),yes)
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 endif
@@ -158,16 +183,26 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS) $(EXTRA_LDFLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
+# The POSIX wrap shim exists only so the profiler can observe allocations. It
+# must never reach a sanitized build: the Linux/macOS test builds are CRT+ASan,
+# and redirecting malloc into mimalloc underneath ASan's own interception mixes
+# two allocators on the same pointers. Windows keeps its wrap flags everywhere,
+# because there the shim is what makes mimalloc own the allocations at all.
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) \
+	$(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(EXTRA_LDFLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) \
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(LIBGIT2_LIBS) \
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS)
 # nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement)
 CFLAGS_NOSAN  = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1
-LDFLAGS_NOSAN = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS)
+LDFLAGS_NOSAN = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) \
+	$(MIMALLOC_WRAP_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
 
 FOUNDATION_SRCS = \
+	src/foundation/mem_override_win.c \
     src/foundation/arena.c \
     src/foundation/hash_table.c \
     src/foundation/str_intern.c \
@@ -349,12 +384,7 @@ GIT_SRCS = src/git/git_command.c \
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
-	src/cli/config_text_edit.c src/cli/activation_transaction.c \
-	src/cli/windows_launcher_state.c
-
-# Tiny permanent Windows launcher.  It deliberately links only the stable
-# launcher-state module and Windows SDK libraries, never the parser/indexer.
-WINDOWS_LAUNCHER_SRC = src/launcher/windows_launcher.c
+	src/cli/config_text_edit.c src/cli/activation_transaction.c
 
 # UI module (graph visualization)
 UI_SRCS = \
@@ -545,8 +575,7 @@ TEST_TRACES_SRCS = tests/test_traces.c
 TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_config_json_like.c \
 	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
-	tests/test_activation_transaction.c \
-	tests/test_windows_launcher_state.c
+	tests/test_activation_transaction.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
@@ -723,7 +752,7 @@ GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
 
 .PHONY: test test-par test-focused test-compositional test-repro test-foundation test-tsan \
         test-syntax test-daemon-smoke \
-        test-leak test-analyze test-memory test-gmalloc cbm cbm-launcher \
+        test-leak test-analyze test-memory test-gmalloc cbm \
         cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck \
         lint-format lint-source-safety install test-runner-nosan security
 
@@ -1041,6 +1070,12 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
                     diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
 TSAN_OPTIONS ?= halt_on_error=1
+TSAN_WORKERS ?= 4
+# A fixed concurrent envelope keeps TSan deterministic across developer hosts
+# and GitHub runners. Four workers still exercise real races without turning
+# sanitizer-instrumented allocator bookkeeping into a high-core lock convoy.
+# Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
+# invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
 $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TSAN) $(TEST_INCLUDE_FLAGS) -o $@ \
@@ -1050,8 +1085,9 @@ $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 
 		$(LDFLAGS_TSAN)
 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
-	@echo "Running ThreadSanitizer build (slow). Reports go to stderr."
-	cd $(CURDIR) && TSAN_OPTIONS="$(TSAN_OPTIONS)" $(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
+	@echo "Running ThreadSanitizer with $(TSAN_WORKERS) workers. Reports go to stderr."
+	cd $(CURDIR) && CBM_WORKERS=$(TSAN_WORKERS) TSAN_OPTIONS="$(TSAN_OPTIONS)" \
+		$(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
 
 # ── Leak detection ───────────────────────────────────────────────
 # macOS: uses `leaks --atExit` (Apple Clang LSan not available on all versions)
@@ -1207,26 +1243,6 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-WINDOWS_LAUNCHER_TARGET :=
-ifeq ($(IS_MINGW),yes)
-WINDOWS_LAUNCHER_TARGET := $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
-endif
-
-# Keep the explicit .exe target even on non-Windows hosts: packaging contracts
-# and native-Windows invocations share this single artifact name.  A non-Windows
-# direct invocation builds a diagnostic stub and is not part of `cbm`.
-$(BUILD_DIR)/codebase-memory-mcp-launcher.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -o $@ \
-		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
-		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
-
-# Native-Windows compatibility fixture: its launcher ABI intentionally does
-# not fit the production payload's default [1,1] range.  It is never packaged.
-$(BUILD_DIR)/codebase-memory-mcp-launcher-abi2.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_PROD) -DCBM_WINDOWS_LAUNCHER_ABI_CURRENT=2 -o $@ \
-		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
-		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
-
 $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
@@ -1234,7 +1250,7 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp $(WINDOWS_LAUNCHER_TARGET)
+cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
 	$(call codesign_binary,$(BUILD_DIR)/codebase-memory-mcp)
 
@@ -1248,9 +1264,6 @@ install: cbm
 	install -m 755 "$(BUILD_DIR)/codebase-memory-mcp" "$(INSTALL_DIR)/codebase-memory-mcp"
 	$(call codesign_binary,$(INSTALL_DIR)/codebase-memory-mcp)
 	@echo "Done. Run: $(INSTALL_DIR)/codebase-memory-mcp"
-
-cbm-launcher: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
-	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
@@ -1267,7 +1280,7 @@ frontend:
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(WINDOWS_LAUNCHER_TARGET)
+cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -1297,7 +1310,7 @@ SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
             $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
-            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC) $(WINDOWS_LAUNCHER_SRC)
+            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 

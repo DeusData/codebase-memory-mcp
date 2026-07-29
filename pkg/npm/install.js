@@ -18,8 +18,7 @@ const MAX_REDIRECTS = 5;
 const DOWNLOAD_HOP_TIMEOUT_MS = 120_000;
 const CANDIDATE_TIMEOUT_MS = 15_000;
 const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
-const WINDOWS_LAUNCHER_NAME = 'codebase-memory-mcp.exe';
-const WINDOWS_PAYLOAD_NAME = 'codebase-memory-mcp.payload.exe';
+const WINDOWS_BINARY_NAME = 'codebase-memory-mcp.exe';
 const UNIX_ARCHIVE_NAMES = [
   'codebase-memory-mcp',
   'LICENSE',
@@ -27,8 +26,7 @@ const UNIX_ARCHIVE_NAMES = [
   'THIRD_PARTY_NOTICES.md',
 ];
 const WINDOWS_ARCHIVE_NAMES = [
-  WINDOWS_LAUNCHER_NAME,
-  WINDOWS_PAYLOAD_NAME,
+  WINDOWS_BINARY_NAME,
   'LICENSE',
   'install.ps1',
   'THIRD_PARTY_NOTICES.md',
@@ -258,7 +256,7 @@ function processIsAlive(pid) {
   }
 }
 
-function readPairLockOwner(lockPath) {
+function readBinaryLockOwner(lockPath) {
   try {
     const owner = JSON.parse(
       fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'),
@@ -273,9 +271,9 @@ function readPairLockOwner(lockPath) {
   }
 }
 
-function tryReclaimPairLock(lockPath, contenderToken) {
+function tryReclaimBinaryLock(lockPath, contenderToken) {
   let reclaim = false;
-  const owner = readPairLockOwner(lockPath);
+  const owner = readBinaryLockOwner(lockPath);
   if (owner) {
     reclaim = !processIsAlive(owner.pid);
   } else {
@@ -299,7 +297,7 @@ function tryReclaimPairLock(lockPath, contenderToken) {
   return true;
 }
 
-function acquireWindowsPairLock(destDir) {
+function acquireWindowsBinaryLock(destDir) {
   const lockPath = path.join(destDir, WINDOWS_PAIR_LOCK_NAME);
   const token = crypto.randomBytes(16).toString('hex');
   const deadline = Date.now() + WINDOWS_PAIR_LOCK_WAIT_MS;
@@ -319,7 +317,7 @@ function acquireWindowsPairLock(destDir) {
       return { lockPath, token };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      if (tryReclaimPairLock(lockPath, token)) continue;
+      if (tryReclaimBinaryLock(lockPath, token)) continue;
       if (Date.now() >= deadline) {
         throw new Error('timed out waiting for Windows package-cache publication lock');
       }
@@ -328,8 +326,8 @@ function acquireWindowsPairLock(destDir) {
   }
 }
 
-function releaseWindowsPairLock(lock) {
-  const owner = readPairLockOwner(lock.lockPath);
+function releaseWindowsBinaryLock(lock) {
+  const owner = readBinaryLockOwner(lock.lockPath);
   if (!owner || owner.token !== lock.token || owner.pid !== process.pid) {
     throw new Error('Windows package-cache publication lock ownership changed');
   }
@@ -337,17 +335,14 @@ function releaseWindowsPairLock(lock) {
   fs.rmdirSync(lock.lockPath);
 }
 
-function windowsPairReady(destDir, verifier = verifyCandidate) {
-  const launcher = path.join(destDir, WINDOWS_LAUNCHER_NAME);
-  const payload = path.join(destDir, WINDOWS_PAYLOAD_NAME);
+function windowsBinaryReady(destDir, verifier = verifyCandidate) {
+  const binary = path.join(destDir, WINDOWS_BINARY_NAME);
   try {
-    const launcherStatus = fs.lstatSync(launcher);
-    const payloadStatus = fs.lstatSync(payload);
-    if (!launcherStatus.isFile() || launcherStatus.isSymbolicLink() ||
-        !payloadStatus.isFile() || payloadStatus.isSymbolicLink()) {
+    const status = fs.lstatSync(binary);
+    if (!status.isFile() || status.isSymbolicLink()) {
       return false;
     }
-    verifier(launcher);
+    verifier(binary);
     return true;
   } catch (_) {
     return false;
@@ -364,8 +359,8 @@ function pathMatchesDigest(candidatePath, expectedDigest) {
   }
 }
 
-function removeOwnedPublishedPair(destDir, publishedDigests) {
-  for (const name of [WINDOWS_PAYLOAD_NAME, WINDOWS_LAUNCHER_NAME]) {
+function removeOwnedPublishedBinary(destDir, publishedDigests) {
+  for (const name of [WINDOWS_BINARY_NAME]) {
     const digest = publishedDigests.get(name);
     const target = path.join(destDir, name);
     if (digest && pathMatchesDigest(target, digest)) {
@@ -374,8 +369,8 @@ function removeOwnedPublishedPair(destDir, publishedDigests) {
   }
 }
 
-function restorePairBackups(destDir, backups) {
-  for (const name of [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME]) {
+function restoreBinaryBackups(destDir, backups) {
+  for (const name of [WINDOWS_BINARY_NAME]) {
     const backup = backups.get(name);
     const target = path.join(destDir, name);
     if (!backup || fs.existsSync(target)) continue;
@@ -383,15 +378,15 @@ function restorePairBackups(destDir, backups) {
   }
 }
 
-function installWindowsPairAtomically(sourceDir, destDir, verifier = verifyCandidate) {
-  // Authenticate the complete source pair before it can contend for the cache.
-  verifier(path.join(sourceDir, WINDOWS_LAUNCHER_NAME));
-  const lock = acquireWindowsPairLock(destDir);
+function installWindowsBinaryAtomically(sourceDir, destDir, verifier = verifyCandidate) {
+  // Authenticate the source binary before it can contend for the cache.
+  verifier(path.join(sourceDir, WINDOWS_BINARY_NAME));
+  const lock = acquireWindowsBinaryLock(destDir);
   let operationError = null;
   try {
     // A contender may have completed while this process waited. Its executable
-    // pair wins and is never moved or deleted.
-    if (windowsPairReady(destDir, verifier)) return;
+    // wins and is never moved or deleted.
+    if (windowsBinaryReady(destDir, verifier)) return;
 
     const transaction = crypto.randomBytes(16).toString('hex');
     const stagedPaths = new Map();
@@ -399,7 +394,7 @@ function installWindowsPairAtomically(sourceDir, destDir, verifier = verifyCandi
     const backups = new Map();
     const publishedDigests = new Map();
     try {
-      for (const name of [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME]) {
+      for (const name of [WINDOWS_BINARY_NAME]) {
         const staged = path.join(destDir, `.cbm-pair-stage-${transaction}-${name}`);
         fs.copyFileSync(path.join(sourceDir, name), staged, fs.constants.COPYFILE_EXCL);
         fs.chmodSync(staged, 0o755);
@@ -407,7 +402,7 @@ function installWindowsPairAtomically(sourceDir, destDir, verifier = verifyCandi
         stagedDigests.set(name, fileSha256(staged));
       }
 
-      for (const name of [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME]) {
+      for (const name of [WINDOWS_BINARY_NAME]) {
         const target = path.join(destDir, name);
         const status = fs.lstatSync(target, { throwIfNoEntry: false });
         if (!status) continue;
@@ -419,32 +414,31 @@ function installWindowsPairAtomically(sourceDir, destDir, verifier = verifyCandi
         backups.set(name, backup);
       }
 
-      // Payload is the readiness signal and is deliberately published last.
-      for (const name of [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME]) {
+      for (const name of [WINDOWS_BINARY_NAME]) {
         const target = path.join(destDir, name);
         fs.renameSync(stagedPaths.get(name), target);
         stagedPaths.delete(name);
         publishedDigests.set(name, stagedDigests.get(name));
       }
-      if (!windowsPairReady(destDir, verifier)) {
-        throw new Error('published Windows package-cache pair failed verification');
+      if (!windowsBinaryReady(destDir, verifier)) {
+        throw new Error('published Windows package-cache binary failed verification');
       }
       for (const backup of backups.values()) {
-        try { fs.unlinkSync(backup); } catch (_) { /* valid pair is already committed */ }
+        try { fs.unlinkSync(backup); } catch (_) { /* valid binary is already committed */ }
       }
       return;
     } catch (err) {
-      // If a non-cooperating contender nevertheless published a valid pair,
+      // If a non-cooperating contender nevertheless published a valid binary,
       // preserve that winner. Otherwise remove only our exact staged bytes and
       // restore the prior files when their target names are still absent.
-      if (windowsPairReady(destDir, verifier)) {
+      if (windowsBinaryReady(destDir, verifier)) {
         for (const backup of backups.values()) {
           try { fs.unlinkSync(backup); } catch (_) { /* winner remains authoritative */ }
         }
         return;
       }
-      removeOwnedPublishedPair(destDir, publishedDigests);
-      restorePairBackups(destDir, backups);
+      removeOwnedPublishedBinary(destDir, publishedDigests);
+      restoreBinaryBackups(destDir, backups);
       throw err;
     } finally {
       for (const staged of stagedPaths.values()) {
@@ -456,7 +450,7 @@ function installWindowsPairAtomically(sourceDir, destDir, verifier = verifyCandi
     throw err;
   } finally {
     try {
-      releaseWindowsPairLock(lock);
+      releaseWindowsBinaryLock(lock);
     } catch (releaseError) {
       if (!operationError) throw releaseError;
     }
@@ -552,25 +546,24 @@ async function main() {
   const platform = getPlatform();
   const arch = getArch();
   const ext = platform === 'windows' ? 'zip' : 'tar.gz';
-  // Package-manager shims are portable one-shot instances on Windows. They
-  // enter through the cached launcher and never create managed launcher state.
-  // The payload path remains the immutable pair's readiness signal.
+  // Package-manager shims are portable one-shot instances: one cached binary
+  // per platform, entered directly.
   const binName = platform === 'windows'
-    ? WINDOWS_PAYLOAD_NAME
+    ? WINDOWS_BINARY_NAME
     : 'codebase-memory-mcp';
   const binPath = path.join(BIN_DIR, binName);
   const cacheNames = platform === 'windows'
-    ? [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME]
+    ? [WINDOWS_BINARY_NAME]
     : [binName];
   const extractedNames = platform === 'windows'
-    ? [WINDOWS_LAUNCHER_NAME, WINDOWS_PAYLOAD_NAME]
+    ? [WINDOWS_BINARY_NAME]
     : [binName];
   const archiveNames = platform === 'windows'
     ? WINDOWS_ARCHIVE_NAMES
     : UNIX_ARCHIVE_NAMES;
   const cachePaths = cacheNames.map((name) => path.join(BIN_DIR, name));
 
-  if (platform === 'windows' && windowsPairReady(BIN_DIR)) return;
+  if (platform === 'windows' && windowsBinaryReady(BIN_DIR)) return;
   if (platform !== 'windows' &&
       cachePaths.every((candidate) => fs.existsSync(candidate))) {
     try {
@@ -631,13 +624,13 @@ async function main() {
 
     if (platform === 'windows') {
       // The launcher resolves the adjacent portable payload in this directory.
-      verifyCandidate(extractedPaths.get(WINDOWS_LAUNCHER_NAME));
+      verifyCandidate(extractedPaths.get(WINDOWS_BINARY_NAME));
     } else {
       verifyCandidate(extractedPaths.get(binName));
     }
 
     if (platform === 'windows') {
-      installWindowsPairAtomically(tmpDir, BIN_DIR);
+      installWindowsBinaryAtomically(tmpDir, BIN_DIR);
     } else {
       const staged = path.join(
         BIN_DIR,
@@ -683,10 +676,9 @@ if (require.main === module || module.parent == null) {
 
 module.exports = {
   UNIX_ARCHIVE_NAMES,
-  WINDOWS_LAUNCHER_NAME,
-  WINDOWS_PAYLOAD_NAME,
+  WINDOWS_BINARY_NAME,
   extractExactTarArchive,
-  installWindowsPairAtomically,
+  installWindowsBinaryAtomically,
   validateExactTarMemberListing,
-  windowsPairReady,
+  windowsBinaryReady,
 };

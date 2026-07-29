@@ -95,7 +95,7 @@ test('non-Windows npm shim keeps its native payload execution path', () => {
   assert.equal(path.basename(observed.calls[0].executable), 'codebase-memory-mcp');
 });
 
-test('PowerShell install mutation runs through the downloaded launcher', () => {
+test('PowerShell install mutation runs through the downloaded binary', () => {
   const installer = fs.readFileSync(
     path.join(__dirname, '..', '..', '..', 'install.ps1'),
     'utf8',
@@ -103,14 +103,16 @@ test('PowerShell install mutation runs through the downloaded launcher', () => {
 
   assert.match(
     installer,
-    /^\s*\$candidateVersion\s*=\s*&\s*\$DownloadedLauncher\s+--version\b/m,
+    /^\s*\$candidateVersion\s*=\s*&\s*\$DownloadedBinary\s+--version\b/m,
   );
   assert.match(
     installer,
-    /^\s*&\s*\$DownloadedLauncher\s+@InstallArgs\b/m,
+    /^\s*&\s*\$DownloadedBinary\s+@InstallArgs\b/m,
   );
-  assert.doesNotMatch(
-    installer,
-    /^\s*&\s*\$DownloadedPayload\s+@InstallArgs\b/m,
-  );
+  // One binary ships per platform — no launcher/payload pair to resolve.
+  assert.doesNotMatch(installer, /payload/i);
+  // A running .exe cannot be overwritten, so an in-place update has to retire
+  // the existing binary by renaming it aside first. This script IS the Windows
+  // update path, so losing that step would silently break every update.
+  assert.match(installer, /Move-Item[\s\S]{0,80}\$Dest[\s\S]{0,40}\$retired/);
 });

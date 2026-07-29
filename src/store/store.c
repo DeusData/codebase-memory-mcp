@@ -78,11 +78,13 @@ enum {
 #include "store/store.h"
 #include "cbm.h"
 #include "service_patterns.h"
-#include "foundation/platform.h"
+
+#include <stdatomic.h>
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/profile.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
@@ -1262,6 +1264,24 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
 
     return s;
 }
+
+/* ── Shared page-cache slab ──────────────────────────────────────────
+ *
+ * Every request opens its own short-lived read-only store, and SQLite serves
+ * that connection's page cache from the general allocator. Measured on native
+ * Windows (#581): those blocks land in the allocator's MEDIUM size class, and a
+ * handful of survivors pin a 512 KiB page each — 140 pages held ~1.4 MiB of
+ * live data, roughly 2% occupancy, which no purge can reclaim because the pages
+ * are in use rather than free. The arena census confirmed the allocator was
+ * behaving correctly: zero free-committed slices, 58% already returned to the
+ * OS. The problem was allocation SHAPE, not retention.
+ *
+ * Giving SQLite one contiguous slab to serve page cache from makes that memory
+ * dense and bounded, and — because the slab is reused across connections —
+ * removes the per-request churn that did the pinning. Costs a fixed upfront
+ * commit, which is the point: bounded beats unbounded.
+ *
+ * Must run before SQLite initialises, so it is done once on the first open. */
 
 cbm_store_t *cbm_store_open_memory(void) {
     return store_open_internal(":memory:", true, true);

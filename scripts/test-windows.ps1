@@ -3,10 +3,10 @@
     Run the native-Windows product-surface test suite for codebase-memory-mcp.
 
 .DESCRIPTION
-    Builds the payload and permanent launcher if they are not already present,
-    stages them under their release names, then runs the deterministic Windows
-    integration tests under tests/windows/ through the launcher (real stdio /
-    CLI / HTTP UI, real SQLite DB).
+    Builds the product binary if it is not already present, stages it under its
+    release name, then runs the deterministic Windows integration tests under
+    tests/windows/ against it (real stdio / CLI / HTTP UI, real SQLite DB).
+    Windows ships ONE binary, exactly like Linux and macOS.
 
     Two categories of test:
 
@@ -20,8 +20,9 @@
                       * test_cli_non_ascii_arg.py guards #423/#20  (wide-argv main())
                       * test_daemon_stability.py guards the daemon parameter
                         surface, crash recovery, busy-stop refusal, and churn
-                      * test_windows_launcher.py guards the permanent launcher,
-                        managed layout, portable refusal, and crash containment
+                      * test_windows_update_handoff.py guards that `update`
+                        hands off to install.ps1 instead of replacing its own
+                        running image (the removed launcher stub's only job)
 
       KNOWN REDS  - genuine, still-open Windows bugs reproduced at the product
                     surface. They are EXPECTED to be RED (exit 1) and are opt-in
@@ -40,13 +41,8 @@
     AddressSanitizer/UBSan (Linux containers, WSL), prefer scripts/test.sh.
 
 .PARAMETER Binary
-    Path to an existing portable payload executable. If omitted, the script
-    builds it (target selected by -Target) into build/c/.
-
-.PARAMETER Launcher
-    Path to the permanent launcher executable. If omitted, the script uses
-    build/c/codebase-memory-mcp-launcher.exe, building target cbm-launcher when
-    needed.
+    Path to an existing product executable. If omitted, the script builds it
+    (target selected by -Target) into build/c/.
 
 .PARAMETER Target
     Makefile.cbm target used when building: 'cbm-with-ui' (default; needed for the
@@ -68,7 +64,6 @@
 [CmdletBinding()]
 param(
     [string]$Binary,
-    [string]$Launcher,
     [ValidateSet("cbm-with-ui", "cbm")]
     [string]$Target = "cbm-with-ui",
     [switch]$GuardsOnly,
@@ -103,36 +98,8 @@ function Resolve-Binary {
     return $built
 }
 
-function Resolve-Launcher {
-    param([string]$Explicit)
-    if ($Explicit) { return (Resolve-Path $Explicit).Path }
-    $built = Join-Path $repoRoot "build\c\codebase-memory-mcp-launcher.exe"
-    if (Test-Path $built) { return $built }
-    Write-Host "Building permanent launcher via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" "cbm-launcher" "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
-    $buildExit = $LASTEXITCODE
-    if ($buildExit -ne 0) { throw "launcher build failed (exit $buildExit)" }
-    if (-not (Test-Path $built)) { throw "launcher not produced at $built" }
-    return $built
-}
-
-function Resolve-AbiMismatchLauncher {
-    $built = Join-Path $repoRoot "build\c\codebase-memory-mcp-launcher-abi2.exe"
-    if (Test-Path $built) { return $built }
-    Write-Host "Building launcher ABI mismatch fixture via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" "build/c/codebase-memory-mcp-launcher-abi2.exe" "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
-    $buildExit = $LASTEXITCODE
-    if ($buildExit -ne 0) { throw "launcher ABI fixture build failed (exit $buildExit)" }
-    if (-not (Test-Path $built)) { throw "launcher ABI fixture not produced at $built" }
-    return $built
-}
-
 $bin = Resolve-Binary -Explicit $Binary
-$launcherBin = Resolve-Launcher -Explicit $Launcher
-$abiMismatchLauncher = Resolve-AbiMismatchLauncher
-Write-Host "Payload: $bin" -ForegroundColor Green
-Write-Host "Launcher: $launcherBin" -ForegroundColor Green
-Write-Host "ABI mismatch fixture: $abiMismatchLauncher" -ForegroundColor Green
+Write-Host "Binary: $bin" -ForegroundColor Green
 
 $previousTemp = $env:TEMP
 $previousTmp = $env:TMP
@@ -145,8 +112,7 @@ try {
     New-Item -ItemType Directory -Path $guardRoot | Out-Null
 
     # GitHub-hosted runner profile children can inherit mutation-capable ACEs
-    # even though the profile ancestry itself passes the launcher's bounded
-    # trust policy. Replace that inheritance before creating any executable or
+    # even though the profile ancestry itself passes the bounded trust policy. Replace that inheritance before creating any executable or
     # Python temporary descendant. Use SIDs rather than localized account names.
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     if (-not $currentSid) { throw "could not resolve the current user's SID" }
@@ -167,24 +133,22 @@ try {
     $guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $guardBundle | Out-Null
     $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
-    $guardPayload = Join-Path $guardBundle "codebase-memory-mcp.payload.exe"
-    Copy-Item -LiteralPath $launcherBin -Destination $guardBin
-    Copy-Item -LiteralPath $bin -Destination $guardPayload
+    Copy-Item -LiteralPath $bin -Destination $guardBin
 
     # Ownership is never inherited on Windows: descendants created under the
     # hardened root by an admin-group token can default to the Administrators
-    # SID, and the launcher's exe policy demands the exact current user as
-    # owner. Stamp the current SID explicitly on everything staged here.
-    foreach ($staged in @($guardBundle, $guardBin, $guardPayload)) {
+    # SID, while the exe policy demands the exact current user as owner. Stamp
+    # the current SID explicitly on everything staged here.
+    foreach ($staged in @($guardBundle, $guardBin)) {
         $stagedAcl = Get-Acl -LiteralPath $staged
         $stagedAcl.SetOwner($currentSid)
         Set-Acl -LiteralPath $staged -AclObject $stagedAcl
     }
     Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
 
-    # The launcher deliberately rejects GitHub's shared D:\a ancestry and the
-    # hosted runner's inherited LocalAppData\Temp ACL. Keep launcher fixtures
-    # and Python-created descendants below the accepted profile ancestry.
+    # The guards deliberately reject GitHub's shared D:\a ancestry and the
+    # hosted runner's inherited LocalAppData\Temp ACL. Keep staged fixtures and
+    # Python-created descendants below the accepted profile ancestry.
     $env:TEMP = $guardRoot
     $env:TMP = $guardRoot
     $env:TMPDIR = $guardRoot
@@ -202,7 +166,7 @@ $guards = @(
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py",
-    "tests\windows\test_windows_launcher.py"
+    "tests\windows\test_windows_update_handoff.py"
 )
 
 # Opt-in known-red repros - EXPECTED red (exit 1); never gate CI. Currently empty:
@@ -216,15 +180,11 @@ $fixedKeepers = @()
 Write-Host "`n--- Green guards ---" -ForegroundColor Cyan
 foreach ($t in $guards) {
     Write-Host "`n=== $t ===" -ForegroundColor Cyan
-    if ($t -eq "tests\windows\test_windows_launcher.py") {
-        & $py $t $guardBin $guardPayload $abiMismatchLauncher
-    } else {
-        & $py $t $guardBin
-    }
+    & $py $t $guardBin
     $code = $LASTEXITCODE
     if ($code -eq 0) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
-    } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_launcher.py") {
+    } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_update_handoff.py") {
         Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
         $guardFailures += $t
     } elseif ($code -eq 2) {

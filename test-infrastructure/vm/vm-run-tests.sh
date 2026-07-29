@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vm-run-tests.sh — run C test suites on the Windows VM under a CI-shaped
 # protected temp root. Runs ON the VM (MSYS2 shell), invoked by win.sh
-# test / ubsan-test / trap-ubsan-test.
+# test / ubsan-test / trap-ubsan-test / soak.
 #
 # Why the temp root: the daemon/coordination suites fail closed on the
 # MSYS-shared /tmp (C:\msys64\tmp), whose ancestry grants mutation rights to
@@ -17,35 +17,71 @@
 # completion summary is a hard failure regardless of exit code.
 set -uo pipefail
 
-RUNNER="${CBM_VM_RUNNER:-build/c/test-runner}"
+usage() {
+    cat <<'EOF'
+Usage: bash test-infrastructure/vm/vm-run-tests.sh <suite...> | --par | --soak <minutes>
+
+VM-side provisioning wrapper (runs ON the Windows VM, invoked by win.sh —
+call `win.sh test|test-par|soak` from the host, not this file). Supplies the
+CI-shaped protected per-user temp root (scripts/ci/new-protected-temp-root.ps1)
+and full-output logging with a completion-summary guard, then routes into the
+CANONICAL entries:
+
+  <suite...>       scripts/test.sh --suites <list>   (iteration mode)
+  --par            scripts/test.sh                   (the full venue leg)
+  --soak <mins>    scripts/soak-legs.sh              (both CI soak legs)
+
+Environment:
+  CBM_VM_RUNNER      sanitizer-variant runner path (ubsan/trap-ubsan builds);
+                     switches to direct-runner mode for those iteration tools.
+  CBM_VM_SOAK_BINARY product binary for --soak (default build/c/codebase-memory-mcp.exe)
+  CBM_VM_TEST_LOG    VM-side log path (default /tmp/win-test.log)
+
+Exit codes: 0 success · 2 usage · 90 = GUARD: no completion summary (a run
+that died without its summary must never read as green) · else the leg's code.
+EOF
+}
+case "${1:-}" in
+-h | --help) usage; exit 0 ;;
+esac
+
+RUNNER="${CBM_VM_RUNNER:-}"
 LOG="${CBM_VM_TEST_LOG:-/tmp/win-test.log}"
 
-[ $# -ge 1 ] || { echo "usage: vm-run-tests.sh <suite...> | --par" >&2; exit 2; }
-[ -x "$RUNNER" ] || { echo "ERROR: runner '$RUNNER' missing — build first" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "vm-run-tests: missing arguments. Please consult --help." >&2; exit 2; }
+if [ "$1" = "--soak" ]; then
+    [ $# -eq 2 ] || { echo "usage: vm-run-tests.sh --soak <positive-minutes>" >&2; exit 2; }
+    duration="$2"
+    case "$duration" in
+    ''|*[!0-9]*) echo "usage: vm-run-tests.sh --soak <positive-minutes>" >&2; exit 2 ;;
+    esac
+    [ "$duration" -gt 0 ] ||
+        { echo "usage: vm-run-tests.sh --soak <positive-minutes>" >&2; exit 2; }
+    binary="${CBM_VM_SOAK_BINARY:-build/c/codebase-memory-mcp.exe}"
+    [ -x "$binary" ] || { echo "ERROR: binary '$binary' missing — build first" >&2; exit 2; }
+    artifact="$binary"
+elif [ -n "$RUNNER" ]; then
+    # Explicit CBM_VM_RUNNER = the sanitizer-variant iteration mode (ubsan /
+    # trap-ubsan runners built into their own BUILD_DIRs by win.sh). Those
+    # builds carry non-default flags, so they keep the direct-runner path.
+    [ -x "$RUNNER" ] || { echo "ERROR: runner '$RUNNER' missing — build first" >&2; exit 2; }
+    artifact="$RUNNER"
+else
+    # Default path: suites run through the canonical scripts/test.sh (which
+    # builds its own runner, same as CI's test jobs). ACL-protect the build
+    # directory it will use.
+    artifact="build/c/test-runner"
+fi
 
 # Stale roots from earlier runs are removed up front; the current root is kept
-# after the run for post-mortem inspection.
-root_windows="$(powershell -NoProfile -Command '
-  $ErrorActionPreference = "Stop"
-  Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter "cbm-vm-tmp-*" -ErrorAction SilentlyContinue |
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-  $root = Join-Path $env:USERPROFILE ("cbm-vm-tmp-" + [guid]::NewGuid().ToString("N"))
-  New-Item -ItemType Directory -Path $root | Out-Null
-  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-  $acl.SetOwner($sid)
-  $acl.SetAccessRuleProtection($true, $false)
-  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sid,
-    [System.Security.AccessControl.FileSystemRights]::FullControl,
-    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-      [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow)
-  $acl.AddAccessRule($rule) | Out-Null
-  Set-Acl -LiteralPath $root -AclObject $acl
-  Write-Output $root
-' | tr -d '\r')"
+# after the run for post-mortem inspection. The root itself is created by the
+# same script CI uses (scripts/ci/new-protected-temp-root.ps1) so the two venues
+# cannot drift apart on the ACL shape the daemon suites are validated against.
+root_windows="$(MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile \
+    -ExecutionPolicy Bypass \
+    -File "$(cygpath -w scripts/ci/new-protected-temp-root.ps1)" \
+    -Prefix 'cbm-vm-tmp-' -PruneStale \
+    -ProtectDir "$(cygpath -w "$(dirname "$artifact")")" | tr -d '\r')"
 [ -n "$root_windows" ] || { echo "ERROR: protected temp root creation failed" >&2; exit 2; }
 
 TEMP="$(cygpath -m "$root_windows")"
@@ -61,7 +97,7 @@ export TEMP TMP TMPDIR
 # Two steps, both idempotent: protect the DIRECTORY (inheritance flags are
 # directory-only — a /T re-root leaves files with empty, deny-all DACLs),
 # then /reset the children so they re-inherit the clean set from it.
-runner_dir_w="$(cygpath -w "$(dirname "$RUNNER")")"
+runner_dir_w="$(cygpath -w "$(dirname "$artifact")")"
 me="$(whoami | tr -d '\r')"
 MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
     /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
@@ -70,14 +106,34 @@ MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q >/dev/null 2
 
 echo "=== vm-run-tests: runner=$RUNNER temp=$TEMP suites: $* ==="
 
-# --par runs the repo's full parallel harness (wave + tail scheduling,
-# per-shard union guard, manifest) under this same protected environment;
-# explicit suite names keep the direct single-runner invocation.
-if [ "$1" = "--par" ]; then
-    bash scripts/run-tests-parallel.sh "$RUNNER" 2>&1 | tee "$LOG"
+if [ "$1" = "--soak" ]; then
+    # The sequence (quick + #581 query-leak) and its completion guards live in
+    # the canonical entry scripts/soak-legs.sh — the same file _soak.yml and the
+    # compose soak service run. This wrapper only supplies the CI-shaped
+    # protected temp root (above) and the persistent VM-side log.
+    echo "=== vm-run-tests: soak binary=$binary temp=$TEMP ${duration}m/leg ==="
+    scripts/soak-legs.sh "$binary" "$duration" 2>&1 | tee "$LOG"
+    exit "${PIPESTATUS[0]}"
+fi
+
+# Both paths run the CANONICAL test entry scripts/test.sh under this protected
+# environment — the same file every CI test leg runs:
+#   --par         the full venue leg (clean build + contracts + parallel suites)
+#   <suite...>    scripts/test.sh --suites — the documented iteration mode
+# Only an explicit CBM_VM_RUNNER (sanitizer-variant builds) bypasses test.sh.
+if [ -n "$RUNNER" ]; then
+    if [ "$1" = "--par" ]; then
+        bash scripts/run-tests-parallel.sh "$RUNNER" 2>&1 | tee "$LOG"
+        rc="${PIPESTATUS[0]}"
+    else
+        "$RUNNER" "$@" 2>&1 | tee "$LOG"
+        rc="${PIPESTATUS[0]}"
+    fi
+elif [ "$1" = "--par" ]; then
+    scripts/test.sh CC=clang CXX=clang++ 2>&1 | tee "$LOG"
     rc="${PIPESTATUS[0]}"
 else
-    "$RUNNER" "$@" 2>&1 | tee "$LOG"
+    scripts/test.sh --suites "$*" CC=clang CXX=clang++ 2>&1 | tee "$LOG"
     rc="${PIPESTATUS[0]}"
 fi
 

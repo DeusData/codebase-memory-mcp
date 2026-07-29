@@ -552,7 +552,7 @@ TEST(httplink_load_config_from_file) {
     /* Create temp dir with .cgrconfig */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/httplink-cfg-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
-        SKIP("cbm_mkdtemp failed");
+        FAIL("cbm_mkdtemp failed");
 
     char cfgpath[512];
     snprintf(cfgpath, sizeof(cfgpath), "%s/.cgrconfig", tmpdir);
@@ -560,7 +560,7 @@ TEST(httplink_load_config_from_file) {
     FILE *f = fopen(cfgpath, "w");
     if (!f) {
         cbm_rmdir(tmpdir);
-        SKIP("cannot write .cgrconfig");
+        FAIL("cannot write .cgrconfig");
     }
     fprintf(f, "\n"
                "http_linker:\n"
@@ -592,7 +592,7 @@ TEST(httplink_load_config_invalid_yaml) {
     /* Invalid YAML → fallback to defaults */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/httplink-bad-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
-        SKIP("cbm_mkdtemp failed");
+        FAIL("cbm_mkdtemp failed");
 
     char cfgpath[512];
     snprintf(cfgpath, sizeof(cfgpath), "%s/.cgrconfig", tmpdir);
@@ -600,7 +600,7 @@ TEST(httplink_load_config_invalid_yaml) {
     FILE *f = fopen(cfgpath, "w");
     if (!f) {
         cbm_rmdir(tmpdir);
-        SKIP("cannot write .cgrconfig");
+        FAIL("cannot write .cgrconfig");
     }
     fprintf(f, "not: [valid: yaml");
     fclose(f);

@@ -480,8 +480,8 @@ static cbm_cli_activation_ops_t cli_activation_fake_ops(cli_activation_fake_t *f
  * duration of the command, keeping agent-config assertions independent of a
  * real dogfood daemon using the developer's cache. Tests of production cohort
  * behavior call cbm_cmd_* directly or install explicit ops. On Windows the
- * same seam also selects the test-only portable flow; release gates keep
- * direct calls so the managed-launcher fail-closed contract remains covered. */
+ * seam also reaches shared agent-config logic before the production
+ * install.ps1 handoff; direct release gates retain that handoff coverage. */
 static cli_activation_fake_t g_cli_test_seam_fake;
 static cbm_cli_activation_ops_t g_cli_test_seam_ops;
 
@@ -2385,6 +2385,306 @@ TEST(cli_editor_mcp_idempotent) {
     PASS();
 }
 
+/* The OS-reported running image is positive prior-install identity. An update
+ * may replace that exact command without probing it or granting the same
+ * authority to uninstall/remove paths. */
+TEST(cli_editor_mcp_repairs_known_previous_managed_entry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+    char stale_command[512];
+    snprintf(stale_command, sizeof(stale_command), "%s/retired-install/codebase-memory-mcp",
+             tmpdir);
+    char original[1024];
+    snprintf(original, sizeof(original),
+             "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}", stale_command);
+    ASSERT_EQ(write_test_file(configpath, original), 0);
+
+    int probes = 0;
+    cbm_set_mcp_command_path_probe_counter_for_testing(&probes);
+    int rc = cbm_install_editor_mcp_with_previous_for_testing("/usr/local/bin/codebase-memory-mcp",
+                                                              stale_command, configpath);
+    cbm_set_mcp_command_path_probe_counter_for_testing(NULL);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(probes, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, stale_command) == NULL);
+
+    ASSERT_EQ(write_test_file(configpath, original), 0);
+    ASSERT_EQ(cbm_remove_editor_mcp_owned("/usr/local/bin/codebase-memory-mcp", configpath), 0);
+    ASSERT_STR_EQ(read_test_file(configpath), original);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+#ifndef _WIN32
+/* Config bytes must never drive a POSIX filesystem lookup. Unknown missing,
+ * remote-mount, and symlink-traversal spellings are all preserved byte-for-
+ * byte unless trusted running-image identity matched first. */
+TEST(cli_editor_mcp_preserves_unrecorded_posix_absolute_entries_without_probe) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    char missing_command[512];
+    char symlink_path[512];
+    char symlink_command[640];
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+    snprintf(missing_command, sizeof(missing_command), "%s/missing/codebase-memory-mcp", tmpdir);
+    snprintf(symlink_path, sizeof(symlink_path), "%s/remote-link", tmpdir);
+    snprintf(symlink_command, sizeof(symlink_command), "%s/codebase-memory-mcp", symlink_path);
+    ASSERT_EQ(symlink("/net/cbm-audit-remote", symlink_path), 0);
+
+    const char *commands[] = {
+        missing_command,
+        "/net/attacker/share/codebase-memory-mcp",
+        "/Volumes/remote/codebase-memory-mcp",
+        symlink_command,
+    };
+    bool preserved = true;
+    int probes = 0;
+    cbm_set_mcp_command_path_probe_counter_for_testing(&probes);
+    for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]); index++) {
+        char original[1024];
+        int written = snprintf(original, sizeof(original),
+                               "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}",
+                               commands[index]);
+        if (written <= 0 || (size_t)written >= sizeof(original) ||
+            write_test_file(configpath, original) != 0 ||
+            cbm_install_editor_mcp("/usr/local/bin/codebase-memory-mcp", configpath) == 0) {
+            preserved = false;
+            break;
+        }
+        const char *after = read_test_file(configpath);
+        if (!after || strcmp(after, original) != 0) {
+            preserved = false;
+            break;
+        }
+    }
+    cbm_set_mcp_command_path_probe_counter_for_testing(NULL);
+
+    ASSERT_TRUE(preserved);
+    ASSERT_EQ(probes, 0);
+    ASSERT_EQ(unlink(symlink_path), 0);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+#endif
+
+/* A relative command is resolved by the client from its own runtime context,
+ * not from the installer process's cwd. Failure to find it here is therefore
+ * inconclusive: preserve it fail-closed instead of treating it as a dead
+ * install footprint. */
+TEST(cli_editor_mcp_preserves_unresolved_relative_entry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+    const char *commands[] = {"./custom-tool", "subdir/custom-tool", "${HOME}/custom-tool",
+                              "/opt/${CBM_HOME}/custom-tool", "C:/%CBM_HOME%/custom-tool"};
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        char original[512];
+        snprintf(original, sizeof(original),
+                 "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}", commands[i]);
+        ASSERT_EQ(write_test_file(configpath, original), 0);
+
+        int rc = cbm_install_editor_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+        ASSERT(rc != 0);
+
+        const char *data = read_test_file(configpath);
+        ASSERT_NOT_NULL(data);
+        ASSERT_STR_EQ(data, original);
+    }
+
+    char overlong_command[5000];
+    memset(overlong_command, 'x', sizeof(overlong_command));
+    overlong_command[0] = '/';
+    overlong_command[sizeof(overlong_command) - 1U] = '\0';
+    char overlong_json[5200];
+    snprintf(overlong_json, sizeof(overlong_json),
+             "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}", overlong_command);
+    ASSERT_EQ(write_test_file(configpath, overlong_json), 0);
+    ASSERT(cbm_install_editor_mcp("/usr/local/bin/codebase-memory-mcp", configpath) != 0);
+    const char *overlong_data = read_test_file(configpath);
+    ASSERT_NOT_NULL(overlong_data);
+    ASSERT_STR_EQ(overlong_data, overlong_json);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* Config content must never make install/update probe a Windows network or
+ * device namespace. Besides unbounded I/O, a UNC stat can disclose the
+ * account's SMB credentials to an attacker-controlled host. */
+TEST(cli_editor_mcp_rejects_unsafe_windows_probe_namespaces) {
+    ASSERT_FALSE(
+        cbm_mcp_command_path_probe_safe_for_testing("/mnt/remote/codebase-memory-mcp", false));
+    ASSERT_FALSE(cbm_mcp_command_path_probe_safe_for_testing("/tmp/codebase-memory-mcp", false));
+    ASSERT_TRUE(cbm_mcp_command_path_probe_safe_for_testing("C:/local/codebase-memory-mcp", true));
+    ASSERT_TRUE(
+        cbm_mcp_command_path_probe_safe_for_testing("D:\\local\\codebase-memory-mcp", true));
+    ASSERT_FALSE(
+        cbm_mcp_command_path_probe_safe_for_testing("//server/share/codebase-memory-mcp", true));
+    ASSERT_FALSE(cbm_mcp_command_path_probe_safe_for_testing(
+        "\\\\server\\share\\codebase-memory-mcp", true));
+    ASSERT_FALSE(cbm_mcp_command_path_probe_safe_for_testing("//?/C:/codebase-memory-mcp", true));
+    ASSERT_FALSE(
+        cbm_mcp_command_path_probe_safe_for_testing("\\\\.\\pipe\\codebase-memory-mcp", true));
+    PASS();
+}
+
+#ifdef _WIN32
+/* A drive-letter spelling is not enough to prove a local probe: mapped drives
+ * are remote, and local paths can cross a junction into a remote namespace.
+ * Preserve both as indeterminate without following them. */
+TEST(cli_editor_mcp_preserves_unsafe_windows_drive_probe) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+
+    char unused_drive = '\0';
+    for (char drive = 'Z'; drive >= 'D'; drive--) {
+        char root[] = {drive, ':', '\\', '\0'};
+        if (GetDriveTypeA(root) == DRIVE_NO_ROOT_DIR) {
+            unused_drive = drive;
+            break;
+        }
+    }
+    ASSERT(unused_drive != '\0');
+    char missing_drive_command[128];
+    snprintf(missing_drive_command, sizeof(missing_drive_command),
+             "%c:/cbm-missing/codebase-memory-mcp", unused_drive);
+    char missing_drive_json[512];
+    snprintf(missing_drive_json, sizeof(missing_drive_json),
+             "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}",
+             missing_drive_command);
+    ASSERT_EQ(write_test_file(configpath, missing_drive_json), 0);
+    ASSERT(cbm_install_editor_mcp("C:/installed/codebase-memory-mcp.exe", configpath) != 0);
+    ASSERT_STR_EQ(read_test_file(configpath), missing_drive_json);
+
+    char outside[256];
+    snprintf(outside, sizeof(outside), "/tmp/cli-mcp-outside-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(outside));
+    char junction[512];
+    snprintf(junction, sizeof(junction), "%s/escape", tmpdir);
+    char junction_native[sizeof(junction)];
+    char outside_native[sizeof(outside)];
+    snprintf(junction_native, sizeof(junction_native), "%s", junction);
+    snprintf(outside_native, sizeof(outside_native), "%s", outside);
+    for (char *cursor = junction_native; *cursor; cursor++) {
+        if (*cursor == '/') {
+            *cursor = '\\';
+        }
+    }
+    for (char *cursor = outside_native; *cursor; cursor++) {
+        if (*cursor == '/') {
+            *cursor = '\\';
+        }
+    }
+    const char *junction_argv[] = {"cmd.exe",       "/d",           "/c", "mklink", "/J",
+                                   junction_native, outside_native, NULL};
+    ASSERT_EQ(cbm_exec_no_shell(junction_argv), 0);
+
+    char junction_command[700];
+    snprintf(junction_command, sizeof(junction_command), "%s/codebase-memory-mcp", junction);
+    char junction_json[1024];
+    snprintf(junction_json, sizeof(junction_json),
+             "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}", junction_command);
+    ASSERT_EQ(write_test_file(configpath, junction_json), 0);
+    ASSERT(cbm_install_editor_mcp("C:/installed/codebase-memory-mcp.exe", configpath) != 0);
+    ASSERT_STR_EQ(read_test_file(configpath), junction_json);
+
+    cbm_rmdir(junction);
+    cbm_rmdir(outside);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* Windows clients commonly omit the executable suffix. Even when the literal
+ * path and common suffixes are absent, another client or PATHEXT can resolve a
+ * custom suffix. Preserve the entry unless positive prior-image identity
+ * establishes ownership. */
+TEST(cli_editor_mcp_preserves_windows_extensionless_commands) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char command[512];
+    char configpath[512];
+    snprintf(command, sizeof(command), "%s/custom-tool", tmpdir);
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+
+    char original[1024];
+    snprintf(original, sizeof(original),
+             "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"%s\"}}}", command);
+    const char *suffixes[] = {".com", ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".cbmshim"};
+    for (size_t index = 0; index < sizeof(suffixes) / sizeof(suffixes[0]); index++) {
+        char executable[640];
+        snprintf(executable, sizeof(executable), "%s%s", command, suffixes[index]);
+        ASSERT_EQ(write_test_file(executable, "live"), 0);
+        ASSERT_EQ(write_test_file(configpath, original), 0);
+        ASSERT(cbm_install_editor_mcp("C:/installed/codebase-memory-mcp.exe", configpath) != 0);
+
+        const char *data = read_test_file(configpath);
+        ASSERT_NOT_NULL(data);
+        ASSERT_STR_EQ(data, original);
+        ASSERT_EQ(cbm_unlink(executable), 0);
+    }
+
+    ASSERT_EQ(write_test_file(configpath, original), 0);
+    ASSERT(cbm_install_editor_mcp("C:/installed/codebase-memory-mcp.exe", configpath) != 0);
+    ASSERT_STR_EQ(read_test_file(configpath), original);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+#endif
+
+/* A same-named entry with a FOREIGN shape (members we never write, e.g. env)
+ * is somebody's deliberate configuration: upsert must keep refusing to touch
+ * it. Pins the protective half of the ownership check. */
+TEST(cli_editor_mcp_refuses_foreign_shaped_entry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.claude.json", tmpdir);
+    ASSERT_EQ(write_test_file(configpath, "{\"mcpServers\":{\"codebase-memory-mcp\":"
+                                          "{\"command\":\"/custom\",\"env\":{\"FOO\":\"1\"}}}}"),
+              0);
+
+    int rc = cbm_install_editor_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT(rc != 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"/custom\"") != NULL);
+    ASSERT(strstr(data, "FOO") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_editor_mcp_preserves_others) {
     /* Port of TestEditorMCPPreservesOtherServers */
     char tmpdir[256];
@@ -2512,6 +2812,48 @@ TEST(cli_junie_mcp_install_issue651) {
     ASSERT(strstr(data, "\"codebase-memory-scout\"") == NULL);
     ASSERT(strstr(data, "\"codebase-memory-analysis\"") != NULL);
     ASSERT(strstr(data, "/opt/user-tool") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_junie_mcp_repairs_all_known_previous_aliases_atomically) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    char previous[512];
+    char original[4096];
+    snprintf(configpath, sizeof(configpath), "%s/mcp.json", tmpdir);
+    snprintf(previous, sizeof(previous), "%s/retired-install/codebase-memory-mcp", tmpdir);
+    snprintf(original, sizeof(original),
+             "{\"mcpServers\":{"
+             "\"codebase-memory-mcp\":{\"command\":\"%s\"},"
+             "\"codebase-memory-scout\":{\"command\":\"%s\","
+             "\"args\":[\"--tool-profile=scout\"]},"
+             "\"codebase-memory-analysis\":{\"command\":\"%s\","
+             "\"args\":[\"--tool-profile=analysis\"]}}}",
+             previous, previous, previous);
+    ASSERT_EQ(write_test_file(configpath, original), 0);
+
+    int probes = 0;
+    cbm_set_mcp_command_path_probe_counter_for_testing(&probes);
+    int rc = cbm_upsert_junie_mcp_with_previous_for_testing("/usr/local/bin/codebase-memory-mcp",
+                                                            previous, configpath);
+    cbm_set_mcp_command_path_probe_counter_for_testing(NULL);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(probes, 0);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, previous) == NULL);
+    ASSERT(strstr(data, "\"codebase-memory-mcp\"") != NULL);
+    ASSERT(strstr(data, "\"codebase-memory-scout\"") != NULL);
+    ASSERT(strstr(data, "\"codebase-memory-analysis\"") != NULL);
+    ASSERT(strstr(data, "--tool-profile=scout") != NULL);
+    ASSERT(strstr(data, "--tool-profile=analysis") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -3375,249 +3717,6 @@ static unsigned char *create_test_zip_stored(const char *filename, const unsigne
 
     *out_len = total;
     return zip;
-}
-
-static void test_zip_put_u16(unsigned char *output, uint16_t value) {
-    output[0] = (unsigned char)value;
-    output[1] = (unsigned char)(value >> 8);
-}
-
-static void test_zip_put_u32(unsigned char *output, uint32_t value) {
-    output[0] = (unsigned char)value;
-    output[1] = (unsigned char)(value >> 8);
-    output[2] = (unsigned char)(value >> 16);
-    output[3] = (unsigned char)(value >> 24);
-}
-
-typedef struct {
-    const char *name;
-    const unsigned char *content;
-    size_t content_size;
-} test_zip_entry_t;
-
-static unsigned char *create_test_zip_entries(const test_zip_entry_t *entries, size_t entry_count,
-                                              int *out_len) {
-    enum { TEST_ZIP_ENTRY_MAX = 8 };
-    if (!entries || !out_len || entry_count == 0 || entry_count > TEST_ZIP_ENTRY_MAX) {
-        return NULL;
-    }
-    size_t local_size = 0;
-    size_t central_size = 0;
-    for (size_t index = 0; index < entry_count; index++) {
-        size_t name_size = strlen(entries[index].name);
-        local_size += 30U + name_size + entries[index].content_size;
-        central_size += 46U + name_size;
-    }
-    size_t total = local_size + central_size + 22U;
-    if (total > INT_MAX) {
-        return NULL;
-    }
-    unsigned char *zip = calloc(1, total);
-    if (!zip) {
-        return NULL;
-    }
-    uint32_t local_offsets[TEST_ZIP_ENTRY_MAX];
-    uint32_t crcs[TEST_ZIP_ENTRY_MAX];
-    size_t cursor = 0;
-    for (size_t index = 0; index < entry_count; index++) {
-        size_t name_size = strlen(entries[index].name);
-        local_offsets[index] = (uint32_t)cursor;
-        crcs[index] =
-            (uint32_t)crc32(0L, entries[index].content, (uInt)entries[index].content_size);
-        zip[cursor] = 0x50;
-        zip[cursor + 1U] = 0x4b;
-        zip[cursor + 2U] = 0x03;
-        zip[cursor + 3U] = 0x04;
-        test_zip_put_u16(zip + cursor + 4U, 20U);
-        test_zip_put_u32(zip + cursor + 14U, crcs[index]);
-        test_zip_put_u32(zip + cursor + 18U, (uint32_t)entries[index].content_size);
-        test_zip_put_u32(zip + cursor + 22U, (uint32_t)entries[index].content_size);
-        test_zip_put_u16(zip + cursor + 26U, (uint16_t)name_size);
-        memcpy(zip + cursor + 30U, entries[index].name, name_size);
-        cursor += 30U + name_size;
-        memcpy(zip + cursor, entries[index].content, entries[index].content_size);
-        cursor += entries[index].content_size;
-    }
-
-    size_t central_offset = cursor;
-    for (size_t index = 0; index < entry_count; index++) {
-        size_t name_size = strlen(entries[index].name);
-        zip[cursor] = 0x50;
-        zip[cursor + 1U] = 0x4b;
-        zip[cursor + 2U] = 0x01;
-        zip[cursor + 3U] = 0x02;
-        test_zip_put_u16(zip + cursor + 4U, 20U);
-        test_zip_put_u16(zip + cursor + 6U, 20U);
-        test_zip_put_u32(zip + cursor + 16U, crcs[index]);
-        test_zip_put_u32(zip + cursor + 20U, (uint32_t)entries[index].content_size);
-        test_zip_put_u32(zip + cursor + 24U, (uint32_t)entries[index].content_size);
-        test_zip_put_u16(zip + cursor + 28U, (uint16_t)name_size);
-        test_zip_put_u32(zip + cursor + 42U, local_offsets[index]);
-        memcpy(zip + cursor + 46U, entries[index].name, name_size);
-        cursor += 46U + name_size;
-    }
-    size_t central_length = cursor - central_offset;
-    zip[cursor] = 0x50;
-    zip[cursor + 1U] = 0x4b;
-    zip[cursor + 2U] = 0x05;
-    zip[cursor + 3U] = 0x06;
-    test_zip_put_u16(zip + cursor + 8U, (uint16_t)entry_count);
-    test_zip_put_u16(zip + cursor + 10U, (uint16_t)entry_count);
-    test_zip_put_u32(zip + cursor + 12U, (uint32_t)central_length);
-    test_zip_put_u32(zip + cursor + 16U, (uint32_t)central_offset);
-    *out_len = (int)total;
-    return zip;
-}
-
-static unsigned char *create_test_zip_pair(const test_zip_entry_t entries[2], int *out_len) {
-    return create_test_zip_entries(entries, 2U, out_len);
-}
-
-static unsigned char *create_test_windows_release_zip(const char *launcher_name,
-                                                      const char *payload_name, int *out_len) {
-    static const unsigned char launcher[] = "MZ-launcher";
-    static const unsigned char payload[] = "MZ-payload";
-    static const unsigned char license[] = "license";
-    static const unsigned char installer[] = "installer";
-    static const unsigned char notices[] = "notices";
-    test_zip_entry_t entries[5] = {
-        {
-            .name = launcher_name,
-            .content = launcher,
-            .content_size = sizeof(launcher) - 1U,
-        },
-        {
-            .name = payload_name,
-            .content = payload,
-            .content_size = sizeof(payload) - 1U,
-        },
-        {"LICENSE", license, sizeof(license) - 1U},
-        {"install.ps1", installer, sizeof(installer) - 1U},
-        {"THIRD_PARTY_NOTICES.md", notices, sizeof(notices) - 1U},
-    };
-    return create_test_zip_entries(entries, 5U, out_len);
-}
-
-TEST(cli_extract_windows_release_pair_rejects_incomplete_release_namespace) {
-    static const unsigned char launcher[] = "MZ-launcher";
-    static const unsigned char payload[] = "MZ-payload";
-    const test_zip_entry_t entries[2] = {
-        {"codebase-memory-mcp.exe", launcher, sizeof(launcher) - 1U},
-        {"codebase-memory-mcp.payload.exe", payload, sizeof(payload) - 1U},
-    };
-    int zip_length = 0;
-    unsigned char *zip = create_test_zip_pair(entries, &zip_length);
-    ASSERT_NOT_NULL(zip);
-    cbm_windows_release_pair_t pair;
-    ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
-    cbm_windows_release_pair_free(&pair);
-    free(zip);
-    PASS();
-}
-
-/* Release archives retain their legal notices and the standalone installer.
- * The updater must accept that exact official namespace while extracting only
- * the launcher/payload pair. Synthetic two-file fixtures previously hid that
- * every published Windows update would be rejected. */
-TEST(cli_extract_windows_release_pair_accepts_official_release_namespace) {
-    static const unsigned char launcher[] = "MZ-launcher";
-    static const unsigned char payload[] = "MZ-payload";
-    static const unsigned char license[] = "license";
-    static const unsigned char installer[] = "installer";
-    static const unsigned char notices[] = "notices";
-    const test_zip_entry_t entries[] = {
-        {"codebase-memory-mcp.exe", launcher, sizeof(launcher) - 1U},
-        {"codebase-memory-mcp.payload.exe", payload, sizeof(payload) - 1U},
-        {"LICENSE", license, sizeof(license) - 1U},
-        {"install.ps1", installer, sizeof(installer) - 1U},
-        {"THIRD_PARTY_NOTICES.md", notices, sizeof(notices) - 1U},
-    };
-    int zip_length = 0;
-    unsigned char *zip =
-        create_test_zip_entries(entries, sizeof(entries) / sizeof(entries[0]), &zip_length);
-    ASSERT_NOT_NULL(zip);
-    cbm_windows_release_pair_t pair;
-    ASSERT_TRUE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
-    ASSERT_EQ(pair.launcher_len, 11);
-    ASSERT_EQ(pair.payload_len, 10);
-    ASSERT_MEM_EQ(pair.launcher, "MZ-launcher", 11);
-    ASSERT_MEM_EQ(pair.payload, "MZ-payload", 10);
-    cbm_windows_release_pair_free(&pair);
-    free(zip);
-    PASS();
-}
-
-TEST(cli_extract_windows_release_pair_rejects_unknown_release_member) {
-    static const unsigned char content[] = "x";
-    const test_zip_entry_t entries[] = {
-        {"codebase-memory-mcp.exe", content, sizeof(content) - 1U},
-        {"codebase-memory-mcp.payload.exe", content, sizeof(content) - 1U},
-        {"LICENSE", content, sizeof(content) - 1U},
-        {"install.ps1", content, sizeof(content) - 1U},
-        {"unexpected.dll", content, sizeof(content) - 1U},
-    };
-    int zip_length = 0;
-    unsigned char *zip =
-        create_test_zip_entries(entries, sizeof(entries) / sizeof(entries[0]), &zip_length);
-    ASSERT_NOT_NULL(zip);
-    cbm_windows_release_pair_t pair;
-    ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
-    cbm_windows_release_pair_free(&pair);
-    free(zip);
-    PASS();
-}
-
-TEST(cli_extract_windows_release_pair_rejects_aliases_and_duplicates) {
-    static const struct {
-        const char *launcher;
-        const char *payload;
-    } attacks[] = {
-        {
-            "CODEBASE-MEMORY-MCP.EXE",
-            "codebase-memory-mcp.payload.exe",
-        },
-        {
-            "codebase-memory-mcp.exe",
-            "codebase-memory-mcp.exe",
-        },
-        {
-            ".\\codebase-memory-mcp.exe",
-            "codebase-memory-mcp.payload.exe",
-        },
-        {
-            "codebase-memory-mcp.exe.",
-            "codebase-memory-mcp.payload.exe",
-        },
-        {
-            "codebase-memory-mcp.exe",
-            "codebase-memory-mcp.payload.exe ",
-        },
-    };
-    for (size_t index = 0; index < sizeof(attacks) / sizeof(attacks[0]); index++) {
-        int zip_length = 0;
-        unsigned char *zip = create_test_windows_release_zip(attacks[index].launcher,
-                                                             attacks[index].payload, &zip_length);
-        ASSERT_NOT_NULL(zip);
-        cbm_windows_release_pair_t pair;
-        ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
-        cbm_windows_release_pair_free(&pair);
-        free(zip);
-    }
-    PASS();
-}
-
-TEST(cli_extract_windows_release_pair_rejects_local_central_mismatch) {
-    int zip_length = 0;
-    unsigned char *zip = create_test_windows_release_zip(
-        "codebase-memory-mcp.exe", "codebase-memory-mcp.payload.exe", &zip_length);
-    ASSERT_NOT_NULL(zip);
-    /* Local name starts at offset 30; central metadata remains unchanged. */
-    zip[30] = 'x';
-    cbm_windows_release_pair_t pair;
-    ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
-    cbm_windows_release_pair_free(&pair);
-    free(zip);
-    PASS();
 }
 
 TEST(cli_extract_binary_from_zip) {
@@ -8444,9 +8543,17 @@ TEST(cli_mcp_installers_preserve_foreign_same_name_entries) {
     char toml_path[512];
     snprintf(json_path, sizeof(json_path), "%s/settings.json", tmpdir);
     snprintf(toml_path, sizeof(toml_path), "%s/config.toml", tmpdir);
-    const char *foreign_json =
-        "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":"
-        "\"/opt/custom/codebase-memory-mcp\",\"args\":[]}},\"theme\":\"dark\"}\n";
+    /* The custom same-name binary EXISTS on disk — a live foreign tool, not
+     * a dead install footprint — so installers must fail closed on it.
+     * (A non-existent command path is the repairable stale case instead.) */
+    char custom_tool[512];
+    snprintf(custom_tool, sizeof(custom_tool), "%s/custom-tool", tmpdir);
+    ASSERT_EQ(write_test_file(custom_tool, "#!/bin/sh\nexit 0\n"), 0);
+    char foreign_json[1024];
+    snprintf(foreign_json, sizeof(foreign_json),
+             "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":"
+             "\"%s\",\"args\":[]}},\"theme\":\"dark\"}\n",
+             custom_tool);
     const char *foreign_toml = "[mcp_servers.codebase-memory-mcp]\n"
                                "command = \"/opt/user-tool\"\n"
                                "args = [\"--private\"]\n"
@@ -11970,12 +12077,14 @@ TEST(cli_sha256_fragmented_updates_match_one_shot_digest) {
 }
 
 #ifdef _WIN32
-/* The fail-closed release contract, asserted with the activation seam OFF:
- * these calls take the exact dispatch a release binary ships (the portable
- * body is unreachable), so the gates themselves keep direct unit coverage. */
-TEST(cli_windows_release_gates_refuse_portable_mutations) {
+/* The Windows update contract, asserted with the activation seam OFF so this
+ * takes the exact dispatch a release binary ships: `update` never replaces the
+ * running image in-process (Windows locks it), it prints the install.ps1
+ * command and exits 0. Regressing to an in-process self-update would mean
+ * reintroducing the launcher stub Defender flags as Trojan:Win32/Wacatac.B!ml. */
+TEST(cli_windows_update_hands_off_to_install_script) {
     char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-portable-refusal-XXXXXX");
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-handoff-XXXXXX");
     if (!cbm_mkdtemp(tmpdir)) {
         FAIL("cbm_mkdtemp failed");
     }
@@ -11992,61 +12101,17 @@ TEST(cli_windows_release_gates_refuse_portable_mutations) {
     snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
     test_mkdirp(bin_dir);
     snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
-    write_test_file(bin_target, "portable refusal must not touch this");
+    write_test_file(bin_target, "in-process update must not touch this");
 
-    /* A one-shot portable payload (this test runner has no launcher context)
-     * may never self-mutate a managed surface. */
-    char *uninstall_argv[] = {"--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(1, uninstall_argv);
     char *update_argv[] = {"--yes"};
     int update_rc = cbm_cmd_update(1, update_argv);
 
     const char *installed = read_test_file(bin_target);
-    bool preserved = installed && strcmp(installed, "portable refusal must not touch this") == 0;
+    bool preserved = installed && strcmp(installed, "in-process update must not touch this") == 0;
     cli_activation_restore_env(old_home, old_cache);
     test_rmdir_r(tmpdir);
 
-    ASSERT_EQ(uninstall_rc, 1);
-    ASSERT_EQ(update_rc, 1);
-    ASSERT_TRUE(preserved);
-    PASS();
-}
-
-TEST(cli_windows_release_gate_refuses_foreign_install_target) {
-    char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-foreign-target-XXXXXX");
-    if (!cbm_mkdtemp(tmpdir)) {
-        FAIL("cbm_mkdtemp failed");
-    }
-    char *old_home = NULL;
-    char *old_cache = NULL;
-    cli_activation_save_env(&old_home, &old_cache);
-    cbm_setenv("HOME", tmpdir, 1);
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
-    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
-
-    char bin_dir[512];
-    char bin_target[640];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
-    test_mkdirp(bin_dir);
-    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
-    write_test_file(bin_target, "foreign binary must be preserved");
-
-    /* An unmanaged file at the canonical launcher path is a conflict the
-     * managed transaction refuses to adopt or replace — even under --force
-     * with prompts auto-answered. */
-    cbm_set_auto_answer_for_test(-1);
-    char *argv[] = {"--force", "-y"};
-    int rc = cbm_cmd_install(2, argv);
-    cbm_set_auto_answer_for_test(0);
-
-    const char *installed = read_test_file(bin_target);
-    bool preserved = installed && strcmp(installed, "foreign binary must be preserved") == 0;
-    cli_activation_restore_env(old_home, old_cache);
-    test_rmdir_r(tmpdir);
-
-    ASSERT_EQ(rc, 1);
+    ASSERT_EQ(update_rc, 0);
     ASSERT_TRUE(preserved);
     PASS();
 }
@@ -13623,8 +13688,7 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
-    RUN_TEST(cli_windows_release_gates_refuse_portable_mutations);
-    RUN_TEST(cli_windows_release_gate_refuses_foreign_install_target);
+    RUN_TEST(cli_windows_update_hands_off_to_install_script);
 #endif
 
     /* Version (2 tests — selfupdate_test.go) */
@@ -13662,9 +13726,21 @@ SUITE(cli) {
     /* Editor MCP: Cursor/Windsurf/Gemini (5 tests — install_test.go) */
     RUN_TEST(cli_editor_mcp_install);
     RUN_TEST(cli_editor_mcp_idempotent);
+    RUN_TEST(cli_editor_mcp_repairs_known_previous_managed_entry);
+#ifndef _WIN32
+    RUN_TEST(cli_editor_mcp_preserves_unrecorded_posix_absolute_entries_without_probe);
+#endif
+    RUN_TEST(cli_editor_mcp_preserves_unresolved_relative_entry);
+    RUN_TEST(cli_editor_mcp_rejects_unsafe_windows_probe_namespaces);
+#ifdef _WIN32
+    RUN_TEST(cli_editor_mcp_preserves_unsafe_windows_drive_probe);
+    RUN_TEST(cli_editor_mcp_preserves_windows_extensionless_commands);
+#endif
+    RUN_TEST(cli_editor_mcp_refuses_foreign_shaped_entry);
     RUN_TEST(cli_editor_mcp_preserves_others);
     RUN_TEST(cli_editor_mcp_uninstall);
     RUN_TEST(cli_junie_mcp_install_issue651);
+    RUN_TEST(cli_junie_mcp_repairs_all_known_previous_aliases_atomically);
     RUN_TEST(cli_gemini_mcp_install);
     RUN_TEST(cli_openclaw_mcp_install_uses_nested_servers);
     RUN_TEST(cli_openclaw_mcp_preserves_existing_config);
@@ -13700,11 +13776,6 @@ SUITE(cli) {
     RUN_TEST(cli_extract_binary_from_targz_not_found);
     RUN_TEST(cli_extract_binary_from_targz_invalid_data);
     RUN_TEST(cli_extract_binary_from_zip);
-    RUN_TEST(cli_extract_windows_release_pair_rejects_incomplete_release_namespace);
-    RUN_TEST(cli_extract_windows_release_pair_accepts_official_release_namespace);
-    RUN_TEST(cli_extract_windows_release_pair_rejects_unknown_release_member);
-    RUN_TEST(cli_extract_windows_release_pair_rejects_aliases_and_duplicates);
-    RUN_TEST(cli_extract_windows_release_pair_rejects_local_central_mismatch);
     RUN_TEST(cli_extract_binary_from_zip_not_found);
     RUN_TEST(cli_extract_binary_from_zip_path_traversal);
     RUN_TEST(cli_extract_binary_from_zip_invalid);

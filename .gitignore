@@ -71,8 +71,11 @@ TEST_PLAN.md
 scripts/autotune_results.json
 CHANGELOG.md
 
-# Soak test output
+# Local memory/soak outputs (uploaded as CI artifacts, never committed)
+memlab-*.jsonl
+memlab-*.log
 soak-results/
+soak-results-query-leak/
 
 # LSP originality-check reference cache (scripts/check-lsp-originality.sh)
 .lsp-refs/

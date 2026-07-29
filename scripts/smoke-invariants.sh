@@ -27,9 +27,30 @@
 set -u
 
 # ── Args / setup ──────────────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+Usage: scripts/smoke-invariants.sh <binary>
+
+Canonical entry for the "the shipped PROD binary does not fail" invariant
+battery — a fast, portable smoke distinct from the full release smoke
+(smoke-local.sh / vm-smoke.sh): no fixture server, no install/update E2E, just
+the binary itself. Checks version/help, the MCP initialize handshake (#513),
+every tool invocable, malformed-input resilience, clean EOF exit, shared-lib
+resolution, and an install dry-run. Prints PASS/FAIL per invariant; exit 0 iff
+ALL pass.
+
+Caller: .github/workflows/smoke.yml — the widest-matrix build-from-source
+battery (incl. older-glibc ubuntu-22.04 legs the release artifacts cannot
+cover). Fine to run locally against any built binary.
+EOF
+}
+case "${1:-}" in
+-h|--help) usage; exit 0 ;;
+-*) echo "smoke-invariants: unknown option '$1'. Please consult --help." >&2; exit 2 ;;
+esac
 BINARY="${1:-}"
 if [ -z "$BINARY" ]; then
-    echo "usage: smoke-invariants.sh <binary>" >&2
+    echo "smoke-invariants: missing <binary>. Please consult --help." >&2
     exit 2
 fi
 if [ ! -x "$BINARY" ]; then

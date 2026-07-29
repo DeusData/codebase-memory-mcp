@@ -18,8 +18,36 @@
 
 set -euo pipefail
 
-BINARY="${1:?Usage: soak-test.sh <binary> <duration_minutes>}"
-DURATION_MIN="${2:?Usage: soak-test.sh <binary> <duration_minutes>}"
+case "${1:-}" in
+-h|--help)
+  cat <<'HELPEOF'
+Usage: scripts/soak-test.sh <binary> <duration_minutes> [--skip-crash-test]
+
+INTERNAL harness — do not call directly in a venue. The canonical entry is
+scripts/soak-legs.sh, which runs the release-gating leg SEQUENCE (quick +
+query-leak) with a completion-summary guard per leg; the venue-parity contract
+forbids direct calls in any venue.
+
+Arguments:
+  <binary>            product binary to soak
+  <duration_minutes>  positive integer, per run
+  --skip-crash-test   skip the crash-recovery phase (query-leak leg sets this)
+
+Environment:
+  CBM_SOAK_MODE   default | query-leak (#581 detector: never reindex/mutate
+                  after the initial index, so RSS growth = query-path leak)
+  RESULTS_DIR     metrics output dir (default soak-results; soak-legs.sh owns
+                  this per leg)
+
+Pass/fail: RSS slope / ratio / ceiling analysis; prints
+"=== soak-test: PASSED ===" or "=== soak-test: FAILED ===" and exits 0/1.
+HELPEOF
+  exit 0
+  ;;
+esac
+
+BINARY="${1:?soak-test: missing <binary>. Please consult --help.}"
+DURATION_MIN="${2:?soak-test: missing <duration_minutes>. Please consult --help.}"
 SKIP_CRASH="${3:-}"
 BINARY=$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")
 
@@ -68,6 +96,35 @@ done
 if [ "$SOAK_IDLE_SECONDS" -eq 0 ] || [ "$SOAK_RESPONSE_TIMEOUT_SECONDS" -eq 0 ]; then
     echo "CBM_SOAK_IDLE_SECONDS and CBM_SOAK_RESPONSE_TIMEOUT_SECONDS must be positive" >&2
     exit 2
+fi
+
+# Isolate daemon coordination from interactive CBM sessions and give this run
+# a deterministic host-side daemon log. Native Windows cannot use an MSYS /tmp
+# ancestor because the cache-private executable-identity check rejects its
+# permissive DACL. The private root is created below once for every platform;
+# this helper only supplies the native-Windows ownership policy.
+soak_stamp_windows_dir() {
+    local dir_w me output
+    dir_w="$(cygpath -w "$1")"
+    me="$(whoami | tr -d '\r')"
+    if ! output=$(MSYS2_ARG_CONV_EXCL='*' icacls "$dir_w" /reset /Q 2>&1); then
+        echo "FAIL: soak DACL normalize failed (dir=$dir_w user=$me)" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    if ! output=$(MSYS2_ARG_CONV_EXCL='*' icacls "$dir_w" /inheritance:r \
+        /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
+        /Q 2>&1); then
+        echo "FAIL: soak DACL stamp failed (dir=$dir_w user=$me)" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+}
+
+SOAK_NATIVE_WINDOWS=false
+if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
+    ! command -v winepath >/dev/null 2>&1; then
+    SOAK_NATIVE_WINDOWS=true
 fi
 case "$SOAK_IDLE_CPU_MAX_PERCENT" in
     ''|*[!0-9]*)
@@ -138,7 +195,20 @@ echo "timestamp,tool,duration_ms,exit_code" > "$LATENCY_CSV"
 DURATION_S=$((DURATION_MIN * 60))
 PASS=true
 
-SOAK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-XXXXXX")
+if $SOAK_NATIVE_WINDOWS; then
+    # The identity guard walks the full executable/cache ancestor chain. Keep
+    # both beneath one strict user-profile root, matching the Windows guard
+    # suites, so security validation and teardown cover the same owned tree.
+    SOAK_ROOT=$(mktemp -d "$(cygpath "$USERPROFILE")/cbm-soak.XXXXXX")
+    if ! soak_stamp_windows_dir "$SOAK_ROOT"; then
+        rm -rf -- "$SOAK_ROOT"
+        exit 1
+    fi
+    cp "$BINARY" "$SOAK_ROOT/codebase-memory-mcp.exe"
+    BINARY="$SOAK_ROOT/codebase-memory-mcp.exe"
+else
+    SOAK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-XXXXXX")
+fi
 SOAK_PROJECT="$SOAK_ROOT/project"
 SERVER_IN="$SOAK_ROOT/server.in"
 SERVER_OUT="$SOAK_ROOT/server.out"
@@ -146,6 +216,16 @@ SOAK_CACHE="$SOAK_ROOT/cache"
 MCP_SOAK_PROJECT="$SOAK_PROJECT"
 CBM_CACHE_DIR="$SOAK_CACHE"
 mkdir -p "$SOAK_PROJECT" "$SOAK_CACHE"
+if $SOAK_NATIVE_WINDOWS; then
+    SOAK_ROOT_W="$(cygpath -w "$SOAK_ROOT")"
+    if ! SOAK_DACL_OUTPUT=$(MSYS2_ARG_CONV_EXCL='*' icacls "${SOAK_ROOT_W}\\*" \
+        /reset /T /C /Q 2>&1); then
+        echo "FAIL: soak child DACL reset failed (dir=$SOAK_ROOT_W)" >&2
+        printf '%s\n' "$SOAK_DACL_OUTPUT" >&2
+        rm -rf -- "$SOAK_ROOT"
+        exit 1
+    fi
+fi
 
 SERVER_PID=""
 DIAG_FILE=""
@@ -172,6 +252,7 @@ else
             ;;
     esac
 fi
+SOAK_CACHE_DIR_VALUE="$CBM_CACHE_DIR"
 
 # Every JSON request uses one pre-escaped spelling of the project path, so a
 # path containing a quote or backslash cannot corrupt the request.
@@ -233,8 +314,65 @@ cleanup_runtime() {
     if [ -f "$DAEMON_LOG" ]; then
         cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-daemon.log" 2>/dev/null || true
     fi
-    rm -rf "$SOAK_ROOT"
+    rm -rf -- "$SOAK_ROOT"
     return 0
+}
+
+# MSYS filesystem FIFOs do not provide a faithful stdin stream to a native
+# Windows process: the child observes a clean EOF before the writer's first
+# request. Use Bash's anonymous coprocess pipes for that one platform. Keep the
+# coproc syntax inside eval so macOS's system Bash 3.2 can still parse this
+# script; that branch is reached only by MSYS2 Bash 5. POSIX hosts retain the
+# established FIFO transport.
+start_mcp_server() {
+    local stderr_mode="$1"
+    if $SOAK_NATIVE_WINDOWS; then
+        unset CBM_SOAK_SERVER CBM_SOAK_SERVER_PID || true
+        if [ "$stderr_mode" = "append" ]; then
+            eval 'coproc CBM_SOAK_SERVER {
+                export CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE"
+                export CBM_AUTO_INDEX=false CBM_DIAGNOSTICS=1
+                export CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text
+                exec "$BINARY" 2>>"$RESULTS_DIR/server-stderr.log"
+            }'
+        else
+            eval 'coproc CBM_SOAK_SERVER {
+                export CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE"
+                export CBM_AUTO_INDEX=false CBM_DIAGNOSTICS=1
+                export CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text
+                exec "$BINARY" 2>"$RESULTS_DIR/server-stderr.log"
+            }'
+        fi
+        SERVER_PID=$CBM_SOAK_SERVER_PID
+        local server_read_fd="${CBM_SOAK_SERVER[0]}"
+        local server_write_fd="${CBM_SOAK_SERVER[1]}"
+        exec 3>&"$server_write_fd"
+        exec 4<&"$server_read_fd"
+        # Only fd3/fd4 may retain the parent endpoints. Otherwise closing fd3
+        # during crash/shutdown would leave the original writer open and the
+        # native frontend would never observe EOF.
+        eval "exec ${server_write_fd}>&-"
+        eval "exec ${server_read_fd}<&-"
+        FDS_OPEN=true
+        return
+    fi
+
+    if [ "$stderr_mode" = "append" ]; then
+        CBM_AUTO_INDEX=false CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" CBM_DIAGNOSTICS=1 \
+            CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text \
+            "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" \
+            2>>"$RESULTS_DIR/server-stderr.log" &
+    else
+        CBM_AUTO_INDEX=false CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" CBM_DIAGNOSTICS=1 \
+            CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text \
+            "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" \
+            2>"$RESULTS_DIR/server-stderr.log" &
+    fi
+    SERVER_PID=$!
+    # Open fds AFTER server starts (otherwise FIFO open blocks).
+    exec 3>"$SERVER_IN"
+    exec 4<"$SERVER_OUT"
+    FDS_OPEN=true
 }
 
 trap cleanup_runtime EXIT
@@ -560,7 +698,13 @@ wait_for_daemon_stop() {
 wait_for_diagnostics_snapshot() {
     local after_count="${1:-0}"
     local previous_path="${2:-}"
-    local attempts=100
+    # 30s, not a 10s sprint: the first snapshot lands one diagnostics interval
+    # (5s) after start, and a cold 4-vCPU hosted runner mid-initial-index can
+    # push the first WRITE past 10s (observed: both Windows runner soak legs
+    # died right after 'server running' while the daemon's own log shows a
+    # perfectly healthy diagnostics.start — the VM's 18 cores never miss the
+    # window). Budget doctrine: the wait sits above the worst case.
+    local attempts=300
     while [ "$attempts" -gt 0 ]; do
         local current_count
         current_count=$(diagnostics_start_count)
@@ -670,15 +814,14 @@ start_server() {
     # CBM_LOG_LEVEL/CBM_LOG_FORMAT are required, not cosmetic: the daemon's
     # diagnostics.start record is how this harness discovers the snapshot path,
     # and it must reach $DAEMON_LOG in a form refresh_diagnostics_paths can read.
+    local previous_snapshot="${1:-}"
+    local stderr_mode="truncate"
+    if [ -n "$previous_snapshot" ]; then
+        stderr_mode="append"
+    fi
     local snapshots_before
     snapshots_before=$(diagnostics_start_count)
-    CBM_AUTO_INDEX=false CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text \
-        "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$SERVER_STDERR" &
-    SERVER_PID=$!
-
-    exec 3>"$SERVER_IN"
-    exec 4<"$SERVER_OUT"
-    FDS_OPEN=true
+    start_mcp_server "$stderr_mode"
     sleep 3
 
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -689,7 +832,7 @@ start_server() {
     # than guessing one from the frontend's pid.
     # $1, when given, is the snapshot path seen BEFORE a restart: requiring a
     # different one proves a fresh daemon generation rather than a stale reattach.
-    if ! wait_for_diagnostics_snapshot "${snapshots_before:-0}" "${1:-}"; then
+    if ! wait_for_diagnostics_snapshot "${snapshots_before:-0}" "$previous_snapshot"; then
         echo "FAIL: daemon did not emit a usable diagnostics.start path" >&2
         return 1
     fi
@@ -706,9 +849,13 @@ start_server() {
 
 echo "--- Phase 1: start server ---"
 # Bidirectional pipes: fd3 = server stdin (write), fd4 = server stdout (read)
-mkfifo "$SERVER_IN" "$SERVER_OUT"
+if ! $SOAK_NATIVE_WINDOWS; then
+    mkfifo "$SERVER_IN" "$SERVER_OUT"
+fi
 
 if ! start_server; then
+    echo "--- server stderr (tail) ---"
+    tail -40 "$SERVER_STDERR" 2>/dev/null || echo "(no stderr captured)"
     exit 1
 fi
 

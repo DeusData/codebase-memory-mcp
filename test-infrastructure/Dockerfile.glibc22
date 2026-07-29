@@ -1,0 +1,24 @@
+# Dockerfile.glibc22 — the glibc-FLOOR venue (ubuntu-22.04, glibc 2.35).
+#
+# Mirrors CI's broad-matrix ubuntu-22.04 legs: the OLDEST userland we claim
+# the portable (musl-static) binary runs on. Two assertions live here:
+#   1. the portable binary passes the full canonical smoke on glibc 2.35;
+#   2. the DYNAMIC binary refuses to start (its glibc 2.38+ floor is by
+#      design — old-glibc coverage is the portable binary's job, and a
+#      dynamic binary that silently ran here would mask a floor regression).
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        coreutils \
+        curl \
+        file \
+        git \
+        python3 \
+        tar \
+        zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+ENTRYPOINT ["bash"]

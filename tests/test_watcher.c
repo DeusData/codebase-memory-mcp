@@ -978,6 +978,12 @@ TEST(watcher_stop_wakes_parked_run_loop) {
  * blocked forever in pclose(). The test owns a verified forced-termination
  * backstop so the pre-fix RED cannot wedge the rest of the suite. */
 #define WATCHER_TEST_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
+/* Budget for the blocked-git child to spawn and write its PID marker (watcher
+ * poll + process spawn + first write). 5s was missed twice on starved 4-vCPU
+ * windows-11-arm runners (release run 30300256783, both attempts) with no
+ * failure on any faster leg — spawn latency under CPU starvation, not a
+ * watcher defect. 20s keeps the wait bounded without re-arming that miss. */
+#define WATCHER_TEST_SPAWN_MARKER_BUDGET_MS 20000
 
 #ifdef _WIN32
 typedef struct {
@@ -1264,7 +1270,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
               0);
 
     uint64_t child_id = 0;
-    bool marker_ready = watcher_windows_wait_pid(marker, cbm_now_ms() + 5000, &child_id);
+    bool marker_ready = watcher_windows_wait_pid(
+        marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &child_id);
     HANDLE child_process =
         marker_ready ? watcher_windows_open_exact_process(child_id, &expected_git) : NULL;
     bool exact_stop_image = child_process != NULL;
@@ -1301,8 +1308,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
                                 &unwatch_run),
               0);
     uint64_t unwatch_child_id = 0;
-    bool unwatch_marker_ready =
-        watcher_windows_wait_pid(unwatch_marker, cbm_now_ms() + 5000, &unwatch_child_id);
+    bool unwatch_marker_ready = watcher_windows_wait_pid(
+        unwatch_marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &unwatch_child_id);
     HANDLE unwatch_process =
         unwatch_marker_ready ? watcher_windows_open_exact_process(unwatch_child_id, &expected_git)
                              : NULL;
@@ -1397,7 +1404,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_EQ(cbm_thread_create(&thread, 128U * 1024U, watcher_blocked_run_thread, &run), 0);
 
     pid_t child = 0;
-    bool marker_ready = watcher_test_wait_pid(marker, cbm_now_ms() + 5000, &child);
+    bool marker_ready =
+        watcher_test_wait_pid(marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &child);
     cbm_watcher_stop(watcher);
     bool stopped_without_backstop =
         marker_ready && watcher_test_wait_complete(&run.completed, cbm_now_ms() + 2500);
@@ -1422,8 +1430,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
         cbm_thread_create(&unwatch_thread, 128U * 1024U, watcher_blocked_run_thread, &unwatch_run),
         0);
     pid_t unwatch_child = 0;
-    bool unwatch_marker_ready =
-        watcher_test_wait_pid(unwatch_marker, cbm_now_ms() + 5000, &unwatch_child);
+    bool unwatch_marker_ready = watcher_test_wait_pid(
+        unwatch_marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &unwatch_child);
     cbm_watcher_unwatch(unwatch_watcher, "blocked-unwatch");
     bool unwatch_cancelled_without_backstop =
         unwatch_marker_ready && watcher_test_wait_process_gone(unwatch_child, cbm_now_ms() + 2500);
@@ -2975,7 +2983,7 @@ TEST(watcher_dirty_hash_stable) {
      * same dirty content must NOT retrigger (same porcelain hash). */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dhs_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
-        SKIP("cbm_mkdtemp failed");
+        FAIL("cbm_mkdtemp failed");
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
@@ -2986,7 +2994,7 @@ TEST(watcher_dirty_hash_stable) {
     if (system(cmd) != 0) {
         snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
         system(cmd);
-        SKIP("git not available");
+        FAIL("git fixture setup failed");
     }
 
     cbm_store_t *store = cbm_store_open_memory();
@@ -3033,7 +3041,7 @@ TEST(watcher_dirty_content_change_retriggered) {
      * This proves hash-based detection allows new changes, not just blocks all. */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dcc_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
-        SKIP("cbm_mkdtemp failed");
+        FAIL("cbm_mkdtemp failed");
 
     char cmd[512];
     /* Commit two files so dirtying each produces a distinct porcelain output */
@@ -3046,7 +3054,7 @@ TEST(watcher_dirty_content_change_retriggered) {
     if (system(cmd) != 0) {
         snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
         system(cmd);
-        SKIP("git not available");
+        FAIL("git fixture setup failed");
     }
 
     cbm_store_t *store = cbm_store_open_memory();
@@ -3096,8 +3104,13 @@ TEST(watcher_watch_path_change_resets_state) {
      * comparison in cbm_watcher_watch() is working correctly. */
     char tmpdirA[256]; snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_pca_XXXXXX");
     char tmpdirB[256]; snprintf(tmpdirB, sizeof(tmpdirB), "/tmp/cbm_watcher_pcb_XXXXXX");
-    if (!cbm_mkdtemp(tmpdirA) || !cbm_mkdtemp(tmpdirB))
-        SKIP("cbm_mkdtemp failed");
+    if (!cbm_mkdtemp(tmpdirA)) {
+        FAIL("cbm_mkdtemp failed for fixture A");
+    }
+    if (!cbm_mkdtemp(tmpdirB)) {
+        th_rmtree(tmpdirA);
+        FAIL("cbm_mkdtemp failed for fixture B");
+    }
 
     char cmd[512];
     /* Init repo A */
@@ -3107,7 +3120,9 @@ TEST(watcher_watch_path_change_resets_state) {
              "git add a.txt && git commit -q -m 'init-A'",
              tmpdirA);
     if (system(cmd) != 0) {
-        SKIP("git not available");
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
+        FAIL("git fixture A setup failed");
     }
     /* Init repo B (already clean — nothing to detect after baseline) */
     snprintf(cmd, sizeof(cmd),
@@ -3116,7 +3131,9 @@ TEST(watcher_watch_path_change_resets_state) {
              "git add b.txt && git commit -q -m 'init-B'",
              tmpdirB);
     if (system(cmd) != 0) {
-        SKIP("git not available");
+        th_rmtree(tmpdirA);
+        th_rmtree(tmpdirB);
+        FAIL("git fixture B setup failed");
     }
 
     cbm_store_t *store = cbm_store_open_memory();
@@ -3170,7 +3187,7 @@ TEST(watcher_watch_idempotent) {
      * idempotent — state is preserved (no reset of baseline or dirty hash). */
     char tmpdir[256]; snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_wid_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
-        SKIP("cbm_mkdtemp failed");
+        FAIL("cbm_mkdtemp failed");
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
@@ -3181,7 +3198,7 @@ TEST(watcher_watch_idempotent) {
     if (system(cmd) != 0) {
         snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
         system(cmd);
-        SKIP("git not available");
+        FAIL("git fixture setup failed");
     }
 
     cbm_store_t *store = cbm_store_open_memory();
@@ -3225,7 +3242,7 @@ TEST(watcher_mark_indexed_refreshes_existing_baseline) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_mark_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
-        SKIP("cbm_mkdtemp failed");
+        FAIL("cbm_mkdtemp failed");
 
     if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
     { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
