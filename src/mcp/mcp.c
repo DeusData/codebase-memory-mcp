@@ -5398,7 +5398,15 @@ static char *toon_payload_with_context_once(const char *payload, cbm_mcp_server_
     }
     cbm_sb_t out;
     cbm_sb_init(&out);
-    cbm_sb_append(&out, payload);
+    size_t payload_len = strlen(payload);
+    cbm_sb_append_n(&out, payload, payload_len);
+    /* Context is a separate TOON document fragment. Successful serializers
+     * already terminate their tables, but plain-text errors do not; preserve
+     * either payload verbatim while guaranteeing exactly one line boundary.
+     * The existing copy remains O(payload bytes), with O(1) separator state. */
+    if (payload_len > 0 && payload[payload_len - SKIP_ONE] != '\n') {
+        cbm_sb_append(&out, "\n");
+    }
     char *ctx_line = cbm_sb_finish(&sb);
     if (ctx_line) {
         cbm_sb_append(&out, ctx_line);
