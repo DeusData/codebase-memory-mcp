@@ -216,6 +216,7 @@ def run_scenario(
     responses: "queue.Queue[dict[str, Any]]",
     scenario: str,
     repo_path: str,
+    symbol: str,
     timeout: float,
 ) -> None:
     request(process, responses, 1, "initialize", INITIALIZE_PARAMS, timeout)
@@ -278,7 +279,7 @@ def run_scenario(
             "tools/call",
             {
                 "name": "search_graph",
-                "arguments": {"project": project, "name_pattern": "compute"},
+                "arguments": {"project": project, "name_pattern": symbol},
             },
             timeout,
         )
@@ -292,7 +293,7 @@ def run_scenario(
             "name": "search_code",
             "arguments": {
                 "project": project,
-                "pattern": "compute",
+                "pattern": symbol,
                 "mode": "compact",
                 "limit": 3,
             },
@@ -308,7 +309,7 @@ def run_scenario(
             "name": "search_graph",
             "arguments": {
                 "project": project,
-                "name_pattern": "compute",
+                "name_pattern": symbol,
                 "format": "json",
                 "limit": 1,
             },
@@ -321,9 +322,9 @@ def run_scenario(
         if isinstance(discovery_result, dict)
         else None
     )
-    qualified_name = grouped_search_qualified_name(discovery_structured, "compute")
+    qualified_name = grouped_search_qualified_name(discovery_structured, symbol)
     if not qualified_name:
-        raise SmokeFailure("search_graph did not discover compute's qualified name")
+        raise SmokeFailure(f"search_graph did not discover {symbol!r}'s qualified name")
     request(
         process,
         responses,
@@ -357,6 +358,11 @@ def main() -> int:
         required=True,
     )
     parser.add_argument("--repo-path", required=True)
+    parser.add_argument(
+        "--symbol",
+        default="compute",
+        help="symbol/pattern exercised by roundtrip and advanced scenarios",
+    )
     parser.add_argument("--response-timeout", type=float, default=45.0)
     parser.add_argument("--exit-timeout", type=float, default=15.0)
     args = parser.parse_args()
@@ -395,6 +401,7 @@ def main() -> int:
             responses,
             args.scenario,
             args.repo_path,
+            args.symbol,
             args.response_timeout,
         )
         assert process.stdin is not None

@@ -896,6 +896,29 @@ TEST(toon_first_response_context_is_native_toon) {
     PASS();
 }
 
+TEST(toon_plain_text_error_separates_first_response_context) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"alpha\",\"file_pattern\":\";\",\"format\":\"toon\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "path or file_pattern contains invalid characters"));
+    ASSERT_NOT_NULL(strstr(resp, "\nsession_project: validation-test"));
+    ASSERT_NULL(strstr(resp, "characterssession_project:"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
 TEST(toon_context_injection_config_is_respected) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
@@ -1863,6 +1886,7 @@ void suite_input_validation(void) {
     RUN_TEST(config_compact_default_false);
     RUN_TEST(config_response_format_json_with_toon_override);
     RUN_TEST(toon_first_response_context_is_native_toon);
+    RUN_TEST(toon_plain_text_error_separates_first_response_context);
     RUN_TEST(toon_context_injection_config_is_respected);
     RUN_TEST(graph_schema_formats_preserve_bounded_facts);
     RUN_TEST(config_default_sort_by_calls);
