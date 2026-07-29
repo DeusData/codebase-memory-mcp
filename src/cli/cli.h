@@ -24,6 +24,9 @@ void cbm_cli_set_version(const char *ver);
 /* Get the version string. */
 const char *cbm_cli_get_version(void);
 
+/* True only for the shared non-semver local-build sentinel. */
+bool cbm_version_is_development(const char *version);
+
 /* ── CLI tool arguments (flags / --args-file / --help) ────────── */
 
 /* Convert `--flag value` / `--flag=value` / bare-boolean `--flag` arguments for

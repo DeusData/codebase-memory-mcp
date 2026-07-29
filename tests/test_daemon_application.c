@@ -33,6 +33,7 @@
  * loaded 3-core CI runner — at 2000 ms the cancel-delivery wait lost the
  * tail of that distribution once in seven otherwise-green TSan rounds. */
 enum { APP_TEST_TIMEOUT_MS = 10000, APP_TEST_PATH_CAP = 1024 };
+#define APP_TEST_RELEASE_VERSION "1.0.0"
 
 typedef struct {
     char runtime_parent[APP_TEST_PATH_CAP];
@@ -2306,6 +2307,9 @@ TEST(daemon_application_auto_index_retries_transient_busy_admission) {
  * per MCP server. Its completed result is replayed exactly once to every
  * eligible full session, including a session initialized after completion. */
 TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_once) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(APP_TEST_RELEASE_VERSION);
+
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, true);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -2364,6 +2368,7 @@ TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_onc
     }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
     free(initial_notice);
     free(initial_second);
     free(late_notice);
@@ -2385,7 +2390,62 @@ TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_onc
     PASS();
 }
 
+/* Development builds do not have an ordered release version. Comparing the
+ * sentinel as semver zero would advertise an arbitrary published release as
+ * an upgrade and prepend that misleading notice to an unrelated tool result. */
+TEST(daemon_application_development_version_suppresses_release_notice) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(CBM_VERSION_DEVELOPMENT);
+
+    app_fake_update_context_t update;
+    app_fake_update_context_init(&update, true);
+    cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
+    cbm_daemon_application_config_t config = {.update_ops = &update_ops};
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-update-dev-root-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_daemon_application_t *application = root_ok ? cbm_daemon_application_new(&config) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 4251) : NULL;
+    bool initialized = app_test_initialize_profile(&callbacks, session, root,
+                                                   CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool generation_completed = initialized && app_wait_for_atomic_int(&update.destroys, 1);
+
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t response_status =
+        generation_completed
+            ? app_test_list_projects(&callbacks, session, 42510, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool notice_absent = response_status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response &&
+                         !strstr((char *)response, "Update available:");
+
+    if (session) {
+        callbacks.session_cancel(callbacks.context, session);
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
+    free(response);
+    (void)th_rmtree(root);
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_TRUE(initialized);
+    ASSERT_TRUE(generation_completed);
+    ASSERT_TRUE(notice_absent);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(atomic_load(&update.cancels), 0);
+    ASSERT_EQ(atomic_load(&update.destroys), 1);
+    PASS();
+}
+
 TEST(daemon_application_update_generation_retries_worker_start_failure) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(APP_TEST_RELEASE_VERSION);
+
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, true);
     atomic_store(&update.start_failures_remaining, 1);
@@ -2413,6 +2473,7 @@ TEST(daemon_application_update_generation_retries_worker_start_failure) {
     }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
     free(notice);
     (void)th_rmtree(root);
 
@@ -2428,6 +2489,9 @@ TEST(daemon_application_update_generation_retries_worker_start_failure) {
 }
 
 TEST(daemon_application_update_generation_retries_cancelled_check) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(APP_TEST_RELEASE_VERSION);
+
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, false);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -2477,6 +2541,7 @@ TEST(daemon_application_update_generation_retries_cancelled_check) {
     }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
     free(notice);
     (void)th_rmtree(root);
 
@@ -5000,6 +5065,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);
     RUN_TEST(daemon_application_auto_index_retries_transient_busy_admission);
     RUN_TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_once);
+    RUN_TEST(daemon_application_development_version_suppresses_release_notice);
     RUN_TEST(daemon_application_update_generation_retries_worker_start_failure);
     RUN_TEST(daemon_application_update_generation_retries_cancelled_check);
     RUN_TEST(daemon_application_final_disconnect_cancels_and_joins_update_generation);

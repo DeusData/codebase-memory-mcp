@@ -90,7 +90,7 @@ enum {
 #endif
 
 #ifndef CBM_VERSION
-#define CBM_VERSION "dev"
+#define CBM_VERSION CBM_VERSION_DEVELOPMENT
 #endif
 
 /* ── Globals for signal handling ────────────────────────────────── */
