@@ -231,6 +231,10 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+bool cbm_path_dir_supported_for_platform_for_testing(const char *bin_dir, const char *os,
+                                                     const char *arch);
+int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
+                                             const char *os, const char *arch);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
@@ -332,8 +336,8 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path);
 
 /* ── PATH management ──────────────────────────────────────────── */
 
-/* Append an export PATH line to the given rc file.
- * Checks if already present. Returns 0 on success, 1 if already present. */
+/* Validate the platform path, append its shell rc entry, and migrate owned legacy entries.
+ * Returns 0 on success, 1 if already present. */
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
 int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run);
 
