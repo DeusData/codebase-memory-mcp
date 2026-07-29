@@ -113,7 +113,7 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #include "foundation/compat_fs.h"
 
 #ifndef CBM_VERSION
-#define CBM_VERSION "dev"
+#define CBM_VERSION CBM_VERSION_DEVELOPMENT
 #endif
 #include <errno.h>  // EEXIST
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
@@ -754,7 +754,7 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
 
 /* ── Version ──────────────────────────────────────────────────── */
 
-static const char *cli_version = "dev";
+static const char *cli_version = CBM_VERSION_DEVELOPMENT;
 
 void cbm_cli_set_version(const char *ver) {
     if (ver) {
@@ -764,6 +764,10 @@ void cbm_cli_set_version(const char *ver) {
 
 const char *cbm_cli_get_version(void) {
     return cli_version;
+}
+
+bool cbm_version_is_development(const char *version) {
+    return version && strcmp(version, CBM_VERSION_DEVELOPMENT) == 0;
 }
 
 /* ── Version comparison ───────────────────────────────────────── */

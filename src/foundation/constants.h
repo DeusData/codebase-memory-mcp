@@ -11,6 +11,9 @@
 #define CBM_STRINGIFY_INNER(value) #value
 #define CBM_STRINGIFY(value) CBM_STRINGIFY_INNER(value)
 
+/* Local builds without a release version use this non-semver sentinel. */
+#define CBM_VERSION_DEVELOPMENT "dev"
+
 /* ── Allocation counts ───────────────────────────────────────── */
 enum { CBM_ALLOC_ONE = 1 }; /* calloc(CBM_ALLOC_ONE, sizeof(T)) */
 

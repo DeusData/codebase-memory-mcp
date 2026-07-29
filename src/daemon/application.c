@@ -1861,15 +1861,20 @@ static bool application_update_version_valid(const char *version) {
 static void application_update_publish_terminal_locked(cbm_daemon_application_t *application,
                                                        const char *latest_version,
                                                        bool completed_generation) {
-    if (!application->update_cancel_requested && application_update_version_valid(latest_version) &&
-        cbm_compare_versions(latest_version, cbm_cli_get_version()) > 0) {
+    const char *current_version = cbm_cli_get_version();
+    /* A local development build has no ordered release version. Treating its
+     * sentinel as semver zero would prepend an arbitrary release as a claimed
+     * upgrade to an unrelated tool response. This bounded string check adds
+     * no allocation, I/O, or lifecycle state to the background generation. */
+    if (!application->update_cancel_requested && !cbm_version_is_development(current_version) &&
+        application_update_version_valid(latest_version) &&
+        cbm_compare_versions(latest_version, current_version) > 0) {
         (void)snprintf(application->update_notice, sizeof(application->update_notice),
                        "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
                        "Enjoying codebase-memory-mcp? Please leave a star: "
                        "https://github.com/DeusData/codebase-memory-mcp",
-                       cbm_cli_get_version(), latest_version);
-        cbm_log_info("update.available", "current", cbm_cli_get_version(), "latest",
-                     latest_version);
+                       current_version, latest_version);
+        cbm_log_info("update.available", "current", current_version, "latest", latest_version);
     }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {

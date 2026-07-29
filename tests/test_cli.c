@@ -1783,6 +1783,10 @@ TEST(cli_compare_versions) {
     ASSERT_EQ(cbm_compare_versions("0.2.1-dev", "0.2.1-dev"), 0);
     ASSERT(cbm_compare_versions("0.3.0", "0.2.1-dev") > 0);
     ASSERT(cbm_compare_versions("0.2.0", "0.2.1-dev") < 0);
+    ASSERT_TRUE(cbm_version_is_development(CBM_VERSION_DEVELOPMENT));
+    ASSERT_FALSE(cbm_version_is_development("0.2.1-dev"));
+    ASSERT_FALSE(cbm_version_is_development("0.2.1"));
+    ASSERT_FALSE(cbm_version_is_development(NULL));
     PASS();
 }
 

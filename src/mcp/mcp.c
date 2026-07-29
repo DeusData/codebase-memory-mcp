@@ -17872,7 +17872,9 @@ static void *update_check_thread(void *arg) {
 
     if (tag_str) {
         const char *current = cbm_cli_get_version();
-        if (cbm_compare_versions(tag_str, current) > 0) {
+        /* Direct in-process MCP servers share the daemon's release policy:
+         * the non-semver local-build sentinel cannot establish upgrade order. */
+        if (!cbm_version_is_development(current) && cbm_compare_versions(tag_str, current) > 0) {
             cbm_mutex_lock(&srv->update_notice_lock);
             snprintf(srv->update_notice, sizeof(srv->update_notice),
                      "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
