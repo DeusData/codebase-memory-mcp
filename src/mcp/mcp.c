@@ -2138,7 +2138,6 @@ static bool path_matches_like_any(const char *path, char **likes) {
     return false;
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
     if (!doc) {
@@ -14406,7 +14405,6 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
                 }
                 int deg = in_d + out_d;
                 bool is_test =
-                    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
                     candidates[i].file_path && strstr(candidates[i].file_path, "_test") != NULL;
                 if (i == 0 || (best_is_test && !is_test) ||
                     (!best_is_test == !is_test && deg > best_deg) ||
@@ -14628,7 +14626,6 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
     }
     return n >= 0 && (size_t)n < cmd_sz;
 #else
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *flag = use_regex ? "-E" : "-F";
     const char *ci_flag = case_sensitive ? "" : " -i";
     int n;
@@ -17688,7 +17685,6 @@ static bool db_is_stale(const char *db_path, const char *repo_path, int max_age_
                            repo_path, null_dev);
     if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd))
         return false;
-    // NOLINTNEXTLINE(bugprone-command-processor,cert-env33-c)
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp)
         return false;

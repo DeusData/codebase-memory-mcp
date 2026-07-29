@@ -165,7 +165,6 @@ static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size
     git_dirty_hash_file_metadata(repo_path, paths, path_count, &h);
     cbm_git_status_paths_free(paths, path_count);
 
-    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     int n = snprintf(out_hash, out_size, "%016llx", (unsigned long long)h);
     return n == CBM_GIT_DIRTY_HASH_HEX_LEN ? bytes : CBM_NOT_FOUND;
 }

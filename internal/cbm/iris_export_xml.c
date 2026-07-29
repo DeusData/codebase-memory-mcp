@@ -230,7 +230,7 @@ static void emit_property(UdlBuf *b, const char *ps, const char *pe) {
             char db[MAX_NAME];
             const char *a = elem_content(po, pe, "Parameter", db, MAX_NAME);
             if (a && db[0])
-                strncpy(params[np].param_value, db, MAX_NAME - 1);
+                (void)snprintf(params[np].param_value, sizeof(params[np].param_value), "%s", db);
         }
         if (params[np].param_name[0])
             np++;
