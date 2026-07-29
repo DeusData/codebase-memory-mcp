@@ -251,6 +251,8 @@ TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
     char cache_path[VERSION_TEST_PATH_CAP] = {0};
     char initial[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char cached[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char future_rehashed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char future_recovered[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char retained[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char strict[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
@@ -280,6 +282,18 @@ TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
         image_path, cache_path, true, cached, &cache_hit));
     ASSERT_TRUE(cache_hit);
     ASSERT_STR_EQ(initial, cached);
+
+    /* A future cache epoch is ambiguous (clock rollback or a skewed volume),
+     * so it must pay the exact hash once and replace the suspect cache. */
+    ASSERT_TRUE(th_futuredate_file_for_cache_test(cache_path));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, future_rehashed, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_EQ(initial, future_rehashed);
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, future_recovered, &cache_hit));
+    ASSERT_TRUE(cache_hit);
+    ASSERT_STR_EQ(initial, future_recovered);
 
     /* A managed daemon copy and its invoking CLI have different native file
      * identities even when their bytes match. Retain both fixed-size records:

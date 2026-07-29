@@ -42,7 +42,6 @@ enum {
     DAEMON_FINGERPRINT_SNAPSHOT_FIELDS = sizeof(((daemon_fingerprint_snapshot_t *)0)->field) /
                                          sizeof(((daemon_fingerprint_snapshot_t *)0)->field[0]),
     DAEMON_FINGERPRINT_FIELD_HEX_CHARS = sizeof(uint64_t) * CBM_SZ_2,
-    DAEMON_FINGERPRINT_VOLUME_FIELD = 0,
     DAEMON_FINGERPRINT_POSIX_WRITE_SEC_FIELD = 3,
     DAEMON_FINGERPRINT_POSIX_WRITE_NSEC_FIELD = 4,
     DAEMON_FINGERPRINT_WINDOWS_WRITE_TIME_FIELD = 4,
@@ -1111,16 +1110,18 @@ static bool daemon_fingerprint_cache_file_snapshot(
 }
 
 /* A cached digest is authoritative only when its cache file was written after
- * the image on the same native volume and is not future-dated. Equal/coarse
- * timestamps, clock rollback, and cross-volume resolution differences are
- * deliberately ambiguous and fall back to exact O(image bytes) hashing. A
+ * the image and is not future-dated. Both timestamps use the OS wall clock, so
+ * cache and image may live on different native volumes (the normal shape for
+ * container bind mounts and runtime directories). Equal/coarse timestamps,
+ * clock rollback, and a volume whose clock is ahead remain ambiguous and fall
+ * back to exact O(image bytes) hashing. The record itself binds the digest to
+ * the image's native volume, file identity, size, and timestamps; descriptor
+ * snapshots below reject cache or image replacement during admission. A
  * settled installed image retains O(1) cache admission time and memory. */
 static bool daemon_fingerprint_cache_newer_than_image(
     const daemon_fingerprint_snapshot_t *cache,
     const daemon_fingerprint_snapshot_t *image) {
-    if (!cache || !image ||
-        cache->field[DAEMON_FINGERPRINT_VOLUME_FIELD] !=
-            image->field[DAEMON_FINGERPRINT_VOLUME_FIELD]) {
+    if (!cache || !image) {
         return false;
     }
 #ifdef _WIN32

@@ -185,10 +185,10 @@ static inline int th_rmtree(const char *path) {
     return rc;
 }
 
-/* Put a fixture's write time unambiguously before a cache created immediately
- * afterward. This avoids sleeps and remains deterministic on coarse-timestamp
+/* Put a fixture's write time unambiguously before or after the current wall
+ * clock. This avoids sleeps and remains deterministic on coarse-timestamp
  * filesystems used by containers and Windows test environments. */
-static inline bool th_backdate_file_for_cache_test(const char *path) {
+static inline bool th_shift_file_time_for_cache_test(const char *path, bool future) {
     enum {
         TH_CACHE_TIMESTAMP_SETTLE_SECONDS = 2,
         TH_WINDOWS_FILETIME_TICKS_PER_SECOND = 10000000,
@@ -210,14 +210,15 @@ static inline bool th_backdate_file_for_cache_test(const char *path) {
     uint64_t ticks = ((uint64_t)now.dwHighDateTime << 32U) | now.dwLowDateTime;
     uint64_t delta = (uint64_t)TH_CACHE_TIMESTAMP_SETTLE_SECONDS *
                      TH_WINDOWS_FILETIME_TICKS_PER_SECOND;
-    bool ok = file != INVALID_HANDLE_VALUE && ticks > delta;
+    bool ok = file != INVALID_HANDLE_VALUE &&
+              (future ? ticks <= UINT64_MAX - delta : ticks > delta);
     if (ok) {
-        ticks -= delta;
-        FILETIME earlier = {
+        ticks = future ? ticks + delta : ticks - delta;
+        FILETIME shifted = {
             .dwLowDateTime = (DWORD)ticks,
             .dwHighDateTime = (DWORD)(ticks >> 32U),
         };
-        ok = SetFileTime(file, NULL, NULL, &earlier) != 0;
+        ok = SetFileTime(file, NULL, NULL, &shifted) != 0;
     }
     if (file != INVALID_HANDLE_VALUE && CloseHandle(file) == 0) {
         ok = false;
@@ -226,15 +227,26 @@ static inline bool th_backdate_file_for_cache_test(const char *path) {
 #else
     struct timespec now;
     if (clock_gettime(CLOCK_REALTIME, &now) != 0 ||
-        now.tv_sec <= TH_CACHE_TIMESTAMP_SETTLE_SECONDS) {
+        (!future && now.tv_sec <= TH_CACHE_TIMESTAMP_SETTLE_SECONDS)) {
         return false;
     }
+    time_t shifted_sec =
+        now.tv_sec + (future ? TH_CACHE_TIMESTAMP_SETTLE_SECONDS
+                             : -TH_CACHE_TIMESTAMP_SETTLE_SECONDS);
     struct timespec times[2] = {
-        {.tv_sec = now.tv_sec - TH_CACHE_TIMESTAMP_SETTLE_SECONDS, .tv_nsec = now.tv_nsec},
-        {.tv_sec = now.tv_sec - TH_CACHE_TIMESTAMP_SETTLE_SECONDS, .tv_nsec = now.tv_nsec},
+        {.tv_sec = shifted_sec, .tv_nsec = now.tv_nsec},
+        {.tv_sec = shifted_sec, .tv_nsec = now.tv_nsec},
     };
     return utimensat(AT_FDCWD, path, times, 0) == 0;
 #endif
+}
+
+static inline bool th_backdate_file_for_cache_test(const char *path) {
+    return th_shift_file_time_for_cache_test(path, false);
+}
+
+static inline bool th_futuredate_file_for_cache_test(const char *path) {
+    return th_shift_file_time_for_cache_test(path, true);
 }
 
 /* ── Temp directory creation ──────────────────────────────────── */
