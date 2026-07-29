@@ -662,6 +662,18 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
                                       cbm_index_worker_memory_budget_bytes());
+    if (index_worker) {
+        /* The worker owns the memory-heavy in-process server, so it must apply
+         * the daemon-supplied cap before allocating graph state. Ordinary CLI
+         * processes are thin IPC frontends: initializing there repeats the
+         * allocator audit and budget setup on every request without governing
+         * daemon memory. Keeping initialization with its owner removes
+         * O(CBM_MEM_OWNERSHIP_CLASSES) probe allocations and constant auxiliary
+         * state from each frontend; daemon and worker lifecycle semantics stay
+         * unchanged on every platform. */
+        cbm_mem_init_with_cap(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram),
+                              cbm_index_worker_memory_budget_bytes());
+    }
 
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -920,8 +932,6 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
                 print_cli_help();
                 return 0;
             }
-            cbm_mem_init_with_cap(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram),
-                                  cbm_index_worker_memory_budget_bytes());
             return run_cli(cli_argc, cli_argv, project_locks, maintenance_context);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {

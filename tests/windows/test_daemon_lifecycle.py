@@ -88,6 +88,10 @@ def main():
             print("RED: a warm cli one-shot should recycle the daemon without the "
                   "cold-start hint:\n%s" % warm_text[:400])
             return 1
+        if "mem.allocator." in warm_text or "mem.init" in warm_text:
+            print("RED: a warm thin cli repeated daemon-owned allocator "
+                  "initialization:\n%s" % warm_text[:400])
+            return 1
         status_active = run_cli(binary, cache, ["daemon", "status"])
         status_text = output_text(status_active)
         if status_active.returncode != 0 or "permanent" not in status_text:

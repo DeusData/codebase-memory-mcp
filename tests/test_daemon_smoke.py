@@ -1131,6 +1131,16 @@ def main():
                     + repr(active_local_cli.stdout)
                 ) from exc
             check(
+                "mem.allocator." not in active_local_cli.stderr
+                and "mem.init" not in active_local_cli.stderr,
+                "thin CLI repeated daemon-owned allocator initialization: "
+                + repr(active_local_cli.stderr),
+            )
+            check(
+                len(json_events(daemon_log, "mem.init")) == 1,
+                "daemon did not retain exactly one allocator initialization",
+            )
+            check(
                 len(json_events(daemon_log, "daemon.start")) == 1,
                 "same-build local CLI restarted the daemon",
             )
