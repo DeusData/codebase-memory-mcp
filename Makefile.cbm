@@ -83,9 +83,9 @@ CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 \
-              $(TSAN_SANITIZE)
+              $(SANITIZED_DEFINE) $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
-                $(TSAN_SANITIZE)
+                $(SANITIZED_DEFINE) $(TSAN_SANITIZE)
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
