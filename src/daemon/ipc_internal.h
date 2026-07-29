@@ -96,4 +96,13 @@ void cbm_daemon_ipc_posix_publication_hook_set_for_test(
     cbm_daemon_ipc_posix_publication_hook_fn hook, void *context);
 void cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(unsigned int count);
 
+/* Deterministic-interleaving seam: fires on the Windows startup path once the
+ * startup lock is held, before the rendezvous handoff. A test parks here to
+ * pin the "startup is holding the lock" interleaving by construction. Polling
+ * for that state instead is a race — the whole acquire → handoff → release
+ * sequence completes in microseconds whenever the handoff does not block, so
+ * the observation window has no lower bound. */
+typedef void (*cbm_daemon_ipc_startup_gate_fn)(void *context);
+void cbm_daemon_ipc_startup_gate_set_for_test(cbm_daemon_ipc_startup_gate_fn gate, void *context);
+
 #endif /* CBM_DAEMON_IPC_INTERNAL_H */

@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-43-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -155,9 +155,21 @@ Watcher registration is controlled separately by `auto_watch` (default `true`). 
 
 ### Keeping Up to Date
 
+**macOS / Linux:**
+
 ```bash
 codebase-memory-mcp update
 ```
+
+**Windows** — updates run from `install.ps1`, not from the running binary, because a running executable cannot replace its own image on Windows. `codebase-memory-mcp update` prints the exact command; it is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "<install-dir>\install.ps1"
+```
+
+`install.ps1` is idempotent, so re-running it *is* the update: it stops the daemon, retires the running binary, installs the new one, and cleans up. `install.ps1` sits next to the binary in your install directory. If PowerShell refuses to run it because the file came from the internet, `Unblock-File` it first.
+
+Installed through **npm or pip**? Update with your package manager on every platform (`npm install -g codebase-memory-mcp@latest` / `pip install -U codebase-memory-mcp`).
 
 The MCP server also checks for updates on startup and notifies on the first tool call if a newer release is available.
 
@@ -364,7 +376,23 @@ git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
-# Binary at: build/c/codebase-memory-mcp
+# Binary at: build/c/codebase-memory-mcp   (codebase-memory-mcp.exe on Windows)
+```
+
+Every platform builds **one self-contained binary** — no runtime dependencies, no companion executables to keep alongside it.
+
+Run the test suite (6,768 tests across 120 suites):
+
+```bash
+scripts/test.sh                     # full: clean sanitizer build + all suites + guards
+scripts/test.sh --suites <name>     # one suite, incremental, seconds
+build/c/test-runner --list-suites   # what is available
+```
+
+`scripts/test.sh` is the same entry the CI gates run, so a local pass means the same thing a CI pass does. Packaging a release archive locally uses the same canonical script the release pipeline calls:
+
+```bash
+scripts/package-release.sh <linux|darwin|windows> <amd64|arm64>
 ```
 
 The standard and release pathways use the Makefile's optimized production defaults

@@ -92,20 +92,51 @@ static char *string_format(const char *format, ...) {
     return result;
 }
 
+#ifndef _WIN32
 static cbm_daemon_ipc_posix_publication_hook_fn g_posix_publication_hook_for_test;
 static void *g_posix_publication_hook_context_for_test;
+#endif
 static atomic_uint g_windows_legacy_guard_release_failures_for_test;
 
 void cbm_daemon_ipc_posix_publication_hook_set_for_test(
     cbm_daemon_ipc_posix_publication_hook_fn hook, void *context) {
+#ifndef _WIN32
     g_posix_publication_hook_context_for_test = context;
     g_posix_publication_hook_for_test = hook;
+#else
+    (void)hook;
+    (void)context;
+#endif
 }
 
 void cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(unsigned int count) {
     atomic_store_explicit(&g_windows_legacy_guard_release_failures_for_test, count,
                           memory_order_release);
 }
+
+#ifdef _WIN32
+static cbm_daemon_ipc_startup_gate_fn g_startup_gate_for_test;
+static void *g_startup_gate_context_for_test;
+#endif
+
+void cbm_daemon_ipc_startup_gate_set_for_test(cbm_daemon_ipc_startup_gate_fn gate, void *context) {
+#ifdef _WIN32
+    g_startup_gate_context_for_test = context;
+    g_startup_gate_for_test = gate;
+#else
+    (void)gate;
+    (void)context;
+#endif
+}
+
+#ifdef _WIN32
+static void ipc_startup_gate_run(void) {
+    cbm_daemon_ipc_startup_gate_fn gate = g_startup_gate_for_test;
+    if (gate) {
+        gate(g_startup_gate_context_for_test);
+    }
+}
+#endif
 
 bool cbm_daemon_ipc_windows_legacy_names(const char *canonical_runtime_parent,
                                          const char *instance_key,
@@ -5762,6 +5793,9 @@ int cbm_daemon_ipc_startup_lock_try_acquire(const cbm_daemon_ipc_endpoint_t *end
     lock->legacy_guard = legacy_guard;
     lock->legacy_sentinel = INVALID_HANDLE_VALUE;
     *lock_out = lock;
+    /* The lock is held and the handoff has not run yet: the one point where a
+     * test can pin this interleaving deterministically. No-op in production. */
+    ipc_startup_gate_run();
     return 1;
 }
 

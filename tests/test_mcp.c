@@ -13,6 +13,7 @@
 #include "../src/git/git_command.h"
 #include "../src/foundation/log.h"
 #include "../src/foundation/str_util.h"
+#include "../src/mcp/compact_out.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -139,6 +140,47 @@ static bool test_file_exists_mcp(const char *path) {
     }
     fclose(fp);
     return true;
+}
+
+TEST(tree_cell_sanitizes_control_and_invalid_utf8) {
+    /* A raw control or invalid UTF-8 byte makes line-oriented consumers treat
+     * the complete response as binary. Cell emission therefore stays O(n)
+     * time/O(1) auxiliary space while escaping controls, replacing malformed
+     * bytes with U+FFFD, and preserving valid UTF-8 unchanged. */
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    cbm_tree_cell_str(&sb,
+                      "evil\x01name\xff"
+                      "end",
+                      true);
+    char *out = cbm_sb_finish(&sb);
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out, "\"evil\\u0001name\xEF\xBF\xBD"
+                       "end\"");
+    free(out);
+
+    cbm_sb_init(&sb);
+    cbm_tree_cell_str(&sb, "b\xC3\xA4r_ok", true);
+    out = cbm_sb_finish(&sb);
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out, "b\xC3\xA4r_ok");
+    free(out);
+
+    /* A truncated multibyte lead at the allocation boundary must be replaced
+     * without reading beyond the terminating NUL. Heap allocation makes an
+     * out-of-bounds continuation-byte probe visible to ASan. */
+    char *truncated = (char *)malloc(2U);
+    ASSERT_NOT_NULL(truncated);
+    truncated[0] = (char)0xF0;
+    truncated[1] = '\0';
+    cbm_sb_init(&sb);
+    cbm_tree_cell_str(&sb, truncated, true);
+    out = cbm_sb_finish(&sb);
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out, "\"\xEF\xBF\xBD\"");
+    free(out);
+    free(truncated);
+    PASS();
 }
 
 static bool has_stale_freshness_view(const char *json, const char *view_name) {
@@ -16985,6 +17027,7 @@ SUITE(mcp) {
     RUN_TEST(jsonrpc_parse_request);
     RUN_TEST(jsonrpc_parse_notification);
     RUN_TEST(jsonrpc_parse_invalid);
+    RUN_TEST(tree_cell_sanitizes_control_and_invalid_utf8);
     RUN_TEST(jsonrpc_parse_tools_call);
     RUN_TEST(jsonrpc_parse_string_id_issue253);
     RUN_TEST(jsonrpc_format_response_string_id_issue253);

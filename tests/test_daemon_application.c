@@ -1557,19 +1557,6 @@ static bool app_wait_for_active_jobs(cbm_daemon_application_t *application, size
     return false;
 }
 
-static bool app_wait_for_terminal_job_with_subscribers(cbm_daemon_application_t *application,
-                                                       const char *project,
-                                                       size_t minimum_subscribers) {
-    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
-    while (cbm_now_ms() < deadline) {
-        if (cbm_daemon_application_active_jobs(application) == 0 &&
-            cbm_daemon_application_job_subscribers(application, project) >= minimum_subscribers) {
-            return true;
-        }
-    }
-    return false;
-}
-
 typedef struct {
     cbm_daemon_application_t *application;
     const char *project;
@@ -2761,16 +2748,21 @@ TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job) {
     bool first_worker_ready_to_publish =
         all_subscribed && app_wait_for_atomic_int(&fake.destroys, 1);
     atomic_store(&fake.release_destroy, true);
-    bool terminal_with_prior_subscribers =
-        first_worker_ready_to_publish &&
-        app_wait_for_terminal_job_with_subscribers(application, project, PRIOR_SUBSCRIBERS / 2U);
+    /* Wait only for the stable end-state. Publish flips terminal and lets the
+     * blocked prior requests drain in the same breath, so "terminal AND still
+     * subscribed" is a transient window no poll cadence can pin (release runs
+     * 30305464193 and 30309182389 missed it from both directions). The
+     * production guard ignores subscriber counts — find_active_job skips any
+     * terminal job — and the stale/fresh assertions below catch a reuse in
+     * every interleaving. */
+    bool job_terminal = first_worker_ready_to_publish && app_wait_for_active_jobs(application, 0);
 
     uint8_t *fresh = NULL;
     uint32_t fresh_length = 0;
     cbm_daemon_runtime_application_status_t fresh_status =
-        terminal_with_prior_subscribers ? app_test_request(&callbacks, sessions[PRIOR_SUBSCRIBERS],
-                                                           tool, tool_length, &fresh, &fresh_length)
-                                        : CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+        job_terminal ? app_test_request(&callbacks, sessions[PRIOR_SUBSCRIBERS], tool, tool_length,
+                                        &fresh, &fresh_length)
+                     : CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     for (size_t i = 0; i < PRIOR_SUBSCRIBERS; i++) {
         if (started[i]) {
             (void)cbm_thread_join(&threads[i]);
@@ -2787,7 +2779,7 @@ TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job) {
     ASSERT_TRUE(setup);
     ASSERT_TRUE(all_subscribed);
     ASSERT_TRUE(first_worker_ready_to_publish);
-    ASSERT_TRUE(terminal_with_prior_subscribers);
+    ASSERT_TRUE(job_terminal);
     ASSERT_EQ(fresh_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_EQ(atomic_load(&fake.starts), 2);
     ASSERT_EQ(atomic_load(&fake.destroys), 2);

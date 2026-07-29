@@ -452,7 +452,7 @@ TEST(dep_discover_skips_test_dirs) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_disc_test_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
-        SKIP("Could not create temp dir");
+        FAIL("Could not create temp dir");
     }
 
     /* Create src/lib.rs and tests/test_foo.rs */
@@ -696,7 +696,7 @@ TEST(test_is_dep_project_without_session) {
 TEST(test_detect_ecosystem_python) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_eco_py_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    if (!cbm_mkdtemp(tmp)) { FAIL("Could not create temp dir"); }
     char path[512];
     snprintf(path, sizeof(path), "%s/pyproject.toml", tmp);
     FILE *fp = fopen(path, "w");
@@ -709,7 +709,7 @@ TEST(test_detect_ecosystem_python) {
 TEST(test_detect_ecosystem_rust) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_eco_rs_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    if (!cbm_mkdtemp(tmp)) { FAIL("Could not create temp dir"); }
     char path[512];
     snprintf(path, sizeof(path), "%s/Cargo.toml", tmp);
     FILE *fp = fopen(path, "w");
@@ -722,7 +722,7 @@ TEST(test_detect_ecosystem_rust) {
 TEST(test_detect_ecosystem_none) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_eco_none_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    if (!cbm_mkdtemp(tmp)) { FAIL("Could not create temp dir"); }
     ASSERT_EQ(cbm_detect_ecosystem(tmp), CBM_PKG_COUNT);
     cleanup_fixture_dir(tmp);
     PASS();
@@ -740,7 +740,7 @@ TEST(test_is_manifest_path) {
 TEST(test_resolve_npm_node_modules) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_resolve_npm_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) { SKIP("Could not create temp dir"); }
+    if (!cbm_mkdtemp(tmp)) { FAIL("Could not create temp dir"); }
 
     /* Create node_modules/react/ with package.json */
     char nm[512];

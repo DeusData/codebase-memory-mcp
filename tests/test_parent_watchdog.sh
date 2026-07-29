@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="${ROOT}/build/c/codebase-memory-mcp"
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
 CHILD_START_ATTEMPTS=50
 CHILD_START_POLL_SECONDS=0.1
 CHILD_READY_LOG_PATTERN='msg=mem.init'

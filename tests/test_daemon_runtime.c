@@ -3716,8 +3716,25 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     }
     bool exited =
         started && cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
-    if (first && !request_thread_started) {
-        (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
+    /* Teardown must be leak-free on EVERY path, including the failure path
+     * where the request thread never completed: close_begin interrupts the
+     * transport, which forces the blocked call to finish, making the join
+     * safe; only close_finish releases the client. Skipping the close while
+     * the thread was still marked running leaked the client + its connection
+     * (LSan, 200 bytes) whenever an earlier stage of this test failed. */
+    if (first) {
+        if (!first_close_begun) {
+            first_close_begun = cbm_daemon_runtime_client_close_begin(first);
+        }
+        if (request_thread_started) {
+            (void)cbm_thread_join(&request_thread);
+            request_thread_started = false;
+        }
+        if (first_close_begun) {
+            (void)cbm_daemon_runtime_client_close_finish(first, RUNTIME_TEST_TIMEOUT_MS);
+        } else {
+            (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
+        }
         first = NULL;
     }
     runtime_test_fixture_finish(&fixture);

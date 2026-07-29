@@ -1118,6 +1118,40 @@ static bool activation_sync_directory(const cbm_activation_transaction_t *transa
 #endif
 }
 
+#ifdef _WIN32
+/* Renaming is how this transaction both publishes and retires -- and on Windows
+ * it is the ONLY mutation permitted on a running image, which is what lets a
+ * single binary replace or remove itself at all. It can still lose to a handle
+ * that is about to go away: an antivirus scan of a just-written executable, or
+ * a child process the OS has not finished reaping. Both surface as a sharing or
+ * access violation and both clear within moments.
+ *
+ * install.ps1 already retries this exact operation for this exact reason. The C
+ * path giving up on the first attempt is what let `uninstall` intermittently
+ * abandon a live installation with "cleanup may remain" -- observed on one
+ * runner while an identical job on the same image passed.
+ *
+ * Bounded on purpose: a file that is genuinely held must still fail, and fail
+ * closed, rather than spin. */
+#define ACTIVATION_RENAME_ATTEMPTS 10U
+#define ACTIVATION_RENAME_RETRY_MS 500U
+
+static unsigned int activation_rename_failures_for_test;
+
+static bool activation_rename_error_is_transient(DWORD error) {
+    return error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED ||
+           error == ERROR_LOCK_VIOLATION;
+}
+#endif
+
+void cbm_activation_transaction_rename_failures_set_for_test(unsigned int count) {
+#ifdef _WIN32
+    activation_rename_failures_for_test = count;
+#else
+    (void)count;
+#endif
+}
+
 static bool activation_rename(const cbm_activation_transaction_t *transaction, const char *source,
                               const char *source_name, const char *destination,
                               const char *destination_name, bool replace_destination) {
@@ -1128,9 +1162,23 @@ static bool activation_rename(const cbm_activation_transaction_t *transaction, c
     wchar_t *wide_source = activation_utf8_to_wide(source);
     wchar_t *wide_destination = activation_utf8_to_wide(destination);
     DWORD flags = MOVEFILE_WRITE_THROUGH | (replace_destination ? MOVEFILE_REPLACE_EXISTING : 0);
-    bool ok = wide_source && wide_destination &&
-              MoveFileExW(wide_source, wide_destination, flags) != 0 &&
-              activation_directory_still_valid(transaction);
+    bool moved = false;
+    for (unsigned int attempt = 0;
+         wide_source && wide_destination && !moved && attempt < ACTIVATION_RENAME_ATTEMPTS;
+         attempt++) {
+        if (activation_rename_failures_for_test > 0) {
+            activation_rename_failures_for_test--;
+        } else if (MoveFileExW(wide_source, wide_destination, flags) != 0) {
+            moved = true;
+            break;
+        } else if (!activation_rename_error_is_transient(GetLastError())) {
+            break;
+        }
+        if (attempt + 1U < ACTIVATION_RENAME_ATTEMPTS) {
+            Sleep(ACTIVATION_RENAME_RETRY_MS);
+        }
+    }
+    bool ok = moved && activation_directory_still_valid(transaction);
     free(wide_source);
     free(wide_destination);
     return ok;

@@ -7705,14 +7705,17 @@ static bool normalize_search_pattern(char **pattern, const char *field, char *er
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mem_phase_mark("handler.args");
     cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
     if (response_format == CBM_MCP_OUTPUT_INVALID) {
         return cbm_mcp_invalid_response_format();
     }
     char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
+    cbm_mem_phase_mark("handler.resolve_store");
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
+    cbm_mem_phase_mark("handler.body");
     REQUIRE_STORE(store, project);
 
     /* TOON is the compact default; JSON remains available and is required
@@ -17247,6 +17250,12 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     srv->store = NULL;
     free(srv->current_project);
     srv->current_project = NULL;
+    /* Closing the store releases its SQLite page cache. Force one allocator
+     * collection at that ownership boundary so unused pages can be returned
+     * promptly instead of accumulating across thousands of request-scoped
+     * stores (#581). Keep this O(allocator-state) work once per released store,
+     * after every store pointer is cleared—not in any per-row result path. */
+    cbm_mem_collect();
 }
 
 /* Apply the one-shot context contract after every tool dispatcher returns.
@@ -17362,17 +17371,32 @@ static char *mcp_tool_result_with_context_once(cbm_mcp_server_t *srv, const char
 }
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    /* Phase marks bracket the WHOLE request with no unlabelled gap, so growth
+     * cannot hide between them (CBM_MEM_PHASES=1; see foundation/mem.h). The
+     * "idle" label owns everything outside a request, which is what makes a
+     * request-path retainer distinguishable from background growth. */
+    cbm_mem_phase_mark("request.scope_begin");
     bool request_scope = !srv || cbm_mcp_server_request_scope_begin(srv);
     if (!request_scope) {
         release_request_store(srv);
+        cbm_mem_phase_mark("idle");
         return cbm_mcp_text_result("request cancellation scope unavailable", true);
     }
+    cbm_mem_phase_mark("request.dispatch_tool");
     char *result = dispatch_tool(srv, tool_name, args_json);
     result = mcp_tool_result_with_context_once(srv, tool_name, args_json, result);
+    cbm_mem_phase_mark("request.scope_end");
     if (srv) {
         cbm_mcp_server_request_scope_end(srv);
     }
+    cbm_mem_phase_mark("request.release_store");
     release_request_store(srv);
+    cbm_mem_phase_mark("idle");
+    /* One census per completed request, so growth can be attributed to a POOL
+     * rather than inferred from a process total (#581). Emitted after the
+     * request store is released, which is the point where a well-behaved
+     * request has given everything back. */
+    cbm_mem_census_log("mcp.request");
     return result;
 }
 

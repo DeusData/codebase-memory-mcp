@@ -1,4 +1,11 @@
-# Weekly soak test: 4h sustained load + ASan leak detection
+# Soak dispatcher — the weekly scheduled soak AND every on-demand soak run.
+#
+# Absorbs the retired soak.yml (the standalone "multi-hour #581" workflow): its
+# reasons to exist — a job budget that actually covers a 4h run, and the
+# query-leak mode that never reindexes so the #581 leak can accumulate — are
+# now _soak.yml facts (timeout 560, legs input). A long #581-only run is
+# `legs: query-leak` here, not a separate workflow with its own copy of the
+# soak procedure. NON-GATING: never a required check, never blocks a merge.
 name: Nightly Soak
 
 on:
@@ -7,9 +14,22 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Soak duration in minutes (default: 240 = 4h)'
+        description: 'Soak duration in minutes PER LEG (default: 240 = 4h)'
         type: number
         default: 240
+      legs:
+        description: 'Soak legs (query-leak = the #581 detector alone)'
+        type: choice
+        options: ['quick,query-leak', 'quick', 'query-leak']
+        default: 'quick,query-leak'
+      run_asan:
+        description: 'Also run the 15-min ASan soak legs'
+        type: boolean
+        default: true
+  # Iteration convenience carried over from soak.yml: pushing a qa/soak-**
+  # branch starts a real run from that branch's own copy of the workflows.
+  push:
+    branches: ['qa/soak-**']
 
 permissions:
   contents: read
@@ -18,5 +38,8 @@ jobs:
   soak:
     uses: ./.github/workflows/_soak.yml
     with:
+      # On schedule/push events the inputs context is empty — fall back to the
+      # weekly defaults (4h, both legs, ASan on).
       duration_minutes: ${{ inputs.duration_minutes || 240 }}
-      run_asan: true
+      legs: ${{ inputs.legs || 'quick,query-leak' }}
+      run_asan: ${{ github.event_name != 'workflow_dispatch' || inputs.run_asan }}

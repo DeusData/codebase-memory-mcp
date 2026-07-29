@@ -14,6 +14,7 @@ RUN apk add --no-cache \
     zlib-dev \
     zlib-static \
     bash \
+    curl \
     git \
     python3 \
     nodejs \

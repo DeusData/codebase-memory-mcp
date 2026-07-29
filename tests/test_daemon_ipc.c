@@ -399,6 +399,36 @@ typedef struct {
     int result;
 } ipc_test_win_startup_call_t;
 
+typedef struct {
+    atomic_bool acquired;
+    atomic_bool may_proceed;
+} ipc_test_startup_gate_t;
+
+/* Runs on the startup thread INSIDE cbm_daemon_ipc_startup_lock_try_acquire,
+ * with the startup lock held and the rendezvous handoff not yet attempted.
+ * Announce that state, then park until the test has released its reader. This
+ * pins the interleaving by construction; the previous version polled for the
+ * lock being busy, which is unobservable whenever the handoff does not block. */
+static void ipc_test_startup_gate(void *context) {
+    ipc_test_startup_gate_t *gate = context;
+    atomic_store(&gate->acquired, true);
+    while (!atomic_load(&gate->may_proceed)) {
+        cbm_usleep(200);
+    }
+}
+
+static bool ipc_test_startup_gate_wait_acquired(ipc_test_startup_gate_t *gate) {
+    /* `acquired` never clears, so this wait cannot miss the event; the bound
+     * only catches a thread that never started at all. */
+    for (size_t attempt = 0; attempt < 50000U; attempt++) {
+        if (atomic_load(&gate->acquired)) {
+            return true;
+        }
+        cbm_usleep(200);
+    }
+    return false;
+}
+
 static void *ipc_test_win_startup_call(void *opaque) {
     ipc_test_win_startup_call_t *call = opaque;
     cbm_daemon_ipc_startup_lock_t *startup = NULL;
@@ -415,14 +445,6 @@ static void ipc_test_win_lock_release(cbm_private_file_lock_t **lock_io) {
            cbm_private_file_lock_release(lock_io) != CBM_PRIVATE_FILE_LOCK_OK) {
         cbm_usleep(1000);
     }
-}
-
-static bool ipc_test_win_lock_busy(cbm_private_lock_directory_t *directory, const char *base_name) {
-    cbm_private_file_lock_t *probe = NULL;
-    cbm_private_file_lock_status_t status =
-        cbm_private_file_lock_try_acquire(directory, base_name, CBM_PRIVATE_FILE_LOCK_SH, &probe);
-    ipc_test_win_lock_release(&probe);
-    return status == CBM_PRIVATE_FILE_LOCK_BUSY;
 }
 #endif
 
@@ -1028,6 +1050,10 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     bool startup_observed = false;
     int join_status = -1;
     ipc_test_win_startup_call_t call = {.result = -1};
+    ipc_test_startup_gate_t gate;
+    atomic_init(&gate.acquired, false);
+    atomic_init(&gate.may_proceed, false);
+    cbm_daemon_ipc_startup_gate_set_for_test(ipc_test_startup_gate, &gate);
 
     bool parent_ok = ipc_test_parent_new(parent, "win-record-reader");
     if (parent_ok) {
@@ -1048,14 +1074,11 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     if (record_status == CBM_PRIVATE_FILE_LOCK_OK) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
-    for (size_t attempt = 0; thread_started && attempt < 200U; attempt++) {
-        if (ipc_test_win_lock_busy(directory, "cbm-startup-v2.lock")) {
-            startup_observed = true;
-            break;
-        }
-        cbm_usleep(1000);
+    if (thread_started) {
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
     }
     ipc_test_win_lock_release(&record_reader);
+    atomic_store(&gate.may_proceed, true);
     if (thread_started) {
         join_status = cbm_thread_join(&thread);
     }
@@ -1063,6 +1086,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
         ipc_test_copy_path(address, cbm_daemon_ipc_endpoint_address(endpoint));
     }
 
+    cbm_daemon_ipc_startup_gate_set_for_test(NULL, NULL);
     ipc_test_win_lock_release(&record_reader);
     cbm_private_lock_directory_close(directory);
     cbm_daemon_ipc_endpoint_free(endpoint);
@@ -1115,6 +1139,11 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     cbm_daemon_ipc_startup_lock_release(&initial_startup);
     initial_startup = NULL;
 
+    ipc_test_startup_gate_t gate;
+    atomic_init(&gate.acquired, false);
+    atomic_init(&gate.may_proceed, false);
+    cbm_daemon_ipc_startup_gate_set_for_test(ipc_test_startup_gate, &gate);
+
     cbm_private_file_lock_status_t directory_status =
         endpoint ? cbm_daemon_ipc_private_lock_directory_new(endpoint, &directory)
                  : CBM_PRIVATE_FILE_LOCK_IO;
@@ -1126,19 +1155,18 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     if (record_status == CBM_PRIVATE_FILE_LOCK_OK) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
-    for (size_t attempt = 0; thread_started && attempt < 200U; attempt++) {
-        if (ipc_test_win_lock_busy(directory, "cbm-startup-v2.lock")) {
-            startup_observed = true;
-            break;
-        }
-        cbm_usleep(1000);
+    if (thread_started) {
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
     }
+    /* Claim the lifetime lock while startup is parked in the gate, so the
+     * concurrent-owner bridge under test is exercised deterministically. */
     cbm_private_file_lock_status_t lifetime_status =
         startup_observed
             ? cbm_private_file_lock_try_acquire(directory, "cbm-lifetime.lock",
                                                 CBM_PRIVATE_FILE_LOCK_EX, &lifetime_owner)
             : CBM_PRIVATE_FILE_LOCK_IO;
     ipc_test_win_lock_release(&record_reader);
+    atomic_store(&gate.may_proceed, true);
     if (thread_started) {
         join_status = cbm_thread_join(&thread);
     }
@@ -1147,6 +1175,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     }
     ipc_test_win_lock_release(&lifetime_owner);
 
+    cbm_daemon_ipc_startup_gate_set_for_test(NULL, NULL);
     ipc_test_win_lock_release(&record_reader);
     ipc_test_win_lock_release(&lifetime_owner);
     cbm_private_lock_directory_close(directory);
@@ -2123,6 +2152,13 @@ typedef struct {
     int receive_result;
 } ipc_forever_wait_server_t;
 
+/* The connection is deliberately NOT closed here. The test interrupts this
+ * thread's wait through server->connection, and `receive_frame` can also return
+ * on its own (a torn connection, an early frame) before that call lands.
+ * Closing from this thread therefore freed the connection while the test was
+ * still dereferencing the pointer it had already loaded — a use-after-free that
+ * crashed roughly one Windows run in five. Ownership stays with the test, which
+ * closes it after joining, so `interrupt` can only ever see a live connection. */
 static void *ipc_forever_wait_server(void *opaque) {
     ipc_forever_wait_server_t *server = (ipc_forever_wait_server_t *)opaque;
     cbm_daemon_frame_t frame = {0};
@@ -2135,8 +2171,6 @@ static void *ipc_forever_wait_server(void *opaque) {
             server->connection, CBM_DAEMON_IPC_WAIT_FOREVER, &frame, &payload);
     }
     free(payload);
-    cbm_daemon_ipc_connection_close(server->connection);
-    server->connection = NULL;
     return NULL;
 }
 
@@ -2180,6 +2214,9 @@ TEST(daemon_ipc_wait_forever_is_interruptible) {
     if (thread_started) {
         join_result = cbm_thread_join(&thread);
     }
+    /* Safe only after the join: the server thread no longer touches it. */
+    cbm_daemon_ipc_connection_close(server.connection);
+    server.connection = NULL;
     cbm_daemon_ipc_connection_close(client);
     cbm_daemon_ipc_listener_close(listener);
     cbm_daemon_ipc_endpoint_free(endpoint);

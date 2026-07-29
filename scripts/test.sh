@@ -1,32 +1,127 @@
 #!/usr/bin/env bash
-# test.sh — Clean build + run all C tests with ASan + UBSan.
-#
-# Usage:
-#   scripts/test.sh                          # Auto-detect everything
-#   scripts/test.sh --arch x86_64            # Force x86_64 build
-#   scripts/test.sh CC=gcc-14 CXX=g++-14    # Override compiler
-#
-# This script is the SINGLE source of truth for running tests.
-# Used identically in local development and CI workflows.
+# test.sh — THE canonical test leg. Every venue (local ladder, PR CI, dry run,
+# release) runs tests through this file; iteration happens through its flags,
+# never through a second entry point.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Parse --arch flag before sourcing env.sh
+usage() {
+    cat <<'EOF'
+Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
+
+The canonical test entry: identical in local CI, PR CI, dry run and release.
+DEFAULT (no --suites) is exactly what CI runs: static contract checks
+(Step 0a-0j), a CLEAN sanitizer build, every suite via the parallel harness,
+then the prod-binary regression guards (Steps 4-6).
+
+Modes:
+  (default)      The venue leg. Clean build (scripts/clean.sh) + all suites +
+                 all contract steps. This is the shape every gate runs.
+  --suites LIST  ITERATION mode: comma- or space-separated suite names, e.g.
+                 --suites daemon,daemon_ipc. Rebuilds the test-runner
+                 INCREMENTALLY (make dependency tracking, no clean) and runs
+                 only those suites — seconds, not minutes. Skips the contract
+                 steps and prod-binary guards; the full default run remains
+                 the merge gate. Suite names: build/c/test-runner --list-suites.
+  --tsan         ThreadSanitizer leg (data-race gate): builds and runs the
+                 widened TSan runner via make test-tsan — the same leg CI's
+                 tsan jobs and the compose test-tsan service run.
+
+Options:
+  --arch ARCH    Force target arch (arm64 | x86_64), e.g. under Rosetta.
+  -h, --help     This text.
+
+Make passthrough (VAR=VAL, forwarded verbatim):
+  CC= CXX=       Compiler override, e.g. CC=gcc-14 CXX=g++-14.
+  BUILD_DIR=     Build in an isolated directory (containers/sanitizer variants).
+  SANITIZE=      Override sanitizer flags. Platform defaults when unset:
+                 unix/CLANG64 use the Makefile's ASan+UBSan test flags;
+                 CLANGARM64 (Windows on ARM, no ASan runtime) gets CI's
+                 trap-UBSan set (-fsanitize=undefined -fsanitize-trap=undefined
+                 -fstack-protector-strong -fno-omit-frame-pointer) applied HERE
+                 so local and CI build identical test binaries. Pass SANITIZE=
+                 (empty) for a plain build when debugging a trap.
+
+Environment:
+  CBM_TEST_SEQUENTIAL=1   Single-process runner instead of the parallel harness.
+  CBM_RUN_HANG_TEST=1     Opt-in C++ index-hang regression (#410, needs prod).
+  CBM_NO_CCACHE=1         Disable the content-verified compiler cache.
+  CBM_TEST_SHARD/_LEG     Set by CI's sharded legs; leave unset locally.
+
+Examples:
+  scripts/test.sh                          # the full venue leg (what CI runs)
+  scripts/test.sh --suites daemon_ipc      # one suite, incremental, seconds
+  scripts/test.sh --suites "arena hash_table" CC=clang CXX=clang++
+  scripts/test.sh SANITIZE= --suites daemon_ipc # plain build for trap debugging
+EOF
+}
+
+# Parse --help / --suites / --tsan / --arch before sourcing env.sh.
+# STRICT: an unknown flag or a stray word is an immediate usage error, never
+# silently swallowed — agents must know exactly what a run will do.
+SUITES=""
+TSAN=0
+prev_arg=""
 for arg in "$@"; do
     case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        --tsan) :;;
+        --suites) :;; # next arg is the value, handled below
+        --suites=*) SUITES="${arg#--suites=}" ;;
         --arch) :;; # next arg is the value, handled below
+        --arch=*) :;; # handled below
+        -*)
+            echo "test.sh: unknown option '$arg'. Please consult --help." >&2
+            exit 2
+            ;;
         arm64|x86_64)
-            # Check if previous arg was --arch
-            if [[ "${prev_arg:-}" == "--arch" ]]; then
-                export CBM_ARCH="$arg"
+            if [[ "${prev_arg:-}" != "--arch" && "${prev_arg:-}" != "--suites" ]]; then
+                echo "test.sh: unexpected argument '$arg' (did you mean --arch $arg?). Please consult --help." >&2
+                exit 2
+            fi
+            ;;
+        *=*) :;; # VAR=VAL make passthrough, validated below
+        *)
+            if [[ "${prev_arg:-}" != "--suites" ]]; then
+                echo "test.sh: unexpected argument '$arg'. Please consult --help." >&2
+                exit 2
             fi
             ;;
     esac
     prev_arg="$arg"
 done
+for arg in "$@"; do
+    case "$arg" in
+        --tsan) TSAN=1 ;;
+        arm64|x86_64)
+            if [[ "${prev_arg2:-}" == "--arch" ]]; then
+                export CBM_ARCH="$arg"
+            fi
+            ;;
+        *)
+            if [[ "${prev_arg2:-}" == "--suites" ]]; then
+                SUITES="$arg"
+            fi
+            ;;
+    esac
+    prev_arg2="$arg"
+done
+# Normalize comma separation to the runner's space-separated argv form.
+SUITES="${SUITES//,/ }"
+case "${prev_arg:-}" in
+    --suites|--arch)
+        echo "test.sh: '$prev_arg' needs a value. Please consult --help." >&2
+        exit 2
+        ;;
+esac
+if [ "$TSAN" -eq 1 ] && [ -n "$SUITES" ]; then
+    echo "test.sh: --tsan and --suites are separate modes (the TSan leg has its own suite set). Please consult --help." >&2
+    exit 2
+fi
+prev_arg=""
 
 # Also support --arch=value
 for arg in "$@"; do
@@ -49,17 +144,58 @@ source "$ROOT/scripts/path-safety.sh"
 # make swallowed the second flag's leading -f as its makefile option.
 MAKE_ARGS=()
 BUILD_DIR="build/c"
+SANITIZE_GIVEN=0
+prev_arg=""
 for arg in "$@"; do
     case "$arg" in
         CC=*|CXX=*) export "${arg}" ;;
         --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
+        --tsan) ;; # already handled
+        --suites|--suites=*) ;; # already handled (value skipped via prev_arg below)
         BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
-        *=*) MAKE_ARGS+=("$arg") ;; # forward any VAR=VAL to make
+        SANITIZE=*) SANITIZE_GIVEN=1; MAKE_ARGS+=("$arg") ;;
+        *=*)
+            if [[ "${prev_arg:-}" != "--suites" ]]; then
+                MAKE_ARGS+=("$arg") # forward any VAR=VAL to make
+            fi
+            ;;
     esac
+    prev_arg="$arg"
 done
 
+# Platform default absorbed FROM CI (previously inline in _test.yml, so the
+# local arm64 leg silently built without it — that divergence is why the SQLite
+# page-cache misalignment was fatal only on the windows-11-arm runner): native
+# ARM64 Windows has no ASan runtime, so its sanitizer gate is UBSan in trap
+# mode + stack protector. Applied here, once, for every venue; an explicit
+# SANITIZE=... (or SANITIZE=) argument overrides.
+if [ "$SANITIZE_GIVEN" -eq 0 ] && [ "${MSYSTEM:-}" = "CLANGARM64" ]; then
+    MAKE_ARGS+=("SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer")
+fi
+
 print_env "test.sh"
+
+# ── TSan mode (--tsan): the data-race gate ──
+# One entry for every venue: CI's tsan jobs and the compose test-tsan service
+# both run this instead of carrying their own make invocation.
+if [ "$TSAN" -eq 1 ]; then
+    echo "=== test.sh: TSan leg (make test-tsan) ==="
+    make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner-tsan" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    make -f Makefile.cbm test-tsan ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    exit "$?"
+fi
+
+# ── Iteration mode (--suites): incremental rebuild + subset run ──
+# The documented fast path: no clean, no contract steps, no prod-binary
+# guards — those all still gate every merge through the default full run.
+if [ -n "$SUITES" ]; then
+    echo "=== test.sh: ITERATION mode — suites: $SUITES (incremental build) ==="
+    make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    # shellcheck disable=SC2086  # suite list is deliberately word-split
+    "$BUILD_DIR/test-runner" $SUITES
+    exit "$?"
+fi
 
 # Step 0: fast build/security harness regressions run before the compiler-heavy
 # suite. The Windows package surface is static here; native launcher behavior is
@@ -87,6 +223,15 @@ bash "$ROOT/tests/test_makefile_logged_command.sh"
 
 echo "=== Step 0h: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
+
+echo "=== Step 0h: smoke release-fixture contract ==="
+bash "$ROOT/tests/test_smoke_fixture_contract.sh"
+
+echo "=== Step 0i: parallel suite scheduler contract ==="
+bash "$ROOT/tests/test_parallel_harness_contract.sh"
+
+echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
+bash "$ROOT/tests/test_venue_parity_contract.sh"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
@@ -119,13 +264,14 @@ fi
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
-bash "$ROOT/tests/test_parent_watchdog.sh"
+WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
 # (`cli --index-worker …`) whose supervisor dies must self-exit instead of
 # indexing on as an orphan. Reuses the prod binary built in Step 5.
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
-bash "$ROOT/tests/test_worker_watchdog.sh"
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

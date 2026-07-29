@@ -14,7 +14,8 @@
  * per-account daemon. One-shot CLI tool calls run in an isolated local server
  * and never create or retain a daemon generation.
  */
-#include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
+#include "cbm.h"
+#include "store/store.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "daemon/application.h"
 #include "daemon/bootstrap.h"
 #include "daemon/frontend.h"
@@ -1840,13 +1841,6 @@ int main(int argc, char **argv) {
         }
     }
 #endif
-    int windows_descriptor_role = cbm_cli_windows_payload_descriptor_role(argc, argv);
-    if (windows_descriptor_role >= 0) {
-        return windows_descriptor_role;
-    }
-    if (cbm_cli_windows_launcher_startup_authenticate(argc, argv) != 0) {
-        return EXIT_FAILURE;
-    }
     cbm_daemon_process_role_t role = cbm_daemon_process_role(argc, argv);
     if (role == CBM_DAEMON_PROCESS_INVALID) {
         (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
