@@ -3393,11 +3393,11 @@ TEST(cli_ensure_path_append) {
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
     write_test_file(rcfile, "# existing content\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc, 0);
 
     const char *data = read_test_file(rcfile);
-    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -3411,9 +3411,9 @@ TEST(cli_ensure_path_already_present) {
 
     char rcfile[512];
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
-    write_test_file(rcfile, "export PATH=\"/usr/local/bin:$PATH\"\n");
+    write_test_file(rcfile, "export PATH=\"/Users/test/.local/bin:$PATH\"\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc, 1); /* 1 = already present */
 
     test_rmdir_r(tmpdir);
@@ -3430,7 +3430,7 @@ TEST(cli_ensure_path_dry_run) {
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
     write_test_file(rcfile, "# clean\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, true);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, true);
     ASSERT_EQ(rc, 0);
 
     /* File should NOT be modified */
@@ -3453,18 +3453,138 @@ TEST(cli_ensure_path_fish_syntax_issue319) {
     snprintf(rcfile, sizeof(rcfile), "%s/config.fish", tmpdir);
     write_test_file(rcfile, "# existing fish config\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc, 0);
 
     const char *data = read_test_file(rcfile);
     ASSERT_NOT_NULL(data);
     /* fish-native form, and NO sh-style export. */
-    ASSERT(strstr(data, "fish_add_path /usr/local/bin") != NULL);
+    ASSERT(strstr(data, "fish_add_path /Users/test/.local/bin") != NULL);
     ASSERT(strstr(data, "export PATH") == NULL);
 
     /* Idempotent: a second call detects the existing fish line. */
-    int rc2 = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc2 = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc2, 1);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_migrates_owned_intel_homebrew_block_on_apple_silicon) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user content\n"
+                            "export KEEP_ME=1\n"
+                            "export PATH=\"/usr/local/bin:$PATH\"\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/usr/local/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/Users/test/.local/bin", rcfile, false,
+                                                       "darwin", "arm64"),
+              0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "export KEEP_ME=1") != NULL);
+    ASSERT_EQ(test_count_substring(data, "export PATH=\"/usr/local/bin:$PATH\""), 1U);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_migrates_owned_arm_homebrew_block_on_intel_macos) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user content\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/Users/test/.local/bin", rcfile, false,
+                                                       "darwin", "amd64"),
+              0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "# user content") != NULL);
+    ASSERT_EQ(test_count_substring(data, "export PATH=\"/opt/homebrew/bin:$PATH\""), 1U);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_honors_explicit_macos_homebrew_overrides) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char arm_rc[512];
+    snprintf(arm_rc, sizeof(arm_rc), "%s/arm.zshrc", tmpdir);
+    write_test_file(arm_rc, "# arm user content\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/usr/local/bin", arm_rc, false, "darwin",
+                                                       "arm64"),
+              0);
+    const char *data = read_test_file(arm_rc);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "# arm user content") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/opt/homebrew/bin:$PATH\"") == NULL);
+
+    char intel_rc[512];
+    snprintf(intel_rc, sizeof(intel_rc), "%s/intel.zshrc", tmpdir);
+    write_test_file(intel_rc, "# intel user content\n"
+                              "\n# Added by codebase-memory-mcp install\n"
+                              "export PATH=\"/usr/local/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/opt/homebrew/bin", intel_rc, false,
+                                                       "darwin", "amd64"),
+              0);
+    data = read_test_file(intel_rc);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "# intel user content") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/opt/homebrew/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_does_not_migrate_homebrew_blocks_off_macos) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user content\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/Users/test/.local/bin", rcfile, false,
+                                                       "linux", "arm64"),
+              0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "export PATH=\"/opt/homebrew/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -12309,14 +12429,14 @@ TEST(cli_remove_owned_path_block_preserves_user_content) {
     char rcfile[512];
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
     write_test_file(rcfile, "# user prefix\nexport KEEP_ME=1\n");
-    ASSERT_EQ(cbm_ensure_path("/usr/local/bin", rcfile, false), 0);
-    ASSERT_EQ(cbm_remove_owned_path("/usr/local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_ensure_path("/Users/test/.local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_remove_owned_path("/Users/test/.local/bin", rcfile, false), 0);
 
     const char *data = read_test_file(rcfile);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "export KEEP_ME=1") != NULL);
     ASSERT(strstr(data, "Added by codebase-memory-mcp install") == NULL);
-    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") == NULL);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -12330,13 +12450,13 @@ TEST(cli_remove_owned_path_dry_run_preserves_block) {
     char rcfile[512];
     snprintf(rcfile, sizeof(rcfile), "%s/config.fish", tmpdir);
     write_test_file(rcfile, "# user prefix\n");
-    ASSERT_EQ(cbm_ensure_path("/usr/local/bin", rcfile, false), 0);
-    ASSERT_EQ(cbm_remove_owned_path("/usr/local/bin", rcfile, true), 0);
+    ASSERT_EQ(cbm_ensure_path("/Users/test/.local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_remove_owned_path("/Users/test/.local/bin", rcfile, true), 0);
 
     const char *data = read_test_file(rcfile);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "Added by codebase-memory-mcp install") != NULL);
-    ASSERT(strstr(data, "fish_add_path /usr/local/bin") != NULL);
+    ASSERT(strstr(data, "fish_add_path /Users/test/.local/bin") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -13828,6 +13948,10 @@ SUITE(cli) {
     RUN_TEST(cli_ensure_path_already_present);
     RUN_TEST(cli_ensure_path_dry_run);
     RUN_TEST(cli_ensure_path_fish_syntax_issue319);
+    RUN_TEST(cli_ensure_path_migrates_owned_intel_homebrew_block_on_apple_silicon);
+    RUN_TEST(cli_ensure_path_migrates_owned_arm_homebrew_block_on_intel_macos);
+    RUN_TEST(cli_ensure_path_honors_explicit_macos_homebrew_overrides);
+    RUN_TEST(cli_ensure_path_does_not_migrate_homebrew_blocks_off_macos);
 
     /* File copy (2 tests — update_test.go) */
     RUN_TEST(cli_copy_file);

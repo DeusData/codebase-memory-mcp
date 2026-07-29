@@ -27,10 +27,16 @@
 #include "pagerank/pagerank.h"
 #include "pipeline/pipeline.h"
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 static bool cli_args_have_help(int argc, char **argv);
 static void print_install_help(void);
 static void print_uninstall_help(void);
 static void print_update_help(void);
+static const char *detect_os(void);
+static const char *detect_arch(void);
 
 /* CLI buffer size constants. */
 enum {
@@ -5860,8 +5866,50 @@ static int cbm_remove_augment_coverage_hook(const char *settings_path, const cha
 
 /* ── PATH management ──────────────────────────────────────────── */
 
-int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
-    if (!bin_dir || !rc_file) {
+static bool cli_path_is_directory(const char *path, const char *directory) {
+    if (!path || !directory) {
+        return false;
+    }
+    size_t path_len = strlen(path);
+    while (path_len > 1U && path[path_len - 1U] == '/') {
+        path_len--;
+    }
+    size_t directory_len = strlen(directory);
+    return path_len == directory_len && strncmp(path, directory, directory_len) == 0;
+}
+
+static const char *cli_stale_owned_homebrew_path(const char *bin_dir, const char *os,
+                                                 const char *arch) {
+    if (strcmp(os, "darwin") != 0) {
+        return NULL;
+    }
+    if (cli_path_is_directory(bin_dir, "/usr/local/bin")) {
+        return "/opt/homebrew/bin";
+    }
+    if (cli_path_is_directory(bin_dir, "/opt/homebrew/bin")) {
+        return "/usr/local/bin";
+    }
+    if (strcmp(arch, "arm64") == 0) {
+        return "/usr/local/bin";
+    }
+    if (strcmp(arch, "amd64") == 0 || strcmp(arch, "x86_64") == 0) {
+        return "/opt/homebrew/bin";
+    }
+    return NULL;
+}
+
+static int cli_remove_opposite_owned_path(const char *bin_dir, const char *rc_file, bool dry_run,
+                                          const char *os, const char *arch) {
+    const char *stale_path = cli_stale_owned_homebrew_path(bin_dir, os, arch);
+    if (!stale_path) {
+        return CLI_OK;
+    }
+    return cbm_remove_owned_path(stale_path, rc_file, dry_run);
+}
+
+static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file, bool dry_run,
+                                        const char *os, const char *arch) {
+    if (!bin_dir || !rc_file || !os || !arch) {
         return CLI_ERR;
     }
 
@@ -5886,7 +5934,9 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
         while (fgets(buf, sizeof(buf), f)) {
             if (strstr(buf, line)) {
                 (void)fclose(f);
-                return CLI_TRUE; /* already present */
+                int cleanup_rc =
+                    cli_remove_opposite_owned_path(bin_dir, rc_file, dry_run, os, arch);
+                return cleanup_rc == CLI_OK ? CLI_TRUE : CLI_ERR; /* already present */
             }
         }
         (void)fclose(f);
@@ -5902,8 +5952,22 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
     }
 
     (void)fprintf(f, "\n# Added by codebase-memory-mcp install\n%s\n", line);
-    (void)fclose(f);
-    return 0;
+    if (fclose(f) != 0) {
+        return CLI_ERR;
+    }
+
+    /* A legacy automatic install may have added the opposite Homebrew prefix.
+     * Remove only our exact managed block after the replacement line is
+     * durable, but never remove bin_dir itself: an explicit --dir remains
+     * authoritative even when it names the other architecture's prefix. */
+    if (cli_remove_opposite_owned_path(bin_dir, rc_file, dry_run, os, arch) != CLI_OK) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
+    return cbm_ensure_path_for_platform(bin_dir, rc_file, dry_run, detect_os(), detect_arch());
 }
 
 int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run) {
@@ -5950,6 +6014,13 @@ int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run
     free(content);
     return rc;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
+                                             const char *os, const char *arch) {
+    return cbm_ensure_path_for_platform(bin_dir, rc_file, dry_run, os, arch);
+}
+#endif
 
 #ifdef _WIN32
 static wchar_t *cli_windows_utf8_to_wide(const char *value) {
@@ -7488,6 +7559,14 @@ static const char *detect_os(void) {
 }
 
 static const char *detect_arch(void) {
+#ifdef __APPLE__
+    int arm64_capable = 0;
+    size_t arm64_capable_size = sizeof(arm64_capable);
+    if (sysctlbyname("hw.optional.arm64", &arm64_capable, &arm64_capable_size, NULL, 0) == 0 &&
+        arm64_capable == 1) {
+        return "arm64";
+    }
+#endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     return "arm64";
 #else

@@ -239,6 +239,8 @@ int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
 int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
                                                    const char *previous_binary_path,
                                                    const char *config_path);
+int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
+                                             const char *os, const char *arch);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
@@ -340,8 +342,10 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path);
 
 /* ── PATH management ──────────────────────────────────────────── */
 
-/* Append an export PATH line to the given rc file.
- * Checks if already present. Returns 0 on success, 1 if already present. */
+/* Append the requested shell PATH entry. On macOS, remove only obsolete
+ * Homebrew entries previously marked as owned by this installer; explicit
+ * install directories and user-authored entries remain authoritative.
+ * Returns 0 on success, 1 if the requested entry was already present. */
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
 int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run);
 
