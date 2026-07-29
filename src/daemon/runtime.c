@@ -870,6 +870,7 @@ static bool runtime_process_image_reference_fingerprint_cached(
 #elif defined(__APPLE__) || defined(__linux__)
     uintptr_t native_file = (uintptr_t)reference->fd;
 #else
+    // cppcheck-suppress unreadVariable
     uintptr_t native_file = 0;
     (void)cache_path;
     (void)allow_cache;
@@ -2202,7 +2203,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     const cbm_daemon_runtime_service_config_t *config,
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io) {
     uint8_t validation[CBM_DAEMON_RENDEZVOUS_REQUEST_SIZE];
-    char active_process_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char active_process_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     bool active_image_fingerprint_cache_hit = false;
     runtime_process_image_reference_t active_image;
     runtime_process_image_reference_init(&active_image);
@@ -2223,8 +2224,8 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     /* WHY: cppcheck evaluates the unsupported-platform fail-closed branch
      * because its invocation defines no host OS macro. Production compilers
      * select one of the Windows/macOS/Linux native-image implementations. */
-    // cppcheck-suppress knownConditionTrueFalse
     uint64_t active_process_id = runtime_current_process_id();
+    // cppcheck-suppress knownConditionTrueFalse
     if (!runtime_process_image_reference_acquire(active_process_id, &active_image, NULL) ||
         !runtime_process_image_reference_fingerprint_cached(
             &active_image, active_process_id, config->build_fingerprint_cache_path,
