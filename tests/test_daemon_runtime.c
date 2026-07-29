@@ -4604,6 +4604,10 @@ TEST(daemon_runtime_service_reuses_cached_active_image_fingerprint) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_test_fixture_t fixture;
+    /* The executable and secure runtime parent may be different native
+     * volumes (for example /src and /tmp in the Linux container gate).
+     * Cache authority follows the bound image identity and epoch, not storage
+     * co-location. */
     bool started = runtime_test_fixture_start_configured(&fixture, "active-image-cache", &identity,
                                                          8, 5000, NULL, true);
     bool cache_hit =

@@ -167,11 +167,13 @@ shard_filter() {
 # index_supervisor); the saturated 3-core macOS CI runners starve those
 # deadlines into deterministic failures while an idle machine passes 6/6.
 # They also all rendezvous through the shared per-account runtime namespace,
-# which the quiet tail keeps free of cross-suite admission traffic.
+# which the quiet tail keeps free of cross-suite admission traffic. The three
+# LSP benchmark suites enforce absolute wall-clock ceilings, so their measured
+# work must likewise run without cross-suite CPU or allocator contention.
 SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
     stack_overflow_a stack_overflow_b stack_overflow_c \
     index_supervisor daemon_application daemon_runtime daemon_frontend \
-    daemon_bootstrap daemon_ipc"
+    daemon_bootstrap daemon_ipc cs_lsp_bench py_lsp_bench py_lsp_scale"
 is_serial() {
     case " $SERIAL_SUITES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
@@ -244,9 +246,12 @@ run_wave "$PAR_FILE" "$JOBS"
 # idle cores into wall time — the old fully-serial tail ran them one at a
 # time on an idle machine. The EXCL group (daemon-family plus the suites
 # that drive daemon one-shots or supervisor rendezvous) then runs strictly
-# sequentially on a machine exactly as quiet as the old tail gave it.
+# sequentially on a machine exactly as quiet as the old tail gave it. Absolute
+# wall-clock LSP benchmarks share that lane so their existing ceilings measure
+# the implementation rather than unrelated suite load.
 TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
-    daemon_frontend daemon_bootstrap daemon_ipc"
+    daemon_frontend daemon_bootstrap daemon_ipc \
+    cs_lsp_bench py_lsp_bench py_lsp_scale"
 is_tail_excl() {
     case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
