@@ -344,8 +344,10 @@ if [ "$CALLERS" -lt 1 ]; then
 fi
 echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
-# 3c: get_graph_schema — verify labels exist
-if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT"); then
+# 3c: get_graph_schema — verify labels exist. Request JSON explicitly because
+# this programmatic consumer parses an object, while the user-facing default is
+# configurable and currently emits compact TOON.
+if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT" --format json); then
   echo "FAIL: get_graph_schema (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
@@ -416,9 +418,11 @@ echo "OK: query_graph count(DISTINCT f.label) returned 1 aggregate row"
 cyp_first_cell() {
   # $1 = query; echoes rows[0][0] (or empty). Flag form passes the query as ONE
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
-  # metacharacters {}|=~<>" need no JSON escaping.
+  # metacharacters {}|=~<>" need no JSON escaping. TOON table headers carry
+  # their row count and columns as rows[N]{...}:; read the first data row.
   cli query_graph --project "$PROJECT" --query "$1" |
-    sed -n '/^rows: /{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
+    sed -n '/^rows\[[0-9][0-9]*\].*:/{n;p;}' |
+    sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -506,7 +510,7 @@ LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
 
 # NOT EXISTS dead-code query (functions with no caller)
 CYPHER_NX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name")
-NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows: [0-9]+' && echo "True" || echo "False")
+NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows\[[0-9]+\]' && echo "True" || echo "False")
 [ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
 
 # CASE expression in RETURN
@@ -530,7 +534,7 @@ if ! ARCH=$(cli get_architecture --project "$PROJECT" --aspects clusters); then
   echo "FAIL: get_architecture (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 # get_architecture default output is TOON: clusters[N]{...} header carries the count
-NCLUST=$(echo "$ARCH" | sed -n 's/^clusters: \([0-9]*\).*/\1/p' | head -1)
+NCLUST=$(echo "$ARCH" | sed -n 's/^clusters\[\([0-9]*\)\].*/\1/p' | head -1)
 NCLUST=${NCLUST:-0}
 if [ "$NCLUST" -lt 1 ]; then
   echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
@@ -571,7 +575,7 @@ echo "=== Phase 3h: CLI input-mode guards (flags / stdin / --args-file / --help 
 assert_json_obj() { python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d,dict) else 1)" 2>/dev/null; }
 # search_graph emits TOON by default: a results/semantic table header proves
 # the tool parsed its typed flags and produced a well-formed response.
-assert_toon_table() { grep -qE '^(results|semantic): [0-9]+'; }
+assert_toon_table() { grep -qE '^(results|semantic)\[[0-9]+\]'; }
 
 # B1: INTEGER flag — --limit is schema-typed integer; must parse and answer.
 if ! IM_INT=$(cli search_graph --project "$PROJECT" --name-pattern compute --limit 5); then
@@ -598,7 +602,7 @@ fi
 if ! IM_ARR=$(cli search_graph --project "$PROJECT" --semantic-query send --semantic-query publish); then
   echo "FAIL B3: search_graph repeated --semantic-query exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_ARR" | grep -qE '^semantic: [0-9]+'; then
+if echo "$IM_ARR" | grep -qE '^semantic\[[0-9]+\]'; then
   echo "OK B3: ARRAY flag (repeated --semantic-query) → semantic TOON table"
 else
   echo "FAIL B3: repeated --semantic-query did not produce a semantic table"; echo "$IM_ARR" | head -c 300
@@ -609,7 +613,8 @@ else
 fi
 
 # B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
-IM_STDIN=$(echo "{\"project\":\"$PROJECT\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
+# Pin the response format independently of the user's configured default.
+IM_STDIN=$(echo "{\"project\":\"$PROJECT\",\"format\":\"json\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
 if ! echo "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
   echo "FAIL B4: stdin get_graph_schema did not resolve"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
 fi
@@ -620,7 +625,7 @@ echo "OK B4: STDIN input resolves, no deprecation warning"
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
 IM_ARGS_FILE=$(smoke_mktemp_file)
-echo "{\"project\":\"$PROJECT\"}" > "$IM_ARGS_FILE"
+echo "{\"project\":\"$PROJECT\",\"format\":\"json\"}" > "$IM_ARGS_FILE"
 if ! IM_AF=$(cli get_graph_schema --args-file "$IM_ARGS_FILE"); then
   echo "FAIL B5: get_graph_schema --args-file exited non-zero"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
 fi
@@ -3451,10 +3456,22 @@ fi
 # standard binary under a ui name would otherwise pass green, and a skip that
 # cannot fail is not a gate.
 SMOKE_REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
+UI_INPUT=""
+UI_PID=""
+smoke_ui_stop() {
+  # Close the held-open writer before reaping the server. Explicit ownership of
+  # both ends leaves no timer child delaying the next phase after the server exits.
+  exec 7>&- 2>/dev/null || true
+  if [ -n "$UI_PID" ]; then
+    kill "$UI_PID" 2>/dev/null || true
+    wait "$UI_PID" 2>/dev/null || true
+  fi
+  [ -z "$UI_INPUT" ] || rm -f "$UI_INPUT"
+}
 smoke_ui_missing() {
   if [ "$SMOKE_REQUIRE_UI" = "1" ]; then
     echo "FAIL $1: SMOKE_REQUIRE_UI=1 but this binary serves no embedded UI assets"
-    kill "$UI_PID" 2>/dev/null || true
+    smoke_ui_stop
     exit 1
   fi
   echo "SKIP $1: $2"
@@ -3475,8 +3492,17 @@ UI_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0
 # the UI does not pin the process, so stdio EOF ends it cleanly (rc=0) before
 # the poll can see it serve — the drive-listing guard holds a pipe for the
 # same reason. Equals-form flags match that guard's proven invocation.
-sleep 300 | "$BINARY" --ui=true --port="$UI_PORT" > /dev/null 2>&1 &
+UI_INPUT=$(smoke_mktemp_file)
+rm -f "$UI_INPUT"
+if ! mkfifo "$UI_INPUT"; then
+  echo "FAIL Phase 15: could not create held-open UI stdin"
+  exit 1
+fi
+"$BINARY" --ui=true --port="$UI_PORT" < "$UI_INPUT" > /dev/null 2>&1 &
 UI_PID=$!
+# Opening the writer unblocks the server's stdin redirect and keeps stdin live.
+# Fixed fd 7 works in macOS Bash 3.2, Linux Bash, and MSYS2 Bash.
+exec 7>"$UI_INPUT"
 # Readiness poll instead of a fixed sleep: SKIP is legitimate ONLY when the
 # process exited (the documented no-embedded-assets case); a slow start on a
 # loaded runner must not masquerade as it. The UI binds ~6s after launch even
@@ -3498,7 +3524,7 @@ if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
     smoke_ui_missing "15a" "UI not reachable (binary may not have embedded assets)"
   else
     echo "FAIL 15a: UI root did not return HTML"
-    kill "$UI_PID" 2>/dev/null || true
+    smoke_ui_stop
     exit 1
   fi
 
@@ -3514,15 +3540,13 @@ if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
     smoke_ui_missing "15b" "/api/ui-config not reachable"
   else
     echo "FAIL 15b: /api/ui-config did not return JSON"
-    kill "$UI_PID" 2>/dev/null || true
+    smoke_ui_stop
     exit 1
   fi
-
-  kill "$UI_PID" 2>/dev/null || true
-  wait "$UI_PID" 2>/dev/null || true
 else
   smoke_ui_missing "Phase 15" "binary exited immediately (no UI assets embedded)"
 fi
+smoke_ui_stop
 
 echo ""
 echo "=== Phase 16: stdio server leaves no orphan after shutdown ==="
