@@ -17,27 +17,26 @@
  *
  * Depends on: pass_definitions, pass_calls (for cross-file prefix resolution)
  */
-// NOLINTNEXTLINE(misc-include-cleaner) — pipeline.h included for interface contract
-#include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/httplink.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
-// NOLINTNEXTLINE(misc-include-cleaner) — platform.h included for worker count
-#include "foundation/platform.h"
-#include "foundation/log.h"
-#include "foundation/profile.h"
+#include "foundation/constants.h"
 #include "foundation/compat.h"
 #include "foundation/compat_regex.h"
+#include "foundation/log.h"
+#include "foundation/platform.h"
+#include "foundation/profile.h"
 
 #include "yyjson/yyjson.h"
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
 #define DOTTED_FRAG_BUF 260      /* buffer for slash-to-dot path conversion */
@@ -150,7 +149,6 @@ static char **extract_decorators(const char *json, int *out_count) {
         return NULL;
     }
 
-    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
     char **out = calloc(cnt + 1, sizeof(char *));
     int idx = 0;
     yyjson_val *item;
@@ -168,7 +166,6 @@ static char **extract_decorators(const char *json, int *out_count) {
     if (idx > 0) {
         return out;
     }
-    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
     free(out);
     return NULL;
 }
@@ -189,7 +186,6 @@ static bool is_test_from_json(const char *json) {
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *v = yyjson_obj_get(root, "is_test");
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     bool result = v && yyjson_is_bool(v) && yyjson_get_bool(v);
     yyjson_doc_free(doc);
     return result;
@@ -240,7 +236,6 @@ static void free_decorators(char **decs) {
     for (int i = 0; decs[i]; i++) {
         free(decs[i]);
     }
-    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
     free(decs);
 }
 
@@ -259,7 +254,6 @@ static bool has_suffix(const char *s, const char *suffix) {
 }
 
 static bool is_jsts_file(const char *path) {
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     return has_suffix(path, ".js") || has_suffix(path, ".ts") || has_suffix(path, ".mjs") ||
            has_suffix(path, ".mts") || has_suffix(path, ".tsx");
 }
@@ -271,7 +265,6 @@ static bool has_source_route_extractor(const char *path) {
      * PHP Route:: registrations are handled by call extraction, which retains
      * enclosing prefix()->group() AST context (#952); rescanning them here with
      * the context-free Laravel regex would mint prefix-dropped duplicates. */
-    // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     return has_suffix(path, ".go") || is_jsts_file(path) || has_suffix(path, ".kt") ||
            has_suffix(path, ".kts");
 }
@@ -639,7 +632,6 @@ static void resolve_express_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
 
 /* Resolve Go gin cross-file Group() prefixes.
  * Pattern: v1 := r.Group("/api"); RegisterRoutes(v1) */
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes,
                                               int route_count) {
     /* Build routesByFunc index: funcQN → (start_index, count) in routes array */
@@ -908,7 +900,6 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
         char h_props_json[2048] = "{}";
         int h_start = 0;
         int h_end = 0;
-        // NOLINTNEXTLINE(misc-include-cleaner) — int64_t provided by standard header
         int64_t h_id = 0;
         if (handler_node) {
             if (handler_node->file_path) {
@@ -1088,7 +1079,6 @@ static int match_and_link(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes, 
             }
 
             /* Create edge */
-            // NOLINTNEXTLINE(readability-implicit-bool-conversion)
             const char *edge_type = cs->is_async ? "ASYNC_CALLS" : "HTTP_CALLS";
             const char *band = cbm_confidence_band(score);
 
@@ -1350,7 +1340,6 @@ static void hl_site_worker(int worker_id, void *arg) {
             continue;
         }
 
-        // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         bool is_async = has_async && !has_http;
 
         char **paths = NULL;
@@ -1545,7 +1534,6 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
 
     if (total_site_nodes > 0) {
         all_site_nodes = malloc((size_t)total_site_nodes * sizeof(cbm_gbuf_node_t *));
-        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
         all_site_labels = malloc((size_t)total_site_nodes * sizeof(const char *));
         site_collection_failed = !all_site_nodes || !all_site_labels;
     }
@@ -1599,9 +1587,7 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
         }
         free(site_bufs);
     }
-    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
     free(all_site_nodes);
-    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
     free(all_site_labels);
     CBM_PROF_END_N("httplinks", "5_callsite_scan_parallel", t_sites, total_site_nodes);
     if (site_collection_failed) {

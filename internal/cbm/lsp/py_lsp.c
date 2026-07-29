@@ -11,6 +11,7 @@
  *                                          resolved_calls entries
  */
 #include "py_lsp.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "../cbm.h"
 #include "../helpers.h"
@@ -2070,12 +2071,13 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
                     if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
-                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
-                                                                                strlen(mod) + 1);
+                        size_t mod_len = strlen(mod);
+                        char *qual_mod = (char *)cbm_arena_alloc(
+                            ctx->arena, root_len + SKIP_ONE + mod_len + SKIP_ONE);
                         if (qual_mod) {
                             memcpy(qual_mod, ctx->module_qn, root_len);
                             qual_mod[root_len] = '.';
-                            strcpy(qual_mod + root_len + 1, mod);
+                            memcpy(qual_mod + root_len + SKIP_ONE, mod, mod_len + SKIP_ONE);
                             const CBMRegisteredFunc *qf =
                                 cbm_registry_lookup_symbol(ctx->registry, qual_mod, attr_name);
                             if (qf) {

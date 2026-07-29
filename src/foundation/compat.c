@@ -187,11 +187,15 @@ char *cbm_mkdtemp(char *tmpl) {
     }
     char *expanded = cbm_wide_to_utf8(wide_template);
     free(wide_template);
-    if (!expanded || strlen(expanded) >= sizeof(buf)) {
+    if (!expanded) {
+        return NULL;
+    }
+    size_t expanded_len = strlen(expanded);
+    if (expanded_len >= sizeof(buf)) {
         free(expanded);
         return NULL;
     }
-    strcpy(buf, expanded);
+    memcpy(buf, expanded, expanded_len + SKIP_ONE);
     free(expanded);
     if (!win_mkdtemp_private_create(buf)) {
         /* One-time note: every private-namespace validation downstream
@@ -305,7 +309,8 @@ int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz) {
         if (!expanded) {
             break;
         }
-        if (strlen(expanded) >= tmpl_sz) {
+        size_t expanded_len = strlen(expanded);
+        if (expanded_len >= tmpl_sz) {
             free(expanded);
             errno = ENAMETOOLONG;
             break;
@@ -318,7 +323,7 @@ int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz) {
         int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
         free(wide_open);
         if (fd >= 0) {
-            strcpy(tmpl, expanded);
+            memcpy(tmpl, expanded, expanded_len + SKIP_ONE);
             free(expanded);
             free(pattern);
             return fd;
