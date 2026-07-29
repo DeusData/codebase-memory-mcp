@@ -70,8 +70,7 @@ bool cbm_platform_parse_proc_stat_group(const char *stat_line, int64_t *process_
     char state = '\0';
     long long parent = 0;
     long long group = 0;
-    if (!command_end ||
-        sscanf(command_end + 1, " %c %lld %lld", &state, &parent, &group) != 3 ||
+    if (!command_end || sscanf(command_end + 1, " %c %lld %lld", &state, &parent, &group) != 3 ||
         state == '\0' || group <= 0) {
         return false;
     }
@@ -269,8 +268,8 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
         return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
     }
     size_t received = capacity;
-    if (sysctl(mib, 4, entries, &received, NULL, 0) != 0 ||
-        received > capacity || received % sizeof(*entries) != 0) {
+    if (sysctl(mib, 4, entries, &received, NULL, 0) != 0 || received > capacity ||
+        received % sizeof(*entries) != 0) {
         free(entries);
         return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
     }
@@ -288,8 +287,7 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
         }
     }
     free(entries);
-    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED
-                      : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
 #elif defined(__linux__)
     cbm_dir_t *directory = cbm_opendir("/proc");
     if (!directory) {
@@ -335,8 +333,7 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
         }
         int64_t process_group = 0;
         bool execution_quiescent = false;
-        if (!cbm_platform_parse_proc_stat_group(stat_line, &process_group,
-                                                &execution_quiescent)) {
+        if (!cbm_platform_parse_proc_stat_group(stat_line, &process_group, &execution_quiescent)) {
             snapshot_unknown = true;
             continue;
         }
@@ -353,8 +350,7 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
     if (snapshot_unknown) {
         return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
     }
-    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED
-                      : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
 #else
     return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
 #endif
@@ -524,7 +520,7 @@ typedef enum {
 } cbm_platform_env_status_t;
 
 static cbm_platform_env_status_t cbm_platform_read_environment_value(const char *name, char *buf,
-                                                                    size_t buf_sz) {
+                                                                     size_t buf_sz) {
     if (!name || !name[0] || !buf || buf_sz == 0) {
         return CBM_PLATFORM_ENV_ERROR;
     }

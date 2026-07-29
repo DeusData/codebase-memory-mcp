@@ -26,8 +26,7 @@ int64_t cbm_stat_mtime_ns(const struct stat *st) {
 #elif defined(_WIN32)
     return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
 #else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtim.tv_nsec;
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
 #endif
 }
 

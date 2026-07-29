@@ -2544,8 +2544,7 @@ static int cbm_build_claude_hook_command(const char *script_name, const char *co
 static int cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    bool env_fits =
-        cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
     if (env_present && !env_fits) {
         return CLI_ERR;
     }
@@ -2562,8 +2561,7 @@ int cbm_resolve_claude_hook_command_for_testing(const char *script_name, bool wi
                                                 char *command, size_t command_size) {
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    bool env_fits =
-        cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
     if (env_present && !env_fits) {
         return CLI_ERR;
     }
@@ -2580,8 +2578,7 @@ static int cbm_resolve_previous_hook_command(const char *script_name, char *out,
     }
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    bool env_fits =
-        cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
     if (env_present && !env_fits) {
         return CLI_ERR;
     }
@@ -2606,8 +2603,7 @@ static int cbm_resolve_released_hook_command(const char *script_name, char *out,
     }
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    bool env_fits =
-        cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
     if (env_present && !env_fits) {
         return CLI_ERR;
     }
@@ -3392,12 +3388,11 @@ static int cbm_build_augment_command(const char *binary_path, char *out, size_t 
 }
 
 static bool cbm_hook_dialect_supported(const char *dialect) {
-    return dialect &&
-           (strcmp(dialect, "hermes") == 0 || strcmp(dialect, "qoder") == 0 ||
-            strcmp(dialect, "kimi") == 0 || strcmp(dialect, "devin") == 0 ||
-            strcmp(dialect, "cline") == 0 || strcmp(dialect, "gemini") == 0 ||
-            strcmp(dialect, "qwen") == 0 || strcmp(dialect, "factory") == 0 ||
-            strcmp(dialect, "augment") == 0);
+    return dialect && (strcmp(dialect, "hermes") == 0 || strcmp(dialect, "qoder") == 0 ||
+                       strcmp(dialect, "kimi") == 0 || strcmp(dialect, "devin") == 0 ||
+                       strcmp(dialect, "cline") == 0 || strcmp(dialect, "gemini") == 0 ||
+                       strcmp(dialect, "qwen") == 0 || strcmp(dialect, "factory") == 0 ||
+                       strcmp(dialect, "augment") == 0);
 }
 
 static int cbm_build_augment_dialect_command(const char *binary_path, const char *dialect,
@@ -5516,14 +5511,14 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path) {
 /* Matcher excludes read_file for consistency with the Claude fix: the hook
  * is an advisory reminder, not a gate over the agent's file reads. */
 #define GEMINI_HOOK_MATCHER "google_web_search|grep_search"
-#define GEMINI_HOOK_COMMAND                                                            \
-    "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"              \
-    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer the "          \
+#define GEMINI_HOOK_COMMAND                                                     \
+    "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"       \
+    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer the " \
     "codebase-memory-mcp graph tools over grep or file search.'}}))\""
 #define GEMINI_PREVIOUS_HOOK_COMMAND                                                   \
     "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"              \
-    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer "             \
-    "codebase-memory-mcp search_graph, trace_path, and get_code_snippet over grep or "  \
+    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer "            \
+    "codebase-memory-mcp search_graph, trace_path, and get_code_snippet over grep or " \
     "file search.'}}))\""
 static const char *const cmm_gemini_released_hook_commands[] = {
     GEMINI_PREVIOUS_HOOK_COMMAND,
@@ -5984,8 +5979,8 @@ int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run
     int line_len = is_fish ? snprintf(line, sizeof(line), "fish_add_path %s", bin_dir)
                            : snprintf(line, sizeof(line), "export PATH=\"%s:$PATH\"", bin_dir);
     char block[CLI_BUF_2K];
-    int block_len = snprintf(block, sizeof(block), "\n# Added by codebase-memory-mcp install\n%s\n",
-                             line);
+    int block_len =
+        snprintf(block, sizeof(block), "\n# Added by codebase-memory-mcp install\n%s\n", line);
     if (line_len <= 0 || (size_t)line_len >= sizeof(line) || block_len <= 0 ||
         (size_t)block_len >= sizeof(block)) {
         return CLI_ERR;
@@ -6891,8 +6886,8 @@ static bool cbm_config_parse_decimal_int(const char *value, int *out) {
     char *endptr;
     errno = 0;
     long parsed = strtol(value, &endptr, CLI_STRTOL_BASE);
-    if (errno == ERANGE || endptr == value || *endptr != '\0' ||
-        parsed < INT_MIN || parsed > INT_MAX) {
+    if (errno == ERANGE || endptr == value || *endptr != '\0' || parsed < INT_MIN ||
+        parsed > INT_MAX) {
         return false;
     }
     *out = (int)parsed;
@@ -7073,8 +7068,7 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "true",
                "Enable auto-indexing on MCP session start");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               CBM_DEFAULT_AUTO_INDEX_LIMIT_STR,
-               "Max files for auto-indexing new projects");
+               CBM_DEFAULT_AUTO_INDEX_LIMIT_STR, "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
                "Register background git watcher on session connect");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
@@ -7115,8 +7109,7 @@ int cbm_cmd_config(int argc, char **argv) {
         } else if (argc == MIN_ARGC_CMD && strcmp(argv[CLI_SKIP_ONE], "apply") == 0) {
             rc = cbm_config_apply_preset_cli(cfg, argv[CLI_PAIR_LEN]);
         } else {
-            (void)fprintf(stderr,
-                          "Usage: config preset list | config preset apply <name>\n");
+            (void)fprintf(stderr, "Usage: config preset list | config preset apply <name>\n");
             rc = CLI_TRUE;
         }
     } else if (strcmp(argv[0], "get") == 0) {
@@ -8921,8 +8914,8 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
     if (agents->claude_desktop) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp),
-                 "%s/Library/Application Support/Claude/claude_desktop_config.json", home);
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Claude/claude_desktop_config.json",
+                 home);
 #elif defined(_WIN32)
         snprintf(cp, sizeof(cp), "%s/AppData/Roaming/Claude/claude_desktop_config.json", home);
 #else
@@ -9685,9 +9678,12 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
             char *last = strrchr(directory, '/');
             if (last) {
                 *last = '\0';
-                last = strrchr(directory, '/');
-                if (last) {
-                    *last = '\0';
+                char *parent = last;
+                while (parent > directory && parent[-SKIP_ONE] != '/') {
+                    parent--;
+                }
+                if (parent > directory) {
+                    parent[-SKIP_ONE] = '\0';
                 }
             }
             yyjson_mut_arr_add_strcpy(doc, skill_dirs, directory);
@@ -10827,8 +10823,8 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
     if (agents->claude_desktop) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp),
-                 "%s/Library/Application Support/Claude/claude_desktop_config.json", home);
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Claude/claude_desktop_config.json",
+                 home);
 #elif defined(_WIN32)
         snprintf(cp, sizeof(cp), "%s/AppData/Roaming/Claude/claude_desktop_config.json", home);
 #else
@@ -12478,18 +12474,17 @@ typedef struct {
 
 #define PRESET_VALUE(key_, value_) {key_, value_}
 #define PRESET_COUNT(values_) (sizeof(values_) / sizeof((values_)[0]))
-#define PRESET_QUALITY_VALUES(auto_index_deps_, rank_, similarity_, semantic_, git_, http_)       \
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, rank_),                                                \
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, auto_index_deps_),                                  \
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, similarity_),                                    \
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, semantic_),                                  \
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, git_),                                           \
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, http_)
+#define PRESET_QUALITY_VALUES(auto_index_deps_, rank_, similarity_, semantic_, git_, http_) \
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, rank_),                                           \
+        PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, auto_index_deps_),                         \
+        PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, similarity_),                           \
+        PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, semantic_),                         \
+        PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, git_),                                  \
+        PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, http_)
 
 static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_DISABLED[] = {
     PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED),
-    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true",
-                          "true", "true"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true", "true", "true"),
 };
 
 static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_ENABLED[] = {
@@ -12499,8 +12494,7 @@ static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_ENABLED[] = {
 
 static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_DISABLED[] = {
     PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC),
-    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true",
-                          "true", "true"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true", "true", "true"),
 };
 
 static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_ENABLED[] = {
@@ -12509,8 +12503,7 @@ static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_ENABLED[] = {
 };
 
 static const cbm_config_preset_value_t PRESET_RANK_DISABLED[] = {
-    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "true", "true", "true",
-                          "true"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "true", "true", "true", "true"),
 };
 
 static const cbm_config_preset_value_t PRESET_MINIMAL_INDEXING[] = {
@@ -12554,7 +12547,8 @@ static const cbm_config_preset_t *cbm_config_find_preset(const char *name) {
 
 int cbm_config_apply_preset(cbm_config_t *cfg, const char *name) {
     const cbm_config_preset_t *preset = cbm_config_find_preset(name);
-    if (!cfg || !preset || sqlite3_exec(cfg->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+    if (!cfg || !preset ||
+        sqlite3_exec(cfg->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
         return CLI_ERR;
     }
     for (size_t i = 0; i < preset->value_count; i++) {
@@ -12609,7 +12603,8 @@ static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name) {
 
     if (overridden) {
         (void)fprintf(stderr,
-                      "preset %s was stored but is not fully effective; remove the listed override and retry\n",
+                      "preset %s was stored but is not fully effective; remove the listed override "
+                      "and retry\n",
                       name);
         return CLI_TRUE;
     }
@@ -13099,8 +13094,8 @@ const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const c
     /* Check env var override first */
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0 && CBM_CONFIG_REGISTRY[i].env_var) {
-            const char *env = cbm_safe_getenv(CBM_CONFIG_REGISTRY[i].env_var, env_value,
-                                              sizeof(env_value), NULL);
+            const char *env =
+                cbm_safe_getenv(CBM_CONFIG_REGISTRY[i].env_var, env_value, sizeof(env_value), NULL);
             if (env && env[0])
                 return env;
             break;

@@ -73,7 +73,8 @@ static void compile_patterns(void) {
 /* Free all compiled regex patterns. Safe to call even if never compiled.
  * Call this in test teardown or at process exit to suppress leak reports. */
 void cbm_envscan_free_patterns(void) {
-    if (!patterns_compiled) return;
+    if (!patterns_compiled)
+        return;
     cbm_regfree(&dockerfile_re);
     cbm_regfree(&yaml_kv_re);
     cbm_regfree(&yaml_setenv_re);

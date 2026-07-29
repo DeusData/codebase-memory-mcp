@@ -170,33 +170,33 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Detected coding agents on the system. */
 typedef struct {
-    bool claude_code;   /* ~/.claude/ exists */
+    bool claude_code;    /* ~/.claude/ exists */
     bool claude_desktop; /* platform Claude Desktop config dir exists */
-    bool codex;         /* $CODEX_HOME or ~/.codex exists */
-    bool gemini;        /* Gemini settings or executable exists */
-    bool zed;           /* platform-specific Zed config dir exists */
-    bool opencode;      /* opencode on PATH or config exists */
-    bool antigravity;   /* Antigravity CLI config or executable exists */
-    bool aider;         /* aider on PATH */
-    bool kilo_cli;      /* standalone Kilo ~/.config/kilo exists */
-    bool kilocode;      /* KiloCode globalStorage dir exists */
-    bool vscode;        /* VS Code User config dir exists */
-    bool cursor;        /* ~/.cursor/ exists */
-    bool windsurf;      /* ~/.codeium/windsurf/ exists */
-    bool augment;       /* ~/.augment/ or Auggie CLI exists */
-    bool openclaw;      /* ~/.openclaw/ exists */
-    bool kiro;          /* ~/.kiro/ exists */
-    bool junie;         /* ~/.junie/ exists */
-    bool hermes;        /* ~/.hermes/ or hermes CLI exists */
-    bool openhands;     /* ~/.openhands/ or openhands CLI exists */
-    bool cline;         /* ~/.cline/ or cline CLI exists */
-    bool warp;          /* Warp footprint or oz/oz-preview/warp-cli exists */
-    bool qwen;          /* ~/.qwen/ or qwen CLI exists */
-    bool copilot_cli;   /* $COPILOT_HOME, ~/.copilot/, or copilot CLI exists */
-    bool factory_droid; /* ~/.factory/ or droid CLI exists */
-    bool crush;         /* Crush config or CLI exists */
-    bool goose;         /* Goose config or CLI exists */
-    bool mistral_vibe;  /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
+    bool codex;          /* $CODEX_HOME or ~/.codex exists */
+    bool gemini;         /* Gemini settings or executable exists */
+    bool zed;            /* platform-specific Zed config dir exists */
+    bool opencode;       /* opencode on PATH or config exists */
+    bool antigravity;    /* Antigravity CLI config or executable exists */
+    bool aider;          /* aider on PATH */
+    bool kilo_cli;       /* standalone Kilo ~/.config/kilo exists */
+    bool kilocode;       /* KiloCode globalStorage dir exists */
+    bool vscode;         /* VS Code User config dir exists */
+    bool cursor;         /* ~/.cursor/ exists */
+    bool windsurf;       /* ~/.codeium/windsurf/ exists */
+    bool augment;        /* ~/.augment/ or Auggie CLI exists */
+    bool openclaw;       /* ~/.openclaw/ exists */
+    bool kiro;           /* ~/.kiro/ exists */
+    bool junie;          /* ~/.junie/ exists */
+    bool hermes;         /* ~/.hermes/ or hermes CLI exists */
+    bool openhands;      /* ~/.openhands/ or openhands CLI exists */
+    bool cline;          /* ~/.cline/ or cline CLI exists */
+    bool warp;           /* Warp footprint or oz/oz-preview/warp-cli exists */
+    bool qwen;           /* ~/.qwen/ or qwen CLI exists */
+    bool copilot_cli;    /* $COPILOT_HOME, ~/.copilot/, or copilot CLI exists */
+    bool factory_droid;  /* ~/.factory/ or droid CLI exists */
+    bool crush;          /* Crush config or CLI exists */
+    bool goose;          /* Goose config or CLI exists */
+    bool mistral_vibe;   /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.

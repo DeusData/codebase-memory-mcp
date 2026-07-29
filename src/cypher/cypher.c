@@ -23,14 +23,14 @@ enum {
     CYP_MAX_TOKEN = 10, /* max token lookahead */
     CYP_PAIR = 2,
     CYP_TRIPLE = 3,
-    CYP_INIT_CAP4 = 4,     /* initial small array capacity */
-    CYP_INIT_CAP8 = 8,     /* initial medium array capacity */
+    CYP_INIT_CAP4 = 4, /* initial small array capacity */
+    CYP_INIT_CAP8 = 8, /* initial medium array capacity */
     /* Keep common bindings allocation-free. Wider queries spill into geometric
      * overflow storage instead of silently losing variables. */
     CYP_INLINE_NODE_VARS = 16,
     CYP_INLINE_EDGE_VARS = 8,
-    CYP_GROWTH_10 = 10,    /* binding growth factor */
-    CYP_CHAR_IDX1 = 1,     /* second character index (e.g. op[1]) */
+    CYP_GROWTH_10 = 10, /* binding growth factor */
+    CYP_CHAR_IDX1 = 1,  /* second character index (e.g. op[1]) */
     CYP_EBUF_MASK = 7,
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
     CYP_EDGE_COLS = 3, /* columns per edge var: name, qn, label */
@@ -2345,8 +2345,8 @@ typedef struct {
 typedef struct {
     const char *var_names[CYP_INLINE_NODE_VARS]; /* variable names (nodes) */
     bool var_name_owned[CYP_INLINE_NODE_VARS];   /* WITH aliases are heap-owned */
-    bool var_is_null[CYP_INLINE_NODE_VARS]; /* projected null differs from an empty string */
-    cbm_node_t var_nodes[CYP_INLINE_NODE_VARS]; /* node data */
+    bool var_is_null[CYP_INLINE_NODE_VARS];      /* projected null differs from an empty string */
+    cbm_node_t var_nodes[CYP_INLINE_NODE_VARS];  /* node data */
     binding_node_overflow_t *var_overflow;
     int var_overflow_capacity;
     int var_count;
@@ -2356,7 +2356,7 @@ typedef struct {
     int edge_overflow_capacity;
     int edge_var_count;
     bool allocation_failed;
-    cbm_store_t *store; /* for computing in_degree/out_degree on demand */
+    cbm_store_t *store;  /* for computing in_degree/out_degree on demand */
     const char *project; /* borrowed project filter for active overlay qn-keyed lookups */
     bool use_active_overlay_edges;
 } binding_t;
@@ -2430,51 +2430,43 @@ static bool binding_reserve_edge_index(binding_t *b, int index) {
 }
 
 static const char *binding_node_name_at(const binding_t *b, int index) {
-    return index < CYP_INLINE_NODE_VARS
-               ? b->var_names[index]
-               : b->var_overflow[index - CYP_INLINE_NODE_VARS].name;
+    return index < CYP_INLINE_NODE_VARS ? b->var_names[index]
+                                        : b->var_overflow[index - CYP_INLINE_NODE_VARS].name;
 }
 
 static bool binding_node_name_owned_at(const binding_t *b, int index) {
-    return index < CYP_INLINE_NODE_VARS
-               ? b->var_name_owned[index]
-               : b->var_overflow[index - CYP_INLINE_NODE_VARS].name_owned;
+    return index < CYP_INLINE_NODE_VARS ? b->var_name_owned[index]
+                                        : b->var_overflow[index - CYP_INLINE_NODE_VARS].name_owned;
 }
 
 static bool binding_node_is_null_at(const binding_t *b, int index) {
-    return index < CYP_INLINE_NODE_VARS
-               ? b->var_is_null[index]
-               : b->var_overflow[index - CYP_INLINE_NODE_VARS].is_null;
+    return index < CYP_INLINE_NODE_VARS ? b->var_is_null[index]
+                                        : b->var_overflow[index - CYP_INLINE_NODE_VARS].is_null;
 }
 
 static cbm_node_t *binding_node_at(binding_t *b, int index) {
-    return index < CYP_INLINE_NODE_VARS
-               ? &b->var_nodes[index]
-               : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
+    return index < CYP_INLINE_NODE_VARS ? &b->var_nodes[index]
+                                        : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
 }
 
 static const cbm_node_t *binding_const_node_at(const binding_t *b, int index) {
-    return index < CYP_INLINE_NODE_VARS
-               ? &b->var_nodes[index]
-               : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
+    return index < CYP_INLINE_NODE_VARS ? &b->var_nodes[index]
+                                        : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
 }
 
 static const char *binding_edge_name_at(const binding_t *b, int index) {
-    return index < CYP_INLINE_EDGE_VARS
-               ? b->edge_var_names[index]
-               : b->edge_overflow[index - CYP_INLINE_EDGE_VARS].name;
+    return index < CYP_INLINE_EDGE_VARS ? b->edge_var_names[index]
+                                        : b->edge_overflow[index - CYP_INLINE_EDGE_VARS].name;
 }
 
 static cbm_edge_t *binding_edge_at(binding_t *b, int index) {
-    return index < CYP_INLINE_EDGE_VARS
-               ? &b->edge_vars[index]
-               : &b->edge_overflow[index - CYP_INLINE_EDGE_VARS].edge;
+    return index < CYP_INLINE_EDGE_VARS ? &b->edge_vars[index]
+                                        : &b->edge_overflow[index - CYP_INLINE_EDGE_VARS].edge;
 }
 
 static const cbm_edge_t *binding_const_edge_at(const binding_t *b, int index) {
-    return index < CYP_INLINE_EDGE_VARS
-               ? &b->edge_vars[index]
-               : &b->edge_overflow[index - CYP_INLINE_EDGE_VARS].edge;
+    return index < CYP_INLINE_EDGE_VARS ? &b->edge_vars[index]
+                                        : &b->edge_overflow[index - CYP_INLINE_EDGE_VARS].edge;
 }
 
 static void binding_set_node_metadata(binding_t *b, int index, const char *name, bool name_owned,
@@ -2649,8 +2641,8 @@ static const char *node_prop_ex(const cbm_node_t *n, const char *prop, cbm_store
         cbm_node_t full = {0};
         if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
             bool full_is_null = true;
-            const char *rv = node_prop_ex(&full, prop, NULL, project, use_active_overlay_edges,
-                                          &full_is_null);
+            const char *rv =
+                node_prop_ex(&full, prop, NULL, project, use_active_overlay_edges, &full_is_null);
             if (!full_is_null) {
                 snprintf(out, CBM_SZ_512, "%s", rv);
             }
@@ -2816,8 +2808,7 @@ static bool node_deep_copy(cbm_node_t *dst, const cbm_node_t *src) {
     dst->properties_json = heap_strdup(src->properties_json);
     if ((src->project && !dst->project) || (src->label && !dst->label) ||
         (src->name && !dst->name) || (src->qualified_name && !dst->qualified_name) ||
-        (src->file_path && !dst->file_path) ||
-        (src->properties_json && !dst->properties_json)) {
+        (src->file_path && !dst->file_path) || (src->properties_json && !dst->properties_json)) {
         node_fields_free(dst);
         memset(dst, 0, sizeof(*dst));
         return false;
@@ -2983,8 +2974,7 @@ static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *ite
 /* Resolve the actual property value and preserve the Cypher distinction between
  * null and a valid empty string. This is the shared lookup used by projection,
  * aggregation, WHERE, and scalar functions. */
-static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b,
-                                           bool *is_null) {
+static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b, bool *is_null) {
     *is_null = true;
     /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
      * Evaluated through the same code path as RETURN projections. The value is
@@ -3086,14 +3076,13 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         if (n && b->store) {
             if (b->use_active_overlay_edges && b->project && n->qualified_name &&
                 n->qualified_name[0]) {
-                int dir = c->exists_dir == CBM_STORE_EDGE_DIR_INBOUND
-                              ? CBM_STORE_EDGE_DIR_INBOUND
-                              : (c->exists_dir == CBM_STORE_EDGE_DIR_ANY
-                                     ? CBM_STORE_EDGE_DIR_ANY
-                                     : CBM_STORE_EDGE_DIR_OUTBOUND);
-                (void)cbm_store_active_edge_exists_by_qn(b->store, b->project,
-                                                         n->qualified_name, c->value, dir,
-                                                         &result);
+                int dir =
+                    c->exists_dir == CBM_STORE_EDGE_DIR_INBOUND
+                        ? CBM_STORE_EDGE_DIR_INBOUND
+                        : (c->exists_dir == CBM_STORE_EDGE_DIR_ANY ? CBM_STORE_EDGE_DIR_ANY
+                                                                   : CBM_STORE_EDGE_DIR_OUTBOUND);
+                (void)cbm_store_active_edge_exists_by_qn(b->store, b->project, n->qualified_name,
+                                                         c->value, dir, &result);
             } else {
                 cbm_edge_t *edges = NULL;
                 int cnt = 0;
@@ -3337,10 +3326,7 @@ typedef struct {
     bool truncated;
 } result_builder_t;
 
-typedef enum {
-    CYP_NODE_SCAN_CANONICAL = 0,
-    CYP_NODE_SCAN_ACTIVE_OVERLAY
-} cypher_node_scan_mode_t;
+typedef enum { CYP_NODE_SCAN_CANONICAL = 0, CYP_NODE_SCAN_ACTIVE_OVERLAY } cypher_node_scan_mode_t;
 
 static void rb_init(result_builder_t *rb) {
     memset(rb, 0, sizeof(*rb));
@@ -3394,8 +3380,7 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
         g_cypher_allocation_failed = true;
         return;
     }
-    memset(row, 0,
-           (rb->col_count > 0 ? (size_t)rb->col_count : SKIP_ONE) * sizeof(const char *));
+    memset(row, 0, (rb->col_count > 0 ? (size_t)rb->col_count : SKIP_ONE) * sizeof(const char *));
     for (int i = 0; i < rb->col_count; i++) {
         row[i] = values[i] ? heap_strdup(values[i]) : heap_strdup("");
         if (!row[i]) {
@@ -3571,8 +3556,8 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
 /* Append one aggregation grouping component. Entity values group by canonical
  * store identity, not display name; scalar values use a length prefix so a
  * delimiter inside user data cannot merge otherwise distinct tuples. */
-static int group_key_append(char *key, size_t key_sz, int pos, binding_t *binding,
-                            const char *var, const char *prop, const char *value, bool is_null) {
+static int group_key_append(char *key, size_t key_sz, int pos, binding_t *binding, const char *var,
+                            const char *prop, const char *value, bool is_null) {
     if ((size_t)pos >= key_sz - SKIP_ONE) {
         return (int)key_sz - SKIP_ONE;
     }
@@ -3955,10 +3940,9 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
                                       int max_new, int *match_count,
                                       const cbm_where_clause_t *pattern_where) {
     cbm_node_t *bound_to = binding_get(b, to_var);
-    const char *bound_to_qn =
-        bound_to && bound_to->qualified_name && bound_to->qualified_name[0]
-            ? bound_to->qualified_name
-            : NULL;
+    const char *bound_to_qn = bound_to && bound_to->qualified_name && bound_to->qualified_name[0]
+                                  ? bound_to->qualified_name
+                                  : NULL;
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
     for (int ri = 0; ri < row_count; ri++) {
         cbm_node_t *found = &rows[ri].node;
@@ -4112,15 +4096,14 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
 
     if (b->use_active_overlay_edges && b->project && src->qualified_name &&
         src->qualified_name[0]) {
-        int direction = is_inbound ? CBM_STORE_EDGE_DIR_INBOUND
-                                   : (is_any ? CBM_STORE_EDGE_DIR_ANY
-                                             : CBM_STORE_EDGE_DIR_OUTBOUND);
+        int direction = is_inbound
+                            ? CBM_STORE_EDGE_DIR_INBOUND
+                            : (is_any ? CBM_STORE_EDGE_DIR_ANY : CBM_STORE_EDGE_DIR_OUTBOUND);
         cbm_store_edge_node_t *rows = NULL;
         int row_count = 0;
         if (cbm_store_find_active_edge_nodes_by_qn(store, b->project, src->qualified_name,
                                                    (const char **)rel->types, rel->type_count,
-                                                   direction, &rows, &row_count) ==
-            CBM_STORE_OK) {
+                                                   direction, &rows, &row_count) == CBM_STORE_OK) {
             process_active_edge_nodes(rows, row_count, target_node, b, to_var, rel_var,
                                       new_bindings, new_count, new_capacity, max_new, match_count,
                                       pattern_where);
@@ -4857,10 +4840,10 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
             continue;
         }
         bool is_null = true;
-        const char *v = binding_get_virtual_ex(b, wc->items[ci].variable,
-                                               wc->items[ci].property, &is_null);
-        kl = group_key_append(key, key_sz, kl, b, wc->items[ci].variable,
-                              wc->items[ci].property, v, is_null);
+        const char *v =
+            binding_get_virtual_ex(b, wc->items[ci].variable, wc->items[ci].property, &is_null);
+        kl = group_key_append(key, key_sz, kl, b, wc->items[ci].variable, wc->items[ci].property, v,
+                              is_null);
     }
     return kl;
 }
@@ -4908,8 +4891,8 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
             continue;
         }
         bool is_null = true;
-        const char *v = binding_get_virtual_ex(b, wc->items[ci].variable,
-                                               wc->items[ci].property, &is_null);
+        const char *v =
+            binding_get_virtual_ex(b, wc->items[ci].variable, wc->items[ci].property, &is_null);
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
         (*aggs)[found].group_nulls[ci] = is_null;
         /* If this group item is a bare node variable, remember its id so the
@@ -4933,8 +4916,8 @@ static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, bindin
             continue;
         }
         bool is_null = true;
-        const char *raw = binding_get_virtual_ex(b, wc->items[ci].variable,
-                                                 wc->items[ci].property, &is_null);
+        const char *raw =
+            binding_get_virtual_ex(b, wc->items[ci].variable, wc->items[ci].property, &is_null);
         if (is_null) {
             continue;
         }
@@ -5133,19 +5116,16 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 } else {
                     with_agg_format(wc->items[ci].func, &aggs[a], ci, vbuf, sizeof(vbuf));
                 }
-                bool is_null = aggs[a].counts[ci] == 0 &&
-                               (strcmp(wc->items[ci].func, "AVG") == 0 ||
-                                strcmp(wc->items[ci].func, "MIN") == 0 ||
-                                strcmp(wc->items[ci].func, "MAX") == 0);
+                bool is_null = aggs[a].counts[ci] == 0 && (strcmp(wc->items[ci].func, "AVG") == 0 ||
+                                                           strcmp(wc->items[ci].func, "MIN") == 0 ||
+                                                           strcmp(wc->items[ci].func, "MAX") == 0);
                 with_add_vbinding_var(&vb, alias, vbuf, is_null);
             } else {
-                with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci],
-                                      aggs[a].group_nulls[ci]);
+                with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci], aggs[a].group_nulls[ci]);
                 /* Tag the carried virtual var with the node id (when the group
                  * var is a node) so node_prop can re-fetch its full properties. */
                 if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
-                    binding_node_at(&vb, vb.var_count - SKIP_ONE)->id =
-                        aggs[a].group_node_ids[ci];
+                    binding_node_at(&vb, vb.var_count - SKIP_ONE)->id = aggs[a].group_node_ids[ci];
                 }
             }
         }
@@ -5484,8 +5464,8 @@ static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret,
             continue;
         }
         bool is_null = true;
-        const char *raw = binding_get_virtual_ex(b, ret->items[ci].variable,
-                                                 ret->items[ci].property, &is_null);
+        const char *raw =
+            binding_get_virtual_ex(b, ret->items[ci].variable, ret->items[ci].property, &is_null);
         if (is_null) {
             continue;
         }
@@ -5696,8 +5676,7 @@ static void build_default_columns(result_builder_t *rb, const char **vars, int v
         return;
     }
     int col_n = vc * CYP_EDGE_COLS;
-    const char **col_names =
-        calloc(col_n > 0 ? (size_t)col_n : SKIP_ONE, sizeof(*col_names));
+    const char **col_names = calloc(col_n > 0 ? (size_t)col_n : SKIP_ONE, sizeof(*col_names));
     if (!col_names) {
         g_cypher_allocation_failed = true;
         return;
@@ -5711,8 +5690,7 @@ static void build_default_columns(result_builder_t *rb, const char **vars, int v
         snprintf(buf, sizeof(buf), "%s.label", vars[v]);
         col_names[((size_t)v * CYP_EDGE_COLS) + PAIR_LEN] = heap_strdup(buf);
         size_t base = (size_t)v * CYP_EDGE_COLS;
-        if (!col_names[base] || !col_names[base + SKIP_ONE] ||
-            !col_names[base + PAIR_LEN]) {
+        if (!col_names[base] || !col_names[base + SKIP_ONE] || !col_names[base + PAIR_LEN]) {
             g_cypher_allocation_failed = true;
             break;
         }
@@ -5761,8 +5739,8 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
     if (bind_count > max_rows) {
         rb->truncated = true;
     }
-    for (int bi = 0;
-         bi < bind_count && rb->row_count < max_rows && !g_cypher_allocation_failed; bi++) {
+    for (int bi = 0; bi < bind_count && rb->row_count < max_rows && !g_cypher_allocation_failed;
+         bi++) {
         for (int v = 0; v < vc; v++) {
             cbm_node_t *n = binding_get(&bindings[bi], vars[v]);
             vals[(size_t)v * CYP_EDGE_COLS] = n && n->name ? n->name : "";
@@ -5937,10 +5915,9 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                                                         : CBM_STORE_EDGE_DIR_OUTBOUND);
                 cbm_store_edge_node_t *rows = NULL;
                 int row_count = 0;
-                if (cbm_store_find_active_edge_nodes_by_qn(store, b->project, term->qualified_name,
-                                                           (const char **)rel->types,
-                                                           rel->type_count, direction, &rows,
-                                                           &row_count) == CBM_STORE_OK) {
+                if (cbm_store_find_active_edge_nodes_by_qn(
+                        store, b->project, term->qualified_name, (const char **)rel->types,
+                        rel->type_count, direction, &rows, &row_count) == CBM_STORE_OK) {
                     process_active_edge_nodes(rows, row_count, start_node, b, start_var,
                                               rel->variable, &new_bindings, &new_count,
                                               &new_capacity, max_new, &match_count, pattern_where);
@@ -6098,7 +6075,11 @@ static void execute_bound_stage(cbm_store_t *store, cbm_query_t *q, const char *
                                 int max_rows, int max_working_rows,
                                 cypher_node_scan_mode_t scan_mode, binding_t **bindings,
                                 int *bind_count, result_builder_t *rb) {
-    while (q) {
+    if (!q) {
+        rb_init(rb);
+        return;
+    }
+    for (;;) {
         int bind_cap = *bind_count;
         if (bind_cap < max_rows) {
             bind_cap = max_rows;
@@ -6211,9 +6192,9 @@ static bool query_initial_scan_can_stop_at_output_cap(const cbm_query_t *q, cons
     return true;
 }
 
-static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
-                          int max_working_rows, cypher_node_scan_mode_t scan_mode,
-                          bool allow_output_prefix, result_builder_t *rb) {
+static void execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
+                           int max_working_rows, cypher_node_scan_mode_t scan_mode,
+                           bool allow_output_prefix, result_builder_t *rb) {
     cbm_pattern_t *pat0 = &q->patterns[0];
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
 
@@ -6222,8 +6203,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     int scan_count = 0;
     bool output_prefix_is_complete =
         allow_output_prefix && query_initial_scan_can_stop_at_output_cap(q, var_name, scan_mode);
-    bool server_output_cap_applies =
-        !q->ret || q->ret->limit < 0 || q->ret->limit > max_rows;
+    bool server_output_cap_applies = !q->ret || q->ret->limit < 0 || q->ret->limit > max_rows;
     int exact_output_limit =
         q->ret && q->ret->limit >= 0 && q->ret->limit < max_rows ? q->ret->limit : max_rows;
     int candidate_limit = output_prefix_is_complete
@@ -6244,7 +6224,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     if (!bindings) {
         g_cypher_allocation_failed = true;
         cbm_store_free_nodes(scanned, scan_count);
-        return 0;
+        return;
     }
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
@@ -6319,16 +6299,10 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     }
     free(bindings);
     cbm_store_free_nodes(scanned, scan_count);
-    return 0;
 }
 
 static bool cypher_is_degree_prop(const char *prop) {
     return prop && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0);
-}
-
-static bool cypher_where_requires_canonical_identity(const cbm_where_clause_t *where) {
-    (void)where;
-    return false;
 }
 
 static bool cypher_return_requires_canonical_identity(const cbm_return_clause_t *ret) {
@@ -6337,8 +6311,7 @@ static bool cypher_return_requires_canonical_identity(const cbm_return_clause_t 
     }
     for (int i = 0; i < ret->order_count; i++) {
         const char *expression = ret->order_items[i].expression;
-        if (expression &&
-            (strstr(expression, ".in_degree") || strstr(expression, ".out_degree"))) {
+        if (expression && (strstr(expression, ".in_degree") || strstr(expression, ".out_degree"))) {
             return false;
         }
     }
@@ -6378,9 +6351,9 @@ static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
                     return false;
                 }
             }
-            if (cypher_where_requires_canonical_identity(stage->where) ||
-                cypher_where_requires_canonical_identity(stage->post_with_where) ||
-                cypher_return_requires_canonical_identity(stage->with_clause) ||
+            /* The WHERE grammar rejects identity functions; identity-bearing
+             * expressions currently enter through WITH/RETURN projections. */
+            if (cypher_return_requires_canonical_identity(stage->with_clause) ||
                 cypher_return_requires_canonical_identity(stage->ret)) {
                 return false;
             }
@@ -6406,10 +6379,11 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     int max_working_rows = limits ? limits->max_working_rows : 0;
     if (max_rows < 0 || max_rows > CBM_MAX_QUERY_ROWS || max_working_rows < 0 ||
         max_working_rows > CBM_MAX_QUERY_WORKING_ROWS) {
-        out->error = heap_strdup(
-            "query row limits are outside the supported range; use max_rows 0.."
-            CBM_STRINGIFY(CBM_MAX_QUERY_ROWS) " and query_max_working_rows 1.."
-            CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS));
+        out->error =
+            heap_strdup("query row limits are outside the supported range; use max_rows "
+                        "0.." CBM_STRINGIFY(CBM_MAX_QUERY_ROWS) " and query_max_working_rows "
+                                                                "1.." CBM_STRINGIFY(
+                                                                    CBM_MAX_QUERY_WORKING_ROWS));
         return CBM_NOT_FOUND;
     }
     if (max_rows == 0) {
@@ -6455,25 +6429,15 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     bool has_union = q->union_next != NULL;
     int branch_output_limit = has_union ? max_working_rows : max_rows;
     result_builder_t rb = {0};
-    // cppcheck-suppress knownConditionTrueFalse
-    if (execute_single(store, q, project, branch_output_limit, max_working_rows, scan_mode,
-                       !has_union, &rb) < 0) {
-        cbm_query_free(q);
-        return CBM_NOT_FOUND;
-    }
+    execute_single(store, q, project, branch_output_limit, max_working_rows, scan_mode, !has_union,
+                   &rb);
 
     /* UNION chain */
     cbm_query_t *uq = q->union_next;
     while (uq) {
         result_builder_t rb2 = {0};
-        // cppcheck-suppress knownConditionTrueFalse
-        if (execute_single(store, uq, project, max_working_rows, max_working_rows, scan_mode, false,
-                           &rb2) < 0) {
-            rb_free(&rb);
-            rb_free(&rb2);
-            cbm_query_free(q);
-            return CBM_NOT_FOUND;
-        }
+        execute_single(store, uq, project, max_working_rows, max_working_rows, scan_mode, false,
+                       &rb2);
         /* Concatenate rows from rb2 into rb */
         for (int i = 0; i < rb2.row_count; i++) {
             if (rb.row_count >= max_working_rows) {

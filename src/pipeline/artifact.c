@@ -667,11 +667,11 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     if (wrc != 0) {
         if (ioerr.code != 0) {
-            cbm_log_error("artifact.import", "err", "write_temp_db", "detail", ioerr.stage,
-                          "errno", itoa_buf(ioerr.code), "path", tmp_path);
+            cbm_log_error("artifact.import", "err", "write_temp_db", "detail", ioerr.stage, "errno",
+                          itoa_buf(ioerr.code), "path", tmp_path);
         } else {
-            cbm_log_error("artifact.import", "err", "write_temp_db", "detail", ioerr.stage,
-                          "path", tmp_path);
+            cbm_log_error("artifact.import", "err", "write_temp_db", "detail", ioerr.stage, "path",
+                          tmp_path);
         }
         cbm_unlink(tmp_path);
         return CBM_NOT_FOUND;

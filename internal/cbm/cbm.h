@@ -532,11 +532,11 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
-    bool extract_macros;                   // C/C++ #define Macro nodes for full mode
-    EFCache ef_cache;                      // enclosing function cache
-    const char *enclosing_class_qn;        // for nested class QN computation
-    CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
-    const CBMMacroTable *macro_table;       // ObjectScript macros, or NULL
+    bool extract_macros;                         // C/C++ #define Macro nodes for full mode
+    EFCache ef_cache;                            // enclosing function cache
+    const char *enclosing_class_qn;              // for nested class QN computation
+    CBMStringConstantMap string_constants;       // module-level NAME = "value" pairs
+    const CBMMacroTable *macro_table;            // ObjectScript macros, or NULL
     const CBMReturnTypeTable *return_type_table; // ObjectScript return types, or NULL
 } CBMExtractCtx;
 
@@ -586,18 +586,21 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char **extra_defines, // NULL-terminated, or NULL
                                 const char **include_paths  // NULL-terminated, or NULL
 );
-CBMFileResult *cbm_extract_file_with_options(
-    const char *source, int source_len, CBMLanguage language, const char *project,
-    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
-    const char **include_paths, bool extract_macros);
+CBMFileResult *cbm_extract_file_with_options(const char *source, int source_len,
+                                             CBMLanguage language, const char *project,
+                                             const char *rel_path, int64_t timeout_micros,
+                                             const char **extra_defines, const char **include_paths,
+                                             bool extract_macros);
 
 /* Canonical compositional entry point for pipeline extraction. Every option is
  * explicit so concurrent pipelines never depend on process-global settings. */
-CBMFileResult *cbm_extract_file_with_options_ex(
-    const char *source, int source_len, CBMLanguage language, const char *project,
-    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
-    const char **include_paths, bool extract_macros, const CBMMacroTable *macro_table,
-    const CBMReturnTypeTable *return_type_table);
+CBMFileResult *cbm_extract_file_with_options_ex(const char *source, int source_len,
+                                                CBMLanguage language, const char *project,
+                                                const char *rel_path, int64_t timeout_micros,
+                                                const char **extra_defines,
+                                                const char **include_paths, bool extract_macros,
+                                                const CBMMacroTable *macro_table,
+                                                const CBMReturnTypeTable *return_type_table);
 
 // Pipeline-internal variant of cbm_extract_file() carrying ObjectScript
 // per-project tables (macro table + method-return-type table). The public

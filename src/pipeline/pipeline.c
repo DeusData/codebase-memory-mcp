@@ -182,7 +182,7 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     cbm_store_t *flush_store; /* when set, use flush_to_store instead of dump_to_sqlite */
-    bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    bool persistence;         /* write .codebase-memory/graph.db.zst after indexing */
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -349,7 +349,8 @@ static int cbm_pipeline_ensure_git_context(cbm_pipeline_t *p) {
 }
 
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store) {
-    if (!p) return;
+    if (!p)
+        return;
     p->flush_store = store;
 }
 
@@ -363,7 +364,8 @@ void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold) 
 }
 
 void cbm_pipeline_set_similarity_enabled(cbm_pipeline_t *p, bool enabled) {
-    if (p) p->similarity_enabled = enabled;
+    if (p)
+        p->similarity_enabled = enabled;
 }
 
 void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshold) {
@@ -373,7 +375,8 @@ void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshol
 }
 
 void cbm_pipeline_set_httplinks_enabled(cbm_pipeline_t *p, bool enabled) {
-    if (p) p->httplinks_enabled = enabled;
+    if (p)
+        p->httplinks_enabled = enabled;
 }
 
 void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold) {
@@ -383,7 +386,8 @@ void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold) {
 }
 
 void cbm_pipeline_set_semantic_edges_enabled(cbm_pipeline_t *p, bool enabled) {
-    if (p) p->semantic_edges_enabled = enabled;
+    if (p)
+        p->semantic_edges_enabled = enabled;
 }
 
 void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold) {
@@ -405,7 +409,8 @@ void cbm_pipeline_set_githistory_max_couplings(cbm_pipeline_t *p, int max_coupli
 }
 
 void cbm_pipeline_set_githistory_enabled(cbm_pipeline_t *p, bool enabled) {
-    if (p) p->githistory_enabled = enabled;
+    if (p)
+        p->githistory_enabled = enabled;
 }
 
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold) {
@@ -439,30 +444,25 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
 
     p->similarity_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, true);
     p->httplinks_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, true);
-    p->semantic_edges_enabled =
-        cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true);
+    p->semantic_edges_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true);
     p->githistory_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, true);
 
-    double sim_thresh =
-        cbm_config_get_double(cfg, CBM_CONFIG_SIMILARITY_THRESHOLD, 0.0);
+    double sim_thresh = cbm_config_get_double(cfg, CBM_CONFIG_SIMILARITY_THRESHOLD, 0.0);
     if (sim_thresh > 0.0) {
         cbm_pipeline_set_similarity_threshold(p, sim_thresh);
     }
 
-    double httplink_min =
-        cbm_config_get_double(cfg, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, 0.0);
+    double httplink_min = cbm_config_get_double(cfg, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, 0.0);
     if (httplink_min > 0.0) {
         cbm_pipeline_set_httplink_min_confidence(p, httplink_min);
     }
 
-    double semantic_thresh =
-        cbm_config_get_double(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, 0.0);
+    double semantic_thresh = cbm_config_get_double(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, 0.0);
     if (semantic_thresh > 0.0) {
         cbm_pipeline_set_semantic_threshold(p, semantic_thresh);
     }
 
-    double gh_min =
-        cbm_config_get_double(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, 0.0);
+    double gh_min = cbm_config_get_double(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, 0.0);
     if (gh_min > 0.0) {
         cbm_pipeline_set_githistory_min_coupling(p, gh_min);
     }
@@ -470,8 +470,7 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
         p, cbm_config_get_int(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS,
                               CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS));
 
-    double lsp_floor =
-        cbm_config_get_double(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
+    double lsp_floor = cbm_config_get_double(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
     if (lsp_floor > 0.0) {
         cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
     }
@@ -499,8 +498,7 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
     const char *overlay_publish =
         cbm_config_get(cfg, CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_OFF);
     p->overlay_publish =
-        overlay_publish &&
-                strcmp(overlay_publish, CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS) == 0
+        overlay_publish && strcmp(overlay_publish, CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS) == 0
             ? CBM_OVERLAY_PUBLISH_SMALL_DELTAS
             : CBM_OVERLAY_PUBLISH_OFF;
 
@@ -615,8 +613,7 @@ static bool pipeline_file_state_metadata_current(cbm_store_t *store, const char 
     bool current = false;
     if (rc == CBM_STORE_OK && state.content_hash && state.content_hash[0] &&
         state.pass_fingerprint && strcmp(state.pass_fingerprint, pass_fingerprint) == 0 &&
-        state.size == st->st_size &&
-        state.mtime_ns == cbm_stat_mtime_ns(st)) {
+        state.size == st->st_size && state.mtime_ns == cbm_stat_mtime_ns(st)) {
         current = true;
     }
     cbm_store_file_state_free_fields(&state);
@@ -625,8 +622,7 @@ static bool pipeline_file_state_metadata_current(cbm_store_t *store, const char 
 
 static int pipeline_store_project_files_current(cbm_store_t *store, const char *project,
                                                 cbm_file_info_t *files, int file_count,
-                                                const char *pass_fingerprint,
-                                                bool *out_current) {
+                                                const char *pass_fingerprint, bool *out_current) {
     *out_current = false;
     if (!store || !project || !project[0] || !files || file_count <= 0 || !pass_fingerprint) {
         return CBM_STORE_ERR;
@@ -692,8 +688,7 @@ int cbm_pipeline_store_project_current(cbm_pipeline_t *p, cbm_store_t *store, bo
     }
 
     char pass_fingerprint[CBM_SZ_256];
-    int rc =
-        cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint, sizeof(pass_fingerprint));
+    int rc = cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint, sizeof(pass_fingerprint));
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -749,9 +744,8 @@ bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     free(p->project_name);
     p->project_name = normalized;
     free(p->branch_qn);
-    p->branch_qn = p->git_context_resolved
-                       ? cbm_git_context_branch_qn(p->project_name, &p->git_ctx)
-                       : NULL;
+    p->branch_qn =
+        p->git_context_resolved ? cbm_git_context_branch_qn(p->project_name, &p->git_ctx) : NULL;
     return true;
 }
 
@@ -1013,10 +1007,10 @@ void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason) {
     p->publish_reason = next;
 }
 
-void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
-                                        int affected_paths, int published_paths) {
-    cbm_pipeline_set_exact_delta_stats_with_limit(p, changed_paths, affected_paths,
-                                                  published_paths, -1, false);
+void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths, int affected_paths,
+                                        int published_paths) {
+    cbm_pipeline_set_exact_delta_stats_with_limit(p, changed_paths, affected_paths, published_paths,
+                                                  -1, false);
 }
 
 void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
@@ -1163,9 +1157,8 @@ static void create_folder_chain(cbm_gbuf_t *gbuf, const char *project, const cha
     free(parent_dir);
 }
 
-int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,
-                                       const char *root_qn, const char *rel_path,
-                                       CBMHashTable *seen_dirs) {
+int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project, const char *root_qn,
+                                       const char *rel_path, CBMHashTable *seen_dirs) {
     if (!gbuf || !project || !rel_path) {
         return CBM_NOT_FOUND;
     }
@@ -1318,10 +1311,9 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
                                                 rel_path, 0, 0, "{\"source\":\"infra\"}");
     char topic_route_qn[CBM_ROUTE_QN_SIZE];
     char topic_route_props[CBM_SZ_256];
-    if (!cbm_pipeline_build_service_route_identity(ib->source_name, CBM_SVC_ASYNC, NULL,
-                                                   ib->broker, "infra", topic_route_qn,
-                                                   sizeof(topic_route_qn), topic_route_props,
-                                                   sizeof(topic_route_props))) {
+    if (!cbm_pipeline_build_service_route_identity(ib->source_name, CBM_SVC_ASYNC, NULL, ib->broker,
+                                                   "infra", topic_route_qn, sizeof(topic_route_qn),
+                                                   topic_route_props, sizeof(topic_route_props))) {
         return 0;
     }
     const cbm_gbuf_node_t *topic_route = cbm_gbuf_find_by_qn(gbuf, topic_route_qn);
@@ -1568,8 +1560,7 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     enum { PREDUMP_PASS_COUNT = 6 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
-        if (passes[i].global_semantic &&
-            !cbm_pipeline_mode_builds_global_semantic_edges(p->mode)) {
+        if (passes[i].global_semantic && !cbm_pipeline_mode_builds_global_semantic_edges(p->mode)) {
             continue;
         }
         bool disabled =
@@ -1958,8 +1949,8 @@ static int pipeline_reinstate_dirty_files(const char *staging_path, const char *
     }
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(final_store);
-        cbm_log_error("pipeline.dirty_ledger.err", "phase", "reinstate", "project", project,
-                      "rc", itoa_buf(rc));
+        cbm_log_error("pipeline.dirty_ledger.err", "phase", "reinstate", "project", project, "rc",
+                      itoa_buf(rc));
     }
     cbm_store_close(final_store);
     cbm_store_free_dirty_files(rows, row_count);
@@ -2095,7 +2086,7 @@ int cbm_pipeline_coverage_replace_with_meta(const cbm_pipeline_t *p, cbm_store_t
     cbm_coverage_meta_t meta = {
         .generation = have_project_info ? project_info.indexed_at : NULL,
         .index_mode = p ? pipeline_mode_name(p->mode) : NULL,
-        .recording_status = !rows_available            ? "unavailable"
+        .recording_status = !rows_available                  ? "unavailable"
                             : ignored_total > ignored_stored ? "truncated"
                                                              : "complete",
         .ignored_files_stored = ignored_stored,
@@ -2174,15 +2165,13 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
      * second file-sized allocation. */
     int begin_rc = cbm_store_begin(store);
     if (begin_rc != CBM_STORE_OK) {
-        cbm_log_error("pipeline.err", "phase", "persist_hashes_begin", "rc",
-                      itoa_buf(begin_rc));
+        cbm_log_error("pipeline.err", "phase", "persist_hashes_begin", "rc", itoa_buf(begin_rc));
         return begin_rc;
     }
     int delete_rc = cbm_store_delete_file_hashes(store, p->project_name);
     if (delete_rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(store);
-        cbm_log_error("pipeline.err", "phase", "persist_hashes_delete", "rc",
-                      itoa_buf(delete_rc));
+        cbm_log_error("pipeline.err", "phase", "persist_hashes_delete", "rc", itoa_buf(delete_rc));
         return delete_rc;
     }
     for (int i = 0; i < file_count; i++) {
@@ -2205,8 +2194,7 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
     int commit_rc = cbm_store_commit(store);
     if (commit_rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(store);
-        cbm_log_error("pipeline.err", "phase", "persist_hashes_commit", "rc",
-                      itoa_buf(commit_rc));
+        cbm_log_error("pipeline.err", "phase", "persist_hashes_commit", "rc", itoa_buf(commit_rc));
         return commit_rc;
     }
 
@@ -2234,18 +2222,17 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
     int state_rc =
         cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint, sizeof(pass_fingerprint));
     if (state_rc == CBM_STORE_OK) {
-        state_rc = cbm_pipeline_persist_file_states(
-            store, p->project_name, files, file_count, CBM_PIPELINE_COMPAT_GENERATION,
-            pass_fingerprint);
+        state_rc =
+            cbm_pipeline_persist_file_states(store, p->project_name, files, file_count,
+                                             CBM_PIPELINE_COMPAT_GENERATION, pass_fingerprint);
     }
     if (state_rc != CBM_STORE_OK) {
         cbm_log_error("pipeline.err", "phase", "persist_file_state", "rc", itoa_buf(state_rc));
         return state_rc;
     }
     if (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_FULL_REBUILD) {
-        int owner_rc =
-            cbm_store_rebuild_file_delta_owners(store, p->project_name,
-                                                CBM_PIPELINE_COMPAT_GENERATION);
+        int owner_rc = cbm_store_rebuild_file_delta_owners(store, p->project_name,
+                                                           CBM_PIPELINE_COMPAT_GENERATION);
         if (owner_rc != CBM_STORE_OK) {
             cbm_log_error("pipeline.err", "phase", "rebuild_file_delta_owners", "rc",
                           itoa_buf(owner_rc));
@@ -2610,8 +2597,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
          * buffer. Platform-valid long paths must never target a truncated
          * sibling database. */
         if (!ensure_db_parent(dump_db_path)) {
-            cbm_log_error("pipeline.err", "phase", "resolve_db_dir", "reason",
-                          "create_failed");
+            cbm_log_error("pipeline.err", "phase", "resolve_db_dir", "reason", "create_failed");
             rc = CBM_NOT_FOUND;
             goto cleanup;
         }

@@ -332,8 +332,7 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
     /* 2. Source-based routes — scoped by file extension to avoid
      * cross-framework false positives (e.g. Ktor regex matching PHP Cache::get) */
     const char *fp = n->file_path;
-    if (has_source_route_extractor(fp) && n->start_line > 0 && n->end_line > 0 &&
-        total < max_out) {
+    if (has_source_route_extractor(fp) && n->start_line > 0 && n->end_line > 0 && total < max_out) {
         char *source = read_source_lines(ctx, fp, n->start_line, n->end_line);
         if (source) {
             int nr;
@@ -435,8 +434,7 @@ static void resolve_fastapi_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
 
         const char *p = source;
         cbm_regmatch_t pm[3];
-        while (import_count < HL_IMPORT_BINDING_MAX &&
-               cbm_regexec(&import_re, p, 3, pm, 0) == 0) {
+        while (import_count < HL_IMPORT_BINDING_MAX && cbm_regexec(&import_re, p, 3, pm, 0) == 0) {
             (void)hl_binding_add(imports, &import_count, HL_IMPORT_BINDING_MAX, p, pm[2], pm[1]);
             p += pm[0].rm_eo;
         }
@@ -559,8 +557,7 @@ static void resolve_express_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_
 
         const char *p = source;
         cbm_regmatch_t pm[4];
-        while (import_count < HL_IMPORT_BINDING_MAX &&
-               cbm_regexec(&require_re, p, 4, pm, 0) == 0) {
+        while (import_count < HL_IMPORT_BINDING_MAX && cbm_regexec(&require_re, p, 4, pm, 0) == 0) {
             (void)hl_binding_add(imports, &import_count, HL_IMPORT_BINDING_MAX, p, pm[2], pm[3]);
             p += pm[0].rm_eo;
         }
@@ -784,8 +781,7 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
                     p = caller_source;
                     while (cbm_regexec(&call_re, p, 2, pm, 0) == 0) {
                         char arg_name[HL_BINDING_KEY_SIZE] = {0};
-                        bool copied_arg =
-                            hl_copy_regex_span(arg_name, sizeof(arg_name), p, pm[1]);
+                        bool copied_arg = hl_copy_regex_span(arg_name, sizeof(arg_name), p, pm[1]);
                         p += pm[0].rm_eo;
                         if (!copied_arg) {
                             continue;
@@ -888,9 +884,9 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
         const char *method = rh->method[0] ? rh->method : CBM_ROUTE_DEFAULT_METHOD;
         char route_qn[CBM_ROUTE_QN_SIZE];
         char route_props[CBM_SZ_256];
-        if (!cbm_pipeline_build_service_route_identity(
-                rh->path, CBM_SVC_HTTP, method, NULL, NULL, route_qn, sizeof(route_qn),
-                route_props, sizeof(route_props))) {
+        if (!cbm_pipeline_build_service_route_identity(rh->path, CBM_SVC_HTTP, method, NULL, NULL,
+                                                       route_qn, sizeof(route_qn), route_props,
+                                                       sizeof(route_props))) {
             continue;
         }
         const cbm_gbuf_node_t *existing_route = cbm_gbuf_find_by_qn(ctx->gbuf, route_qn);
@@ -959,8 +955,8 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
             cbm_json_escape(esc_handler, sizeof(esc_handler), handler_qn);
             cbm_json_escape(esc_path, sizeof(esc_path), rh->path);
             int n = snprintf(props, sizeof(props),
-                             "{\"method\":\"%s\",\"path\":\"%s\",\"handler\":\"%s\"",
-                             method, esc_path, esc_handler);
+                             "{\"method\":\"%s\",\"path\":\"%s\",\"handler\":\"%s\"", method,
+                             esc_path, esc_handler);
             if (protocol[0] && n >= 0 && (size_t)n < sizeof(props)) {
                 char esc_protocol[CBM_SZ_32];
                 cbm_json_escape(esc_protocol, sizeof(esc_protocol), protocol);
@@ -971,8 +967,8 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
                 continue;
             }
             snprintf(props + n, sizeof(props) - (size_t)n, "}");
-            route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", rh->path, route_qn, h_file,
-                                            h_start, h_end, props);
+            route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", rh->path, route_qn, h_file, h_start,
+                                            h_end, props);
         }
         if (route_id <= 0) {
             continue;
@@ -1005,10 +1001,8 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
             }
             if (live_handle_count == 0 || has_handler) {
                 cbm_gbuf_insert_edge(ctx->gbuf, h_id, route_id, "HANDLES", "{}");
-            }
-
-            /* Mark handler as entry point */
-            if (live_handle_count == 0 || has_handler) {
+                /* Only the canonical handler is an entry point; weaker
+                 * regex fallbacks must not acquire the marker. */
                 char *new_props = set_entry_point(h_props_json);
                 if (new_props) {
                     cbm_gbuf_upsert_node(ctx->gbuf, h_label, h_name, h_qn, h_file, h_start, h_end,
@@ -1022,8 +1016,7 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
          * registrar → Route edge. Existing AST registrations already have it,
          * and graph-buffer insertion deduplicates the identical edge. */
         if (rh->handler_ref[0] != '\0') {
-            const cbm_gbuf_node_t *registrar =
-                cbm_gbuf_find_by_qn(ctx->gbuf, rh->qualified_name);
+            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_qn(ctx->gbuf, rh->qualified_name);
             if (registrar) {
                 cbm_gbuf_insert_edge(ctx->gbuf, registrar->id, route_id, "CALLS",
                                      "{\"via\":\"route_registration\"}");
@@ -1067,7 +1060,7 @@ static int match_and_link(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes, 
 
             /* Score path match */
             double min_conf = ctx->httplink_min_confidence > 0.0 ? ctx->httplink_min_confidence
-                                                                  : MIN_PATH_CONFIDENCE;
+                                                                 : MIN_PATH_CONFIDENCE;
             double score = cbm_path_match_score(cs->path, rh->path);
             if (score < min_conf) {
                 continue; /* minimum confidence threshold */
@@ -1167,8 +1160,8 @@ static bool hl_reserve_items(void **items, int *capacity, int required, size_t i
 
 static bool hl_append_items(void **items, int *count, int *capacity, const void *new_items,
                             int new_count, size_t item_size) {
-    if (!items || !count || !capacity || new_count < 0 ||
-        (new_count > 0 && !new_items) || new_count > INT_MAX - *count) {
+    if (!items || !count || !capacity || new_count < 0 || (new_count > 0 && !new_items) ||
+        new_count > INT_MAX - *count) {
         return false;
     }
     int required = *count + new_count;
@@ -1192,11 +1185,10 @@ static bool hl_discover_item_routes(hl_route_buf_t *buf, const hl_work_item_t *i
             return false;
         }
         int available = buf->capacity - first;
-        int discovered = item->is_module
-                             ? discover_module_routes(item->node, ctx, buf->routes + first,
-                                                      available)
-                             : discover_node_routes(item->node, ctx, buf->routes + first,
-                                                    available);
+        int discovered =
+            item->is_module
+                ? discover_module_routes(item->node, ctx, buf->routes + first, available)
+                : discover_node_routes(item->node, ctx, buf->routes + first, available);
         if (discovered < available) {
             buf->count = first + discovered;
             return true;
@@ -1558,8 +1550,8 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
         site_collection_failed = !all_site_nodes || !all_site_labels;
     }
 
-    int site_node_count = 0;
     if (!site_collection_failed) {
+        int site_node_count = 0;
         for (int li = 0; li < 2; li++) {
             for (int i = 0; i < label_counts[li]; i++) {
                 all_site_nodes[site_node_count] = label_nodes[li][i];
@@ -1585,8 +1577,7 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
             atomic_init(&sc.next_idx, 0);
             atomic_init(&sc.allocation_failed, 0);
 
-            cbm_parallel_for_opts_t opts = {.max_workers = site_workers,
-                                            .force_pthreads = false};
+            cbm_parallel_for_opts_t opts = {.max_workers = site_workers, .force_pthreads = false};
             cbm_parallel_for(site_workers, hl_site_worker, &sc, opts);
 
             site_collection_failed =
@@ -1594,8 +1585,7 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
             if (!site_collection_failed) {
                 for (int w = 0; w < site_workers; w++) {
                     if (!hl_append_items((void **)&sites, &site_count, &site_capacity,
-                                         site_bufs[w].sites, site_bufs[w].count,
-                                         sizeof(*sites))) {
+                                         site_bufs[w].sites, site_bufs[w].count, sizeof(*sites))) {
                         site_collection_failed = true;
                         break;
                     }

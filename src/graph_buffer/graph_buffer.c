@@ -525,8 +525,7 @@ int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz)
         return gbuf_invariant_error(err, err_sz, "lookup indexes are unavailable");
     }
     if (gb->next_id <= GB_INVALID_ID) {
-        return gbuf_invariant_error(err, err_sz, "invalid next_id=%lld",
-                                    (long long)gb->next_id);
+        return gbuf_invariant_error(err, err_sz, "invalid next_id=%lld", (long long)gb->next_id);
     }
 
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -555,18 +554,16 @@ int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz)
         }
         if (edge->id <= GB_INVALID_ID || edge->source_id <= GB_INVALID_ID ||
             edge->target_id <= GB_INVALID_ID || !edge->type || edge->type[0] == '\0') {
-            return gbuf_invariant_error(err, err_sz,
-                                        "invalid edge fields edge_id=%lld src=%lld tgt=%lld",
-                                        (long long)edge->id, (long long)edge->source_id,
-                                        (long long)edge->target_id);
+            return gbuf_invariant_error(
+                err, err_sz, "invalid edge fields edge_id=%lld src=%lld tgt=%lld",
+                (long long)edge->id, (long long)edge->source_id, (long long)edge->target_id);
         }
         const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gb, edge->source_id);
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, edge->target_id);
         if (!gbuf_node_is_live(gb, source) || !gbuf_node_is_live(gb, target)) {
-            return gbuf_invariant_error(err, err_sz,
-                                        "edge endpoint missing edge_id=%lld src=%lld tgt=%lld",
-                                        (long long)edge->id, (long long)edge->source_id,
-                                        (long long)edge->target_id);
+            return gbuf_invariant_error(
+                err, err_sz, "edge endpoint missing edge_id=%lld src=%lld tgt=%lld",
+                (long long)edge->id, (long long)edge->source_id, (long long)edge->target_id);
         }
 
         char key[EDGE_KEY_BUF];
@@ -578,14 +575,12 @@ int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz)
         }
         make_src_type_key(key, sizeof(key), edge->source_id, edge->type);
         if (!edge_index_has_id(cbm_ht_get(gb->edges_by_source_type, key), edge->id)) {
-            return gbuf_invariant_error(err, err_sz,
-                                        "edges_by_source_type missing edge_id=%lld",
+            return gbuf_invariant_error(err, err_sz, "edges_by_source_type missing edge_id=%lld",
                                         (long long)edge->id);
         }
         make_src_type_key(key, sizeof(key), edge->target_id, edge->type);
         if (!edge_index_has_id(cbm_ht_get(gb->edges_by_target_type, key), edge->id)) {
-            return gbuf_invariant_error(err, err_sz,
-                                        "edges_by_target_type missing edge_id=%lld",
+            return gbuf_invariant_error(err, err_sz, "edges_by_target_type missing edge_id=%lld",
                                         (long long)edge->id);
         }
         if (!edge_index_has_id(cbm_ht_get(gb->edges_by_type, edge->type), edge->id)) {
@@ -965,8 +960,7 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * the structural Project/Folder container. Never let extraction relabel
          * or attach a file path to that shared structural node (#787). */
         if (existing->label && label && strcmp(label, "Module") == 0 &&
-            (strcmp(existing->label, "Project") == 0 ||
-             strcmp(existing->label, "Folder") == 0)) {
+            (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
             return existing->id;
         }
 
@@ -979,15 +973,14 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
         const char *selected_label = use_next_source_span ? label : existing->label;
         const char *selected_name =
             use_next_source_span ? select_upsert_name(existing, label, name) : existing->name;
-        const char *selected_file_path =
-            use_next_source_span ? select_upsert_file_path(existing, label, file_path)
-                                 : (existing->file_path ? existing->file_path : "");
+        const char *selected_file_path = use_next_source_span
+                                             ? select_upsert_file_path(existing, label, file_path)
+                                             : (existing->file_path ? existing->file_path : "");
         int selected_start_line = use_next_source_span ? start_line : existing->start_line;
         int selected_end_line = use_next_source_span ? end_line : existing->end_line;
-        const char *selected_props = use_next_source_span
-                                         ? select_upsert_properties_json(existing, label,
-                                                                         properties_json)
-                                         : existing->properties_json;
+        const char *selected_props =
+            use_next_source_span ? select_upsert_properties_json(existing, label, properties_json)
+                                 : existing->properties_json;
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
@@ -1097,14 +1090,16 @@ int cbm_gbuf_find_by_name(const cbm_gbuf_t *gb, const char *name, const cbm_gbuf
 /* HC-1: DRY helper for name+label+file resolution fallback.
  * Used by pass_calls.c (B2) and pass_normalize.c (B17).
  * Runtime: O(1) hash + O(k) filter where k = name matches (~1-3). */
-const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(
-    const cbm_gbuf_t *gb, const char *qn, const char *file_path,
-    const char **label_filter, int label_count)
-{
-    if (!gb || !qn || !file_path) return NULL;
+const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(const cbm_gbuf_t *gb, const char *qn,
+                                                        const char *file_path,
+                                                        const char **label_filter,
+                                                        int label_count) {
+    if (!gb || !qn || !file_path)
+        return NULL;
     const char *dot = strrchr(qn, '.');
     const char *short_name = dot ? dot + 1 : qn;
-    if (!short_name[0]) return NULL;
+    if (!short_name[0])
+        return NULL;
 
     const cbm_gbuf_node_t **matches = NULL;
     int match_count = 0;
@@ -1113,7 +1108,8 @@ const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(
     for (int m = 0; m < match_count; m++) {
         if (!matches[m]->file_path || strcmp(matches[m]->file_path, file_path) != 0)
             continue;
-        if (!matches[m]->label) continue;
+        if (!matches[m]->label)
+            continue;
         for (int l = 0; l < label_count; l++) {
             if (strcmp(matches[m]->label, label_filter[l]) == 0)
                 return matches[m];
@@ -1642,14 +1638,12 @@ static bool merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
      * to the canonical container (#787). */
     bool module_on_container =
         existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
-        (strcmp(existing->label, "Project") == 0 ||
-         strcmp(existing->label, "Folder") == 0);
+        (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
     if (!module_on_container) {
         /* Mirror upsert's richer deterministic source-span selection so the
          * sequential and parallel paths choose the same representative node. */
-        bool use_next_source_span =
-            select_source_span_from_next(existing, sn->label, sn->file_path, sn->start_line,
-                                         sn->end_line);
+        bool use_next_source_span = select_source_span_from_next(existing, sn->label, sn->file_path,
+                                                                 sn->start_line, sn->end_line);
         const char *selected_label = use_next_source_span ? sn->label : existing->label;
         const char *selected_name = use_next_source_span
                                         ? select_upsert_name(existing, sn->label, sn->name)
@@ -1659,10 +1653,10 @@ static bool merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                  : (existing->file_path ? existing->file_path : "");
         int selected_start_line = use_next_source_span ? sn->start_line : existing->start_line;
         int selected_end_line = use_next_source_span ? sn->end_line : existing->end_line;
-        const char *selected_props = use_next_source_span
-                                         ? select_upsert_properties_json(existing, sn->label,
-                                                                         sn->properties_json)
-                                         : existing->properties_json;
+        const char *selected_props =
+            use_next_source_span
+                ? select_upsert_properties_json(existing, sn->label, sn->properties_json)
+                : existing->properties_json;
         char *new_name = heap_strdup(selected_name);
         if (selected_name && !new_name) {
             goto record_remap;
@@ -2256,7 +2250,6 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     int64_t *store_node_ids = NULL;
     cbm_node_t *store_nodes = NULL;
     cbm_edge_t *store_edges = NULL;
-    const char *phase = "begin_bulk";
     CBM_PROF_START(t_begin_bulk);
     int rc = cbm_store_begin_bulk(store);
     CBM_PROF_END("gbuf_flush", "0_begin_bulk", t_begin_bulk);
@@ -2264,7 +2257,6 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return rc;
     }
 
-    phase = "begin";
     CBM_PROF_START(t_begin);
     rc = cbm_store_begin(store);
     CBM_PROF_END("gbuf_flush", "1_begin", t_begin);
@@ -2277,7 +2269,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
      * tables owned by this project before the replacement graph is inserted.
      * This preserves sibling projects, including dependency subprojects; caller
      * code still owns contentless FTS rebuilds and user-authored project memory. */
-    phase = "delete_project";
+    const char *phase = "delete_project";
     CBM_PROF_START(t_delete_project);
     rc = cbm_store_delete_project(store, gb->project);
     CBM_PROF_END("gbuf_flush", "2_delete_project", t_delete_project);
@@ -2445,13 +2437,12 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     free(store_edges);
     return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
 
-fail:
-    {
-        char rc_str[CBM_SZ_32];
-        snprintf(rc_str, sizeof(rc_str), "%d", rc);
-        cbm_log_error("gbuf.flush.err", "phase", phase, "project", gb->project,
-                      "rc", rc_str, "store_error", cbm_store_error(store));
-    }
+fail: {
+    char rc_str[CBM_SZ_32];
+    snprintf(rc_str, sizeof(rc_str), "%d", rc);
+    cbm_log_error("gbuf.flush.err", "phase", phase, "project", gb->project, "rc", rc_str,
+                  "store_error", cbm_store_error(store));
+}
     (void)cbm_store_rollback(store);
     (void)cbm_store_end_bulk(store);
     free(temp_to_real);

@@ -396,8 +396,8 @@ static bool daemon_fingerprint_native_snapshot(uintptr_t native_file,
 #endif
     *snapshot = (daemon_fingerprint_snapshot_t){
         .field = {(uint64_t)status.st_dev, (uint64_t)status.st_ino, (uint64_t)status.st_size,
-                  (uint64_t)modified.tv_sec, (uint64_t)modified.tv_nsec,
-                  (uint64_t)changed.tv_sec, (uint64_t)changed.tv_nsec},
+                  (uint64_t)modified.tv_sec, (uint64_t)modified.tv_nsec, (uint64_t)changed.tv_sec,
+                  (uint64_t)changed.tv_nsec},
     };
     return true;
 }
@@ -1093,8 +1093,8 @@ static bool daemon_fingerprint_snapshot_equal(const daemon_fingerprint_snapshot_
     return true;
 }
 
-static bool daemon_fingerprint_cache_file_snapshot(
-    FILE *file, daemon_fingerprint_snapshot_t *snapshot) {
+static bool daemon_fingerprint_cache_file_snapshot(FILE *file,
+                                                   daemon_fingerprint_snapshot_t *snapshot) {
     if (!file || !snapshot) {
         return false;
     }
@@ -1118,9 +1118,8 @@ static bool daemon_fingerprint_cache_file_snapshot(
  * the image's native volume, file identity, size, and timestamps; descriptor
  * snapshots below reject cache or image replacement during admission. A
  * settled installed image retains O(1) cache admission time and memory. */
-static bool daemon_fingerprint_cache_newer_than_image(
-    const daemon_fingerprint_snapshot_t *cache,
-    const daemon_fingerprint_snapshot_t *image) {
+static bool daemon_fingerprint_cache_newer_than_image(const daemon_fingerprint_snapshot_t *cache,
+                                                      const daemon_fingerprint_snapshot_t *image) {
     if (!cache || !image) {
         return false;
     }
@@ -1144,8 +1143,7 @@ static bool daemon_fingerprint_cache_newer_than_image(
     uint64_t now_nsec = (uint64_t)now.tv_nsec;
     bool image_before_cache =
         image_sec < cache_sec || (image_sec == cache_sec && image_nsec < cache_nsec);
-    bool cache_not_future =
-        cache_sec < now_sec || (cache_sec == now_sec && cache_nsec <= now_nsec);
+    bool cache_not_future = cache_sec < now_sec || (cache_sec == now_sec && cache_nsec <= now_nsec);
     return image_before_cache && cache_not_future;
 #endif
 }
@@ -1186,11 +1184,11 @@ static bool daemon_fingerprint_cache_load(const char *cache_path,
     bool before_ok = daemon_fingerprint_cache_file_snapshot(file, &before);
     size_t length = fread(out, 1, DAEMON_SERVICE_FINGERPRINT_CACHE_CAP, file);
     int extra = length == DAEMON_SERVICE_FINGERPRINT_CACHE_CAP ? fgetc(file) : EOF;
-    bool read_ok = before_ok && !ferror(file) && extra == EOF &&
-                   daemon_fingerprint_cache_file_snapshot(file, &after) &&
-                   daemon_fingerprint_snapshot_equal(&before, &after) &&
-                   (!image_snapshot ||
-                    daemon_fingerprint_cache_newer_than_image(&after, image_snapshot));
+    bool read_ok =
+        before_ok && !ferror(file) && extra == EOF &&
+        daemon_fingerprint_cache_file_snapshot(file, &after) &&
+        daemon_fingerprint_snapshot_equal(&before, &after) &&
+        (!image_snapshot || daemon_fingerprint_cache_newer_than_image(&after, image_snapshot));
     bool close_ok = fclose(file) == 0;
     if (!read_ok || !close_ok) {
         return false;
@@ -1298,7 +1296,7 @@ static void daemon_fingerprint_cache_write(const char *cache_path,
     size_t previous_length = 0;
     bool previous_valid =
         daemon_fingerprint_cache_load(cache_path, NULL, previous, &previous_length) &&
-                          previous_length % record_length == 0;
+        previous_length % record_length == 0;
     char cache[DAEMON_SERVICE_FINGERPRINT_CACHE_CAP];
     size_t cache_length = 0;
     memcpy(cache, record, record_length);
@@ -1320,9 +1318,10 @@ static void daemon_fingerprint_cache_write(const char *cache_path,
     (void)cbm_write_file_atomic(cache_path, cache, cache_length, NULL);
 }
 
-bool cbm_daemon_build_fingerprint_native_file_cached(
-    uintptr_t native_file, const char *cache_path, bool allow_cache,
-    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out) {
+bool cbm_daemon_build_fingerprint_native_file_cached(uintptr_t native_file, const char *cache_path,
+                                                     bool allow_cache,
+                                                     char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE],
+                                                     bool *cache_hit_out) {
     if (!out) {
         return false;
     }
@@ -1373,18 +1372,17 @@ bool cbm_daemon_build_fingerprint_file_cached_for_testing(
         CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     free(wide);
-    bool ok =
-        file != INVALID_HANDLE_VALUE &&
-        cbm_daemon_build_fingerprint_native_file_cached((uintptr_t)file, cache_path, allow_cache,
-                                                        out, cache_hit_out);
+    bool ok = file != INVALID_HANDLE_VALUE &&
+              cbm_daemon_build_fingerprint_native_file_cached((uintptr_t)file, cache_path,
+                                                              allow_cache, out, cache_hit_out);
     if (file != INVALID_HANDLE_VALUE && !CloseHandle(file)) {
         ok = false;
     }
 #else
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     bool ok = fd >= 0 && fd_cloexec(fd) &&
-              cbm_daemon_build_fingerprint_native_file_cached((uintptr_t)fd, cache_path, allow_cache,
-                                                              out, cache_hit_out);
+              cbm_daemon_build_fingerprint_native_file_cached((uintptr_t)fd, cache_path,
+                                                              allow_cache, out, cache_hit_out);
     if (fd >= 0 && close(fd) != 0) {
         ok = false;
     }

@@ -26,9 +26,10 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
  * metadata. The owner-private directory containing cache_path is a caller
  * precondition. Cache I/O or validation failures fall back to hashing the
  * native file and never weaken the exact digest. */
-bool cbm_daemon_build_fingerprint_native_file_cached(
-    uintptr_t native_file, const char *cache_path, bool allow_cache,
-    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out);
+bool cbm_daemon_build_fingerprint_native_file_cached(uintptr_t native_file, const char *cache_path,
+                                                     bool allow_cache,
+                                                     char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE],
+                                                     bool *cache_hit_out);
 
 #if defined(CBM_CLI_ENABLE_TEST_API)
 /* Path-opening test seam for the native-file cache contract. Production

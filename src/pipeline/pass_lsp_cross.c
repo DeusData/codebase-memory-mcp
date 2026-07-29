@@ -283,8 +283,7 @@ static const char *pxc_json_string_dup(CBMArena *arena, yyjson_val *root, const 
     return str && str[0] ? cbm_arena_strdup(arena, str) : NULL;
 }
 
-static const char **pxc_json_string_array_dup(CBMArena *arena, yyjson_val *root,
-                                              const char *key) {
+static const char **pxc_json_string_array_dup(CBMArena *arena, yyjson_val *root, const char *key) {
     if (!arena || !root || !key) {
         return NULL;
     }
@@ -712,11 +711,10 @@ static bool pxc_language_for_store_path(const cbm_pipeline_ctx_t *ctx, const cha
     return false;
 }
 
-static const char *pxc_find_import_symbol_qn(CBMLSPDef *defs, int def_count,
-                                             const char *module_qn,
+static const char *pxc_find_import_symbol_qn(CBMLSPDef *defs, int def_count, const char *module_qn,
                                              const char *local_name) {
-    if (!defs || def_count <= 0 || !module_qn || !module_qn[0] || !local_name ||
-        !local_name[0] || strcmp(local_name, "*") == 0) {
+    if (!defs || def_count <= 0 || !module_qn || !module_qn[0] || !local_name || !local_name[0] ||
+        strcmp(local_name, "*") == 0) {
         return NULL;
     }
 
@@ -735,17 +733,16 @@ static const char *pxc_find_import_symbol_qn(CBMLSPDef *defs, int def_count,
     return NULL;
 }
 
-const char **cbm_pxc_refine_import_values_from_defs(CBMArena *arena, CBMLSPDef *defs,
-                                                    int def_count, const char **imp_keys,
-                                                    const char **imp_vals, int imp_count) {
+const char **cbm_pxc_refine_import_values_from_defs(CBMArena *arena, CBMLSPDef *defs, int def_count,
+                                                    const char **imp_keys, const char **imp_vals,
+                                                    int imp_count) {
     if (!arena || !defs || def_count <= 0 || !imp_keys || !imp_vals || imp_count <= 0) {
         return NULL;
     }
 
     const char **refined = NULL;
     for (int i = 0; i < imp_count; i++) {
-        const char *override =
-            pxc_find_import_symbol_qn(defs, def_count, imp_vals[i], imp_keys[i]);
+        const char *override = pxc_find_import_symbol_qn(defs, def_count, imp_vals[i], imp_keys[i]);
         if (!override || (imp_vals[i] && strcmp(override, imp_vals[i]) == 0)) {
             continue;
         }
@@ -763,9 +760,10 @@ const char **cbm_pxc_refine_import_values_from_defs(CBMArena *arena, CBMLSPDef *
     return refined;
 }
 
-static CBMLSPDef *pxc_collect_store_backed_defs_for_file(
-    const cbm_pipeline_ctx_t *ctx, CBMArena *arena, const char *const *imp_qns, int imp_count,
-    int *out_count) {
+static CBMLSPDef *pxc_collect_store_backed_defs_for_file(const cbm_pipeline_ctx_t *ctx,
+                                                         CBMArena *arena,
+                                                         const char *const *imp_qns, int imp_count,
+                                                         int *out_count) {
     if (out_count) {
         *out_count = 0;
     }
@@ -782,8 +780,8 @@ static CBMLSPDef *pxc_collect_store_backed_defs_for_file(
         ctx->store_backed_lsp_scope_cap, &candidate_qns, &candidate_count, &truncated);
     if (rc != CBM_STORE_OK || truncated || candidate_count <= 0) {
         if (truncated) {
-            cbm_log_info("lsp_cross.store_defs_skipped", "reason", "scope_truncated",
-                         "cap", itoa_buf(ctx->store_backed_lsp_scope_cap));
+            cbm_log_info("lsp_cross.store_defs_skipped", "reason", "scope_truncated", "cap",
+                         itoa_buf(ctx->store_backed_lsp_scope_cap));
         }
         for (int i = 0; i < candidate_count; i++) {
             free(candidate_qns[i]);
@@ -1373,11 +1371,10 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
         pxc_mark_module_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total);
     }
     if (pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
-        const char *namespace_key =
-            (caller_namespace && caller_namespace[0]) ? caller_namespace
-                                                      : PXC_DEFAULT_JVM_NAMESPACE;
-        pxc_module_entry_t *e =
-            (pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, namespace_key);
+        const char *namespace_key = (caller_namespace && caller_namespace[0])
+                                        ? caller_namespace
+                                        : PXC_DEFAULT_JVM_NAMESPACE;
+        pxc_module_entry_t *e = (pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, namespace_key);
         total += pxc_mark_entry_defs(selected, e, all_defs, caller_lang);
     }
 

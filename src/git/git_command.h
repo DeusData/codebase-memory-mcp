@@ -44,11 +44,11 @@ void cbm_git_output_cleanup(cbm_git_output_t *output);
 /* Remove trailing LF/CRLF bytes from one captured Git output line. */
 void cbm_git_trim_newlines(char *line);
 
-int cbm_git_capture_first_line_buf(const char *repo_path, const char *const git_args[],
-                                   char *out, size_t out_size);
+int cbm_git_capture_first_line_buf(const char *repo_path, const char *const git_args[], char *out,
+                                   size_t out_size);
 int cbm_git_capture_first_line(const char *repo_path, const char *const git_args[], char **out);
-int cbm_git_run_first_line_buf(const char *repo_path, const char *const git_args[],
-                               char *out, size_t out_size, int *out_exit_code);
+int cbm_git_run_first_line_buf(const char *repo_path, const char *const git_args[], char *out,
+                               size_t out_size, int *out_exit_code);
 int cbm_git_drain_command(const char *repo_path, const char *const git_args[]);
 
 #endif

@@ -22,7 +22,8 @@ typedef struct cbm_config cbm_config_t;
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
-#define CBM_DEP_PATH_MAX 4096 /* renamed: avoids collision with constants.h enum CBM_PATH_MAX (1024) */
+#define CBM_DEP_PATH_MAX \
+    4096 /* renamed: avoids collision with constants.h enum CBM_PATH_MAX (1024) */
 #define CBM_NAME_MAX 512
 #define CBM_DEP_SEPARATOR ".dep."
 #define CBM_DEP_SEPARATOR_LEN 5
@@ -50,24 +51,25 @@ extern const char *const CBM_MANIFEST_FILES[];
 /* ── Package Manager Enum ──────────────────────────────────────── */
 
 typedef enum {
-    CBM_PKG_UV = 0,  /* Python: uv/pip/poetry/pdm (pyproject.toml, setup.py, requirements.txt, Pipfile) */
-    CBM_PKG_CARGO,   /* Rust: cargo (Cargo.toml) */
-    CBM_PKG_NPM,     /* Node.js: npm/yarn/pnpm (package.json) */
-    CBM_PKG_BUN,     /* Bun: (bun.lockb) */
-    CBM_PKG_GO,      /* Go modules: (go.mod) */
-    CBM_PKG_JVM,     /* JVM: Maven/Gradle (pom.xml, build.gradle, build.gradle.kts) */
-    CBM_PKG_DOTNET,  /* .NET: NuGet (*.csproj, *.fsproj, global.json, Directory.Build.props) */
-    CBM_PKG_RUBY,    /* Ruby: Bundler (Gemfile) */
-    CBM_PKG_PHP,     /* PHP: Composer (composer.json) */
-    CBM_PKG_SWIFT,   /* Swift: SPM (Package.swift) */
-    CBM_PKG_DART,    /* Dart: pub (pubspec.yaml) */
-    CBM_PKG_MIX,     /* Elixir: Mix (mix.exs) */
-    CBM_PKG_MAKE,    /* C/C++: Make (Makefile, GNUmakefile) */
-    CBM_PKG_CMAKE,   /* C/C++: CMake (CMakeLists.txt, vcpkg.json) */
-    CBM_PKG_MESON,   /* C/C++: Meson (meson.build) */
-    CBM_PKG_CONAN,   /* C/C++: Conan (conanfile.txt, conanfile.py) */
-    CBM_PKG_CUSTOM,  /* Generic: vendored deps (vendor/, vendored/, third_party/, deps/, etc.) */
-    CBM_PKG_COUNT    /* sentinel / invalid */
+    CBM_PKG_UV =
+        0, /* Python: uv/pip/poetry/pdm (pyproject.toml, setup.py, requirements.txt, Pipfile) */
+    CBM_PKG_CARGO,  /* Rust: cargo (Cargo.toml) */
+    CBM_PKG_NPM,    /* Node.js: npm/yarn/pnpm (package.json) */
+    CBM_PKG_BUN,    /* Bun: (bun.lockb) */
+    CBM_PKG_GO,     /* Go modules: (go.mod) */
+    CBM_PKG_JVM,    /* JVM: Maven/Gradle (pom.xml, build.gradle, build.gradle.kts) */
+    CBM_PKG_DOTNET, /* .NET: NuGet (*.csproj, *.fsproj, global.json, Directory.Build.props) */
+    CBM_PKG_RUBY,   /* Ruby: Bundler (Gemfile) */
+    CBM_PKG_PHP,    /* PHP: Composer (composer.json) */
+    CBM_PKG_SWIFT,  /* Swift: SPM (Package.swift) */
+    CBM_PKG_DART,   /* Dart: pub (pubspec.yaml) */
+    CBM_PKG_MIX,    /* Elixir: Mix (mix.exs) */
+    CBM_PKG_MAKE,   /* C/C++: Make (Makefile, GNUmakefile) */
+    CBM_PKG_CMAKE,  /* C/C++: CMake (CMakeLists.txt, vcpkg.json) */
+    CBM_PKG_MESON,  /* C/C++: Meson (meson.build) */
+    CBM_PKG_CONAN,  /* C/C++: Conan (conanfile.txt, conanfile.py) */
+    CBM_PKG_CUSTOM, /* Generic: vendored deps (vendor/, vendored/, third_party/, deps/, etc.) */
+    CBM_PKG_COUNT   /* sentinel / invalid */
 } cbm_pkg_manager_t;
 
 /* Parse "uv"/"cargo"/"npm"/"bun"/etc → enum. Returns CBM_PKG_COUNT if unknown. */
@@ -133,9 +135,8 @@ typedef struct {
 /* Discover installed deps by querying the indexed graph.
  * store: open store with freshly indexed project.
  * Returns 0 on success. Caller must call cbm_dep_discovered_free(). */
-int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
-                                cbm_store_t *store, const char *project_name,
-                                cbm_dep_discovered_t **out, int *count,
+int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root, cbm_store_t *store,
+                                const char *project_name, cbm_dep_discovered_t **out, int *count,
                                 int max_results);
 void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count);
 
@@ -147,24 +148,20 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count);
  * thresholds as the parent project pipeline and max_deps is the fallback
  * configured package cap. Without cfg, max_deps is already effective.
  * Returns number of deps indexed, or 0 if none. */
-int cbm_dep_auto_index(const char *project_name, const char *project_root,
-                       cbm_store_t *store, int max_deps, cbm_config_t *cfg);
+int cbm_dep_auto_index(const char *project_name, const char *project_root, cbm_store_t *store,
+                       int max_deps, cbm_config_t *cfg);
 
 /* Same as cbm_dep_auto_index(), but the package limit is already effective:
  * 0 disables, <0 is unlimited, >0 caps packages. cfg still configures each
  * dependency pipeline for non-limit settings. */
 int cbm_dep_auto_index_effective(const char *project_name, const char *project_root,
-                                 cbm_store_t *store, int effective_max_deps,
-                                 cbm_config_t *cfg);
+                                 cbm_store_t *store, int effective_max_deps, cbm_config_t *cfg);
 
 /* Observable variant used by MCP responses and logs. The legacy return value
  * remains the number of dependency projects reindexed in this call. */
-int cbm_dep_auto_index_effective_with_stats(const char *project_name,
-                                            const char *project_root,
-                                            cbm_store_t *store,
-                                            int effective_max_deps,
-                                            cbm_config_t *cfg,
-                                            cbm_dep_auto_index_stats_t *stats);
+int cbm_dep_auto_index_effective_with_stats(const char *project_name, const char *project_root,
+                                            cbm_store_t *store, int effective_max_deps,
+                                            cbm_config_t *cfg, cbm_dep_auto_index_stats_t *stats);
 
 /* ── Cross-Boundary Edges ──────────────────────────────────────── */
 

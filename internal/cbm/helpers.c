@@ -6,7 +6,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat.h" // CBM_TLS
 #include <limits.h>
-#include <stdlib.h>            // calloc/free for the symbol-set cache
+#include <stdlib.h> // calloc/free for the symbol-set cache
 
 enum {
     MIN_ROUTE_LEN = 3,

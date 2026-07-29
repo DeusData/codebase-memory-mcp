@@ -55,16 +55,16 @@ static const char *ALWAYS_SKIP_DIRS[] = {
 
 /* Prefix patterns for vendored directory names that vary (e.g. "vendored_libs",
  * "vendor-bundle"). Checked when exact match fails. Kept short for performance. */
-static const char *VENDORED_DIR_PREFIXES[] = {
-    "vendor", "3rdparty", "third_party", "thirdparty", NULL};
+static const char *VENDORED_DIR_PREFIXES[] = {"vendor", "3rdparty", "third_party", "thirdparty",
+                                              NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "migrations",  "seeds",
-    "e2e",       "integration",   "locale",         "locales",      "i18n",         "l10n",
-    "scripts",   "tools",         "hack",           "bin",          "build",        "out",
+    "generated", "gen",           "auto-generated", "fixtures",     "testdata",   "test_data",
+    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",   "docs",
+    "doc",       "documentation", "examples",       "example",      "samples",    "sample",
+    "assets",    "static",        "public",         "media",        "migrations", "seeds",
+    "e2e",       "integration",   "locale",         "locales",      "i18n",       "l10n",
+    "scripts",   "tools",         "hack",           "bin",          "build",      "out",
     NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
@@ -107,16 +107,13 @@ static const char *FAST_PATTERNS[] = {".d.ts",      ".bundle.", ".chunk.", ".gen
  * needed by pass_configlink and dep auto-discovery. Tree-sitter JSON
  * grammar + extract_defs.c already handle them correctly. */
 static const char *IGNORED_JSON_FILES[] = {
-    "package-lock.json",  "tsconfig.json",
-    "jsconfig.json",      "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
+    "package-lock.json", "tsconfig.json",     "jsconfig.json",      "composer.lock",
+    "yarn.lock",         "openapi.json",      "swagger.json",       "jest.config.json",
+    ".eslintrc.json",    ".prettierrc.json",  ".babelrc.json",      "tslint.json",
+    "angular.json",      "firebase.json",     "renovate.json",      "lerna.json",
+    "turbo.json",        ".stylelintrc.json", "pnpm-lock.json",     "deno.json",
+    "biome.json",        "devcontainer.json", ".devcontainer.json", "launch.json",
+    "settings.json",     "extensions.json",   "tasks.json",         NULL};
 
 /* ── Helper: check if string is in NULL-terminated array ─────────── */
 
@@ -350,15 +347,11 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
 /* DEP mode: minimal skip list — only VCS, IDE, caches, test dirs.
  * Keeps vendor/, dist/, bin/, scripts/, third_party/ for dep source. */
 static const char *DEP_SKIP_DIRS[] = {
-    ".git", ".hg", ".svn",
-    ".idea", ".vs", ".vscode",
-    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    ".cache", "htmlcov", "coverage",
-    "node_modules",
-    ".next", ".nuxt", ".angular",
-    "__tests__", "__mocks__", "__snapshots__",
-    NULL
-};
+    ".git",    ".hg",         ".svn",        ".idea",         ".vs",
+    ".vscode", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".cache",  "htmlcov",     "coverage",    "node_modules",  ".next",
+    ".nuxt",   ".angular",    "__tests__",   "__mocks__",     "__snapshots__",
+    NULL};
 
 /* Check if dirname starts with any vendored prefix (e.g. "vendor-bundle",
  * "vendored_libs", "third_party_deps"). Catches naming variations that
@@ -382,7 +375,7 @@ static bool has_vendored_prefix(const char *dirname) {
 
 const char *cbm_index_mode_name(cbm_index_mode_t mode) {
 #define CBM_INDEX_MODE_NAME_CASE(enum_value, spelling, caller_selectable) \
-    case enum_value:                                                     \
+    case enum_value:                                                      \
         return spelling;
     switch (mode) {
         CBM_INDEX_MODE_TABLE(CBM_INDEX_MODE_NAME_CASE)
@@ -398,14 +391,14 @@ bool cbm_index_mode_from_name(const char *name, cbm_index_mode_t *out,
         return false;
     }
 #define CBM_INDEX_MODE_PARSE_ARM(enum_value, spelling, caller_selectable) \
-    if (strcmp(name, spelling) == 0) {                                   \
-        if (out) {                                                       \
-            *out = (enum_value);                                         \
-        }                                                                \
-        if (caller_selectable_out) {                                     \
-            *caller_selectable_out = (caller_selectable);                \
-        }                                                                \
-        return true;                                                     \
+    if (strcmp(name, spelling) == 0) {                                    \
+        if (out) {                                                        \
+            *out = (enum_value);                                          \
+        }                                                                 \
+        if (caller_selectable_out) {                                      \
+            *caller_selectable_out = (caller_selectable);                 \
+        }                                                                 \
+        return true;                                                      \
     }
     CBM_INDEX_MODE_TABLE(CBM_INDEX_MODE_PARSE_ARM)
 #undef CBM_INDEX_MODE_PARSE_ARM
@@ -418,13 +411,13 @@ int cbm_index_mode_accepted(char *buf, int bufsize) {
     }
     buf[0] = '\0';
     int pos = 0;
-#define CBM_INDEX_MODE_ACCEPTED_ARM(enum_value, spelling, caller_selectable)     \
-    if (caller_selectable) {                                                    \
-        int written = snprintf(buf + pos, (size_t)(bufsize - pos), "%s%s",      \
-                               pos > 0 ? "|" : "", spelling);                   \
-        if (written > 0 && written < bufsize - pos) {                           \
-            pos += written;                                                     \
-        }                                                                       \
+#define CBM_INDEX_MODE_ACCEPTED_ARM(enum_value, spelling, caller_selectable)                    \
+    if (caller_selectable) {                                                                    \
+        int written =                                                                           \
+            snprintf(buf + pos, (size_t)(bufsize - pos), "%s%s", pos > 0 ? "|" : "", spelling); \
+        if (written > 0 && written < bufsize - pos) {                                           \
+            pos += written;                                                                     \
+        }                                                                                       \
     }
     CBM_INDEX_MODE_TABLE(CBM_INDEX_MODE_ACCEPTED_ARM)
 #undef CBM_INDEX_MODE_ACCEPTED_ARM
@@ -499,11 +492,8 @@ bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode) {
 
 /* DEP mode skip patterns: skip tests/mocks but NOT .d.ts (TS API surface) */
 static const char *DEP_SKIP_PATTERNS[] = {
-    ".spec.", ".test.", ".stories.",
-    "mock_", "_mock.", "_test_helpers.",
-    ".generated.", ".pb.go", "_pb2.py",
-    NULL
-};
+    ".spec.",         ".test.",      ".stories.", "mock_",   "_mock.",
+    "_test_helpers.", ".generated.", ".pb.go",    "_pb2.py", NULL};
 
 bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode) {
     /* DEP uses its own DEP_SKIP_PATTERNS (keeping the .d.ts TypeScript API

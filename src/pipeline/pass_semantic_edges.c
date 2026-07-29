@@ -432,13 +432,11 @@ static bool token_capacity_for_node(const cbm_gbuf_node_t *node, const cbm_gbuf_
     if (!node || !out_capacity) {
         return false;
     }
-    size_t capacity =
-        (size_t)MAX_CALLEES * CBM_SEM_EDGE_MAX_CALLEE_PATTERN_TOKENS +
-        CBM_SEM_EDGE_MAX_LOCAL_PATTERN_TOKENS + SKIP_ONE;
-    const char *stable_qn = node->qualified_name
-                                ? cbm_pipeline_fqn_without_project(project_name,
-                                                                   node->qualified_name)
-                                : NULL;
+    size_t capacity = (size_t)MAX_CALLEES * CBM_SEM_EDGE_MAX_CALLEE_PATTERN_TOKENS +
+                      CBM_SEM_EDGE_MAX_LOCAL_PATTERN_TOKENS + SKIP_ONE;
+    const char *stable_qn =
+        node->qualified_name ? cbm_pipeline_fqn_without_project(project_name, node->qualified_name)
+                             : NULL;
     if (!token_capacity_add_text(&capacity, node->name) ||
         !token_capacity_add_text(&capacity, stable_qn) ||
         !token_capacity_add_text(&capacity, node->file_path) ||
@@ -596,8 +594,8 @@ static int json_str_array(const char *json, const char *key, char **out, int max
 /* Tokenize one complete JSON string field. The per-node capacity calculation
  * accounts for every properties_json byte, so this temporary copy removes the
  * former 512-byte prefix without repeated token-array growth. */
-static bool tokenize_json_string_field(const char *json, const char *key, char **tokens,
-                                       int *count, int max_tokens) {
+static bool tokenize_json_string_field(const char *json, const char *key, char **tokens, int *count,
+                                       int max_tokens) {
     const char *start = NULL;
     size_t len = 0;
     if (!json_str_span(json, key, &start, &len)) {
@@ -664,8 +662,8 @@ static bool tokenize_json_array_field(const char *json, const char *key, char **
 /* Walk the CALLS edges rooted at n (either outbound or inbound depending on
  * `outbound`) and tokenize the names of the target/source nodes.  Caller-side
  * caps via max_tokens and MAX_CALLEES. */
-static int tokenize_call_neighbor_names(const char **names, int name_count, char **tokens, int count,
-                                        int max_tokens) {
+static int tokenize_call_neighbor_names(const char **names, int name_count, char **tokens,
+                                        int count, int max_tokens) {
     if (!names || count >= max_tokens) {
         return count;
     }
@@ -682,8 +680,7 @@ static bool tokenize_node(const cbm_gbuf_node_t *n, const char *project_name,
     int count = 0;
     count += cbm_sem_tokenize(n->name, tokens + count, max_tokens - count);
     if (n->qualified_name && count < max_tokens) {
-        const char *stable_qn =
-            cbm_pipeline_fqn_without_project(project_name, n->qualified_name);
+        const char *stable_qn = cbm_pipeline_fqn_without_project(project_name, n->qualified_name);
         count += cbm_sem_tokenize(stable_qn, tokens + count, max_tokens - count);
     }
     if (n->file_path && count < max_tokens) {
@@ -707,8 +704,7 @@ static bool tokenize_node(const cbm_gbuf_node_t *n, const char *project_name,
             return false;
         }
     }
-    count =
-        tokenize_call_neighbor_names(outbound_names, outbound_count, tokens, count, max_tokens);
+    count = tokenize_call_neighbor_names(outbound_names, outbound_count, tokens, count, max_tokens);
 
     /* Caller names: what CALLS this function (contextual vocabulary).
      * Functions called by error handlers inherit "error" context. */
@@ -722,7 +718,8 @@ static bool tokenize_node(const cbm_gbuf_node_t *n, const char *project_name,
 static void build_api_vec(const cbm_gbuf_t *gbuf, int64_t node_id, cbm_sem_vec_t *out) {
     memset(out, 0, sizeof(*out));
     const char *names[MAX_CALLEES];
-    int name_count = collect_call_neighbor_names(gbuf, node_id, /*outbound=*/true, names, MAX_CALLEES);
+    int name_count =
+        collect_call_neighbor_names(gbuf, node_id, /*outbound=*/true, names, MAX_CALLEES);
     for (int i = 0; i < name_count; i++) {
         cbm_sem_vec_t callee_ri;
         cbm_sem_random_index(names[i], &callee_ri);
@@ -840,8 +837,8 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
         int outbound_count = 0;
         int inbound_count = 0;
         int capacity = 0;
-        if (!token_capacity_for_node(n, tc->gbuf, tc->project_name, outbound_names,
-                                     &outbound_count, inbound_names, &inbound_count, &capacity)) {
+        if (!token_capacity_for_node(n, tc->gbuf, tc->project_name, outbound_names, &outbound_count,
+                                     inbound_names, &inbound_count, &capacity)) {
             cbm_log_error("pass.semantic.tokenize_failed", "reason", "capacity", "function",
                           n->qualified_name ? n->qualified_name : n->name);
             atomic_store_explicit(&tc->alloc_failed, true, memory_order_relaxed);
@@ -859,8 +856,7 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
         int count = 0;
         bool complete = tokenize_node(n, tc->project_name, outbound_names, outbound_count,
                                       inbound_names, inbound_count, dst, capacity, &count);
-        count =
-            inject_pattern_tokens(n, outbound_names, outbound_count, dst, count, capacity);
+        count = inject_pattern_tokens(n, outbound_names, outbound_count, dst, count, capacity);
         if (tc->pools && tc->pools[worker_id]) {
             CBMHashTable *pool = tc->pools[worker_id];
             for (int t = 0; t < count; t++) {
@@ -1135,8 +1131,9 @@ static int score_collect_candidates(score_ctx_t *sc, int i, int *seen,
     int cand_count = 0;
     for (int b = 0; b < SEM_LSH_BANDS; b++) {
         int shift = b * SEM_LSH_ROWS;
-        uint32_t band_val = (uint32_t)((sc->signatures[i] >> shift) &
-                                       ((CBM_SEM_EDGE_ONE_ULL << SEM_LSH_ROWS) - CBM_SEM_EDGE_ONE_ULL));
+        uint32_t band_val =
+            (uint32_t)((sc->signatures[i] >> shift) &
+                       ((CBM_SEM_EDGE_ONE_ULL << SEM_LSH_ROWS) - CBM_SEM_EDGE_ONE_ULL));
         uint64_t bh = XXH3_64bits_withSeed(&band_val, sizeof(band_val), (uint64_t)b);
         uint32_t bucket_idx = (uint32_t)(bh & SEM_BUCKET_MASK);
         int bcount = sc->band_buckets[b][bucket_idx].count;
@@ -1228,7 +1225,8 @@ static void collect_worker(int worker_id, void *ctx_ptr) {
     (void)worker_id;
     collect_ctx_t *cc = ctx_ptr;
     while (true) {
-        int f = atomic_fetch_add_explicit(&cc->next_idx, CBM_SEM_EDGE_BATCH_64, memory_order_relaxed);
+        int f =
+            atomic_fetch_add_explicit(&cc->next_idx, CBM_SEM_EDGE_BATCH_64, memory_order_relaxed);
         if (f >= cc->func_count) {
             break;
         }
@@ -1310,8 +1308,7 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
                 }
                 if (func_count > 0) {
                     memcpy(grown, funcs, (size_t)func_count * sizeof(cbm_sem_func_t));
-                    memcpy(np_grown, node_ptrs,
-                           (size_t)func_count * sizeof(cbm_gbuf_node_t *));
+                    memcpy(np_grown, node_ptrs, (size_t)func_count * sizeof(cbm_gbuf_node_t *));
                 }
                 free(funcs);
                 free(node_ptrs);
@@ -1357,8 +1354,9 @@ static bool phase5c_build_lsh_buckets(const uint64_t *signatures, int func_count
     for (int f = 0; f < func_count; f++) {
         for (int b = 0; b < SEM_LSH_BANDS; b++) {
             int shift = b * SEM_LSH_ROWS;
-            uint32_t band_val = (uint32_t)((signatures[f] >> shift) &
-                                           ((CBM_SEM_EDGE_ONE_ULL << SEM_LSH_ROWS) - CBM_SEM_EDGE_ONE_ULL));
+            uint32_t band_val =
+                (uint32_t)((signatures[f] >> shift) &
+                           ((CBM_SEM_EDGE_ONE_ULL << SEM_LSH_ROWS) - CBM_SEM_EDGE_ONE_ULL));
             uint64_t bh = XXH3_64bits_withSeed(&band_val, sizeof(band_val), (uint64_t)b);
             uint32_t bucket_idx = (uint32_t)(bh & SEM_BUCKET_MASK);
             sem_bucket_t *bucket = &band_buckets[b][bucket_idx];
@@ -1513,9 +1511,9 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
 /* Phase 2: tokenize each function's metadata into an independently sized
  * array. Returns false after all workers join if any document allocation or
  * complete-field tokenization failed. */
-static bool phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf,
-                            char ***doc_tokens, int *token_counts, int func_count,
-                            int worker_count, CBMHashTable **pools, const char *project_name) {
+static bool phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char ***doc_tokens,
+                            int *token_counts, int func_count, int worker_count,
+                            CBMHashTable **pools, const char *project_name) {
     tokenize_ctx_t tc = {
         .node_ptrs = node_ptrs,
         .gbuf = gbuf,
@@ -1612,10 +1610,10 @@ static bool phase5_lsh_build(cbm_sem_func_t *funcs, int func_count, int worker_c
 }
 
 /* Phase 6a: score candidate pairs in parallel and collect deferred edges. */
-static bool phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures,
-                                     int *edge_counts, sem_bucket_t **band_buckets,
-                                     cbm_sem_config_t cfg, deferred_edge_buf_t *worker_bufs,
-                                     int func_count, int worker_count) {
+static bool phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures, int *edge_counts,
+                                     sem_bucket_t **band_buckets, cbm_sem_config_t cfg,
+                                     deferred_edge_buf_t *worker_bufs, int func_count,
+                                     int worker_count) {
     score_ctx_t sc = {
         .funcs = funcs,
         .signatures = signatures,
@@ -1669,8 +1667,8 @@ static void free_lsh_buckets(sem_bucket_t **band_buckets) {
 /* Phases 3a/3b/3c bundled: create corpus, batch-add docs, finalize, export
  * enriched token vectors to the graph buffer.  Returns the new corpus, which
  * the caller must cbm_sem_corpus_free() later. */
-static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char ***doc_tokens,
-                                          int *token_counts, int func_count, int worker_count) {
+static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char ***doc_tokens, int *token_counts,
+                                          int func_count, int worker_count) {
     CBM_PROF_START(t_phase3a);
     cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
     if (!corpus) {
@@ -1720,7 +1718,7 @@ static int run_scoring_phase(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs, uint64_t *
 
     CBM_PROF_START(t_phase6a);
     bool scoring_complete = phase6a_score_candidates(funcs, signatures, edge_counts, band_buckets,
-                                                      cfg, worker_bufs, func_count, worker_count);
+                                                     cfg, worker_bufs, func_count, worker_count);
     CBM_PROF_END_N("semantic_edges", "6a_score_deterministic", t_phase6a, func_count);
     if (!scoring_complete) {
         for (int w = 0; w < worker_count; w++) {
@@ -1749,8 +1747,7 @@ static void free_token_pool_entry(const char *key, void *value, void *ud) {
 
 /* With pools, token-list slots borrow strings and each pool owns one copy per
  * unique token. Without pools, each populated slot owns its strdup directly. */
-static void free_funcs_and_tokens(cbm_sem_func_t *funcs, int func_count,
-                                  char ***doc_tokens,
+static void free_funcs_and_tokens(cbm_sem_func_t *funcs, int func_count, char ***doc_tokens,
                                   const int *token_counts, CBMHashTable **pools, int worker_count) {
     for (int f = 0; f < func_count; f++) {
         free(funcs[f].tfidf_indices);
@@ -1886,8 +1883,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_phase5);
     uint64_t *signatures = NULL;
     sem_bucket_t **band_buckets = NULL;
-    bool lsh_ready =
-        phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
+    bool lsh_ready = phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
     CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
 
     if (!lsh_ready) {

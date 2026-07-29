@@ -34,7 +34,7 @@
 enum {
     CHAN_CONST_INITIAL_CAPACITY = CBM_SZ_32,
     CHAN_STACK_CAP = CBM_SZ_4K, /* initial traversal stack capacity */
-    CHAN_DIR_UNKNOWN = -1, /* unrecognized method → no channel */
+    CHAN_DIR_UNKNOWN = -1,      /* unrecognized method → no channel */
 };
 
 typedef struct {
@@ -97,8 +97,7 @@ static const char *literal_from_first_child(CBMExtractCtx *ctx, TSNode node) {
 
 /* ── Constant resolution table ──────────────────────────────────── */
 
-static bool chan_const_table_append(chan_const_table_t *tbl, const char *name,
-                                    const char *value) {
+static bool chan_const_table_append(chan_const_table_t *tbl, const char *name, const char *value) {
     if (!tbl || !name || !value) {
         return true;
     }
@@ -113,8 +112,7 @@ static bool chan_const_table_append(chan_const_table_t *tbl, const char *name,
         if ((size_t)next_capacity > SIZE_MAX / sizeof(*tbl->items)) {
             return false;
         }
-        chan_const_t *grown =
-            realloc(tbl->items, (size_t)next_capacity * sizeof(*tbl->items));
+        chan_const_t *grown = realloc(tbl->items, (size_t)next_capacity * sizeof(*tbl->items));
         if (!grown) {
             return false;
         }
@@ -249,9 +247,7 @@ static const char *resolve_identifier(const chan_const_table_t *tbl, const char 
             hi = mid;
         }
     }
-    return lo < tbl->count && strcmp(tbl->items[lo].name, name) == 0
-               ? tbl->items[lo].value
-               : NULL;
+    return lo < tbl->count && strcmp(tbl->items[lo].name, name) == 0 ? tbl->items[lo].value : NULL;
 }
 
 /* ── Enclosing function detection ───────────────────────────────── */

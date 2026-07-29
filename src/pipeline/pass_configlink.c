@@ -197,7 +197,8 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
      * containment runs pick different candidates when graph iteration order
      * differed, breaking incremental/fresh parity on large repositories. */
     config_entry_t *config_entries = calloc((size_t)var_count, sizeof(config_entry_t));
-    if (!config_entries) return 0;
+    if (!config_entries)
+        return 0;
     int config_count = collect_config_entries(vars, var_count, config_entries, var_count);
 
     if (config_count == 0) {
@@ -211,7 +212,10 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
         return 0;
     }
     code_entry_t *code_entries = calloc((size_t)code_cap, sizeof(code_entry_t));
-    if (!code_entries) { free(config_entries); return 0; }
+    if (!code_entries) {
+        free(config_entries);
+        return 0;
+    }
     int code_count = collect_code_entries(gb, code_entries, code_cap);
 
     int edge_count = 0;
@@ -349,7 +353,8 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
     /* Heap-allocate from discovered variable count; large manifests should not
      * silently truncate dependency candidates. */
     dep_entry_t *deps = calloc((size_t)var_count, sizeof(dep_entry_t));
-    if (!deps) return 0;
+    if (!deps)
+        return 0;
     int dep_count = collect_manifest_deps(vars, var_count, deps, var_count);
 
     if (dep_count == 0) {
@@ -385,13 +390,12 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
             double confidence = match_dep_to_import(target, dep_lower);
             if (confidence > 0.0) {
                 char props[CBM_SZ_512];
-                snprintf(
-                    props, sizeof(props),
-                    "{\"strategy\":\"%s\",\"confidence\":%.2f,\"dep_name\":\"%s\"}",
-                    configlink_strategy_dep_import, confidence, deps[di].name);
+                snprintf(props, sizeof(props),
+                         "{\"strategy\":\"%s\",\"confidence\":%.2f,\"dep_name\":\"%s\"}",
+                         configlink_strategy_dep_import, confidence, deps[di].name);
 
-                cbm_gbuf_insert_edge(gb, source->id, deps[di].node_id,
-                                     configlink_edge_configures, props);
+                cbm_gbuf_insert_edge(gb, source->id, deps[di].node_id, configlink_edge_configures,
+                                     props);
                 edge_count++;
             }
         }

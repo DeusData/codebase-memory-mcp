@@ -223,7 +223,7 @@ typedef struct {
     _Atomic uint64_t omitted_candidates;
     _Atomic uint64_t noisy_bucket_visits;
     _Atomic bool query_allocation_failed;
-    double threshold;         /* Jaccard cutoff; <=0 = use CBM_MINHASH_JACCARD_THRESHOLD */
+    double threshold; /* Jaccard cutoff; <=0 = use CBM_MINHASH_JACCARD_THRESHOLD */
 } sim_query_ctx_t;
 
 enum { SIM_CAND_CAP = 4096 };
@@ -292,8 +292,7 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             double jaccard = cbm_minhash_jaccard(&src->fp, cand->fingerprint);
             /* Configurable threshold (#41): sc carries the tunable value from
              * the pipeline ctx; <=0 (unset) falls back to the default. */
-            double threshold = sc->threshold > 0.0 ? sc->threshold
-                                                   : CBM_MINHASH_JACCARD_THRESHOLD;
+            double threshold = sc->threshold > 0.0 ? sc->threshold : CBM_MINHASH_JACCARD_THRESHOLD;
             if (jaccard < threshold) {
                 continue;
             }

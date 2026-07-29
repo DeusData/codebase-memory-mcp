@@ -477,7 +477,7 @@ static bool client_start_parent_watchdog(pid_t initial_ppid) {
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE                                                                            \
+#define CLI_USAGE \
     "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [--flag value ...]\n"
 
 static bool cli_args_request_help(int argc, char **argv) {
@@ -1138,9 +1138,8 @@ static main_build_identity_status_t main_build_identity(
      * modes produce the same SHA-256, while cached_exact reduces unchanged
      * startup work from O(executable bytes) to O(1) metadata and record I/O. */
     cbm_config_t *config = cbm_config_open_readonly(canonical_cache);
-    const char *fingerprint_mode =
-        cbm_config_get_effective(config, CBM_CONFIG_BUILD_FINGERPRINT_MODE,
-                                 CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT);
+    const char *fingerprint_mode = cbm_config_get_effective(
+        config, CBM_CONFIG_BUILD_FINGERPRINT_MODE, CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT);
     bool cached_exact =
         fingerprint_mode &&
         strcmp(fingerprint_mode, CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT) == 0;
@@ -1156,9 +1155,8 @@ static main_build_identity_status_t main_build_identity(
     int fingerprint_cache_written =
         snprintf(fingerprint_cache_path, sizeof(fingerprint_cache_path), "%s/%s", canonical_cache,
                  CBM_DAEMON_BUILD_FINGERPRINT_CACHE_BASENAME);
-    bool cache_path_ready =
-        fingerprint_cache_written > 0 &&
-        fingerprint_cache_written < (int)sizeof(fingerprint_cache_path);
+    bool cache_path_ready = fingerprint_cache_written > 0 &&
+                            fingerprint_cache_written < (int)sizeof(fingerprint_cache_path);
     if (fingerprint_cache_out && cached_exact && cache_path_ready) {
         memcpy(fingerprint_cache_out->path, fingerprint_cache_path,
                (size_t)fingerprint_cache_written + 1U);

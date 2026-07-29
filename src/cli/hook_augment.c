@@ -1174,24 +1174,23 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
     };
     const char *cache_dir = cbm_resolve_cache_dir();
     cbm_config_t *cfg = cache_dir ? cbm_config_open_readonly(cache_dir) : NULL;
-    const char *tool_mode = cbm_config_get_effective(
-        cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED);
+    const char *tool_mode =
+        cbm_config_get_effective(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED);
     result.streamlined = strcmp(tool_mode, CBM_CONFIG_TOOL_MODE_CLASSIC) != 0;
     result.auto_index = cbm_config_get_effective_bool(cfg, CBM_CONFIG_AUTO_INDEX, true);
     result.context_injection =
         cbm_config_get_effective_bool(cfg, CBM_CONFIG_CONTEXT_INJECTION, true);
     result.auto_watch = cbm_config_get_effective_bool(cfg, CBM_CONFIG_AUTO_WATCH, true);
-    result.auto_index_deps = cbm_config_get_effective_bool(
-        cfg, CBM_CONFIG_AUTO_INDEX_DEPS, CBM_DEFAULT_AUTO_INDEX_DEPS);
-    result.auto_index_limit =
-        cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT,
-                                     CBM_DEFAULT_AUTO_INDEX_LIMIT);
+    result.auto_index_deps =
+        cbm_config_get_effective_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, CBM_DEFAULT_AUTO_INDEX_DEPS);
+    result.auto_index_limit = cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                                           CBM_DEFAULT_AUTO_INDEX_LIMIT);
     int configured_dep_limit =
         cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, CBM_DEFAULT_AUTO_DEP_LIMIT);
     result.auto_dep_limit =
         cbm_dep_normalize_configured_limit(configured_dep_limit, CBM_DEFAULT_AUTO_DEP_LIMIT);
-    int configured_dep_max_files = cbm_config_get_effective_int(
-        cfg, CBM_CONFIG_DEP_MAX_FILES, CBM_DEFAULT_DEP_MAX_FILES);
+    int configured_dep_max_files =
+        cbm_config_get_effective_int(cfg, CBM_CONFIG_DEP_MAX_FILES, CBM_DEFAULT_DEP_MAX_FILES);
     result.dep_max_files = cbm_dep_normalize_file_limit(configured_dep_max_files);
     if (cfg) {
         cbm_config_close(cfg);
@@ -1199,8 +1198,7 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
     return result;
 }
 
-static void ha_format_api_guidance(const ha_guidance_config_t *cfg, char *out,
-                                   size_t out_size) {
+static void ha_format_api_guidance(const ha_guidance_config_t *cfg, char *out, size_t out_size) {
     if (cfg->streamlined) {
         const char *automatic = "";
         if (cfg->auto_index && cfg->context_injection) {
@@ -1260,9 +1258,8 @@ static void ha_format_freshness_guidance(const ha_guidance_config_t *cfg, char *
                  : "Freshness: auto_watch=false; refresh explicitly after Git changes.");
 }
 
-static void ha_format_no_project_guidance(const char *event,
-                                          const ha_guidance_config_t *cfg, char *out,
-                                          size_t out_size) {
+static void ha_format_no_project_guidance(const char *event, const ha_guidance_config_t *cfg,
+                                          char *out, size_t out_size) {
     bool subagent = event && strcmp(event, "SubagentStart") == 0;
     if (subagent) {
         if (cfg->auto_index) {
@@ -1346,10 +1343,8 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
     char freshness_guidance[CBM_SZ_256];
     char evidence_guidance[CBM_SZ_1K];
     ha_format_api_guidance(&guidance_cfg, api_guidance, sizeof(api_guidance));
-    ha_format_dependency_guidance(&guidance_cfg, dependency_guidance,
-                                  sizeof(dependency_guidance));
-    ha_format_freshness_guidance(&guidance_cfg, freshness_guidance,
-                                 sizeof(freshness_guidance));
+    ha_format_dependency_guidance(&guidance_cfg, dependency_guidance, sizeof(dependency_guidance));
+    ha_format_freshness_guidance(&guidance_cfg, freshness_guidance, sizeof(freshness_guidance));
     ha_format_evidence_guidance(tier, evidence_guidance, sizeof(evidence_guidance));
     if (project) {
         char safe_project[HA_METADATA_CAP];
@@ -1361,8 +1356,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  evidence_guidance);
     } else {
         char index_guidance[CBM_SZ_512];
-        ha_format_no_project_guidance(event, &guidance_cfg, index_guidance,
-                                      sizeof(index_guidance));
+        ha_format_no_project_guidance(event, &guidance_cfg, index_guidance, sizeof(index_guidance));
         snprintf(context, sizeof(context),
                  "[codebase-memory] %s context: no indexed graph project matched this working "
                  "directory. %s %s %s %s Once indexed, %s",

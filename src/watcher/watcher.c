@@ -465,8 +465,7 @@ static bool watcher_store_has_project(cbm_store_t *store, const char *project_na
         return true;
     }
     if (rc != CBM_STORE_NOT_FOUND) {
-        cbm_log_warn("watcher.dirty_ledger.warn", "project", project_name, "phase",
-                     "get_project");
+        cbm_log_warn("watcher.dirty_ledger.warn", "project", project_name, "phase", "get_project");
     }
     return false;
 }
@@ -572,8 +571,8 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
      * written only if the signature actually CHANGED (below): a persistently
      * dirty tree polled while idle must not re-upsert the same rows every poll,
      * which is the same waste #937's signature exists to avoid. */
-    bool ledger = record_ledger && w && w->store &&
-                  watcher_store_has_project(w->store, state->project_name);
+    bool ledger =
+        record_ledger && w && w->store && watcher_store_has_project(w->store, state->project_name);
     watcher_ledger_paths_t ledger_paths = {0};
     bool ledger_failed = false;
     const char *status_argv[] = {"git",    "--no-optional-locks", "-C",    state->root_path,
@@ -1215,7 +1214,8 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
             return false;
         }
         s->file_count = file_count;
-        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
+        s->interval_ms =
+            cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
     } else {

@@ -168,7 +168,7 @@ typedef struct {
     int64_t generation;
     const cbm_file_hash_t *file_hash;   /* optional */
     const cbm_file_state_t *file_state; /* optional */
-    const cbm_node_t *context_nodes;     /* optional unowned structure nodes needed by edges */
+    const cbm_node_t *context_nodes;    /* optional unowned structure nodes needed by edges */
     int context_node_count;
     const cbm_store_delta_edge_t *context_edges; /* optional unowned structure edges */
     int context_edge_count;
@@ -207,8 +207,7 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
  * because overlay nodes do not have canonical node ids. Counts all active edge
  * types except INHERITS to match cbm_store_node_degree(). */
 int cbm_store_active_node_degree_by_qn(cbm_store_t *s, const char *project,
-                                       const char *qualified_name, int *in_deg,
-                                       int *out_deg);
+                                       const char *qualified_name, int *in_deg, int *out_deg);
 /* True when an active-overlay edge exists for qualified_name in the requested
  * direction. direction must be CBM_STORE_EDGE_DIR_*. edge_type may be NULL. */
 int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
@@ -220,10 +219,9 @@ int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
  * node view; returned edge keeps source/target ids from that same active view.
  * Caller must free with cbm_store_free_edge_nodes(). */
 int cbm_store_find_active_edge_nodes_by_qn(cbm_store_t *s, const char *project,
-                                           const char *qualified_name,
-                                           const char **edge_types, int edge_type_count,
-                                           int direction, cbm_store_edge_node_t **out,
-                                           int *count);
+                                           const char *qualified_name, const char **edge_types,
+                                           int edge_type_count, int direction,
+                                           cbm_store_edge_node_t **out, int *count);
 void cbm_store_free_edge_nodes(cbm_store_edge_node_t *rows, int count);
 
 /* Get distinct file paths for a project. Caller must free each out[i] and out itself.
@@ -277,25 +275,26 @@ int cbm_store_prepare_path_for_replace(const char *path);
 #define CBM_SEARCH_SUMMARY_TOP_FILES 20
 
 typedef struct {
-    const char *project;          /* exact or prefix match */
-    const char *project_pattern;  /* LIKE pattern (from glob), mutually exclusive with project */
-    bool project_exact;           /* true = exact match only (no prefix), used for "self" */
-    const char *label;            /* NULL = any label */
-    const char *name_pattern;     /* regex on name, NULL = any */
-    const char *qn_pattern;       /* regex on qualified_name, NULL = any */
-    const char *pattern;          /* OR-search: matches name OR qualified_name, NULL = any */
-    const char *file_pattern;     /* glob on file_path, NULL = any */
-    const char *file_contains;    /* literal case-sensitive file_path substring, NULL = any */
-    const char *relationship;     /* edge type filter, NULL = any */
-    const char *direction;        /* "inbound" / "outbound" / "any", NULL = any */
-    int min_degree;               /* -1 = no filter (default), 0+ = minimum */
-    int max_degree;               /* -1 = no filter (default), 0+ = maximum */
-    int limit;                    /* 0 = unlimited */
+    const char *project;         /* exact or prefix match */
+    const char *project_pattern; /* LIKE pattern (from glob), mutually exclusive with project */
+    bool project_exact;          /* true = exact match only (no prefix), used for "self" */
+    const char *label;           /* NULL = any label */
+    const char *name_pattern;    /* regex on name, NULL = any */
+    const char *qn_pattern;      /* regex on qualified_name, NULL = any */
+    const char *pattern;         /* OR-search: matches name OR qualified_name, NULL = any */
+    const char *file_pattern;    /* glob on file_path, NULL = any */
+    const char *file_contains;   /* literal case-sensitive file_path substring, NULL = any */
+    const char *relationship;    /* edge type filter, NULL = any */
+    const char *direction;       /* "inbound" / "outbound" / "any", NULL = any */
+    int min_degree;              /* -1 = no filter (default), 0+ = minimum */
+    int max_degree;              /* -1 = no filter (default), 0+ = maximum */
+    int limit;                   /* 0 = unlimited */
     int offset;
     bool exclude_entry_points;
     bool include_connected;
-    const char *sort_by;          /* "relevance" / "name" / "degree" / "calls" / "linkrank", NULL = relevance */
-    const char *degree_mode;      /* "weighted" / "unweighted" / "calls_only", NULL = unweighted */
+    const char
+        *sort_by; /* "relevance" / "name" / "degree" / "calls" / "linkrank", NULL = relevance */
+    const char *degree_mode; /* "weighted" / "unweighted" / "calls_only", NULL = unweighted */
     bool case_sensitive;
     /* Ranking: when true, dependency sub-project symbols (proj.dep.*) are NOT
      * demoted below the project's own symbols — pure relevance order applies.
@@ -303,8 +302,8 @@ typedef struct {
      * never fronts the user's own 'Path'. Tunable via MCP config key
      * "search_disable_dep_ranking" (search_graph). */
     bool disable_dep_ranking;
-    const char **exclude_labels;  /* NULL-terminated array, or NULL */
-    const char **exclude_paths;   /* NULL-terminated array of glob patterns to exclude by file_path */
+    const char **exclude_labels; /* NULL-terminated array, or NULL */
+    const char **exclude_paths; /* NULL-terminated array of glob patterns to exclude by file_path */
     /* Return exact aggregate facets without materializing node rows. The
      * filters above still apply; pagination and result ordering do not. */
     bool summary_only;
@@ -314,7 +313,7 @@ typedef struct {
     cbm_node_t node;
     int in_degree;
     int out_degree;
-    double pagerank_score;  /* PageRank rank, 0.0 if not computed */
+    double pagerank_score; /* PageRank rank, 0.0 if not computed */
     /* connected_names: allocated array of strings, count in connected_count */
     const char **connected_names;
     int connected_count;
@@ -342,7 +341,7 @@ typedef struct {
 
 typedef struct {
     cbm_node_t node;
-    int hop; /* BFS depth from root */
+    int hop;               /* BFS depth from root */
     double pagerank_score; /* PageRank rank already selected by cbm_store_bfs(), 0.0 if absent */
 } cbm_node_hop_t;
 
@@ -553,16 +552,16 @@ int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int cou
                                 int64_t *out_ids);
 
 /* Upsert nodes inside a transaction owned by the caller. */
-int cbm_store_upsert_node_batch_in_transaction(cbm_store_t *s, const cbm_node_t *nodes,
-                                               int count, int64_t *out_ids);
+int cbm_store_upsert_node_batch_in_transaction(cbm_store_t *s, const cbm_node_t *nodes, int count,
+                                               int64_t *out_ids);
 
 /* Find node by primary key. Returns CBM_STORE_OK or CBM_STORE_NOT_FOUND. */
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out);
 
 /* Find node by project + qualified_name. */
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn, cbm_node_t *out);
-int cbm_store_find_node_by_qn_overlay_view(cbm_store_t *s, const char *project,
-                                           const char *qn, cbm_node_t *out);
+int cbm_store_find_node_by_qn_overlay_view(cbm_store_t *s, const char *project, const char *qn,
+                                           cbm_node_t *out);
 
 /* Find node by qualified_name only (no project filter — QNs are globally unique). */
 int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
@@ -570,9 +569,8 @@ int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *ou
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count);
-int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *project,
-                                              const char *name, cbm_node_t **out,
-                                              int *count);
+int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *project, const char *name,
+                                              cbm_node_t **out, int *count);
 
 /* Find nodes by name across all projects. Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_t **out,
@@ -596,8 +594,8 @@ int cbm_store_find_nodes_by_label_overlay_view_limited(cbm_store_t *s, const cha
 /* Visit lightweight node identity rows for a label without allocating full
  * cbm_node_t values. Callback strings are borrowed until the next callback. */
 typedef int (*cbm_store_node_identity_visitor_fn)(const char *label, const char *name,
-                                                  const char *qualified_name,
-                                                  const char *file_path, void *userdata);
+                                                  const char *qualified_name, const char *file_path,
+                                                  void *userdata);
 int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                    cbm_store_node_identity_visitor_fn visitor, void *userdata);
 /* ID-bearing variant for callers that create relationships while streaming.
@@ -609,9 +607,10 @@ int cbm_store_visit_node_refs_by_label(cbm_store_t *s, const char *project, cons
                                        cbm_store_node_ref_visitor_fn visitor, void *userdata);
 /* Project-pattern variant that exposes rank without sorting or materializing
  * full nodes. Callback strings are borrowed until the next row. */
-typedef int (*cbm_store_ranked_node_ref_visitor_fn)(
-    int64_t id, const char *label, const char *name, const char *qualified_name,
-    const char *file_path, double pagerank, void *userdata);
+typedef int (*cbm_store_ranked_node_ref_visitor_fn)(int64_t id, const char *label, const char *name,
+                                                    const char *qualified_name,
+                                                    const char *file_path, double pagerank,
+                                                    void *userdata);
 int cbm_store_visit_ranked_node_refs_by_project_pattern_and_label(
     cbm_store_t *s, const char *project_pattern, const char *label,
     cbm_store_ranked_node_ref_visitor_fn visitor, void *userdata);
@@ -625,8 +624,7 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
  * ready overlay for that file; otherwise return canonical nodes. Overlay nodes
  * use id=CBM_STORE_NO_NODE_ID because overlay row ids are not graph node ids. */
 int cbm_store_find_nodes_by_file_overlay_view(cbm_store_t *s, const char *project,
-                                              const char *file_path, cbm_node_t **out,
-                                              int *count);
+                                              const char *file_path, cbm_node_t **out, int *count);
 
 /* Batch lookup: map qualified names → node IDs.
  * qns[i] is resolved; out_ids[i] receives the ID or 0 if not found.
@@ -636,8 +634,8 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
 
 /* Batch lookup: return full node rows for qualified names that exist in project.
  * Results are ordered by the input QN order; missing/null QNs are skipped. */
-int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char **qns,
-                                int qn_count, cbm_node_t **out, int *count);
+int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char **qns, int qn_count,
+                                cbm_node_t **out, int *count);
 
 /* Candidate scope expansion for bounded resolver context.
  * Returns exact QNs plus member QNs below each input QN ("Type.member"),
@@ -659,10 +657,10 @@ int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char
  * so a hint can never contradict a row the query could see). Fail-open: any
  * non-definitive outcome (NULL args, prepare/step failure) returns true
  * (observed) — only a definitive miss returns false. */
-bool cbm_store_schema_label_observed(cbm_store_t *s, const char *project,
-                                     bool include_overlay, const char *label);
-bool cbm_store_schema_type_observed(cbm_store_t *s, const char *project,
-                                    bool include_overlay, const char *type);
+bool cbm_store_schema_label_observed(cbm_store_t *s, const char *project, bool include_overlay,
+                                     const char *label);
+bool cbm_store_schema_type_observed(cbm_store_t *s, const char *project, bool include_overlay,
+                                    const char *type);
 
 /* True when path is a non-empty architecture scope after normalization. */
 bool cbm_store_arch_path_scoped(const char *path);
@@ -704,8 +702,7 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
 
 /* Insert edges while the caller owns the active transaction. */
-int cbm_store_insert_edge_batch_in_transaction(cbm_store_t *s, const cbm_edge_t *edges,
-                                               int count);
+int cbm_store_insert_edge_batch_in_transaction(cbm_store_t *s, const cbm_edge_t *edges, int count);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
@@ -782,8 +779,8 @@ int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char 
  * they only let callers warn that newer file contents may exist. */
 int cbm_store_upsert_dirty_file(cbm_store_t *s, const cbm_dirty_file_state_t *state);
 int cbm_store_clear_dirty_file(cbm_store_t *s, const char *project, const char *rel_path);
-int cbm_store_list_dirty_files(cbm_store_t *s, const char *project,
-                               cbm_dirty_file_state_t **out, int *count);
+int cbm_store_list_dirty_files(cbm_store_t *s, const char *project, cbm_dirty_file_state_t **out,
+                               int *count);
 int cbm_store_count_dirty_files(cbm_store_t *s, const char *project, int *out_pending,
                                 int *out_overlay_ready);
 
@@ -791,84 +788,73 @@ int cbm_store_upsert_node_owner(cbm_store_t *s, const char *project, int64_t nod
                                 const char *rel_path, int64_t generation);
 
 int cbm_store_upsert_edge_owner(cbm_store_t *s, const char *project, int64_t edge_id,
-                                const char *rel_path, const char *derived_kind,
-                                int64_t generation);
+                                const char *rel_path, const char *derived_kind, int64_t generation);
 
 /* Rebuild file-delta owner rows from the persisted graph for one project.
  * Used after a full index when exact incremental reindexing is enabled. */
-int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project,
-                                        int64_t generation);
+int cbm_store_rebuild_file_delta_owners(cbm_store_t *s, const char *project, int64_t generation);
 
-int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project,
-                                         const char *rel_path);
+int cbm_store_delete_node_owners_by_file(cbm_store_t *s, const char *project, const char *rel_path);
 
-int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project,
-                                          const char *rel_path);
+int cbm_store_delete_edge_owners_by_file(cbm_store_t *s, const char *project, const char *rel_path);
 
-int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project,
-                                      const char *rel_path, int *out_node_owners,
-                                      int *out_edge_owners);
+int cbm_store_count_file_delta_owners(cbm_store_t *s, const char *project, const char *rel_path,
+                                      int *out_node_owners, int *out_edge_owners);
 
 /* Caller frees each returned string and the array. Empty string means the inbound
  * source node has no owner metadata and must be treated as unsafe for exact delta. */
 int cbm_store_list_file_delta_inbound_source_paths(cbm_store_t *s, const char *project,
-                                                   const char *rel_path, char ***out,
-                                                   int *count);
+                                                   const char *rel_path, char ***out, int *count);
 
 /* Caller frees with cbm_store_free_inbound_edges(). */
 int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
-                                            const char *rel_path,
-                                            cbm_store_inbound_edge_t **out, int *count);
+                                            const char *rel_path, cbm_store_inbound_edge_t **out,
+                                            int *count);
 
 void cbm_store_free_inbound_edges(cbm_store_inbound_edge_t *edges, int count);
 
-int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project,
-                                   const char *qualified_name, const char *rel_path,
-                                   int64_t node_id, int64_t generation);
+int cbm_store_upsert_symbol_export(cbm_store_t *s, const char *project, const char *qualified_name,
+                                   const char *rel_path, int64_t node_id, int64_t generation);
 
 int cbm_store_delete_symbol_exports_by_file(cbm_store_t *s, const char *project,
                                             const char *rel_path);
 
 /* Caller frees each returned string and the array. */
-int cbm_store_list_symbol_exports_by_file(cbm_store_t *s, const char *project,
-                                          const char *rel_path, char ***out, int *count);
+int cbm_store_list_symbol_exports_by_file(cbm_store_t *s, const char *project, const char *rel_path,
+                                          char ***out, int *count);
 
 int cbm_store_upsert_import_ref(cbm_store_t *s, const char *project, const char *rel_path,
                                 const char *import_text, const char *local_name,
                                 const char *target_qn, int64_t generation);
 
-int cbm_store_delete_import_refs_by_file(cbm_store_t *s, const char *project,
-                                         const char *rel_path);
+int cbm_store_delete_import_refs_by_file(cbm_store_t *s, const char *project, const char *rel_path);
 
 /* Caller frees each returned string and the array. */
 int cbm_store_list_import_ref_paths_by_target(cbm_store_t *s, const char *project,
-                                              const char *target_qn, char ***out,
-                                              int *count);
+                                              const char *target_qn, char ***out, int *count);
 
 /* Caller frees each returned string and the array. Uses persisted graph IMPORTS
  * edges, not import_refs metadata, so it also works for full-indexed stores. */
 int cbm_store_list_import_edge_source_paths_by_target_qn(cbm_store_t *s, const char *project,
-                                                        const char *target_qn, char ***out,
-                                                        int *count);
+                                                         const char *target_qn, char ***out,
+                                                         int *count);
 
 /* Caller frees each returned string and the array. */
 int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,
-                                                   const char *export_rel_path, char ***out,
-                                                   int *count);
+                                                    const char *export_rel_path, char ***out,
+                                                    int *count);
 
 /* Returns sorted unique paths containing rel_path plus importers of removed old exports and
  * newly added exports. Unchanged exports do not expand the frontier. Caller frees each
  * returned string and the array. new_export_qns may be NULL when new_export_count is 0. */
 int cbm_store_list_file_delta_affected_paths(cbm_store_t *s, const char *project,
-                                             const char *rel_path,
-                                             const char **new_export_qns, int new_export_count,
-                                             char ***out, int *count);
+                                             const char *rel_path, const char **new_export_qns,
+                                             int new_export_count, char ***out, int *count);
 
 /* Reserve the next per-project index generation in its own BEGIN IMMEDIATE transaction.
  * Callers should use the returned generation for a later exact-delta publish. */
 int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
-                                       const char *repo_fingerprint,
-                                       const char *config_fingerprint,
+                                       const char *repo_fingerprint, const char *config_fingerprint,
                                        int64_t *out_generation);
 
 /* Return the latest complete canonical generation for a project, or 0 when the
@@ -884,13 +870,11 @@ int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64
  * metadata anchors only until overlay row tables/read views are enabled; dirty
  * rows still do not hide canonical graph rows by themselves. */
 int cbm_store_reserve_overlay_generation(cbm_store_t *s, const char *project,
-                                         int64_t base_generation,
-                                         int64_t *out_overlay_generation);
+                                         int64_t base_generation, int64_t *out_overlay_generation);
 int cbm_store_set_overlay_generation_status(cbm_store_t *s, const char *project,
-                                            int64_t overlay_generation,
-                                            const char *status);
-int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
-                                        const char *status, int *out_count);
+                                            int64_t overlay_generation, const char *status);
+int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project, const char *status,
+                                        int *out_count);
 /* Atomically claim the oldest unclaimed ready overlay generation for compaction
  * without changing its read-visible overlay_ready status. Returns
  * CBM_STORE_NOT_FOUND when no claimable overlay generation exists. */
@@ -911,19 +895,16 @@ int cbm_store_compact_next_overlay_generation(cbm_store_t *s, const char *projec
  * work; positive values cap how many generations this API call compacts.
  * Returns OK with out_compacted=0 when no work is ready. */
 int cbm_store_compact_ready_overlay_generations(cbm_store_t *s, const char *project,
-                                                int max_generations,
-                                                int *out_compacted);
+                                                int max_generations, int *out_compacted);
 
 /* Publish one file's replacement facts into overlay storage. This does not
  * mutate canonical nodes/edges; active read paths decide later how to combine
  * canonical rows, tombstones, and overlay rows. */
-int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
-                                         const cbm_store_file_delta_t *delta,
+int cbm_store_publish_overlay_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta,
                                          int64_t overlay_generation);
 int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
                                                const cbm_store_file_delta_t *const *deltas,
-                                               int delta_count,
-                                               int64_t overlay_generation);
+                                               int delta_count, int64_t overlay_generation);
 /* Publish additive overlay facts without file tombstones. Canonical rows for
  * the same rel_path remain visible; callers must pass only facts that are safe
  * to layer on top of the base graph. */
@@ -931,8 +912,7 @@ int cbm_store_publish_overlay_file_delta_additions_batch(
     cbm_store_t *s, const cbm_store_file_delta_t *const *deltas, int delta_count,
     int64_t overlay_generation);
 int cbm_store_compact_overlay_generation(cbm_store_t *s, const char *project,
-                                         int64_t overlay_generation,
-                                         int64_t index_generation);
+                                         int64_t overlay_generation, int64_t index_generation);
 
 typedef struct {
     int overlay_ready_generations;
@@ -942,11 +922,10 @@ typedef struct {
     int total_nodes_visible;
 } cbm_store_overlay_node_view_summary_t;
 
-static inline bool
-cbm_store_overlay_node_view_has_ready_rows(
+static inline bool cbm_store_overlay_node_view_has_ready_rows(
     const cbm_store_overlay_node_view_summary_t *summary) {
-    return summary && (summary->active_file_tombstones > 0 ||
-                       summary->overlay_owned_nodes_visible > 0);
+    return summary &&
+           (summary->active_file_tombstones > 0 || summary->overlay_owned_nodes_visible > 0);
 }
 
 /* Summarize the current node read view as canonical nodes minus files with a
@@ -956,31 +935,25 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
                                             cbm_store_overlay_node_view_summary_t *out);
 
 /* Record derived-view freshness. Status must be one of CBM_STORE_DERIVED_STATUS_*. */
-int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
-                                     const char *view_name, int64_t generation,
-                                     const char *status);
+int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project, const char *view_name,
+                                     int64_t generation, const char *status);
 
 /* Mark multiple derived views stale in one transaction. view_count may be 0. */
-int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project,
-                                       int64_t generation, const char *const *view_names,
-                                       int view_count);
-int cbm_store_mark_derived_views_complete(cbm_store_t *s, const char *project,
-                                          int64_t generation,
+int cbm_store_mark_derived_views_stale(cbm_store_t *s, const char *project, int64_t generation,
+                                       const char *const *view_names, int view_count);
+int cbm_store_mark_derived_views_complete(cbm_store_t *s, const char *project, int64_t generation,
                                           const char *const *view_names, int view_count);
 int cbm_store_mark_rank_derived_views_stale(cbm_store_t *s, const char *project,
                                             int64_t generation);
 
-int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project,
-                                     const char *view_name,
+int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project, const char *view_name,
                                      cbm_derived_view_state_t *out);
-bool cbm_store_derived_view_is_stale(cbm_store_t *s, const char *project,
-                                     const char *view_name);
+bool cbm_store_derived_view_is_stale(cbm_store_t *s, const char *project, const char *view_name);
 
 /* Publish canonical graph and freshness metadata owned by one file in one transaction.
  * Project-wide graph-derived views are marked stale at the delta generation. */
 int cbm_store_publish_file_delta(cbm_store_t *s, const cbm_store_file_delta_t *delta);
-int cbm_store_publish_file_delta_batch(cbm_store_t *s,
-                                       const cbm_store_file_delta_t *const *deltas,
+int cbm_store_publish_file_delta_batch(cbm_store_t *s, const cbm_store_file_delta_t *const *deltas,
                                        int delta_count);
 int cbm_store_publish_file_delta_batch_complete(cbm_store_t *s,
                                                 const cbm_store_file_delta_t *const *deltas,
@@ -997,8 +970,8 @@ int cbm_store_file_delta_batch_graph_equal(cbm_store_t *s,
  * delta file is still present in the new delta. This is the safety proof for
  * additive overlays that keep canonical rows visible. */
 int cbm_store_file_delta_batch_preserves_owned_graph(cbm_store_t *s,
-                                                    const cbm_store_file_delta_t *const *deltas,
-                                                    int delta_count, bool *out_preserves);
+                                                     const cbm_store_file_delta_t *const *deltas,
+                                                     int delta_count, bool *out_preserves);
 int cbm_store_refresh_file_delta_metadata_batch_complete(
     cbm_store_t *s, const cbm_store_file_delta_t *const *deltas, int delta_count);
 
@@ -1009,9 +982,8 @@ int cbm_store_delete_file_delta(cbm_store_t *s, const char *project, const char 
                                 int64_t generation, const char *derived_view_name);
 /* Same delete semantics as cbm_store_delete_file_delta(), plus mark the reserved generation
  * complete in the same transaction. generation must be positive and already reserved. */
-int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project,
-                                         const char *rel_path, int64_t generation,
-                                         const char *derived_view_name);
+int cbm_store_delete_file_delta_complete(cbm_store_t *s, const char *project, const char *rel_path,
+                                         int64_t generation, const char *derived_view_name);
 
 /* ── Index coverage (#963) ──────────────────────────────────────── */
 
@@ -1110,9 +1082,8 @@ void cbm_store_search_free(cbm_search_output_t *out);
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
 int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *start_qn,
-                               const char *direction, const char **edge_types,
-                               int edge_type_count, int max_depth, int max_results,
-                               cbm_traverse_result_t *out);
+                               const char *direction, const char **edge_types, int edge_type_count,
+                               int max_depth, int max_results, cbm_traverse_result_t *out);
 
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
@@ -1196,8 +1167,7 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
  * discovery (json_each scans over every row) — for callers that only need
  * label/type counts, e.g. get_architecture. */
 int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
-int cbm_store_get_schema_overlay_view(cbm_store_t *s, const char *project,
-                                      cbm_schema_info_t *out);
+int cbm_store_get_schema_overlay_view(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
 int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project,
                                              cbm_schema_info_t *out);
 int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
@@ -1322,8 +1292,8 @@ int cbm_store_get_architecture_scoped_with_options(cbm_store_t *s, const char *p
                                                    const cbm_architecture_options_t *options);
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
-                               int aspect_count, cbm_architecture_info_t *out,
-                               int hotspot_limit, double leiden_resolution);
+                               int aspect_count, cbm_architecture_info_t *out, int hotspot_limit,
+                               double leiden_resolution);
 int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const char *path,
                                       const char **aspects, int aspect_count,
                                       cbm_architecture_info_t *out, int hotspot_limit,

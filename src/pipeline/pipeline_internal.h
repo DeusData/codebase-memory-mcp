@@ -76,10 +76,9 @@ void cbm_pipeline_detect_url_arg_routes(cbm_gbuf_t *gb, const cbm_gbuf_node_t *s
                                         CBMLanguage lang);
 
 static inline bool cbm_pipeline_call_arg_is_route_path_keyword(const char *keyword) {
-    static const char *const path_keywords[] = {"prefix",     "path",      "route",
-                                                "pattern",    "url",       "endpoint",
-                                                "rule",       "mount_path", "route_path",
-                                                "url_path",   "uri",       NULL};
+    static const char *const path_keywords[] = {"prefix",     "path",     "route", "pattern",
+                                                "url",        "endpoint", "rule",  "mount_path",
+                                                "route_path", "url_path", "uri",   NULL};
     if (!keyword) {
         return false;
     }
@@ -95,7 +94,7 @@ static inline bool cbm_pipeline_call_arg_is_route_path_keyword(const char *keywo
  * APIs. Shared by sequential and parallel call passes to keep FastAPI/Starlette,
  * Express-style, and keyword-argument registrations on the same semantics. */
 static inline const char *cbm_pipeline_call_route_path_and_handler(const CBMCall *call,
-                                                                  const char **out_handler) {
+                                                                   const char **out_handler) {
     if (out_handler) {
         *out_handler = NULL;
     }
@@ -246,8 +245,7 @@ static inline void cbm_pipeline_sanitize_call_arg_expr(char *expr_buf, size_t ex
 }
 
 static inline int cbm_pipeline_format_call_arg_json(char *buf, size_t bufsize,
-                                                    const CBMCallArg *arg,
-                                                    const char *expr) {
+                                                    const CBMCallArg *arg, const char *expr) {
     if (!buf || !arg || bufsize == 0) {
         return 0;
     }
@@ -268,14 +266,14 @@ static inline int cbm_pipeline_format_call_arg_json(char *buf, size_t bufsize,
     }
     if (arg->value) {
         cbm_json_escape(esc_value, sizeof(esc_value), arg->value);
-        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", arg->index,
-                        esc_expr, esc_value);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", arg->index, esc_expr,
+                        esc_value);
     }
     return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", arg->index, esc_expr);
 }
 
 static inline size_t cbm_pipeline_append_call_args_json(char *buf, size_t bufsize, size_t pos,
-                                                       const CBMCall *call) {
+                                                        const CBMCall *call) {
     if (!buf || !call || call->arg_count == 0 || bufsize <= CBM_CALL_ARG_JSON_MARGIN ||
         pos >= bufsize - CBM_CALL_ARG_JSON_MARGIN) {
         return pos;
@@ -395,16 +393,13 @@ static inline void cbm_pipeline_try_field_type_hint_with_finder(
 }
 
 static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *registry,
-                                                    const cbm_gbuf_t *gbuf,
-                                                    cbm_resolution_t *res,
-                                                    const char *callee_name,
-                                                    int64_t source_id) {
+                                                    const cbm_gbuf_t *gbuf, cbm_resolution_t *res,
+                                                    const char *callee_name, int64_t source_id) {
     if (!gbuf) {
         return;
     }
     cbm_pipeline_try_field_type_hint_with_finder(
-        registry, res, callee_name, source_id, cbm_pipeline_field_hint_find_in_gbuf,
-        (void *)gbuf);
+        registry, res, callee_name, source_id, cbm_pipeline_field_hint_find_in_gbuf, (void *)gbuf);
 }
 
 /* Test-only incremental fault injection. Values name internal phases and are
@@ -421,10 +416,8 @@ static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *regist
 
 static inline bool cbm_pipeline_test_fail_phase_enabled(const char *phase) {
     char buf[CBM_SZ_64];
-    const char *val =
-        cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
-    return val && val[0] != '\0' &&
-           strcmp(val, CBM_TEST_FAIL_INCREMENTAL_DISABLED) != 0 && phase &&
+    const char *val = cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, CBM_TEST_FAIL_INCREMENTAL_DISABLED) != 0 && phase &&
            strcmp(val, phase) == 0;
 }
 
@@ -451,24 +444,24 @@ enum { CBM_PIPELINE_STORE_BACKED_LSP_SCOPE_DEFAULT_CAP = CBM_SZ_64 };
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
-    const char *project_name; /* borrowed from pipeline */
-    const char *repo_path;    /* borrowed from pipeline */
-    cbm_gbuf_t *gbuf;         /* owned by pipeline */
-    cbm_registry_t *registry; /* owned by pipeline */
-    atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
-    cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
-                               * (Stage 2 / Track B). May be NULL on paths that
-                               * don't record; cbm_pipeline_add_file_error is
-                               * NULL-safe. */
-    int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=dep) */
-    double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 means
-                                  * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
-    double httplink_min_confidence;    /* <=0 uses httplink pass default 0.25 */
-    double semantic_threshold;         /* <=0 uses semantic default 0.75 */
-    double githistory_min_coupling;    /* <=0 uses git-history default 0.3 */
-    int githistory_max_couplings;      /* bounded FILE_CHANGES_WITH output budget */
-    double lsp_confidence_floor;       /* <=0 uses LSP default 0.6 */
-    int64_t extract_timeout_micros;    /* bounded tree-sitter parse deadline */
+    const char *project_name;       /* borrowed from pipeline */
+    const char *repo_path;          /* borrowed from pipeline */
+    cbm_gbuf_t *gbuf;               /* owned by pipeline */
+    cbm_registry_t *registry;       /* owned by pipeline */
+    atomic_int *cancelled;          /* pointer to pipeline's cancelled flag */
+    cbm_pipeline_t *pipeline;       /* back-pointer for recording per-file skips
+                                     * (Stage 2 / Track B). May be NULL on paths that
+                                     * don't record; cbm_pipeline_add_file_error is
+                                     * NULL-safe. */
+    int mode;                       /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=dep) */
+    double similarity_threshold;    /* Jaccard threshold for SIMILAR edges; <=0 means
+                                     * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
+    double httplink_min_confidence; /* <=0 uses httplink pass default 0.25 */
+    double semantic_threshold;      /* <=0 uses semantic default 0.75 */
+    double githistory_min_coupling; /* <=0 uses git-history default 0.3 */
+    int githistory_max_couplings;   /* bounded FILE_CHANGES_WITH output budget */
+    double lsp_confidence_floor;    /* <=0 uses LSP default 0.6 */
+    int64_t extract_timeout_micros; /* bounded tree-sitter parse deadline */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -550,8 +543,8 @@ static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store
         CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
     };
 
-    int rc = cbm_store_mark_rank_derived_views_stale(
-        store, project, CBM_PIPELINE_COMPAT_GENERATION);
+    int rc =
+        cbm_store_mark_rank_derived_views_stale(store, project, CBM_PIPELINE_COMPAT_GENERATION);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -686,13 +679,10 @@ int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
 /* Resolve and insert all IMPORTS edges for one file.
  * Shared by sequential and parallel definition passes so source-file lookup,
  * resolver order, JSON properties, and self-edge filtering cannot drift. */
-int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx,
-                                              const CBMFileResult *result,
-                                              const char *rel_path,
-                                              CBMHashTable *namespace_map);
+int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                              const char *rel_path, CBMHashTable *namespace_map);
 int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
-                                                const CBMFileResult *result,
-                                                const char *rel_path);
+                                                const CBMFileResult *result, const char *rel_path);
 
 /* Extract IMPORTS edge local_name from the canonical edge JSON. Caller frees. */
 char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);
@@ -702,10 +692,8 @@ char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);
 int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
                                              const char *rel_path, const char ***out_keys,
                                              const char ***out_vals, int *out_count);
-bool cbm_pipeline_import_map_entry_is_reexport(const cbm_gbuf_t *gbuf,
-                                               const char *project_name,
-                                               const char *rel_path,
-                                               const char *local_name,
+bool cbm_pipeline_import_map_entry_is_reexport(const cbm_gbuf_t *gbuf, const char *project_name,
+                                               const char *rel_path, const char *local_name,
                                                const char *resolved_qn);
 void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
 
@@ -757,10 +745,10 @@ bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path);
 bool cbm_pipeline_is_c_family_source(CBMLanguage lang, const char *rel_path);
 bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
 int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst);
-int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src,
-                                 cbm_store_delta_edge_t *dst);
-int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
-    cbm_store_t *store, const cbm_pipeline_file_delta_t *delta, bool *out_collision);
+int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src, cbm_store_delta_edge_t *dst);
+int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(cbm_store_t *store,
+                                                             const cbm_pipeline_file_delta_t *delta,
+                                                             bool *out_collision);
 int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
                                                         cbm_pipeline_file_delta_t *delta,
                                                         int *out_added);
@@ -770,8 +758,7 @@ int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_d
 int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
                                             const cbm_file_info_t *file);
 /* Stamp the reserved generation after exact-delta planning and before publish. */
-int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta,
-                                             int64_t generation);
+int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta, int64_t generation);
 void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);
 
 /* Preflight an exact-delta publish candidate. This never writes the store. */
@@ -807,8 +794,7 @@ void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
  * symbol resolution. Used to build exact-delta descriptors without loading the
  * full stored graph. `changed_paths` entries are borrowed and skipped. */
 int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
-                                                    cbm_registry_t *registry,
-                                                    const char *project,
+                                                    cbm_registry_t *registry, const char *project,
                                                     const char *const *changed_paths,
                                                     int changed_path_count);
 const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, const char *qn);
@@ -825,8 +811,8 @@ static inline void cbm_pipeline_try_field_type_hint_ctx(cbm_pipeline_ctx_t *ctx,
     if (!ctx) {
         return;
     }
-    cbm_pipeline_try_field_type_hint_with_finder(
-        ctx->registry, res, callee_name, source_id, cbm_pipeline_field_hint_find_in_ctx, ctx);
+    cbm_pipeline_try_field_type_hint_with_finder(ctx->registry, res, callee_name, source_id,
+                                                 cbm_pipeline_field_hint_find_in_ctx, ctx);
 }
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
@@ -918,8 +904,7 @@ typedef struct {
  * cbm_change_coupling_paths_free before releasing or reusing the row array. */
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
                                 cbm_change_coupling_t *out, int max_out);
-int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits,
-                                               int commit_count,
+int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits, int commit_count,
                                                cbm_change_coupling_t *out, int max_out,
                                                double min_coupling_score);
 cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit_files_t *commits,
@@ -1229,9 +1214,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 void cbm_pipeline_clear_route_derived_edges(cbm_gbuf_t *gb);
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 
-int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,
-                                       const char *root_qn, const char *rel_path,
-                                       CBMHashTable *seen_dirs);
+int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project, const char *root_qn,
+                                       const char *rel_path, CBMHashTable *seen_dirs);
 
 /* ── Pass function prototypes ────────────────────────────────────── */
 
@@ -1374,8 +1358,8 @@ bool cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindex
     const cbm_pipeline_t *p);
 bool cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(
     const cbm_pipeline_t *p);
-void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
-                                        int affected_paths, int published_paths);
+void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths, int affected_paths,
+                                        int published_paths);
 void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
                                                    int affected_paths, int published_paths,
                                                    int affected_paths_limit,

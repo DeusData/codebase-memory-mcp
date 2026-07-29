@@ -174,17 +174,17 @@ bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t 
     }
 
     char esc_value[CBM_SZ_256];
-    char esc_source[CBM_SZ_256];
     cbm_json_escape(esc_value, sizeof(esc_value), prefix);
     if (source && source[0] != '\0') {
+        char esc_source[CBM_SZ_256];
         cbm_json_escape(esc_source, sizeof(esc_source), source);
         int prop_len;
         if (svc == CBM_SVC_HTTP) {
-            prop_len = snprintf(route_props, route_props_sz, "{\"method\":\"%s\",\"source\":\"%s\"}",
-                                esc_value, esc_source);
+            prop_len = snprintf(route_props, route_props_sz,
+                                "{\"method\":\"%s\",\"source\":\"%s\"}", esc_value, esc_source);
         } else {
-            prop_len = snprintf(route_props, route_props_sz, "{\"broker\":\"%s\",\"source\":\"%s\"}",
-                                esc_value, esc_source);
+            prop_len = snprintf(route_props, route_props_sz,
+                                "{\"broker\":\"%s\",\"source\":\"%s\"}", esc_value, esc_source);
         }
         return prop_len >= 0 && (size_t)prop_len < route_props_sz;
     }
@@ -568,8 +568,8 @@ static int match_handler_route_ref(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
 
     const char *handler_path = handler->handler_path;
     int path_match =
-        (strlen(handler_path) > SKIP_ONE && (strstr(infra_path, handler_path) != NULL ||
-                                             strstr(handler_path, infra_path) != NULL));
+        (strlen(handler_path) > SKIP_ONE &&
+         (strstr(infra_path, handler_path) != NULL || strstr(handler_path, infra_path) != NULL));
     int root_svc_match =
         (file_matches && strcmp(handler_path, "/") == 0 && strcmp(infra_path, "/") == 0);
     if (!path_match && !root_svc_match) {
@@ -578,8 +578,7 @@ static int match_handler_route_ref(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
 
     const cbm_gbuf_edge_t **fn_handles = NULL;
     int fn_hcount = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, handler->route->id, "HANDLES", &fn_handles,
-                                       &fn_hcount);
+    cbm_gbuf_find_edges_by_target_type(gb, handler->route->id, "HANDLES", &fn_handles, &fn_hcount);
     for (int fh = 0; fh < fn_hcount; fh++) {
         cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
                              RN_PROPS_INFRA_MATCH);
@@ -594,8 +593,7 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                  const rn_handler_route_ref_t *handler_routes, int handler_count) {
     int matched = 0;
     for (int j = 0; j < handler_count; j++) {
-        matched |=
-            match_handler_route_ref(gb, infra, infra_path, svc_name, &handler_routes[j]);
+        matched |= match_handler_route_ref(gb, infra, infra_path, svc_name, &handler_routes[j]);
     }
     return matched;
 }
@@ -645,8 +643,8 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
         }
 
         if (handler_routes) {
-            matched +=
-                match_one_infra_route(gb, infra, infra_path, svc_name, handler_routes, handler_count);
+            matched += match_one_infra_route(gb, infra, infra_path, svc_name, handler_routes,
+                                             handler_count);
         } else {
             matched += match_one_infra_route_scan(gb, infra, infra_path, svc_name, all_routes,
                                                   route_count);
@@ -674,8 +672,8 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
  * a verb registration covers the ANY variant, but distinct concrete verbs
  * stay separate (a POST call must not appear handled by a GET-only handler).
  * Bounded exact-QN lookups; cbm_gbuf_insert_edge deduplicates HANDLES. */
-static void attach_one_method_variant(cbm_gbuf_t *gb, const cbm_gbuf_node_t *func,
-                                      const char *path, const char *variant_method) {
+static void attach_one_method_variant(cbm_gbuf_t *gb, const cbm_gbuf_node_t *func, const char *path,
+                                      const char *variant_method) {
     char variant_qn[CBM_ROUTE_QN_SIZE];
     char variant_props[CBM_SZ_256];
     if (!cbm_pipeline_build_service_route_identity(path, CBM_SVC_HTTP, variant_method, NULL, NULL,
@@ -783,8 +781,7 @@ static void ensure_decorator_routes(cbm_gbuf_t *gb) {
 
 /* Link decorator handlers under one registrar directory to one prefix Route.
  * Returns newly inserted links; cbm_gbuf_insert_edge deduplicates HANDLES. */
-static int bridge_decorator_handlers_to_prefix(cbm_gbuf_t *gb,
-                                               const cbm_gbuf_node_t *prefix_route,
+static int bridge_decorator_handlers_to_prefix(cbm_gbuf_t *gb, const cbm_gbuf_node_t *prefix_route,
                                                const char *registrar_path, int dir_len,
                                                const char *prefix_segs) {
     const cbm_gbuf_node_t **funcs = NULL;
@@ -807,8 +804,7 @@ static int bridge_decorator_handlers_to_prefix(cbm_gbuf_t *gb,
             continue;
         }
         int before = cbm_gbuf_edge_count(gb);
-        cbm_gbuf_insert_edge(gb, func->id, prefix_route->id, "HANDLES",
-                             RN_PROPS_PREFIX_BRIDGE);
+        cbm_gbuf_insert_edge(gb, func->id, prefix_route->id, "HANDLES", RN_PROPS_PREFIX_BRIDGE);
         if (cbm_gbuf_edge_count(gb) > before) {
             connected++;
         }
@@ -1000,7 +996,12 @@ static int compare_caller_edges(const cbm_gbuf_t *gb, const caller_edge_ref_t *a
     if (cmp != 0) {
         return cmp;
     }
+    /* The property strings are independent tie-breakers. cppcheck 2.20
+     * incorrectly carries equality from the edge-type comparison into this
+     * distinct member comparison. */
+    // cppcheck-suppress redundantAssignment
     cmp = strcmp(a->props ? a->props : "", b->props ? b->props : "");
+    // cppcheck-suppress knownConditionTrueFalse
     if (cmp != 0) {
         return cmp;
     }

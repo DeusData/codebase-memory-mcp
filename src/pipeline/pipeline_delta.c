@@ -50,9 +50,8 @@ static const char *const cbm_delta_scratch_graph_seed_labels[] = {
 };
 
 static const char *const cbm_delta_scratch_registry_seed_labels[] = {
-    "Struct", "Enum", "Trait", "Type", "Function", "Method", "Class", "Interface", "Variable",
-    "Field",
-    NULL,
+    "Struct", "Enum",      "Trait",    "Type",  "Function", "Method",
+    "Class",  "Interface", "Variable", "Field", NULL,
 };
 
 enum {
@@ -166,10 +165,10 @@ static int delta_seed_store_node(cbm_gbuf_t *gbuf, cbm_registry_t *registry,
     if (!gbuf || !node || !node->label || !node->qualified_name) {
         return CBM_STORE_ERR;
     }
-    int64_t id = cbm_gbuf_upsert_node(gbuf, node->label, node->name ? node->name : "",
-                                      node->qualified_name, node->file_path ? node->file_path : "",
-                                      node->start_line, node->end_line,
-                                      node->properties_json ? node->properties_json : "{}");
+    int64_t id =
+        cbm_gbuf_upsert_node(gbuf, node->label, node->name ? node->name : "", node->qualified_name,
+                             node->file_path ? node->file_path : "", node->start_line,
+                             node->end_line, node->properties_json ? node->properties_json : "{}");
     if (id <= 0) {
         return CBM_STORE_ERR;
     }
@@ -203,8 +202,7 @@ static int delta_seed_registry_row(const char *label, const char *name, const ch
 }
 
 int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
-                                                    cbm_registry_t *registry,
-                                                    const char *project,
+                                                    cbm_registry_t *registry, const char *project,
                                                     const char *const *changed_paths,
                                                     int changed_path_count) {
     if (!store || !gbuf || !project || changed_path_count < 0 ||
@@ -254,7 +252,8 @@ const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, con
     }
 
     cbm_node_t stored = {0};
-    int rc = cbm_store_find_node_by_qn(ctx->store_backed_node_lookup, ctx->project_name, qn, &stored);
+    int rc =
+        cbm_store_find_node_by_qn(ctx->store_backed_node_lookup, ctx->project_name, qn, &stored);
     if (rc != CBM_STORE_OK) {
         return NULL;
     }
@@ -327,16 +326,15 @@ int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst) {
         .end_line = src->end_line,
         .properties_json = delta_strdup(src->properties_json ? src->properties_json : "{}"),
     };
-    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name ||
-        !dst->file_path || !dst->properties_json) {
+    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name || !dst->file_path ||
+        !dst->properties_json) {
         cbm_node_free_fields(dst);
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
 }
 
-int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src,
-                                 cbm_store_delta_edge_t *dst) {
+int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src, cbm_store_delta_edge_t *dst) {
     if (!src || !dst) {
         return CBM_STORE_ERR;
     }
@@ -404,8 +402,7 @@ static bool delta_node_is_structure_root(const cbm_gbuf_node_t *node) {
            (strcmp(node->label, "Project") == 0 || strcmp(node->label, "Branch") == 0);
 }
 
-static int delta_append_context_node(cbm_delta_build_ctx_t *ctx,
-                                     const cbm_gbuf_node_t *node) {
+static int delta_append_context_node(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *node) {
     if (ctx->out->delta.context_node_count >= ctx->context_node_cap &&
         delta_grow((void **)&ctx->out->context_nodes, &ctx->context_node_cap,
                    sizeof(*ctx->out->context_nodes)) != CBM_STORE_OK) {
@@ -420,8 +417,7 @@ static int delta_append_context_node(cbm_delta_build_ctx_t *ctx,
                       .end_line = node->end_line,
                       .properties_json = node->properties_json};
     if (cbm_pipeline_copy_delta_node(
-            &row, &ctx->out->context_nodes[ctx->out->delta.context_node_count]) !=
-        CBM_STORE_OK) {
+            &row, &ctx->out->context_nodes[ctx->out->delta.context_node_count]) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
     ctx->out->delta.context_node_count++;
@@ -444,8 +440,7 @@ static int delta_append_export(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t
 }
 
 static int delta_append_context_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *src,
-                                     const cbm_gbuf_node_t *tgt,
-                                     const cbm_gbuf_edge_t *edge) {
+                                     const cbm_gbuf_node_t *tgt, const cbm_gbuf_edge_t *edge) {
     if (ctx->out->delta.context_edge_count >= ctx->context_edge_cap &&
         delta_grow((void **)&ctx->out->context_edges, &ctx->context_edge_cap,
                    sizeof(*ctx->out->context_edges)) != CBM_STORE_OK) {
@@ -541,19 +536,18 @@ static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     bool target_owned = delta_same_path(tgt->file_path, ctx->rel_path);
     bool source_context = delta_node_is_structure_context(src, ctx->rel_path);
     bool target_context = delta_node_is_structure_context(tgt, ctx->rel_path);
-    bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) &&
-                                  tgt->label && strcmp(tgt->label, "File") == 0;
-    bool context_structure_edge =
-        strcmp(edge->type, CBM_PIPELINE_EDGE_CONTAINS_FOLDER) == 0 && target_context &&
-        (source_context || delta_node_is_structure_root(src));
+    bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) && tgt->label &&
+                                  strcmp(tgt->label, "File") == 0;
+    bool context_structure_edge = strcmp(edge->type, CBM_PIPELINE_EDGE_CONTAINS_FOLDER) == 0 &&
+                                  target_context &&
+                                  (source_context || delta_node_is_structure_root(src));
     bool regenerated_file_structure = !source_owned &&
                                       strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
                                       target_is_changed_file;
-    bool target_owned_usage =
-        !source_owned && target_owned &&
-        cbm_pipeline_is_c_family_header(CBM_LANG_COUNT, ctx->rel_path) && src->label &&
-        strcmp(src->label, cbm_delta_label_module) == 0 &&
-        strcmp(edge->type, cbm_delta_edge_usage) == 0;
+    bool target_owned_usage = !source_owned && target_owned &&
+                              cbm_pipeline_is_c_family_header(CBM_LANG_COUNT, ctx->rel_path) &&
+                              src->label && strcmp(src->label, cbm_delta_label_module) == 0 &&
+                              strcmp(edge->type, cbm_delta_edge_usage) == 0;
     if (context_structure_edge) {
         ctx->rc = delta_append_context_edge(ctx, src, tgt, edge);
         return;
@@ -640,10 +634,9 @@ static bool file_state_content_matches_current(cbm_store_t *store, const char *p
     if (rc == CBM_STORE_OK && state.content_hash && state.content_hash[0] &&
         state.pass_fingerprint && strcmp(state.pass_fingerprint, current_pass) == 0) {
         char current_hash[CBM_SZ_32];
-        matches =
-            (cbm_pipeline_content_hash_file(file->path, current_hash, sizeof(current_hash)) ==
-                 CBM_STORE_OK &&
-             strcmp(current_hash, state.content_hash) == 0);
+        matches = (cbm_pipeline_content_hash_file(file->path, current_hash, sizeof(current_hash)) ==
+                       CBM_STORE_OK &&
+                   strcmp(current_hash, state.content_hash) == 0);
     }
     cbm_store_file_state_free_fields(&state);
     return matches;
@@ -700,8 +693,9 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                   .mtime_ns = cbm_stat_mtime_ns(&st),
                                   .size = st.st_size,
                                   .language = cbm_language_name(files[i].language),
-                                  .pass_fingerprint = pass_fingerprint ? pass_fingerprint
-                                                                       : cbm_pipeline_file_delta_pass_fingerprint(),
+                                  .pass_fingerprint =
+                                      pass_fingerprint ? pass_fingerprint
+                                                       : cbm_pipeline_file_delta_pass_fingerprint(),
                                   .generation = generation,
                                   .indexed_at = indexed_at};
         rc = cbm_store_upsert_file_state(store, &state);
@@ -743,18 +737,18 @@ int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_d
                                          .sha256 = cbm_delta_file_hash_legacy_empty,
                                          .mtime_ns = mtime_ns,
                                          .size = st.st_size};
-    delta->file_state = (cbm_file_state_t){.project = delta->delta.project,
-                                           .rel_path = delta->delta.rel_path,
-                                           .content_hash = delta->file_content_hash,
-                                           .git_oid = NULL,
-                                           .mtime_ns = mtime_ns,
-                                           .size = st.st_size,
-                                           .language = cbm_language_name(file->language),
-                                           .pass_fingerprint =
-                                               pass_fingerprint ? pass_fingerprint
-                                                                : cbm_pipeline_file_delta_pass_fingerprint(),
-                                           .generation = delta->delta.generation,
-                                           .indexed_at = delta->file_indexed_at};
+    delta->file_state = (cbm_file_state_t){
+        .project = delta->delta.project,
+        .rel_path = delta->delta.rel_path,
+        .content_hash = delta->file_content_hash,
+        .git_oid = NULL,
+        .mtime_ns = mtime_ns,
+        .size = st.st_size,
+        .language = cbm_language_name(file->language),
+        .pass_fingerprint =
+            pass_fingerprint ? pass_fingerprint : cbm_pipeline_file_delta_pass_fingerprint(),
+        .generation = delta->delta.generation,
+        .indexed_at = delta->file_indexed_at};
     delta->delta.file_hash = &delta->file_hash;
     delta->delta.file_state = &delta->file_state;
     return CBM_STORE_OK;
@@ -766,8 +760,7 @@ int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
         delta, file, cbm_pipeline_file_delta_pass_fingerprint());
 }
 
-int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta,
-                                             int64_t generation) {
+int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta, int64_t generation) {
     if (!delta || generation <= 0) {
         return CBM_STORE_ERR;
     }
@@ -887,8 +880,7 @@ static bool delta_existing_or_insert_ownership_supported(
         return false;
     }
     if (!existing_state && node_owners == 0 && edge_owners == 0 &&
-        file_delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_UPSERT &&
-        delta->node_count > 0) {
+        file_delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_UPSERT && delta->node_count > 0) {
         return true;
     }
     if (node_owners <= 0) {
@@ -898,8 +890,9 @@ static bool delta_existing_or_insert_ownership_supported(
     return true;
 }
 
-int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
-    cbm_store_t *store, const cbm_pipeline_file_delta_t *delta, bool *out_collision) {
+int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(cbm_store_t *store,
+                                                             const cbm_pipeline_file_delta_t *delta,
+                                                             bool *out_collision) {
     if (out_collision) {
         *out_collision = false;
     }
@@ -915,8 +908,8 @@ int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
             continue;
         }
         cbm_node_t existing = {0};
-        int rc = cbm_store_find_node_by_qn(store, delta->delta.project, node->qualified_name,
-                                           &existing);
+        int rc =
+            cbm_store_find_node_by_qn(store, delta->delta.project, node->qualified_name, &existing);
         if (rc == CBM_STORE_NOT_FOUND) {
             continue;
         }
@@ -925,9 +918,8 @@ int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
             return rc;
         }
         const char *node_file = node->file_path ? node->file_path : delta->delta.rel_path;
-        bool source_span_selectable =
-            cbm_label_uses_source_span_selection(existing.label) ||
-            cbm_label_uses_source_span_selection(node->label);
+        bool source_span_selectable = cbm_label_uses_source_span_selection(existing.label) ||
+                                      cbm_label_uses_source_span_selection(node->label);
         bool collision = existing.file_path && node_file &&
                          !delta_field_matches(existing.file_path, node_file) &&
                          !source_span_selectable;
@@ -974,8 +966,7 @@ static bool delta_path_in_batch(const char *path, const cbm_pipeline_file_delta_
  * local_name.  Exact-delta preflight/preservation must use the same identity;
  * otherwise preserving the first import to a shared target suppresses every
  * subsequent named import with the same source, target, and type. */
-static bool delta_import_local_name_equal(const char *lhs_properties,
-                                          const char *rhs_properties) {
+static bool delta_import_local_name_equal(const char *lhs_properties, const char *rhs_properties) {
     const char *lhs_json = lhs_properties ? lhs_properties : "{}";
     const char *rhs_json = rhs_properties ? rhs_properties : "{}";
     if (strcmp(lhs_json, rhs_json) == 0) {
@@ -1000,12 +991,12 @@ static bool delta_import_local_name_equal(const char *lhs_properties,
     return equal;
 }
 
-static bool delta_edge_identity_equal(const cbm_store_delta_edge_t *edge,
-                                      const char *source_qn, const char *target_qn,
-                                      const char *type, const char *properties_json) {
+static bool delta_edge_identity_equal(const cbm_store_delta_edge_t *edge, const char *source_qn,
+                                      const char *target_qn, const char *type,
+                                      const char *properties_json) {
     if (!edge || !edge->source_qn || !edge->target_qn || !edge->type ||
-        strcmp(edge->source_qn, source_qn) != 0 ||
-        strcmp(edge->target_qn, target_qn) != 0 || strcmp(edge->type, type) != 0) {
+        strcmp(edge->source_qn, source_qn) != 0 || strcmp(edge->target_qn, target_qn) != 0 ||
+        strcmp(edge->type, type) != 0) {
         return false;
     }
     return strcmp(type, cbm_delta_edge_imports) != 0 ||
@@ -1013,9 +1004,8 @@ static bool delta_edge_identity_equal(const cbm_store_delta_edge_t *edge,
 }
 
 static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *deltas,
-                                      int delta_count, const char *source_qn,
-                                      const char *target_qn, const char *type,
-                                      const char *properties_json) {
+                                      int delta_count, const char *source_qn, const char *target_qn,
+                                      const char *type, const char *properties_json) {
     if (!deltas || !source_qn || !target_qn || !type) {
         return false;
     }
@@ -1046,8 +1036,7 @@ static bool delta_inbound_edge_is_regenerated_by_batch(
 }
 
 static void delta_inbound_debug_unsupported(const cbm_store_file_delta_t *delta,
-                                            const cbm_store_inbound_edge_t *edge,
-                                            int delta_count) {
+                                            const cbm_store_inbound_edge_t *edge, int delta_count) {
     char env[CBM_SZ_16];
     if (!delta || !edge ||
         cbm_safe_getenv(cbm_delta_debug_inbound_env, env, sizeof(env), NULL) == NULL ||
@@ -1060,9 +1049,9 @@ static void delta_inbound_debug_unsupported(const cbm_store_file_delta_t *delta,
     }
     cbm_log_debug("delta.inbound.unsupported", "project", delta->project, "rel_path",
                   delta->rel_path, "source_path", edge->source_rel_path, "edge_path",
-                  edge->edge_rel_path, "target_path", edge->target_rel_path, "type",
-                  edge->type, "source_qn", edge->source_qn, "target_qn", edge->target_qn,
-                  "delta_count", delta_count_buf);
+                  edge->edge_rel_path, "target_path", edge->target_rel_path, "type", edge->type,
+                  "source_qn", edge->source_qn, "target_qn", edge->target_qn, "delta_count",
+                  delta_count_buf);
 }
 
 static bool delta_owned_inbound_edge_is_deleted(const cbm_store_inbound_edge_t *edge,
@@ -1074,8 +1063,7 @@ static bool delta_owned_inbound_edge_is_deleted(const cbm_store_inbound_edge_t *
 static bool delta_inbound_edges_supported(cbm_store_t *store,
                                           const cbm_pipeline_file_delta_t *delta,
                                           const cbm_pipeline_file_delta_t *const *deltas,
-                                          int delta_count,
-                                          cbm_pipeline_file_delta_plan_t *plan) {
+                                          int delta_count, cbm_pipeline_file_delta_plan_t *plan) {
     cbm_store_inbound_edge_t *edges = NULL;
     int edge_count = 0;
     int rc = cbm_store_list_file_delta_inbound_edges(store, delta->delta.project,
@@ -1087,9 +1075,8 @@ static bool delta_inbound_edges_supported(cbm_store_t *store,
     bool ok = true;
     for (int i = 0; i < edge_count; i++) {
         if (!delta_path_in_batch(edges[i].source_rel_path, deltas, delta_count) &&
-            !delta_batch_contains_edge(deltas, delta_count, edges[i].source_qn,
-                                       edges[i].target_qn, edges[i].type,
-                                       edges[i].properties_json) &&
+            !delta_batch_contains_edge(deltas, delta_count, edges[i].source_qn, edges[i].target_qn,
+                                       edges[i].type, edges[i].properties_json) &&
             !delta_inbound_edge_is_regenerated_by_batch(&edges[i], deltas, delta_count) &&
             !delta_owned_inbound_edge_is_deleted(&edges[i], delta)) {
             delta_inbound_debug_unsupported(&delta->delta, &edges[i], delta_count);
@@ -1179,8 +1166,8 @@ int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
         const cbm_store_inbound_edge_t *edge = &edges[i];
         if (cbm_pipeline_delta_edge_type_is_recomputed(edge->type) ||
             !delta_node_qn_present(&delta->delta, edge->target_qn) ||
-            delta_batch_contains_edge(single_delta, 1, edge->source_qn, edge->target_qn,
-                                      edge->type, edge->properties_json)) {
+            delta_batch_contains_edge(single_delta, 1, edge->source_qn, edge->target_qn, edge->type,
+                                      edge->properties_json)) {
             continue;
         }
         rc = delta_append_preserved_inbound_edge(delta, edge);
@@ -1269,8 +1256,8 @@ static int delta_edge_endpoints_resolve(cbm_store_t *store, const cbm_store_file
     int rc = delta_collect_edge_endpoint_qns(delta, delta->context_edges, delta->context_edge_count,
                                              qns, &qn_count);
     if (rc == CBM_STORE_OK) {
-        rc = delta_collect_edge_endpoint_qns(delta, delta->edges, delta->edge_count, qns,
-                                             &qn_count);
+        rc =
+            delta_collect_edge_endpoint_qns(delta, delta->edges, delta->edge_count, qns, &qn_count);
     }
     if (rc != CBM_STORE_OK) {
         free(qns);
@@ -1307,9 +1294,10 @@ static bool delta_batch_node_qn_present(const cbm_pipeline_file_delta_t *const *
     return false;
 }
 
-static int delta_collect_batch_edge_endpoint_qns(
-    const cbm_pipeline_file_delta_t *const *deltas, int delta_count,
-    const cbm_store_delta_edge_t *edges, int edge_count, const char **qns, int *qn_count) {
+static int delta_collect_batch_edge_endpoint_qns(const cbm_pipeline_file_delta_t *const *deltas,
+                                                 int delta_count,
+                                                 const cbm_store_delta_edge_t *edges,
+                                                 int edge_count, const char **qns, int *qn_count) {
     for (int i = 0; i < edge_count; i++) {
         const char *edge_qns[PAIR_LEN] = {edges[i].source_qn, edges[i].target_qn};
         for (int j = 0; j < PAIR_LEN; j++) {
@@ -1371,8 +1359,7 @@ static int delta_batch_edge_endpoints_resolve(cbm_store_t *store,
     return found == qn_count ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
 }
 
-static int delta_plan_append_affected_path(cbm_pipeline_file_delta_plan_t *plan,
-                                           const char *path) {
+static int delta_plan_append_affected_path(cbm_pipeline_file_delta_plan_t *plan, const char *path) {
     if (!plan || !path) {
         return CBM_STORE_ERR;
     }
@@ -1389,8 +1376,7 @@ static int delta_plan_append_affected_path(cbm_pipeline_file_delta_plan_t *plan,
         free(dup);
         return CBM_STORE_ERR;
     }
-    char **next =
-        realloc(plan->affected_paths, (size_t)(plan->affected_count + 1) * sizeof(*next));
+    char **next = realloc(plan->affected_paths, (size_t)(plan->affected_count + 1) * sizeof(*next));
     if (!next) {
         free(dup);
         return CBM_STORE_ERR;
@@ -1438,9 +1424,9 @@ static int delta_collect_batch_affected_paths(cbm_store_t *store,
 
         char **paths = NULL;
         int path_count = 0;
-        int rc = cbm_store_list_file_delta_affected_paths(
-            store, delta->project, delta->rel_path, new_export_qns, delta->export_count, &paths,
-            &path_count);
+        int rc = cbm_store_list_file_delta_affected_paths(store, delta->project, delta->rel_path,
+                                                          new_export_qns, delta->export_count,
+                                                          &paths, &path_count);
         free(new_export_qns);
         if (rc != CBM_STORE_OK ||
             delta_plan_append_frontier(out, paths, path_count) != CBM_STORE_OK) {
@@ -1596,8 +1582,8 @@ int cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
         }
     }
 
-    if (delta_collect_batch_affected_paths(store, deltas, frontier_noop_mask, delta_count,
-                                           out) != CBM_STORE_OK) {
+    if (delta_collect_batch_affected_paths(store, deltas, frontier_noop_mask, delta_count, out) !=
+        CBM_STORE_OK) {
         delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
         return CBM_STORE_OK;
     }
@@ -1666,8 +1652,8 @@ int cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
     if (delta_count == 1 && deltas[0] &&
         deltas[0]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
         rc = cbm_store_delete_file_delta_complete(
-            store, deltas[0]->delta.project, deltas[0]->delta.rel_path,
-            deltas[0]->delta.generation, deltas[0]->delta.derived_view_name);
+            store, deltas[0]->delta.project, deltas[0]->delta.rel_path, deltas[0]->delta.generation,
+            deltas[0]->delta.derived_view_name);
         if (rc != CBM_STORE_OK) {
             delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
             return CBM_STORE_OK;
@@ -1755,8 +1741,7 @@ static int pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
     if (out_overlay_generation) {
         *out_overlay_generation = 0;
     }
-    if (!store || !deltas || delta_count <= 0 || base_generation < 0 ||
-        !out_overlay_generation) {
+    if (!store || !deltas || delta_count <= 0 || base_generation < 0 || !out_overlay_generation) {
         return CBM_STORE_ERR;
     }
 
@@ -1779,8 +1764,8 @@ static int pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
     }
 
     int64_t overlay_generation = 0;
-    int rc = cbm_store_reserve_overlay_generation(store, project, base_generation,
-                                                  &overlay_generation);
+    int rc =
+        cbm_store_reserve_overlay_generation(store, project, base_generation, &overlay_generation);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -1802,8 +1787,7 @@ static int pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
     }
 
     rc = replace_files ? cbm_store_publish_overlay_file_delta_batch(store, store_deltas,
-                                                                    delta_count,
-                                                                    overlay_generation)
+                                                                    delta_count, overlay_generation)
                        : cbm_store_publish_overlay_file_delta_additions_batch(
                              store, store_deltas, delta_count, overlay_generation);
     free(store_deltas);
@@ -1824,8 +1808,8 @@ static int pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
             .observed_hash = file_state && file_state->content_hash
                                  ? file_state->content_hash
                                  : (file_hash && file_hash->sha256 ? file_hash->sha256 : ""),
-            .observed_mtime_ns = file_state ? file_state->mtime_ns
-                                : (file_hash ? file_hash->mtime_ns : 0),
+            .observed_mtime_ns =
+                file_state ? file_state->mtime_ns : (file_hash ? file_hash->mtime_ns : 0),
             .observed_size = file_state ? file_state->size : (file_hash ? file_hash->size : 0),
             .observed_generation = overlay_generation,
             .source = source,
