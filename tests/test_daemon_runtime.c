@@ -4311,8 +4311,10 @@ TEST(daemon_runtime_copied_image_peer_fingerprint_reuses_exact_cache_record) {
             : -1;
     bool copied = image_path_written > 0 && image_path_written < (int)sizeof(image_path) &&
                   runtime_test_copy_self_image(image_path);
+    bool timestamp_ready = copied && th_backdate_file_for_cache_test(image_path);
     char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
-    bool exact_bytes = copied && cbm_daemon_build_fingerprint_file(image_path, fingerprint) &&
+    bool exact_bytes = timestamp_ready &&
+                       cbm_daemon_build_fingerprint_file(image_path, fingerprint) &&
                        strcmp(fingerprint, identity.build_fingerprint) == 0;
     int first_exit = -1;
     bool first_ran =
@@ -4327,6 +4329,7 @@ TEST(daemon_runtime_copied_image_peer_fingerprint_reuses_exact_cache_record) {
 
     ASSERT_TRUE(started);
     ASSERT_TRUE(copied);
+    ASSERT_TRUE(timestamp_ready);
     ASSERT_TRUE(exact_bytes);
     ASSERT_TRUE(first_ran);
     ASSERT_EQ(first_exit, 0);

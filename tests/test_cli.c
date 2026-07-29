@@ -12193,6 +12193,56 @@ static char *make_overlong_nested_path(const char *base, const char *leaf) {
     return path;
 }
 
+/* Deep long-path fixtures must not use the generic recursive tree remover:
+ * one call frame per short component can overflow an ASan thread stack. Walk
+ * leaf-to-root iteratively in O(path length) time, O(path length) heap, and
+ * O(1) stack while tolerating a writer that stopped at an earlier component. */
+static void remove_long_nested_path_fixture(const char *path, const char *root) {
+    if (!path || !root) {
+        return;
+    }
+    (void)cbm_unlink(path);
+    char *cursor = cbm_strdup(path);
+    if (!cursor) {
+        return;
+    }
+    size_t root_length = strlen(root);
+    size_t cursor_length = strlen(cursor);
+    char *separator = cursor + cursor_length;
+    while (separator > cursor && separator[-1] != '/'
+#ifdef _WIN32
+           && separator[-1] != '\\'
+#endif
+    ) {
+        --separator;
+    }
+    if (separator == cursor) {
+        free(cursor);
+        return;
+    }
+    --separator;
+    *separator = '\0';
+    cursor_length = (size_t)(separator - cursor);
+    while (cursor_length > root_length) {
+        (void)cbm_rmdir(cursor);
+        while (separator > cursor && separator[-1] != '/'
+#ifdef _WIN32
+               && separator[-1] != '\\'
+#endif
+        ) {
+            --separator;
+        }
+        if (separator == cursor) {
+            break;
+        }
+        --separator;
+        *separator = '\0';
+        cursor_length = (size_t)(separator - cursor);
+    }
+    free(cursor);
+    (void)cbm_rmdir(root);
+}
+
 static int cli_run_help_without_home(int (*cmd)(int, char **)) {
     cli_env_snapshot_t home = {0};
     cli_env_snapshot_t userprofile = {0};
@@ -13004,7 +13054,7 @@ TEST(cli_upsert_codex_mcp_preserves_owned_descendant_tool_policy) {
     test_rmdir_r(tmpdir);
     PASS();
 }
-TEST(cli_upsert_json_rejects_overlong_path_without_truncated_parent) {
+TEST(cli_upsert_json_preserves_platform_valid_long_path_without_truncation) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-json-long-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -13016,11 +13066,23 @@ TEST(cli_upsert_json_rejects_overlong_path_without_truncated_parent) {
     ASSERT_NOT_NULL(configpath);
 
     int rc = cbm_upsert_antigravity_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
-    ASSERT_NEQ(rc, 0);
-    ASSERT_FALSE(test_path_exists(unexpected));
+    bool exact_file_created = test_path_exists(configpath);
+    const char *data = exact_file_created ? read_test_file(configpath) : NULL;
+    bool exact_content =
+        data && strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL;
+    bool no_partial_parent = rc == 0 || !test_path_exists(unexpected);
 
+    remove_long_nested_path_fixture(configpath, tmpdir);
     free(configpath);
-    test_rmdir_r(tmpdir);
+#ifdef __linux__
+    /* Linux permits a total path longer than the historical CBM_PATH_MAX
+     * scratch buffer when each component is valid. The JSON-like writer uses
+     * path-sized allocation, so an arbitrary application cap would be a
+     * correctness regression rather than a portability safeguard. */
+    ASSERT_EQ(rc, 0);
+#endif
+    ASSERT_TRUE((rc == 0 && exact_file_created && exact_content) ||
+                (rc != 0 && no_partial_parent));
     PASS();
 }
 TEST(cli_upsert_instructions_rejects_overlong_path_without_truncated_parent) {
@@ -14029,7 +14091,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config);
     RUN_TEST(cli_detect_agents_finds_claude_desktop);
     RUN_TEST(cli_upsert_codex_mcp_preserves_owned_descendant_tool_policy);
-    RUN_TEST(cli_upsert_json_rejects_overlong_path_without_truncated_parent);
+    RUN_TEST(cli_upsert_json_preserves_platform_valid_long_path_without_truncation);
     RUN_TEST(cli_upsert_instructions_rejects_overlong_path_without_truncated_parent);
     RUN_TEST(cli_mode_guidance_artifacts_preserve_both_contracts);
     RUN_TEST(cli_hook_gate_script_rejects_overlong_home_without_truncated_parent);

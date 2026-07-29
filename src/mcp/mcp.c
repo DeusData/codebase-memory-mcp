@@ -5959,7 +5959,13 @@ static bool collect_project_db_names(const char *dir_path, char ***out_names, in
         free_counted_string_array(names, count);
         return false;
     }
-    qsort(names, (size_t)count, sizeof(*names), compare_project_db_names);
+    /* C permits an empty result but qsort's base parameter is declared
+     * nonnull by sanitizer runtimes even when nmemb is zero. Zero/one entries
+     * are already sorted, so avoid both the invalid contract and needless
+     * comparator setup. */
+    if (count > 1) {
+        qsort(names, (size_t)count, sizeof(*names), compare_project_db_names);
+    }
     *out_names = names;
     *out_count = count;
     return true;
@@ -14621,10 +14627,16 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
                      ci_flag, flag, tmpfile, filelist);
     } else {
         if (file_pattern) {
-            n = snprintf(cmd, cmd_sz, "grep -rn%s %s --include='%s' -f '%s' '%s' 2>/dev/null",
+            n = snprintf(cmd, cmd_sz,
+                         "grep -Hrn%s %s --include='%s' -f '%s' '%s' 2>/dev/null",
                          ci_flag, flag, file_pattern, tmpfile, root_path);
         } else {
-            n = snprintf(cmd, cmd_sz, "grep -rn%s %s -f '%s' '%s' 2>/dev/null", ci_flag, flag,
+            /* -H makes the output contract independent of whether traversal
+             * targets a directory or one exact file. GNU and BSD grep both
+             * otherwise omit the filename for a single-file operand, which
+             * makes file:line:content parsing silently discard exact filters.
+             * This changes neither traversal complexity nor match storage. */
+            n = snprintf(cmd, cmd_sz, "grep -Hrn%s %s -f '%s' '%s' 2>/dev/null", ci_flag, flag,
                          tmpfile, root_path);
         }
     }

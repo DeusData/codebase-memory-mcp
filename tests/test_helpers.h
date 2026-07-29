@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include "../src/foundation/win_utf8.h"
+#else
+#include <fcntl.h>
 #endif
 
 /* ── Path building ────────────────────────────────────────────── */
@@ -181,6 +183,58 @@ static inline int th_rmtree(const char *path) {
         rc = -1;
     }
     return rc;
+}
+
+/* Put a fixture's write time unambiguously before a cache created immediately
+ * afterward. This avoids sleeps and remains deterministic on coarse-timestamp
+ * filesystems used by containers and Windows test environments. */
+static inline bool th_backdate_file_for_cache_test(const char *path) {
+    enum {
+        TH_CACHE_TIMESTAMP_SETTLE_SECONDS = 2,
+        TH_WINDOWS_FILETIME_TICKS_PER_SECOND = 10000000,
+    };
+    if (!path) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_path_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE file = CreateFileW(wide, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                                               FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide);
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    uint64_t ticks = ((uint64_t)now.dwHighDateTime << 32U) | now.dwLowDateTime;
+    uint64_t delta = (uint64_t)TH_CACHE_TIMESTAMP_SETTLE_SECONDS *
+                     TH_WINDOWS_FILETIME_TICKS_PER_SECOND;
+    bool ok = file != INVALID_HANDLE_VALUE && ticks > delta;
+    if (ok) {
+        ticks -= delta;
+        FILETIME earlier = {
+            .dwLowDateTime = (DWORD)ticks,
+            .dwHighDateTime = (DWORD)(ticks >> 32U),
+        };
+        ok = SetFileTime(file, NULL, NULL, &earlier) != 0;
+    }
+    if (file != INVALID_HANDLE_VALUE && CloseHandle(file) == 0) {
+        ok = false;
+    }
+    return ok;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 ||
+        now.tv_sec <= TH_CACHE_TIMESTAMP_SETTLE_SECONDS) {
+        return false;
+    }
+    struct timespec times[2] = {
+        {.tv_sec = now.tv_sec - TH_CACHE_TIMESTAMP_SETTLE_SECONDS, .tv_nsec = now.tv_nsec},
+        {.tv_sec = now.tv_sec - TH_CACHE_TIMESTAMP_SETTLE_SECONDS, .tv_nsec = now.tv_nsec},
+    };
+    return utimensat(AT_FDCWD, path, times, 0) == 0;
+#endif
 }
 
 /* ── Temp directory creation ──────────────────────────────────── */

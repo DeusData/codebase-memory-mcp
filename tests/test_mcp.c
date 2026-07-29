@@ -5200,6 +5200,22 @@ TEST(tool_check_index_coverage_surfaces_lookup_errors) {
     PASS();
 }
 
+/* Create a real committed repository without a shell or process-CWD
+ * dependency. Tests that exercise Git-backed MCP paths share this fixture so
+ * spaces and platform command interpreters cannot change their semantics. */
+static bool mcp_test_init_committed_repo(const char *repo, const char *relative_path) {
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.com", NULL};
+    const char *const name_args[] = {"config", "user.name", "Test", NULL};
+    const char *const add_args[] = {"add", relative_path, NULL};
+    const char *const commit_args[] = {"commit", "-q", "-m", "initial", NULL};
+    return repo && relative_path && cbm_git_drain_command(repo, init_args) == 0 &&
+           cbm_git_drain_command(repo, email_args) == 0 &&
+           cbm_git_drain_command(repo, name_args) == 0 &&
+           cbm_git_drain_command(repo, add_args) == 0 &&
+           cbm_git_drain_command(repo, commit_args) == 0;
+}
+
 TEST(tool_index_status_includes_git_metadata) {
     /* The git context block moved behind verbose:true (lean-default contract,
      * TOON round 2) — this test pins the verbose path's content; the default-
@@ -8548,17 +8564,18 @@ TEST(search_code_exact_path_filter_scopes_traversal) {
                                    "\"arguments\":{\"pattern\":\"HandleRequest\","
                                    "\"path_filter\":\"^main\\\\.go$\","
                                    "\"project\":\"test-project\",\"format\":\"json\"}}}");
-    ASSERT_NOT_NULL(resp);
-    char *inner = extract_text_content(resp);
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"search_scope\":\"path_filter_exact\""));
-    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
-    ASSERT_NULL(strstr(inner, "\"isError\":true"));
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    bool scope_exact = inner && strstr(inner, "\"search_scope\":\"path_filter_exact\"");
+    bool match_reported = inner && strstr(inner, "HandleRequest");
+    bool no_error = inner && !strstr(inner, "\"isError\":true");
 
     free(inner);
     free(resp);
     cleanup_snippet_dir(tmp);
     cbm_mcp_server_free(srv);
+    ASSERT_TRUE(scope_exact);
+    ASSERT_TRUE(match_reported);
+    ASSERT_TRUE(no_error);
     PASS();
 }
 
@@ -8569,17 +8586,10 @@ TEST(search_code_git_worktree_scope_includes_untracked_source) {
 
     char proj_dir[512];
     snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
-    char cmd[CBM_SZ_1K];
-#ifdef _WIN32
-    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" init -q >NUL 2>NUL", proj_dir);
-#else
-    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" init -q >/dev/null 2>/dev/null", proj_dir);
-#endif
-    ASSERT(n >= 0 && (size_t)n < sizeof(cmd));
-    if (system(cmd) != 0) {
+    if (!mcp_test_init_committed_repo(proj_dir, "main.go")) {
         cbm_mcp_server_free(srv);
         th_rmtree(tmp);
-        FAIL("git init failed for search_code git worktree test");
+        SKIP_PLATFORM("git is unavailable");
     }
 
     char extra_path[512];
@@ -16652,7 +16662,15 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     bool environment_ready = cache_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
 
     char root[CBM_SZ_4K] = {0};
-    bool root_ready = cbm_getcwd(root, sizeof(root)) != NULL;
+    int root_length = snprintf(root, sizeof(root), "%s/repo", cache);
+    bool root_ready = environment_ready && root_length > 0 &&
+                      (size_t)root_length < sizeof(root) && th_mkdir_p(root) == 0;
+    char source_path[CBM_SZ_4K] = {0};
+    int source_length =
+        root_ready ? snprintf(source_path, sizeof(source_path), "%s/main.c", root) : -1;
+    root_ready = root_ready && source_length > 0 && (size_t)source_length < sizeof(source_path) &&
+                 th_write_file(source_path, "int main(void) { return 0; }\n") == 0 &&
+                 mcp_test_init_committed_repo(root, "main.c");
     const char *project = "detect-contained-project";
     cbm_mcp_server_t *srv = environment_ready && root_ready ? cbm_mcp_server_new(NULL) : NULL;
     bool server_ready = srv != NULL;

@@ -1033,14 +1033,15 @@ void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int change
     p->exact_delta_stats.affected_paths_truncated = affected_paths_truncated;
 }
 
-static bool resolve_db_path_buf(const cbm_pipeline_t *p, char *path, size_t path_sz) {
-    if (!p || !path || path_sz == 0) {
-        return false;
+/* Resolve the exact database path once per pipeline. Path handling is O(n)
+ * time and O(n) memory in the path length and must not impose an application
+ * limit below the host filesystem's own component/path rules. */
+static char *resolve_db_path(const cbm_pipeline_t *p) {
+    if (!p) {
+        return NULL;
     }
-    path[0] = '\0';
     if (p->db_path) {
-        int n = snprintf(path, path_sz, "%s", p->db_path);
-        return n > 0 && (size_t)n < path_sz;
+        return p->db_path[0] ? cbm_strdup(p->db_path) : NULL;
     }
 
     const char *cdir = cbm_resolve_cache_dir();
@@ -1048,11 +1049,28 @@ static bool resolve_db_path_buf(const cbm_pipeline_t *p, char *path, size_t path
         cdir = cbm_tmpdir();
     }
     if (!cdir || !p->project_name) {
-        return false;
+        return NULL;
     }
-    int n = snprintf(path, path_sz, "%s/%s.db", cdir, p->project_name);
-    return n > 0 && (size_t)n < path_sz;
+    size_t cache_length = strlen(cdir);
+    size_t project_length = strlen(p->project_name);
+    if (cache_length > SIZE_MAX - project_length ||
+        cache_length + project_length > SIZE_MAX - sizeof("/.db")) {
+        return NULL;
+    }
+    size_t path_size = cache_length + project_length + sizeof("/.db");
+    char *path = malloc(path_size);
+    if (!path) {
+        return NULL;
+    }
+    int written = snprintf(path, path_size, "%s/%s.db", cdir, p->project_name);
+    if (written <= 0 || (size_t)written >= path_size) {
+        free(path);
+        return NULL;
+    }
+    return path;
 }
+
+static bool ensure_db_parent(const char *path);
 
 /* Effective worker count. Honour the explicit single-thread diagnostic override
  * everywhere worker count drives the parallel/sequential decision. Supervised
@@ -1064,43 +1082,6 @@ static int effective_worker_count(bool initial) {
         return 1;
     }
     return cbm_default_worker_count(initial);
-}
-
-/* Resolve the DB path for this pipeline. Caller must free(). */
-static char *resolve_db_path(const cbm_pipeline_t *p) {
-    char path[CBM_PATH_MAX];
-    if (!resolve_db_path_buf(p, path, sizeof(path))) {
-        return NULL;
-    }
-    char *out = cbm_strdup(path);
-    if (!out) {
-        return NULL;
-    }
-    return out;
-}
-
-static bool pipeline_parent_dir(char *out, size_t out_sz, const char *path) {
-    if (!out || out_sz == 0 || !path) {
-        return false;
-    }
-    int n = snprintf(out, out_sz, "%s", path);
-    if (n <= 0 || (size_t)n >= out_sz) {
-        out[0] = '\0';
-        return false;
-    }
-    char *last_slash = strrchr(out, '/');
-#ifdef _WIN32
-    char *last_bslash = strrchr(out, '\\');
-    if (last_bslash && (!last_slash || last_bslash > last_slash)) {
-        last_slash = last_bslash;
-    }
-#endif
-    if (last_slash) {
-        *last_slash = '\0';
-    } else {
-        out[0] = '\0';
-    }
-    return true;
 }
 
 static int check_cancel(const cbm_pipeline_t *p) {
@@ -2442,6 +2423,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
     gh_compute_task_t githistory_task = {0};
+    char *dump_db_path = NULL;
 
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
@@ -2616,22 +2598,22 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     if (!check_cancel(p)) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-        char db_path[CBM_PATH_MAX];
-        if (!resolve_db_path_buf(p, db_path, sizeof(db_path))) {
-            cbm_log_error("pipeline.err", "phase", "resolve_db_path", "reason", "path_too_long");
+        dump_db_path = resolve_db_path(p);
+        if (!dump_db_path) {
+            cbm_log_error("pipeline.err", "phase", "resolve_db_path", "reason",
+                          "invalid_or_unavailable");
             rc = CBM_NOT_FOUND;
             goto cleanup;
         }
 
-        /* Ensure parent directory exists (e.g. ~/.cache/codebase-memory-mcp/) */
-        char db_dir[CBM_PATH_MAX];
-        if (!pipeline_parent_dir(db_dir, sizeof(db_dir), db_path)) {
-            cbm_log_error("pipeline.err", "phase", "resolve_db_dir", "reason", "path_too_long");
+        /* Create the exact parent without copying through a fixed scratch
+         * buffer. Platform-valid long paths must never target a truncated
+         * sibling database. */
+        if (!ensure_db_parent(dump_db_path)) {
+            cbm_log_error("pipeline.err", "phase", "resolve_db_dir", "reason",
+                          "create_failed");
             rc = CBM_NOT_FOUND;
             goto cleanup;
-        }
-        if (db_dir[0]) {
-            cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
         }
 
         /* Record committed counts BEFORE the dump: cbm_gbuf_dump_to_sqlite /
@@ -2644,7 +2626,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         cbm_store_t *replacement_store = NULL;
         cbm_store_t *target_store = p->flush_store;
         if (!target_store && replace_project_in_existing_store) {
-            replacement_store = cbm_store_open_path(db_path);
+            replacement_store = cbm_store_open_path(dump_db_path);
             if (!replacement_store) {
                 /* Never fall through to a whole-file rewrite: this path was
                  * selected specifically to preserve sibling projects. */
@@ -2657,7 +2639,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         if (target_store) {
             rc = cbm_gbuf_flush_to_store(p->gbuf, target_store);
         } else {
-            rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+            rc = cbm_gbuf_dump_to_sqlite(p->gbuf, dump_db_path);
         }
         if (rc != 0) {
             cbm_log_error("pipeline.err", "phase", "dump");
@@ -2680,7 +2662,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
                 goto cleanup;
             }
         } else {
-            cbm_store_t *hash_store = cbm_store_open_path(db_path);
+            cbm_store_t *hash_store = cbm_store_open_path(dump_db_path);
             if (!hash_store) {
                 cbm_log_error("pipeline.err", "phase", "reopen_persisted_store");
                 rc = CBM_STORE_ERR;
@@ -2710,6 +2692,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
 
 cleanup:
+    free(dump_db_path);
     githistory_task_release(&githistory_task);
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
@@ -2804,7 +2787,7 @@ static bool db_sidecars_absent(const char *db_path) {
     if (!db_path || !db_path[0]) {
         return false;
     }
-    enum { SIDECAR_PATH_MAX = 4096 };
+    enum { SIDECAR_PATH_MAX = CBM_SZ_4K };
     char side[SIDECAR_PATH_MAX];
     if (strlen(db_path) > sizeof(side) - sizeof("-journal")) {
         return false;
