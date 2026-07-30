@@ -1233,16 +1233,14 @@ static bool cbm_subprocess_memory_macos(cbm_subprocess_t *process, size_t *bytes
         if (pids[i] <= 0) {
             continue;
         }
-        struct proc_bsdinfo info;
-        if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != (int)sizeof(info) ||
-            (pid_t)info.pbi_pgid != process->pgid) {
+        struct proc_taskallinfo info;
+        if (proc_pidinfo(pids[i], PROC_PIDTASKALLINFO, 0, &info, sizeof(info)) !=
+                (int)sizeof(info) ||
+            (pid_t)info.pbsd.pbi_pgid != process->pgid) {
             continue;
         }
-        struct rusage_info_v2 usage;
-        if (proc_pid_rusage(pids[i], RUSAGE_INFO_V2, (rusage_info_t *)&usage) == 0) {
-            observed = true;
-            (void)cbm_memory_add(&total, usage.ri_resident_size);
-        }
+        observed = true;
+        (void)cbm_memory_add(&total, info.ptinfo.pti_resident_size);
     }
     free(pids);
     *bytes_out = total;
