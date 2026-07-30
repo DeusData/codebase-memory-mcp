@@ -402,10 +402,27 @@ try:
     stdout, stderr = process.communicate(timeout=8)
 
     if os.name == "nt":
-        if process.returncode != 2 or "tree cleanup" not in stderr:
+        # Assert the PROPERTY, not the wording. This used to require the phrase
+        # "tree cleanup" in stderr, which pinned one specific refusal message:
+        # rewording the guard broke the contract while the behaviour was still
+        # correct. What "fails closed" actually means is that the scheduler
+        # refused (rc=2) AND did not silently leave the descendant behind as if
+        # cleanup had succeeded.
+        descendant_pid = int(descendant_path.read_text(encoding="utf-8"))
+        if process.returncode != 2:
             raise SystemExit(
                 f"FAIL: Windows timeout race did not fail closed "
                 f"(rc={process.returncode}, stdout={stdout!r}, stderr={stderr!r})"
+            )
+        if process_state(descendant_pid) != "live":
+            raise SystemExit(
+                "FAIL: Windows timeout race refused without a surviving descendant "
+                "to refuse over -- the fixture no longer exercises the race"
+            )
+        if "cleanup" not in stderr.lower():
+            raise SystemExit(
+                f"FAIL: Windows timeout race refused without naming a cleanup "
+                f"failure (stderr={stderr!r})"
             )
     else:
         if process.returncode != 0:

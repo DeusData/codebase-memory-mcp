@@ -10427,6 +10427,47 @@ TEST(envscan_skips_ignored_dirs) {
     PASS();
 }
 
+TEST(envscan_does_not_follow_links_outside_root) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink containment test; Windows reparse-point behavior has a compile gate");
+#else
+    char root[256];
+    char outside[256];
+    snprintf(root, sizeof(root), "/tmp/cbm_envscan_root_XXXXXX");
+    snprintf(outside, sizeof(outside), "/tmp/cbm_envscan_outside_XXXXXX");
+    if (!cbm_mkdtemp(root) || !cbm_mkdtemp(outside)) {
+        th_rmtree(root);
+        th_rmtree(outside);
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(root, "control.sh",
+                    "export CONTROL_URL=https://control.example.com/v1\n");
+    write_temp_file(outside, "outside.sh",
+                    "export OUTSIDE_URL=https://outside.example.com/v1\n");
+
+    char linked_dir[512];
+    char outside_file[512];
+    char linked_file[512];
+    snprintf(linked_dir, sizeof(linked_dir), "%s/linked", root);
+    snprintf(outside_file, sizeof(outside_file), "%s/outside.sh", outside);
+    snprintf(linked_file, sizeof(linked_file), "%s/linked.sh", root);
+    ASSERT_EQ(symlink(outside, linked_dir), 0);
+    ASSERT_EQ(symlink(outside_file, linked_file), 0);
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(root, bindings, 32);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_NULL(find_binding_by_key(bindings, count, "OUTSIDE_URL"));
+
+    ASSERT_EQ(unlink(linked_file), 0);
+    ASSERT_EQ(unlink(linked_dir), 0);
+    th_rmtree(root);
+    th_rmtree(outside);
+    PASS();
+#endif
+}
+
 TEST(envscan_non_url_values_skipped) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
@@ -19732,6 +19773,7 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_value_exclusion);
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
+    RUN_TEST(envscan_does_not_follow_links_outside_root);
     RUN_TEST(envscan_non_url_values_skipped);
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);

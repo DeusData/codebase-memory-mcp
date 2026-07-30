@@ -343,33 +343,29 @@ require(
     and "invalid Windows PATH smoke seam fell back" in smoke_test,
     "Windows release smoke must prove malformed PATH-test gating fails closed",
 )
+# There is no in-process update left to refresh the MCP command, so Phase 14
+# cannot assert a refresh. The refresh itself still happens -- the install
+# script re-runs `install` -- and is covered by Phase 8 (agent config install
+# E2E) and Phase 13 (install script E2E). Phase 14 must say so rather than
+# quietly dropping the step.
 require(
-    'if [ "$UPD_CMD" != "$EXPECTED_UPD_CMD" ]' in smoke_test,
-    "Phase 14 must require the refreshed MCP command to equal the updated binary",
+    "config refresh covered by install" in smoke_test,
+    "Phase 14 must name where the config-refresh coverage moved to",
 )
+# The retired-image driver existed to exercise an in-process replacement that no
+# platform performs any more: `update` prints the shipped install script's
+# command and touches nothing. Phase 14 now drives from the installed binary
+# everywhere, and 14a asserts the binary is byte-identical afterwards.
 require(
-    'UPDATE_DRIVER="$RETIRED_DIR/codebase-memory-mcp"' in smoke_test
+    'UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp"' in smoke_test
     and 'STALE_CMD="$UPDATE_DRIVER"' in smoke_test,
-    "POSIX Phase 14 must refresh from positive running-image identity without probing config paths",
+    "Phase 14 must drive update from the installed binary on every platform",
 )
-# This used to pin the retired path so Windows Phase 14 carried a config entry
-# naming a missing executable. Two things retired that intent. The fixture now
-# COPIES a binary to the retired path, so it stopped being missing regardless of
-# what this string says -- the requirement was only ever checking the string,
-# never the property. And Windows update is a handoff to install.ps1 now, so
-# nothing rewrites this entry in-process the way the launcher-managed update
-# did: an entry naming a foreign path simply survives to uninstall, which
-# correctly refuses to remove a config entry owned by a DIFFERENT installation,
-# and 14f would then be demanding the one thing uninstall must never do.
-#
-# The missing-executable classification lives on in named unit tests instead of
-# here: cli_editor_mcp_preserves_unrecorded_posix_absolute_entries_without_probe
-# and cli_editor_mcp_preserves_unsafe_windows_drive_probe (tests/test_cli.c),
-# the latter covering the Windows missing-drive case specifically.
 require(
-    'STALE_CMD="$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"' in smoke_test,
-    "Windows Phase 14 must seed the MCP command at the binary uninstall will own",
+    "update replaced the binary in-process" in smoke_test,
+    "Phase 14 must assert update leaves the binary byte-identical",
 )
+
 for changed_path in (
     "install\\.(sh|ps1)",
     "scripts/smoke-local",

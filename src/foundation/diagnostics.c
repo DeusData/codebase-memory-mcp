@@ -29,7 +29,10 @@
 
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
+#include <fcntl.h> /* _O_* for the exclusive stats-file create */
+#include <io.h>    /* _wopen / _close */
 #include <process.h>
+#include <sys/stat.h> /* _S_IREAD / _S_IWRITE */
 #include <windows.h>
 #define getpid _getpid
 #else
@@ -136,6 +139,52 @@ static void diag_stats_write(const char *text, void *arg) {
     }
 }
 
+/* Create the stats file at its fixed, discoverable path without ever writing
+ * through something another process planted there. Exclusive creation IS the
+ * guarantee, so the predictable name stays safe: the unlink drops a stale file
+ * from an earlier run with this pid (and, if a local attacker pre-created a
+ * symlink, removes the link itself — never its target), and the O_EXCL create
+ * that follows fails closed if anything reappears at the path in between. The
+ * write therefore lands on a file this process just created, or not at all.
+ * O_NOFOLLOW is belt-and-braces for the same window on POSIX. Mode 0600: the
+ * snapshot describes this process's heap layout, so it is owner-only. */
+static FILE *diag_open_private_stats_file(const char *path) {
+    (void)cbm_unlink(path);
+#ifdef _WIN32
+    /* _wopen mirrors cbm_mkstemp's Windows contract — the ANSI CRT interprets
+     * the UTF-8 bytes of a non-ASCII %TEMP% in the local codepage and fails. */
+    wchar_t *wide = cbm_path_to_wide(path);
+    if (!wide) {
+        return NULL;
+    }
+    int descriptor = _wopen(wide, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_NOINHERIT,
+                            _S_IREAD | _S_IWRITE);
+    free(wide);
+    if (descriptor < 0) {
+        return NULL;
+    }
+    FILE *sink = _fdopen(descriptor, "wb");
+    if (!sink) {
+        (void)_close(descriptor);
+    }
+    return sink;
+#else
+    int flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int descriptor = open(path, flags, 0600);
+    if (descriptor < 0) {
+        return NULL;
+    }
+    FILE *sink = fdopen(descriptor, "wb");
+    if (!sink) {
+        (void)close(descriptor);
+    }
+    return sink;
+#endif
+}
+
 static void diag_write_allocator_stats(void) {
     char flag[CBM_SZ_16];
     if (cbm_safe_getenv("CBM_MEM_STATS", flag, sizeof(flag), NULL) == NULL || flag[0] != '1') {
@@ -145,13 +194,14 @@ static void diag_write_allocator_stats(void) {
     /* Deliberately NOT inside the diagnostics directory: that tree is
      * owner-private with anchored (openat-based) writes on POSIX, which a plain
      * path-based open does not satisfy. This file is a developer diagnostic, so
-     * a predictable temp path keeps it working identically on every platform. */
+     * a predictable temp path keeps it working identically on every platform —
+     * diag_open_private_stats_file is what makes that path safe to write. */
     int written =
         snprintf(path, sizeof(path), "%s/cbm-allocator-stats-%d.txt", cbm_tmpdir(), (int)getpid());
     if (written <= 0 || (size_t)written >= sizeof(path)) {
         return;
     }
-    FILE *sink = cbm_fopen(path, "wb");
+    FILE *sink = diag_open_private_stats_file(path);
     if (!sink) {
         return;
     }

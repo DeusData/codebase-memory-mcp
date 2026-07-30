@@ -8379,13 +8379,11 @@ static void cleanup_prefilter_dir(const char *tmp, const char *src_path, const c
     rmdir(tmp);
 }
 
-/* PR #756 (distilled): scoped search_code prefilters the indexed filelist by
- * path_filter before grep runs. POSITIVE invariant guard: a path_filter that
- * matches the file containing the hit must still return that hit (guards
- * against over-filtering — the prefilter predicate must stay IDENTICAL to the
- * post-grep filter in collect_grep_matches), and files outside the filter
- * stay excluded. Green on pre-prefilter main too (the post-grep filter alone
- * produced the same results): the change is results-preserving perf-only. */
+/* PR #756 (distilled): path_filter must retain matching files and exclude
+ * non-matching files regardless of where filtering occurs. Exact anchored
+ * paths may narrow the traversal before grep; general regular expressions stay
+ * in collect_grep_matches so fresh or untracked files absent from the graph
+ * remain discoverable. This test guards the common result invariant. */
 TEST(search_code_path_filter_prefilter_keeps_matches) {
     char tmp[512], src_path[768], vendor_path[768];
     cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
@@ -8406,8 +8404,7 @@ TEST(search_code_path_filter_prefilter_keeps_matches) {
     ASSERT_NOT_NULL(strstr(inner, "src/handler.go"));
     ASSERT_TRUE(strstr(inner, "vendor/other.go") == NULL);
 
-    /* Exactly the one in-filter grep match survives (same count before and
-     * after the prefilter — predicate identity). */
+    /* Exactly the one in-filter grep match survives. */
     int grep_matches = -1;
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
@@ -8425,14 +8422,9 @@ TEST(search_code_path_filter_prefilter_keeps_matches) {
     PASS();
 }
 
-/* PR #756 (distilled): path_filter matching ZERO indexed files. With the
- * prefilter the scoped filelist has 0 records, and handle_search_code now
- * skips the grep subprocess entirely (xargs on an empty filelist is
- * platform-dependent: GNU execs grep once with no operands, BSD skips) and
- * returns the empty result directly. Must be a clean zero-result response —
- * no error. Green on pre-prefilter main too (there the full filelist is
- * grepped and the post-grep filter drops every hit — an empty filelist is
- * unreachable on main): guards the edge the prefilter introduces. */
+/* PR #756 (distilled): a path_filter matching no files must return a clean
+ * zero-result response, not a subprocess or protocol error. This remains true
+ * for exact-path traversal narrowing and for general-regex post-filtering. */
 TEST(search_code_path_filter_matches_nothing) {
     char tmp[512], src_path[768], vendor_path[768];
     cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),

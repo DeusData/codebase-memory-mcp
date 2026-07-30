@@ -158,7 +158,27 @@ export XDG_CONFIG_HOME="$SMOKE_CONFIG"
 trap 'smoke_rmtree "$TMPDIR" "$SMOKE_STATE" "${DRYRUN_HOME:-}"' EXIT
 
 CLI_STDERR="$SMOKE_STATE/cli-stderr.log"
-cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
+# 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
+# `set -euo pipefail` a non-zero exit there kills the smoke with NOTHING
+# printed: no FAIL line, no stderr, just an abort indistinguishable from a hang,
+# a starved runner, or a real regression. One such abort cost a full Windows
+# cycle just to locate, and still could not be attributed. Surface the command
+# and its stderr here, while we still can.
+#
+# Neutral wording on purpose: one call site deliberately expects a non-zero exit
+# (the unknown-function query must error loudly), so this must not read as a
+# failure on its own.
+cli() {
+  local rc=0
+  "$BINARY" cli "$@" 2>"$CLI_STDERR" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    {
+      printf 'cli: `%s` exited %s\n' "$*" "$rc"
+      sed 's/^/  /' "$CLI_STDERR" 2>/dev/null
+    } >&2
+  fi
+  return "$rc"
+}
 skill_has_delegation_contract() {
   grep -qF 'When handing work to another agent' "$1" 2>/dev/null
 }
@@ -974,46 +994,47 @@ fi
 echo "OK: uninstall --dry-run completed"
 
 # 6c: update --dry-run --standard -y
+# The product binary never replaces itself on ANY platform. `update` is a
+# handoff: it prints the shipped install script's command and exits 0. An
+# in-process updater is structurally a downloader -- fetch archive, extract,
+# chmod, exec -- which is impossible on Windows without a second resident
+# binary, and is the shape Defender's ML scores as a dropper everywhere else.
 echo "--- Phase 6c: update --dry-run ---"
 if [[ "$BINARY" == *.exe ]]; then
-  # Same contract Phase 14a asserts against a real update: Windows never
-  # replaces the running image in-process, so `update` is a handoff — it exits 0
-  # and prints the exact install.ps1 command. The old refusal here was the
-  # portable-vs-managed split, which died with the launcher stub.
-  if ! UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1); then
-    echo "FAIL: Windows update handoff exited non-zero"
-    echo "$UPDATE_OUT"
-    exit 1
-  fi
-  if ! echo "$UPDATE_OUT" | grep -q 'install.ps1'; then
-    echo "FAIL: Windows update did not print the install.ps1 handoff"
-    echo "$UPDATE_OUT"
-    exit 1
-  fi
+  UPDATE_SCRIPT="install.ps1"
 else
-  UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1)
-  if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
-    echo "FAIL: update --dry-run did not indicate dry-run mode"
-    echo "$UPDATE_OUT"
-    exit 1
-  fi
-  if ! echo "$UPDATE_OUT" | grep -qi 'standard'; then
-    echo "FAIL: update --dry-run did not respect --standard flag"
-    exit 1
-  fi
+  UPDATE_SCRIPT="install.sh"
 fi
-# On Linux the binary must self-update from the static "-portable" asset: the
-# standard linux asset dynamically links glibc 2.38+ and breaks on older distros
-# (Debian 11, RHEL 8, Ubuntu 20.04). Guards build_update_url in src/cli/cli.c.
-if [ "$(uname -s)" = "Linux" ]; then
-  if ! echo "$UPDATE_OUT" | grep -q -- '-portable'; then
-    echo "FAIL: linux update --dry-run does not target the -portable asset"
-    echo "$UPDATE_OUT"
+if ! UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1); then
+  echo "FAIL: update handoff exited non-zero"
+  echo "$UPDATE_OUT"
+  exit 1
+fi
+if ! echo "$UPDATE_OUT" | grep -q "$UPDATE_SCRIPT"; then
+  echo "FAIL: update did not print the $UPDATE_SCRIPT handoff"
+  echo "$UPDATE_OUT"
+  exit 1
+fi
+# A handoff that still fetched something would defeat the entire point.
+if echo "$UPDATE_OUT" | grep -qiE 'downloading |releases/latest/download'; then
+  echo "FAIL: update still performs an in-process download"
+  echo "$UPDATE_OUT"
+  exit 1
+fi
+echo "OK: update hands off to $UPDATE_SCRIPT without downloading"
+
+# The glibc constraint did NOT disappear with in-process update -- it moved. The
+# standard linux asset dynamically links glibc 2.38+ and breaks on Debian 11,
+# RHEL 8 and Ubuntu 20.04, so the installer must fetch the static "-portable"
+# build. Guard it where the behaviour now lives instead of retiring the
+# protection along with the code that used to implement it.
+if [ -f "$REPO_ROOT/install.sh" ]; then
+  if ! grep -q 'PORTABLE="-portable"' "$REPO_ROOT/install.sh"; then
+    echo "FAIL: install.sh no longer selects the static -portable Linux asset"
     exit 1
   fi
-  echo "OK: linux update targets the -portable (static) asset"
+  echo "OK: install.sh targets the -portable (static) Linux asset"
 fi
-echo "OK: update --dry-run --standard completed"
 
 # 6d: config set/get/reset round-trip
 echo "--- Phase 6d: config set/get/reset ---"
@@ -3001,15 +3022,14 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
     fi
   fi
 
-  # POSIX runs `update` from the retired image so the in-process replacement is
-  # exercised end to end. Windows has no in-process replacement: a running .exe
-  # cannot replace itself, so `update` hands off to install.ps1 (asserted in
-  # 14a below) and the installed copy drives the later uninstall phases.
+  # No platform replaces its own image any more, so there is no in-process
+  # swap left to exercise from a retired copy: every platform drives `update`
+  # from the installed binary, and the installed copy drives the later
+  # uninstall phases.
   if [[ "$BINARY" == *.exe ]]; then
     UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
   else
-    RETIRED_DIR=$(cd "$UPDATE_HOME/retired-install" && pwd -P)
-    UPDATE_DRIVER="$RETIRED_DIR/codebase-memory-mcp"
+    UPDATE_DRIVER="$UPDATE_HOME/.local/bin/codebase-memory-mcp"
   fi
 
   # Pre-install agent config with positive prior-install identity. POSIX runs
@@ -3022,11 +3042,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   # make 14f demand that uninstall delete an entry owned by a DIFFERENT
   # installation, which it correctly refuses to do. install.ps1 re-runs
   # `install`, so this is exactly what a real Windows user is left holding.
-  if [[ "$BINARY" == *.exe ]]; then
-    STALE_CMD="$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
-  else
-    STALE_CMD="$UPDATE_DRIVER"
-  fi
+  STALE_CMD="$UPDATE_DRIVER"
   if command -v cygpath &>/dev/null; then
     STALE_CMD=$(cygpath -m "$STALE_CMD")
   fi
@@ -3040,30 +3056,34 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
     UPDATE_VARIANT="--ui"
   fi
   UPDATE_LOG=$(smoke_mktemp_file)
+  # Hash the driver BEFORE the run and compare it against itself afterwards.
+  # Comparing against "$BINARY" instead looks equivalent but is not: the POSIX
+  # fixture ad-hoc re-signs its copy on macOS, so the two differ before `update`
+  # is ever invoked and the assertion fires on a difference the fixture created.
+  UPDATE_BIN_SHA_BEFORE=$(smoke_file_sha256 "$UPDATE_DRIVER")
   HOME="$UPDATE_HOME" CBM_DOWNLOAD_URL="$UPDATE_DOWNLOAD_URL" \
     "$UPDATE_DRIVER" update $UPDATE_VARIANT -y > "$UPDATE_LOG" 2>&1
   UPDATE_RC=$?
   cat "$UPDATE_LOG"
 
-  if [[ "$BINARY" == *.exe ]]; then
-    # Windows contract: update NEVER replaces the running image in-process. It
-    # exits 0 and prints the install.ps1 command. Regressing to an in-process
-    # self-update means reintroducing the AV-flagged launcher stub.
-    if [ "$UPDATE_RC" -ne 0 ]; then
-      echo "FAIL 14a: Windows update exited rc=$UPDATE_RC (expected 0)"
-      exit 1
-    fi
-    if ! grep -q "install.ps1" "$UPDATE_LOG"; then
-      echo "FAIL 14a: Windows update did not print the install.ps1 command"
-      exit 1
-    fi
-    if [ "$(smoke_file_sha256 "$BINARY")" != \
-         "$(smoke_file_sha256 "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe")" ]; then
-      echo "FAIL 14a: Windows update replaced the binary in-process"
-      exit 1
-    fi
-    echo "OK 14a: Windows update handed off to install.ps1 without touching the binary"
+  # Contract, every platform: update NEVER replaces the running image in
+  # process. It exits 0 and prints the shipped install script's command. On
+  # Windows regressing this means reintroducing the AV-flagged launcher stub;
+  # everywhere else it means putting download -> extract -> chmod -> exec back
+  # into the product binary.
+  if [ "$UPDATE_RC" -ne 0 ]; then
+    echo "FAIL 14a: update exited rc=$UPDATE_RC (expected 0)"
+    exit 1
   fi
+  if ! grep -q "$UPDATE_SCRIPT" "$UPDATE_LOG"; then
+    echo "FAIL 14a: update did not print the $UPDATE_SCRIPT command"
+    exit 1
+  fi
+  if [ "$UPDATE_BIN_SHA_BEFORE" != "$(smoke_file_sha256 "$UPDATE_DRIVER")" ]; then
+    echo "FAIL 14a: update replaced the binary in-process"
+    exit 1
+  fi
+  echo "OK 14a: update handed off to $UPDATE_SCRIPT without touching the binary"
   rm -f "$UPDATE_LOG"
 
   # 14b: Verify new binary exists and runs
@@ -3085,25 +3105,11 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   fi
   echo "OK 14b: updated binary runs"
 
-  # 14c: Verify agent config was refreshed to the exact installed binary.
-  # Windows has no in-process update, so there is no config refresh to assert:
-  # install.ps1 re-runs `install`, which is covered by Phase 8 and Phase 13.
-  if [[ "$BINARY" == *.exe ]]; then
-    echo "SKIP 14c: Windows update hands off to install.ps1 (config refresh covered by install)"
-  else
-  UPD_CMD=$(cat "$UPDATE_HOME/.claude.json" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command',''))" 2>/dev/null || echo "")
-  EXPECTED_UPD_CMD="$UPD_BIN"
-  if command -v cygpath &>/dev/null; then
-    EXPECTED_UPD_CMD=$(cygpath -w "$UPD_BIN")
-  fi
-  if [ "$UPD_CMD" != "$EXPECTED_UPD_CMD" ]; then
-    echo "FAIL 14c: agent config does not point at the updated binary"
-    echo "  expected: $EXPECTED_UPD_CMD"
-    echo "  actual:   ${UPD_CMD:-<missing>}"
-    exit 1
-  fi
-  echo "OK 14c: agent config refreshed (path=$UPD_CMD)"
-  fi
+  # 14c: there is no in-process update on any platform now, so there is no
+  # config refresh for this phase to assert. The install script re-runs
+  # `install`, which performs the refresh and is covered by Phase 8 (agent
+  # config install E2E) and Phase 13 (install script E2E).
+  echo "SKIP 14c: update hands off to $UPDATE_SCRIPT (config refresh covered by install)"
 
   # ── 14d-f: Real uninstall with binary removal ──
   # First verify binary + configs exist

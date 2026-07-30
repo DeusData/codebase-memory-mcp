@@ -6,7 +6,11 @@
 #   2. the DYNAMIC binary refuses to start (its glibc 2.38+ floor is by
 #      design — old-glibc coverage is the portable binary's job, and a
 #      dynamic binary that silently ran here would mask a floor regression).
-FROM ubuntu:22.04
+# Pinned by digest like every other venue image: a floating tag means the
+# glibc-FLOOR assertion silently drifts to whatever ubuntu:22.04 points at, and
+# a floor that moves is not a floor. (Scorecard PinnedDependenciesID #76 — this
+# was the one image the pinning pass missed.)
+FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash \

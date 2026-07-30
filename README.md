@@ -155,23 +155,25 @@ Watcher registration is controlled separately by `auto_watch` (default `true`). 
 
 ### Keeping Up to Date
 
-**macOS / Linux:**
+**Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
 
 ```bash
-codebase-memory-mcp update
+# macOS / Linux
+bash "<install-dir>/install.sh"
 ```
 
-**Windows** — updates run from `install.ps1`, not from the running binary, because a running executable cannot replace its own image on Windows. `codebase-memory-mcp update` prints the exact command; it is:
-
 ```powershell
+# Windows
 powershell -ExecutionPolicy Bypass -File "<install-dir>\install.ps1"
 ```
 
-`install.ps1` is idempotent, so re-running it *is* the update: it stops the daemon, retires the running binary, installs the new one, and cleans up. `install.ps1` sits next to the binary in your install directory. If PowerShell refuses to run it because the file came from the internet, `Unblock-File` it first.
+The install script is placed next to the binary at install time, so the printed path resolves beside the executable. It is idempotent, so re-running it *is* the update: it stops the daemon, retires the running binary, installs the new one, and cleans up.
+
+Why it works this way. On Windows it is a hard requirement — a running executable cannot replace its own image, so the swap has to happen from a process that is not the binary being replaced. On macOS and Linux it is a deliberate choice: an in-process updater is structurally a downloader (fetch an archive, verify it, unpack it, mark a file executable, run it), and shipping that composite in every binary to serve a command most people run a handful of times is a poor trade. The release archives now carry no download URLs at all, and **cbm makes no network request of its own accord** — it does not check for new versions in the background, and nothing phones home. You find out about releases from the install script, your package manager, or GitHub.
+
+If PowerShell refuses to run the script because the file came from the internet, `Unblock-File` it first.
 
 Installed through **npm or pip**? Update with your package manager on every platform (`npm install -g codebase-memory-mcp@latest` / `pip install -U codebase-memory-mcp`).
-
-The MCP server also checks for updates on startup and notifies on the first tool call if a newer release is available.
 
 ### Uninstall
 
@@ -180,6 +182,8 @@ codebase-memory-mcp uninstall
 ```
 
 Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and deleted only after confirmation.
+
+The install script placed beside the binary is **reported, not deleted** — uninstall prints its path and the `rm` command for it. It is left alone on purpose: it may be your own copy, a symlink into a checkout, or managed by a package manager, and an uninstaller should not delete a file it cannot prove it owns.
 
 ## Features
 

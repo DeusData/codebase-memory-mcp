@@ -94,8 +94,12 @@ GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
                   -Wno-stringop-truncation -Wno-alloc-size-larger-than
 endif
 
+# -Wdate-time: with -Werror, any use of __DATE__/__TIME__/__TIMESTAMP__ fails the
+# build. Build-time entropy is how one identical source tree produced a new hash
+# on every compile (see the local patch in vendored/mimalloc/src/options.c) —
+# once removed, it must not creep back through a new call site.
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
-                -Wno-unused-parameter -Wno-sign-compare \
+                -Wno-unused-parameter -Wno-sign-compare -Wdate-time \
                 $(GCC_ONLY_FLAGS) \
                 $(LIBGIT2_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
@@ -106,12 +110,21 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
+# Test seams are opt-in for production binaries. The test runner always enables
+# them through EDITOR_TEST_DEFINES, while selected production watchdog tests set
+# TEST_SEAMS=1 explicitly. A forgotten flag therefore produces a clean release
+# binary instead of silently shipping test-only process and lease controls.
+TEST_SEAM_DEFINE :=
+ifeq ($(TEST_SEAMS),1)
+TEST_SEAM_DEFINE := -DCBM_ENABLE_TEST_SEAMS=1
+endif
+
 # Production flags. CFLAGS_EXTRA carries the generated version define;
 # EXTRA_{C,CXX,LD}FLAGS are explicit developer/CI overrides appended last.
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA) $(EXTRA_CFLAGS)
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) $(CFLAGS_EXTRA) $(EXTRA_CFLAGS)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(EXTRA_CXXFLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
@@ -120,7 +133,7 @@ EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
 	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_PIPELINE_ENABLE_TEST_API=1 \
-	-DCBM_WATCHER_ENABLE_TEST_API=1
+	-DCBM_WATCHER_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
 TEST_INCLUDE_FLAGS = -Itests -Itests/repro
 # The build system is the single source of truth for "is this binary
 # instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
@@ -175,12 +188,27 @@ ifeq ($(IS_LINUX),yes)
 MIMALLOC_WRAP_FLAGS_POSIX := $(foreach sym,$(MIMALLOC_WRAP_SYMS_POSIX),-Wl,--wrap=$(sym))
 endif
 ifeq ($(IS_MINGW),yes)
-WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+# --no-insert-timestamp: the PE header otherwise carries the link wall clock, so
+# two Windows builds of identical source are never byte-identical and every
+# release is a brand-new file to a reputation system. Same motivation as the
+# mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
 ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
+endif
+
+# W^X: demand a non-executable stack on ELF. This is belt to the braces of the
+# .note.GNU-stack annotation in vendored/nomic/code_vectors_blob.S — that note
+# fixes the CAUSE (an unannotated object makes ld assume the worst for the whole
+# link), this flag fixes the OUTCOME, and the composition gate proves it on the
+# shipped artifact. ELF-only: Apple's ld rejects -z noexecstack outright and it
+# is meaningless for PE, so it is gated rather than made "common".
+ELF_HARDENING_FLAGS :=
+ifeq ($(IS_LINUX),yes)
+ELF_HARDENING_FLAGS := -Wl,-z,noexecstack
 endif
 
 # The POSIX wrap shim exists only so the profiler can observe allocations. It
@@ -189,15 +217,15 @@ endif
 # two allocators on the same pointers. Windows keeps its wrap flags everywhere,
 # because there the shim is what makes mimalloc own the allocations at all.
 LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) \
-	$(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(EXTRA_LDFLAGS)
+	$(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS) $(EXTRA_LDFLAGS)
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) \
-	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS)
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(LIBGIT2_LIBS) \
-	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS)
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 # nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement)
 CFLAGS_NOSAN  = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1
 LDFLAGS_NOSAN = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) \
-	$(MIMALLOC_WRAP_FLAGS)
+	$(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -431,9 +459,20 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
 # BM25 search path in search_graph (see nodes_fts virtual table in store.c).
+#
+# SQLITE_OMIT_LOAD_EXTENSION: no cbm code calls sqlite3_load_extension or
+# sqlite3_enable_load_extension, and we never want a graph DB to be able to pull
+# a shared library into the process. Loading is off by default at runtime, but
+# "disabled by default" is a setting while "not compiled in" is a property —
+# this compiles the machinery out, removing the API surface and part of the
+# dlopen/dlsym import surface with it. The composition gate asserts the symbols
+# are absent from every release artifact.
+SQLITE3_OMIT_FLAGS = -DSQLITE_OMIT_LOAD_EXTENSION
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
-SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
+                 $(SQLITE3_OMIT_FLAGS)
+SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
+                      $(SQLITE3_OMIT_FLAGS)
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
@@ -821,7 +860,14 @@ $(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+# static.c is an AMALGAMATION: it #includes options.c and friends, none of which
+# make can see through the single named prerequisite, and the compile flags live
+# in this Makefile. Both gaps bit for real — the __DATE__ removal in options.c and
+# SQLITE_OMIT_LOAD_EXTENSION below each silently did nothing on an incremental
+# build because the object was considered up to date. Depend on the included
+# sources AND on this Makefile so a flag change rebuilds too.
+$(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) $(wildcard vendored/mimalloc/src/*.c) \
+                              $(wildcard vendored/mimalloc/include/*.h) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS) -c -o $@ $<
 
 # sqlite3 object files (vendored amalgamation)
@@ -835,7 +881,7 @@ $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
@@ -1243,7 +1289,26 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+# Rebuild when the build CONFIGURATION changes, not only when sources do. The
+# product binary is compiled in ONE shot from sources, so after a TEST_SEAMS or
+# version flip make finds the binary newer than every source and skips the recipe
+# entirely, handing back a binary built with the PREVIOUS configuration. The
+# dangerous direction is a release build silently keeping test seams, which is a
+# property no reviewer can see by reading the diff. The stamp's CONTENT is the
+# configuration and it is rewritten only when that content changes, so ordinary
+# incremental builds are unaffected. (Single-quoted: the signature may contain
+# the escaped quotes of -DCBM_VERSION, which are literal inside '', but must not
+# contain a literal single quote.)
+BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)
+.PHONY: build-config-check
+build-config-check:
+$(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
+	@printf '%s\n' '$(BUILD_CONFIG_SIG)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; \
+	else mv -f $@.tmp $@; rm -f $(BUILD_DIR)/codebase-memory-mcp; \
+	echo "=== build config changed -> full rebuild: $(BUILD_CONFIG_SIG) ==="; fi
+
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \

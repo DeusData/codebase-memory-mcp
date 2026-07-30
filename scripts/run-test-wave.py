@@ -123,15 +123,55 @@ def start_suite(
     )
 
 
+def windows_descendants(pid: int, timeout: int) -> bool:
+    """True if any live process still claims `pid` as its parent.
+
+    Used only when the suite leader has already exited: `taskkill /T` cannot
+    walk a tree from a dead PID, so cleanup is proven by asking whether anything
+    is still parented to it. One level deep on purpose -- Windows does not
+    reparent orphans, so a grandchild keeps pointing at its own (dead) parent
+    and would not be found here. That is a weaker proof than taskkill /T, which
+    is why it is reserved for the case where the strong proof is impossible.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "@(Get-CimInstance Win32_Process -Filter "
+                f"'ParentProcessId={pid}').Count",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # cannot prove absence -> assume the worst
+    if completed.returncode != 0:
+        return True
+    return (completed.stdout or "").strip() not in ("0", "")
+
+
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
     process = active.process
     leader_exited = process.poll() is not None
     if os.name == "nt":
         if leader_exited:
-            raise RuntimeError(
-                f"suite {active.name!r} leader exited before Windows tree cleanup "
-                "could be proven"
-            )
+            # The leader can exit on its own between the timeout decision and
+            # this call. Refusing outright made the harness itself lose a race:
+            # a natural exit at the wrong moment failed the whole wave, which is
+            # how a deliberately-hanging fixture suite reddened a release run.
+            # taskkill /T cannot walk a tree from a dead PID, so prove cleanup
+            # the only way still available -- nothing is parented to it.
+            if windows_descendants(process.pid, kill_grace):
+                raise RuntimeError(
+                    f"suite {active.name!r} leader exited leaving live descendants"
+                )
+            return
         try:
             completed = subprocess.run(
                 [

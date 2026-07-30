@@ -3039,10 +3039,17 @@ TEST(daemon_application_cancels_physical_job_only_after_final_session) {
         started[i] = cbm_thread_create(&threads[i], 0, app_request_thread, &requests[i]) == 0;
     }
     bool subscribed = started[0] && started[1] && app_wait_for_subscribers(application, project, 2);
-    if (subscribed) {
+    /* The physical job starts asynchronously once a session subscribes, so a
+     * subscriber count of 2 does NOT imply it has started. Cancelling both
+     * sessions before that point leaves starts == 0 -- arguably the correct
+     * outcome, and the reason this test failed intermittently on Windows while
+     * passing everywhere else. Wait for the state the assertions below actually
+     * require; `starts` only increments, so this cannot miss the transition. */
+    bool job_started = subscribed && app_wait_for_atomic_int(&fake.starts, 1);
+    if (job_started) {
         callbacks.session_cancel(callbacks.context, sessions[0]);
     }
-    bool one_left = subscribed && app_wait_for_subscribers(application, project, 1);
+    bool one_left = job_started && app_wait_for_subscribers(application, project, 1);
     int cancels_after_first = atomic_load(&fake.cancels);
     if (one_left) {
         callbacks.session_cancel(callbacks.context, sessions[1]);
@@ -3058,6 +3065,7 @@ TEST(daemon_application_cancels_physical_job_only_after_final_session) {
 
     ASSERT_TRUE(setup);
     ASSERT_TRUE(subscribed);
+    ASSERT_TRUE(job_started);
     ASSERT_TRUE(one_left);
     ASSERT_EQ(atomic_load(&fake.starts), 1);
     ASSERT_EQ(cancels_after_first, 0);

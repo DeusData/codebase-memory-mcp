@@ -85,10 +85,16 @@ enum {
 #include <process.h>
 #include <windows.h>
 #define getpid _getpid
+/* Write through the descriptor cbm_mkstemp returned rather than reopening its
+ * path — see search_scratch_open. Mirrors config_toml_edit.c's toml_fdopen. */
+#define mcp_fdopen _fdopen
+#define mcp_close _close
 #else
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#define mcp_fdopen fdopen
+#define mcp_close close
 #endif
 #include <yyjson/yyjson.h>
 #include <ctype.h>
@@ -2456,16 +2462,10 @@ typedef enum {
 
 struct cbm_mcp_server {
     cbm_mcp_tool_profile_t tool_profile;
-    cbm_store_t *store;             /* currently open project store (or NULL) */
-    bool owns_store;                /* true if we opened the store */
-    char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
-    char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
-    cbm_mutex_t
-        update_notice_lock;    /* protects update_notice across background check/request thread */
-    bool update_checked;       /* true after background check has been launched */
-    cbm_thread_t update_tid;   /* background update check thread */
-    bool update_thread_active; /* true if update thread was started and needs joining */
+    cbm_store_t *store;     /* currently open project store (or NULL) */
+    bool owns_store;        /* true if we opened the store */
+    char *current_project;  /* which project store is open for (heap) */
+    time_t store_last_used; /* last time resolve_store was called for a named project */
 
     /* Session + auto-index state */
     char session_root[CBM_SZ_1K];     /* detected project root path */
@@ -2657,14 +2657,6 @@ static int cbm_mcp_store_idle_timeout_s(cbm_mcp_server_t *srv) {
 static int cbm_mcp_db_validate_busy_timeout_ms(cbm_mcp_server_t *srv) {
     return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_DB_VALIDATE_BUSY_TIMEOUT_MS,
                                       CBM_DB_VALIDATE_BUSY_TIMEOUT_MS, 0, CBM_SZ_64K);
-}
-
-static int cbm_mcp_update_check_timeout_s(cbm_mcp_server_t *srv) {
-    if (!srv || !srv->config) {
-        return 0;
-    }
-    return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S,
-                                      CBM_MCP_UPDATE_CHECK_TIMEOUT_S, 0, CBM_SZ_256);
 }
 
 static bool cbm_mcp_auto_index_enabled(cbm_mcp_server_t *srv) {
@@ -3370,7 +3362,6 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     if (!srv) {
         return NULL;
     }
-    cbm_mutex_init(&srv->update_notice_lock);
     cbm_mutex_init(&srv->active_request_lock);
     cbm_mutex_init(&srv->request_scope_mutex);
     atomic_init(&srv->pipeline_cancel_requested, 0);
@@ -3622,13 +3613,9 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     /* Free is a shutdown boundary, not a wait-for-work API. Tell a supervised
      * auto-index child to terminate before joining its owner thread. */
     cbm_mcp_server_request_stop(srv);
-    if (srv->update_thread_active) {
-        cbm_thread_join(&srv->update_tid);
-    }
     (void)cbm_mcp_server_join_autoindex(srv);
     (void)cbm_mcp_server_join_overlay_compaction(srv, NULL);
     cbm_mutex_destroy(&srv->overlay_compaction_lock);
-    cbm_mutex_destroy(&srv->update_notice_lock);
     cbm_mutex_destroy(&srv->active_request_lock);
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
@@ -15305,7 +15292,7 @@ static bool search_code_file_pattern_matches(const char *file_pattern, const cha
  * zero files; that preserves upstream's "indexed scope first" behavior instead
  * of falling through to an unbounded recursive scan. */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *file_pattern, const char *filelist) {
+                                  const char *file_pattern, FILE *fl) {
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
         return false;
@@ -15319,7 +15306,6 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         return false;
     }
 
-    FILE *fl = fopen(filelist, "wb");
     if (!fl) {
         free_counted_string_array(indexed_files, indexed_count);
         return false;
@@ -15348,13 +15334,7 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
             break;
         }
     }
-    if (fclose(fl) != 0) {
-        ok = false;
-    }
     free_counted_string_array(indexed_files, indexed_count);
-    if (!ok) {
-        cbm_unlink(filelist);
-    }
     return ok;
 }
 
@@ -15424,35 +15404,113 @@ static bool extract_exact_path_filter(const char *filter, char *out, size_t out_
     return validate_search_path_arg(out) && search_rel_path_is_safe(out);
 }
 
-/* Write pattern to a temp file for grep -f. Returns true on success. */
-static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    if (!tmpfile || tmpfile_sz <= 0 || !pattern) {
+/* Private scratch for one search_code scan: the grep -f pattern file and the
+ * scoped file list.
+ *
+ * Both used to be fixed, guessable paths derived from the pid —
+ * "<tmp>/cbm_search_<pid>.pat" and its ".files" companion — opened with a plain
+ * fopen. Another local user could pre-plant a symlink at either name and
+ * redirect the write; two searches in the same process could also collide on
+ * them. Now both live inside a directory created by cbm_mkdtemp (0700 on POSIX,
+ * an explicit owner-only DACL on Windows) under an unguessable XXXXXX suffix,
+ * and each file is created by cbm_mkstemp — O_CREAT|O_EXCL at mode 0600, so the
+ * create fails rather than following anything already at the name. Every write
+ * goes through the descriptor cbm_mkstemp returned; neither path is ever
+ * reopened by name.
+ *
+ * Sizing: cbm_mkdtemp copies its expanded result back into `dir`, and its own
+ * internal buffer is CBM_SZ_512, so `dir` must be at least that big to receive
+ * it. The two file paths are `dir` plus a short basename. */
+typedef struct {
+    char dir[CBM_SZ_512];
+    char pattern_path[CBM_SZ_1K];
+    char filelist_path[CBM_SZ_1K];
+    FILE *filelist; /* held open for write_scoped_filelist; closed by the caller */
+} search_scratch_t;
+
+/* Create <scratch>/<basename>-XXXXXX exclusively and return a stream on the
+ * descriptor. On failure `path_out` is emptied so cleanup skips it. */
+static FILE *search_scratch_file(const char *dir, const char *basename, char *path_out,
+                                 size_t path_sz) {
+    path_out[0] = '\0';
+    int written = snprintf(path_out, path_sz, "%s/%s-XXXXXX", dir, basename);
+    if (written <= 0 || (size_t)written >= path_sz) {
+        path_out[0] = '\0';
+        return NULL;
+    }
+    int descriptor = cbm_mkstemp(path_out);
+    if (descriptor < 0) {
+        path_out[0] = '\0';
+        return NULL;
+    }
+    /* Binary mode: the file list uses an explicit per-platform record separator
+     * (NUL for xargs -0, newline for PowerShell) that CRLF translation would
+     * corrupt — the same reason the previous code opened it "wb". */
+    FILE *stream = mcp_fdopen(descriptor, "wb");
+    if (!stream) {
+        (void)mcp_close(descriptor);
+        (void)cbm_unlink(path_out);
+        path_out[0] = '\0';
+    }
+    return stream;
+}
+
+/* Anchored cleanup: removes both scratch files and the private directory. Safe
+ * to call more than once and on any partially-initialised scratch, so every
+ * exit from handle_search_code can call it unconditionally. rmdir succeeding is
+ * itself the proof nothing was left inside. */
+static void search_scratch_close(search_scratch_t *scratch) {
+    if (scratch->filelist) {
+        (void)fclose(scratch->filelist);
+        scratch->filelist = NULL;
+    }
+    if (scratch->pattern_path[0] != '\0') {
+        (void)cbm_unlink(scratch->pattern_path);
+        scratch->pattern_path[0] = '\0';
+    }
+    if (scratch->filelist_path[0] != '\0') {
+        (void)cbm_unlink(scratch->filelist_path);
+        scratch->filelist_path[0] = '\0';
+    }
+    if (scratch->dir[0] != '\0') {
+        (void)cbm_rmdir(scratch->dir);
+        scratch->dir[0] = '\0';
+    }
+}
+
+/* Open the scratch directory, write `pattern` to the grep -f file, and leave the
+ * file list open for write_scoped_filelist. Returns true on success; on failure
+ * everything already created is removed before returning. */
+static bool search_scratch_open(search_scratch_t *scratch, const char *pattern) {
+    scratch->dir[0] = '\0';
+    scratch->pattern_path[0] = '\0';
+    scratch->filelist_path[0] = '\0';
+    scratch->filelist = NULL;
+
+    int written =
+        snprintf(scratch->dir, sizeof(scratch->dir), "%s/cbm-search-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || (size_t)written >= sizeof(scratch->dir) || !cbm_mkdtemp(scratch->dir)) {
+        scratch->dir[0] = '\0';
         return false;
     }
-    int n = snprintf(tmpfile, (size_t)tmpfile_sz, "%s/cbm_search_XXXXXX", cbm_tmpdir());
-    if (n < 0 || n >= tmpfile_sz) {
+
+    FILE *pattern_file = search_scratch_file(scratch->dir, "pat", scratch->pattern_path,
+                                             sizeof(scratch->pattern_path));
+    if (!pattern_file) {
+        search_scratch_close(scratch);
         return false;
     }
-    int fd = cbm_mkstemp_s(tmpfile, (size_t)tmpfile_sz);
-    if (fd < 0) {
-        return false;
-    }
-#ifdef _WIN32
-    FILE *tf = _fdopen(fd, "w");
-#else
-    FILE *tf = fdopen(fd, "w");
-#endif
-    if (!tf) {
-        cbm_close_fd(fd);
-        cbm_unlink(tmpfile);
-        return false;
-    }
-    bool ok = fputs(pattern, tf) >= 0 && fputc('\n', tf) != EOF;
-    if (fclose(tf) != 0) {
-        ok = false;
-    }
+    bool ok = fprintf(pattern_file, "%s\n", pattern) >= 0;
+    ok = fclose(pattern_file) == 0 && ok;
     if (!ok) {
-        cbm_unlink(tmpfile);
+        search_scratch_close(scratch);
+        return false;
+    }
+
+    scratch->filelist = search_scratch_file(scratch->dir, "files", scratch->filelist_path,
+                                            sizeof(scratch->filelist_path));
+    if (!scratch->filelist) {
+        search_scratch_close(scratch);
         return false;
     }
     return true;
@@ -15641,8 +15699,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
-    char tmpfile[CBM_PATH_MAX];
-    if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
+    search_scratch_t scratch;
+    if (!search_scratch_open(&scratch, pattern)) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
                  strerror(errno));
@@ -15657,6 +15715,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                    "\"hint\":\"Check that /tmp is writable and has disk space.\"}",
                                    true);
     }
+    const char *tmpfile = scratch.pattern_path;
+    const char *filelist = scratch.filelist_path;
 
     /* Case-sensitivity: default case-insensitive (grep -i), opt-in case-sensitive. */
     bool case_sensitive = cbm_mcp_get_bool_arg(args, "case_sensitive");
@@ -15671,28 +15731,13 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * are searchable before the next index. Exact literal path_filter values can
      * safely narrow traversal to one file; general regex path_filter stays a
      * post-filter because approximating regexes as filesystem globs is lossy. */
-    char filelist[CBM_PATH_MAX];
-    int filelist_len = snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
-    if (filelist_len < 0 || (size_t)filelist_len >= sizeof(filelist)) {
-        cbm_unlink(tmpfile);
-        if (has_path_filter) {
-            cbm_regfree(&path_regex);
-        }
-        free(root_path);
-        free(pattern);
-        free(project);
-        free(file_pattern);
-        return cbm_mcp_text_result("{\"error\":\"search failed: temporary file path too long\","
-                                   "\"hint\":\"Use a shorter TMPDIR/TEMP path or project path.\"}",
-                                   true);
-    }
     search_code_scan_mode_t scan_mode = SEARCH_CODE_SCAN_RECURSIVE_GREP;
     char grep_root[CBM_PATH_MAX];
     const char *grep_target = root_path;
     if (has_exact_filter_path) {
         int gn = snprintf(grep_root, sizeof(grep_root), "%s/%s", root_path, exact_filter_path);
         if (gn < 0 || (size_t)gn >= sizeof(grep_root) || !validate_search_path_arg(grep_root)) {
-            cbm_unlink(tmpfile);
+            search_scratch_close(&scratch);
             free(root_path);
             free(pattern);
             free(project);
@@ -15709,17 +15754,34 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     } else if (!file_pattern && search_code_git_worktree_available(root_path)) {
         scan_mode = SEARCH_CODE_SCAN_GIT_GREP;
     } else if (file_pattern &&
-               write_scoped_filelist(srv, project, root_path, file_pattern, filelist)) {
+               write_scoped_filelist(srv, project, root_path, file_pattern, scratch.filelist)) {
         scan_mode = SEARCH_CODE_SCAN_FILELIST_GREP;
+    }
+
+    /* Flush and close the exclusive descriptor before xargs/PowerShell reads the
+     * file list by path. The containing directory remains owner-private until
+     * search_scratch_close removes both files after the subprocess exits. */
+    int filelist_close_rc = fclose(scratch.filelist);
+    scratch.filelist = NULL;
+    if (filelist_close_rc != 0) {
+        search_scratch_close(&scratch);
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result(
+            "{\"error\":\"search failed: could not flush scoped file list\","
+            "\"hint\":\"Check that the temporary directory has available disk space.\"}",
+            true);
     }
 
     char cmd[CBM_SZ_4K];
     if (!build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scan_mode, file_pattern,
                         tmpfile, filelist, grep_target)) {
-        cbm_unlink(tmpfile);
-        if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
-            cbm_unlink(filelist);
-        }
+        search_scratch_close(&scratch);
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
@@ -15734,10 +15796,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        cbm_unlink(tmpfile);
-        if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
-            cbm_unlink(filelist);
-        }
+        search_scratch_close(&scratch);
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
@@ -15756,10 +15815,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
                                             &path_regex, grep_limit, &gm_count);
     cbm_pclose(fp);
-    cbm_unlink(tmpfile);
-    if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
-        cbm_unlink(filelist);
-    }
+    search_scratch_close(&scratch);
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
     /* Sort grep matches by file for contiguous processing.
@@ -17839,138 +17895,6 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 }
 
-/* ── Background update check ──────────────────────────────────── */
-
-#define UPDATE_CHECK_URL "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
-
-static void *update_check_thread(void *arg) {
-    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
-
-    int timeout_s = cbm_mcp_update_check_timeout_s(srv);
-    if (timeout_s <= 0) {
-        return NULL;
-    }
-
-    char cmd[CBM_SZ_512];
-    int cmd_len = snprintf(cmd, sizeof(cmd),
-                           "curl -sf --max-time %d -H 'Accept: application/vnd.github+json' "
-                           "'" UPDATE_CHECK_URL "' 2>/dev/null",
-                           timeout_s);
-    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
-        return NULL;
-    }
-
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return NULL;
-    }
-
-    char buf[CBM_SZ_4K];
-    size_t total = 0;
-    while (total < sizeof(buf) - SKIP_ONE) {
-        size_t n = fread(buf + total, SKIP_ONE, sizeof(buf) - SKIP_ONE - total, fp);
-        if (n == 0) {
-            break;
-        }
-        total += n;
-    }
-    buf[total] = '\0';
-    cbm_pclose(fp);
-
-    /* Parse tag_name from JSON response */
-    yyjson_doc *doc = yyjson_read(buf, total, 0);
-    if (!doc) {
-        return NULL;
-    }
-
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *tag = yyjson_obj_get(root, "tag_name");
-    const char *tag_str = yyjson_get_str(tag);
-
-    if (tag_str) {
-        const char *current = cbm_cli_get_version();
-        /* Direct in-process MCP servers share the daemon's release policy:
-         * the non-semver local-build sentinel cannot establish upgrade order. */
-        if (!cbm_version_is_development(current) && cbm_compare_versions(tag_str, current) > 0) {
-            cbm_mutex_lock(&srv->update_notice_lock);
-            snprintf(srv->update_notice, sizeof(srv->update_notice),
-                     "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
-                     "Enjoying codebase-memory-mcp? Please leave a star: "
-                     "https://github.com/DeusData/codebase-memory-mcp",
-                     current, tag_str);
-            cbm_mutex_unlock(&srv->update_notice_lock);
-            cbm_log_info("update.available", "current", current, "latest", tag_str);
-        }
-    }
-
-    yyjson_doc_free(doc);
-    return NULL;
-}
-
-static void start_update_check(cbm_mcp_server_t *srv) {
-    if (srv->update_checked) {
-        return;
-    }
-    srv->update_checked = true; /* prevent double-launch */
-    if (cbm_thread_create(&srv->update_tid, 0, update_check_thread, srv) == 0) {
-        srv->update_thread_active = true;
-    }
-}
-
-/* Prepend update notice to a tool result, then clear it (one-shot). */
-static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
-    if (!srv || !result_json) {
-        return result_json;
-    }
-
-    char notice[sizeof(srv->update_notice)];
-    cbm_mutex_lock(&srv->update_notice_lock);
-    snprintf(notice, sizeof(notice), "%s", srv->update_notice);
-    cbm_mutex_unlock(&srv->update_notice_lock);
-
-    if (notice[0] == '\0') {
-        return result_json;
-    }
-
-    /* Parse existing result, prepend notice text, rebuild */
-    yyjson_doc *doc = yyjson_read(result_json, strlen(result_json), 0);
-    if (!doc) {
-        return result_json;
-    }
-
-    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
-    yyjson_doc_free(doc);
-    if (!root) {
-        yyjson_mut_doc_free(mdoc);
-        return result_json;
-    }
-    yyjson_mut_doc_set_root(mdoc, root);
-
-    /* Find the "content" array */
-    yyjson_mut_val *content = yyjson_mut_obj_get(root, "content");
-    if (content && yyjson_mut_is_arr(content)) {
-        /* Prepend a text content item with the update notice */
-        yyjson_mut_val *notice_item = yyjson_mut_obj(mdoc);
-        yyjson_mut_obj_add_str(mdoc, notice_item, "type", "text");
-        yyjson_mut_obj_add_str(mdoc, notice_item, "text", notice);
-        yyjson_mut_arr_prepend(content, notice_item);
-    }
-
-    size_t len;
-    char *new_json = yyjson_mut_write(mdoc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
-    yyjson_mut_doc_free(mdoc);
-
-    if (new_json) {
-        free(result_json);
-        cbm_mutex_lock(&srv->update_notice_lock);
-        srv->update_notice[0] = '\0'; /* clear — one-shot after successful injection */
-        cbm_mutex_unlock(&srv->update_notice_lock);
-        return new_json;
-    }
-    return result_json;
-}
-
 /* ── MCP Resources (Phase 10) ─────────────────────────────────── */
 
 static void write_protocol_json(FILE *out, const char *json, bool content_length_framed) {
@@ -18595,7 +18519,6 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
                                                               cbm_mcp_tool_mode_is_classic(srv));
         detect_session(srv);
         if (srv->background_tasks && srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
-            start_update_check(srv);
             maybe_auto_index(srv);
         }
     } else if (strcmp(req.method, "resources/list") == 0) {
@@ -18700,9 +18623,6 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
         request_logged = true;
 
-        CBM_PROF_START(prof_mcp_inject_notice);
-        result_json = inject_update_notice(srv, result_json);
-        CBM_PROF_END("mcp_tool_call", "inject_update_notice", prof_mcp_inject_notice);
         free(tool_name);
         free(tool_args);
     } else {

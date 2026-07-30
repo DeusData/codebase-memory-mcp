@@ -4851,6 +4851,32 @@ static long extract_wide_flat_ms(int n, int *out_defs) {
     return (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
 }
 
+/* Best-of-N. Timing noise only ever ADDS time, so the minimum of a few runs is
+ * the cheapest good estimate of the noise-free cost. A single sample at each
+ * size made the RATIO carry the noise of BOTH measurements: on a loaded Windows
+ * VM this read 184ms -> 9387ms (51x) for code that measures ~20x unloaded, and
+ * tripped a bound calibrated for exactly that linear case.
+ *
+ * Deliberately NOT solved by raising WF_RATIO_MAX: the bound sits where it does
+ * because linear (~20x) and quadratic (~128x) are each >=2x away from it, so
+ * inflating it moves the test toward the very signal it exists to catch. This
+ * keeps the threshold and removes the variance instead. */
+static long extract_wide_flat_ms_best_of(int n, int reps, int *out_defs) {
+    long best = -1;
+    for (int i = 0; i < reps; i++) {
+        int defs = 0;
+        long ms = extract_wide_flat_ms(n, &defs);
+        if (ms < 0) {
+            return ms;
+        }
+        if (best < 0 || ms < best) {
+            best = ms;
+            *out_defs = defs;
+        }
+    }
+    return best;
+}
+
 TEST(extract_wide_flat_file_is_linear) {
     /* SCALING-RATIO guard: assert the COMPLEXITY CLASS, not a wall-clock
      * bound. Index-based ts_node_child(i) child loops are O(i) per call —
@@ -4874,8 +4900,10 @@ TEST(extract_wide_flat_file_is_linear) {
     enum { WF_SMALL = 20 * 1000, WF_BIG = 400 * 1000, WF_RATIO_MAX = 40, WF_FLOOR_MS = 120 };
     int defs_small = 0;
     int defs_big = 0;
-    long t_small = extract_wide_flat_ms(WF_SMALL, &defs_small);
-    long t_big = extract_wide_flat_ms(WF_BIG, &defs_big);
+    /* Small is cheap, so sample it more; big dominates runtime, so twice is the
+     * affordable compromise that still discards one unlucky sample. */
+    long t_small = extract_wide_flat_ms_best_of(WF_SMALL, 3, &defs_small);
+    long t_big = extract_wide_flat_ms_best_of(WF_BIG, 2, &defs_big);
     ASSERT_GTE(t_small, 0);
     ASSERT_GTE(t_big, 0);
     /* Anti-vacuous guard: the breadth was actually walked at both sizes. */

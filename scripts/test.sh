@@ -262,8 +262,14 @@ fi
 
 # Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
 # binary and verifies it self-exits when its launching parent is killed.
+#
+# TEST_SEAMS=1: the worker-mode leg below needs the crash-orphan probe, which is
+# compiled out of ordinary builds (it forks a SIGTERM-ignoring child — see
+# src/main.c). Requesting it HERE, in the leg that consumes it, is what keeps
+# release artifacts free of it; scripts/ci/check-binary-composition.sh proves
+# they stay that way.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-make -j"$NPROC" -f Makefile.cbm cbm ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 

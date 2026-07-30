@@ -113,16 +113,30 @@ NAME="codebase-memory-mcp${SUFFIX}-${GOOS}-${GOARCH}"
 strip_release_binary() {
     local binary="$1"
     [ -f "$binary" ] || return 0
+    # The right flags differ per format, and the WRONG ones fail silently in
+    # the dangerous direction. Measured on the flagged darwin-arm64 artifact:
+    #
+    #   llvm-strip --strip-all   373 symbols   scanned CLEAN
+    #   strip        (no flags)  378 symbols   equivalent
+    #   strip -x -S             4058 symbols   the state VirusTotal FLAGGED
+    #   strip -X / -u -r        4058 symbols   likewise
+    #
+    # Apple's strip returns success for `-x -S`, so a helper that just tries
+    # candidates until one exits 0 would quietly reship the flagged binary.
+    # GNU/LLVM `--strip-all` is not even accepted by Apple's strip, which is why
+    # generalising it to every platform broke the macOS build -- loudly, which
+    # was the lucky outcome.
+    #
+    # So: --strip-all where it is understood, plain `strip` for Mach-O, and a
+    # hard error when no candidate can do the job. Never a weaker fallback.
     local stripped=""
     for tool in "${STRIP:-}" llvm-strip strip; do
         [ -n "$tool" ] || continue
         command -v "$tool" >/dev/null 2>&1 || continue
-        if [ "$GOOS" = "darwin" ]; then
-            # -x keeps external symbols: a full strip of a Mach-O can leave an
-            # image dyld will not load.
-            "$tool" -x "$binary" 2>/dev/null && stripped="$tool"
-        else
-            "$tool" --strip-all "$binary" 2>/dev/null && stripped="$tool"
+        if "$tool" --strip-all "$binary" 2>/dev/null; then
+            stripped="$tool --strip-all"
+        elif [ "$GOOS" = "darwin" ] && "$tool" "$binary" 2>/dev/null; then
+            stripped="$tool"
         fi
         [ -n "$stripped" ] && break
     done
@@ -155,6 +169,11 @@ if [ "$GOOS" = "windows" ]; then
     trap 'rm -rf "$PACK_DIR"' EXIT
     cp "$PAYLOAD" "$PACK_DIR/codebase-memory-mcp.exe"
     strip_release_binary "$PACK_DIR/codebase-memory-mcp.exe" || exit 2
+    # Gate the artifact AFTER strip: strip is the last byte-changing step, so
+    # this inspects exactly what goes into the archive. Runs here rather than in
+    # a workflow step so the local artifact-flow smoke enforces the same thing.
+    scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
+        "$PACK_DIR/codebase-memory-mcp.exe" || exit 2
     cp LICENSE install.ps1 "$PACK_DIR/"
     scripts/gen-third-party-notices.sh "$PACK_DIR/THIRD_PARTY_NOTICES.md"
     (
@@ -168,6 +187,8 @@ else
     [ -f "$BUILD_DIR/codebase-memory-mcp" ] ||
         { echo "package-release: build first; missing $BUILD_DIR/codebase-memory-mcp" >&2; exit 2; }
     strip_release_binary "$BUILD_DIR/codebase-memory-mcp" || exit 2
+    scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
+        "$BUILD_DIR/codebase-memory-mcp" || exit 2
     cp LICENSE install.sh "$BUILD_DIR/"
     scripts/gen-third-party-notices.sh "$BUILD_DIR/THIRD_PARTY_NOTICES.md"
     tar -czf "$OUT_DIR/$NAME.tar.gz" -C "$BUILD_DIR" \

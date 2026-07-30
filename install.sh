@@ -268,6 +268,32 @@ if [ "$SKIP_CONFIG" = true ]; then
 fi
 "$DLBIN" install "${INSTALL_ARGS[@]}"
 
+# Place the installer beside the binary so `update` can point at a local file
+# instead of a URL, and so the next update uses THIS release's installer.
+#
+# Two things make this safe. The source is the copy from the archive we just
+# checksum-verified -- never "$0", which does not exist under `curl | bash` and
+# would pin us to the OLD installer forever. And it is published by atomic
+# rename, never by writing over the live path: bash reads a script incrementally
+# by byte offset, so overwriting the file it is executing continues reading the
+# NEW bytes at the OLD offset. That fails silently and bizarrely, which is worse
+# than failing loudly.
+#
+# Best effort by design: a user who cannot write to INSTALL_DIR still gets a
+# working install, and `update` falls back to explaining where to find it.
+DL_INSTALLER="$DLDIR/install.sh"
+if [ -f "$DL_INSTALLER" ]; then
+    INSTALLER_TMP="$INSTALL_DIR/.install.sh.$$"
+    if cp "$DL_INSTALLER" "$INSTALLER_TMP" 2>/dev/null &&
+        chmod 755 "$INSTALLER_TMP" 2>/dev/null &&
+        mv -f "$INSTALLER_TMP" "$INSTALL_DIR/install.sh" 2>/dev/null; then
+        echo "Installed updater -> $INSTALL_DIR/install.sh"
+    else
+        rm -f "$INSTALLER_TMP" 2>/dev/null || true
+        echo "note: could not place install.sh in $INSTALL_DIR (update will explain where to find it)"
+    fi
+fi
+
 # Verify
 VERSION=$("$DEST" --version 2>&1) || {
     echo "error: installed binary failed to run" >&2
