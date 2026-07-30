@@ -5988,6 +5988,196 @@ TEST(cancelled_full_reindex_preserves_committed_db) {
     PASS();
 }
 
+TEST(discovery_resource_limit_preserves_committed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    cbm_store_close(live);
+    ASSERT_GT(baseline_nodes, 0);
+
+    cbm_index_limits_t limits;
+    cbm_index_limits_defaults(&limits);
+    limits.max_files = 1;
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_index_limits(p, &limits);
+    int rc = cbm_pipeline_run(p);
+    cbm_discover_report_t report = {0};
+    cbm_pipeline_get_resource_violation(p, &report);
+    cbm_pipeline_free(p);
+
+    live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    cbm_store_close(live);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(report.violation, CBM_DISCOVER_LIMIT_FILES);
+    ASSERT_EQ(report.limit, 1);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    PASS();
+}
+
+TEST(storage_resource_limits_preserve_committed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    cbm_store_close(live);
+    ASSERT_GT(baseline_nodes, 0);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "resource_candidate.go",
+                              "package main\n\nfunc ResourceCandidate() int { return 44 }\n"));
+
+    cbm_index_limits_t limits;
+    cbm_pipeline_limit_report_t report = {0};
+    cbm_index_limits_defaults(&limits);
+    limits.max_staging_bytes = 1;
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_index_limits(p, &limits);
+    int staging_rc = cbm_pipeline_run(p);
+    cbm_pipeline_get_limit_violation(p, &report);
+    cbm_pipeline_free(p);
+    bool staging_identified = report.violation == CBM_PIPELINE_LIMIT_STAGING_BYTES &&
+                              report.observed > report.limit && report.limit == 1;
+
+    cbm_index_limits_defaults(&limits);
+    limits.max_db_bytes = 1;
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_index_limits(p, &limits);
+    int database_rc = cbm_pipeline_run(p);
+    cbm_pipeline_get_limit_violation(p, &report);
+    cbm_pipeline_free(p);
+    bool database_identified = report.violation == CBM_PIPELINE_LIMIT_DATABASE_BYTES &&
+                               report.observed > report.limit && report.limit == 1;
+
+    cbm_index_limits_defaults(&limits);
+    limits.min_free_disk_bytes = UINT64_MAX;
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_index_limits(p, &limits);
+    int disk_rc = cbm_pipeline_run(p);
+    cbm_pipeline_get_limit_violation(p, &report);
+    cbm_pipeline_free(p);
+    bool disk_identified = report.violation == CBM_PIPELINE_LIMIT_FREE_DISK_BYTES &&
+                           report.observed < report.limit && report.limit == UINT64_MAX;
+
+    live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    int unpublished = count_nodes_named(live, project, "ResourceCandidate");
+    cbm_store_close(live);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(staging_rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_TRUE(staging_identified);
+    ASSERT_EQ(database_rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_TRUE(database_identified);
+    ASSERT_EQ(disk_rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_TRUE(disk_identified);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    ASSERT_EQ(unpublished, 0);
+    PASS();
+}
+
+TEST(cache_resource_limit_blocks_new_staging_without_eviction) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char cache[512];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-pipeline-cache-limit-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char db_path[CBM_SZ_4K];
+    (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *live = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(live);
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    cbm_store_close(live);
+    ASSERT_GT(baseline_nodes, 0);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "cache_candidate.go",
+                              "package main\n\nfunc CacheCandidate() int { return 45 }\n"));
+    cbm_index_limits_t limits;
+    cbm_index_limits_defaults(&limits);
+    limits.cache_max_bytes = 1;
+    p = cbm_pipeline_new(g_incr_tmpdir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_index_limits(p, &limits);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_limit_report_t report = {0};
+    cbm_pipeline_get_limit_violation(p, &report);
+    cbm_pipeline_free(p);
+
+    live = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    int unpublished = count_nodes_named(live, project, "CacheCandidate");
+    cbm_store_close(live);
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+    free(project);
+    cleanup_incremental_repo();
+    th_rmtree(cache);
+
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(report.violation, CBM_PIPELINE_LIMIT_CACHE_BYTES);
+    ASSERT_GT(report.observed, report.limit);
+    ASSERT_EQ(report.limit, 1);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    ASSERT_EQ(unpublished, 0);
+    PASS();
+}
+
 /* The same contract applies to the incremental path: the modified file is
  * present in a complete staging DB at the hook, but cancellation leaves the
  * prior committed snapshot queryable and removes every staging artifact. */
@@ -7540,6 +7730,9 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(cancelled_full_reindex_preserves_committed_db);
+    RUN_TEST(discovery_resource_limit_preserves_committed_db);
+    RUN_TEST(storage_resource_limits_preserve_committed_db);
+    RUN_TEST(cache_resource_limit_blocks_new_staging_without_eviction);
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
     RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
     RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);

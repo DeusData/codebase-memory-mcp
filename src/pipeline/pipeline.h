@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 
 #include "discover/discover.h" /* cbm_ignored_file_t (#963) */
+#include "foundation/index_limits.h"
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -28,6 +29,29 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_pipeline cbm_pipeline_t;
+
+enum {
+    CBM_PIPELINE_OK = 0,
+    CBM_PIPELINE_ERROR = -1,
+    CBM_PIPELINE_RESOURCE_LIMIT = -3,
+};
+
+typedef enum {
+    CBM_PIPELINE_LIMIT_NONE = 0,
+    CBM_PIPELINE_LIMIT_STAGING_BYTES,
+    CBM_PIPELINE_LIMIT_DATABASE_BYTES,
+    CBM_PIPELINE_LIMIT_FREE_DISK_BYTES,
+    CBM_PIPELINE_LIMIT_CACHE_BYTES,
+    CBM_PIPELINE_LIMIT_TASK_TEMP_BYTES,
+} cbm_pipeline_limit_t;
+
+typedef struct {
+    cbm_pipeline_limit_t violation;
+    uint64_t observed;
+    uint64_t limit;
+} cbm_pipeline_limit_report_t;
+
+const char *cbm_pipeline_limit_name(cbm_pipeline_limit_t limit);
 
 /* ── Index mode ─────────────────────────────────────────────────── */
 
@@ -51,6 +75,15 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
+
+/* Replace the default index resource policy with a previously validated
+ * policy. The value is copied and may be released by the caller. */
+void cbm_pipeline_set_index_limits(cbm_pipeline_t *p, const cbm_index_limits_t *limits);
+
+/* Copy the discovery resource violation from the most recent run. A successful
+ * run or non-resource error returns CBM_DISCOVER_LIMIT_NONE. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p, cbm_discover_report_t *report);
+void cbm_pipeline_get_limit_violation(const cbm_pipeline_t *p, cbm_pipeline_limit_report_t *report);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

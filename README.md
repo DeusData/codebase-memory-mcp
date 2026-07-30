@@ -661,6 +661,12 @@ codebase-memory-mcp config set auto_watch false          # don't register backgr
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
+Repository indexing also has bounded defaults for root breadth, discovery,
+worker count, memory, duration, temporary files, database size, cache admission,
+and reserved free disk. See
+[docs/INDEX_RESOURCE_LIMITS.md](docs/INDEX_RESOURCE_LIMITS.md) for all keys and
+failure semantics.
+
 ### Environment Variables
 
 | Variable | Default | Description |

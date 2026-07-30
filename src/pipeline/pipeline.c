@@ -85,6 +85,9 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    cbm_index_limits_t index_limits;
+    cbm_discover_report_t resource_violation;
+    cbm_pipeline_limit_report_t limit_violation;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -190,12 +193,52 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
     p->persistence = false;
+    cbm_index_limits_defaults(&p->index_limits);
     p->committed_nodes = -1;
     p->committed_edges = -1;
     atomic_init(&p->cancelled_storage, 0);
     p->cancelled = &p->cancelled_storage;
 
     return p;
+}
+
+void cbm_pipeline_set_index_limits(cbm_pipeline_t *p, const cbm_index_limits_t *limits) {
+    if (p && limits) {
+        p->index_limits = *limits;
+    }
+}
+
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p, cbm_discover_report_t *report) {
+    if (!report) {
+        return;
+    }
+    *report = p ? p->resource_violation : (cbm_discover_report_t){0};
+}
+
+void cbm_pipeline_get_limit_violation(const cbm_pipeline_t *p,
+                                      cbm_pipeline_limit_report_t *report) {
+    if (!report) {
+        return;
+    }
+    *report = p ? p->limit_violation : (cbm_pipeline_limit_report_t){0};
+}
+
+const char *cbm_pipeline_limit_name(cbm_pipeline_limit_t limit) {
+    switch (limit) {
+    case CBM_PIPELINE_LIMIT_NONE:
+        return "none";
+    case CBM_PIPELINE_LIMIT_STAGING_BYTES:
+        return "staging_bytes";
+    case CBM_PIPELINE_LIMIT_DATABASE_BYTES:
+        return "database_bytes";
+    case CBM_PIPELINE_LIMIT_FREE_DISK_BYTES:
+        return "free_disk_bytes";
+    case CBM_PIPELINE_LIMIT_CACHE_BYTES:
+        return "cache_bytes";
+    case CBM_PIPELINE_LIMIT_TASK_TEMP_BYTES:
+        return "task_temp_bytes";
+    }
+    return "unknown";
 }
 
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
@@ -1577,10 +1620,26 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
 
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
+    uint64_t now_ms = cbm_now_ms();
+    cbm_discover_limits_t discover_limits = {
+        .max_files = p->index_limits.max_files,
+        .max_directories = p->index_limits.max_directories,
+        .max_entries = p->index_limits.max_entries,
+        .max_depth = p->index_limits.max_depth,
+        .max_source_bytes = p->index_limits.max_source_bytes,
+        .deadline_ms = p->index_limits.scan_timeout_ms > UINT64_MAX - now_ms
+                           ? UINT64_MAX
+                           : now_ms + p->index_limits.scan_timeout_ms,
+    };
+    p->resource_violation = (cbm_discover_report_t){0};
     cbm_discover_opts_t opts = {
         .mode = p->mode,
         .ignore_file = NULL,
-        .max_file_size = 0,
+        .max_file_size = p->index_limits.max_file_bytes > INT64_MAX
+                             ? INT64_MAX
+                             : (int64_t)p->index_limits.max_file_bytes,
+        .limits = &discover_limits,
+        .report = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;
     int file_count = 0;
@@ -1605,7 +1664,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
     if (rc != 0 || check_cancel(p)) {
-        rc = CBM_NOT_FOUND;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
         goto cleanup;
     }
 
@@ -1679,6 +1738,96 @@ static void cleanup_staging_db(const char *path) {
     }
     (void)cbm_unlink(path);
     (void)cbm_remove_db_sidecars(path);
+}
+
+static uint64_t db_footprint_bytes(const char *path) {
+    static const char *suffixes[] = {"", "-wal", "-shm", "-journal"};
+    uint64_t total = 0;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char artifact[CBM_SZ_4K];
+        int written = snprintf(artifact, sizeof(artifact), "%s%s", path, suffixes[i]);
+        if (written <= 0 || (size_t)written >= sizeof(artifact)) {
+            return UINT64_MAX;
+        }
+        struct stat info;
+        if (stat(artifact, &info) != 0 || info.st_size <= 0) {
+            continue;
+        }
+        uint64_t size = (uint64_t)info.st_size;
+        total = size > UINT64_MAX - total ? UINT64_MAX : total + size;
+    }
+    return total;
+}
+
+static int pipeline_limit_failed(cbm_pipeline_t *p, cbm_pipeline_limit_t violation,
+                                 uint64_t observed, uint64_t limit) {
+    p->limit_violation = (cbm_pipeline_limit_report_t){
+        .violation = violation,
+        .observed = observed,
+        .limit = limit,
+    };
+    char observed_text[32];
+    char limit_text[32];
+    (void)snprintf(observed_text, sizeof(observed_text), "%llu", (unsigned long long)observed);
+    (void)snprintf(limit_text, sizeof(limit_text), "%llu", (unsigned long long)limit);
+    cbm_log_warn("pipeline.resource_limit", "limit", cbm_pipeline_limit_name(violation), "observed",
+                 observed_text, "configured", limit_text);
+    return CBM_PIPELINE_RESOURCE_LIMIT;
+}
+
+static int check_staging_limits(cbm_pipeline_t *p, const char *staging_path,
+                                bool check_database_limit) {
+    uint64_t footprint = db_footprint_bytes(staging_path);
+    if (footprint > p->index_limits.max_staging_bytes) {
+        return pipeline_limit_failed(p, CBM_PIPELINE_LIMIT_STAGING_BYTES, footprint,
+                                     p->index_limits.max_staging_bytes);
+    }
+    if (footprint > p->index_limits.max_task_temp_bytes) {
+        return pipeline_limit_failed(p, CBM_PIPELINE_LIMIT_TASK_TEMP_BYTES, footprint,
+                                     p->index_limits.max_task_temp_bytes);
+    }
+    if (check_database_limit && footprint > p->index_limits.max_db_bytes) {
+        return pipeline_limit_failed(p, CBM_PIPELINE_LIMIT_DATABASE_BYTES, footprint,
+                                     p->index_limits.max_db_bytes);
+    }
+    return CBM_PIPELINE_OK;
+}
+
+static int check_cache_limit(cbm_pipeline_t *p, const char *cache_path) {
+    uint64_t cache_bytes = 0;
+    if (!cbm_directory_size_bounded(cache_path, p->index_limits.cache_max_bytes, &cache_bytes)) {
+        return CBM_PIPELINE_ERROR;
+    }
+    return cache_bytes > p->index_limits.cache_max_bytes
+               ? pipeline_limit_failed(p, CBM_PIPELINE_LIMIT_CACHE_BYTES, cache_bytes,
+                                       p->index_limits.cache_max_bytes)
+               : CBM_PIPELINE_OK;
+}
+
+static bool db_parent_path(const char *path, char *parent, size_t parent_size) {
+    if (!path || !parent || parent_size == 0) {
+        return false;
+    }
+    int written = snprintf(parent, parent_size, "%s", path);
+    if (written <= 0 || (size_t)written >= parent_size) {
+        return false;
+    }
+    char *slash = strrchr(parent, '/');
+#ifdef _WIN32
+    char *backslash = strrchr(parent, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    if (!slash) {
+        return snprintf(parent, parent_size, ".") == 1;
+    }
+    if (slash == parent) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return true;
 }
 
 static bool ensure_db_parent(const char *path) {
@@ -1826,14 +1975,36 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path, bool 
     return 0;
 }
 
-int cbm_pipeline_run(cbm_pipeline_t *p) {
+static int pipeline_run_with_limits(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->limit_violation = (cbm_pipeline_limit_report_t){0};
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);
         return CBM_NOT_FOUND;
+    }
+    char parent_path[CBM_SZ_4K];
+    uint64_t free_disk_bytes = 0;
+    if (!db_parent_path(final_path, parent_path, sizeof(parent_path)) ||
+        !cbm_disk_free_bytes(parent_path, &free_disk_bytes)) {
+        free(final_path);
+        return CBM_NOT_FOUND;
+    }
+    if (free_disk_bytes < p->index_limits.min_free_disk_bytes) {
+        int limit_rc = pipeline_limit_failed(p, CBM_PIPELINE_LIMIT_FREE_DISK_BYTES, free_disk_bytes,
+                                             p->index_limits.min_free_disk_bytes);
+        free(final_path);
+        return limit_rc;
+    }
+    bool enforce_cache_limit = p->db_path == NULL;
+    if (enforce_cache_limit) {
+        int cache_rc = check_cache_limit(p, parent_path);
+        if (cache_rc != 0) {
+            free(final_path);
+            return cache_rc;
+        }
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
@@ -1867,7 +2038,26 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     free(p->db_path);
     p->db_path = configured_db_path;
 
-    if (rc != 0 || check_cancel(p) || seal_staging_db(staging_path) != 0) {
+    if (rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return rc == CBM_PIPELINE_RESOURCE_LIMIT ? rc : CBM_NOT_FOUND;
+    }
+    rc = check_staging_limits(p, staging_path, false);
+    if (rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return rc;
+    }
+    if (enforce_cache_limit && (rc = check_cache_limit(p, parent_path)) != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return rc;
+    }
+    if (check_cancel(p) || seal_staging_db(staging_path) != 0) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
@@ -1892,6 +2082,13 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
+    rc = check_staging_limits(p, staging_path, true);
+    if (rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return rc;
+    }
 
     if (!prepare_publish_destination(final_path, final_existed, backup_succeeded) ||
         (p->rename_hook ? p->rename_hook(staging_path, final_path, p->rename_hook_ctx)
@@ -1906,5 +2103,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     rc = export_after_publish(p, final_path, was_incremental);
     free(staging_path);
     free(final_path);
+    return rc;
+}
+
+int cbm_pipeline_run(cbm_pipeline_t *p) {
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    int previous_worker_limit = cbm_worker_limit_set_for_thread(p->index_limits.cpu_cores);
+    int rc = pipeline_run_with_limits(p);
+    (void)cbm_worker_limit_set_for_thread(previous_worker_limit);
     return rc;
 }

@@ -200,12 +200,30 @@ char *cbm_normalize_path_sep(char *path) {
     return path;
 }
 
+bool cbm_disk_free_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    wchar_t *wide_path = cbm_path_to_wide(path);
+    if (!wide_path) {
+        return false;
+    }
+    ULARGE_INTEGER available;
+    bool ok = GetDiskFreeSpaceExW(wide_path, &available, NULL, NULL) != 0;
+    free(wide_path);
+    if (ok) {
+        *bytes_out = available.QuadPart;
+    }
+    return ok;
+}
+
 #else /* POSIX (macOS + Linux) */
 
 /* ── POSIX implementation ────────────────────────────────── */
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -334,6 +352,21 @@ char *cbm_normalize_path_sep(char *path) {
         cbm_canonicalize_drive(path);
     }
     return path;
+}
+
+bool cbm_disk_free_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    struct statvfs info;
+    if (statvfs(path, &info) != 0) {
+        return false;
+    }
+    uint64_t blocks = (uint64_t)info.f_bavail;
+    uint64_t block_size = (uint64_t)info.f_frsize;
+    *bytes_out =
+        block_size > 0 && blocks > UINT64_MAX / block_size ? UINT64_MAX : blocks * block_size;
+    return true;
 }
 
 #endif /* _WIN32 */

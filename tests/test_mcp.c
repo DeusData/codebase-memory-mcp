@@ -7898,6 +7898,13 @@ TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery) {
               CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
 
     result.supervision_failed = false;
+    result.resource_limit = CBM_INDEX_RESOURCE_LIMIT_MEMORY;
+    result.resource_observed = 4097;
+    result.resource_limit_value = 4096;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_RESOURCE_LIMIT);
+
+    result.resource_limit = CBM_INDEX_RESOURCE_LIMIT_NONE;
     result.outcome = CBM_PROC_CRASH;
     result.response = NULL;
     ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
@@ -9231,6 +9238,83 @@ TEST(index_repository_honors_allowed_root) {
     PASS();
 }
 
+TEST(index_repository_rejects_configured_aggregate_root) {
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm_denied_root_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+
+    char canonical[CBM_SZ_4K];
+    ASSERT_TRUE(cbm_canonical_path(root, canonical, sizeof(canonical)));
+
+    cbm_config_t *config = cbm_config_open(root);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, "index_denied_roots", canonical), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+
+    char request[CBM_SZ_8K];
+    snprintf(request, sizeof(request),
+             "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_repository\","
+             "\"arguments\":{\"repo_path\":\"%s\"}}}",
+             root);
+    char *response = cbm_mcp_server_handle(srv, request);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "configured_root"));
+    ASSERT_NOT_NULL(strstr(response, "isError"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(index_repository_reports_structured_discovery_resource_limit) {
+    char repo[512];
+    char cache[512];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-index-limit-repo-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-limit-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char first[768];
+    char second[768];
+    (void)snprintf(first, sizeof(first), "%s/first.c", repo);
+    (void)snprintf(second, sizeof(second), "%s/second.c", repo);
+    ASSERT_EQ(th_write_file(first, "int first(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(second, "int second(void) { return 2; }\n"), 0);
+
+    cbm_config_t *config = cbm_config_open(cache);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, "index_max_files", "1"), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+
+    char request[CBM_SZ_4K];
+    (void)snprintf(request, sizeof(request),
+                   "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\","
+                   "\"params\":{\"name\":\"index_repository\","
+                   "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\"}}}",
+                   repo);
+    char *response = cbm_mcp_server_handle(srv, request);
+    ASSERT_NOT_NULL(response);
+    bool structured = strstr(response, "resource_limit_exceeded") != NULL &&
+                      strstr(response, "files") != NULL && strstr(response, "observed") != NULL &&
+                      strstr(response, "limit") != NULL && strstr(response, "isError") != NULL;
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    th_rmtree(cache);
+    th_rmtree(repo);
+
+    ASSERT_TRUE(structured);
+    PASS();
+}
+
 TEST(index_repository_relative_path_uses_explicit_session_root) {
     char session_root[512];
     char cache[512];
@@ -9482,6 +9566,103 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
 #endif
 }
 
+#ifndef _WIN32
+enum {
+    IDXPOLICY_OK = 0,
+    IDXPOLICY_CONFIG_FAILED = 91,
+    IDXPOLICY_NO_SERVER = 92,
+    IDXPOLICY_NO_SPAWN = 93,
+    IDXPOLICY_NO_RESULT = 94,
+    IDXPOLICY_LIMIT_BYPASSED = 95,
+};
+
+static int idxpolicy_supervised_check(const char *repo, const char *cache) {
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+    cbm_config_t *config = cbm_config_open(cache);
+    if (!config || cbm_config_set(config, "index_max_files", "1") != 0) {
+        cbm_config_close(config);
+        return IDXPOLICY_CONFIG_FAILED;
+    }
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        cbm_config_close(config);
+        return IDXPOLICY_NO_SERVER;
+    }
+    cbm_mcp_server_set_config(srv, config);
+
+    char args[CBM_SZ_8K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"_cbm_index_limits\":"
+                   "{\"index_max_files\":\"999999\"}}",
+                   repo);
+    int spawns_before = cbm_index_supervisor_spawn_count();
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+    int spawns_after = cbm_index_supervisor_spawn_count();
+
+    int code = IDXPOLICY_OK;
+    if (spawns_after == spawns_before) {
+        code = IDXPOLICY_NO_SPAWN;
+    } else if (!response) {
+        code = IDXPOLICY_NO_RESULT;
+    } else if (!strstr(response, "resource_limit_exceeded") || !strstr(response, "files") ||
+               !strstr(response, "\"limit\":1")) {
+        code = IDXPOLICY_LIMIT_BYPASSED;
+    }
+    free(response);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    return code;
+}
+#endif
+
+TEST(index_repository_supervisor_propagates_trusted_resource_policy) {
+#ifdef _WIN32
+    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+#else
+    char repo[512];
+    char cache[512];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-policy-repo-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-policy-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char first[768];
+    char second[768];
+    (void)snprintf(first, sizeof(first), "%s/first.c", repo);
+    (void)snprintf(second, sizeof(second), "%s/second.c", repo);
+    ASSERT_EQ(th_write_file(first, "int first(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(second, "int second(void) { return 2; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(idxpolicy_supervised_check(repo, cache));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(repo);
+    th_rmtree(cache);
+
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(code, IDXPOLICY_OK);
+    PASS();
+#endif
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -9492,6 +9673,8 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
     RUN_TEST(index_repository_honors_allowed_root);
+    RUN_TEST(index_repository_rejects_configured_aggregate_root);
+    RUN_TEST(index_repository_reports_structured_discovery_resource_limit);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
     RUN_TEST(jsonrpc_parse_notification);
@@ -9639,6 +9822,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
     RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
+    RUN_TEST(index_repository_supervisor_propagates_trusted_resource_policy);
     RUN_TEST(index_repository_cli_name_override_issue823);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);

@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_fs_internal.h"
+#include "foundation/platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,6 +117,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     d->entry.name[nlen] = '\0';
     free(u8);
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    d->entry.is_symlink = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     d->entry.d_type = 0;
     return &d->entry;
 }
@@ -714,6 +716,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
         d->entry.is_dir = (de->d_type == DT_DIR);
+        d->entry.is_symlink = (de->d_type == DT_LNK);
         d->entry.d_type = de->d_type;
         return &d->entry;
     }
@@ -1003,4 +1006,69 @@ int cbm_remove_db_sidecars(const char *db_path) {
         result = CBM_NOT_FOUND;
     }
     return result;
+}
+
+static bool directory_size_walk(const char *path, uint64_t stop_after, unsigned depth,
+                                uint64_t *total) {
+    enum { DIRECTORY_SIZE_MAX_DEPTH = 64 };
+    if (depth > DIRECTORY_SIZE_MAX_DEPTH) {
+        return false;
+    }
+    cbm_dir_t *directory = cbm_opendir(path);
+    if (!directory) {
+        return false;
+    }
+    bool ok = true;
+    cbm_dirent_t *entry;
+    while (ok && (entry = cbm_readdir(directory)) != NULL) {
+        if (entry->is_symlink) {
+            continue;
+        }
+        char child[CBM_SZ_4K];
+        int written = snprintf(child, sizeof(child), "%s/%s", path, entry->name);
+        if (written <= 0 || (size_t)written >= sizeof(child)) {
+            ok = false;
+            break;
+        }
+#ifdef _WIN32
+        bool child_is_directory = entry->is_dir;
+#else
+        /* d_type may be DT_UNKNOWN (notably on network and FUSE filesystems).
+         * lstat keeps the documented no-follow contract authoritative instead
+         * of letting a later stat-based directory probe follow a link. */
+        struct stat child_state;
+        if (lstat(child, &child_state) != 0) {
+            ok = false;
+            break;
+        }
+        if (S_ISLNK(child_state.st_mode)) {
+            continue;
+        }
+        bool child_is_directory = S_ISDIR(child_state.st_mode);
+#endif
+        if (child_is_directory) {
+            ok = directory_size_walk(child, stop_after, depth + 1U, total);
+        } else {
+            int64_t file_size = cbm_file_size(child);
+            if (file_size < 0) {
+                ok = false;
+                break;
+            }
+            uint64_t size = (uint64_t)file_size;
+            *total = size > UINT64_MAX - *total ? UINT64_MAX : *total + size;
+        }
+        if (*total > stop_after) {
+            break;
+        }
+    }
+    cbm_closedir(directory);
+    return ok;
+}
+
+bool cbm_directory_size_bounded(const char *path, uint64_t stop_after, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    return directory_size_walk(path, stop_after, 0, bytes_out);
 }

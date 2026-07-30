@@ -191,6 +191,7 @@ FOUNDATION_SRCS = \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
+    src/foundation/index_limits.c \
     src/foundation/subprocess.c \
     src/foundation/sha256.c \
     src/foundation/macos_acl.c \
@@ -430,6 +431,7 @@ TEST_FOUNDATION_SRCS = \
     tests/test_platform.c \
     tests/test_diagnostics.c \
     tests/test_dump_verify.c \
+    tests/test_index_limits.c \
     tests/test_subprocess.c \
     tests/test_private_file_lock.c \
     tests/test_lock_registry.c

@@ -23,6 +23,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
 
@@ -108,6 +109,15 @@ int cbm_index_supervisor_spawn_count(void);
  * recovery is parallel-only; no sequential runs). */
 int cbm_index_supervisor_spawn_st_count(void);
 
+typedef enum {
+    CBM_INDEX_RESOURCE_LIMIT_NONE = 0,
+    CBM_INDEX_RESOURCE_LIMIT_MEMORY,
+    CBM_INDEX_RESOURCE_LIMIT_TASK_TEMP,
+    CBM_INDEX_RESOURCE_LIMIT_DURATION,
+} cbm_index_resource_limit_t;
+
+const char *cbm_index_resource_limit_name(cbm_index_resource_limit_t limit);
+
 typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */
     int exit_code;              /* worker exit code (-1 if signalled) */
@@ -117,8 +127,11 @@ typedef struct {
     bool tree_quiesced;
     bool supervision_failed;
     bool response_rejected; /* clean worker exceeded the bounded response protocol */
-    char *response;         /* worker result only after a contained, uncancelled CLEAN exit;
-                             * borrowed for async polls, caller-owned from the sync wrapper */
+    cbm_index_resource_limit_t resource_limit;
+    uint64_t resource_observed;
+    uint64_t resource_limit_value;
+    char *response; /* worker result only after a contained, uncancelled CLEAN exit;
+                     * borrowed for async polls, caller-owned from the sync wrapper */
 } cbm_index_worker_result_t;
 
 /* Daemon-owned, nonblocking supervisor for one contained worker process tree. */
@@ -146,6 +159,17 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
                                     bool single_thread, const char *marker_file,
                                     const char *quarantine_file, cbm_proc_log_cb log_callback,
                                     void *log_context, cbm_index_worker_handle_t **handle_out);
+
+/* Configure process-tree resource ceilings for a newly started worker. These
+ * are distinct from memory_budget_bytes, which remains the worker allocator's
+ * internal budget. Zero disables a ceiling. The owner must call these before
+ * polling the handle. */
+void cbm_index_worker_set_memory_limit(cbm_index_worker_handle_t *handle,
+                                       size_t memory_limit_bytes);
+void cbm_index_worker_set_task_temp_limit(cbm_index_worker_handle_t *handle,
+                                          uint64_t task_temp_limit_bytes);
+void cbm_index_worker_set_max_duration(cbm_index_worker_handle_t *handle, uint64_t max_duration_ms);
+bool cbm_index_worker_set_low_priority(cbm_index_worker_handle_t *handle, bool low_priority);
 
 /* Strictly nonblocking and called by one owner thread/event loop. result_out is
  * set to NULL while running and to a borrowed immutable cached result only at
@@ -199,6 +223,12 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
                                            cbm_proc_log_cb log_callback, void *log_context,
                                            const atomic_int *cancel_requested,
                                            cbm_index_worker_result_t *result);
+
+int cbm_index_spawn_worker_with_limits_and_log_cancel(
+    const char *args_json, size_t memory_limit_bytes, uint64_t task_temp_limit_bytes,
+    uint64_t max_duration_ms, bool low_priority, bool single_thread, const char *marker_file,
+    const char *quarantine_file, cbm_proc_log_cb log_callback, void *log_context,
+    const atomic_int *cancel_requested, cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
 

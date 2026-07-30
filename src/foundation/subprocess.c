@@ -24,9 +24,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#elif defined(__linux__)
+#include <ctype.h>
+#include <dirent.h>
+#include <limits.h>
+#endif
 #endif
 
 /* NTSTATUS severity ERROR (top two bits set) covers the Windows crash exception
@@ -1189,6 +1197,169 @@ bool cbm_subprocess_request_cancel(cbm_subprocess_t *process) {
             return true;
         }
     }
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+static bool cbm_memory_add(size_t *total, uint64_t value) {
+    if (value > SIZE_MAX || *total > SIZE_MAX - (size_t)value) {
+        *total = SIZE_MAX;
+        return false;
+    }
+    *total += (size_t)value;
+    return true;
+}
+#endif
+
+#ifdef __APPLE__
+static bool cbm_subprocess_memory_macos(cbm_subprocess_t *process, size_t *bytes_out) {
+    int required = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (required <= 0) {
+        return false;
+    }
+    pid_t *pids = calloc((size_t)required / sizeof(pid_t) + 1, sizeof(pid_t));
+    if (!pids) {
+        return false;
+    }
+    int received = proc_listpids(PROC_ALL_PIDS, 0, pids, required);
+    if (received <= 0) {
+        free(pids);
+        return false;
+    }
+
+    size_t total = 0;
+    bool observed = false;
+    size_t count = (size_t)received / sizeof(pid_t);
+    for (size_t i = 0; i < count; i++) {
+        if (pids[i] <= 0) {
+            continue;
+        }
+        struct proc_taskallinfo info;
+        if (proc_pidinfo(pids[i], PROC_PIDTASKALLINFO, 0, &info, sizeof(info)) !=
+                (int)sizeof(info) ||
+            (pid_t)info.pbsd.pbi_pgid != process->pgid) {
+            continue;
+        }
+        observed = true;
+        (void)cbm_memory_add(&total, info.ptinfo.pti_resident_size);
+    }
+    free(pids);
+    *bytes_out = total;
+    return observed;
+}
+#elif defined(__linux__)
+static bool cbm_linux_process_group_and_rss(const char *pid_text, pid_t expected_group,
+                                            size_t page_size, size_t *rss_out) {
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "/proc/%s/stat", pid_text);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    FILE *stat_file = fopen(path, "r");
+    if (!stat_file) {
+        return false;
+    }
+    char stat_line[4096];
+    bool read_stat = fgets(stat_line, sizeof(stat_line), stat_file) != NULL;
+    (void)fclose(stat_file);
+    char *command_end = read_stat ? strrchr(stat_line, ')') : NULL;
+    char state = '\0';
+    long parent = 0;
+    long process_group = 0;
+    if (!command_end ||
+        sscanf(command_end + 1, " %c %ld %ld", &state, &parent, &process_group) != 3 ||
+        (pid_t)process_group != expected_group) {
+        return false;
+    }
+
+    written = snprintf(path, sizeof(path), "/proc/%s/statm", pid_text);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    FILE *memory_file = fopen(path, "r");
+    if (!memory_file) {
+        return false;
+    }
+    unsigned long ignored_pages = 0;
+    unsigned long resident_pages = 0;
+    bool read_memory = fscanf(memory_file, "%lu %lu", &ignored_pages, &resident_pages) == 2;
+    (void)fclose(memory_file);
+    if (!read_memory) {
+        return false;
+    }
+    if (resident_pages > SIZE_MAX / page_size) {
+        *rss_out = SIZE_MAX;
+    } else {
+        *rss_out = (size_t)resident_pages * page_size;
+    }
+    return true;
+}
+
+static bool cbm_subprocess_memory_linux(cbm_subprocess_t *process, size_t *bytes_out) {
+    DIR *directory = opendir("/proc");
+    if (!directory) {
+        return false;
+    }
+    long configured_page_size = sysconf(_SC_PAGESIZE);
+    size_t page_size = configured_page_size > 0 ? (size_t)configured_page_size : 4096U;
+    size_t total = 0;
+    bool observed = false;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        bool numeric = entry->d_name[0] != '\0';
+        for (const char *cursor = entry->d_name; numeric && *cursor; cursor++) {
+            numeric = isdigit((unsigned char)*cursor) != 0;
+        }
+        if (!numeric) {
+            continue;
+        }
+        size_t rss = 0;
+        if (cbm_linux_process_group_and_rss(entry->d_name, process->pgid, page_size, &rss)) {
+            observed = true;
+            (void)cbm_memory_add(&total, rss);
+        }
+    }
+    (void)closedir(directory);
+    *bytes_out = total;
+    return observed;
+}
+#endif
+
+bool cbm_subprocess_memory_bytes(cbm_subprocess_t *process, size_t *bytes_out) {
+    if (!process || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+#ifdef _WIN32
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION information;
+    memset(&information, 0, sizeof(information));
+    if (!process->job || !QueryInformationJobObject(process->job, JobObjectExtendedLimitInformation,
+                                                    &information, sizeof(information), NULL)) {
+        return false;
+    }
+    *bytes_out =
+        information.PeakJobMemoryUsed > SIZE_MAX ? SIZE_MAX : (size_t)information.PeakJobMemoryUsed;
+    return true;
+#elif defined(__APPLE__)
+    return cbm_subprocess_memory_macos(process, bytes_out);
+#elif defined(__linux__)
+    return cbm_subprocess_memory_linux(process, bytes_out);
+#else
+    return false;
+#endif
+}
+
+bool cbm_subprocess_set_low_priority(cbm_subprocess_t *process, bool low_priority) {
+    if (!process) {
+        return false;
+    }
+    if (!low_priority) {
+        return true;
+    }
+#ifdef _WIN32
+    return process->process && SetPriorityClass(process->process, BELOW_NORMAL_PRIORITY_CLASS) != 0;
+#else
+    return setpriority(PRIO_PROCESS, process->pid, 10) == 0;
+#endif
 }
 
 void cbm_subprocess_destroy(cbm_subprocess_t *process) {

@@ -368,6 +368,8 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
     uint64_t before_poll = cbm_now_ms();
     cbm_proc_poll_t first_poll = cbm_subprocess_poll(process, &result);
     uint64_t poll_elapsed = cbm_now_ms() - before_poll;
+    size_t tree_memory_bytes = 0;
+    bool memory_observed = cbm_subprocess_memory_bytes(process, &tree_memory_bytes);
     bool cancel_accepted = cbm_subprocess_request_cancel(process);
     bool terminal = poll_until_terminal(process, 2000, &result);
     if (terminal) {
@@ -383,6 +385,8 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
     ASSERT_EQ(first_poll, CBM_PROC_POLL_RUNNING);
     ASSERT_LT(spawn_elapsed, 3500);
     ASSERT_LT(poll_elapsed, 3500);
+    ASSERT_TRUE(memory_observed);
+    ASSERT_GT(tree_memory_bytes, 0);
     ASSERT_TRUE(cancel_accepted);
     ASSERT_TRUE(terminal);
     ASSERT_TRUE(result.cancellation_requested);

@@ -395,6 +395,108 @@ TEST(discover_bounded_count_fails_closed_after_deadline) {
     PASS();
 }
 
+TEST(discover_resource_limits_report_exact_boundary_and_discard_partial_results) {
+    char *base = th_mktempdir("cbm_disc_resource_files");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "src/first.c"), "int first;\n");
+    th_write_file(TH_PATH(base, "src/second.c"), "int second;\n");
+
+    cbm_discover_limits_t limits = {
+        .max_files = 1,
+        .max_directories = 100,
+        .max_entries = 100,
+        .max_depth = 10,
+        .max_source_bytes = 1024,
+        .deadline_ms = cbm_now_ms() + 2000,
+    };
+    cbm_discover_report_t report = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .limits = &limits,
+        .report = &report,
+    };
+    cbm_file_info_t *files = (cbm_file_info_t *)1;
+    int count = 99;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+
+    th_cleanup(base);
+    ASSERT_EQ(rc, CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(report.violation, CBM_DISCOVER_LIMIT_FILES);
+    ASSERT_EQ(report.observed, 2);
+    ASSERT_EQ(report.limit, 1);
+    ASSERT_STR_EQ(cbm_discover_limit_name(report.violation), "files");
+    PASS();
+}
+
+TEST(discover_resource_limits_cover_directories_entries_depth_and_source_bytes) {
+    char *base = th_mktempdir("cbm_disc_resource_dimensions");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "a/b/c/deep.c"), "int deep;\n");
+    th_write_file(TH_PATH(base, "root.c"), "int root_value;\n");
+
+    struct {
+        cbm_discover_limits_t limits;
+        cbm_discover_limit_t expected;
+    } cases[] = {
+        {
+            .limits = {.max_files = 100,
+                       .max_directories = 1,
+                       .max_entries = 100,
+                       .max_depth = 10,
+                       .max_source_bytes = 1024},
+            .expected = CBM_DISCOVER_LIMIT_DIRECTORIES,
+        },
+        {
+            .limits = {.max_files = 100,
+                       .max_directories = 100,
+                       .max_entries = 1,
+                       .max_depth = 10,
+                       .max_source_bytes = 1024},
+            .expected = CBM_DISCOVER_LIMIT_ENTRIES,
+        },
+        {
+            .limits = {.max_files = 100,
+                       .max_directories = 100,
+                       .max_entries = 100,
+                       .max_depth = 1,
+                       .max_source_bytes = 1024},
+            .expected = CBM_DISCOVER_LIMIT_DEPTH,
+        },
+        {
+            .limits = {.max_files = 100,
+                       .max_directories = 100,
+                       .max_entries = 100,
+                       .max_depth = 10,
+                       .max_source_bytes = 1},
+            .expected = CBM_DISCOVER_LIMIT_SOURCE_BYTES,
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cases[i].limits.deadline_ms = cbm_now_ms() + 2000;
+        cbm_discover_report_t report = {0};
+        cbm_discover_opts_t opts = {
+            .mode = CBM_MODE_FULL,
+            .limits = &cases[i].limits,
+            .report = &report,
+        };
+        cbm_file_info_t *files = NULL;
+        int count = 0;
+        int rc = cbm_discover(base, &opts, &files, &count);
+        ASSERT_EQ(rc, CBM_DISCOVER_LIMIT_EXCEEDED);
+        ASSERT(files == NULL);
+        ASSERT_EQ(count, 0);
+        ASSERT_EQ(report.violation, cases[i].expected);
+        ASSERT(report.observed > report.limit);
+    }
+
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_skips_git_dir) {
     char *base = th_mktempdir("cbm_disc_git");
     ASSERT(base != NULL);
@@ -1432,6 +1534,8 @@ SUITE(discover) {
     RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);
+    RUN_TEST(discover_resource_limits_report_exact_boundary_and_discard_partial_results);
+    RUN_TEST(discover_resource_limits_cover_directories_entries_depth_and_source_bytes);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);

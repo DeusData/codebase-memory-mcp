@@ -83,10 +83,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Fixture: one good file + one the injector busy-spins on.
-mkdir -p "${tmpdir}/repo"
+# Fixture: one good file + one the injector busy-spins on. Keep the test cache
+# isolated and private so the worker's exact-build admission never depends on
+# the invoking user's real cache permissions.
+mkdir -p "${tmpdir}/repo" "${tmpdir}/cache"
+chmod 700 "${tmpdir}/cache"
 printf 'def good():\n    return 1\n' > "${tmpdir}/repo/good.py"
 printf 'def slow():\n    return 2\n' > "${tmpdir}/repo/hang_me.py"
+
+# A physical worker rejects missing or partial resource policy. Production
+# supervisors serialize this complete object after removing caller-supplied
+# values; this direct watchdog fixture must model that trusted boundary too.
+# Keeping the full registry here is intentional: adding a new policy key must
+# fail this integration guard until the physical-worker contract is updated.
+TRUSTED_INDEX_POLICY='{"index_max_files":"100000","index_max_directories":"20000","index_max_entries":"500000","index_max_depth":"64","index_max_source_mb":"4096","index_max_file_mb":"64","index_scan_timeout_seconds":"30","index_cpu_cores":"4","index_concurrent_jobs":"1","index_memory_limit_mb":"8192","index_max_db_mb":"16384","index_max_staging_mb":"20480","index_max_task_temp_mb":"24576","index_cache_max_mb":"32768","index_min_free_disk_mb":"4096","index_max_duration_seconds":"3600","index_low_priority":"true","index_denied_roots":""}'
+WORKER_ARGS="{\"repo_path\":\"${tmpdir}/repo\",\"_cbm_index_limits\":${TRUSTED_INDEX_POLICY}}"
 
 # Wrapper "parent": launches the worker exactly as the supervisor would
 # (cli --index-worker … --response-out), records the child PID, then waits.
@@ -106,7 +117,8 @@ SH
 chmod +x "${tmpdir}/wrapper.sh"
 
 CBM_BINARY="${BINARY}" BUILD_FINGERPRINT="${BUILD_FINGERPRINT}" TMPDIR_PATH="${tmpdir}" \
-  ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\"}" \
+  ARGS_JSON="${WORKER_ARGS}" \
+  CBM_CACHE_DIR="${tmpdir}/cache" \
   CBM_TEST_HANG_ON=hang_me \
   CBM_TEST_WORKER_DESCENDANT_PID_FILE="${tmpdir}/descendant.pid" \
   "${tmpdir}/wrapper.sh" &
@@ -141,11 +153,12 @@ if ! kill -0 "${descendant_pid}" 2>/dev/null; then
   echo "worker descendant exited before supervisor death" >&2
   exit 3
 fi
-child_pgid="$(ps -p "${child_pid}" -o pgid= 2>/dev/null | tr -d '[:space:]')"
-descendant_pgid="$(ps -p "${descendant_pid}" -o pgid= 2>/dev/null | tr -d '[:space:]')"
+child_pgid="$(ps -p "${child_pid}" -o pgid= 2>/dev/null | tr -d '[:space:]' || true)"
+descendant_pgid="$(ps -p "${descendant_pid}" -o pgid= 2>/dev/null | tr -d '[:space:]' || true)"
 if [[ -z "${child_pgid}" || "${child_pgid}" != "${child_pid}" ||
       "${descendant_pgid}" != "${child_pgid}" ]]; then
   echo "worker tree is not in its expected isolated process group" >&2
+  [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
   exit 3
 fi
 

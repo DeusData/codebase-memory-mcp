@@ -374,6 +374,14 @@ struct cbm_index_worker_handle {
     bool process_terminal;
     cbm_proc_result_t process_result;
     atomic_bool terminal;
+    atomic_bool explicit_cancel_requested;
+    size_t memory_limit_bytes;
+    uint64_t task_temp_limit_bytes;
+    uint64_t max_duration_ms;
+    uint64_t started_ms;
+    cbm_index_resource_limit_t resource_limit;
+    uint64_t resource_observed;
+    uint64_t resource_limit_value;
     cbm_index_worker_result_t result;
 };
 
@@ -550,7 +558,22 @@ static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
 
 static bool worker_result_succeeded(const cbm_index_worker_result_t *result) {
     return result && result->outcome == CBM_PROC_CLEAN && !result->cancellation_requested &&
-           result->tree_quiesced && !result->supervision_failed;
+           result->resource_limit == CBM_INDEX_RESOURCE_LIMIT_NONE && result->tree_quiesced &&
+           !result->supervision_failed;
+}
+
+const char *cbm_index_resource_limit_name(cbm_index_resource_limit_t limit) {
+    switch (limit) {
+    case CBM_INDEX_RESOURCE_LIMIT_NONE:
+        return "none";
+    case CBM_INDEX_RESOURCE_LIMIT_MEMORY:
+        return "memory_bytes";
+    case CBM_INDEX_RESOURCE_LIMIT_TASK_TEMP:
+        return "task_temp_bytes";
+    case CBM_INDEX_RESOURCE_LIMIT_DURATION:
+        return "duration_ms";
+    }
+    return "unknown";
 }
 
 static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
@@ -566,6 +589,16 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
     } else if (handle->result.supervision_failed || !handle->result.tree_quiesced) {
         cbm_log_error("index.supervisor.containment_failed", "outcome",
                       cbm_proc_outcome_str(handle->result.outcome), "log", handle->log_path);
+    } else if (handle->result.resource_limit != CBM_INDEX_RESOURCE_LIMIT_NONE) {
+        char observed_text[32];
+        char limit_text[32];
+        (void)snprintf(observed_text, sizeof(observed_text), "%llu",
+                       (unsigned long long)handle->result.resource_observed);
+        (void)snprintf(limit_text, sizeof(limit_text), "%llu",
+                       (unsigned long long)handle->result.resource_limit_value);
+        cbm_log_warn("index.supervisor.resource_limit", "limit",
+                     cbm_index_resource_limit_name(handle->result.resource_limit), "observed",
+                     observed_text, "configured", limit_text);
     } else if (handle->result.cancellation_requested) {
         cbm_log_warn("index.supervisor.worker_cancelled", "outcome",
                      cbm_proc_outcome_str(handle->result.outcome), "log", handle->log_path);
@@ -616,6 +649,8 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
         return -1;
     }
     atomic_init(&handle->terminal, false);
+    atomic_init(&handle->explicit_cancel_requested, false);
+    handle->started_ms = cbm_now_ms();
     handle->log_callback = log_callback;
     handle->log_context = log_context;
     worker_result_init(&handle->result);
@@ -686,6 +721,89 @@ int cbm_index_worker_start(const char *args_json, size_t memory_budget_bytes, bo
                                            marker_file, quarantine_file, NULL, NULL, handle_out);
 }
 
+void cbm_index_worker_set_max_duration(cbm_index_worker_handle_t *handle,
+                                       uint64_t max_duration_ms) {
+    if (handle && !atomic_load_explicit(&handle->terminal, memory_order_acquire)) {
+        handle->max_duration_ms = max_duration_ms;
+    }
+}
+
+void cbm_index_worker_set_memory_limit(cbm_index_worker_handle_t *handle,
+                                       size_t memory_limit_bytes) {
+    if (handle && !atomic_load_explicit(&handle->terminal, memory_order_acquire)) {
+        handle->memory_limit_bytes = memory_limit_bytes;
+    }
+}
+
+void cbm_index_worker_set_task_temp_limit(cbm_index_worker_handle_t *handle,
+                                          uint64_t task_temp_limit_bytes) {
+    if (handle && !atomic_load_explicit(&handle->terminal, memory_order_acquire)) {
+        handle->task_temp_limit_bytes = task_temp_limit_bytes;
+    }
+}
+
+bool cbm_index_worker_set_low_priority(cbm_index_worker_handle_t *handle, bool low_priority) {
+    if (!handle || atomic_load_explicit(&handle->terminal, memory_order_acquire)) {
+        return false;
+    }
+    return cbm_subprocess_set_low_priority(handle->process, low_priority);
+}
+
+static uint64_t worker_task_temp_bytes(const cbm_index_worker_handle_t *handle) {
+    uint64_t total = 0;
+    const char *paths[] = {handle->response_path, handle->log_path};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        int64_t size = cbm_file_size(paths[i]);
+        if (size <= 0) {
+            continue;
+        }
+        uint64_t add = (uint64_t)size;
+        total = UINT64_MAX - total < add ? UINT64_MAX : total + add;
+    }
+    return total;
+}
+
+static void worker_enforce_resource_limits(cbm_index_worker_handle_t *handle) {
+    if (!handle || handle->resource_limit != CBM_INDEX_RESOURCE_LIMIT_NONE ||
+        atomic_load_explicit(&handle->explicit_cancel_requested, memory_order_acquire)) {
+        return;
+    }
+
+    cbm_index_resource_limit_t breached = CBM_INDEX_RESOURCE_LIMIT_NONE;
+    uint64_t observed = 0;
+    uint64_t configured = 0;
+    size_t memory_bytes = 0;
+    if (handle->memory_limit_bytes > 0 &&
+        cbm_subprocess_memory_bytes(handle->process, &memory_bytes) &&
+        memory_bytes > handle->memory_limit_bytes) {
+        breached = CBM_INDEX_RESOURCE_LIMIT_MEMORY;
+        observed = (uint64_t)memory_bytes;
+        configured = (uint64_t)handle->memory_limit_bytes;
+    }
+    if (breached == CBM_INDEX_RESOURCE_LIMIT_NONE && handle->task_temp_limit_bytes > 0) {
+        uint64_t task_temp_bytes = worker_task_temp_bytes(handle);
+        if (task_temp_bytes > handle->task_temp_limit_bytes) {
+            breached = CBM_INDEX_RESOURCE_LIMIT_TASK_TEMP;
+            observed = task_temp_bytes;
+            configured = handle->task_temp_limit_bytes;
+        }
+    }
+    if (breached == CBM_INDEX_RESOURCE_LIMIT_NONE && handle->max_duration_ms > 0) {
+        uint64_t elapsed_ms = cbm_now_ms() - handle->started_ms;
+        if (elapsed_ms > handle->max_duration_ms) {
+            breached = CBM_INDEX_RESOURCE_LIMIT_DURATION;
+            observed = elapsed_ms;
+            configured = handle->max_duration_ms;
+        }
+    }
+    if (breached != CBM_INDEX_RESOURCE_LIMIT_NONE &&
+        cbm_subprocess_request_cancel(handle->process)) {
+        handle->resource_limit = breached;
+        handle->resource_observed = observed;
+        handle->resource_limit_value = configured;
+    }
+}
+
 cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
                                               const cbm_index_worker_result_t **result_out) {
     if (result_out) {
@@ -700,6 +818,7 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
     }
     bool relay_caught_up = true;
     if (!handle->process_terminal) {
+        worker_enforce_resource_limits(handle);
         cbm_proc_result_t process_result;
         cbm_proc_poll_t state = cbm_subprocess_poll(handle->process, &process_result);
         relay_caught_up = worker_relay_log(handle);
@@ -724,10 +843,14 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
     handle->result.outcome = process_result->outcome;
     handle->result.exit_code = process_result->exit_code;
     handle->result.term_signal = process_result->term_signal;
-    handle->result.cancellation_requested = process_result->cancellation_requested;
+    handle->result.cancellation_requested =
+        atomic_load_explicit(&handle->explicit_cancel_requested, memory_order_acquire);
     handle->result.forced = process_result->forced;
     handle->result.tree_quiesced = process_result->tree_quiesced;
     handle->result.supervision_failed = process_result->supervision_failed;
+    handle->result.resource_limit = handle->resource_limit;
+    handle->result.resource_observed = handle->resource_observed;
+    handle->result.resource_limit_value = handle->resource_limit_value;
     if (worker_result_succeeded(&handle->result)) {
         worker_response_read_status_t response_status;
         handle->result.response = slurp_worker_response(handle->response_path, &response_status);
@@ -747,8 +870,14 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
 }
 
 bool cbm_index_worker_request_cancel(cbm_index_worker_handle_t *handle) {
-    return handle && !atomic_load_explicit(&handle->terminal, memory_order_acquire) &&
-           cbm_subprocess_request_cancel(handle->process);
+    if (!handle || atomic_load_explicit(&handle->terminal, memory_order_acquire)) {
+        return false;
+    }
+    bool accepted = cbm_subprocess_request_cancel(handle->process);
+    if (accepted) {
+        atomic_store_explicit(&handle->explicit_cancel_requested, true, memory_order_release);
+    }
+    return accepted;
 }
 
 const char *cbm_index_worker_response_path(const cbm_index_worker_handle_t *handle) {
@@ -773,11 +902,11 @@ void cbm_index_worker_destroy(cbm_index_worker_handle_t *handle) {
     free(handle);
 }
 
-int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_thread,
-                                           const char *marker_file, const char *quarantine_file,
-                                           cbm_proc_log_cb log_callback, void *log_context,
-                                           const atomic_int *cancel_requested,
-                                           cbm_index_worker_result_t *result) {
+int cbm_index_spawn_worker_with_limits_and_log_cancel(
+    const char *args_json, size_t memory_limit_bytes, uint64_t task_temp_limit_bytes,
+    uint64_t max_duration_ms, bool low_priority, bool single_thread, const char *marker_file,
+    const char *quarantine_file, cbm_proc_log_cb log_callback, void *log_context,
+    const atomic_int *cancel_requested, cbm_index_worker_result_t *result) {
     if (!result) {
         return -1;
     }
@@ -786,6 +915,12 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
     if (cbm_index_worker_start_with_log(args_json, 0, single_thread, marker_file, quarantine_file,
                                         log_callback, log_context, &handle) != 0) {
         return -1;
+    }
+    cbm_index_worker_set_memory_limit(handle, memory_limit_bytes);
+    cbm_index_worker_set_task_temp_limit(handle, task_temp_limit_bytes);
+    cbm_index_worker_set_max_duration(handle, max_duration_ms);
+    if (!cbm_index_worker_set_low_priority(handle, low_priority)) {
+        cbm_log_warn("index.supervisor.priority_not_lowered", "action", "continue");
     }
     const cbm_index_worker_result_t *cached = NULL;
     bool cancellation_forwarded = false;
@@ -808,6 +943,16 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
     result->response = cached->response ? cbm_strdup(cached->response) : NULL;
     cbm_index_worker_destroy(handle);
     return 0;
+}
+
+int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_thread,
+                                           const char *marker_file, const char *quarantine_file,
+                                           cbm_proc_log_cb log_callback, void *log_context,
+                                           const atomic_int *cancel_requested,
+                                           cbm_index_worker_result_t *result) {
+    return cbm_index_spawn_worker_with_limits_and_log_cancel(
+        args_json, 0, 0, 0, false, single_thread, marker_file, quarantine_file, log_callback,
+        log_context, cancel_requested, result);
 }
 
 int cbm_index_spawn_worker_with_log(const char *args_json, bool single_thread,

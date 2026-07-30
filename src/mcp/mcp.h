@@ -204,6 +204,7 @@ typedef enum {
     CBM_MCP_SUPERVISED_RESULT_SUCCESS,
     CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE,
     CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL,
+    CBM_MCP_SUPERVISED_RESULT_RESOURCE_LIMIT,
 } cbm_mcp_supervised_result_disposition_t;
 
 cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
