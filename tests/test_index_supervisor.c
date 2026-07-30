@@ -881,7 +881,9 @@ TEST(index_supervisor_can_lower_worker_scheduling_priority) {
     int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"hang-tree\"}", 0, false, NULL,
                                           NULL, &handle);
     bool priority_lowered = cbm_index_worker_set_low_priority(handle, true);
+#ifndef _WIN32
     int priority_error = errno;
+#endif
     bool cancel_accepted = handle && cbm_index_worker_request_cancel(handle);
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(

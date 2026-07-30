@@ -1199,6 +1199,7 @@ bool cbm_subprocess_request_cancel(cbm_subprocess_t *process) {
     }
 }
 
+#if defined(__APPLE__) || defined(__linux__)
 static bool cbm_memory_add(size_t *total, uint64_t value) {
     if (value > SIZE_MAX || *total > SIZE_MAX - (size_t)value) {
         *total = SIZE_MAX;
@@ -1207,6 +1208,7 @@ static bool cbm_memory_add(size_t *total, uint64_t value) {
     *total += (size_t)value;
     return true;
 }
+#endif
 
 #ifdef __APPLE__
 static bool cbm_subprocess_memory_macos(cbm_subprocess_t *process, size_t *bytes_out) {
