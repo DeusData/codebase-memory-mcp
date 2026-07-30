@@ -404,8 +404,6 @@ static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *regist
 
 /* Test-only incremental fault injection. Values name internal phases and are
  * intentionally not user configuration. */
-#define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
-#define CBM_TEST_FAIL_INCREMENTAL_DISABLED "0"
 #define CBM_TEST_FAIL_INCREMENTAL_EXTRACT "incr_extract"
 #define CBM_TEST_FAIL_INCREMENTAL_REGISTRY "incr_registry"
 #define CBM_TEST_FAIL_INCREMENTAL_RESOLVE "incr_resolve"
@@ -414,12 +412,22 @@ static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *regist
 #define CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST "hash_persist"
 #define CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH "overlay_publish"
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+#define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
+#define CBM_TEST_FAIL_INCREMENTAL_DISABLED "0"
+
 static inline bool cbm_pipeline_test_fail_phase_enabled(const char *phase) {
     char buf[CBM_SZ_64];
     const char *val = cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
     return val && val[0] != '\0' && strcmp(val, CBM_TEST_FAIL_INCREMENTAL_DISABLED) != 0 && phase &&
            strcmp(val, phase) == 0;
 }
+#else
+/* Production must not accept an environment variable that injects pipeline
+ * failures. The argument is intentionally unused so its test-only identifier
+ * is not expanded into the release image. */
+#define cbm_pipeline_test_fail_phase_enabled(phase) false
+#endif
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 

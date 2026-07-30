@@ -357,7 +357,11 @@ int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run
 /* Get the Codex CLI instructions content. */
 const char *cbm_get_codex_instructions(void);
 
-/* ── Tar.gz extraction ────────────────────────────────────────── */
+/* ── Tar.gz / zip extraction (TEST-ONLY) ──────────────────────────
+ * Reachable only from the excluded in-process updater and tests/test_cli.c.
+ * Declared and defined under the test guard so the capability is absent from
+ * release artifacts rather than present-but-unreachable. */
+#ifdef CBM_CLI_ENABLE_TEST_API
 
 /* Extract a binary named "codebase-memory-mcp*" from a tar.gz buffer.
  * Returns malloc'd binary content and sets *out_len.
@@ -368,6 +372,8 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
  * Returns malloc'd binary content and sets *out_len.
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
+
+#endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Index management ─────────────────────────────────────────── */
 

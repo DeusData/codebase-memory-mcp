@@ -666,10 +666,15 @@ require(
     and 'CBM_DOWNLOAD_URL="$UPDATE_DOWNLOAD_URL"' in smoke_script,
     "Phase 14 native update must use an explicit file:// fixture override",
 )
+# The handoff contract is no longer Windows-specific: no platform replaces its
+# own image in process, so Phase 14 asserts one platform-neutral contract and
+# selects the script name via UPDATE_SCRIPT. Windows still has the strictest
+# reason for it -- regressing here means reintroducing the launcher stub.
 require(
-    "FAIL 14a: Windows update replaced the binary in-process" in smoke_script
-    and 'grep -q "install.ps1" "$UPDATE_LOG"' in smoke_script,
-    "Phase 14 must assert the Windows update handoff instead of an in-process replacement",
+    "FAIL 14a: update replaced the binary in-process" in smoke_script
+    and 'grep -q "$UPDATE_SCRIPT" "$UPDATE_LOG"' in smoke_script
+    and 'UPDATE_SCRIPT="install.ps1"' in smoke_script,
+    "Phase 14 must assert the update handoff instead of an in-process replacement",
 )
 require(
     'HOME="$WIN_HOME" TEMP="$WIN_HOME" TMP="$WIN_HOME"' in smoke_script

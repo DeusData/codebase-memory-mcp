@@ -48,6 +48,7 @@ enum {
 
 /* Test-only fault injection for the atomic publish boundary. It lets the suite
  * prove a failed replace leaves the previously published DB untouched. */
+#ifdef CBM_ENABLE_TEST_SEAMS
 static const char cbm_test_env_disabled[] = "0";
 
 static bool cbm_gbuf_test_fail_before_replace_enabled(void) {
@@ -63,6 +64,12 @@ static bool cbm_gbuf_test_fail_before_flush_commit_enabled(void) {
         cbm_safe_getenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, buf, sizeof(buf), NULL);
     return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
 }
+#else
+/* Keep release builds structurally incapable of environment-driven publish
+ * failure. Constant false lets the compiler erase the guarded branch. */
+#define cbm_gbuf_test_fail_before_replace_enabled() false
+#define cbm_gbuf_test_fail_before_flush_commit_enabled() false
+#endif
 
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;

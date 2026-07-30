@@ -55,15 +55,25 @@ enum {
     APPLICATION_MARKER_MAX_BYTES = 64 * 1024 * 1024,
     APPLICATION_MAX_SUSPECTS = 65536,
     APPLICATION_UPDATE_POLL_US = 10000,
-    APPLICATION_UPDATE_TIMEOUT_MS = 7000,
     APPLICATION_BACKGROUND_REAP_MS = 10000,
     APPLICATION_UPDATE_VERSION_CAP = 128,
     APPLICATION_UPDATE_NOTICE_CAP = 1024,
-    APPLICATION_UPDATE_RESPONSE_MAX = 1024 * 1024,
 };
 
-#define APPLICATION_UPDATE_URL \
-    "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+/* There is deliberately NO production update-check provider. The daemon used to
+ * spawn `curl` against the GitHub releases API on the first eligible session of
+ * every run, purely to print "a newer version exists". That put a release URL
+ * and an outbound request into every shipped binary, and made a developer tool
+ * phone home from every agent session, to deliver something the install scripts
+ * and package managers already report.
+ *
+ * The SEAM below survives: `update_ops` remains injectable, and the notice,
+ * ownership, cancellation and generation-replay logic is still exercised by the
+ * fakes in tests/test_daemon_application.c. With no provider installed the whole
+ * machinery simply never starts a generation (see
+ * application_update_subscribe_locked), so a build that ships no provider makes
+ * no network request by default -- the property, not just the absence of a call.
+ */
 
 typedef struct cbm_daemon_application_watch cbm_daemon_application_watch_t;
 typedef struct cbm_daemon_application_session cbm_daemon_application_session_t;
@@ -182,13 +192,6 @@ struct cbm_daemon_application {
     /* See cbm_daemon_application_set_permanent. */
     bool permanent;
 };
-
-typedef struct {
-    cbm_subprocess_t *process;
-    char output_path[APPLICATION_PATH_CAP];
-    char latest_version[APPLICATION_UPDATE_VERSION_CAP];
-    bool terminal;
-} application_update_worker_t;
 
 static void application_job_unsubscribe_locked(cbm_daemon_application_job_t *job);
 static void application_watch_job_unsubscribe_session_locked(
@@ -628,132 +631,6 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
     }
     (void)application_close(descriptor);
     return true;
-}
-
-static int application_update_worker_start_default(
-    void *context, cbm_daemon_application_update_worker_t *worker_out) {
-    (void)context;
-    if (!worker_out) {
-        return -1;
-    }
-    *worker_out = NULL;
-    application_update_worker_t *worker = calloc(1, sizeof(*worker));
-    if (!worker || !application_unique_recovery_file(worker->output_path, "update")) {
-        free(worker);
-        return -1;
-    }
-    const char *argv[] = {
-        "curl",
-        "-sf",
-        "--max-time",
-        "5",
-        "--max-filesize",
-        "1048576",
-        "-H",
-        "Accept: application/vnd.github+json",
-        APPLICATION_UPDATE_URL,
-        NULL,
-    };
-    cbm_proc_opts_t options = {
-        .bin = "curl",
-        .argv = argv,
-        .log_file = worker->output_path,
-        .quiet_timeout_ms = APPLICATION_UPDATE_TIMEOUT_MS,
-        .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
-        .delete_log_on_exit = false,
-    };
-    if (cbm_subprocess_spawn(&options, &worker->process) != 0) {
-        (void)cbm_unlink(worker->output_path);
-        free(worker);
-        return -1;
-    }
-    *worker_out = worker;
-    return 0;
-}
-
-static void application_update_worker_read_version(application_update_worker_t *worker) {
-    int64_t size = cbm_file_size(worker->output_path);
-    if (size <= 0 || size > APPLICATION_UPDATE_RESPONSE_MAX) {
-        return;
-    }
-    FILE *file = cbm_fopen(worker->output_path, "rb");
-    if (!file) {
-        return;
-    }
-    char *bytes = malloc((size_t)size);
-    size_t read = bytes ? fread(bytes, 1, (size_t)size, file) : 0;
-    (void)fclose(file);
-    if (read != (size_t)size) {
-        free(bytes);
-        return;
-    }
-    yyjson_doc *document = yyjson_read(bytes, read, 0);
-    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
-    yyjson_val *tag = yyjson_is_obj(root) ? yyjson_obj_get(root, "tag_name") : NULL;
-    const char *version = yyjson_is_str(tag) ? yyjson_get_str(tag) : NULL;
-    if (version && version[0] && strlen(version) < sizeof(worker->latest_version)) {
-        bool valid = true;
-        for (const unsigned char *cursor = (const unsigned char *)version; *cursor; cursor++) {
-            if (!(isalnum(*cursor) || *cursor == '.' || *cursor == '-' || *cursor == '_' ||
-                  *cursor == '+')) {
-                valid = false;
-                break;
-            }
-        }
-        if (valid) {
-            (void)snprintf(worker->latest_version, sizeof(worker->latest_version), "%s", version);
-        }
-    }
-    yyjson_doc_free(document);
-    free(bytes);
-}
-
-static cbm_daemon_application_update_poll_t application_update_worker_poll_default(
-    void *context, cbm_daemon_application_update_worker_t handle, const char **latest_version_out) {
-    (void)context;
-    if (latest_version_out) {
-        *latest_version_out = NULL;
-    }
-    application_update_worker_t *worker = handle;
-    if (!worker || !worker->process || !latest_version_out) {
-        return CBM_DAEMON_APPLICATION_UPDATE_POLL_ERROR;
-    }
-    if (!worker->terminal) {
-        cbm_proc_result_t result;
-        cbm_proc_poll_t status = cbm_subprocess_poll(worker->process, &result);
-        if (status == CBM_PROC_POLL_RUNNING) {
-            return CBM_DAEMON_APPLICATION_UPDATE_POLL_RUNNING;
-        }
-        if (status != CBM_PROC_POLL_TERMINAL) {
-            return CBM_DAEMON_APPLICATION_UPDATE_POLL_ERROR;
-        }
-        worker->terminal = true;
-        if (result.outcome == CBM_PROC_CLEAN && result.exit_code == 0 && result.tree_quiesced &&
-            !result.supervision_failed && !result.cancellation_requested) {
-            application_update_worker_read_version(worker);
-        }
-    }
-    *latest_version_out = worker->latest_version[0] ? worker->latest_version : NULL;
-    return CBM_DAEMON_APPLICATION_UPDATE_POLL_TERMINAL;
-}
-
-static bool application_update_worker_cancel_default(
-    void *context, cbm_daemon_application_update_worker_t handle) {
-    (void)context;
-    application_update_worker_t *worker = handle;
-    return worker && worker->process && cbm_subprocess_request_cancel(worker->process);
-}
-
-static void application_update_worker_destroy_default(
-    void *context, cbm_daemon_application_update_worker_t handle) {
-    (void)context;
-    application_update_worker_t *worker = handle;
-    if (!worker) {
-        return;
-    }
-    cbm_subprocess_destroy(worker->process);
-    (void)cbm_unlink(worker->output_path);
-    free(worker);
 }
 
 static bool application_recovery_files_create(char marker_path[APPLICATION_PATH_CAP],
@@ -1944,6 +1821,13 @@ static void *application_update_thread(void *opaque) {
 
 static void application_update_subscribe_locked(cbm_daemon_application_session_t *session) {
     cbm_daemon_application_t *application = session->application;
+    /* No provider, no generation. This is what makes "the daemon performs no
+     * network request by default" a structural property rather than a promise:
+     * with update_ops empty nothing is ever started, so no session can observe
+     * a generation, become its owner, or wait on it. */
+    if (!application->update_ops.start) {
+        return;
+    }
     if (application->update_generation_started) {
         if (application->update_thread_started && !application->update_thread_done &&
             !application->update_cancel_requested && !session->update_owner) {
@@ -2916,17 +2800,13 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         free(application);
         return NULL;
     }
-    if (!application->update_ops.start) {
-        application->update_ops = (cbm_daemon_application_update_ops_t){
-            .context = NULL,
-            .start = application_update_worker_start_default,
-            .poll = application_update_worker_poll_default,
-            .cancel = application_update_worker_cancel_default,
-            .destroy = application_update_worker_destroy_default,
-        };
-    }
-    if (!application->update_ops.poll || !application->update_ops.cancel ||
-        !application->update_ops.destroy) {
+    /* No provider means no update checking, which is the production default now
+     * that the curl-based GitHub check is gone. An INCOMPLETE provider is still
+     * a programming error: a caller that supplies `start` must supply the whole
+     * quartet, or the thread would start work it cannot poll, cancel or free. */
+    if (application->update_ops.start &&
+        (!application->update_ops.poll || !application->update_ops.cancel ||
+         !application->update_ops.destroy)) {
         cbm_mutex_destroy(&application->mutex);
         free(application);
         return NULL;

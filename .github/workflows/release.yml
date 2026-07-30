@@ -31,6 +31,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_tests:
+        description: "Skip the test phase entirely (re-release of an already test-green tree; build/smoke/soak/verify still run)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,7 +51,12 @@ jobs:
     uses: ./.github/workflows/_lint.yml
 
   # ── 2. Tests (all platforms, full suite for release) ────────────
+  # skip_tests exists for RE-releases of a tree whose tests are already green:
+  # when only packaging/gating changed and the previous run proved the suites,
+  # re-running ~2h of tests adds no information. It skips ONLY this phase —
+  # build, smoke, soak and verify always run against the fresh artifacts.
   test:
+    if: ${{ !inputs.skip_tests }}
     needs: [lint]
     uses: ./.github/workflows/_test.yml
     with:
@@ -55,7 +65,10 @@ jobs:
       shard_suites: true
 
   # ── 3. Build all platforms ──────────────────────────────────────
+  # !cancelled() && !failure(): run when `test` is deliberately skipped, but
+  # never when lint or test actually failed.
   build:
+    if: ${{ !cancelled() && !failure() }}
     needs: [test]
     permissions:
       contents: read
@@ -220,44 +233,23 @@ jobs:
           vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           files: binaries/*
 
+      # ZERO tolerance: any detection on any artifact blocks the release.
+      # False positives are resolved upstream (Microsoft false-positive
+      # submission for the exact hashes, then re-run this job — no rebuild),
+      # never by loosening this gate.
       - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
         run: scripts/ci/check-virustotal.sh
 
+      # Renders per-binary sha256 + VT links into the notes; only reachable
+      # after the zero-tolerance gate passed, so "0 detections" is verified.
       - name: Append VirusTotal scan links to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
-        run: |
-          # Hash the extracted binaries (not the archives — VT indexes binary hashes)
-          TABLE="\n\n## Security Verification\n\n"
-          TABLE+="All release binaries scanned with 70+ antivirus engines — **0 detections**.\n\n"
-          TABLE+="| Binary | SHA-256 | VirusTotal |\n"
-          TABLE+="|--------|---------|------------|\n"
-
-          for bin in binaries/codebase-memory-mcp-*; do
-            [ -f "$bin" ] || continue
-            name=$(basename "$bin")
-            # Skip UI variants and non-binary files
-            echo "$name" | grep -qE \
-              '^codebase-memory-mcp-(linux|darwin|windows)-(amd64|arm64)(\.exe)?$' || continue
-            sha256=$(sha256sum "$bin" 2>/dev/null | awk '{print $1}' \
-              || shasum -a 256 "$bin" | awk '{print $1}')
-            label=$(echo "$name" \
-              | sed 's/^codebase-memory-mcp-//' \
-              | sed 's/\.exe$//')
-            short="${sha256:0:20}..."
-            vt_url="https://www.virustotal.com/gui/file/${sha256}/detection"
-            TABLE+="| \`${label}\` | \`${short}\` | [0/72 ✅](${vt_url}) |\n"
-          done
-
-          CURRENT=$(gh release view "$VERSION" \
-            --json body --jq '.body // ""' --repo "$GITHUB_REPOSITORY")
-          printf '%s%b' "$CURRENT" "$TABLE" > /tmp/release_notes.md
-          gh release edit "$VERSION" \
-            --notes-file /tmp/release_notes.md --repo "$GITHUB_REPOSITORY"
+        run: scripts/ci/append-vt-notes.sh
 
   # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
   # Wrappers in pkg/npm and pkg/pypi download the released binary at

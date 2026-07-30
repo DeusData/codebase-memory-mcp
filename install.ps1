@@ -301,6 +301,28 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# Place the installer beside the binary so `update` points at a local file
+# rather than a URL, and so the next update runs THIS release's installer.
+#
+# Sourced from the archive we just checksum-verified, and published by rename
+# rather than written over the live path. PowerShell parses a script fully
+# before executing it, so self-overwrite is less hazardous here than it is for
+# bash -- but rename costs nothing and keeps both platforms on one rule.
+# Best effort: a failure here still leaves a working install.
+$DownloadedInstaller = Join-Path $TmpDir "install.ps1"
+if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
+    $InstallerDest = Join-Path $InstallDir "install.ps1"
+    $InstallerTmp = "$InstallerDest.new"
+    try {
+        Copy-Item -LiteralPath $DownloadedInstaller -Destination $InstallerTmp -Force -ErrorAction Stop
+        Move-Item -LiteralPath $InstallerTmp -Destination $InstallerDest -Force -ErrorAction Stop
+        Write-Host "Installed updater -> $InstallerDest"
+    } catch {
+        Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        Write-Host "note: could not place install.ps1 in $InstallDir (update will explain where to find it)"
+    }
+}
+
 # Verify. The launcher's activation transaction already staged, swapped, and
 # rolled back the binary under its own ownership and DACL checks, so this step
 # only confirms the activated executable runs; there is no script-level

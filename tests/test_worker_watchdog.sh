@@ -36,6 +36,20 @@ if [[ ! -x "${BINARY}" ]]; then
   exit 2
 fi
 
+# PRECONDITION, not a skip: this test drives the crash-orphan probe, which is
+# compiled out of ordinary builds (it forks a SIGTERM-ignoring child, which must
+# never ship — see src/main.c and TEST_SEAMS in Makefile.cbm). Against a
+# seam-less binary the probe silently no-ops and the test dies with an opaque
+# "Killed: 9" many lines later. Assert the capability up front and say exactly
+# how to get it. Failing (not skipping) is deliberate: a skip here would hide
+# the loss of watchdog coverage entirely.
+if ! LC_ALL=C grep -a -q -F 'CBM_TEST_WORKER_DESCENDANT_PID_FILE' "${BINARY}"; then
+  echo "binary lacks the crash-orphan test seam: ${BINARY}" >&2
+  echo "  rebuild it with:  make -f Makefile.cbm cbm TEST_SEAMS=1" >&2
+  echo "  or run this test through scripts/test.sh, which does that for you." >&2
+  exit 2
+fi
+
 if command -v shasum >/dev/null 2>&1; then
   BUILD_FINGERPRINT="$(shasum -a 256 "${BINARY}" | awk '{print $1}')"
 elif command -v sha256sum >/dev/null 2>&1; then
