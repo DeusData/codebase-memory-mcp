@@ -1598,8 +1598,10 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     }
     char *old_home = NULL;
     char *old_cache = NULL;
+    char *old_path = save_test_env("PATH");
     cli_activation_save_env(&old_home, &old_cache);
     cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
 
     char cache_dir[512];
     char index_path[640];
@@ -1636,6 +1638,7 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     const char *installed = read_test_file(bin_target);
     bool binary_preserved =
         installed && strcmp(installed, "binary must survive active-daemon refusal") == 0;
+    restore_test_env("PATH", old_path);
     cli_activation_restore_env(old_home, old_cache);
     test_rmdir_r(tmpdir);
 
