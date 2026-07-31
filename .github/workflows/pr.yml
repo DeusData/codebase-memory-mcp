@@ -31,6 +31,8 @@ jobs:
   #    Standalone job, not bolted onto _lint.yml, because it needs a real
   #    build of the standard binary and lint intentionally stays build-free/fast. ──
   plugin-drift:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.plugin == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -58,6 +60,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       product: ${{ steps.f.outputs.product }}
+      plugin: ${{ steps.f.outputs.plugin }}
     steps:
       - name: Detect product-code changes
         id: f
@@ -74,6 +77,11 @@ jobs:
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|plugin/|server\.json$|scripts/(build|env|check-plugin-drift|sync-plugin)\.sh$|Makefile\.cbm$)'; then
+            echo "plugin=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "plugin=false" >> "$GITHUB_OUTPUT"
           fi
 
   # ── Light smoke: build the PRODUCTION binary and run the core smoke on the

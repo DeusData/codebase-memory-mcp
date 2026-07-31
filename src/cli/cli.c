@@ -5259,7 +5259,12 @@ static int emit_rm_rf(const char *path) {
     while (rc == CLI_OK && (e = cbm_readdir(d)) != NULL) {
         char child[CLI_BUF_1K];
         snprintf(child, sizeof(child), "%s/%s", path, e->name);
-        rc = e->is_dir ? emit_rm_rf(child) : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+        if (e->is_reparse_point) {
+            rc = e->is_dir ? (cbm_rmdir(child) == 0 ? CLI_OK : CLI_ERR)
+                           : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+        } else {
+            rc = e->is_dir ? emit_rm_rf(child) : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+        }
     }
     cbm_closedir(d);
     if (rc != CLI_OK) {
@@ -5272,7 +5277,7 @@ static int emit_write_file(const char *path, const char *content) {
     if (!path || !content || ensure_parent_dir(path) != CLI_OK) {
         return CLI_ERR;
     }
-    FILE *f = fopen(path, "wb");
+    FILE *f = cbm_fopen(path, "wb");
     if (!f) {
         return CLI_ERR;
     }
@@ -5283,8 +5288,7 @@ static int emit_write_file(const char *path, const char *content) {
 }
 
 /* Copy src into dst (size cap) as a JSON-safe string body: escape " and \,
- * drop control chars < 0x20. Only version needs this — later artifacts write
- * static literals or verbatim source, not interpolated untrusted data. */
+ * drop control chars < 0x20. */
 static void json_escape_into(char *dst, size_t dst_sz, const char *src) {
     size_t j = 0;
     for (size_t i = 0; src[i] && j + 2 < dst_sz; i++) {
@@ -5348,44 +5352,100 @@ static int emit_agents(const char *out_dir) {
     return CLI_OK;
 }
 
-static int emit_mcp_json(const char *out_dir) {
+static int emit_package_spec(char *dst, size_t dst_sz, const char *version) {
+    char package[CLI_BUF_1K];
+    int len = snprintf(package, sizeof(package), "codebase-memory-mcp@%s", version);
+    if (len < 0 || (size_t)len >= sizeof(package)) {
+        return CLI_ERR;
+    }
+    json_escape_into(dst, dst_sz, package);
+    return CLI_OK;
+}
+
+static int emit_mcp_json(const char *out_dir, const char *version) {
     char path[CLI_BUF_1K];
     snprintf(path, sizeof(path), "%s/.mcp.json", out_dir);
-    static const char body[] = "{\n"
-                               "  \"mcpServers\": {\n"
-                               "    \"codebase-memory-mcp\": {\n"
-                               "      \"type\": \"stdio\",\n"
-                               "      \"command\": \"npx\",\n"
-                               "      \"args\": [\"-y\", \"codebase-memory-mcp\"]\n"
-                               "    }\n"
-                               "  }\n"
-                               "}\n";
+    char package[CLI_BUF_2K];
+    if (emit_package_spec(package, sizeof(package), version) != CLI_OK) {
+        return CLI_ERR;
+    }
+    char body[CLI_BUF_2K];
+    int len = snprintf(body, sizeof(body),
+                       "{\n"
+                       "  \"mcpServers\": {\n"
+                       "    \"codebase-memory-mcp\": {\n"
+                       "      \"type\": \"stdio\",\n"
+                       "      \"command\": \"npx\",\n"
+                       "      \"args\": [\"-y\", \"%s\"]\n"
+                       "    }\n"
+                       "  }\n"
+                       "}\n",
+                       package);
+    if (len < 0 || (size_t)len >= sizeof(body)) {
+        return CLI_ERR;
+    }
     return emit_write_file(path, body);
 }
 
-static int emit_hooks_json(const char *out_dir) {
+static int emit_hooks_json(const char *out_dir, const char *version) {
     char path[CLI_BUF_1K];
     snprintf(path, sizeof(path), "%s/hooks/hooks.json", out_dir);
-    static const char body[] =
+    char package[CLI_BUF_2K];
+    if (emit_package_spec(package, sizeof(package), version) != CLI_OK) {
+        return CLI_ERR;
+    }
+    char body[CLI_BUF_4K];
+    int len = snprintf(
+        body, sizeof(body),
         "{\n"
         "  \"SessionStart\": [\n"
-        "    { \"hooks\": [ { \"type\": \"command\", \"command\": "
-        "\"npx -y codebase-memory-mcp hook-augment --event SessionStart\" } ] }\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": \"npx\", "
+        "\"args\": [\"-y\", \"%s\", \"hook-augment\", \"--event\", \"SessionStart\"] } ] }\n"
         "  ],\n"
         "  \"SubagentStart\": [\n"
-        "    { \"hooks\": [ { \"type\": \"command\", \"command\": "
-        "\"npx -y codebase-memory-mcp hook-augment --event SubagentStart\" } ] }\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": \"npx\", "
+        "\"args\": [\"-y\", \"%s\", \"hook-augment\", \"--event\", \"SubagentStart\"] } ] }\n"
         "  ],\n"
         "  \"PreToolUse\": [\n"
-        "    { \"matcher\": \"Grep|Glob\", \"hooks\": [ { \"type\": \"command\", \"command\": "
-        "\"npx -y codebase-memory-mcp hook-augment\" } ] }\n"
+        "    { \"matcher\": \"Grep|Glob\", \"hooks\": [ { \"type\": \"command\", "
+        "\"command\": \"npx\", \"args\": [\"-y\", \"%s\", \"hook-augment\"] } ] }\n"
         "  ],\n"
         "  \"PostToolUse\": [\n"
-        "    { \"matcher\": \"Read\", \"hooks\": [ { \"type\": \"command\", \"command\": "
-        "\"npx -y codebase-memory-mcp hook-augment\" } ] }\n"
+        "    { \"matcher\": \"Read\", \"hooks\": [ { \"type\": \"command\", "
+        "\"command\": \"npx\", \"args\": [\"-y\", \"%s\", \"hook-augment\"] } ] }\n"
         "  ]\n"
-        "}\n";
+        "}\n",
+        package, package, package, package);
+    if (len < 0 || (size_t)len >= sizeof(body)) {
+        return CLI_ERR;
+    }
     return emit_write_file(path, body);
+}
+
+static bool emit_marker_is_owned(const char *path) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char json[CLI_BUF_8K];
+    size_t len = fread(json, 1, sizeof(json) - 1, f);
+    int extra = len == sizeof(json) - 1 ? fgetc(f) : EOF;
+    int read_failed = ferror(f);
+    int close_failed = fclose(f);
+    if (read_failed || close_failed != 0 || extra != EOF) {
+        return false;
+    }
+    json[len] = '\0';
+
+    yyjson_doc *doc = yyjson_read(json, len, YYJSON_READ_NOFLAG);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *name = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "name") : NULL;
+    const char *owned_name = name ? yyjson_get_str(name) : NULL;
+    bool owned = owned_name && strcmp(owned_name, "codebase-memory") == 0;
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return owned;
 }
 
 int cbm_emit_plugin(const char *out_dir, const char *version) {
@@ -5393,20 +5453,26 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         return CLI_ERR;
     }
     const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
-    /* Refuse to wipe a directory that isn't already an emitted plugin tree —
-     * emit-plugin recursively clears out_dir, so guard against `emit-plugin .`
-     * or a typo destroying real files. Safe when the dir is absent or already
-     * contains our marker. */
-    struct stat st;
-    if (stat(out_dir, &st) == 0) {
+    /* Refuse to wipe anything that is not a real directory carrying our
+     * validated marker. This also rejects top-level links/reparse points. */
+    cbm_path_info_t out_info;
+    if (cbm_path_info(out_dir, &out_info) != 0) {
+        (void)fprintf(stderr, "error: unable to inspect plugin output path %s\n", out_dir);
+        return CLI_ERR;
+    }
+    if (out_info.exists) {
         char marker[CLI_BUF_1K];
         snprintf(marker, sizeof(marker), "%s/.claude-plugin/plugin.json", out_dir);
-        struct stat mst;
-        if (stat(marker, &mst) != 0) {
+        cbm_path_info_t marker_info;
+        bool owned = out_info.is_dir && !out_info.is_reparse_point &&
+                     cbm_path_info(marker, &marker_info) == 0 && marker_info.exists &&
+                     marker_info.is_regular_file && !marker_info.is_reparse_point &&
+                     emit_marker_is_owned(marker);
+        if (!owned) {
             (void)fprintf(stderr,
                           "error: refusing to clear %s: not an emitted plugin directory "
-                          "(missing .claude-plugin/plugin.json). Emit into a fresh or "
-                          "previously-emitted directory.\n",
+                          "owned by codebase-memory. Emit into a fresh or "
+                          "previously-emitted codebase-memory plugin directory.\n",
                           out_dir);
             return CLI_ERR;
         }
@@ -5423,10 +5489,10 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
     if (emit_agents(out_dir) != CLI_OK) {
         return CLI_ERR;
     }
-    if (emit_mcp_json(out_dir) != CLI_OK) {
+    if (emit_mcp_json(out_dir, ver) != CLI_OK) {
         return CLI_ERR;
     }
-    if (emit_hooks_json(out_dir) != CLI_OK) {
+    if (emit_hooks_json(out_dir, ver) != CLI_OK) {
         return CLI_ERR;
     }
     return CLI_OK;
@@ -5444,14 +5510,14 @@ int cbm_cmd_emit_plugin(int argc, char **argv) {
     }
     if (!out_dir) {
         (void)fprintf(stderr, "usage: codebase-memory-mcp emit-plugin <dir> [--version X]\n");
-        return CLI_ERR;
+        return EXIT_FAILURE;
     }
     if (cbm_emit_plugin(out_dir, version) != CLI_OK) {
         (void)fprintf(stderr, "error: emit-plugin failed for %s\n", out_dir);
-        return CLI_ERR;
+        return EXIT_FAILURE;
     }
     printf("Emitted Claude Code plugin to %s\n", out_dir);
-    return CLI_OK;
+    return EXIT_SUCCESS;
 }
 
 /* ── Interactive prompt ───────────────────────────────────────── */

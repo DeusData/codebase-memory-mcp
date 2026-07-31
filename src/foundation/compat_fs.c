@@ -114,6 +114,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     d->entry.name[nlen] = '\0';
     free(u8);
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    d->entry.is_reparse_point = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     d->entry.d_type = 0;
     return &d->entry;
 }
@@ -392,6 +393,36 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return f;
 }
 
+int cbm_path_info(const char *path, cbm_path_info_t *info) {
+    if (!path || !info) {
+        return -1;
+    }
+    memset(info, 0, sizeof(*info));
+
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return -1;
+    }
+    DWORD attributes = GetFileAttributesW(wpath);
+    DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    free(wpath);
+
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+            error == ERROR_INVALID_NAME) {
+            return 0;
+        }
+        return -1;
+    }
+
+    info->exists = true;
+    info->is_dir = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    info->is_reparse_point = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    info->is_regular_file =
+        !info->is_dir && !info->is_reparse_point && (attributes & FILE_ATTRIBUTE_DEVICE) == 0;
+    return 0;
+}
+
 static bool cbm_windows_mkdir_component(wchar_t *path) {
     if (_wmkdir(path) != 0 && errno != EEXIST) {
         return false;
@@ -659,6 +690,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
         d->entry.is_dir = (de->d_type == DT_DIR);
+        d->entry.is_reparse_point = (de->d_type == DT_LNK);
         d->entry.d_type = de->d_type;
         return &d->entry;
     }
@@ -684,6 +716,27 @@ int cbm_pclose(FILE *f) {
 
 FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
+}
+
+int cbm_path_info(const char *path, cbm_path_info_t *info) {
+    if (!path || !info) {
+        return -1;
+    }
+    memset(info, 0, sizeof(*info));
+
+    struct stat state;
+    if (lstat(path, &state) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return 0;
+        }
+        return -1;
+    }
+
+    info->exists = true;
+    info->is_dir = S_ISDIR(state.st_mode);
+    info->is_regular_file = S_ISREG(state.st_mode);
+    info->is_reparse_point = S_ISLNK(state.st_mode);
+    return 0;
 }
 
 static int cbm_open_directory_component(int parent, const char *component, int flags) {
