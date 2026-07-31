@@ -2555,6 +2555,7 @@ struct cbm_mcp_server {
     uint64_t query_store_open_count_for_testing;
     uint64_t request_mem_collect_count_for_testing;
     bool skip_request_mem_collect_for_testing;
+    bool retain_request_store_for_testing;
 #endif
 
     /* Session + auto-index state */
@@ -3555,6 +3556,11 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
         cbm_safe_getenv("CBM_TEST_SKIP_REQUEST_MEM_COLLECT", skip_collect, sizeof(skip_collect),
                         NULL) != NULL &&
         skip_collect[0] == '1';
+    char retain_store[CBM_SZ_16];
+    srv->retain_request_store_for_testing =
+        cbm_safe_getenv("CBM_TEST_RETAIN_REQUEST_STORE", retain_store, sizeof(retain_store),
+                        NULL) != NULL &&
+        retain_store[0] == '1';
 #endif
 
     cbm_mutex_init(&srv->overlay_compaction_lock);
@@ -17623,6 +17629,15 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     if (!srv || !srv->owns_store || !srv->store || !cbm_store_db_path(srv->store)) {
         return;
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* Diagnostic only: keep one server-owned SQLite handle/page cache so an
+     * A/B can isolate repeated O(schema + integrity) open/validation work from
+     * the O(1) cached-store path. Shipping builds cannot enable this branch;
+     * cross-platform publication policy must be decided from separate tests. */
+    if (srv->retain_request_store_for_testing) {
+        return;
+    }
+#endif
     cbm_store_close(srv->store);
     srv->store = NULL;
     free(srv->current_project);
