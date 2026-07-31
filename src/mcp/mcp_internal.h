@@ -31,6 +31,7 @@ bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv);
  * on wall-clock timing. */
 #ifdef CBM_ENABLE_TEST_SEAMS
 uint64_t cbm_mcp_server_query_store_open_count_for_testing(const cbm_mcp_server_t *srv);
+uint64_t cbm_mcp_server_request_mem_collect_count_for_testing(const cbm_mcp_server_t *srv);
 #endif
 
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
