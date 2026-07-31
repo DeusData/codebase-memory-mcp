@@ -49,6 +49,7 @@ enum {
 #include "store/store.h"
 #include <sqlite3.h>
 #include <ctype.h>
+#include <inttypes.h>
 #include "cypher/cypher.h"
 #include "discover/discover.h"
 #include "pipeline/pipeline.h"
@@ -5033,8 +5034,19 @@ static bool add_project_status_summary(yyjson_mut_doc *doc, yyjson_mut_val *root
         return false;
     }
 
-    int nodes = cbm_store_count_nodes(store, project);
-    int edges = cbm_store_count_edges(store, project);
+    cbm_project_graph_stats_t graph_stats = {0};
+    if (cbm_store_get_project_graph_stats(store, project, &graph_stats) != CBM_STORE_OK) {
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_strcpy(doc, root, "detail", cbm_store_error(store));
+        yyjson_mut_obj_add_str(
+            doc, root, "action_required",
+            "The project graph statistics could not be read exactly. Check store integrity, then "
+            "reindex the project if the database schema or contents are damaged.");
+        return false;
+    }
+    int64_t nodes = graph_stats.node_count;
+    int64_t edges = graph_stats.edge_count;
+    cbm_store_project_graph_stats_free_fields(&graph_stats);
     bool ready = nodes > 0;
     yyjson_mut_obj_add_str(doc, root, "status", ready ? "ready" : "empty");
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
@@ -5272,24 +5284,20 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_m
     sqlite3 *db = cbm_store_get_db(store);
     bool pagerank_stale =
         proj && cbm_store_derived_view_is_stale(store, proj, CBM_STORE_DERIVED_VIEW_PAGERANK);
-    int ranked_nodes = 0;
+    int64_t ranked_nodes = 0;
     int key_functions_count = 0;
     if (db && proj && rank_enabled && !pagerank_stale) {
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db,
-                               "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
-                               -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                ranked_nodes = sqlite3_column_int(stmt, 0);
-                if (ranked_nodes > 0) {
-                    yyjson_mut_obj_add_int(doc, ctx, "ranked_nodes", ranked_nodes);
-                    const char *ts = (const char *)sqlite3_column_text(stmt, 1);
-                    if (ts)
-                        yyjson_mut_obj_add_strcpy(doc, ctx, "pagerank_computed_at", ts);
+        cbm_project_graph_stats_t graph_stats = {0};
+        if (cbm_store_get_project_graph_stats(store, proj, &graph_stats) == CBM_STORE_OK) {
+            ranked_nodes = graph_stats.ranked_node_count;
+            if (ranked_nodes > 0) {
+                yyjson_mut_obj_add_int(doc, ctx, "ranked_nodes", ranked_nodes);
+                if (graph_stats.pagerank_computed_at) {
+                    yyjson_mut_obj_add_strcpy(doc, ctx, "pagerank_computed_at",
+                                              graph_stats.pagerank_computed_at);
                 }
             }
-            sqlite3_finalize(stmt);
+            cbm_store_project_graph_stats_free_fields(&graph_stats);
         }
     }
 
@@ -6090,8 +6098,14 @@ static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         return true;
     }
 
-    int nodes = cbm_store_count_nodes(pstore, project_name);
-    int edges = cbm_store_count_edges(pstore, project_name);
+    cbm_project_graph_stats_t graph_stats = {0};
+    if (cbm_store_get_project_graph_stats(pstore, project_name, &graph_stats) != CBM_STORE_OK) {
+        cbm_store_close(pstore);
+        return false;
+    }
+    int64_t nodes = graph_stats.node_count;
+    int64_t edges = graph_stats.edge_count;
+    cbm_store_project_graph_stats_free_fields(&graph_stats);
     char root_path_buf[CBM_SZ_1K] = "";
     cbm_project_t proj = {0};
     if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
@@ -9488,9 +9502,26 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 
     if (project) {
         CBM_PROF_START(prof_index_status_counts);
-        int nodes = cbm_store_count_nodes(store, project);
-        int edges = cbm_store_count_edges(store, project);
+        cbm_project_graph_stats_t project_graph_stats = {0};
+        int stats_rc = cbm_store_get_project_graph_stats(store, project, &project_graph_stats);
         CBM_PROF_END("index_status", "graph_counts", prof_index_status_counts);
+        if (stats_rc != CBM_STORE_OK) {
+            yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+            yyjson_mut_obj_add_str(doc, root, "status", "error");
+            yyjson_mut_obj_add_strcpy(doc, root, "detail", cbm_store_error(store));
+            yyjson_mut_obj_add_str(
+                doc, root, "action_required",
+                "Check store integrity, then reindex the project if its schema or contents are "
+                "damaged.");
+            char *json = yy_doc_to_str(doc);
+            yyjson_mut_doc_free(doc);
+            free(project);
+            char *result = cbm_mcp_text_result(json, false);
+            free(json);
+            return result;
+        }
+        int64_t nodes = project_graph_stats.node_count;
+        int64_t edges = project_graph_stats.edge_count;
         yyjson_mut_obj_add_str(doc, root, "project", project);
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
@@ -9521,8 +9552,15 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                 }
                 yyjson_mut_val *dependency = yyjson_mut_obj(doc);
                 yyjson_mut_obj_add_strcpy(doc, dependency, "package", package);
-                yyjson_mut_obj_add_int(doc, dependency, "nodes",
-                                       cbm_store_count_nodes(store, dep_project));
+                cbm_project_graph_stats_t dependency_stats = {0};
+                if (cbm_store_get_project_graph_stats(store, dep_project, &dependency_stats) ==
+                    CBM_STORE_OK) {
+                    yyjson_mut_obj_add_int(doc, dependency, "nodes", dependency_stats.node_count);
+                    cbm_store_project_graph_stats_free_fields(&dependency_stats);
+                } else {
+                    yyjson_mut_obj_add_str(doc, dependency, "status", "error");
+                    yyjson_mut_obj_add_strcpy(doc, dependency, "detail", cbm_store_error(store));
+                }
                 yyjson_mut_arr_add_val(dep_arr, dependency);
                 dep_count++;
             }
@@ -9564,28 +9602,15 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         CBM_PROF_END("index_status", "project_coverage", prof_index_status_coverage);
         /* Report PageRank stats */
         CBM_PROF_START(prof_index_status_pagerank);
-        {
-            sqlite3 *db = cbm_store_get_db(store);
-            if (db) {
-                sqlite3_stmt *pr_stmt = NULL;
-                const char *pr_sql = "SELECT COUNT(*), MAX(computed_at) "
-                                     "FROM pagerank WHERE project = ?1";
-                if (sqlite3_prepare_v2(db, pr_sql, -1, &pr_stmt, NULL) == SQLITE_OK) {
-                    sqlite3_bind_text(pr_stmt, 1, project, -1, SQLITE_TRANSIENT);
-                    if (sqlite3_step(pr_stmt) == SQLITE_ROW) {
-                        int ranked = sqlite3_column_int(pr_stmt, 0);
-                        if (ranked > 0) {
-                            yyjson_mut_val *pr_obj = yyjson_mut_obj(doc);
-                            yyjson_mut_obj_add_int(doc, pr_obj, "ranked_nodes", ranked);
-                            const char *ts = (const char *)sqlite3_column_text(pr_stmt, 1);
-                            if (ts)
-                                yyjson_mut_obj_add_strcpy(doc, pr_obj, "computed_at", ts);
-                            yyjson_mut_obj_add_val(doc, root, "pagerank", pr_obj);
-                        }
-                    }
-                    sqlite3_finalize(pr_stmt);
-                }
+        if (project_graph_stats.ranked_node_count > 0) {
+            yyjson_mut_val *pr_obj = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_int(doc, pr_obj, "ranked_nodes",
+                                   project_graph_stats.ranked_node_count);
+            if (project_graph_stats.pagerank_computed_at) {
+                yyjson_mut_obj_add_strcpy(doc, pr_obj, "computed_at",
+                                          project_graph_stats.pagerank_computed_at);
             }
+            yyjson_mut_obj_add_val(doc, root, "pagerank", pr_obj);
         }
         CBM_PROF_END("index_status", "pagerank", prof_index_status_pagerank);
 
@@ -9603,6 +9628,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             "index_status includes overlay_read_view counts, but nodes/edges are canonical counts "
             "while overlay-aware tools may read active overlay rows.");
         CBM_PROF_END("index_status", "freshness_overlay", prof_index_status_freshness);
+        cbm_store_project_graph_stats_free_fields(&project_graph_stats);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -10408,6 +10434,10 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
     char norm_path[CBM_SZ_512];
     bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
+    cbm_project_graph_stats_t root_graph_stats = {0};
+    bool have_root_graph_stats =
+        !path_scoped ||
+        cbm_store_get_project_graph_stats(store, project, &root_graph_stats) == CBM_STORE_OK;
     bool active_languages_requested = aspect_wanted(aspects_doc, aspects_arr, "languages");
     bool active_entry_points_requested = aspect_wanted(aspects_doc, aspects_arr, "entry_points");
     bool active_routes_requested = aspect_wanted(aspects_doc, aspects_arr, "routes");
@@ -10431,8 +10461,10 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         }
         if (path_scoped) {
             cbm_toon_scalar_str(&sb, "path", norm_path);
-            cbm_toon_scalar_int(&sb, "root_total_nodes", cbm_store_count_nodes(store, project));
-            cbm_toon_scalar_int(&sb, "root_total_edges", cbm_store_count_edges(store, project));
+            if (have_root_graph_stats) {
+                cbm_toon_scalar_int(&sb, "root_total_nodes", root_graph_stats.node_count);
+                cbm_toon_scalar_int(&sb, "root_total_edges", root_graph_stats.edge_count);
+            }
             cbm_toon_scalar_int(&sb, "scoped_total_nodes", node_count);
             cbm_toon_scalar_int(&sb, "scoped_total_edges", edge_count);
         }
@@ -10687,6 +10719,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
         cbm_store_architecture_free(&arch);
         cbm_store_schema_free(&schema);
+        cbm_store_project_graph_stats_free_fields(&root_graph_stats);
         if (aspects_doc) {
             yyjson_doc_free(aspects_doc);
         }
@@ -10716,10 +10749,10 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     if (path_scoped) {
         yyjson_mut_obj_add_str(doc, root, "path", norm_path);
-        int root_nodes = cbm_store_count_nodes(store, project);
-        int root_edges = cbm_store_count_edges(store, project);
-        yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_nodes);
-        yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_edges);
+        if (have_root_graph_stats) {
+            yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_graph_stats.node_count);
+            yyjson_mut_obj_add_int(doc, root, "root_total_edges", root_graph_stats.edge_count);
+        }
         yyjson_mut_obj_add_int(doc, root, "scoped_total_nodes", node_count);
         yyjson_mut_obj_add_int(doc, root, "scoped_total_edges", edge_count);
     }
@@ -11010,6 +11043,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_free(doc);
     cbm_store_architecture_free(&arch);
     cbm_store_schema_free(&schema);
+    cbm_store_project_graph_stats_free_fields(&root_graph_stats);
     if (aspects_doc) {
         yyjson_doc_free(aspects_doc);
     }
@@ -12741,30 +12775,34 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
 
     cbm_store_t *store = resolve_store(srv, project_name);
-    int nodes = 0;
-    int edges = 0;
+    int64_t nodes = 0;
+    int64_t edges = 0;
     bool degraded = false;
 
     if (!store) {
         degraded = true;
     } else {
-        nodes = cbm_store_count_nodes(store, project_name);
-        edges = cbm_store_count_edges(store, project_name);
-        if (nodes < 0) {
+        cbm_project_graph_stats_t graph_stats = {0};
+        int stats_rc = cbm_store_get_project_graph_stats(store, project_name, &graph_stats);
+        if (stats_rc != CBM_STORE_OK) {
             degraded = true;
-            nodes = 0;
-            edges = edges >= 0 ? edges : 0;
-        } else if (cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor)) {
+        } else {
+            nodes = graph_stats.node_count;
+            edges = graph_stats.edge_count;
+            cbm_store_project_graph_stats_free_fields(&graph_stats);
+        }
+        if (!degraded && nodes <= INT_MAX &&
+            cbm_dump_verify_is_degraded(exp_nodes, (int)nodes, ratio, min_floor)) {
             (void)cbm_store_checkpoint(store);
-            int nodes2 = cbm_store_count_nodes(store, project_name);
-            int edges2 = cbm_store_count_edges(store, project_name);
-            if (nodes2 >= 0) {
-                nodes = nodes2;
+            cbm_project_graph_stats_t checked_stats = {0};
+            if (cbm_store_get_project_graph_stats(store, project_name, &checked_stats) ==
+                CBM_STORE_OK) {
+                nodes = checked_stats.node_count;
+                edges = checked_stats.edge_count;
+                cbm_store_project_graph_stats_free_fields(&checked_stats);
             }
-            if (edges2 >= 0) {
-                edges = edges2;
-            }
-            degraded = cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor);
+            degraded = nodes <= INT_MAX &&
+                       cbm_dump_verify_is_degraded(exp_nodes, (int)nodes, ratio, min_floor);
         }
     }
 
@@ -12786,7 +12824,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
             char exp_buf[MCP_FIELD_SIZE];
             char got_buf[MCP_FIELD_SIZE];
             snprintf(exp_buf, sizeof(exp_buf), "%d", exp_nodes);
-            snprintf(got_buf, sizeof(got_buf), "%d", nodes);
+            snprintf(got_buf, sizeof(got_buf), "%" PRId64, nodes);
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
                 "Persisted far fewer nodes than indexed — likely durability loss from a "
@@ -13744,11 +13782,17 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             }
 
             CBM_PROF_START(prof_index_counts);
-            int nodes = cbm_store_count_nodes(store, project_name);
-            int edges = cbm_store_count_edges(store, project_name);
+            cbm_project_graph_stats_t graph_stats = {0};
+            int stats_rc = cbm_store_get_project_graph_stats(store, project_name, &graph_stats);
             CBM_PROF_END("index_repository", "count_graph", prof_index_counts);
-            yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
-            yyjson_mut_obj_add_int(doc, root, "edges", edges);
+            if (stats_rc == CBM_STORE_OK) {
+                yyjson_mut_obj_add_int(doc, root, "nodes", graph_stats.node_count);
+                yyjson_mut_obj_add_int(doc, root, "edges", graph_stats.edge_count);
+                cbm_store_project_graph_stats_free_fields(&graph_stats);
+            } else {
+                yyjson_mut_obj_add_str(doc, root, "counts_status", "error");
+                yyjson_mut_obj_add_strcpy(doc, root, "counts_detail", cbm_store_error(store));
+            }
             if (deps_reindexed > 0)
                 yyjson_mut_obj_add_int(doc, root, "dependencies_indexed", deps_reindexed);
             cbm_mcp_add_dependency_auto_index_stats(doc, root, &dep_stats);
@@ -17317,11 +17361,17 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
             cbm_pipeline_free(dp);
 
             if (rc == 0) {
-                int nodes = cbm_store_count_nodes(store, dep_proj);
-                int edges = cbm_store_count_edges(store, dep_proj);
                 yyjson_mut_obj_add_str(doc, pr, "status", "indexed");
-                yyjson_mut_obj_add_int(doc, pr, "nodes", nodes);
-                yyjson_mut_obj_add_int(doc, pr, "edges", edges);
+                cbm_project_graph_stats_t graph_stats = {0};
+                if (cbm_store_get_project_graph_stats(store, dep_proj, &graph_stats) ==
+                    CBM_STORE_OK) {
+                    yyjson_mut_obj_add_int(doc, pr, "nodes", graph_stats.node_count);
+                    yyjson_mut_obj_add_int(doc, pr, "edges", graph_stats.edge_count);
+                    cbm_store_project_graph_stats_free_fields(&graph_stats);
+                } else {
+                    yyjson_mut_obj_add_str(doc, pr, "counts_status", "error");
+                    yyjson_mut_obj_add_strcpy(doc, pr, "counts_detail", cbm_store_error(store));
+                }
             } else {
                 yyjson_mut_obj_add_str(doc, pr, "status", "index_failed");
             }
@@ -18528,10 +18578,17 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         return;
     }
 
-    int nodes = cbm_store_count_nodes(store, proj);
-    int edges = cbm_store_count_edges(store, proj);
-    yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
-    yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
+    cbm_project_graph_stats_t graph_stats = {0};
+    if (cbm_store_get_project_graph_stats(store, proj, &graph_stats) == CBM_STORE_OK) {
+        yyjson_mut_obj_add_int(doc, root, "total_nodes", graph_stats.node_count);
+        yyjson_mut_obj_add_int(doc, root, "total_edges", graph_stats.edge_count);
+        cbm_store_project_graph_stats_free_fields(&graph_stats);
+    } else {
+        add_response_warning(doc, root,
+                             "codebase://architecture omitted exact canonical totals because "
+                             "project graph statistics could not be read; check store integrity "
+                             "and reindex if the database is damaged.");
+    }
     bool pagerank_stale = add_architecture_derived_status(doc, root, srv, store, proj);
 
     const char *resource_aspects[] = {"languages", "entry_points", "routes"};
@@ -18656,21 +18713,16 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
     /* PageRank stats */
     struct sqlite3 *db = cbm_store_get_db(store);
     if (db && proj && !pagerank_stale) {
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db,
-                               "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
-                               -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                int ranked = sqlite3_column_int(stmt, 0);
-                if (ranked > 0) {
-                    yyjson_mut_obj_add_int(doc, root, "ranked_nodes", ranked);
-                    const char *ts = (const char *)sqlite3_column_text(stmt, 1);
-                    if (ts)
-                        yyjson_mut_obj_add_strcpy(doc, root, "pagerank_computed_at", ts);
+        cbm_project_graph_stats_t graph_stats = {0};
+        if (cbm_store_get_project_graph_stats(store, proj, &graph_stats) == CBM_STORE_OK) {
+            if (graph_stats.ranked_node_count > 0) {
+                yyjson_mut_obj_add_int(doc, root, "ranked_nodes", graph_stats.ranked_node_count);
+                if (graph_stats.pagerank_computed_at) {
+                    yyjson_mut_obj_add_strcpy(doc, root, "pagerank_computed_at",
+                                              graph_stats.pagerank_computed_at);
                 }
             }
-            sqlite3_finalize(stmt);
+            cbm_store_project_graph_stats_free_fields(&graph_stats);
         }
     }
 
@@ -18689,8 +18741,15 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
                 if (dname) {
                     yyjson_mut_val *d = yyjson_mut_obj(doc);
                     yyjson_mut_obj_add_strcpy(doc, d, "name", dname);
-                    int dn = cbm_store_count_nodes(store, dname);
-                    yyjson_mut_obj_add_int(doc, d, "nodes", dn);
+                    cbm_project_graph_stats_t dependency_stats = {0};
+                    if (cbm_store_get_project_graph_stats(store, dname, &dependency_stats) ==
+                        CBM_STORE_OK) {
+                        yyjson_mut_obj_add_int(doc, d, "nodes", dependency_stats.node_count);
+                        cbm_store_project_graph_stats_free_fields(&dependency_stats);
+                    } else {
+                        yyjson_mut_obj_add_str(doc, d, "status", "error");
+                        yyjson_mut_obj_add_strcpy(doc, d, "detail", cbm_store_error(store));
+                    }
                     yyjson_mut_arr_add_val(dep_arr, d);
                     dep_count++;
                 }

@@ -4960,6 +4960,75 @@ TEST(tool_index_status_no_project) {
     PASS();
 }
 
+TEST(status_surfaces_share_exact_graph_stats) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    const char *project = "status-exact-stats";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/status-exact-stats"), CBM_STORE_OK);
+    cbm_node_t first = {.project = project,
+                        .label = "Function",
+                        .name = "first",
+                        .qualified_name = "status.first"};
+    cbm_node_t second = {.project = project,
+                         .label = "Function",
+                         .name = "second",
+                         .qualified_name = "status.second"};
+    int64_t first_id = cbm_store_upsert_node(store, &first);
+    int64_t second_id = cbm_store_upsert_node(store, &second);
+    ASSERT_GT(first_id, 0);
+    ASSERT_GT(second_id, 0);
+    cbm_edge_t edge = {
+        .project = project, .source_id = first_id, .target_id = second_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "INSERT INTO pagerank(project,node_id,rank,computed_at) VALUES"
+                             "('status-exact-stats',1,0.6,'2026-07-31T21:00:00Z'),"
+                             "('status-exact-stats',2,0.4,'2026-07-31T21:00:00Z');"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+
+    /* Unfinalized writes take the automatic exact-scan path. */
+    char *response = cbm_mcp_handle_tool(srv, "index_status",
+                                         "{\"project\":\"status-exact-stats\"}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"nodes\":2"));
+    ASSERT_NOT_NULL(strstr(inner, "\"edges\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"ranked_nodes\":2"));
+    ASSERT_NOT_NULL(strstr(inner, "\"computed_at\":\"2026-07-31T21:00:00Z\""));
+    free(inner);
+    free(response);
+
+    /* Finalized O(log P) reads preserve the existing resource field names. */
+    ASSERT_EQ(cbm_store_refresh_project_graph_stats(store), CBM_STORE_OK);
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":151,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://status\"}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\\\"nodes\\\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\\\"edges\\\":1"));
+    ASSERT_NOT_NULL(strstr(response, "\\\"ranked_nodes\\\":2"));
+    ASSERT_NOT_NULL(strstr(response,
+                           "\\\"pagerank_computed_at\\\":\\\"2026-07-31T21:00:00Z\\\""));
+    free(response);
+
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":152,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://architecture\"}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\\\"total_nodes\\\":2"));
+    ASSERT_NOT_NULL(strstr(response, "\\\"total_edges\\\":1"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce the exact-file false negative in the current Read hook: index_status
  * intentionally caps each coverage category at 500 entries, so a later path is
  * absent even though the authoritative index_coverage table contains it.  The
@@ -17521,6 +17590,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);
     RUN_TEST(tool_index_status_no_project);
+    RUN_TEST(status_surfaces_share_exact_graph_stats);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
     RUN_TEST(first_response_and_status_resource_share_coverage_generation_state);

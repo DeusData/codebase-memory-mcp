@@ -199,10 +199,25 @@ static bool rank_enabled_from_config(cbm_config_t *cfg) {
     return cfg ? cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true) : true;
 }
 
+static void refresh_graph_stats_best_effort(cbm_store_t *store, const char *project) {
+    /* Graph/rank publication remains authoritative if this derived accelerator
+     * cannot be built: invalidation makes every reader fall back to the exact
+     * O(N + E + R) scans. A successful refresh pays that scan once per
+     * publication and makes subsequent status reads O(log P), with O(1)
+     * returned memory, for P projects. */
+    if (cbm_store_refresh_project_graph_stats(store) != CBM_STORE_OK) {
+        cbm_log_warn("pagerank.graph_stats_refresh_failed", "project", project ? project : "",
+                     "fallback", "exact_scan", "detail", cbm_store_error(store));
+    }
+}
+
 static int clear_rank_rows_for_project(cbm_store_t *store, const char *project) {
     if (!store || !project || !project[0]) return -1;
     sqlite3 *db = cbm_store_get_db(store);
-    if (!db || cbm_store_exec(store, "SAVEPOINT cbm_disable_rank") != CBM_STORE_OK) return -1;
+    if (!db || cbm_store_invalidate_project_graph_stats(store) != CBM_STORE_OK ||
+        cbm_store_exec(store, "SAVEPOINT cbm_disable_rank") != CBM_STORE_OK) {
+        return -1;
+    }
 
     static const char *tables[] = {"pagerank", "linkrank", "node_degree"};
     sqlite3_stmt *stmt = NULL;
@@ -232,6 +247,7 @@ static int clear_rank_rows_for_project(cbm_store_t *store, const char *project) 
     sqlite3_finalize(stmt);
     stmt = NULL;
     if (cbm_store_exec(store, "RELEASE cbm_disable_rank") != CBM_STORE_OK) goto rollback;
+    refresh_graph_stats_best_effort(store, project);
     return 0;
 
 rollback:
@@ -390,7 +406,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         free(node_ids);
         free(node_labels); /* no strdup'd elements since N==0 */
         free(node_projects);
-        return 0;
+        return clear_rank_rows_for_project(store, project);
     }
 
     /* Build id->index map */
@@ -566,8 +582,10 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
      * outer store transaction while making PageRank, LinkRank, node degree,
      * and completeness metadata one generation. Publication performs O(N + E)
      * writes and retains O(1) additional memory. */
-    if (cbm_store_exec(store, "SAVEPOINT cbm_rank_publish") != CBM_STORE_OK)
+    if (cbm_store_invalidate_project_graph_stats(store) != CBM_STORE_OK ||
+        cbm_store_exec(store, "SAVEPOINT cbm_rank_publish") != CBM_STORE_OK) {
         goto cleanup;
+    }
     static const char *rank_tables[] = {"pagerank", "linkrank", "node_degree"};
     for (size_t ti = 0; ti < sizeof(rank_tables) / sizeof(rank_tables[0]); ti++) {
         int written = snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM %s WHERE %s", rank_tables[ti],
@@ -654,6 +672,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     }
     if (cbm_store_exec(store, "RELEASE cbm_rank_publish") != CBM_STORE_OK)
         goto publish_rollback;
+    refresh_graph_stats_best_effort(store, project);
 
     /* ── Logging ──────────────────────────────────────────── */
     char iter_s[CBM_LOG_INT_BUF], n_s[CBM_LOG_INT_BUF], e_s[CBM_LOG_INT_BUF];
@@ -790,6 +809,7 @@ int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
     }
     if (!graph_changed && deps_reindexed <= 0 && cbm_pagerank_views_complete(store, project)) {
         cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");
+        refresh_graph_stats_best_effort(store, project);
         return 0;
     }
     cbm_rank_refresh_policy_t policy = rank_refresh_policy_from_config(cfg);
@@ -797,6 +817,7 @@ int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
         rank_refresh_policy_allows_defer(policy, publish_kind) &&
         pagerank_views_stale(store, project)) {
         cbm_log_info("pagerank.defer", "project", project, "reason", "incremental_stale_views");
+        refresh_graph_stats_best_effort(store, project);
         return 0;
     }
     return cbm_pagerank_compute_with_config(store, project, cfg);

@@ -93,6 +93,15 @@ typedef struct {
     const char *root_path;
 } cbm_project_t;
 
+/* Exact, generation-bound graph aggregates. The timestamp is heap-owned and
+ * must be released with cbm_store_project_graph_stats_free_fields(). */
+typedef struct {
+    int64_t node_count;
+    int64_t edge_count;
+    int64_t ranked_node_count;
+    const char *pagerank_computed_at;
+} cbm_project_graph_stats_t;
+
 typedef struct {
     const char *project;
     const char *rel_path;
@@ -548,6 +557,20 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);
+
+/* Refresh all exact project aggregates in O(P + N + E + R) time and O(P)
+ * SQLite working/output memory, where P/N/E/R are projects/nodes/edges/ranks.
+ * Reads use the O(log P) materialization when current and automatically run an
+ * exact O(N + E + R), O(1)-result-memory fallback for legacy/unfinalized data. */
+int cbm_store_refresh_project_graph_stats(cbm_store_t *s);
+int cbm_store_get_project_graph_stats(cbm_store_t *s, const char *project,
+                                      cbm_project_graph_stats_t *out);
+void cbm_store_project_graph_stats_free_fields(cbm_project_graph_stats_t *stats);
+
+/* Invalidate materialized graph aggregates once per write session. Rank code
+ * uses raw SQLite for bulk publication and must call this before changing rank
+ * tables; normal graph CRUD calls it automatically. */
+int cbm_store_invalidate_project_graph_stats(cbm_store_t *s);
 
 /* ── Node CRUD ──────────────────────────────────────────────────── */
 
