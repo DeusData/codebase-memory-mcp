@@ -645,25 +645,47 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
+    /* Preserve ADR content stored in project_summaries before replacing the DB. */
+    char *saved_adr = NULL;
+    cbm_store_t *adr_store = cbm_store_open_path(db_path);
+    if (adr_store) {
+        cbm_adr_t existing = {0};
+        if (cbm_store_adr_get(adr_store, project, &existing) == CBM_STORE_OK) {
+            if (existing.content) {
+                saved_adr = strdup(existing.content);
+            }
+            cbm_store_adr_free(&existing);
+        }
+        cbm_store_close(adr_store);
+    }
+
+    int rc = CBM_STORE_ERR;
+
     if ((cbm_unlink(db_path) != 0 && errno != ENOENT) || cbm_remove_db_sidecars(db_path) != 0) {
         cbm_log_error("incremental.err", "msg", "clear_staging_failed", "path", db_path);
-        return CBM_STORE_ERR;
+        goto cleanup;
     }
 
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
     if (dump_rc != 0) {
-        return dump_rc;
+        rc = dump_rc;
+        goto cleanup;
     }
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (!hash_store) {
         cbm_log_error("incremental.err", "msg", "open_staging_after_dump", "path", db_path);
-        return CBM_STORE_ERR;
+        goto cleanup;
     }
-    int rc =
-        persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+    /* #992: restore the captured ADR before persisting hashes, mirroring the
+     * full-reindex path (#516) -- the DB replacement above dropped it. */
+    if (saved_adr && cbm_store_adr_store(hash_store, project, saved_adr) != CBM_STORE_OK) {
+        cbm_log_error("incremental.err", "msg", "adr_restore", "project", project);
+    }
+
+    rc = persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
 
     /* Coverage rows (#963): re-write the merged set into the rebuilt DB
      * (AFTER hashes, so the deleted-file prune sees the live file set). */
@@ -701,6 +723,9 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         }
     }
     cbm_store_close(hash_store);
+
+cleanup:
+    free(saved_adr);
     return rc;
 }
 
