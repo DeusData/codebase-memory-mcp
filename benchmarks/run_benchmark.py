@@ -3247,6 +3247,65 @@ def summarize_daemon_mem_census_since(
     }
 
 
+def summarize_daemon_profiles_since(
+    path: Path | None,
+    offset: int,
+    selected_profiles: tuple[tuple[str, str], ...],
+) -> dict[str, dict[str, int | float]] | None:
+    """Summarize selected profile spans in O(B + R) time and O(L + P) memory.
+
+    B is the number of new log bytes, R the matching records, L the longest log
+    line, and P the caller-bounded profile key count. Aggregating count/sum/range
+    avoids retaining every request duration while preserving exact arithmetic
+    means and extrema for server-versus-transport attribution.
+    """
+    if not path or not path.is_file() or not selected_profiles:
+        return None
+    selected = set(selected_profiles)
+    summaries: dict[tuple[str, str], dict[str, int]] = {}
+    try:
+        current_size = path.stat().st_size
+        with path.open("rb") as stream:
+            stream.seek(offset if current_size >= offset else 0)
+            for raw_line in stream:
+                line = raw_line.decode("utf-8", errors="replace")
+                if "msg=prof" not in line:
+                    continue
+                phase = parse_log_text_field(line, "msg=prof", "phase")
+                subphase = parse_log_text_field(line, "msg=prof", "sub")
+                profile = (phase, subphase)
+                if profile not in selected:
+                    continue
+                elapsed_us = parse_log_int_field(line, "msg=prof", "us")
+                if elapsed_us is None or elapsed_us < 0:
+                    continue
+                summary = summaries.setdefault(profile, {})
+                if not summary:
+                    summary.update(
+                        count=1,
+                        total_us=elapsed_us,
+                        min_us=elapsed_us,
+                        max_us=elapsed_us,
+                    )
+                else:
+                    summary["count"] += 1
+                    summary["total_us"] += elapsed_us
+                    summary["min_us"] = min(summary["min_us"], elapsed_us)
+                    summary["max_us"] = max(summary["max_us"], elapsed_us)
+    except OSError:
+        return None
+    if not summaries:
+        return None
+    return {
+        f"{phase}/{subphase}": {
+            **profile_summary,
+            "mean_us": profile_summary["total_us"] / profile_summary["count"],
+        }
+        for phase, subphase in selected_profiles
+        if (profile_summary := summaries.get((phase, subphase))) is not None
+    }
+
+
 def parse_exact_reason(stderr: str) -> str | None:
     detail = parse_exact_route_detail(stderr)
     reason = detail.get("reason")
@@ -4038,6 +4097,16 @@ def measure_indexed_query_probes_for_transport(
         census = summarize_daemon_mem_census_since(daemon_log, daemon_log_offset)
         if result is not None and census is not None:
             result["daemon_mem_census"] = census
+        profiles = summarize_daemon_profiles_since(
+            daemon_log,
+            daemon_log_offset,
+            (
+                ("mcp_tool_execute", tool_name),
+                ("mcp_request_total", "tools/call"),
+            ),
+        )
+        if result is not None and profiles is not None:
+            result["daemon_profile"] = profiles
         return result
     return measure_cli_overhead_probes(
         binary, env, tool_name, count, timeout, include_logs, arguments

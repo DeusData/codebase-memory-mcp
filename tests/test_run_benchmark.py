@@ -133,6 +133,69 @@ class RunBenchmarkTest(unittest.TestCase):
             },
         )
 
+    def test_indexed_query_probes_summarize_matching_daemon_profile_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            daemon_log = cache / BENCHMARK.DAEMON_LOG_RELATIVE_PATH
+            daemon_log.parent.mkdir(parents=True)
+            daemon_log.write_text(
+                "level=info msg=prof phase=mcp_request_total sub=tools/call us=999\n"
+            )
+            client = mock.Mock()
+
+            def call_tool(_tool: str, _arguments: dict[str, object]):
+                with daemon_log.open("a", encoding="utf-8") as stream:
+                    stream.write(
+                        "level=info msg=prof phase=mcp_tool_execute "
+                        "sub=index_status ms=0 us=120\n"
+                        "level=info msg=prof phase=mcp_request_total "
+                        "sub=tools/call ms=0 us=180\n"
+                        "level=info msg=prof phase=mcp_tool_execute "
+                        "sub=search_graph ms=8 us=8000\n"
+                        "level=info msg=prof phase=mcp_tool_execute "
+                        "sub=index_status ms=0 us=140\n"
+                        "level=info msg=prof phase=mcp_request_total "
+                        "sub=tools/call ms=0 us=220\n"
+                        "level=info msg=prof phase=mcp_request_total "
+                        "sub=tools/call us=not-a-number\n"
+                    )
+                return {"status": "ready"}, "", 17, 1.25
+
+            client.call_tool.side_effect = call_tool
+            result = BENCHMARK.measure_indexed_query_probes_for_transport(
+                "mcp",
+                Path("/candidate/cbm"),
+                {"CBM_CACHE_DIR": str(cache)},
+                "index_status",
+                1,
+                "stable-project",
+                30,
+                False,
+                client,
+            )
+
+        self.assertEqual(
+            result["daemon_profile"],
+            {
+                "mcp_tool_execute/index_status": {
+                    "count": 2,
+                    "total_us": 260,
+                    "min_us": 120,
+                    "max_us": 140,
+                    "mean_us": 130.0,
+                },
+                "mcp_request_total/tools/call": {
+                    "count": 2,
+                    "total_us": 400,
+                    "min_us": 180,
+                    "max_us": 220,
+                    "mean_us": 200.0,
+                },
+            },
+        )
+
     def test_find_project_db_ignores_dependency_databases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir)
