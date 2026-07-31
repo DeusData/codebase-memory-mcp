@@ -679,10 +679,12 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_log_error("incremental.err", "msg", "open_staging_after_dump", "path", db_path);
         goto cleanup;
     }
+    bool adr_restore_failed = false;
     /* #992: restore the captured ADR before persisting hashes, mirroring the
      * full-reindex path (#516) -- the DB replacement above dropped it. */
     if (saved_adr && cbm_store_adr_store(hash_store, project, saved_adr) != CBM_STORE_OK) {
         cbm_log_error("incremental.err", "msg", "adr_restore", "project", project);
+        adr_restore_failed = true;
     }
 
     rc = persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
@@ -723,6 +725,9 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         }
     }
     cbm_store_close(hash_store);
+    if (adr_restore_failed) {
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
 
 cleanup:
     free(saved_adr);
