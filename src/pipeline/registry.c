@@ -455,6 +455,37 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
 }
 
+/* High-fan-in Python basenames that frequently collide across modules (G2).
+ * Bare calls like a Callable parameter `run()` must not suffix_match onto an
+ * unrelated Method/Function with the same name. Member calls (is_method) are
+ * handled regardless of name — mirror TS/JS #592/#606. */
+static bool cbm_python_is_generic_callee_name(const char *callee_name) {
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    return strcmp(callee_name, "get") == 0 || strcmp(callee_name, "run") == 0 ||
+           strcmp(callee_name, "execute") == 0;
+}
+
+static bool cbm_python_is_weak_short_name_strategy(const char *strategy) {
+    if (!strategy || !strategy[0]) {
+        return false;
+    }
+    return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
+           strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
+bool cbm_python_suppress_weak_generic_call(bool is_python, bool is_method, const char *callee_name,
+                                           const char *strategy) {
+    if (!is_python || !cbm_python_is_weak_short_name_strategy(strategy)) {
+        return false;
+    }
+    if (is_method) {
+        return true; /* prior_cp.get → unrelated SessionRegistry.get, etc. */
+    }
+    return cbm_python_is_generic_callee_name(callee_name); /* bare run()/get()/execute() */
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {

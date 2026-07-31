@@ -964,6 +964,58 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     PASS();
 }
 
+/* Python weak same-name suppression (G2 / WP-B C2). Dict `.get` and a Callable
+ * parameter `run()` must not suffix_match onto unrelated project Methods.
+ * Same-module bare helpers remain. < 50 files → sequential path. */
+static void write_temp_file(const char *dir, const char *name, const char *content);
+TEST(pipeline_python_suppresses_weak_generic_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_g2_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "browser.py",
+                    "class SessionRegistry:\n"
+                    "    def get(self, name):\n"
+                    "        return name\n");
+    write_temp_file(tmp, "live.py",
+                    "class SatoriLive:\n"
+                    "    def run(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "router.py",
+                    "def submit_task(prior_cp):\n"
+                    "    return prior_cp.get(\"runtime_decision_id\")\n");
+    write_temp_file(tmp, "gate.py",
+                    "def _run_with_heavy_slot(run):\n"
+                    "    return run()\n"
+                    "\n"
+                    "def local_helper():\n"
+                    "    return 2\n"
+                    "\n"
+                    "def calls_local():\n"
+                    "    return local_helper()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_g2.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_FALSE(cross_file_call_exists(s, project, "submit_task", "get"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "run"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "calls_local", "local_helper"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* TS/JS receiver-aware weak-strategy suppression (#592/#606 direction; Perl
  * precedent #477). A member call x.foo() whose receiver TYPE the TS-LSP cannot
  * resolve (a regex literal `re.test()`) must NOT be bound to a same-named
@@ -7788,6 +7840,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_python_suppresses_weak_generic_edges);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

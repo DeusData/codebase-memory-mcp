@@ -803,6 +803,35 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
     PASS();
 }
 
+
+TEST(python_suppress_drops_weak_member_and_generic_bare) {
+    /* G2: Python prior_cp.get / bare run() must not keep weak short-name edges. */
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, true, "get", "suffix_match"));
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, true, "anything", "unique_name"));
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, true, "foo", "field_type_hint"));
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, true, "bar", "fuzzy"));
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, false, "get", "suffix_match"));
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, false, "run", "unique_name"));
+    ASSERT_TRUE(cbm_python_suppress_weak_generic_call(true, false, "execute", "suffix_match"));
+    PASS();
+}
+
+TEST(python_suppress_keeps_strong_strategies_and_non_generic_bare) {
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, true, "get", "same_module"));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, true, "get", "import_map"));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, true, "get", "import_map_suffix"));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, true, "get", "lsp_generic_method"));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, true, "get", "lsp_direct"));
+    /* Bare non-generic helper must not be suppressed (unique_name often correct). */
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, false, "local_helper", "unique_name"));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, false, "helper", "suffix_match"));
+    /* Non-Python unaffected. */
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(false, true, "get", "suffix_match"));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, false, "run", NULL));
+    ASSERT_FALSE(cbm_python_suppress_weak_generic_call(true, true, "get", ""));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* Method call THROUGH an imported symbol that is itself an indexed node
@@ -895,4 +924,6 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(python_suppress_drops_weak_member_and_generic_bare);
+    RUN_TEST(python_suppress_keeps_strong_strategies_and_non_generic_bare);
 }
