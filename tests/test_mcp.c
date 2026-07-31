@@ -13918,6 +13918,29 @@ TEST(file_backed_store_is_released_at_request_end_not_pinned) {
     PASS();
 }
 
+TEST(resolve_store_validates_and_serves_with_one_query_open) {
+    const char *cache = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache);
+    const char *project = "single-open-project";
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(db_path, sizeof(db_path), cache, project), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_create_generation_db(db_path, project, "Function", "OneOpen"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"single-open-project\",\"name_pattern\":\"OneOpen\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "OneOpen"));
+    free(response);
+
+    ASSERT_EQ(cbm_mcp_server_query_store_open_count_for_testing(srv), 1);
+    cbm_mcp_server_free(srv);
+    mcp_unlink_db_sidecars(db_path);
+    PASS();
+}
+
 TEST(index_second_inprocess_run_survives_issue773) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
@@ -17487,6 +17510,7 @@ SUITE(mcp) {
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(file_backed_store_is_released_at_request_end_not_pinned);
+    RUN_TEST(resolve_store_validates_and_serves_with_one_query_open);
     RUN_TEST(index_repository_rejects_unknown_mode_instead_of_silent_full);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);

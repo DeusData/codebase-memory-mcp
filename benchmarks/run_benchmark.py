@@ -95,6 +95,8 @@ RANK_REFRESH_CANDIDATE_DEFAULT = "candidate_default"
 DEFAULT_RANK_REFRESH = RANK_REFRESH_CANDIDATE_DEFAULT
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
+DEFAULT_INDEXED_QUERY_PROBES = 0
+DEFAULT_INDEXED_QUERY_TOOL = "index_status"
 DEFAULT_FRONTIER_FILES = 16
 DEFAULT_LIST_PROJECT_COUNTS = "1,16,64"
 DEFAULT_LIST_PROJECT_FIXTURE_MAX_MB = 512
@@ -3665,8 +3667,10 @@ def run_cli_tool_probe(
     tool_name: str,
     timeout: int,
     include_logs: bool,
+    arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    cmd = [str(binary), "cli", "--json", tool_name, "{}"]
+    encoded = json.dumps(arguments or {}, separators=(",", ":"))
+    cmd = [str(binary), "cli", "--json", tool_name, encoded]
     proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
         raise command_failure(f"{tool_name}_probe", cmd, env, proc, elapsed_ms)
@@ -3680,8 +3684,11 @@ def run_mcp_tool_probe(
     client: McpClient,
     tool_name: str,
     include_logs: bool,
+    arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    data, stderr, stdout_bytes, elapsed_ms = client.call_tool(tool_name, {})
+    data, stderr, stdout_bytes, elapsed_ms = client.call_tool(
+        tool_name, arguments or {}
+    )
     return build_tool_probe_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
 
 
@@ -3850,11 +3857,12 @@ def measure_cli_overhead_probes(
     count: int,
     timeout: int,
     include_logs: bool,
+    arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if count <= 0:
         return None
     probes = [
-        run_cli_tool_probe(binary, env, tool_name, timeout, include_logs)
+        run_cli_tool_probe(binary, env, tool_name, timeout, include_logs, arguments)
         for _ in range(count)
     ]
     return {
@@ -3869,10 +3877,14 @@ def measure_mcp_overhead_probes(
     tool_name: str,
     count: int,
     include_logs: bool,
+    arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if count <= 0:
         return None
-    probes = [run_mcp_tool_probe(client, tool_name, include_logs) for _ in range(count)]
+    probes = [
+        run_mcp_tool_probe(client, tool_name, include_logs, arguments)
+        for _ in range(count)
+    ]
     return {
         "tool": tool_name,
         "trials": probes,
@@ -7140,6 +7152,20 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OVERHEAD_TOOL,
         help="Existing MCP tool used by --overhead-probes.",
     )
+    parser.add_argument(
+        "--indexed-query-probes",
+        type=int,
+        default=DEFAULT_INDEXED_QUERY_PROBES,
+        help=(
+            "Run N project-scoped tool calls after initial indexing to measure the "
+            "file-backed query path; 0 preserves the historical gate behavior."
+        ),
+    )
+    parser.add_argument(
+        "--indexed-query-tool",
+        default=DEFAULT_INDEXED_QUERY_TOOL,
+        help="Existing project-aware MCP tool used by --indexed-query-probes.",
+    )
     args = parser.parse_args()
     if args.build_metadata_json:
         try:
@@ -7284,6 +7310,8 @@ def main() -> int:
             "transport": args.transport,
             "overhead_probes": args.overhead_probes,
             "overhead_tool": args.overhead_tool,
+            "indexed_query_probes": args.indexed_query_probes,
+            "indexed_query_tool": args.indexed_query_tool,
         },
         "cleanup": {
             "requested": auto_root and not args.keep_work_root,
@@ -7307,6 +7335,13 @@ def main() -> int:
                 initial = run_index_mcp(
                     client, repo_dir, args.include_logs, args.index_mode
                 )
+                indexed_query_probe = measure_mcp_overhead_probes(
+                    client,
+                    args.indexed_query_tool,
+                    args.indexed_query_probes,
+                    args.include_logs,
+                    {"project": str(repo_dir)},
+                )
                 changed_paths = modify_existing_files(
                     repo_dir, args.changed_files, args.functions_per_file
                 )
@@ -7329,6 +7364,15 @@ def main() -> int:
             )
             initial = run_index(
                 binary, env, repo_dir, args.timeout, args.include_logs, args.index_mode
+            )
+            indexed_query_probe = measure_cli_overhead_probes(
+                binary,
+                env,
+                args.indexed_query_tool,
+                args.indexed_query_probes,
+                args.timeout,
+                args.include_logs,
+                {"project": str(repo_dir)},
             )
             changed_paths = modify_existing_files(
                 repo_dir, args.changed_files, args.functions_per_file
@@ -7357,6 +7401,7 @@ def main() -> int:
                 "removed_project_dbs": removed_dbs,
                 "measurements": {
                     "overhead_probe": overhead_probe,
+                    "indexed_query_probe": indexed_query_probe,
                     "initial_fast_full": initial,
                     "incremental_exact": incremental,
                     "incremental": incremental,
