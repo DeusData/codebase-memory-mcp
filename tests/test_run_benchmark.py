@@ -21,6 +21,28 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class RunBenchmarkTest(unittest.TestCase):
+    def test_mcp_overhead_probes_forward_indexed_project_arguments(self) -> None:
+        client = mock.Mock()
+        client.call_tool.return_value = ({"status": "indexed"}, "", 17, 1.25)
+        arguments = {"project": "/isolated/repo"}
+
+        result = BENCHMARK.measure_mcp_overhead_probes(
+            client,
+            "index_status",
+            2,
+            False,
+            arguments,
+        )
+
+        self.assertEqual(result["summary"]["count"], 2)
+        self.assertEqual(
+            client.call_tool.call_args_list,
+            [
+                mock.call("index_status", arguments),
+                mock.call("index_status", arguments),
+            ],
+        )
+
     def test_find_project_db_ignores_dependency_databases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir)

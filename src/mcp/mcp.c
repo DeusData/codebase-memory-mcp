@@ -2532,7 +2532,10 @@ static void free_counted_string_array(char **arr, int count) {
 /* Forward declarations for functions defined after first use */
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit,
                                      bool path_scoped);
-static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms);
+static bool validate_cbm_db_with_timeout(cbm_mcp_server_t *srv, const char *path,
+                                         int busy_timeout_ms);
+static cbm_store_t *open_validated_cbm_query_store(cbm_mcp_server_t *srv, const char *path,
+                                                   int busy_timeout_ms);
 static void *overlay_compaction_thread(void *arg);
 
 typedef enum {
@@ -2548,6 +2551,9 @@ struct cbm_mcp_server {
     bool owns_store;        /* true if we opened the store */
     char *current_project;  /* which project store is open for (heap) */
     time_t store_last_used; /* last time resolve_store was called for a named project */
+#ifdef CBM_ENABLE_TEST_SEAMS
+    uint64_t query_store_open_count_for_testing;
+#endif
 
     /* Session + auto-index state */
     char session_root[CBM_SZ_1K];     /* detected project root path */
@@ -3843,6 +3849,23 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
     return (srv && srv->store != NULL) != 0;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+uint64_t cbm_mcp_server_query_store_open_count_for_testing(const cbm_mcp_server_t *srv) {
+    return srv ? srv->query_store_open_count_for_testing : 0;
+}
+#endif
+
+static cbm_store_t *mcp_open_query_store(cbm_mcp_server_t *srv, const char *path) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (srv) {
+        srv->query_store_open_count_for_testing++;
+    }
+#else
+    (void)srv;
+#endif
+    return cbm_store_open_path_query(path);
+}
+
 bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv) {
     const char *db_path = srv && srv->store ? cbm_store_db_path(srv->store) : NULL;
     if (!srv || !srv->owns_store || !srv->store || srv->current_project ||
@@ -4264,7 +4287,7 @@ static bool quarantine_corrupt_store(cbm_mcp_server_t *srv, const char *project,
      * quarantine machinery below (atomic snapshot publication, unique backup
      * names, step gating) is otherwise the stronger implementation, so the guard
      * is applied to it rather than keeping a second quarantine function. */
-    if (!validate_cbm_db_with_timeout(path, cbm_mcp_db_validate_busy_timeout_ms(srv))) {
+    if (!validate_cbm_db_with_timeout(srv, path, cbm_mcp_db_validate_busy_timeout_ms(srv))) {
         cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
                       "not a codebase-memory cache schema; left untouched");
         return false;
@@ -4434,9 +4457,7 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
         return NULL;
     }
     int validate_busy_timeout_ms = cbm_mcp_db_validate_busy_timeout_ms(srv);
-    srv->store = validate_cbm_db_with_timeout(path, validate_busy_timeout_ms)
-                     ? cbm_store_open_path_query(path)
-                     : NULL;
+    srv->store = open_validated_cbm_query_store(srv, path, validate_busy_timeout_ms);
     if (srv->store) {
         /* Check DB integrity before serving a cache database. A bad project
          * root_path (with an otherwise-fine projects table) is cosmetic: the
@@ -5837,29 +5858,31 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
 }
 /* ── Tool handler implementations ─────────────────────────────── */
 
-/* Validate that a file is a codebase-memory-mcp SQLite database.
- * Returns true if file has SQLite magic bytes AND contains the expected
- * 'nodes' table (core schema indicator).
- * On ANY error: returns false, logs actionable warning to stderr,
- * does NOT crash, does NOT hang, does NOT modify the file.
- * Opens read-only with busy_timeout to avoid hanging on locked files. */
-static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) {
+/* Open a read-only codebase-memory-mcp SQLite database and validate its magic
+ * bytes plus the required `nodes` table before returning the same handle to the
+ * caller. On any error, close partial ownership, log an actionable warning, and
+ * leave the file unchanged. Reusing this handle keeps each resolve at one
+ * SQLite open/schema load instead of validating with one connection and serving
+ * with a second. Both forms are O(schema pages) time and O(page-cache) memory,
+ * but one open avoids duplicate constant work and transient allocator churn. */
+static cbm_store_t *open_validated_cbm_query_store(cbm_mcp_server_t *srv, const char *path,
+                                                   int busy_timeout_ms) {
     if (!path)
-        return false;
+        return NULL;
 
     int64_t file_size = cbm_file_size(path);
     if (file_size < 0)
-        return false;
+        return NULL;
     if (file_size == 0) {
         cbm_log_warn("db.skip", "path", path, "reason", "empty_file");
-        return false;
+        return NULL;
     }
 
     /* Check SQLite magic bytes (first 16 bytes = "SQLite format 3\0") */
     FILE *f = fopen(path, "rb");
     if (!f) {
         cbm_log_warn("db.skip", "path", path, "reason", "cannot_open");
-        return false;
+        return NULL;
     }
     char magic[16];
     size_t n = fread(magic, 1, 16, f);
@@ -5868,17 +5891,17 @@ static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) 
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
         cbm_log_warn("db.skip", "file", base, "reason", "not_sqlite");
-        return false;
+        return NULL;
     }
 
-    /* Reuse the canonical query-only open so validation gets the same WAL and
-     * immutable read-only-filesystem fallback as the subsequent query. */
-    cbm_store_t *store = cbm_store_open_path_query(path);
+    /* Use the canonical query-only open so validation and the caller get the
+     * same WAL and immutable read-only-filesystem behavior. */
+    cbm_store_t *store = mcp_open_query_store(srv, path);
     if (!store) {
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
         cbm_log_warn("db.skip", "file", base, "reason", "sqlite_open_failed");
-        return false;
+        return NULL;
     }
     sqlite3 *db = cbm_store_get_db(store);
     sqlite3_busy_timeout(db, busy_timeout_ms);
@@ -5887,10 +5910,8 @@ static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) 
     int rc = sqlite3_prepare_v2(
         db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes' LIMIT 1;", -1, &stmt,
         NULL);
-    bool valid = false;
-    if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
-        valid = true;
-    } else {
+    bool valid = rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW;
+    if (!valid) {
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
         cbm_log_warn("db.skip", "file", base, "reason", "not_cbm_database", "hint",
@@ -5899,8 +5920,21 @@ static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms) 
     }
     if (stmt)
         sqlite3_finalize(stmt);
+    if (!valid) {
+        cbm_store_close(store);
+        return NULL;
+    }
+    return store;
+}
+
+static bool validate_cbm_db_with_timeout(cbm_mcp_server_t *srv, const char *path,
+                                         int busy_timeout_ms) {
+    cbm_store_t *store = open_validated_cbm_query_store(srv, path, busy_timeout_ms);
+    if (!store) {
+        return false;
+    }
     cbm_store_close(store);
-    return valid;
+    return true;
 }
 
 /* Return true if filename is a valid project .db file (not temp/internal).
@@ -6170,7 +6204,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         }
 
         /* Validate db structure before opening — skip corrupt/non-cbm files */
-        if (!validate_cbm_db_with_timeout(full_path, validate_busy_timeout_ms)) {
+        if (!validate_cbm_db_with_timeout(srv, full_path, validate_busy_timeout_ms)) {
             continue;
         }
 
