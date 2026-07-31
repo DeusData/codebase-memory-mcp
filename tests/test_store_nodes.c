@@ -5887,6 +5887,90 @@ TEST(store_integrity_null_check) {
     PASS();
 }
 
+TEST(store_project_graph_stats_are_exact_and_generation_invalidated) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "stats", "/tmp/stats"), CBM_STORE_OK);
+
+    cbm_node_t first = {.project = "stats",
+                        .label = "Function",
+                        .name = "first",
+                        .qualified_name = "stats.first"};
+    cbm_node_t second = {.project = "stats",
+                         .label = "Function",
+                         .name = "second",
+                         .qualified_name = "stats.second"};
+    int64_t first_id = cbm_store_upsert_node(s, &first);
+    int64_t second_id = cbm_store_upsert_node(s, &second);
+    ASSERT_GT(first_id, 0);
+    ASSERT_GT(second_id, 0);
+    cbm_edge_t edge = {
+        .project = "stats", .source_id = first_id, .target_id = second_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    ASSERT_EQ(cbm_store_exec(s,
+                             "INSERT INTO pagerank(project,node_id,rank,computed_at) VALUES"
+                             "('stats',1,0.6,'2026-07-31T20:00:00Z'),"
+                             "('stats',2,0.4,'2026-07-31T20:00:00Z');"),
+              CBM_STORE_OK);
+
+    cbm_project_graph_stats_t stats = {0};
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 2);
+    ASSERT_EQ(stats.edge_count, 1);
+    ASSERT_EQ(stats.ranked_node_count, 2);
+    ASSERT_STR_EQ(stats.pagerank_computed_at, "2026-07-31T20:00:00Z");
+    cbm_store_project_graph_stats_free_fields(&stats);
+    ASSERT_EQ(cbm_store_refresh_project_graph_stats(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 2);
+    ASSERT_EQ(stats.edge_count, 1);
+    ASSERT_EQ(stats.ranked_node_count, 2);
+    ASSERT_STR_EQ(stats.pagerank_computed_at, "2026-07-31T20:00:00Z");
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    cbm_node_t third = {.project = "stats",
+                        .label = "Function",
+                        .name = "third",
+                        .qualified_name = "stats.third"};
+    ASSERT_GT(cbm_store_upsert_node(s, &third), 0);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 3);
+    cbm_store_project_graph_stats_free_fields(&stats);
+    ASSERT_EQ(cbm_store_refresh_project_graph_stats(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 3);
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    cbm_node_t rolled_back = {.project = "stats",
+                              .label = "Function",
+                              .name = "rolled_back",
+                              .qualified_name = "stats.rolled_back"};
+    ASSERT_GT(cbm_store_upsert_node(s, &rolled_back), 0);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 4);
+    cbm_store_project_graph_stats_free_fields(&stats);
+    ASSERT_EQ(cbm_store_rollback(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 3);
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    /* A read-only pre-migration database lacks only the new materialization;
+     * exact fallback remains automatic. Unrelated schema failures stay errors
+     * instead of being misreported as valid zero counts. */
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE project_graph_stats;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 3);
+    ASSERT_EQ(stats.edge_count, 1);
+    ASSERT_EQ(stats.ranked_node_count, 2);
+    cbm_store_project_graph_stats_free_fields(&stats);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE nodes;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "stats", &stats), CBM_STORE_ERR);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_integrity_full_path_only_classification) {
     /* The _full variant must classify a bad root_path (with an otherwise-fine
      * projects table) as a path-only defect so callers can retain the DB
@@ -6806,6 +6890,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
     RUN_TEST(store_integrity_multiple_project_rows_allowed);
     RUN_TEST(store_integrity_null_check);
+    RUN_TEST(store_project_graph_stats_are_exact_and_generation_invalidated);
     RUN_TEST(store_integrity_full_path_only_classification);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_reads_reset_cached_statements);

@@ -371,6 +371,71 @@ TEST(pagerank_disabled_config_clears_rank_views) {
     PASS();
 }
 
+TEST(pagerank_refresh_finalizes_exact_graph_stats) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "rank_stats", "/tmp/rank_stats"), CBM_STORE_OK);
+    int64_t a = add_node(s, "rank_stats", "a");
+    int64_t b = add_node(s, "rank_stats", "b");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(add_edge(s, "rank_stats", a, b, "CALLS"), 0);
+
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "rank_stats"), 2);
+    cbm_project_graph_stats_t stats = {0};
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "rank_stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 2);
+    ASSERT_EQ(stats.edge_count, 1);
+    ASSERT_EQ(stats.ranked_node_count, 2);
+    ASSERT_NOT_NULL(stats.pagerank_computed_at);
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    int64_t c = add_node(s, "rank_stats", "c");
+    ASSERT_GT(c, 0);
+    ASSERT_GT(add_edge(s, "rank_stats", b, c, "CALLS"), 0);
+    ASSERT_EQ(cbm_store_mark_rank_derived_views_stale(
+                  s, "rank_stats", CBM_STORE_DERIVED_GENERATION_UNKNOWN),
+              CBM_STORE_OK);
+
+    char tmpdir[CBM_PATH_MAX];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-summary-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "rank_stats", cfg, true, 0, true), 0);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "rank_stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 3);
+    ASSERT_EQ(stats.edge_count, 2);
+    ASSERT_EQ(stats.ranked_node_count, 2);
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "rank_stats", cfg, true, 0, false), 0);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "rank_stats", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 3);
+    ASSERT_EQ(stats.edge_count, 2);
+    ASSERT_EQ(stats.ranked_node_count, 0);
+    ASSERT_NULL(stats.pagerank_computed_at);
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(cbm_store_upsert_project(s, "rank_empty", "/tmp/rank_empty"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "rank_empty"), 0);
+    ASSERT_EQ(cbm_store_get_project_graph_stats(s, "rank_empty", &stats), CBM_STORE_OK);
+    ASSERT_EQ(stats.node_count, 0);
+    ASSERT_EQ(stats.edge_count, 0);
+    ASSERT_EQ(stats.ranked_node_count, 0);
+    cbm_store_project_graph_stats_free_fields(&stats);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pagerank_refresh_defer_exact_delta_reindexes_defers_only_with_stale_rank_views) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_policy", "/tmp/refresh_policy");
@@ -1510,6 +1575,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_refresh_if_needed_recomputes_changed_graph);
     RUN_TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps);
     RUN_TEST(pagerank_disabled_config_clears_rank_views);
+    RUN_TEST(pagerank_refresh_finalizes_exact_graph_stats);
     RUN_TEST(pagerank_refresh_defer_exact_delta_reindexes_defers_only_with_stale_rank_views);
     RUN_TEST(pagerank_refresh_defer_exact_delta_reindexes_does_not_defer_containment);
     RUN_TEST(pagerank_refresh_defer_all_incremental_reindexes_defers_containment);

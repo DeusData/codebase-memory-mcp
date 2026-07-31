@@ -202,6 +202,7 @@ struct cbm_store {
     const char *db_path; /* heap-allocated, or NULL for :memory: */
     cbm_file_identity_t opened_file_identity;
     char errbuf[CBM_SZ_512];
+    bool project_graph_stats_invalidated;
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -297,7 +298,7 @@ static int exec_sql(cbm_store_t *s, const char *sql) {
     return CBM_STORE_OK;
 }
 
-static bool store_fts_unavailable(cbm_store_t *s, const char *table_name) {
+static bool store_table_unavailable(cbm_store_t *s, const char *table_name) {
     const char *msg = (s && s->db) ? sqlite3_errmsg(s->db) : NULL;
     if (!msg || !table_name || !table_name[0]) {
         return false;
@@ -308,11 +309,11 @@ static bool store_fts_unavailable(cbm_store_t *s, const char *table_name) {
 }
 
 static bool store_nodes_fts_unavailable(cbm_store_t *s) {
-    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS);
+    return store_table_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS);
 }
 
 static bool store_overlay_nodes_fts_unavailable(cbm_store_t *s) {
-    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY);
+    return store_table_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY);
 }
 
 /* Safe string: returns "" if NULL. */
@@ -527,6 +528,18 @@ static int init_schema(cbm_store_t *s) {
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
         "  root_path TEXT NOT NULL"
+        ");"
+        /* Exact generation summaries turn repeated status reads from linear
+         * graph/rank scans into one primary-key lookup. Writable legacy stores
+         * gain the table through normal schema initialization; read-only old
+         * stores remain valid and use the exact-scan fallback. */
+        "CREATE TABLE IF NOT EXISTS project_graph_stats ("
+        "  project TEXT PRIMARY KEY REFERENCES projects(name) ON DELETE CASCADE,"
+        "  source_generation TEXT NOT NULL,"
+        "  node_count INTEGER NOT NULL,"
+        "  edge_count INTEGER NOT NULL,"
+        "  ranked_node_count INTEGER NOT NULL,"
+        "  pagerank_computed_at TEXT"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -1749,7 +1762,13 @@ int cbm_store_commit(cbm_store_t *s) {
 }
 
 int cbm_store_rollback(cbm_store_t *s) {
-    return exec_sql(s, "ROLLBACK;");
+    int rc = exec_sql(s, "ROLLBACK;");
+    if (rc == CBM_STORE_OK && s) {
+        /* The summary deletion participated in the rolled-back transaction.
+         * Permit the next write phase to invalidate it again. */
+        s->project_graph_stats_invalidated = false;
+    }
+    return rc;
 }
 
 /* ── Bulk write ─────────────────────────────────────────────────── */
@@ -2043,7 +2062,177 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
+int cbm_store_invalidate_project_graph_stats(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    if (s->project_graph_stats_invalidated) {
+        return CBM_STORE_OK;
+    }
+    /* Delete the materialization before the graph/rank write, in the caller's
+     * transaction when one exists. A crash or failed publication therefore
+     * cannot expose stale counts. The hot per-row path after this first call
+     * is one branch, so W mutations remain O(W), without a trigger/SQL write
+     * per row. Cursor mutation_gen remains owned by upsert_project below. */
+    if (exec_sql(s, "DELETE FROM project_graph_stats;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    s->project_graph_stats_invalidated = true;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_refresh_project_graph_stats(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    char generation[CBM_SZ_128];
+    if (cbm_store_generation(s, generation, sizeof(generation)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, "SAVEPOINT cbm_project_graph_stats_refresh;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    /* Each grouped input scan follows its project-leading index. Refresh is
+     * O(P + N + E + R) time with O(P) aggregate/output state; request reads
+     * become O(log P) with O(1) result memory. */
+    if (exec_sql(s, "DELETE FROM project_graph_stats;") != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK TO cbm_project_graph_stats_refresh;");
+        (void)exec_sql(s, "RELEASE cbm_project_graph_stats_refresh;");
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] =
+        "WITH node_stats AS ("
+        "  SELECT project, COUNT(*) AS count FROM nodes GROUP BY project"
+        "), edge_stats AS ("
+        "  SELECT project, COUNT(*) AS count FROM edges GROUP BY project"
+        "), rank_stats AS ("
+        "  SELECT project, COUNT(*) AS count, MAX(computed_at) AS computed_at "
+        "  FROM pagerank GROUP BY project"
+        ") "
+        "INSERT INTO project_graph_stats("
+        "  project, source_generation, node_count, edge_count, ranked_node_count,"
+        "  pagerank_computed_at"
+        ") "
+        "SELECT p.name, ?1, COALESCE(n.count, 0), COALESCE(e.count, 0),"
+        "       COALESCE(r.count, 0), r.computed_at "
+        "FROM projects p "
+        "LEFT JOIN node_stats n ON n.project = p.name "
+        "LEFT JOIN edge_stats e ON e.project = p.name "
+        "LEFT JOIN rank_stats r ON r.project = p.name;";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        bind_text(stmt, ST_COL_1, generation);
+        rc = sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        (void)exec_sql(s, "ROLLBACK TO cbm_project_graph_stats_refresh;");
+        (void)exec_sql(s, "RELEASE cbm_project_graph_stats_refresh;");
+        store_set_error_sqlite(s, "refresh_project_graph_stats");
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, "RELEASE cbm_project_graph_stats_refresh;") != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK TO cbm_project_graph_stats_refresh;");
+        (void)exec_sql(s, "RELEASE cbm_project_graph_stats_refresh;");
+        return CBM_STORE_ERR;
+    }
+    s->project_graph_stats_invalidated = false;
+    return CBM_STORE_OK;
+}
+
+static int store_read_project_graph_stats_row(sqlite3_stmt *stmt, cbm_project_graph_stats_t *out) {
+    out->node_count = sqlite3_column_int64(stmt, 0);
+    out->edge_count = sqlite3_column_int64(stmt, ST_COL_1);
+    out->ranked_node_count = sqlite3_column_int64(stmt, ST_COL_2);
+    const char *computed_at = (const char *)sqlite3_column_text(stmt, ST_COL_3);
+    out->pagerank_computed_at = computed_at ? heap_strdup(computed_at) : NULL;
+    return computed_at && !out->pagerank_computed_at ? CBM_STORE_ERR : CBM_STORE_OK;
+}
+
+static int store_get_materialized_project_graph_stats(cbm_store_t *s, const char *project,
+                                                      cbm_project_graph_stats_t *out) {
+    if (s->project_graph_stats_invalidated) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    char generation[CBM_SZ_128];
+    if (cbm_store_generation(s, generation, sizeof(generation)) != CBM_STORE_OK) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    static const char sql[] =
+        "SELECT node_count, edge_count, ranked_node_count, pagerank_computed_at "
+        "FROM project_graph_stats WHERE project = ?1 AND source_generation = ?2;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        if (store_table_unavailable(s, "project_graph_stats")) {
+            return CBM_STORE_NOT_FOUND;
+        }
+        store_set_error_sqlite(s, "get_project_graph_stats materialized prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, generation);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "get_project_graph_stats materialized step");
+            return CBM_STORE_ERR;
+        }
+        return CBM_STORE_NOT_FOUND;
+    }
+    rc = store_read_project_graph_stats_row(stmt, out);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int store_scan_project_graph_stats(cbm_store_t *s, const char *project,
+                                          cbm_project_graph_stats_t *out) {
+    /* Exact compatibility path for legacy, invalidated, or not-yet-published
+     * summaries. The three indexed scalar scans are O(N + E + R) worst case
+     * and O(1) result memory; publication normally makes request reads O(log P). */
+    static const char sql[] = "SELECT (SELECT COUNT(*) FROM nodes WHERE project = ?1),"
+                              "       (SELECT COUNT(*) FROM edges WHERE project = ?1),"
+                              "       (SELECT COUNT(*) FROM pagerank WHERE project = ?1),"
+                              "       (SELECT MAX(computed_at) FROM pagerank WHERE project = ?1) "
+                              "FROM projects WHERE name = ?1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "get_project_graph_stats exact prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "get_project_graph_stats exact step");
+            return CBM_STORE_ERR;
+        }
+        return CBM_STORE_NOT_FOUND;
+    }
+    rc = store_read_project_graph_stats_row(stmt, out);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_get_project_graph_stats(cbm_store_t *s, const char *project,
+                                      cbm_project_graph_stats_t *out) {
+    if (!s || !s->db || !project || !project[0] || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    int rc = store_get_materialized_project_graph_stats(s, project, out);
+    return rc == CBM_STORE_NOT_FOUND ? store_scan_project_graph_stats(s, project, out) : rc;
+}
+
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_project,
                        "INSERT INTO projects (name, indexed_at, root_path) VALUES (?1, ?2, ?3) "
@@ -2218,6 +2407,12 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
     if (owns_transaction && cbm_store_begin(s) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        if (owns_transaction) {
+            (void)cbm_store_rollback(s);
+        }
+        return CBM_STORE_ERR;
+    }
 
     int rc = store_overlay_nodes_fts_delete_by_project(s, name);
     if (rc != CBM_STORE_OK) {
@@ -2287,6 +2482,9 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
 /* ── Node CRUD ──────────────────────────────────────────────────── */
 
 int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_node,
                        "INSERT INTO nodes (project, label, name, qualified_name, file_path, "
@@ -3062,6 +3260,9 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
 }
 
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_project,
                                         "DELETE FROM nodes WHERE project = ?1;");
     if (!stmt) {
@@ -3077,6 +3278,9 @@ int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
 }
 
 int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_file,
                                         "DELETE FROM nodes WHERE project = ?1 AND file_path = ?2;");
     if (!stmt) {
@@ -3093,6 +3297,9 @@ int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const ch
 }
 
 int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const char *label) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_nodes_by_label,
                                         "DELETE FROM nodes WHERE project = ?1 AND label = ?2;");
     if (!stmt) {
@@ -3257,6 +3464,9 @@ int cbm_store_upsert_node_batch_in_transaction(cbm_store_t *s, const cbm_node_t 
     if (!s || !s->db || !nodes || count < 0) {
         return CBM_STORE_ERR;
     }
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     if (out_ids) {
         memset(out_ids, 0, (size_t)count * sizeof(*out_ids));
     }
@@ -3294,6 +3504,9 @@ int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int cou
 /* ── Edge CRUD ──────────────────────────────────────────────────── */
 
 int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     /* Conflict target includes local_name_gen (#768) so IMPORTS edges with
      * different local_name coexist while re-inserting the same import still
      * upserts. Must match the table's UNIQUE constraint in init_schema. */
@@ -3579,6 +3792,9 @@ int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const cha
 }
 
 int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_edges_by_project,
                                         "DELETE FROM edges WHERE project = ?1;");
     if (!stmt) {
@@ -3595,6 +3811,9 @@ int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project) {
 
 int cbm_store_delete_edges_touching_project_nodes(cbm_store_t *s, const char *project) {
     if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
 
@@ -3619,6 +3838,9 @@ int cbm_store_delete_edges_touching_project_nodes(cbm_store_t *s, const char *pr
 }
 
 int cbm_store_delete_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_delete_edges_by_type,
                                         "DELETE FROM edges WHERE project = ?1 AND type = ?2;");
     if (!stmt) {
@@ -3730,6 +3952,9 @@ int cbm_store_insert_edge_batch_in_transaction(cbm_store_t *s, const cbm_edge_t 
         return CBM_STORE_OK;
     }
     if (!s || !s->db || !edges || count < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
     if (count >= ST_DELTA_EDGE_BULK_MIN) {
@@ -6066,6 +6291,11 @@ static int store_delete_file_delta_transaction(cbm_store_t *s, const char *proje
                                                bool finish_generation) {
     int rc = cbm_store_begin(s);
     if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_invalidate_project_graph_stats(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
         return rc;
     }
     rc = store_delete_file_delta_body(s, project, rel_path, generation, derived_view_name);
@@ -8688,6 +8918,11 @@ int cbm_store_apply_file_delta_batch_complete(cbm_store_t *s,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    rc = cbm_store_invalidate_project_graph_stats(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
     CBM_PROF_START(t_delete);
     for (int i = 0; i < delete_count; i++) {
         rc = store_delete_file_delta_body(s, delete_deltas[i]->project, delete_deltas[i]->rel_path,
@@ -8911,14 +9146,18 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
     if (!s || !s->db || !project || count < 0 || (count > 0 && !rows)) {
         return CBM_STORE_ERR;
     }
-    if (exec_sql(s, "BEGIN;") != CBM_STORE_OK) {
+    if (cbm_store_begin(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_store_invalidate_project_graph_stats(s) != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *del = NULL;
     if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage WHERE project = ?1;", CBM_NOT_FOUND,
                            &del, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage delete prepare");
-        (void)exec_sql(s, "ROLLBACK;");
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
     bind_text(del, SKIP_ONE, project);
@@ -8926,7 +9165,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
     sqlite3_finalize(del);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "coverage delete");
-        (void)exec_sql(s, "ROLLBACK;");
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *ins = NULL;
@@ -8936,7 +9175,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
             "VALUES (?1, ?2, ?3, ?4);",
             CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage insert prepare");
-        (void)exec_sql(s, "ROLLBACK;");
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
     for (int i = 0; i < count; i++) {
@@ -8950,7 +9189,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         if (sqlite3_step(ins) != SQLITE_DONE) {
             store_set_error_sqlite(s, "coverage insert");
             sqlite3_finalize(ins);
-            (void)exec_sql(s, "ROLLBACK;");
+            (void)cbm_store_rollback(s);
             return CBM_STORE_ERR;
         }
         sqlite3_reset(ins);
@@ -8968,7 +9207,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                            "(SELECT rel_path FROM file_hashes WHERE project = ?1);",
                            CBM_NOT_FOUND, &prune, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage prune prepare");
-        (void)exec_sql(s, "ROLLBACK;");
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
     bind_text(prune, SKIP_ONE, project);
@@ -8976,7 +9215,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
     sqlite3_finalize(prune);
     if (prune_rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "coverage prune");
-        (void)exec_sql(s, "ROLLBACK;");
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
 
@@ -9012,7 +9251,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                 "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
                 CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
             store_set_error_sqlite(s, "coverage meta upsert prepare");
-            (void)exec_sql(s, "ROLLBACK;");
+            (void)cbm_store_rollback(s);
             return CBM_STORE_ERR;
         }
         bind_text(up_meta, SKIP_ONE, project);
@@ -9028,7 +9267,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_finalize(up_meta);
         if (meta_rc != SQLITE_DONE) {
             store_set_error_sqlite(s, "coverage meta upsert");
-            (void)exec_sql(s, "ROLLBACK;");
+            (void)cbm_store_rollback(s);
             return CBM_STORE_ERR;
         }
     } else {
@@ -9036,7 +9275,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage_meta WHERE project = ?1;",
                                CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
             store_set_error_sqlite(s, "coverage meta delete prepare");
-            (void)exec_sql(s, "ROLLBACK;");
+            (void)cbm_store_rollback(s);
             return CBM_STORE_ERR;
         }
         bind_text(del_meta, SKIP_ONE, project);
@@ -9044,7 +9283,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_finalize(del_meta);
         if (meta_rc != SQLITE_DONE) {
             store_set_error_sqlite(s, "coverage meta delete");
-            (void)exec_sql(s, "ROLLBACK;");
+            (void)cbm_store_rollback(s);
             return CBM_STORE_ERR;
         }
     }
@@ -9052,10 +9291,10 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
     /* Rebuild the derived miss-graph view from the now-authoritative table
      * contents (same transaction — the table and its view stay in step). */
     if (cov_rebuild_shadow_graph(s, project) != CBM_STORE_OK) {
-        (void)exec_sql(s, "ROLLBACK;");
+        (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
-    return exec_sql(s, "COMMIT;");
+    return cbm_store_commit(s);
 }
 
 int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,
@@ -18759,6 +18998,13 @@ void cbm_project_free_fields(cbm_project_t *p) {
     safe_str_free(&p->name);
     safe_str_free(&p->indexed_at);
     safe_str_free(&p->root_path);
+}
+
+void cbm_store_project_graph_stats_free_fields(cbm_project_graph_stats_t *stats) {
+    if (!stats) {
+        return;
+    }
+    safe_str_free(&stats->pagerank_computed_at);
 }
 
 void cbm_store_free_projects(cbm_project_t *projects, int count) {
