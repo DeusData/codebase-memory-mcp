@@ -8003,6 +8003,38 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     ASSERT_NULL(strstr(list, "ghost704"));     /* 0-byte ghost filtered (RED before) */
     free(list);
 
+    char *page = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"list_projects\","
+             "\"arguments\":{\"offset\":0,\"limit\":1}}}");
+    ASSERT_NOT_NULL(page);
+    ASSERT_NOT_NULL(strstr(page, "\\\"total\\\":3"));
+    ASSERT_NOT_NULL(strstr(page, "\\\"limit\\\":1"));
+    ASSERT_NOT_NULL(strstr(page, "\\\"returned\\\":1"));
+    ASSERT_NOT_NULL(strstr(page, "\\\"has_more\\\":true"));
+    ASSERT_NOT_NULL(strstr(page, "alpha704"));
+    ASSERT_NULL(strstr(page, "beta704"));
+    ASSERT_NULL(strstr(page, "\\\"nodes\\\"")); /* details are opt-in */
+    free(page);
+
+    char *next_page = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"list_projects\","
+             "\"arguments\":{\"offset\":1,\"limit\":1,\"metadata_only\":true}}}");
+    ASSERT_NOT_NULL(next_page);
+    ASSERT_NOT_NULL(strstr(next_page, "beta704"));
+    ASSERT_NULL(strstr(next_page, "alpha704"));
+    ASSERT_NULL(strstr(next_page, "\\\"nodes\\\"")); /* compatibility alias stays lean */
+    free(next_page);
+
+    char *details = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"list_projects\","
+             "\"arguments\":{\"offset\":0,\"limit\":1,\"include_details\":true}}}");
+    ASSERT_NOT_NULL(details);
+    ASSERT_NOT_NULL(strstr(details, "\\\"nodes\\\""));
+    free(details);
+
     /* ── B: the drifted project resolves by its INTERNAL name ──────── */
     char *q_beta = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
