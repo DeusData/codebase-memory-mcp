@@ -13941,6 +13941,53 @@ TEST(resolve_store_validates_and_serves_with_one_query_open) {
     PASS();
 }
 
+/* Benchmark-only ablation seam: the product still has to close the file-backed
+ * SQLite handle at request end, but a TEST_SEAMS build can suppress the
+ * allocator-wide mi_collect(true) independently. This separates close/reopen
+ * correctness and cost from allocator collection without adding a production
+ * mode or retaining a publication-blocking handle. */
+TEST(request_store_release_collection_can_be_isolated_for_measurement) {
+    const char *cache = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache);
+    const char *project = "request-collect-ablation-project";
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(db_path, sizeof(db_path), cache, project), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_create_generation_db(db_path, project, "Function", "CollectAblation"));
+
+    const char *saved = getenv("CBM_TEST_SKIP_REQUEST_MEM_COLLECT");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_TEST_SKIP_REQUEST_MEM_COLLECT", "1", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    bool server_created = srv != NULL;
+    char *response =
+        srv ? cbm_mcp_handle_tool(
+                  srv, "search_graph",
+                  "{\"project\":\"request-collect-ablation-project\","
+                  "\"name_pattern\":\"CollectAblation\",\"format\":\"json\"}")
+            : NULL;
+    bool returned_result = response && strstr(response, "CollectAblation") != NULL;
+    bool released_store = srv && cbm_mcp_server_store(srv) == NULL;
+    uint64_t collection_count =
+        srv ? cbm_mcp_server_request_mem_collect_count_for_testing(srv) : UINT64_MAX;
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_TEST_SKIP_REQUEST_MEM_COLLECT", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_TEST_SKIP_REQUEST_MEM_COLLECT");
+    }
+    free(saved_copy);
+    mcp_unlink_db_sidecars(db_path);
+
+    ASSERT_TRUE(server_created);
+    ASSERT_TRUE(returned_result);
+    ASSERT_TRUE(released_store);
+    ASSERT_EQ(collection_count, 0);
+    PASS();
+}
+
 TEST(index_second_inprocess_run_survives_issue773) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
@@ -17511,6 +17558,7 @@ SUITE(mcp) {
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(file_backed_store_is_released_at_request_end_not_pinned);
     RUN_TEST(resolve_store_validates_and_serves_with_one_query_open);
+    RUN_TEST(request_store_release_collection_can_be_isolated_for_measurement);
     RUN_TEST(index_repository_rejects_unknown_mode_instead_of_silent_full);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);

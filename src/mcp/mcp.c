@@ -2553,6 +2553,8 @@ struct cbm_mcp_server {
     time_t store_last_used; /* last time resolve_store was called for a named project */
 #ifdef CBM_ENABLE_TEST_SEAMS
     uint64_t query_store_open_count_for_testing;
+    uint64_t request_mem_collect_count_for_testing;
+    bool skip_request_mem_collect_for_testing;
 #endif
 
     /* Session + auto-index state */
@@ -3547,6 +3549,13 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     srv->background_tasks = true;
     srv->response_context = true;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char skip_collect[CBM_SZ_16];
+    srv->skip_request_mem_collect_for_testing =
+        cbm_safe_getenv("CBM_TEST_SKIP_REQUEST_MEM_COLLECT", skip_collect, sizeof(skip_collect),
+                        NULL) != NULL &&
+        skip_collect[0] == '1';
+#endif
 
     cbm_mutex_init(&srv->overlay_compaction_lock);
     return srv;
@@ -3852,6 +3861,10 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 #ifdef CBM_ENABLE_TEST_SEAMS
 uint64_t cbm_mcp_server_query_store_open_count_for_testing(const cbm_mcp_server_t *srv) {
     return srv ? srv->query_store_open_count_for_testing : 0;
+}
+
+uint64_t cbm_mcp_server_request_mem_collect_count_for_testing(const cbm_mcp_server_t *srv) {
+    return srv ? srv->request_mem_collect_count_for_testing : 0;
 }
 #endif
 
@@ -17619,7 +17632,14 @@ static void release_request_store(cbm_mcp_server_t *srv) {
      * promptly instead of accumulating across thousands of request-scoped
      * stores (#581). Keep this O(allocator-state) work once per released store,
      * after every store pointer is cleared—not in any per-row result path. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (!srv->skip_request_mem_collect_for_testing) {
+        srv->request_mem_collect_count_for_testing++;
+        cbm_mem_collect();
+    }
+#else
     cbm_mem_collect();
+#endif
 }
 
 /* End every server-level JSON-RPC request through one ownership boundary.
