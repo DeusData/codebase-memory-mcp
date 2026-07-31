@@ -1184,6 +1184,70 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     PASS();
 }
 
+/* Slash-prefixed call arguments are not necessarily HTTP routes. Keep the
+ * parallel arg-url heuristic from minting Route nodes for filesystem paths or
+ * regex-replacement operands, while preserving a genuine API path. */
+TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_arg_url_guard_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/args.py",
+                    "import requests\n"
+                    "TMP = '/tmp/pgv_fuzz.bin'\n"
+                    "def run_copy(path):\n"
+                    "    return path\n"
+                    "def write_fixture():\n"
+                    "    return run_copy(TMP)\n"
+                    "def load_api():\n"
+                    "    return requests.get('/api/data')\n");
+    write_temp_file(tmp, "src/regex.js",
+                    "function sink(value) { return value; }\n"
+                    "export function sanitize(template) {\n"
+                    "  sink(/<table/i);\n"
+                    "  return template.replace('/html/g', '');\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_guard.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_EQ(count_nodes_named(s, project, "/html/g"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/<table/i"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/pgv_fuzz.bin"), 0);
+    ASSERT_GTE(count_nodes_named(s, project, "/api/data"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Native `fetch()` (#856), sequential path (< 50 files → pass_calls.c). A bare
  * unqualified call to the global fetch API has no import and no local
  * definition anywhere in this project, so registry resolution comes back
@@ -7790,6 +7854,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
