@@ -1836,12 +1836,22 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                const CBMCall *call) {
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
+        /* A slash-prefixed raw expression is not a URL string. In JS/TS this
+         * is notably a regex literal (`/<table/i`); genuine string literals
+         * and propagated constants are carried in `value`, while template
+         * literals keep their leading backtick in `expr`. */
+        if (!ca->value && ca->expr && ca->expr[0] == '/') {
+            continue;
+        }
         const char *url = ca->value ? ca->value : ca->expr;
         if (!url || (url[0] != '/' && url[0] != '`')) {
             continue;
         }
         char norm[CBM_SZ_256];
         if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
+            continue;
+        }
+        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
         char route_qn[CBM_ROUTE_QN_SIZE];

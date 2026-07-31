@@ -678,7 +678,11 @@ static bool callee_is_delimiter_or_filesystem_builder(const char *callee_name) {
         method = last_colon + 2;
     }
     if (strcmp(method, "split") == 0 || strcmp(method, "rsplit") == 0 ||
-        strcmp(method, "partition") == 0 || strcmp(method, "join") == 0) {
+        strcmp(method, "partition") == 0 || strcmp(method, "join") == 0 ||
+        strcmp(method, "replace") == 0 || strcmp(method, "replaceAll") == 0 ||
+        strcmp(method, "match") == 0 || strcmp(method, "matchAll") == 0 ||
+        strcmp(method, "search") == 0 || strcmp(method, "test") == 0 ||
+        strcmp(method, "exec") == 0) {
         return true;
     }
     return strstr(callee_name, "os.path.join") != NULL || strstr(callee_name, "path.join") != NULL;
