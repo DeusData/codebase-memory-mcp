@@ -43,6 +43,31 @@ class RunBenchmarkTest(unittest.TestCase):
             ],
         )
 
+    def test_indexed_query_probes_bind_the_named_project_over_mcp(self) -> None:
+        client = mock.Mock()
+        client.call_tool.return_value = ({"status": "ready"}, "", 17, 1.25)
+
+        result = BENCHMARK.measure_indexed_query_probes_for_transport(
+            "mcp",
+            Path("/candidate/cbm"),
+            {},
+            "index_status",
+            2,
+            "stable-project",
+            30,
+            False,
+            client,
+        )
+
+        self.assertEqual(result["summary"]["count"], 2)
+        self.assertEqual(
+            client.call_tool.call_args_list,
+            [
+                mock.call("index_status", {"project": "stable-project"}),
+                mock.call("index_status", {"project": "stable-project"}),
+            ],
+        )
+
     def test_find_project_db_ignores_dependency_databases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir)
