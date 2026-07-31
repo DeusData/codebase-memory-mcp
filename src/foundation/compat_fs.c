@@ -137,7 +137,9 @@ bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
     if (!path || !out) {
         return false;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    /* File identity is a filesystem operation, so retain the same
+     * UTF-8/extended-length path contract as open/replace/canonicalize. */
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return false;
     }
@@ -647,6 +649,101 @@ int cbm_rmdir(const char *path) {
     return ret;
 }
 
+typedef struct {
+    DWORD flags;
+    HANDLE root_directory;
+    DWORD file_name_length;
+    WCHAR file_name[CBM_ALLOC_ONE];
+} cbm_windows_file_rename_info_ex_t;
+
+enum {
+    /* FILE_INFO_BY_HANDLE_CLASS::FileRenameInfoEx and FILE_RENAME_INFO flags
+     * were added after older MinGW headers supported by this project. Keep the
+     * documented Win32 ABI values behind named compatibility definitions. */
+    CBM_WINDOWS_FILE_RENAME_INFO_EX = 22,
+    CBM_WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001U,
+    CBM_WINDOWS_FILE_RENAME_POSIX_SEMANTICS = 0x00000002U,
+    /* Two publishers can briefly collide inside the Windows namespace even
+     * after both opened independent temp files correctly. A scheduler yield
+     * lets the winning rename release that namespace operation without adding
+     * a timer floor to the ordinary or uncontended paths. Keep the retry count
+     * finite so latency and syscall work remain O(1). */
+    CBM_WINDOWS_FILE_RENAME_ATTEMPTS = 8,
+};
+
+bool cbm_windows_replace_error_is_transient(DWORD error) {
+    return error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED ||
+           error == ERROR_LOCK_VIOLATION;
+}
+
+bool cbm_windows_replace_open_file(HANDLE source, const wchar_t *destination_path,
+                                   DWORD *platform_error) {
+    if (platform_error) {
+        *platform_error = ERROR_SUCCESS;
+    }
+    if (source == INVALID_HANDLE_VALUE || !destination_path) {
+        if (platform_error) {
+            *platform_error = ERROR_INVALID_PARAMETER;
+        }
+        return false;
+    }
+
+    size_t characters = wcslen(destination_path);
+    /* FileRenameInfoEx expects the bare drive spelling here; the NT layer
+     * rejects the extended-length \\?\ prefix used for the CreateFileW call. */
+    if (characters >= CBM_SZ_4 && wcsncmp(destination_path, L"\\\\?\\", CBM_SZ_4) == 0) {
+        destination_path += CBM_SZ_4;
+        characters -= CBM_SZ_4;
+    }
+    size_t fixed_bytes = offsetof(cbm_windows_file_rename_info_ex_t, file_name) + sizeof(wchar_t);
+    if (characters == 0U || fixed_bytes > (size_t)UINT32_MAX ||
+        characters > ((size_t)UINT32_MAX - fixed_bytes) / sizeof(wchar_t)) {
+        if (platform_error) {
+            *platform_error = ERROR_FILENAME_EXCED_RANGE;
+        }
+        return false;
+    }
+
+    size_t name_bytes = characters * sizeof(wchar_t);
+    /* FileNameLength excludes a terminator, but retain one wchar_t after the
+     * counted name because filesystem filter drivers may still inspect
+     * FileName as a NUL-terminated string. Allocation remains O(path bytes). */
+    size_t allocation = fixed_bytes + name_bytes;
+    cbm_windows_file_rename_info_ex_t *rename = calloc(CBM_ALLOC_ONE, allocation);
+    if (!rename) {
+        if (platform_error) {
+            *platform_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        return false;
+    }
+    rename->flags =
+        CBM_WINDOWS_FILE_RENAME_REPLACE_IF_EXISTS | CBM_WINDOWS_FILE_RENAME_POSIX_SEMANTICS;
+    rename->root_directory = NULL;
+    rename->file_name_length = (DWORD)name_bytes;
+    memcpy(rename->file_name, destination_path, name_bytes);
+    rename->file_name[characters] = L'\0';
+
+    BOOL replaced = FALSE;
+    DWORD error = ERROR_SUCCESS;
+    for (unsigned int attempt = 0; attempt < CBM_WINDOWS_FILE_RENAME_ATTEMPTS; attempt++) {
+        replaced = SetFileInformationByHandle(
+            source, (FILE_INFO_BY_HANDLE_CLASS)CBM_WINDOWS_FILE_RENAME_INFO_EX, rename,
+            (DWORD)allocation);
+        error = replaced ? ERROR_SUCCESS : GetLastError();
+        if (replaced || !cbm_windows_replace_error_is_transient(error)) {
+            break;
+        }
+        if (attempt + 1U < CBM_WINDOWS_FILE_RENAME_ATTEMPTS) {
+            (void)SwitchToThread();
+        }
+    }
+    free(rename);
+    if (!replaced && platform_error) {
+        *platform_error = error;
+    }
+    return replaced != 0;
+}
+
 int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platform_error) {
     if (platform_error) {
         *platform_error = 0;
@@ -657,8 +754,12 @@ int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platfo
         }
         return CBM_NOT_FOUND;
     }
-    wchar_t *wtmp = cbm_utf8_to_wide(tmp_path);
-    wchar_t *wdest = cbm_utf8_to_wide(dest_path);
+    /* Use the same absolute extended-length path conversion as the other
+     * filesystem seams. UTF-8-to-wide conversion alone still leaves Win32's
+     * legacy MAX_PATH parsing in force. Conversion is O(path bytes) time and
+     * O(path bytes) transient memory. */
+    wchar_t *wtmp = cbm_path_to_wide(tmp_path);
+    wchar_t *wdest = cbm_path_to_wide(dest_path);
     if (!wtmp || !wdest) {
         if (platform_error) {
             *platform_error = ERROR_NOT_ENOUGH_MEMORY;
@@ -668,7 +769,41 @@ int cbm_replace_file_ex(const char *tmp_path, const char *dest_path, int *platfo
         return CBM_NOT_FOUND;
     }
     BOOL ok = MoveFileExW(wtmp, wdest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    DWORD err = ok ? 0 : GetLastError();
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    /* Concurrent publishers of complete sibling temp files can collide only
+     * while Windows updates the shared destination name. Retry that ordinary
+     * name-based operation first: a scheduler yield lets the winner leave the
+     * namespace critical section without imposing a sleep floor. The initial
+     * attempt plus this finite loop keeps latency and syscall work O(1). */
+    for (unsigned int attempt = 1; !ok && cbm_windows_replace_error_is_transient(err) &&
+                                   attempt < CBM_WINDOWS_FILE_RENAME_ATTEMPTS;
+         attempt++) {
+        (void)SwitchToThread();
+        ok = MoveFileExW(wtmp, wdest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        err = ok ? ERROR_SUCCESS : GetLastError();
+    }
+    if (!ok && cbm_windows_replace_error_is_transient(err)) {
+        /* MoveFileExW cannot supersede a destination generation that a reader
+         * still names after writer-vs-writer contention has cleared, even when
+         * that reader allows delete sharing. Reopen the complete temp
+         * generation with DELETE access and use the same FileRenameInfoEx
+         * POSIX-semantics seam as UI config publication. The ordinary path
+         * remains one rename syscall; only persistent documented contention
+         * pays this O(path bytes), one-handle fallback. */
+        HANDLE source = CreateFileW(wtmp, DELETE | SYNCHRONIZE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (source != INVALID_HANDLE_VALUE) {
+            ok = cbm_windows_replace_open_file(source, wdest, &err);
+            /* Always release the source handle, but do not turn an already
+             * committed namespace replacement into a reported failure:
+             * CloseHandle cannot roll publication back, and callers would
+             * otherwise retry or reject a destination that already changed. */
+            (void)CloseHandle(source);
+        } else {
+            err = GetLastError();
+        }
+    }
     free(wtmp);
     free(wdest);
     if (!ok && platform_error) {
@@ -685,8 +820,8 @@ int cbm_move_file_no_replace(const char *src_path, const char *dest_path) {
     if (!src_path || !dest_path) {
         return CBM_NOT_FOUND;
     }
-    wchar_t *wsrc = cbm_utf8_to_wide(src_path);
-    wchar_t *wdest = cbm_utf8_to_wide(dest_path);
+    wchar_t *wsrc = cbm_path_to_wide(src_path);
+    wchar_t *wdest = cbm_path_to_wide(dest_path);
     if (!wsrc || !wdest) {
         free(wsrc);
         free(wdest);

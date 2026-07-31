@@ -8220,6 +8220,12 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
         sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_TRUE(grep_matches > 0);
+    /* Scanner rows are absolute on this PowerShell path, but MCP results must
+     * remain project-relative after Windows canonicalization normalizes the
+     * root spelling. Leaking proj_dir here catches slash/case drift between
+     * the canonical root and Select-String output. */
+    ASSERT_NOT_NULL(strstr(inner, "main.go"));
+    ASSERT_NULL(strstr(inner, proj_dir));
 
     free(inner);
     free(resp);
@@ -10465,6 +10471,7 @@ TEST(resource_error_preserves_string_id) {
     ASSERT_NOT_NULL(strstr(resp, "\"code\":-32002"));
     ASSERT_NULL(strstr(resp, "\"result\""));
     free(resp);
+    ASSERT_FALSE(cbm_mcp_server_cancel_active(srv));
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -10487,6 +10494,7 @@ TEST(server_handle_tools_call_missing_name) {
     ASSERT_NULL(strstr(resp, "\"result\""));
     ASSERT_NULL(strstr(resp, "\"isError\""));
     free(resp);
+    ASSERT_FALSE(cbm_mcp_server_cancel_active(srv));
 
     cbm_mcp_server_free(srv);
     PASS();

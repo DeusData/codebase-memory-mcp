@@ -510,17 +510,41 @@ int cbm_yaml_remove_lock_sidecar(const char *file_path) {
     free(lock_path);
     return 0;
 #else
-    struct stat state;
-    int result = 0;
-    if (lstat(lock_path, &state) != 0) {
-        result = 0; /* already absent */
-    } else if (!yaml_lock_file_state_is_safe(&state)) {
-        result = YAML_ERROR; /* symlink or foreign file: preserve it */
-    } else if (unlink(lock_path) != 0) {
-        result = YAML_ERROR;
+#ifndef O_NOFOLLOW
+    free(lock_path);
+    return YAML_ERROR;
+#else
+    int flags = O_RDWR | O_NOFOLLOW | O_NONBLOCK;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int descriptor = open(lock_path, flags);
+    if (descriptor < 0) {
+        int result = errno == ENOENT ? 0 : YAML_ERROR;
+        free(lock_path);
+        return result;
     }
+
+    struct stat opened_state;
+    bool safe = fstat(descriptor, &opened_state) == 0 &&
+                yaml_lock_file_state_is_safe(&opened_state) &&
+                yaml_flock_nointr(descriptor, LOCK_EX | LOCK_NB) == 0;
+    /* Validate through the opened descriptor rather than lstat(path), then
+     * remove the directory entry while holding the same advisory lock used by
+     * every YAML editor. O_NOFOLLOW preserves an existing symlink collision;
+     * fstat preserves hard-linked, foreign-owner, and wrong-mode files. POSIX
+     * has no portable unlink-by-handle primitive, so the user-owned parent
+     * directory remains the trust boundary against a malicious same-user
+     * pathname replacement. This is one O(1) open/stat/lock/unlink lifecycle
+     * with no pathname check/use pair. */
+    int result = safe && cbm_unlink(lock_path) == 0 ? 0 : YAML_ERROR;
+    if (safe) {
+        (void)yaml_flock_nointr(descriptor, LOCK_UN);
+    }
+    (void)close(descriptor);
     free(lock_path);
     return result;
+#endif
 #endif
 }
 

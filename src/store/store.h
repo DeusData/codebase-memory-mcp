@@ -442,6 +442,13 @@ const char *cbm_store_db_path(const cbm_store_t *s);
  * store. Constant-time metadata only; it never queries or mutates SQLite. */
 bool cbm_store_backing_file_replaced(const cbm_store_t *s);
 
+/* Copy the stable filesystem identity captured when this file-backed store
+ * opened. This identifies the exact SQLite generation read by the handle,
+ * without a pathname re-stat race. Constant time with no allocation. Returns
+ * false for in-memory stores or when the platform could not capture a stable
+ * identity. */
+bool cbm_store_backing_file_identity(const cbm_store_t *s, uint64_t *volume, uint64_t *file_id);
+
 /* Check database integrity. Returns true if the DB passes basic sanity checks
  * (projects table has correct types, no corruption indicators).
  * Returns false if corruption is detected. Callers must not assume ownership of

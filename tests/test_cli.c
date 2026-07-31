@@ -5528,7 +5528,7 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
     write_test_file(scout_path, foreign_scout);
 
     char binary_path[640];
-    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary_path, sizeof(binary_path));
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     bool plan_ok =
         plan && strstr(plan, scout_path) && strstr(plan, verify_path) && strstr(plan, auditor_path);
@@ -12590,25 +12590,47 @@ TEST(cli_uninstall_removes_vscode_profile_mcp_only) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+#ifdef _WIN32
+    cli_env_snapshot_t app_config = {0};
+    ASSERT_TRUE(cli_env_snapshot(&app_config, "APPDATA"));
+    char app_config_path[512];
+    snprintf(app_config_path, sizeof(app_config_path), "%s/AppData/Roaming", tmpdir);
+#elif !defined(__APPLE__)
+    cli_env_snapshot_t app_config = {0};
+    ASSERT_TRUE(cli_env_snapshot(&app_config, "XDG_CONFIG_HOME"));
+    char app_config_path[512];
+    snprintf(app_config_path, sizeof(app_config_path), "%s/.config", tmpdir);
+#endif
+
+    /* Snapshot every inherited value before mutating any of them, so a failed
+     * setup assertion cannot leave a half-isolated environment for later
+     * tests. The platform resolver is evaluated only after both overrides. */
+    cbm_setenv("HOME", tmpdir, 1);
+#ifdef _WIN32
+    cbm_setenv("APPDATA", app_config_path, 1);
+#elif !defined(__APPLE__)
+    cbm_setenv("XDG_CONFIG_HOME", app_config_path, 1);
+#endif
+
     char profile_dir[768];
     char profile_mcp[1024];
 #ifdef __APPLE__
     snprintf(profile_dir, sizeof(profile_dir),
              "%s/Library/Application Support/Code/User/profiles/profile-a", tmpdir);
 #else
-    snprintf(profile_dir, sizeof(profile_dir), "%s/.config/Code/User/profiles/profile-a", tmpdir);
+    snprintf(profile_dir, sizeof(profile_dir), "%s/Code/User/profiles/profile-a",
+             cbm_app_config_dir());
 #endif
     snprintf(profile_mcp, sizeof(profile_mcp), "%s/mcp.json", profile_dir);
     ASSERT_EQ(test_mkdirp(profile_dir), 0);
     ASSERT_EQ(
         write_test_file(profile_mcp, "{\"servers\":{\"user-server\":{\"command\":\"user\"}}}"), 0);
     char binary[768];
-    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
     ASSERT_EQ(cbm_install_vscode_mcp(binary, profile_mcp), 0);
 
-    cli_env_snapshot_t home = {0};
-    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
-    cbm_setenv("HOME", tmpdir, 1);
     char *args[] = {"-n"};
     ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
 
@@ -12619,6 +12641,9 @@ TEST(cli_uninstall_removes_vscode_profile_mcp_only) {
 
     extern void cbm_set_auto_answer_for_test(int value);
     cbm_set_auto_answer_for_test(0);
+#if defined(_WIN32) || !defined(__APPLE__)
+    cli_env_restore(&app_config);
+#endif
     cli_env_restore(&home);
     test_rmdir_r(tmpdir);
     PASS();
@@ -12662,7 +12687,7 @@ TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries) {
                   "\"command\": [\"keep-me\"]},\n  },\n}\n"),
               0);
     char binary[768];
-    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
     ASSERT_EQ(cbm_upsert_opencode_mcp(binary, config_path), 0);
 
     cli_env_snapshot_t home = {0};
@@ -12694,7 +12719,7 @@ TEST(cli_json_mcp_migrates_legacy_enabled_true_entry) {
     char config_path[768];
     snprintf(config_path, sizeof(config_path), "%s/kilo.jsonc", tmpdir);
     char binary[768];
-    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
 
     char legacy[1600];
     snprintf(legacy, sizeof(legacy),
@@ -12800,7 +12825,7 @@ TEST(cli_claude_desktop_plan_and_uninstall_preserve_foreign_entries) {
         write_test_file(config_path, "{\"mcpServers\":{\"foreign\":{\"command\":\"keep-me\"}}}"),
         0);
     char binary[768];
-    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
     ASSERT_EQ(cbm_install_editor_mcp(binary, config_path), 0);
 
     cli_env_snapshot_t home = {0};

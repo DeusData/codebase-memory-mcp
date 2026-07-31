@@ -1,0 +1,10 @@
+# SQLite coordinates WAL-index readers and writers through shared-memory
+# barriers plus OS file locks that ThreadSanitizer cannot observe. The vendored
+# amalgamation already marks walIndexWriteHdr and walIndexTryHdr SQLITE_NO_TSAN
+# for this protocol; macOS can attribute the matching read to walTryBeginRead.
+# Suppress only that upstream protocol boundary so every CBM frame and all
+# other SQLite functions remain instrumented.
+#
+# SQLite's explanation of this intentional WAL-index access pattern:
+# https://sqlite.org/forum/info/2d74563d6c67bb0c
+race:walTryBeginRead

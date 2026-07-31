@@ -95,7 +95,9 @@ int cbm_rmdir(const char *path);
 
 /* Atomically replace dest_path with tmp_path when the platform supports it.
  * tmp_path must already contain the complete new file. Returns 0 on success.
- * POSIX: rename(). Windows: MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH). */
+ * POSIX: one atomic name replacement. Windows: write-through MoveFileExW on
+ * the ordinary path, with a handle-based FileRenameInfoEx fallback when an
+ * open reader retains the previous destination generation. */
 int cbm_replace_file(const char *tmp_path, const char *dest_path);
 
 /* Move src_path to dest_path only when dest_path does not already exist.

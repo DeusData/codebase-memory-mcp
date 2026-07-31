@@ -908,6 +908,8 @@ typedef struct {
     const char *dest;
     const char *payload;
     int failures;
+    const char *first_failure_stage;
+    int first_failure_code;
 } atomic_writer_arg_t;
 
 static void *atomic_writer_thread(void *arg) {
@@ -916,6 +918,10 @@ static void *atomic_writer_thread(void *arg) {
     for (int i = 0; i < ATOMIC_CONCURRENT_WRITES; i++) {
         cbm_atomic_file_error_t err = {0};
         if (cbm_write_file_atomic(wa->dest, wa->payload, len, &err) != 0) {
+            if (wa->failures == 0) {
+                wa->first_failure_stage = err.stage;
+                wa->first_failure_code = err.code;
+            }
             wa->failures++;
         }
     }
@@ -939,6 +945,12 @@ TEST(compat_write_file_atomic_concurrent_same_destination) {
     ASSERT_EQ(cbm_thread_create(&tb, 0, atomic_writer_thread, &b), 0);
     ASSERT_EQ(cbm_thread_join(&ta), 0);
     ASSERT_EQ(cbm_thread_join(&tb), 0);
+    if (a.failures != 0 || b.failures != 0) {
+        printf("    atomic writer failures: a=%d stage=%s code=%d; b=%d stage=%s code=%d\n",
+               a.failures, a.first_failure_stage ? a.first_failure_stage : "none",
+               a.first_failure_code, b.failures,
+               b.first_failure_stage ? b.first_failure_stage : "none", b.first_failure_code);
+    }
     ASSERT_EQ(a.failures, 0);
     ASSERT_EQ(b.failures, 0);
 

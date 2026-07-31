@@ -1,5 +1,6 @@
 /* Transactional binary activation. See activation_transaction.h. */
 #include "cli/activation_transaction.h"
+#include "foundation/compat_fs_internal.h"
 #include "foundation/macos_acl.h"
 
 #include <errno.h>
@@ -1138,10 +1139,6 @@ static bool activation_sync_directory(const cbm_activation_transaction_t *transa
 
 static unsigned int activation_rename_failures_for_test;
 
-static bool activation_rename_error_is_transient(DWORD error) {
-    return error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED ||
-           error == ERROR_LOCK_VIOLATION;
-}
 #endif
 
 void cbm_activation_transaction_rename_failures_set_for_test(unsigned int count) {
@@ -1171,7 +1168,7 @@ static bool activation_rename(const cbm_activation_transaction_t *transaction, c
         } else if (MoveFileExW(wide_source, wide_destination, flags) != 0) {
             moved = true;
             break;
-        } else if (!activation_rename_error_is_transient(GetLastError())) {
+        } else if (!cbm_windows_replace_error_is_transient(GetLastError())) {
             break;
         }
         if (attempt + 1U < ACTIVATION_RENAME_ATTEMPTS) {

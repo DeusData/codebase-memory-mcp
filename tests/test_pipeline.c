@@ -10824,7 +10824,7 @@ static int setup_incremental_repo(void) {
 
     /* main.go — calls Helper() */
     snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
-    f = fopen(path, "w");
+    f = cbm_fopen(path, "wb");
     if (!f) {
         rm_rf(g_incr_tmpdir);
         g_incr_tmpdir[0] = '\0';
@@ -10836,7 +10836,7 @@ static int setup_incremental_repo(void) {
 
     /* helper.go — defines Helper() */
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
-    f = fopen(path, "w");
+    f = cbm_fopen(path, "wb");
     if (!f) {
         rm_rf(g_incr_tmpdir);
         g_incr_tmpdir[0] = '\0';

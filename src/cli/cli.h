@@ -242,6 +242,8 @@ int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
 int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
                                                    const char *previous_binary_path,
                                                    const char *config_path);
+void cbm_agent_installed_binary_path_for_testing(const char *home, char *binary_path,
+                                                 size_t binary_path_size);
 int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
                                              const char *os, const char *arch);
 #endif
