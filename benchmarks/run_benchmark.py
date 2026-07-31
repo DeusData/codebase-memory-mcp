@@ -389,6 +389,14 @@ LOG_MARKER_EXACT_SKIP = "incremental.exact.skip"
 LOG_MARKER_DEP_AUTO_INDEX = "sub=dep_auto_index"
 LOG_MARKER_RANK_REFRESH = "phase=index_repository sub=rank_refresh"
 LOG_MARKER_INDEX_WORKER_TOTAL = "phase=index_repository sub=TOTAL"
+INDEXED_QUERY_PROFILE_COMPONENTS = (
+    ("resolve_store", "open_validate"),
+    ("resolve_store", "integrity"),
+    ("resolve_store", "project_lookup"),
+    ("resolve_store", "session_sync"),
+    ("request_release_store", "store_close"),
+    ("request_release_store", "mem_collect"),
+)
 
 
 class BenchmarkCommandError(RuntimeError):
@@ -4103,6 +4111,7 @@ def measure_indexed_query_probes_for_transport(
             (
                 ("mcp_tool_execute", tool_name),
                 ("mcp_request_total", "tools/call"),
+                *INDEXED_QUERY_PROFILE_COMPONENTS,
             ),
         )
         if result is not None and profiles is not None:

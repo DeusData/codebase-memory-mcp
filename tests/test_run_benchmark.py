@@ -158,6 +158,10 @@ class RunBenchmarkTest(unittest.TestCase):
                         "sub=index_status ms=0 us=140\n"
                         "level=info msg=prof phase=mcp_request_total "
                         "sub=tools/call ms=0 us=220\n"
+                        "level=info msg=prof phase=resolve_store "
+                        "sub=open_validate ms=0 us=75\n"
+                        "level=info msg=prof phase=request_release_store "
+                        "sub=store_close ms=0 us=55\n"
                         "level=info msg=prof phase=mcp_request_total "
                         "sub=tools/call us=not-a-number\n"
                     )
@@ -192,6 +196,20 @@ class RunBenchmarkTest(unittest.TestCase):
                     "min_us": 180,
                     "max_us": 220,
                     "mean_us": 200.0,
+                },
+                "resolve_store/open_validate": {
+                    "count": 1,
+                    "total_us": 75,
+                    "min_us": 75,
+                    "max_us": 75,
+                    "mean_us": 75.0,
+                },
+                "request_release_store/store_close": {
+                    "count": 1,
+                    "total_us": 55,
+                    "min_us": 55,
+                    "max_us": 55,
+                    "mean_us": 55.0,
                 },
             },
         )
