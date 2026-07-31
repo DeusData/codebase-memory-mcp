@@ -952,6 +952,11 @@ def fact_result_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]
 
 
 def fact_artifact_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    """Normalize path-based and content-addressed log metadata from any report branch.
+
+    Visiting N report values and A distinct artifacts costs O(N + A) time and
+    O(A) memory for the emitted rows and deduplication set.
+    """
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -962,7 +967,11 @@ def fact_artifact_rows(report: dict[str, Any], run_id: str) -> list[dict[str, An
                 for artifact in artifacts:
                     if not isinstance(artifact, dict):
                         continue
-                    path = artifact.get("path") or artifact.get("artifact_path")
+                    path = (
+                        artifact.get("path")
+                        or artifact.get("artifact_path")
+                        or artifact.get("artifact_name")
+                    )
                     digest = artifact.get("sha256") or artifact.get("artifact_sha256")
                     if not isinstance(path, str) or not isinstance(digest, str):
                         continue
@@ -980,7 +989,11 @@ def fact_artifact_rows(report: dict[str, Any], run_id: str) -> list[dict[str, An
                             "path": path,
                             "sha256": digest,
                             "size_bytes": artifact.get(
-                                "size_bytes", unknown_fact("artifact_size_not_recorded")
+                                "size_bytes",
+                                artifact.get(
+                                    "artifact_bytes",
+                                    unknown_fact("artifact_size_not_recorded"),
+                                ),
                             ),
                             "schema_version": unknown_fact(
                                 "unstructured_measurement_log"
