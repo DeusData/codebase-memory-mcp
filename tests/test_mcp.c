@@ -13988,6 +13988,61 @@ TEST(request_store_release_collection_can_be_isolated_for_measurement) {
     PASS();
 }
 
+/* Benchmark-only ablation seam: retaining a file-backed query store is unsafe
+ * as a portable product default until POSIX generation detection and Windows
+ * publication behavior are proven separately. A TEST_SEAMS build may retain
+ * it to measure the complete open/validate/integrity/close lifecycle without
+ * conflating that cost with query execution. Two same-project requests should
+ * then remain one O(schema + integrity) open followed by an O(1) cached lookup,
+ * with one live SQLite page cache owned by the server until teardown. */
+TEST(request_store_retention_can_be_isolated_for_measurement) {
+    const char *cache = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache);
+    const char *project = "request-store-retention-ablation-project";
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(db_path, sizeof(db_path), cache, project), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_create_generation_db(db_path, project, "Function", "RetainedStore"));
+
+    const char *saved = getenv("CBM_TEST_RETAIN_REQUEST_STORE");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_TEST_RETAIN_REQUEST_STORE", "1", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *first =
+        srv ? cbm_mcp_handle_tool(
+                  srv, "search_graph",
+                  "{\"project\":\"request-store-retention-ablation-project\","
+                  "\"name_pattern\":\"RetainedStore\",\"format\":\"json\"}")
+            : NULL;
+    char *second =
+        srv ? cbm_mcp_handle_tool(
+                  srv, "search_graph",
+                  "{\"project\":\"request-store-retention-ablation-project\","
+                  "\"name_pattern\":\"RetainedStore\",\"format\":\"json\"}")
+            : NULL;
+    bool returned_both = first && second && strstr(first, "RetainedStore") &&
+                         strstr(second, "RetainedStore");
+    bool retained_store = srv && cbm_mcp_server_store(srv) != NULL;
+    uint64_t open_count =
+        srv ? cbm_mcp_server_query_store_open_count_for_testing(srv) : UINT64_MAX;
+
+    free(first);
+    free(second);
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_TEST_RETAIN_REQUEST_STORE", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_TEST_RETAIN_REQUEST_STORE");
+    }
+    free(saved_copy);
+    mcp_unlink_db_sidecars(db_path);
+
+    ASSERT_TRUE(returned_both);
+    ASSERT_TRUE(retained_store);
+    ASSERT_EQ(open_count, 1);
+    PASS();
+}
+
 TEST(index_second_inprocess_run_survives_issue773) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
@@ -17559,6 +17614,7 @@ SUITE(mcp) {
     RUN_TEST(file_backed_store_is_released_at_request_end_not_pinned);
     RUN_TEST(resolve_store_validates_and_serves_with_one_query_open);
     RUN_TEST(request_store_release_collection_can_be_isolated_for_measurement);
+    RUN_TEST(request_store_retention_can_be_isolated_for_measurement);
     RUN_TEST(index_repository_rejects_unknown_mode_instead_of_silent_full);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);
