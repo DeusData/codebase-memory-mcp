@@ -396,6 +396,13 @@ INDEXED_QUERY_PROFILE_COMPONENTS = (
     ("resolve_store", "session_sync"),
     ("request_release_store", "store_close"),
     ("request_release_store", "mem_collect"),
+    ("index_status", "resolve_project"),
+    ("index_status", "graph_counts"),
+    ("index_status", "dependency_inventory"),
+    ("index_status", "project_coverage"),
+    ("index_status", "pagerank"),
+    ("index_status", "freshness_overlay"),
+    ("index_status", "serialize"),
 )
 
 

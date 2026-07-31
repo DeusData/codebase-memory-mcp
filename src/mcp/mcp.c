@@ -9471,7 +9471,9 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
+    CBM_PROF_START(prof_index_status_resolve);
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
+    CBM_PROF_END("index_status", "resolve_project", prof_index_status_resolve);
     char *project = pe.value;
     REQUIRE_STORE(store, project);
     bool verbose = cbm_mcp_get_bool_arg(args, "verbose");
@@ -9485,8 +9487,10 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     add_overlay_compaction_worker_status(srv, doc, root);
 
     if (project) {
+        CBM_PROF_START(prof_index_status_counts);
         int nodes = cbm_store_count_nodes(store, project);
         int edges = cbm_store_count_edges(store, project);
+        CBM_PROF_END("index_status", "graph_counts", prof_index_status_counts);
         yyjson_mut_obj_add_str(doc, root, "project", project);
         yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, root, "edges", edges);
@@ -9497,6 +9501,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
          * merely because their nodes fall beyond a search-result limit. */
         cbm_project_t *all_projects = NULL;
         int all_project_count = 0;
+        CBM_PROF_START(prof_index_status_dependencies);
         if (cbm_store_list_projects(store, &all_projects, &all_project_count) == CBM_STORE_OK) {
             yyjson_mut_val *dep_arr = yyjson_mut_arr(doc);
             int dep_count = 0;
@@ -9529,9 +9534,11 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         } else {
             yyjson_mut_obj_add_str(doc, root, "dependencies_status", "error");
         }
+        CBM_PROF_END("index_status", "dependency_inventory", prof_index_status_dependencies);
 
         /* Report detected ecosystem + root_path + git metadata */
         cbm_project_t proj_info;
+        CBM_PROF_START(prof_index_status_coverage);
         if (cbm_store_get_project(store, project, &proj_info) == 0) {
             if (proj_info.root_path) {
                 /* root_path + git context — capture before free (fields are heap-alloc'd) */
@@ -9554,7 +9561,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                     "Project is empty. Re-run index_repository(repo_path=...) to populate.");
             }
         }
+        CBM_PROF_END("index_status", "project_coverage", prof_index_status_coverage);
         /* Report PageRank stats */
+        CBM_PROF_START(prof_index_status_pagerank);
         {
             sqlite3 *db = cbm_store_get_db(store);
             if (db) {
@@ -9578,7 +9587,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                 }
             }
         }
+        CBM_PROF_END("index_status", "pagerank", prof_index_status_pagerank);
 
+        CBM_PROF_START(prof_index_status_freshness);
         int dirty_pending = 0;
         int dirty_overlay_ready = 0;
         if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
@@ -9591,16 +9602,19 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             doc, root, store, project,
             "index_status includes overlay_read_view counts, but nodes/edges are canonical counts "
             "while overlay-aware tools may read active overlay rows.");
+        CBM_PROF_END("index_status", "freshness_overlay", prof_index_status_freshness);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
 
+    CBM_PROF_START(prof_index_status_serialize);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     free(project);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);
+    CBM_PROF_END("index_status", "serialize", prof_index_status_serialize);
     return result;
 }
 
