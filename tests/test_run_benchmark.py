@@ -667,6 +667,30 @@ class RunBenchmarkTest(unittest.TestCase):
             self.assertEqual(len(first["artifact_sha256"]), 64)
             self.assertEqual(len(list(artifacts.glob("*.log.gz"))), 1)
 
+    def test_error_detail_archived_log_is_retained_in_artifact_facts(self) -> None:
+        archived = {
+            "artifact_name": "a" * 64 + ".log.gz",
+            "artifact_bytes": 2306,
+            "artifact_sha256": "b" * 64,
+            "source_bytes": 8750,
+            "source_name": ".worker-log-example",
+            "source_sha256": "c" * 64,
+            "compression": "gzip-mtime-0",
+        }
+        facts = BENCHMARK.normalize_benchmark_report(
+            {
+                "error": "worker failed",
+                "error_detail": {"measurement_log_artifacts": [archived]},
+            }
+        )
+
+        self.assertEqual(len(facts["artifacts"]), 1)
+        artifact = facts["artifacts"][0]
+        self.assertEqual(artifact["artifact_type"], "measurement_log")
+        self.assertEqual(artifact["path"], archived["artifact_name"])
+        self.assertEqual(artifact["sha256"], archived["artifact_sha256"])
+        self.assertEqual(artifact["size_bytes"], archived["artifact_bytes"])
+
     def test_run_index_mcp_archives_worker_log_before_raising_decode_error(
         self,
     ) -> None:
