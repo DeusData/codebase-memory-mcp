@@ -4476,7 +4476,9 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
         return NULL;
     }
     int validate_busy_timeout_ms = cbm_mcp_db_validate_busy_timeout_ms(srv);
+    CBM_PROF_START(prof_resolve_open_validate);
     srv->store = open_validated_cbm_query_store(srv, path, validate_busy_timeout_ms);
+    CBM_PROF_END("resolve_store", "open_validate", prof_resolve_open_validate);
     if (srv->store) {
         /* Check DB integrity before serving a cache database. A bad project
          * root_path (with an otherwise-fine projects table) is cosmetic: the
@@ -4485,7 +4487,10 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
          * data loss reported in #557. Only genuine structural corruption is
          * quarantined out of the active derived-cache path. */
         bool path_only = false;
-        if (!cbm_store_check_integrity_full(srv->store, &path_only)) {
+        CBM_PROF_START(prof_resolve_integrity);
+        bool integrity_valid = cbm_store_check_integrity_full(srv->store, &path_only);
+        CBM_PROF_END("resolve_store", "integrity", prof_resolve_integrity);
+        if (!integrity_valid) {
             if (path_only) {
                 cbm_log_warn("store.integrity_retain", "project", project, "path", path, "reason",
                              "bad project root_path only; data retained");
@@ -4540,13 +4545,18 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
          * Linux where unlink defers actual removal). Opening an empty/deleted
          * store without closing it leaks the SQLite connection. */
         cbm_project_t proj_verify = {0};
-        if (cbm_store_get_project(srv->store, project, &proj_verify) == CBM_STORE_OK) {
+        CBM_PROF_START(prof_resolve_project_lookup);
+        int project_lookup_rc = cbm_store_get_project(srv->store, project, &proj_verify);
+        CBM_PROF_END("resolve_store", "project_lookup", prof_resolve_project_lookup);
+        if (project_lookup_rc == CBM_STORE_OK) {
             /* Register only usable roots: #557 showed that malformed root metadata
              * must not discard an otherwise valid graph or create a bogus watch. */
             if (srv->watcher && root_path_looks_usable(proj_verify.root_path)) {
                 cbm_watcher_watch(srv->watcher, project, proj_verify.root_path);
             }
+            CBM_PROF_START(prof_resolve_session_sync);
             sync_session_from_open_project(srv, srv->store, db_project, &proj_verify);
+            CBM_PROF_END("resolve_store", "session_sync", prof_resolve_session_sync);
             cbm_project_free_fields(&proj_verify);
             srv->owns_store = true;
             free(srv->current_project);
@@ -17638,7 +17648,9 @@ static void release_request_store(cbm_mcp_server_t *srv) {
         return;
     }
 #endif
+    CBM_PROF_START(prof_request_store_close);
     cbm_store_close(srv->store);
+    CBM_PROF_END("request_release_store", "store_close", prof_request_store_close);
     srv->store = NULL;
     free(srv->current_project);
     srv->current_project = NULL;
@@ -17650,10 +17662,14 @@ static void release_request_store(cbm_mcp_server_t *srv) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (!srv->skip_request_mem_collect_for_testing) {
         srv->request_mem_collect_count_for_testing++;
+        CBM_PROF_START(prof_request_mem_collect);
         cbm_mem_collect();
+        CBM_PROF_END("request_release_store", "mem_collect", prof_request_mem_collect);
     }
 #else
+    CBM_PROF_START(prof_request_mem_collect);
     cbm_mem_collect();
+    CBM_PROF_END("request_release_store", "mem_collect", prof_request_mem_collect);
 #endif
 }
 
