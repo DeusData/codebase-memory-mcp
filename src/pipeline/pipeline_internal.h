@@ -259,6 +259,20 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
  * creates IMPLEMENTS + OVERRIDE edges. Returns edge count created. */
 int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
 
+/* Edge type for an explicit base-class relation, keyed off the resolved
+ * TARGET node's label: Interface → IMPLEMENTS, anything else → INHERITS.
+ * The single decision point for BOTH the sequential semantic pass and the
+ * parallel per-file resolve — the two venues must never diverge. */
+const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
+
+/* Explicit-language override detection on the full graph (serial tail).
+ * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches
+ * the class's DEFINES_METHOD children by name against the base's and creates
+ * Method→Method OVERRIDE edges (Java @Override, TS/C#/Kotlin override, PHP
+ * redefinition). Go is excluded: implicit satisfaction already covers it.
+ * Returns edge count created. */
+int cbm_pipeline_override_explicit(cbm_pipeline_ctx_t *ctx);
+
 /* ── Git diff helpers (pass_gitdiff.c) ───────────────────────────── */
 
 typedef struct {
@@ -267,17 +281,12 @@ typedef struct {
     char old_path[CBM_SZ_512]; /* non-empty only for renames */
 } cbm_changed_file_t;
 
-typedef struct {
-    char path[CBM_SZ_512];
-    int start_line;
-    int end_line;
-} cbm_changed_hunk_t;
+/* cbm_changed_hunk_t + cbm_parse_hunks moved to pipeline.h (public — consumed
+ * by src/mcp/mcp.c's detect_changes for line-scoped seed detection). Visible
+ * here via the `#include "pipeline/pipeline.h"` above. */
 
 /* Parse git diff --name-status output. Returns count written to out. */
 int cbm_parse_name_status(const char *output, cbm_changed_file_t *out, int max_out);
-
-/* Parse git diff --unified=0 output. Returns count written to out. */
-int cbm_parse_hunks(const char *output, cbm_changed_hunk_t *out, int max_out);
 
 /* Parse "start,count" or "start" → (start, count). */
 void cbm_parse_range(const char *s, int *out_start, int *out_count);
@@ -630,6 +639,22 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+
+/* Test seam: invoked after a complete staging DB is sealed and immediately
+ * before the cancellation check + atomic replace. Not part of the public API. */
+void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
+                                            int (*hook)(const char *, const char *, void *),
+                                            void *ctx);
+
+/* Synchronous thread-local seam for deterministic cross-repo cancellation
+ * tests. The callback runs immediately after a CROSS_* edge is committed and
+ * is never retained; it must not re-enter cross-repo matching. */
+typedef void (*cbm_cross_repo_after_insert_test_hook_t)(const char *project, const char *edge_type,
+                                                        void *context);
+void cbm_cross_repo_set_after_insert_hook_for_tests(cbm_cross_repo_after_insert_test_hook_t hook,
+                                                    void *context);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

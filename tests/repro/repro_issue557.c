@@ -74,6 +74,7 @@
  */
 
 #include <foundation/compat.h>
+#include <foundation/compat_fs.h>
 #include "test_framework.h"
 
 #include <store/store.h>
@@ -94,6 +95,95 @@
 static int file_exists(const char *path) {
     struct stat st;
     return (stat(path, &st) == 0) ? 1 : 0;
+}
+
+/* Unique quarantine generations use:
+ *
+ *   <project>.db.corrupt.<16-hex-token>
+ *
+ * Only the main DB generation proves recoverability. SQLite sidecars and
+ * reservation artifacts (for example, -wal, -shm, or .pending) must not make
+ * the primary survival assertion pass on their own. */
+static int is_hex_digit(char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+}
+
+static int is_unique_corrupt_main_name(const char *name) {
+    char prefix[CBM_DIRENT_NAME_MAX];
+    snprintf(prefix, sizeof(prefix), "%s.db.corrupt.", REPRO557_PROJECT);
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(name, prefix, prefix_len) != 0) {
+        return 0;
+    }
+
+    const char *token = name + prefix_len;
+    if (strlen(token) != 16) {
+        return 0;
+    }
+    for (size_t i = 0; i < 16; i++) {
+        if (!is_hex_digit(token[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int unique_corrupt_main_exists(const char *cache_dir) {
+    cbm_dir_t *dir = cbm_opendir(cache_dir);
+    if (!dir) {
+        return 0;
+    }
+
+    int found = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (!is_unique_corrupt_main_name(entry->name)) {
+            continue;
+        }
+        char path[800];
+        snprintf(path, sizeof(path), "%s/%s", cache_dir, entry->name);
+        if (file_exists(path)) {
+            found = 1;
+            break;
+        }
+    }
+    cbm_closedir(dir);
+    return found;
+}
+
+static int is_backup_artifact_name(const char *name) {
+    char corrupt_prefix[CBM_DIRENT_NAME_MAX];
+    char bak_prefix[CBM_DIRENT_NAME_MAX];
+    snprintf(corrupt_prefix, sizeof(corrupt_prefix), "%s.db.corrupt", REPRO557_PROJECT);
+    snprintf(bak_prefix, sizeof(bak_prefix), "%s.db.bak", REPRO557_PROJECT);
+
+    size_t corrupt_len = strlen(corrupt_prefix);
+    if (strncmp(name, corrupt_prefix, corrupt_len) == 0 &&
+        (name[corrupt_len] == '\0' || name[corrupt_len] == '.' || name[corrupt_len] == '-')) {
+        return 1;
+    }
+
+    size_t bak_len = strlen(bak_prefix);
+    return strncmp(name, bak_prefix, bak_len) == 0 &&
+           (name[bak_len] == '\0' || name[bak_len] == '.' || name[bak_len] == '-');
+}
+
+static void cleanup_backup_artifacts(const char *cache_dir) {
+    cbm_dir_t *dir = cbm_opendir(cache_dir);
+    if (!dir) {
+        return;
+    }
+
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (!is_backup_artifact_name(entry->name)) {
+            continue;
+        }
+        char path[800];
+        snprintf(path, sizeof(path), "%s/%s", cache_dir, entry->name);
+        cbm_unlink(path);
+    }
+    cbm_closedir(dir);
 }
 
 /* ── Test ─────────────────────────────────────────────────────────────
@@ -230,9 +320,10 @@ TEST(repro_issue557_corrupt_db_not_silently_deleted) {
      *   (a) the original DB still exists at db_path (zero deletion), or
      *   (b) a backup file exists at a conventional backup path.
      *
-     * Two conventional backup suffixes from the suggested fix in #557:
-     *   "<db_path>.corrupt"  -- timestamped or plain rename
-     *   "<db_path>.bak"      -- simpler alternative
+     * Accepted backup forms from the suggested fix in #557:
+     *   "<db_path>.corrupt.<16-hex-token>" -- unique quarantine generation
+     *   "<db_path>.corrupt"                -- legacy plain rename
+     *   "<db_path>.bak"                    -- simpler alternative
      *
      * WHY RED on buggy code:
      *   cbm_unlink(path) at mcp.c:803 removes the file.
@@ -244,19 +335,19 @@ TEST(repro_issue557_corrupt_db_not_silently_deleted) {
 
     char backup_corrupt[720], backup_bak[720];
     snprintf(backup_corrupt, sizeof(backup_corrupt), "%s.corrupt", db_path);
-    snprintf(backup_bak,     sizeof(backup_bak),     "%s.bak",     db_path);
-    int backup_exists = file_exists(backup_corrupt) || file_exists(backup_bak);
+    snprintf(backup_bak, sizeof(backup_bak), "%s.bak", db_path);
+    int backup_exists = unique_corrupt_main_exists(tmp_cache) || file_exists(backup_corrupt) ||
+                        file_exists(backup_bak);
 
     /* Clean up temp dir (best effort -- before the assertion so the dir
      * is removed even when the assertion fails and longjmp unwinds). */
     unlink(db_path);
-    unlink(backup_corrupt);
-    unlink(backup_bak);
     char wal[730], shm[730];
     snprintf(wal, sizeof(wal), "%s-wal", db_path);
     snprintf(shm, sizeof(shm), "%s-shm", db_path);
     unlink(wal);
     unlink(shm);
+    cleanup_backup_artifacts(tmp_cache);
     rmdir(tmp_cache);
 
 #if defined(_WIN32)
@@ -269,7 +360,7 @@ TEST(repro_issue557_corrupt_db_not_silently_deleted) {
      * THE KEY ASSERTION -- must be RED on unpatched code:
      *
      *   db_still_exists  -- 1 if the DB was preserved in-place (zero-delete fix)
-     *   backup_exists    -- 1 if a .corrupt or .bak rename was made (quarantine fix)
+     *   backup_exists    -- 1 if a main .corrupt generation or .bak rename exists
      *
      * On buggy code: both are 0 because cbm_unlink() ran with no backup.
      * On fixed code: at least one is 1.

@@ -16,14 +16,41 @@ cd "$ROOT"
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
 
+usage() {
+    cat <<'EOF'
+Usage: scripts/lint.sh [--ci] [VAR=VAL ...]
+
+The canonical lint entry: CI (_lint.yml) calls this script; it drives the same
+Makefile.cbm lint targets `make lint`/`make lint-ci` run, plus the no-skips
+policy check. Runs clang-tidy + cppcheck + clang-format by default.
+
+Options:
+  --ci            CI mode: cppcheck + clang-format only (no clang-tidy) —
+                  exactly what _lint.yml gates on. `make lint-ci` uses this.
+  VAR=VAL         Forwarded to make, e.g. CLANG_FORMAT=clang-format-20.
+                  NOTE: the project formatter is the Homebrew LLVM build; a
+                  standalone clang-format-20 produces false whole-file drift.
+  -h, --help      This text.
+EOF
+}
+
 # Check for --ci flag (skip clang-tidy for platforms without it)
 CI_ONLY=false
 MAKE_ARGS=()
 for arg in "$@"; do
-    if [ "$arg" = "--ci" ]; then
+    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+        usage; exit 0
+    elif [ "$arg" = "--ci" ]; then
         CI_ONLY=true
     else
-        MAKE_ARGS+=("$arg")
+        # STRICT: only VAR=VAL make passthrough beyond the known flags.
+        case "$arg" in
+        *=*) MAKE_ARGS+=("$arg") ;;
+        *)
+            echo "lint.sh: unknown argument '$arg'. Please consult --help." >&2
+            exit 2
+            ;;
+        esac
     fi
 done
 

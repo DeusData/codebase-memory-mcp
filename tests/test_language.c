@@ -1,7 +1,7 @@
 /*
  * test_language.c — Tests for language detection (filename + extension).
  *
- * RED phase: These tests define the expected behavior for all 64 languages.
+ * RED phase: These tests define the expected behavior for registered languages.
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"

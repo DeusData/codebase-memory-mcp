@@ -65,6 +65,8 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+
+#include <stdatomic.h>
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -653,19 +655,29 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
     }
 }
 
-static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
+static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool create) {
     cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
         return NULL;
     }
 
-    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
     if (in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
+    char open_path[4096];
+    const char *effective_path = path;
+    if (path && !in_memory) {
+        if (!cbm_path_for_file_api(path, open_path, sizeof(open_path))) {
+            free(s);
+            return NULL;
+        }
+        effective_path = open_path;
+    }
+    int rc = sqlite3_open_v2(effective_path, &s->db, flags, NULL);
     if (rc != SQLITE_OK) {
+        sqlite3_close(s->db);
         free(s);
         return NULL;
     }
@@ -702,15 +714,40 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     return s;
 }
 
+/* ── Shared page-cache slab ──────────────────────────────────────────
+ *
+ * Every request opens its own short-lived read-only store, and SQLite serves
+ * that connection's page cache from the general allocator. Measured on native
+ * Windows (#581): those blocks land in the allocator's MEDIUM size class, and a
+ * handful of survivors pin a 512 KiB page each — 140 pages held ~1.4 MiB of
+ * live data, roughly 2% occupancy, which no purge can reclaim because the pages
+ * are in use rather than free. The arena census confirmed the allocator was
+ * behaving correctly: zero free-committed slices, 58% already returned to the
+ * OS. The problem was allocation SHAPE, not retention.
+ *
+ * Giving SQLite one contiguous slab to serve page cache from makes that memory
+ * dense and bounded, and — because the slab is reused across connections —
+ * removes the per-request churn that did the pinning. Costs a fixed upfront
+ * commit, which is the point: bounded beats unbounded.
+ *
+ * Must run before SQLite initialises, so it is done once on the first open. */
+
 cbm_store_t *cbm_store_open_memory(void) {
-    return store_open_internal(":memory:", true);
+    return store_open_internal(":memory:", true, true);
 }
 
 cbm_store_t *cbm_store_open_path(const char *db_path) {
     if (!db_path) {
         return NULL;
     }
-    return store_open_internal(db_path, false);
+    return store_open_internal(db_path, false, true);
+}
+
+cbm_store_t *cbm_store_open_path_existing(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+    return store_open_internal(db_path, false, false);
 }
 
 const char *cbm_store_db_path(const cbm_store_t *s) {
@@ -799,7 +836,12 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    char open_path[4096];
+    if (!cbm_path_for_file_api(db_path, open_path, sizeof(open_path))) {
+        free(s);
+        return NULL;
+    }
+    int rc = sqlite3_open_v2(open_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
@@ -951,7 +993,7 @@ cbm_store_t *cbm_store_open(const char *project) {
     }
     char path[CBM_SZ_1K];
     snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
-    return store_open_internal(path, false);
+    return store_open_internal(path, false, true);
 }
 
 static void finalize_stmt(sqlite3_stmt **s) {
@@ -1114,6 +1156,99 @@ int cbm_store_checkpoint(cbm_store_t *s) {
                      "concurrent readers block the WAL reset — the -wal file keeps growing");
     }
     return exec_sql(s, "PRAGMA optimize;");
+}
+
+static int prepare_sqlite_for_publish(sqlite3 *db) {
+    if (!db) {
+        return CBM_STORE_ERR;
+    }
+    int log_frames = -1;
+    int checkpointed_frames = -1;
+    int rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log_frames,
+                                       &checkpointed_frames);
+    if (rc != SQLITE_OK || (log_frames >= 0 && checkpointed_frames != log_frames)) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA journal_mode=DELETE;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bool delete_mode = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+        delete_mode = mode && strcmp(mode, "delete") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return delete_mode ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+int cbm_store_prepare_for_publish(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    return prepare_sqlite_for_publish(s->db);
+}
+
+int cbm_store_prepare_path_for_replace(const char *path) {
+    if (!path) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(db, 10000);
+    int result = prepare_sqlite_for_publish(db);
+    if (sqlite3_close(db) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    return result;
+}
+
+int cbm_store_backup_path(const char *source_path, const char *staging_path) {
+    if (!source_path || !staging_path) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_remove_db_sidecars(staging_path) != 0) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3 *source = NULL;
+    sqlite3 *dest = NULL;
+    int rc = sqlite3_open_v2(source_path, &source, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(source, 10000);
+    rc = sqlite3_open_v2(staging_path, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(dest);
+        sqlite3_close(source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(dest, 10000);
+
+    sqlite3_backup *backup = sqlite3_backup_init(dest, "main", source, "main");
+    int result = CBM_STORE_ERR;
+    if (backup) {
+        int step_rc = sqlite3_backup_step(backup, CBM_NOT_FOUND);
+        int finish_rc = sqlite3_backup_finish(backup);
+        if (step_rc == SQLITE_DONE && finish_rc == SQLITE_OK) {
+            result = CBM_STORE_OK;
+        }
+    }
+    if (sqlite3_close(dest) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    if (sqlite3_close(source) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    return result;
 }
 
 /* #1083: the WAL size limit configured on this (write) connection, in bytes.
@@ -5141,7 +5276,7 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase =
         "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
-        "('Function','Method','Class')";
+        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", nbase, arch_path_scope_sql());
     } else {
@@ -5284,7 +5419,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char qsqlbuf[ST_SQL_BUF];
     const char *qbase = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
-                        "('Function','Method','Class')";
+                        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     if (scoped) {
         snprintf(qsqlbuf, sizeof(qsqlbuf), "%s%s", qbase, arch_path_scope_sql());
     } else {
@@ -6551,7 +6686,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase = "SELECT id, name, qualified_name, file_path FROM nodes "
-                        "WHERE project=?1 AND label IN ('Function','Method','Class')";
+                        "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", nbase,
                  arch_path_scope_sql());
@@ -7002,12 +7137,33 @@ cbm_adr_sections_t cbm_adr_parse_sections(const char *content) {
     return result;
 }
 
-/* Append a section to the render buffer. */
+/* Append a section to the render buffer.
+ *
+ * snprintf returns the length it WOULD have written, so a section larger than
+ * the space left would otherwise push pos past buf_sz; the next call would then
+ * compute a wrapped (huge) remaining size from (buf_sz - pos) and write out of
+ * bounds. Clamp pos into [0, buf_sz-1] after every write so each snprintf gets
+ * a positive size and the returned cursor never escapes the buffer. */
 static int adr_render_section(char *buf, int buf_sz, int pos, const char *key, const char *value) {
-    if (pos > 0) {
-        pos += snprintf(buf + pos, buf_sz - pos, "\n\n");
+    if (buf_sz <= 0) {
+        return 0;
     }
-    pos += snprintf(buf + pos, buf_sz - pos, "## %s\n%s", key, value);
+    if (pos < 0) {
+        pos = 0;
+    }
+    if (pos >= buf_sz) {
+        return buf_sz - SKIP_ONE;
+    }
+    if (pos > 0) {
+        pos += snprintf(buf + pos, (size_t)(buf_sz - pos), "\n\n");
+        if (pos >= buf_sz) {
+            return buf_sz - SKIP_ONE;
+        }
+    }
+    pos += snprintf(buf + pos, (size_t)(buf_sz - pos), "## %s\n%s", key, value);
+    if (pos >= buf_sz) {
+        pos = buf_sz - SKIP_ONE;
+    }
     return pos;
 }
 
@@ -7604,7 +7760,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"
                       " WHERE v.project = ?2"
-                      " AND n.label IN ('Function','Method','Class')"
+                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")"
                       " ORDER BY score DESC"
                       " LIMIT ?3";
 

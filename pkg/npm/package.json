@@ -26,6 +26,7 @@
     "codebase-memory-mcp": "./bin.js"
   },
   "scripts": {
+    "test": "node --test test/*.test.js",
     "postinstall": "node install.js"
   },
   "engines": {

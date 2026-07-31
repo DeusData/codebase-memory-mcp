@@ -6,6 +6,7 @@
  * RETURN with COUNT/ORDER BY/LIMIT/DISTINCT.
  */
 #include "cypher/cypher.h"
+#include "foundation/compat.h"
 #include "store/store.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
@@ -35,6 +36,7 @@ enum {
 #define CYP_DBL_MAX 1e308
 
 #include <ctype.h>
+#include <limits.h> // INT_MAX
 #include "foundation/compat_regex.h"
 #include <stddef.h>
 #include <stdint.h> // int64_t
@@ -1020,11 +1022,11 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     }
     cbm_node_pattern_t anchor = {0};
     cbm_rel_pattern_t rel = {0};
-    cbm_node_pattern_t far = {0};
-    if (parse_node(p, &anchor) < 0 || parse_rel(p, &rel) < 0 || parse_node(p, &far) < 0) {
+    cbm_node_pattern_t far_node = {0};
+    if (parse_node(p, &anchor) < 0 || parse_rel(p, &rel) < 0 || parse_node(p, &far_node) < 0) {
         free_one_node_pattern(&anchor);
         free_one_rel_pattern(&rel);
-        free_one_node_pattern(&far);
+        free_one_node_pattern(&far_node);
         snprintf(p->error, sizeof(p->error),
                  "unsupported EXISTS pattern — only the single-hop form "
                  "'(var)-[:TYPE]->()' is supported");
@@ -1042,7 +1044,7 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
                                                                             : 0;
     free_one_node_pattern(&anchor);
     free_one_rel_pattern(&rel);
-    free_one_node_pattern(&far);
+    free_one_node_pattern(&far_node);
     return expr_leaf(c);
 }
 
@@ -1836,23 +1838,33 @@ static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
         advance(p);
         char buf[CBM_SZ_2K] = "[";
         int blen = SKIP_ONE;
+        /* snprintf returns the length it WOULD have written, so a single
+         * oversized token (string literals lex up to CBM_SZ_4K-1) can push
+         * blen past sizeof(buf). Clamp after every write and guard the raw
+         * buf[blen++] stores, mirroring format_collect_list(). */
+        const int cap = (int)sizeof(buf);
         while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-            if (blen > SKIP_ONE) {
+            if (blen > SKIP_ONE && blen < cap - SKIP_ONE) {
                 buf[blen++] = ',';
             }
             if (check(p, TOK_STRING)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "\"%s\"", peek(p)->text);
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "\"%s\"", peek(p)->text);
                 advance(p);
             } else if (check(p, TOK_NUMBER)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "%s", peek(p)->text);
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "%s", peek(p)->text);
                 advance(p);
             } else {
                 advance(p);
             }
+            if (blen >= cap) {
+                blen = cap - SKIP_ONE;
+            }
             match(p, TOK_COMMA);
         }
         expect(p, TOK_RBRACKET);
-        buf[blen++] = ']';
+        if (blen < cap - SKIP_ONE) {
+            buf[blen++] = ']';
+        }
         buf[blen] = '\0';
         q->unwind_expr = heap_strdup(buf);
     } else if (check(p, TOK_IDENT)) {
@@ -2343,7 +2355,7 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
     return buf;
 }
 
-/* Get edge property by name. Uses rotating static buffers to allow
+/* Get edge property by name. Uses rotating thread-local buffers to allow
  * multiple concurrent calls (e.g. projecting r.url_path, r.confidence
  * in the same row). */
 static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
@@ -2353,9 +2365,9 @@ static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
     if (strcmp(prop, "type") == 0) {
         return e->type ? e->type : "";
     }
-    /* Rotate through 8 static buffers so multiple props can be accessed per row */
-    static char ebufs[CYP_BUF_8][CBM_SZ_512];
-    static int ebuf_idx = 0;
+    /* Rotate through 8 thread-local buffers so multiple props can be accessed per row. */
+    static CBM_TLS char ebufs[CYP_BUF_8][CBM_SZ_512];
+    static CBM_TLS int ebuf_idx = 0;
     char *buf = ebufs[ebuf_idx++ & CYP_EBUF_MASK];
     json_extract_prop(e->properties_json, prop, buf, CBM_SZ_512);
     return buf;
@@ -3221,7 +3233,15 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + SKIP_ONE;
+        /* Size this hop's output for BOTH writers without dropping any row: the
+         * expansion helpers emit at most max_new = bind_cap*10 rows (they stop at
+         * max_new), and the OPTIONAL fallback emits at most one row per source
+         * (<= *bind_count). A source either matches (feeds the expansion) or takes
+         * the fallback, never both, so the two counts are additive and bounded by
+         * max_new + *bind_count. Computed in size_t so the product cannot overflow.
+         * The previous "+ 1" sizing fit only a SINGLE fallback row after a
+         * saturated expansion; a second one ran off the end (heap OOB, CWE-787). */
+        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + (size_t)*bind_count;
         binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
         if (!new_bindings) {
             return; /* OOM: leave existing bindings untouched rather than corrupt */
@@ -3249,7 +3269,10 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                                     &new_count, max_new, &match_count);
             }
 
-            /* OPTIONAL MATCH: keep binding with empty target if no matches */
+            /* OPTIONAL MATCH: no expansion for this source, so keep the binding
+             * with the target unbound (projection renders it ""). The buffer is
+             * sized max_new + *bind_count precisely so every such fallback row has
+             * a slot — no guard needed, and no OPTIONAL no-match row is dropped. */
             if (is_optional && match_count == 0) {
                 binding_t nb = {0};
                 binding_copy(&nb, b);
@@ -3719,10 +3742,11 @@ typedef struct {
 static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
     int kl = 0;
     for (int ci = 0; ci < wc->count; ci++) {
-        if (wc->items[ci].func) {
+        if (is_aggregate_func(wc->items[ci].func)) {
             continue;
         }
-        const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
+        char vbuf[CBM_SZ_512];
+        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
         if (kl >= (int)key_sz) {
             kl = (int)key_sz - SKIP_ONE;
@@ -3758,16 +3782,21 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
     }
     for (int ci = 0; ci < wc->count; ci++) {
-        if (wc->items[ci].func) {
+        if (is_aggregate_func(wc->items[ci].func)) {
             (*aggs)[found].group_vals[ci] = heap_strdup("0");
             continue;
         }
-        const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
+        char vbuf[CBM_SZ_512];
+        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
         /* If this group item is a bare node variable, remember its id so the
          * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). */
-        if (!wc->items[ci].property && wc->items[ci].variable) {
+         * the name). Excludes entity-introspection funcs (labels/id/keys/
+         * properties): those project a scalar off the node (via project_item
+         * above), not the node itself, so the carried id must not be set or a
+         * later alias.property re-fetches the source node's real properties
+         * instead of returning empty for the non-node alias. */
+        if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
             cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
             if (gn) {
                 (*aggs)[found].group_node_ids[ci] = gn->id;
@@ -3780,7 +3809,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
 /* Accumulate aggregation values for a binding */
 static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
-        if (!wc->items[ci].func) {
+        if (!is_aggregate_func(wc->items[ci].func)) {
             continue;
         }
         agg->counts[ci]++;
@@ -3875,7 +3904,7 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-            if (wc->items[ci].func) {
+            if (is_aggregate_func(wc->items[ci].func)) {
                 char vbuf[CBM_SZ_64];
                 if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
                     snprintf(vbuf, sizeof(vbuf), "%d", aggs[a].distinct_n[ci]); /* #239 */
@@ -4174,7 +4203,7 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 /* Accumulate a binding into RETURN aggregation */
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!ret->items[ci].func) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
             continue;
         }
         entry->counts[ci]++;
@@ -4226,7 +4255,7 @@ static void ret_agg_build_key(cbm_return_clause_t *ret, binding_t *b, char *key,
                               const char **vals, char valbufs[][CBM_SZ_512]) {
     int klen = 0;
     for (int ci = 0; ci < ret->count; ci++) {
-        if (ret->items[ci].func) {
+        if (is_aggregate_func(ret->items[ci].func)) {
             vals[ci] = "0";
             continue;
         }
@@ -4250,7 +4279,7 @@ static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, res
     const char *row[CBM_SZ_32];
     char bufs[CBM_SZ_32][CBM_SZ_64];
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!ret->items[ci].func) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
             row[ci] = agg->group_vals[ci];
             continue;
         }
@@ -4400,19 +4429,53 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
     }
 }
 
-/* Cross-join node-only pattern into existing bindings */
-static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
-                             int extra_count, const char *nvar, bool opt) {
-    binding_t *new_bindings = malloc(((*bind_count * extra_count) + SKIP_ONE) * sizeof(binding_t));
-    int new_count = 0;
+/* Worst-case binding_t slot count for a node cross-join: one row per
+ * (existing binding × extra node), plus — for an OPTIONAL join with no extra
+ * nodes — one fallback row per existing binding, plus a trailing sentinel slot.
+ *
+ * The plain-int product bind_count * extra_count overflows to a negative/garbage
+ * malloc size on large graphs (the failure mode fixed for cross_join_with_rels),
+ * so the count is computed in size_t and rejected if it would not fit the int
+ * binding counter or would overflow the size_t byte size. Returns 0 and writes
+ * *out_n on success, CBM_NOT_FOUND on overflow. Non-static so the arithmetic
+ * boundary can be unit-tested directly. */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n) {
+    size_t per_binding = extra_count > 0 ? (size_t)extra_count : (opt ? (size_t)SKIP_ONE : 0U);
+    size_t rows = (size_t)bind_count * per_binding;
+    if (rows > (size_t)INT_MAX) {
+        return CBM_NOT_FOUND; /* new_count would not fit the int binding counter */
+    }
+    size_t n = rows + SKIP_ONE;
+    if (n > SIZE_MAX / sizeof(binding_t)) {
+        return CBM_NOT_FOUND; /* alloc_n * sizeof(binding_t) would overflow size_t */
+    }
+    *out_n = n;
+    return 0;
+}
+
+/* Cross-join node-only pattern into existing bindings. Returns 0 on success,
+ * CBM_NOT_FOUND when the allocation is refused (overflow) or fails (OOM); the
+ * caller propagates that as a query error rather than silently skipping the
+ * MATCH, which would return a wrong (short) result. */
+static int cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
+                            int extra_count, const char *nvar, bool opt) {
+    size_t alloc_n = 0;
+    if (cbm_cypher_cross_join_alloc(*bind_count, extra_count, opt, &alloc_n) != 0) {
+        return CBM_NOT_FOUND; /* product overflows int/size_t: fail the query */
+    }
+    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    if (!new_bindings) {
+        return CBM_NOT_FOUND; /* OOM: propagate, don't silently skip the MATCH */
+    }
+    size_t new_count = 0;
     for (int bi = 0; bi < *bind_count; bi++) {
-        for (int ni = 0; ni < extra_count; ni++) {
+        for (int ni = 0; ni < extra_count && new_count < alloc_n; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
             new_bindings[new_count++] = nb;
         }
-        if (opt && extra_count == 0) {
+        if (opt && extra_count == 0 && new_count < alloc_n) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             new_bindings[new_count++] = nb;
@@ -4423,7 +4486,8 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
     }
     free(*bindings);
     *bindings = new_bindings;
-    *bind_count = new_count;
+    *bind_count = (int)new_count; /* new_count <= INT_MAX, guaranteed above */
+    return 0;
 }
 
 /* Cross-join pattern-with-rels into existing bindings */
@@ -4562,9 +4626,9 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
 }
 
 /* Expand additional MATCH patterns (pi >= 1) */
-static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
-                                       int max_rows, binding_t **bindings, int *bind_count,
-                                       int *bind_cap) {
+static int expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
+                                      int max_rows, binding_t **bindings, int *bind_count,
+                                      int *bind_cap) {
     for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
         cbm_pattern_t *patn = &q->patterns[pi];
         bool opt = q->pattern_optional[pi];
@@ -4593,14 +4657,19 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
         scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+        int rc = 0;
         if (patn->rel_count == 0) {
-            cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
+            rc = cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
         } else {
             cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count, nvar,
                                  opt);
         }
         cbm_store_free_nodes(extra_nodes, extra_count);
+        if (rc != 0) {
+            return rc; /* allocation refused/failed: propagate as a query error */
+        }
     }
+    return 0;
 }
 
 /* Project RETURN clause results */
@@ -4667,7 +4736,15 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                         q->pattern_optional[0]);
 
     /* Step 2b: Additional patterns */
-    expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap);
+    if (expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count,
+                                   &bind_cap) != 0) {
+        for (int bi = 0; bi < bind_count; bi++) {
+            binding_free(&bindings[bi]);
+        }
+        free(bindings);
+        cbm_store_free_nodes(scanned, scan_count);
+        return CBM_NOT_FOUND; /* cross-join allocation refused/failed */
+    }
 
     /* Step 3: Late WHERE */
     if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
@@ -4712,9 +4789,10 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     }
 
     result_builder_t rb = {0};
-    // cppcheck-suppress knownConditionTrueFalse
     if (execute_single(store, q, project, max_rows, &rb) < 0) {
+        rb_free(&rb);
         cbm_query_free(q);
+        out->error = heap_strdup("query aborted: out of memory or an allocation limit was reached");
         return CBM_NOT_FOUND;
     }
 
@@ -4722,11 +4800,12 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     cbm_query_t *uq = q->union_next;
     while (uq) {
         result_builder_t rb2 = {0};
-        // cppcheck-suppress knownConditionTrueFalse
         if (execute_single(store, uq, project, max_rows, &rb2) < 0) {
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
+            out->error =
+                heap_strdup("query aborted: out of memory or an allocation limit was reached");
             return CBM_NOT_FOUND;
         }
         /* Concatenate rows from rb2 into rb */

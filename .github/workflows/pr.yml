@@ -52,6 +52,10 @@ jobs:
       # Perf assertions are timing-sensitive on shared runners; they stay in
       # dry runs and releases where a flaky red does not block a merge.
       skip_perf: true
+      # Iteration speed: split each C-suite leg across parallel shard jobs
+      # (ubuntu x3, windows x2; coverage re-proven every run by the
+      # shard-completeness job). Dry runs and releases shard identically.
+      shard_suites: true
 
   # ── Which files changed? Gate the (heavier) build+smoke on product code so
   #    docs / CI / test-only PRs stay fast. ──
@@ -73,7 +77,7 @@ jobs:
           # The paginated files endpoint remains filename-only for this gate.
           FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
           printf '%s\n' "$FILES"
-          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|scripts/build\.sh|scripts/smoke-test\.sh|scripts/env\.sh|Makefile\.cbm)'; then
+          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
@@ -89,8 +93,8 @@ jobs:
   #    time (e.g. the Windows CreateProcess argv-quoting class that previously
   #    only surfaced in the release dry run). The full broad/emulated smoke stays
   #    in the dry run. Only product-code PRs pay this; every leg gates.
-  #    SMOKE_DOWNLOAD_URL is intentionally unset — the download/update phases of
-  #    smoke-test.sh self-skip; the core index/search/trace phases still run. ──
+  #    The maintained local wrappers add a race-free release fixture so the
+  #    download/checksum/install/update phases run here as well. ──
   pr-smoke:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
@@ -105,7 +109,11 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      - name: Install ccache (macOS)
+        if: matrix.os == 'macos-14'
+        run: command -v ccache >/dev/null 2>&1 || brew install ccache
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         if: matrix.os == 'windows-latest'
@@ -116,30 +124,51 @@ jobs:
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
             mingw-w64-clang-x86_64-python3
+            mingw-w64-clang-x86_64-ccache
             make
             coreutils
+            curl
+            zip
+            unzip
+
+      # Verified compiler cache — content-keyed, stale hits impossible by
+      # construction (see scripts/env.sh).
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-smoke-${{ matrix.os }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-smoke-${{ matrix.os }}-${{ github.ref }}-
 
       - name: Build prod + smoke (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
           scripts/build.sh CC=gcc CXX=g++
-          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1000M
 
       - name: Build prod + smoke (macOS)
         if: matrix.os == 'macos-14'
         run: |
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp
-          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1000M
 
       - name: Build prod + smoke (Windows)
         if: matrix.os == 'windows-latest'
         shell: msys2 {0}
         run: |
           scripts/build.sh CC=clang CXX=clang++
-          BIN="$(pwd)/build/c/codebase-memory-mcp"
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/smoke-test.sh "$BIN"
+          SMOKE_ARCH=amd64 bash test-infrastructure/vm/vm-smoke.sh
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1000M
 
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage
@@ -150,16 +179,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Needs a checkout (unlike before): the gate logic lives in the canonical
+      # scripts/ci entry, not inline YAML (venue-parity contract).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: All PR stages must have succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: |
-          echo "$RESULTS" | python3 -c "
-          import json, sys
-          needs = json.load(sys.stdin)
-          bad = {k: v['result'] for k, v in needs.items() if v['result'] not in ('success', 'skipped')}
-          if bad:
-              print('CI NOT OK:', bad)
-              sys.exit(1)
-          print('CI OK:', ', '.join(needs))
-          "
+        run: scripts/ci/require-all-green.sh

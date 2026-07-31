@@ -59,7 +59,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
 
@@ -79,15 +79,10 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: codesign --sign - --force build/c/codebase-memory-mcp
 
-      - name: Archive standard binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-${GOOS}-${GOARCH}.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+      # Archive layout/name live in the ONE canonical script the local
+      # artifact-flow smoke lane also runs (venue-parity contract).
+      - name: Archive standard binary (canonical package-release.sh)
+        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
       - name: Attest standard binary provenance
         if: ${{ inputs.attest }}
@@ -115,15 +110,8 @@ jobs:
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: scripts/security-ui.sh
 
-      - name: Archive UI binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-ui-${GOOS}-${GOARCH}.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+      - name: Archive UI binary (canonical package-release.sh)
+        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }} --variant ui
 
       - name: Attest UI binary provenance
         if: ${{ inputs.attest }}
@@ -152,7 +140,7 @@ jobs:
             make
             zip
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
 
@@ -167,14 +155,11 @@ jobs:
             scripts/build.sh CC=clang CXX=clang++
           fi
 
-      - name: Archive standard binary
+      # Archive layout/name live in the ONE canonical script the local
+      # artifact-flow smoke lane also runs (venue-parity contract).
+      - name: Archive standard binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+        run: scripts/package-release.sh windows amd64 CC=clang CXX=clang++
 
       - name: Attest standard binary provenance
         if: ${{ inputs.attest }}
@@ -193,14 +178,9 @@ jobs:
             scripts/build.sh --with-ui CC=clang CXX=clang++
           fi
 
-      - name: Archive UI binary
+      - name: Archive UI binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+        run: scripts/package-release.sh windows amd64 --variant ui CC=clang CXX=clang++
 
       - name: Attest UI binary provenance
         if: ${{ inputs.attest }}
@@ -233,7 +213,7 @@ jobs:
             make
             zip
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
 
@@ -248,14 +228,9 @@ jobs:
             scripts/build.sh CC=clang CXX=clang++
           fi
 
-      - name: Archive standard binary
+      - name: Archive standard binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+        run: scripts/package-release.sh windows arm64 CC=clang CXX=clang++
 
       - name: Attest standard binary provenance
         if: ${{ inputs.attest }}
@@ -274,14 +249,9 @@ jobs:
             scripts/build.sh --with-ui CC=clang CXX=clang++
           fi
 
-      - name: Archive UI binary
+      - name: Archive UI binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+        run: scripts/package-release.sh windows arm64 --variant ui CC=clang CXX=clang++
 
       - name: Attest UI binary provenance
         if: ${{ inputs.attest }}
@@ -313,7 +283,7 @@ jobs:
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
 
@@ -332,14 +302,8 @@ jobs:
           file build/c/codebase-memory-mcp
           ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
 
-      - name: Archive standard binary
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-linux-${ARCH}-portable.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+      - name: Archive standard binary (canonical package-release.sh)
+        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable
 
       - name: Attest standard binary provenance
         if: ${{ inputs.attest }}
@@ -357,14 +321,8 @@ jobs:
             scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
           fi
 
-      - name: Archive UI binary
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-ui-linux-${ARCH}-portable.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+      - name: Archive UI binary (canonical package-release.sh)
+        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable --variant ui
 
       - name: Attest UI binary provenance
         if: ${{ inputs.attest }}

@@ -8,6 +8,11 @@
 
 services:
   # ── Linux test (ASan + UBSan + LeakSanitizer) ──────────────
+  # Always full-parallel: the suite is designed to be core-count-independent
+  # for correctness — timing/scheduling/subprocess suites assert invariants
+  # (ordering, bounded-return, RUNNING poll state), not wall-clock, so they
+  # pass at any parallelism. Artificial CPU starvation belongs to smoke/soak
+  # (CBM_LOCAL_CI_CPUS), not the regular suite.
   test:
     build:
       context: ..
@@ -15,7 +20,13 @@ services:
     platform: linux/arm64
     volumes:
       - ..:/src
-    command: ["CC=gcc", "CXX=g++"]
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64"]
 
   test-amd64:
     build:
@@ -24,7 +35,64 @@ services:
     platform: linux/amd64
     volumes:
       - ..:/src
-    command: ["CC=gcc", "CXX=g++"]
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-amd64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64"]
+
+  # ── ThreadSanitizer (data-race gate) ───────────────────────────
+  # Overrides the default test.sh entrypoint to build + run the widened TSan
+  # suite set. /usr/lib/ccache is first on PATH in the image, so CC=gcc is
+  # ccache-masqueraded automatically (same as the ASan legs).
+  test-tsan:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    # make is PID 1 for this service. Give orphaned subprocess-test descendants
+    # a real reaper so killed zombies do not keep process groups appearing live.
+    init: true
+    volumes:
+      - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    # TSan's shadow memory needs a predictable address space; modern aarch64
+    # kernels' high-entropy mmap ASLR makes its runtime abort with "unexpected
+    # memory mapping" before any test runs. setarch -R (ADDR_NO_RANDOMIZE)
+    # fixes it, but the personality() syscall it uses is blocked by the default
+    # seccomp profile — unconfined is safe here (the container runs only our own
+    # test code). The no-randomize personality inherits to the make child.
+    security_opt: ["seccomp=unconfined"]
+    # The TSan leg lives in the canonical test entry (scripts/test.sh --tsan),
+    # same as CI's tsan jobs; the no-randomize personality inherits through it.
+    entrypoint: ["setarch", "-R", "bash", "scripts/test.sh", "--tsan"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64-tsan"]
+
+  test-tsan-amd64:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/amd64
+    init: true
+    volumes:
+      - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-amd64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    security_opt: ["seccomp=unconfined"]
+    # Canonical test entry, TSan mode — same file as CI's tsan jobs.
+    entrypoint: ["setarch", "-R", "bash", "scripts/test.sh", "--tsan"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64-tsan"]
 
   # ── Linux production build (-O2 -Werror) ───────────────────
   build:
@@ -35,7 +103,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["scripts/build.sh"]
-    command: ["CC=gcc", "CXX=g++"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64"]
 
   build-amd64:
     build:
@@ -45,7 +113,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["scripts/build.sh"]
-    command: ["CC=gcc", "CXX=g++"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64"]
 
   # ── Windows cross-compile + test (llvm-mingw + Wine) ────────
   build-windows:
@@ -64,12 +132,13 @@ services:
     volumes:
       - ..:/src
     command: >-
-      make -j4 -f Makefile.cbm clean-c &&
-      make -j4 -f Makefile.cbm build/c/test-runner
+      make -j4 -f Makefile.cbm clean-c BUILD_DIR=build/win-cross &&
+      make -j4 -f Makefile.cbm build/win-cross/test-runner
+        BUILD_DIR=build/win-cross
         CC=x86_64-w64-mingw32-clang
         CXX=x86_64-w64-mingw32-clang++ &&
       echo '=== Running tests under Wine ===' &&
-      WINEDEBUG=-all wine64 build/c/test-runner.exe &&
+      WINEDEBUG=-all wine64 build/win-cross/test-runner.exe &&
       echo '=== Windows test: OK ==='
 
   # ── Smoke test (build + run smoke-test.sh) ──────────────────
@@ -83,8 +152,8 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=gcc CXX=g++ &&
-        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+        scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
+        scripts/smoke-local.sh ./build/linux-arm64/codebase-memory-mcp
 
   smoke-amd64:
     build:
@@ -96,8 +165,26 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=gcc CXX=g++ &&
-        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+        scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-amd64 &&
+        scripts/smoke-local.sh ./build/linux-amd64/codebase-memory-mcp
+
+  # ── Soak (both CI legs) ────────────────────────────────────
+  # The sequence (quick + #581 query-leak) lives in the canonical entry
+  # scripts/soak-legs.sh — the same file _soak.yml and the Windows VM run.
+  # The local ladder previously had NO unix soak at all. Duration follows
+  # CBM_SOAK_MINUTES (default 10, matching the dry run).
+  soak:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
+        scripts/soak-legs.sh ./build/linux-arm64/codebase-memory-mcp ${CBM_SOAK_MINUTES:-10}
 
   # ── Windows smoke (cross-compile + Wine) ──────────────────
   smoke-windows:
@@ -110,24 +197,10 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ &&
-        mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
-        WINEDEBUG=-all scripts/smoke-test.sh ./build/c/codebase-memory-mcp.exe
-
-  # ── Windows soak (cross-compile + Wine) ───────────────────
-  soak-windows:
-    build:
-      context: ..
-      dockerfile: test-infrastructure/Dockerfile.mingw
-    platform: linux/amd64
-    volumes:
-      - ..:/src
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ &&
-        mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
-        CBM_DIAGNOSTICS=1 WINEDEBUG=-all scripts/soak-test.sh ./build/c/codebase-memory-mcp.exe 10
+        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ BUILD_DIR=build/win-cross &&
+        test ! -e build/win-cross/codebase-memory-mcp.payload.exe &&
+        WINEDEBUG=-all wine64 ./build/win-cross/codebase-memory-mcp.exe --version &&
+        WINEDEBUG=-all wine64 cmd /c build/win-cross/codebase-memory-mcp.exe --version
 
   # ── Linux portable (Alpine musl static) ────────────────────
   test-portable:
@@ -138,7 +211,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["bash", "scripts/test.sh"]
-    command: ["CC=gcc", "CXX=g++"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/alpine"]
 
   build-portable:
     build:
@@ -148,7 +221,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["bash", "scripts/build.sh"]
-    command: ["CC=gcc", "CXX=g++", "STATIC=1"]
+    command: ["CC=gcc", "CXX=g++", "STATIC=1", "BUILD_DIR=build/alpine"]
 
   smoke-portable:
     build:
@@ -160,10 +233,53 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=gcc CXX=g++ STATIC=1 &&
-        file build/c/codebase-memory-mcp | grep -q "statically linked" &&
+        scripts/build.sh CC=gcc CXX=g++ STATIC=1 BUILD_DIR=build/alpine &&
+        file build/alpine/codebase-memory-mcp | grep -q "statically linked" &&
         echo "=== Verified: statically linked ===" &&
-        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
+
+  # ── Artifact-flow smoke (package → extract → wrapper) ──────
+  # The release venue smokes the shipped archive; this lane reproduces that
+  # flow with local bytes via the canonical package-release.sh +
+  # smoke-local.sh artifact mode, so archive-layout bugs surface locally.
+  smoke-artifact:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        BUILD_DIR=build/linux-arm64 \
+          scripts/ci/smoke-artifact.sh linux arm64 CC=gcc CXX=g++
+
+  # ── glibc floor (ubuntu-22.04, glibc 2.35) ─────────────────
+  # Mirrors CI's broad-matrix 22.04 legs: the portable (musl-static) binary
+  # must pass the canonical smoke on the oldest supported userland, and the
+  # dynamic binary must REFUSE to start (glibc 2.38+ floor is by design).
+  smoke-glibc-floor:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.glibc22
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        file build/alpine/codebase-memory-mcp | grep -q "statically linked"
+        echo "=== glibc-floor: portable binary smoke on glibc 2.35 ==="
+        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
+        echo "=== glibc-floor: dynamic binary must refuse (glibc 2.38+ floor) ==="
+        if build/linux-arm64/codebase-memory-mcp --version 2>/tmp/dynamic-floor.err; then
+          echo "ERROR: dynamic binary ran on glibc 2.35 — floor contract broken"
+          exit 1
+        fi
+        grep -qi 'GLIBC' /tmp/dynamic-floor.err
+        echo "=== Verified: dynamic binary refuses with a GLIBC floor error ==="
 
   # ── Lint ────────────────────────────────────────────────────
   lint:
@@ -172,3 +288,14 @@ services:
       dockerfile: test-infrastructure/Dockerfile.lint
     volumes:
       - ..:/src
+    command: ["--ci", "CLANG_FORMAT=clang-format-20"]
+
+volumes:
+  cbm-ccache-arm64:
+  cbm-ccache-amd64:
+  # Build artifacts and the incremental-suite fixture cache stay on the VM's
+  # native filesystem: object writes over the virtiofs bind mount are the
+  # container legs' largest avoidable I/O cost, and the fixture cache makes
+  # the network clone once-per-volume instead of once-per-container.
+  cbm-build:
+  cbm-fixture-cache:

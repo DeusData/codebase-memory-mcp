@@ -34,15 +34,19 @@ enum {
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
     MCP_RETURN_2 = 2,
     MCP_TOOLS_PAGE_SIZE = 8,
+    MCP_HELP_TOOLS_WRAP_COL = 74, /* --help tool list stays readable on 80-col terminals */
+    MCP_MAX_CROSS_REPO_TARGETS = 4096,
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
+#include "mcp/mcp_internal.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
+#include "discover/discover.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
@@ -56,6 +60,7 @@ enum {
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/limits.h"
+#include "foundation/subprocess.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/compact_out.h"
 #include "foundation/str_util.h"
@@ -64,17 +69,27 @@ enum {
 #include "pipeline/artifact.h"
 
 #ifdef _WIN32
+#include "foundation/win_utf8.h"
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
 #define getpid _getpid
+/* Write through the descriptor cbm_mkstemp returned rather than reopening its
+ * path — see search_scratch_open. Mirrors config_toml_edit.c's toml_fdopen. */
+#define mcp_fdopen _fdopen
+#define mcp_close _close
 #else
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#define mcp_fdopen fdopen
+#define mcp_close close
 #endif
 #include <yyjson/yyjson.h>
 #include <ctype.h>
+#include <limits.h>
+#include <stdarg.h> // va_list, for the bounded help-list appender
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +97,7 @@ enum {
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
 
@@ -100,6 +116,12 @@ enum {
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
 #define JSONRPC_INVALID_PARAMS (-32602)
 #define JSONRPC_INTERNAL_ERROR (-32603)
+
+/* MCP stdio framing limits. The body limit is also the upper bound used by the
+ * daemon IPC transport; headers stay deliberately small to prevent a peer from
+ * growing getline buffers without bound through ignored extension headers. */
+#define MCP_MAX_MESSAGE_SIZE ((size_t)10U * 1024U * 1024U)
+#define MCP_MAX_HEADER_SIZE ((size_t)8U * 1024U)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -488,7 +510,11 @@ static const tool_def_t TOOLS[] = {
      "filtered out. When true, test nodes are included with a test column/marker.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\","
      "\"description\":\"Response encoding. tree (default): prefix-grouped text rows. "
-     "json: the SAME tree model as structured JSON (groups + column-ordered row arrays).\"}},"
+     "json: the SAME tree model as structured JSON (groups + column-ordered row arrays).\"},"
+     "\"include_evidence\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Add how each hop was resolved: a strategy class (lsp | language_rule | "
+     "heuristic | unresolved) and the resolver's confidence. Off by default — it adds two "
+     "columns per row. Use it to judge whether an edge is trustworthy, not to find edges.\"}},"
      "\"required\":[\"function_name\",\"project\"]}"},
 
     {"get_code_snippet", "Get code snippet",
@@ -628,9 +654,11 @@ static const tool_def_t TOOLS[] = {
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
-     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
-     "}"},
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"update replaces "
+     "the entire ADR document; sections only lists existing "
+     "headings\"},\"content\":{\"type\":\"string\",\"description\":\"Complete replacement document "
+     "required by update\"}},\"additionalProperties\":false,"
+     "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
@@ -868,6 +896,74 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
         }
     }
     return NULL;
+}
+
+int cbm_mcp_tool_count(void) {
+    return TOOL_COUNT;
+}
+
+const char *cbm_mcp_tool_name(int index) {
+    if (index < 0 || index >= TOOL_COUNT) {
+        return NULL;
+    }
+    return TOOLS[index].name;
+}
+
+/* Render the top-level --help "Tools:" block from the registry tools/list
+ * serves. The list used to be hand-maintained in the help text and drifted
+ * when check_index_coverage was added (#1361); deriving it here makes that
+ * divergence impossible. Heap-allocated; caller frees. */
+/* Append at out[len] and return the bytes ACTUALLY written.
+ *
+ * snprintf returns the length it WOULD have written, so accumulating that value
+ * lets len run past cap; the next `cap - len` then underflows to a huge size_t
+ * and the following write lands outside the buffer. CodeQL flagged exactly that
+ * shape here, and it is the same class #1173 just fixed in the Cypher list
+ * builder. The capacity computed below does happen to be sufficient today —
+ * which makes this the more dangerous version, not the safer one: the code is
+ * correct only by an argument made ten lines away, so renaming a tool or
+ * changing the wrap rule would turn it into an overflow with nothing to notice.
+ * Clamping makes `len <= cap - 1` a local invariant no later edit can void. */
+static size_t help_append(char *out, size_t cap, size_t len, const char *fmt, ...) {
+    if (len + 1 >= cap) {
+        return 0;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(out + len, cap - len, fmt, args);
+    va_end(args);
+    if (written <= 0) {
+        return 0;
+    }
+    size_t room = cap - len - 1;
+    return (size_t)written > room ? room : (size_t)written;
+}
+
+char *cbm_mcp_tools_help_list(void) {
+    size_t cap = SLEN("Tools:") + 2; /* trailing newline + NUL */
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        cap += strlen(TOOLS[i].name) + SLEN(" ,\n "); /* per-tool worst case incl. a wrap */
+    }
+    char *out = malloc(cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t len = help_append(out, cap, 0, "Tools:");
+    size_t col = len;
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        const char *sep = (i + 1 < TOOL_COUNT) ? "," : "";
+        size_t item = SLEN(" ") + strlen(TOOLS[i].name) + strlen(sep);
+        if (i > 0 && col + item > MCP_HELP_TOOLS_WRAP_COL) {
+            len += help_append(out, cap, len, "\n ");
+            col = 1;
+        }
+        size_t wrote = help_append(out, cap, len, " %s%s", TOOLS[i].name, sep);
+        len += wrote;
+        col += wrote;
+    }
+    len += help_append(out, cap, len, "\n");
+    (void)len; /* final length is not needed; the buffer is NUL-terminated */
+    return out;
 }
 
 static int mcp_tools_cursor_offset(const char *params_json, bool *has_cursor_out) {
@@ -1273,6 +1369,20 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
     return repo_path;
 }
 
+static bool repo_path_is_absolute(const char *path) {
+    if (!path || path[0] == '\0') {
+        return false;
+    }
+#ifdef _WIN32
+    /* Path separators are normalized before this helper is called. A drive-
+     * relative path such as "C:repo" is deliberately not considered absolute. */
+    return (path[0] == '/' && path[1] == '/') ||
+           (isalpha((unsigned char)path[0]) && path[1] == ':' && path[2] == '/');
+#else
+    return path[0] == '/';
+#endif
+}
+
 static char *normalize_project_arg(char *project) {
     if (!project || (!strchr(project, '/') && !strchr(project, '\\'))) {
         return project;
@@ -1403,25 +1513,41 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  * ══════════════════════════════════════════════════════════════════ */
 
 struct cbm_mcp_server {
-    cbm_store_t *store;             /* currently open project store (or NULL) */
-    bool owns_store;                /* true if we opened the store */
-    char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
-    char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
-    bool update_checked;            /* true after background check has been launched */
-    cbm_thread_t update_tid;        /* background update check thread */
-    bool update_thread_active;      /* true if update thread was started and needs joining */
+    cbm_store_t *store;     /* currently open project store (or NULL) */
+    bool owns_store;        /* true if we opened the store */
+    char *current_project;  /* which project store is open for (heap) */
+    time_t store_last_used; /* last time resolve_store was called for a named project */
 
     /* Session + auto-index state */
     char session_root[CBM_SZ_1K];     /* detected project root path */
     char session_project[CBM_SZ_256]; /* derived project name */
     bool session_detected;            /* true after first detection attempt */
+    char *allowed_root;               /* explicit per-session boundary (heap, nullable) */
+    bool allowed_root_policy_set;     /* true even when explicit policy is unrestricted */
+    bool background_tasks;            /* per-server update/auto-index work enabled */
     struct cbm_watcher *watcher;      /* external watcher ref (not owned) */
     struct cbm_config *config;        /* external config ref (not owned) */
+    cbm_mcp_index_executor_fn index_executor;
+    void *index_executor_context;
+    cbm_proc_log_cb index_log_callback;
+    void *index_log_context;
+    cbm_mcp_project_mutation_begin_fn mutation_begin;
+    cbm_mcp_project_mutation_try_begin_fn mutation_try_begin;
+    cbm_mcp_project_mutation_end_fn mutation_end;
+    void *mutation_context;
+    cbm_mcp_quarantine_test_hook_fn quarantine_test_hook;
+    void *quarantine_test_context;
+    cbm_mcp_command_test_hook_fn command_test_hook;
+    void *command_test_context;
     cbm_thread_t autoindex_tid;
     bool autoindex_active; /* true if auto-index thread was started */
 
-    /* Active pipeline tracking for cancellation support */
+    /* Request-scoped cancellation. The flag is shared by every cancellable
+     * operation reached during one tool dispatch; active_pipeline remains a
+     * diagnostic pointer for index_repository only. */
+    cbm_mutex_t request_scope_mutex;
+    unsigned int request_scope_depth;
+    atomic_int pipeline_cancel_requested;
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
@@ -1433,6 +1559,8 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     if (!srv) {
         return NULL;
     }
+    cbm_mutex_init(&srv->request_scope_mutex);
+    atomic_init(&srv->pipeline_cancel_requested, 0);
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
@@ -1444,6 +1572,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     }
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
+    srv->background_tasks = true;
 
     return srv;
 }
@@ -1478,12 +1607,112 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
-void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
+bool cbm_mcp_server_set_session_context(cbm_mcp_server_t *srv, const char *session_root,
+                                        const char *allowed_root) {
+    if (!srv || !session_root || session_root[0] == '\0' ||
+        strlen(session_root) >= sizeof(srv->session_root)) {
+        return false;
+    }
+
+    char *project = cbm_project_name_from_path(session_root);
+    if (!project || project[0] == '\0' || strlen(project) >= sizeof(srv->session_project)) {
+        free(project);
+        return false;
+    }
+
+    char *allowed_copy = allowed_root ? heap_strdup(allowed_root) : NULL;
+    if (allowed_root && !allowed_copy) {
+        free(project);
+        return false;
+    }
+
+    snprintf(srv->session_root, sizeof(srv->session_root), "%s", session_root);
+    snprintf(srv->session_project, sizeof(srv->session_project), "%s", project);
+    free(project);
+
+    free(srv->allowed_root);
+    srv->allowed_root = allowed_copy;
+    srv->allowed_root_policy_set = true;
+    srv->session_detected = true;
+    return true;
+}
+
+const char *cbm_mcp_server_session_root(const cbm_mcp_server_t *srv) {
+    return srv ? srv->session_root : NULL;
+}
+
+const char *cbm_mcp_server_session_project(const cbm_mcp_server_t *srv) {
+    return srv ? srv->session_project : NULL;
+}
+
+const char *cbm_mcp_server_allowed_root(const cbm_mcp_server_t *srv) {
+    return srv ? srv->allowed_root : NULL;
+}
+
+void cbm_mcp_server_set_background_tasks(cbm_mcp_server_t *srv, bool enabled) {
+    if (srv) {
+        srv->background_tasks = enabled;
+    }
+}
+
+void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_executor_fn executor,
+                                       void *context) {
+    if (srv) {
+        srv->index_executor = executor;
+        srv->index_executor_context = context;
+    }
+}
+
+void cbm_mcp_server_set_index_log_callback(cbm_mcp_server_t *srv, cbm_proc_log_cb callback,
+                                           void *context) {
+    if (srv) {
+        srv->index_log_callback = callback;
+        srv->index_log_context = callback ? context : NULL;
+    }
+}
+
+void cbm_mcp_server_set_project_mutation_guard(cbm_mcp_server_t *srv,
+                                               cbm_mcp_project_mutation_begin_fn begin,
+                                               cbm_mcp_project_mutation_end_fn end, void *context) {
     if (!srv) {
         return;
     }
-    if (srv->update_thread_active) {
-        cbm_thread_join(&srv->update_tid);
+    /* A half-configured guard could acquire without releasing (or mutate
+     * without acquiring), so accept only complete callback pairs. */
+    if ((begin == NULL) != (end == NULL)) {
+        return;
+    }
+    srv->mutation_begin = begin;
+    srv->mutation_try_begin = NULL;
+    srv->mutation_end = end;
+    srv->mutation_context = begin ? context : NULL;
+}
+
+void cbm_mcp_server_set_project_mutation_try_guard(
+    cbm_mcp_server_t *srv, cbm_mcp_project_mutation_try_begin_fn try_begin) {
+    if (srv && srv->mutation_begin) {
+        srv->mutation_try_begin = try_begin;
+    }
+}
+
+static bool mcp_project_mutation_begin(cbm_mcp_server_t *srv, const char *project) {
+    return !srv->mutation_begin || srv->mutation_begin(srv->mutation_context, project);
+}
+
+static bool mcp_project_mutation_try_begin(cbm_mcp_server_t *srv, const char *project) {
+    return !srv->mutation_begin ||
+           (srv->mutation_try_begin && srv->mutation_try_begin(srv->mutation_context, project));
+}
+
+static void mcp_project_mutation_end(cbm_mcp_server_t *srv, const char *project) {
+    if (srv->mutation_end) {
+        srv->mutation_end(srv->mutation_context, project);
+    }
+}
+
+void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
     }
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
@@ -1492,7 +1721,9 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
         cbm_store_close(srv->store);
     }
     free(srv->current_project);
+    free(srv->allowed_root);
     free(srv->active_request_id_str);
+    cbm_mutex_destroy(&srv->request_scope_mutex);
     free(srv);
 }
 
@@ -1526,8 +1757,84 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
     return (srv && srv->store != NULL) != 0;
 }
 
+bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv) {
+    const char *db_path = srv && srv->store ? cbm_store_db_path(srv->store) : NULL;
+    if (!srv || !srv->owns_store || !srv->store || srv->current_project ||
+        srv->store_last_used != 0 || db_path != NULL) {
+        return false;
+    }
+    cbm_store_close(srv->store);
+    srv->store = NULL;
+    return true;
+}
+
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
     return srv ? srv->active_pipeline : NULL;
+}
+
+bool cbm_mcp_server_cancel_active(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return false;
+    }
+    cbm_mutex_lock(&srv->request_scope_mutex);
+    bool active = srv->request_scope_depth != 0;
+    if (active) {
+        atomic_store_explicit(&srv->pipeline_cancel_requested, 1, memory_order_release);
+    }
+    cbm_mutex_unlock(&srv->request_scope_mutex);
+    return active;
+}
+
+bool cbm_mcp_server_request_scope_begin(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return false;
+    }
+    cbm_mutex_lock(&srv->request_scope_mutex);
+    bool available = srv->request_scope_depth < UINT_MAX;
+    if (available) {
+        if (srv->request_scope_depth == 0) {
+            atomic_store_explicit(&srv->pipeline_cancel_requested, 0, memory_order_release);
+        }
+        srv->request_scope_depth++;
+    }
+    cbm_mutex_unlock(&srv->request_scope_mutex);
+    return available;
+}
+
+void cbm_mcp_server_request_scope_end(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    cbm_mutex_lock(&srv->request_scope_mutex);
+    if (srv->request_scope_depth > 0) {
+        srv->request_scope_depth--;
+        if (srv->request_scope_depth == 0) {
+            atomic_store_explicit(&srv->pipeline_cancel_requested, 0, memory_order_release);
+        }
+    }
+    cbm_mutex_unlock(&srv->request_scope_mutex);
+}
+
+static bool mcp_request_cancelled(const cbm_mcp_server_t *srv) {
+    return srv && atomic_load_explicit(&srv->pipeline_cancel_requested, memory_order_acquire) != 0;
+}
+
+void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
+                                             cbm_mcp_quarantine_test_hook_fn hook, void *context) {
+    if (!srv) {
+        return;
+    }
+    srv->quarantine_test_hook = hook;
+    srv->quarantine_test_context = context;
+}
+
+void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
+                                          void *context) {
+    if (!srv) {
+        return;
+    }
+    srv->command_test_hook = hook;
+    srv->command_test_context = context;
 }
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
@@ -1572,10 +1879,198 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
  * passed name (drifted filename). Defined after is_project_db_file below. */
 static cbm_store_t *resolve_store_fallback_scan(const char *project);
 
+static bool reserve_unique_corrupt_pending(const char *path, char *pending, size_t pending_size,
+                                           char *backup, size_t backup_size) {
+    static atomic_uint_fast64_t sequence = 0;
+    for (unsigned int attempt = 0; attempt < 128; attempt++) {
+        uint64_t token = cbm_now_ns() ^ ((uint64_t)(unsigned int)getpid() << 32) ^
+                         atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed);
+        int backup_written =
+            snprintf(backup, backup_size, "%s.corrupt.%016llx", path, (unsigned long long)token);
+        int pending_written = snprintf(pending, pending_size, "%s.corrupt.pending.%016llx", path,
+                                       (unsigned long long)token);
+        if (backup_written <= 0 || (size_t)backup_written >= backup_size || pending_written <= 0 ||
+            (size_t)pending_written >= pending_size) {
+            return false;
+        }
+        if (cbm_file_exists(backup)) {
+            continue;
+        }
+#ifdef _WIN32
+        wchar_t *wide = cbm_path_to_wide(pending);
+        HANDLE file = wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                         FILE_ATTRIBUTE_NORMAL, NULL)
+                           : INVALID_HANDLE_VALUE;
+        DWORD create_error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        free(wide);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            return true;
+        }
+        if (create_error != ERROR_FILE_EXISTS && create_error != ERROR_ALREADY_EXISTS) {
+            return false;
+        }
+#else
+        int fd = open(pending, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            (void)close(fd);
+            return true;
+        }
+        if (errno != EEXIST) {
+            return false;
+        }
+#endif
+    }
+    return false;
+}
+
+static void discard_corrupt_pending(const char *pending) {
+    if (!pending) {
+        return;
+    }
+    (void)cbm_remove_db_sidecars(pending);
+    (void)cbm_unlink(pending);
+}
+
+#ifndef _WIN32
+static bool sync_parent_directory(const char *path) {
+    char directory[CBM_SZ_2K];
+    int written = snprintf(directory, sizeof(directory), "%s", path ? path : "");
+    if (written <= 0 || (size_t)written >= sizeof(directory)) {
+        return false;
+    }
+    char *slash = strrchr(directory, '/');
+    if (!slash) {
+        snprintf(directory, sizeof(directory), ".");
+    } else if (slash == directory) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    int fd = open(directory, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        return false;
+    }
+    int rc;
+    do {
+        rc = fsync(fd);
+    } while (rc != 0 && errno == EINTR);
+    (void)close(fd);
+    return rc == 0;
+}
+#endif
+
+/* Publish only a fully closed SQLite snapshot, without ever replacing a prior
+ * recovery file. POSIX link() and Windows MoveFileExW without REPLACE are
+ * atomic no-clobber operations within the cache directory. */
+static bool publish_corrupt_backup(const char *pending, const char *backup) {
+#ifdef _WIN32
+    wchar_t *wide_pending = cbm_path_to_wide(pending);
+    wchar_t *wide_backup = cbm_path_to_wide(backup);
+    bool published = wide_pending && wide_backup &&
+                     MoveFileExW(wide_pending, wide_backup, MOVEFILE_WRITE_THROUGH) != 0;
+    free(wide_pending);
+    free(wide_backup);
+    return published;
+#else
+    if (link(pending, backup) != 0) {
+        return false;
+    }
+    if (!sync_parent_directory(backup)) {
+        (void)cbm_unlink(backup);
+        return false;
+    }
+    /* A crash before this cleanup merely leaves a second link to the same
+     * complete snapshot; the published recovery generation is already safe. */
+    (void)cbm_unlink(pending);
+    (void)sync_parent_directory(backup);
+    return true;
+#endif
+}
+
+static bool quarantine_step_allowed(cbm_mcp_server_t *srv, const char *step) {
+    return !srv || !srv->quarantine_test_hook ||
+           srv->quarantine_test_hook(srv->quarantine_test_context, step);
+}
+
+/* Create one transactionally consistent, self-contained recovery snapshot
+ * (SQLite backup incorporates committed WAL frames), publish it atomically,
+ * and only then remove the corrupt live generation. A crash can therefore
+ * leave the live DB, the completed backup, or both, but never destroys the
+ * only recoverable generation. */
+static bool quarantine_corrupt_store(cbm_mcp_server_t *srv, const char *project, const char *path,
+                                     char *backup_out, size_t backup_out_size) {
+    char backup[CBM_SZ_2K];
+    char pending[CBM_SZ_2K];
+    if (!reserve_unique_corrupt_pending(path, pending, sizeof(pending), backup, sizeof(backup))) {
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
+                      "cannot reserve unique backup");
+        return false;
+    }
+
+    if (cbm_store_backup_path(path, pending) != CBM_STORE_OK ||
+        cbm_store_prepare_path_for_replace(pending) != CBM_STORE_OK) {
+        discard_corrupt_pending(pending);
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
+                      "cannot create self-contained recovery snapshot");
+        return false;
+    }
+
+    cbm_store_t *snapshot = cbm_store_open_path_query(pending);
+    if (!snapshot) {
+        discard_corrupt_pending(pending);
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
+                      "recovery snapshot cannot be reopened");
+        return false;
+    }
+    cbm_store_close(snapshot);
+
+    if (!quarantine_step_allowed(srv, "before_snapshot_publish") ||
+        !publish_corrupt_backup(pending, backup)) {
+        discard_corrupt_pending(pending);
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
+                      "cannot atomically publish recovery snapshot");
+        return false;
+    }
+    discard_corrupt_pending(pending);
+
+    if (!quarantine_step_allowed(srv, "after_snapshot_publish")) {
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
+                      "backup complete; live generation retained", "backup", backup);
+        return false;
+    }
+
+    if (cbm_unlink(path) != 0 && errno != ENOENT) {
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
+                      "backup complete; live database removal failed", "backup", backup);
+        return false;
+    }
+    if (cbm_remove_db_sidecars(path) != 0) {
+        cbm_log_error("store.auto_clean_sidecars", "project", project, "path", path, "reason",
+                      "backup complete; stale sidecar cleanup deferred");
+    }
+
+    if (backup_out && backup_out_size > 0) {
+        snprintf(backup_out, backup_out_size, "%s", backup);
+    }
+    return true;
+}
+
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
-static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+typedef enum {
+    STORE_RECOVERY_NONE,
+    STORE_RECOVERY_BUSY,
+    STORE_RECOVERY_TRY_GUARD_UNAVAILABLE,
+} store_recovery_status_t;
+
+static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *project,
+                                           bool mutation_already_held, bool nonblocking_recovery,
+                                           store_recovery_status_t *recovery_status) {
+    if (recovery_status) {
+        *recovery_status = STORE_RECOVERY_NONE;
+    }
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
@@ -1601,26 +2096,44 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     if (srv->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
-            cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
-                          "backing up corrupt db to .corrupt — re-index required");
             cbm_store_close(srv->store);
             srv->store = NULL;
-            /* #557 (data loss): rename the corrupt DB to a .corrupt backup instead
-             * of unlinking it, so the user's graph is recoverable / reportable.
-             * Re-index rebuilds a fresh DB at `path`. WAL/SHM are transient. */
-            char bak_path[MCP_FIELD_SIZE];
-            snprintf(bak_path, sizeof(bak_path), "%s.corrupt", path);
-            cbm_unlink(bak_path); /* clear any prior backup so rename succeeds on Windows */
-            if (rename(path, bak_path) != 0) {
-                cbm_unlink(path); /* rename failed (e.g. cross-device) — fall back to delete */
+            bool mutation_acquired = mutation_already_held;
+            if (!mutation_acquired) {
+                mutation_acquired = nonblocking_recovery
+                                        ? mcp_project_mutation_try_begin(srv, project)
+                                        : mcp_project_mutation_begin(srv, project);
             }
-            char wal_path[MCP_FIELD_SIZE];
-            char shm_path[MCP_FIELD_SIZE];
-            snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
-            snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
-            cbm_unlink(wal_path);
-            cbm_unlink(shm_path);
-            return NULL;
+            if (!mutation_acquired) {
+                if (nonblocking_recovery && recovery_status) {
+                    *recovery_status = srv->mutation_try_begin
+                                           ? STORE_RECOVERY_BUSY
+                                           : STORE_RECOVERY_TRY_GUARD_UNAVAILABLE;
+                }
+                return NULL;
+            }
+
+            /* The lease may have waited behind a publisher. Re-open and trust
+             * only the current generation, never the stale pre-wait verdict. */
+            srv->store = cbm_store_open_path_query(path);
+            bool current_valid = srv->store && cbm_store_check_integrity(srv->store);
+            if (!current_valid) {
+                cbm_store_close(srv->store);
+                srv->store = NULL;
+                char backup[CBM_SZ_2K] = {0};
+                bool quarantined =
+                    quarantine_corrupt_store(srv, project, path, backup, sizeof(backup));
+                cbm_log_error("store.auto_clean", "project", project, "path", path, "action",
+                              quarantined ? "corrupt generation quarantined"
+                                          : "corrupt generation preserved",
+                              "backup", quarantined ? backup : "none");
+            }
+            if (!mutation_already_held) {
+                mcp_project_mutation_end(srv, project);
+            }
+            if (!srv->store) {
+                return NULL;
+            }
         }
 
         /* Verify the project actually exists in this database.
@@ -1657,6 +2170,10 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     }
 
     return srv->store;
+}
+
+static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+    return resolve_store_internal(srv, project, false, false, NULL);
 }
 
 /* Forward decl — definition lives below alongside list_projects. */
@@ -2346,7 +2863,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "       (fts.base_rank "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
-        "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
+        "               WHEN n.label IN (" CBM_SQL_TYPE_LIKE_LABELS ") THEN 5.0 "
         "               ELSE 0.0 END) AS rank "
         "FROM ("
         "    SELECT rowid, bm25(nodes_fts) AS base_rank"
@@ -2954,8 +3471,14 @@ static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
+    /* Inner phase split: every tool leaks the same ~4 MB per request, so the
+     * retainer is in what the handlers share -- store resolution or the query
+     * itself. These marks separate the two. */
+    cbm_mem_phase_mark("handler.args");
     char *project = get_project_arg(args);
+    cbm_mem_phase_mark("handler.resolve_store");
     cbm_store_t *store = resolve_store(srv, project);
+    cbm_mem_phase_mark("handler.body");
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
@@ -3812,7 +4335,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 yyjson_mut_arr_add_val(scope_results, item);
                 continue;
             }
-            yyjson_mut_obj_add_str(doc, item, "scope", scope[0] ? scope : ".");
+            yyjson_mut_obj_add_strcpy(doc, item, "scope", scope[0] ? scope : ".");
             cbm_coverage_row_t *rows = NULL;
             int row_count = 0;
             int cov_rc = cbm_store_coverage_get_scope(store, project, scope, &rows, &row_count);
@@ -3922,6 +4445,11 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     if (!name) {
         return cbm_mcp_text_result("project is required", true);
     }
+    if (!mcp_project_mutation_begin(srv, name)) {
+        free(name);
+        return cbm_mcp_text_result("project operation cancelled or blocked by an active index",
+                                   true);
+    }
 
     /* Close store if it's the project being deleted */
     if (srv->current_project && strcmp(srv->current_project, name) == 0) {
@@ -3972,6 +4500,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_mem_collect(); /* return freed pages to OS after closing database */
+    mcp_project_mutation_end(srv, name);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -5154,6 +5683,96 @@ static const char *bfs_edge_args_for_hop(cbm_traverse_result_t *tr, int64_t hop_
     return NULL;
 }
 
+/* Classify a resolver strategy into the CLOSED public vocabulary.
+ *
+ * The indexer records ~20 internal strategy names on CALLS edges
+ * (lsp_trait_dispatch, php_self_static, callee_suffix, ...) and the set grows
+ * with every language. Publishing those verbatim would make each internal
+ * resolver name public API by accident, so a rename would silently change a
+ * user-visible field. We publish the CLASS instead: adding lsp_foo_dispatch
+ * maps automatically, while a genuinely new KIND of resolution fails the
+ * pinning test in tests/test_mcp.c and forces a deliberate decision.
+ *
+ * Returns NULL only for a NULL/empty strategy — every non-empty value lands in
+ * a class, so an unmapped strategy can never silently vanish from output. */
+const char *cbm_mcp_edge_strategy_class(const char *strategy) {
+    if (!strategy || !strategy[0]) {
+        return NULL;
+    }
+    /* Order matters: lsp_unresolved is an LSP strategy that failed, and the
+     * caller cares that it did NOT resolve — so it classifies as unresolved. */
+    if (strcmp(strategy, "lsp_unresolved") == 0 || strcmp(strategy, "unknown") == 0) {
+        return "unresolved";
+    }
+    if (strncmp(strategy, "lsp_", 4) == 0) {
+        return "lsp";
+    }
+    if (strncmp(strategy, "php_", 4) == 0 || strncmp(strategy, "perl_", 5) == 0) {
+        return "language_rule";
+    }
+    /* Everything else is a name/shape heuristic: callee_suffix,
+     * field_type_hint, service_pattern, fastapi_depends, unique_name, ... */
+    return "heuristic";
+}
+
+/* Find the resolution evidence on the edge that leads to the given hop node —
+ * the same endpoint-matching rule as bfs_edge_args_for_hop (target for an
+ * outbound trace, source for inbound, so both directions surface it).
+ *
+ * Reads only from tr->edges, and callers pass the PAGINATED view, so evidence
+ * is emitted for the rows on this page and nothing else.
+ *
+ * Returns false when the edge carries no strategy (non-CALLS edges do not). */
+static bool bfs_edge_evidence_for_hop(cbm_traverse_result_t *tr, int64_t hop_node_id,
+                                      const char **class_out, double *confidence_out) {
+    for (int e = 0; e < tr->edge_count; e++) {
+        if (tr->edges[e].target_id != hop_node_id && tr->edges[e].source_id != hop_node_id) {
+            continue;
+        }
+        const char *pj = tr->edges[e].properties_json;
+        if (!pj) {
+            continue;
+        }
+        const char *key = strstr(pj, "\"strategy\"");
+        if (!key) {
+            continue;
+        }
+        const char *open = strchr(key + 10, '"');
+        if (!open) {
+            continue;
+        }
+        open++;
+        const char *close = strchr(open, '"');
+        if (!close || close == open) {
+            continue;
+        }
+        char raw[CBM_SZ_64];
+        size_t len = (size_t)(close - open);
+        if (len >= sizeof(raw)) {
+            len = sizeof(raw) - 1;
+        }
+        memcpy(raw, open, len);
+        raw[len] = '\0';
+        const char *cls = cbm_mcp_edge_strategy_class(raw);
+        if (!cls) {
+            continue;
+        }
+        *class_out = cls;
+        /* Confidence rides on the same edge; absent is reported as -1 so a
+         * genuine 0.0 stays distinguishable from "not recorded". */
+        *confidence_out = -1.0;
+        const char *conf = strstr(pj, "\"confidence\"");
+        if (conf) {
+            const char *colon = strchr(conf, ':');
+            if (colon) {
+                *confidence_out = strtod(colon + 1, NULL);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 /* TOON table for one trace direction: callees[N]{qn,hop,...} with optional
  * risk / test / args columns. `name` is omitted (it is the qn's last
  * segment); the per-item JSON key envelope was 84% of the legacy payload. */
@@ -5567,7 +6186,7 @@ static int tree_hop_cmp_qn(const void *pa, const void *pb) {
 }
 
 static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
-                              bool include_tests) {
+                              bool include_tests, bool include_evidence) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
         if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
@@ -5576,8 +6195,12 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         visible++;
     }
     char buf[CBM_SZ_256];
-    snprintf(buf, sizeof(buf), "%s: %d  (rows: name hop; qn = group prefix + \".\" + name)\n", key,
-             visible);
+    snprintf(buf, sizeof(buf),
+             include_evidence
+                 ? "%s: %d  (rows: name hop strategy confidence; qn = group prefix + \".\" + "
+                   "name)\n"
+                 : "%s: %d  (rows: name hop; qn = group prefix + \".\" + name)\n",
+             key, visible);
     cbm_sb_append(sb, buf);
     if (tr->visited_count > 1) {
         qsort(tr->visited, (size_t)tr->visited_count, sizeof(cbm_node_hop_t), tree_hop_cmp_qn);
@@ -5599,7 +6222,26 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
             cbm_sb_append(sb, ":\n");
         }
         char row[CBM_SZ_512];
-        snprintf(row, sizeof(row), "  %s %d\n", plen ? qn + plen + 1 : qn, tr->visited[i].hop);
+        const char *ev_class = NULL;
+        double ev_conf = -1.0;
+        if (include_evidence &&
+            bfs_edge_evidence_for_hop(tr, tr->visited[i].node.id, &ev_class, &ev_conf)) {
+            if (ev_conf >= 0.0) {
+                snprintf(row, sizeof(row), "  %s %d %s %.2f\n", plen ? qn + plen + 1 : qn,
+                         tr->visited[i].hop, ev_class, ev_conf);
+            } else {
+                snprintf(row, sizeof(row), "  %s %d %s -\n", plen ? qn + plen + 1 : qn,
+                         tr->visited[i].hop, ev_class);
+            }
+        } else if (include_evidence) {
+            /* The root hop has no inbound edge, and non-CALLS edges record no
+             * strategy. Emit placeholders so the column count stays fixed —
+             * a ragged table is worse to parse than an explicit "-". */
+            snprintf(row, sizeof(row), "  %s %d - -\n", plen ? qn + plen + 1 : qn,
+                     tr->visited[i].hop);
+        } else {
+            snprintf(row, sizeof(row), "  %s %d\n", plen ? qn + plen + 1 : qn, tr->visited[i].hop);
+        }
         cbm_sb_append(sb, row);
     }
 }
@@ -5643,6 +6285,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
+    /* Off by default: two extra columns on every row is exactly the kind of
+     * inflation the tree format exists to avoid. Opt in when you need to judge
+     * whether an edge is trustworthy. */
+    bool include_evidence = cbm_mcp_get_bool_arg(args, "include_evidence");
 
     if (!func_name) {
         free(project);
@@ -5889,10 +6535,10 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * attached so data_flow args resolve for boundary nodes whose incoming
      * edge originated on an earlier page. */
     cbm_traverse_result_t view_out = tr_out;
-    view_out.visited += out_start;
+    view_out.visited = tr_out.visited ? tr_out.visited + out_start : NULL;
     view_out.visited_count = out_len;
     cbm_traverse_result_t view_in = tr_in;
-    view_in.visited += in_start;
+    view_in.visited = tr_in.visited ? tr_in.visited + in_start : NULL;
     view_in.visited_count = in_len;
 
     /* Totals must count what the caller can actually enumerate: when
@@ -5930,7 +6576,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow);
             } else {
-                bfs_to_tree_table(&sb, "callees", &view_out, include_tests);
+                bfs_to_tree_table(&sb, "callees", &view_out, include_tests, include_evidence);
             }
         }
         if (do_inbound) {
@@ -5938,7 +6584,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow);
             } else {
-                bfs_to_tree_table(&sb, "callers", &view_in, include_tests);
+                bfs_to_tree_table(&sb, "callers", &view_in, include_tests, include_evidence);
             }
         }
         if (more_rows) {
@@ -6067,12 +6713,8 @@ static char *read_file_lines(const char *path, int start, int end) {
 
 /* ── Helper: get project root_path from store ─────────────────── */
 
-static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
-    if (!project) {
-        return NULL;
-    }
-    cbm_store_t *store = resolve_store(srv, project);
-    if (!store) {
+static char *project_root_from_store(cbm_store_t *store, const char *project) {
+    if (!store || !project) {
         return NULL;
     }
     cbm_project_t proj = {0};
@@ -6086,11 +6728,71 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
     return root;
 }
 
+static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
+    return project_root_from_store(resolve_store(srv, project), project);
+}
+
 /* ── index_repository ─────────────────────────────────────────── */
 
+static int cross_repo_project_key_compare(const void *left, const void *right) {
+    const char *const *left_key = left;
+    const char *const *right_key = right;
+    return strcmp(*left_key, *right_key);
+}
+
+static unsigned char cross_repo_project_lock_fold(unsigned char ch) {
+    return ch >= 'A' && ch <= 'Z' ? (unsigned char)(ch + ('a' - 'A')) : ch;
+}
+
+/* Match daemon/project_lock.c's OS-key identity exactly: only ASCII A-Z folds.
+ * The raw strcmp tie-break gives qsort a total, input-order-independent order
+ * while keeping the caller's original project spelling as the lease value. */
+static int cross_repo_project_lock_key_compare_values(const char *left, const char *right) {
+    const unsigned char *left_cursor = (const unsigned char *)left;
+    const unsigned char *right_cursor = (const unsigned char *)right;
+    while (*left_cursor && *right_cursor) {
+        unsigned char left_folded = cross_repo_project_lock_fold(*left_cursor);
+        unsigned char right_folded = cross_repo_project_lock_fold(*right_cursor);
+        if (left_folded != right_folded) {
+            return left_folded < right_folded ? -1 : 1;
+        }
+        left_cursor++;
+        right_cursor++;
+    }
+    if (*left_cursor != *right_cursor) {
+        return *left_cursor ? 1 : -1;
+    }
+    return strcmp(left, right);
+}
+
+static int cross_repo_project_lock_key_compare(const void *left, const void *right) {
+    const char *const *left_key = left;
+    const char *const *right_key = right;
+    return cross_repo_project_lock_key_compare_values(*left_key, *right_key);
+}
+
+static bool cross_repo_project_lock_keys_equivalent(const char *left, const char *right) {
+    const unsigned char *left_cursor = (const unsigned char *)left;
+    const unsigned char *right_cursor = (const unsigned char *)right;
+    while (*left_cursor && *right_cursor) {
+        if (cross_repo_project_lock_fold(*left_cursor) !=
+            cross_repo_project_lock_fold(*right_cursor)) {
+            return false;
+        }
+        left_cursor++;
+        right_cursor++;
+    }
+    return *left_cursor == *right_cursor;
+}
+
 /* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
-static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
-    char *project = heap_strdup(cbm_project_name_from_path(repo_path));
+static char *handle_cross_repo_mode(cbm_mcp_server_t *srv, const char *repo_path,
+                                    const char *name_override, const char *args) {
+    if (name_override && name_override[0] && !cbm_validate_project_name(name_override)) {
+        return cbm_mcp_text_result("invalid project name", true);
+    }
+    char *project = name_override && name_override[0] ? heap_strdup(name_override)
+                                                      : cbm_project_name_from_path(repo_path);
     if (!project) {
         return cbm_mcp_text_result("cannot derive project name", true);
     }
@@ -6108,28 +6810,135 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
             true);
     }
 
-    int tp_count = (int)yyjson_arr_size(tp_arr);
-    const char **targets = malloc((size_t)tp_count * sizeof(char *));
+    size_t target_count = yyjson_arr_size(tp_arr);
+    if (target_count > MCP_MAX_CROSS_REPO_TARGETS) {
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("too many cross-repo target projects", true);
+    }
+    int tp_count = (int)target_count;
+    const char **targets = malloc((size_t)tp_count * sizeof(*targets));
+    const char **lease_keys = malloc(((size_t)tp_count + 1U) * sizeof(*lease_keys));
+    if (!targets || !lease_keys) {
+        free(targets);
+        free(lease_keys);
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("failed to allocate cross-repo project leases", true);
+    }
     size_t idx;
     size_t max;
     yyjson_val *val;
     int ti = 0;
+    bool all_projects = false;
+    bool invalid_target = false;
     yyjson_arr_foreach(tp_arr, idx, max, val) {
-        targets[ti++] = yyjson_get_str(val);
+        const char *target = yyjson_is_str(val) ? yyjson_get_str(val) : NULL;
+        if (!target || !target[0] || strlen(target) >= CBM_SZ_256 ||
+            (strcmp(target, "*") != 0 && !cbm_validate_project_name(target))) {
+            invalid_target = true;
+            break;
+        }
+        targets[ti++] = target;
+        all_projects = all_projects || strcmp(target, "*") == 0;
+    }
+    if (invalid_target || ti != tp_count) {
+        free(targets);
+        free(lease_keys);
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("target_projects must contain valid project names or '*'", true);
+    }
+    if (all_projects && tp_count != 1) {
+        free(targets);
+        free(lease_keys);
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("target_projects wildcard '*' must be the only entry", true);
+    }
+    if (!all_projects) {
+        qsort(targets, (size_t)tp_count, sizeof(*targets), cross_repo_project_key_compare);
+        int unique_count = 0;
+        for (int i = 0; i < tp_count; i++) {
+            if (unique_count == 0 || strcmp(targets[i], targets[unique_count - 1]) != 0) {
+                targets[unique_count++] = targets[i];
+            }
+        }
+        tp_count = unique_count;
     }
 
-    cbm_cross_repo_result_t result = cbm_cross_repo_match(project, targets, tp_count);
+    int lease_count = 0;
+    if (all_projects) {
+        lease_keys[lease_count++] = "*";
+    } else {
+        lease_keys[lease_count++] = project;
+        for (int i = 0; i < tp_count; i++) {
+            lease_keys[lease_count++] = targets[i];
+        }
+        qsort(lease_keys, (size_t)lease_count, sizeof(*lease_keys),
+              cross_repo_project_lock_key_compare);
+        int unique_count = 0;
+        for (int i = 0; i < lease_count; i++) {
+            if (unique_count == 0 || !cross_repo_project_lock_keys_equivalent(
+                                         lease_keys[i], lease_keys[unique_count - 1])) {
+                lease_keys[unique_count++] = lease_keys[i];
+            }
+        }
+        lease_count = unique_count;
+    }
+
+    int held_count = 0;
+    while (held_count < lease_count && mcp_project_mutation_begin(srv, lease_keys[held_count])) {
+        held_count++;
+    }
+    bool cancelled =
+        atomic_load_explicit(&srv->pipeline_cancel_requested, memory_order_acquire) != 0;
+    if (held_count != lease_count || cancelled) {
+        while (held_count > 0) {
+            held_count--;
+            mcp_project_mutation_end(srv, lease_keys[held_count]);
+        }
+        free(targets);
+        free(lease_keys);
+        yyjson_doc_free(jdoc);
+        free(project);
+        return cbm_mcp_text_result("cross-repo operation cancelled or blocked by active indexing",
+                                   true);
+    }
+
+    cbm_cross_repo_result_t result = cbm_cross_repo_match_cancellable(
+        project, targets, tp_count, &srv->pipeline_cancel_requested);
+    while (held_count > 0) {
+        held_count--;
+        mcp_project_mutation_end(srv, lease_keys[held_count]);
+    }
     free(targets);
+    free(lease_keys);
     yyjson_doc_free(jdoc);
+
+    if (result.failed) {
+        free(project);
+        return cbm_mcp_text_result(
+            "cross-repo source or target project is missing, invalid, or not indexed", true);
+    }
 
     int total = result.http_edges + result.async_edges + result.channel_edges + result.grpc_edges +
                 result.graphql_edges + result.trpc_edges;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_str(doc, root, "status", "success");
+    yyjson_mut_obj_add_str(doc, root, "status", result.cancelled ? "cancelled" : "success");
     yyjson_mut_obj_add_str(doc, root, "mode", "cross-repo-intelligence");
     yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+    if (result.cancelled) {
+        yyjson_mut_obj_add_bool(doc, root, "partial_results", result.partial_results);
+        yyjson_mut_obj_add_str(
+            doc, root, "message",
+            result.partial_results
+                ? "cross-repo operation cancelled with partial results; completed database "
+                  "writes were retained"
+                : "cross-repo operation cancelled before database writes");
+    }
     yyjson_mut_obj_add_int(doc, root, "projects_scanned", result.projects_scanned);
     yyjson_mut_obj_add_int(doc, root, "cross_http_calls", result.http_edges);
     yyjson_mut_obj_add_int(doc, root, "cross_async_calls", result.async_edges);
@@ -6143,7 +6952,7 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     free(project);
-    char *out = cbm_mcp_text_result(json, false);
+    char *out = cbm_mcp_text_result(json, result.cancelled);
     free(json);
     return out;
 }
@@ -6479,13 +7288,24 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
-    yyjson_mut_obj_add_str(
-        doc, root, "hint",
-        outcome == CBM_PROC_HANG
-            ? "Indexing worker timed out (a file made no progress). The worker was "
-              "terminated and the server survived. Re-run to retry."
-            : "Indexing worker crashed on a file. The crash was contained (the server "
-              "survived). Re-run to retry; a future release isolates the culprit file.");
+    const char *hint = NULL;
+    if (outcome == CBM_PROC_SPAWN_FAILED) {
+        hint = "Indexing worker could not be started. Supervision is mandatory in a CBM "
+               "host, so no in-process fallback was attempted.";
+    } else if (outcome == CBM_PROC_HANG) {
+        hint = "Indexing worker timed out (a file made no progress). The worker was "
+               "terminated and the server survived. Re-run to retry.";
+    } else if (outcome == CBM_PROC_CRASH) {
+        hint = "Indexing worker crashed on a file. The crash was contained (the server "
+               "survived). Re-run to retry; a future release isolates the culprit file.";
+    } else if (outcome == CBM_PROC_CLEAN) {
+        hint = "Indexing worker exited without a valid response. No in-process fallback "
+               "was attempted.";
+    } else {
+        hint = "Indexing worker did not complete successfully. The failure was contained "
+               "and no in-process fallback was attempted.";
+    }
+    yyjson_mut_obj_add_str(doc, root, "hint", hint);
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
     }
@@ -6497,12 +7317,37 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     return result;
 }
 
+static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_outcome_t outcome,
+                                                   bool cancellation_requested) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
+    yyjson_mut_obj_add_str(
+        doc, root, "hint",
+        cancellation_requested
+            ? "Indexing worker was cancelled. No in-process retry was started."
+            : "Indexing worker process-tree containment failed. No in-process retry was "
+              "started; inspect daemon logs.");
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(repo_path);
+    char *response = cbm_mcp_text_result(json, true);
+    free(json);
+    return response;
+}
+
 /* Drop the cached store so the next query reopens whatever the worker wrote (each
  * worker is a fresh process that deletes + recreates the .db). NULL-safe: the
  * background watcher path (main.c) has no MCP server / cached store — the child
  * writes the DB and the parent only needs the return code, so there is nothing
  * to invalidate. */
-static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
+static void invalidate_cached_store(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
@@ -6631,6 +7476,22 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
     return true;
 }
 
+cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
+    int spawn_result, const cbm_index_worker_result_t *worker_result) {
+    if (spawn_result != 0 || !worker_result || worker_result->outcome == CBM_PROC_SPAWN_FAILED) {
+        return CBM_MCP_SUPERVISED_RESULT_FALLBACK;
+    }
+    if (worker_result->cancellation_requested || !worker_result->tree_quiesced ||
+        worker_result->supervision_failed) {
+        return CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL;
+    }
+    if (worker_result->outcome == CBM_PROC_CLEAN) {
+        return worker_result->response ? CBM_MCP_SUPERVISED_RESULT_SUCCESS
+                                       : CBM_MCP_SUPERVISED_RESULT_FALLBACK;
+    }
+    return CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE;
+}
+
 /* Run index_repository in a supervised worker subprocess with skip-and-continue
  * (Stage 3c). Returns the response string (caller frees):
  *   - the worker's own response on a clean first run (the common path);
@@ -6640,30 +7501,38 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
  *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
  *     loop cannot converge but at least one file was quarantined;
  *   - a contained-failure response only if even that cannot produce a clean run.
- * Returns NULL only when the worker could not be spawned at all, so the caller
- * degrades to the in-process path. */
+ * A physical CBM host never falls back to its in-process pipeline: an initial
+ * start/protocol failure is returned as an explicit error response. */
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
-    supervisor_invalidate_store(srv);
+    invalidate_cached_store(srv);
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
-    int rc = cbm_index_spawn_worker(args, false, NULL, NULL, &wr);
+    int rc = cbm_index_spawn_worker_with_log_cancel(
+        args, false, NULL, NULL, srv ? srv->index_log_callback : NULL,
+        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL, &wr);
+    cbm_mcp_supervised_result_disposition_t disposition =
+        cbm_mcp_supervised_result_disposition(rc, &wr);
 
-    if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
+        cbm_proc_outcome_t outcome = wr.outcome;
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
-        return NULL; /* degrade to in-process */
+        invalidate_cached_store(srv);
+        return build_worker_failure_response(args, outcome);
     }
-    if (wr.outcome == CBM_PROC_CLEAN) {
-        /* Clean exit → transfer the worker's response (the common path). If the
-         * worker exited clean but wrote no response (a degenerate case, e.g. a
-         * self binary that does not act as an index worker), resp is NULL and the
-         * caller degrades to the in-process path — a clean run never needs the
-         * crash-recovery loop. */
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
+        char *failure =
+            build_worker_unsafe_terminal_response(args, wr.outcome, wr.cancellation_requested);
+        cbm_index_worker_result_free(&wr);
+        invalidate_cached_store(srv);
+        return failure;
+    }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
+        /* Clean exit → transfer the worker's response (the common path). */
         char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
         wr.response = NULL;
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        invalidate_cached_store(srv);
         return resp;
     }
 
@@ -6710,16 +7579,29 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     int quarantined = 0;         /* files pinned + added to the quarantine list so far */
     char **prev_suspects = NULL; /* previous failed round's in-flight set */
     int prev_n = 0;
+    bool unsafe_terminal = false;
+    bool terminal_cancelled = false;
     for (int i = 0; i < cap; i++) {
         cbm_index_worker_result_t wr2;
-        int rc2 = cbm_index_spawn_worker(args, /*single_thread=*/false, marker_path,
-                                         quarantine_path, &wr2);
-        if (rc2 != 0) {
+        int rc2 = cbm_index_spawn_worker_with_log_cancel(
+            args, /*single_thread=*/false, marker_path, quarantine_path,
+            srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
+            srv ? &srv->pipeline_cancel_requested : NULL, &wr2);
+        cbm_mcp_supervised_result_disposition_t recovery_disposition =
+            cbm_mcp_supervised_result_disposition(rc2, &wr2);
+        if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
             last_outcome = wr2.outcome;
             cbm_index_worker_result_free(&wr2);
             break; /* spawn failed mid-recovery — give up */
         }
-        if (wr2.outcome == CBM_PROC_CLEAN && wr2.response) {
+        if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
+            last_outcome = wr2.outcome;
+            unsafe_terminal = true;
+            terminal_cancelled = wr2.cancellation_requested;
+            cbm_index_worker_result_free(&wr2);
+            break;
+        }
+        if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
             resp = wr2.response; /* transfer ownership to caller */
             wr2.response = NULL;
             cbm_index_worker_result_free(&wr2);
@@ -6790,26 +7672,37 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
      * a PARTIAL index (all good files indexed, all known crashers/hangs reported
      * as skips) rather than a hard failure. Bounded by the same quiet-timeout,
      * so it cannot itself hang. Rare given monotonic progress. */
-    if (!resp && quarantined > 0) {
+    if (!resp && !unsafe_terminal && quarantined > 0) {
         cbm_index_worker_result_t wrp;
-        int rcp =
-            cbm_index_spawn_worker(args, /*single_thread=*/false, NULL, quarantine_path, &wrp);
-        if (rcp == 0 && wrp.outcome == CBM_PROC_CLEAN && wrp.response) {
+        int rcp = cbm_index_spawn_worker_with_log_cancel(
+            args, /*single_thread=*/false, NULL, quarantine_path,
+            srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
+            srv ? &srv->pipeline_cancel_requested : NULL, &wrp);
+        cbm_mcp_supervised_result_disposition_t partial_disposition =
+            cbm_mcp_supervised_result_disposition(rcp, &wrp);
+        if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
             resp = wrp.response; /* transfer ownership to caller */
             wrp.response = NULL;
             char qn[MCP_FIELD_SIZE];
             snprintf(qn, sizeof(qn), "%d", quarantined);
             cbm_log_error("index.supervisor.partial", "quarantined", qn, "outcome",
                           cbm_proc_outcome_str(last_outcome));
+        } else if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
+            last_outcome = wrp.outcome;
+            unsafe_terminal = true;
+            terminal_cancelled = wrp.cancellation_requested;
         }
         cbm_index_worker_result_free(&wrp);
     }
 
     (void)remove(quarantine_path);
-    supervisor_invalidate_store(srv);
+    invalidate_cached_store(srv);
 
     if (resp) {
         return resp;
+    }
+    if (unsafe_terminal) {
+        return build_worker_unsafe_terminal_response(args, last_outcome, terminal_cancelled);
     }
     return build_worker_failure_response(args, last_outcome);
 }
@@ -6844,21 +7737,104 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
-static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
-    /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
-     * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
-     * is set. On spawn failure, fall through to the in-process path (degrade). */
-    if (cbm_index_supervisor_should_wrap()) {
-        char *supervised = index_run_supervised(srv, args);
-        if (supervised) {
-            return supervised;
-        }
+/* Resolve relative index requests against an explicitly supplied MCP session
+ * root, never against the long-lived daemon process cwd. */
+static bool resolve_session_repo_path(cbm_mcp_server_t *srv, char **repo_path) {
+    if (!srv || !repo_path || !*repo_path || !srv->allowed_root_policy_set ||
+        srv->session_root[0] == '\0' || repo_path_is_absolute(*repo_path)) {
+        return true;
     }
 
+    size_t root_len = strlen(srv->session_root);
+    size_t path_len = strlen(*repo_path);
+    bool needs_separator = root_len > 0 && srv->session_root[root_len - 1] != '/';
+    if (root_len > SIZE_MAX - path_len - (needs_separator ? 2U : 1U)) {
+        return false;
+    }
+
+    size_t joined_size = root_len + (needs_separator ? 1U : 0U) + path_len + 1U;
+    char *joined = malloc(joined_size);
+    if (!joined) {
+        return false;
+    }
+    (void)snprintf(joined, joined_size, "%s%s%s", srv->session_root, needs_separator ? "/" : "",
+                   *repo_path);
+    cbm_normalize_path_sep(joined);
+    free(*repo_path);
+    *repo_path = joined;
+    return true;
+}
+
+/* Preserve every index option while replacing all caller-supplied repo_path
+ * keys with the one canonical path that was actually authorized. */
+static char *index_args_with_repo_path(const char *args, const char *canonical_repo_path) {
+    if (!args || !canonical_repo_path) {
+        return NULL;
+    }
+    yyjson_doc *source = yyjson_read(args, strlen(args), 0);
+    yyjson_val *source_root = source ? yyjson_doc_get_root(source) : NULL;
+    if (!source_root || !yyjson_is_obj(source_root)) {
+        yyjson_doc_free(source);
+        return NULL;
+    }
+
+    yyjson_mut_doc *copy = yyjson_doc_mut_copy(source, NULL);
+    yyjson_doc_free(source);
+    yyjson_mut_val *copy_root = copy ? yyjson_mut_doc_get_root(copy) : NULL;
+    if (!copy_root || !yyjson_mut_is_obj(copy_root)) {
+        yyjson_mut_doc_free(copy);
+        return NULL;
+    }
+    (void)yyjson_mut_obj_remove_key(copy_root, "repo_path");
+    if (!yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path)) {
+        yyjson_mut_doc_free(copy);
+        return NULL;
+    }
+    char *rewritten = yy_doc_to_str(copy);
+    yyjson_mut_doc_free(copy);
+    return rewritten;
+}
+
+/* #1211: index_repository requires repo_path, but list_projects only ever
+ * advertises the project NAME, and every read tool accepts that name back via
+ * get_project_arg's "project"/"project_name"/"project_id"/"projectName"
+ * aliases (mcp.c:1385). Re-indexing an already-indexed project by that same
+ * name had no resolution path and fell straight to "repo_path is required".
+ * Look up the project's own stored root_path (list_projects proves it's on
+ * file) before giving up. Query-only open, always closed here: this never
+ * creates a store or touches srv->store/srv->current_project, so it cannot
+ * disturb whatever project the server has cached. */
+static char *resolved_repo_path_from_project_arg(const char *args) {
+    char *project = get_project_arg(args);
+    if (!project) {
+        return NULL;
+    }
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    cbm_store_t *store = db_path[0] ? cbm_store_open_path_query(db_path) : NULL;
+    char *root_path = NULL;
+    if (store) {
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
+            root_path = proj.root_path ? heap_strdup(proj.root_path) : NULL;
+            cbm_project_free_fields(&proj);
+        }
+        cbm_store_close(store);
+    }
+    free(project);
+    return root_path;
+}
+
+static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
     cbm_normalize_path_sep(repo_path);
+
+    if (!repo_path) {
+        repo_path = resolved_repo_path_from_project_arg(args);
+        cbm_normalize_path_sep(repo_path);
+    }
 
     if (!repo_path) {
         free(mode_str);
@@ -6866,14 +7842,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("repo_path is required", true);
     }
 
+    if (!resolve_session_repo_path(srv, &repo_path)) {
+        free(mode_str);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result("failed to resolve repo_path", true);
+    }
+
     repo_path = canonicalize_repo_path_if_exists(repo_path);
 
-    /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
-     * multi-tenant deployments where repo_path may be influenced by an
-     * untrusted caller), refuse to index a path that resolves outside it.
-     * Unset by default, so the standard "index the path I gave you" behaviour
-     * is unchanged. */
-    const char *allowed_root = getenv("CBM_ALLOWED_ROOT");
+    /* Optional workspace boundary. Embedded/daemon sessions always use their
+     * explicit policy, including an explicit NULL meaning unrestricted. A
+     * standalone server retains the process-wide CBM_ALLOWED_ROOT fallback. */
+    const char *allowed_root =
+        srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
     if (allowed_root && allowed_root[0] && repo_path &&
         !cbm_path_within_root(allowed_root, repo_path)) {
         free(mode_str);
@@ -6884,10 +7866,89 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
+        char *result = handle_cross_repo_mode(srv, repo_path, name_override, args);
         free(name_override);
-        char *result = handle_cross_repo_mode(repo_path, args);
         free(repo_path);
         return result;
+    }
+
+    /* A daemon session delegates the one physical write to its shared job
+     * registry only after path canonicalization and workspace authorization. */
+    if (srv->index_executor) {
+        char *worker_args = index_args_with_repo_path(args, repo_path);
+        char *coordinated =
+            worker_args ? srv->index_executor(srv->index_executor_context, repo_path, worker_args)
+                        : NULL;
+        free(worker_args);
+        free(repo_path);
+        free(mode_str);
+        free(name_override);
+        return coordinated ? coordinated
+                           : cbm_mcp_text_result(
+                                 "daemon index coordinator could not start the operation", true);
+    }
+
+    /* Resolve the exact project key before choosing supervised or in-process
+     * execution. A supervised worker owns the OS mutation lease itself: if the
+     * CLI parent is killed, the worker must keep project exclusion until its
+     * parent-death watchdog reaps the complete worker tree. */
+    char *mutation_project =
+        cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
+    if (!mutation_project) {
+        free(repo_path);
+        free(mode_str);
+        free(name_override);
+        return cbm_mcp_text_result("could not resolve index project name", true);
+    }
+
+    /* Supervisor gate: validate the canonical path and the host session's
+     * workspace policy before handing work to a crash/hang-isolating worker.
+     * The parent deliberately owns no project lease on this path; the worker
+     * installs the same guard before running the in-process pipeline. A marked
+     * host fails closed if preparation or worker startup cannot complete. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *worker_args = index_args_with_repo_path(args, repo_path);
+        if (!worker_args) {
+            free(mutation_project);
+            free(repo_path);
+            free(mode_str);
+            free(name_override);
+            return cbm_mcp_text_result("failed to prepare supervised index request", true);
+        }
+        char *supervised = index_run_supervised(srv, worker_args);
+        free(worker_args);
+        if (supervised) {
+            free(mutation_project);
+            free(repo_path);
+            free(mode_str);
+            free(name_override);
+            return supervised;
+        }
+        free(mutation_project);
+        free(repo_path);
+        free(mode_str);
+        free(name_override);
+        return cbm_mcp_text_result(
+            "index supervision failed before a contained worker could start; no "
+            "in-process fallback was attempted",
+            true);
+    }
+
+    if (!mcp_project_mutation_begin(srv, mutation_project)) {
+        free(mutation_project);
+        free(repo_path);
+        free(mode_str);
+        free(name_override);
+        return cbm_mcp_text_result("index operation blocked by another mutation for this project",
+                                   true);
+    }
+    if (mcp_request_cancelled(srv)) {
+        mcp_project_mutation_end(srv, mutation_project);
+        free(mutation_project);
+        free(repo_path);
+        free(mode_str);
+        free(name_override);
+        return cbm_mcp_text_result("index operation cancelled for this request", true);
     }
 
     cbm_index_mode_t mode = CBM_MODE_FULL;
@@ -6902,12 +7963,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
+        mcp_project_mutation_end(srv, mutation_project);
+        free(mutation_project);
         free(name_override);
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
     if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
         cbm_pipeline_free(p);
+        mcp_project_mutation_end(srv, mutation_project);
+        free(mutation_project);
         free(name_override);
         free(repo_path);
         return cbm_mcp_text_result("invalid project name", true);
@@ -6932,6 +7997,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * Track active pipeline so signal handler and notifications/cancelled
      * can cancel it mid-run. */
     cbm_pipeline_lock();
+    cbm_pipeline_bind_cancel_flag(p, &srv->pipeline_cancel_requested);
     srv->active_pipeline = p;
     int rc = cbm_pipeline_run(p);
     srv->active_pipeline = NULL;
@@ -6999,6 +8065,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(project_name);
     free(repo_path);
+
+    mcp_project_mutation_end(srv, mutation_project);
+    free(mutation_project);
 
     char *result = cbm_mcp_text_result(json, rc != 0);
     free(json);
@@ -7073,10 +8142,10 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
  * across preprocessor branches, which defeats source-level tooling that parses
  * without the preprocessor (and left this function unindexed in the graph). */
 static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
-    /* cbm_canonical_path: realpath on POSIX; wide existence check +
-     * GetFullPathNameW on Windows (the old bare _fullpath was ANSI —
-     * CJK-locale corruption, #973 — and, unlike POSIX realpath, resolved
-     * nonexistent paths too; requiring existence aligns the platforms). */
+    /* cbm_canonical_path: realpath on POSIX; an opened handle plus
+     * GetFinalPathNameByHandleW on Windows.  The old bare _fullpath was ANSI
+     * (CJK-locale corruption, #973), accepted nonexistent paths, and lexical
+     * expansion alone did not resolve junctions for containment checks. */
     if (!cbm_canonical_path(path, out, out_sz)) {
         return false;
     }
@@ -7084,6 +8153,39 @@ static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
     cbm_normalize_path_sep(out);
 #endif
     return true;
+}
+
+static bool canonical_path_has_root(const char *root_path, const char *candidate_path) {
+#ifdef _WIN32
+    wchar_t *wide_root = cbm_utf8_to_wide(root_path);
+    wchar_t *wide_candidate = cbm_utf8_to_wide(candidate_path);
+    bool contained = false;
+    if (wide_root && wide_candidate) {
+        size_t root_len = wcslen(wide_root);
+        size_t candidate_len = wcslen(wide_candidate);
+        bool prefix_equal = root_len <= candidate_len && root_len <= INT_MAX &&
+                            CompareStringOrdinal(wide_candidate, (int)root_len, wide_root,
+                                                 (int)root_len, TRUE) == CSTR_EQUAL;
+        bool root_ends_separator =
+            root_len > 0 && (wide_root[root_len - 1] == L'/' || wide_root[root_len - 1] == L'\\');
+        bool boundary = root_ends_separator || root_len == candidate_len ||
+                        (root_len < candidate_len &&
+                         (wide_candidate[root_len] == L'/' || wide_candidate[root_len] == L'\\'));
+        contained = prefix_equal && boundary;
+    }
+    free(wide_root);
+    free(wide_candidate);
+    return contained;
+#else
+    size_t root_len = strlen(root_path);
+    size_t candidate_len = strlen(candidate_path);
+    bool prefix_equal =
+        root_len <= candidate_len && strncmp(candidate_path, root_path, root_len) == 0;
+    bool root_ends_separator = root_len > 0 && root_path[root_len - 1] == '/';
+    bool boundary = root_ends_separator || root_len == candidate_len ||
+                    (root_len < candidate_len && candidate_path[root_len] == '/');
+    return prefix_equal && boundary;
+#endif
 }
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path) {
@@ -7094,9 +8196,7 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     char real_file[CBM_SZ_4K];
     if (resolve_canonical_path(root_path, real_root, sizeof(real_root)) &&
         resolve_canonical_path(abs_path, real_file, sizeof(real_file))) {
-        size_t root_len = strlen(real_root);
-        if (strncmp(real_file, real_root, root_len) == 0 &&
-            (real_file[root_len] == '/' || real_file[root_len] == '\0')) {
+        if (canonical_path_has_root(real_root, real_file)) {
             return true;
         }
     }
@@ -8137,10 +9237,14 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
  * normalized on Windows first), so prefiltering can only skip files whose
  * hits would be dropped anyway — results-preserving by construction.
  * *out_written receives the number of records written (0 = the filter
- * excluded every indexed file). */
+ * excluded every indexed file).
+ *
+ * `fl` is the caller's already-open binary stream on the descriptor cbm_mkstemp
+ * created inside the private scratch directory; this function never opens or
+ * closes it, so the list is never reachable through a predictable pathname. */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist, bool has_path_filter,
-                                  cbm_regex_t *path_regex, int *out_written) {
+                                  FILE *fl, bool has_path_filter, cbm_regex_t *path_regex,
+                                  int *out_written) {
     *out_written = 0;
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
@@ -8152,7 +9256,6 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         indexed_count == 0) {
         return false;
     }
-    FILE *fl = fopen(filelist, "wb");
     bool ok = false;
     int written = 0;
     if (fl) {
@@ -8191,7 +9294,8 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
 #endif
             written++;
         }
-        (void)fclose(fl);
+        /* The stream stays open — the caller owns it and closes it (flushing
+         * these records to disk) before the grep subprocess reads the list. */
         ok = true;
     }
     for (int fi = 0; fi < indexed_count; fi++) {
@@ -8249,6 +9353,19 @@ static bool validate_search_path_arg(const char *s) {
     return true;
 }
 
+/* These characters retain command-language meaning inside quoted cmd.exe
+ * arguments: percent expands environment variables, exclamation can expand
+ * delayed variables, and caret changes parsing. Never interpolate them from a
+ * stored project root or request branch into the Windows detect_changes payload.
+ * /V:OFF is defense in depth for exclamation; validation remains the boundary. */
+static bool validate_windows_cmd_interpolation_arg(const char *s) {
+#ifdef _WIN32
+    return s && strpbrk(s, "%!^") == NULL;
+#else
+    return s != NULL;
+#endif
+}
+
 static bool validate_search_args(const char *root_path, const char *file_pattern) {
     if (!validate_search_path_arg(root_path)) {
         return false;
@@ -8259,15 +9376,115 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
     return true;
 }
 
-/* Write pattern to a temp file for grep -f. Returns true on success. */
-static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
-    FILE *tf = fopen(tmpfile, "w");
-    if (!tf) {
+/* Private scratch for one search_code scan: the grep -f pattern file and the
+ * scoped file list.
+ *
+ * Both used to be fixed, guessable paths derived from the pid —
+ * "<tmp>/cbm_search_<pid>.pat" and its ".files" companion — opened with a plain
+ * fopen. Another local user could pre-plant a symlink at either name and
+ * redirect the write; two searches in the same process could also collide on
+ * them. Now both live inside a directory created by cbm_mkdtemp (0700 on POSIX,
+ * an explicit owner-only DACL on Windows) under an unguessable XXXXXX suffix,
+ * and each file is created by cbm_mkstemp — O_CREAT|O_EXCL at mode 0600, so the
+ * create fails rather than following anything already at the name. Every write
+ * goes through the descriptor cbm_mkstemp returned; neither path is ever
+ * reopened by name.
+ *
+ * Sizing: cbm_mkdtemp copies its expanded result back into `dir`, and its own
+ * internal buffer is CBM_SZ_512, so `dir` must be at least that big to receive
+ * it. The two file paths are `dir` plus a short basename. */
+typedef struct {
+    char dir[CBM_SZ_512];
+    char pattern_path[CBM_SZ_1K];
+    char filelist_path[CBM_SZ_1K];
+    FILE *filelist; /* held open for write_scoped_filelist; closed by the caller */
+} search_scratch_t;
+
+/* Create <scratch>/<basename>-XXXXXX exclusively and return a stream on the
+ * descriptor. On failure `path_out` is emptied so cleanup skips it. */
+static FILE *search_scratch_file(const char *dir, const char *basename, char *path_out,
+                                 size_t path_sz) {
+    path_out[0] = '\0';
+    int written = snprintf(path_out, path_sz, "%s/%s-XXXXXX", dir, basename);
+    if (written <= 0 || (size_t)written >= path_sz) {
+        path_out[0] = '\0';
+        return NULL;
+    }
+    int descriptor = cbm_mkstemp(path_out);
+    if (descriptor < 0) {
+        path_out[0] = '\0';
+        return NULL;
+    }
+    /* Binary mode: the file list uses an explicit per-platform record separator
+     * (NUL for xargs -0, newline for PowerShell) that CRLF translation would
+     * corrupt — the same reason the previous code opened it "wb". */
+    FILE *stream = mcp_fdopen(descriptor, "wb");
+    if (!stream) {
+        (void)mcp_close(descriptor);
+        (void)cbm_unlink(path_out);
+        path_out[0] = '\0';
+    }
+    return stream;
+}
+
+/* Anchored cleanup: removes both scratch files and the private directory. Safe
+ * to call more than once and on any partially-initialised scratch, so every
+ * exit from handle_search_code can call it unconditionally. rmdir succeeding is
+ * itself the proof nothing was left inside. */
+static void search_scratch_close(search_scratch_t *scratch) {
+    if (scratch->filelist) {
+        (void)fclose(scratch->filelist);
+        scratch->filelist = NULL;
+    }
+    if (scratch->pattern_path[0] != '\0') {
+        (void)cbm_unlink(scratch->pattern_path);
+        scratch->pattern_path[0] = '\0';
+    }
+    if (scratch->filelist_path[0] != '\0') {
+        (void)cbm_unlink(scratch->filelist_path);
+        scratch->filelist_path[0] = '\0';
+    }
+    if (scratch->dir[0] != '\0') {
+        (void)cbm_rmdir(scratch->dir);
+        scratch->dir[0] = '\0';
+    }
+}
+
+/* Open the scratch directory, write `pattern` to the grep -f file, and leave the
+ * file list open for write_scoped_filelist. Returns true on success; on failure
+ * everything already created is removed before returning. */
+static bool search_scratch_open(search_scratch_t *scratch, const char *pattern) {
+    scratch->dir[0] = '\0';
+    scratch->pattern_path[0] = '\0';
+    scratch->filelist_path[0] = '\0';
+    scratch->filelist = NULL;
+
+    int written =
+        snprintf(scratch->dir, sizeof(scratch->dir), "%s/cbm-search-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || (size_t)written >= sizeof(scratch->dir) || !cbm_mkdtemp(scratch->dir)) {
+        scratch->dir[0] = '\0';
         return false;
     }
-    (void)fprintf(tf, "%s\n", pattern);
-    (void)fclose(tf);
+
+    FILE *pattern_file = search_scratch_file(scratch->dir, "pat", scratch->pattern_path,
+                                             sizeof(scratch->pattern_path));
+    if (!pattern_file) {
+        search_scratch_close(scratch);
+        return false;
+    }
+    bool ok = fprintf(pattern_file, "%s\n", pattern) >= 0;
+    ok = fclose(pattern_file) == 0 && ok;
+    if (!ok) {
+        search_scratch_close(scratch);
+        return false;
+    }
+
+    scratch->filelist = search_scratch_file(scratch->dir, "files", scratch->filelist_path,
+                                            sizeof(scratch->filelist_path));
+    if (!scratch->filelist) {
+        search_scratch_close(scratch);
+        return false;
+    }
     return true;
 }
 
@@ -8397,8 +9614,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
-    char tmpfile[CBM_SZ_256];
-    if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
+    search_scratch_t scratch;
+    if (!search_scratch_open(&scratch, pattern)) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
                  strerror(errno));
@@ -8408,6 +9625,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern);
         return cbm_mcp_text_result(errmsg, true);
     }
+    const char *tmpfile = scratch.pattern_path;
+    const char *filelist = scratch.filelist_path;
 
     /* No grep-level match limit — let grep find all matches, then dedup and
      * cap in our code. The -m flag caused results from large vendored files
@@ -8419,13 +9638,16 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * Query the graph for distinct file paths, write them to a temp file,
      * then use xargs to pass them to grep. Falls back to recursive grep if
      * no indexed files found (project not fully indexed). */
-    char filelist[CBM_SZ_256];
-    snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
     int scoped_written = 0;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
+    scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, has_path_filter,
                                    has_path_filter ? &path_regex : NULL, &scoped_written);
+    /* Close before grep runs: this is what flushes the records the helper wrote
+     * through the descriptor. Clearing the field hands ownership to
+     * search_scratch_close, which still unlinks the file itself. */
+    (void)fclose(scratch.filelist);
+    scratch.filelist = NULL;
 
     /* Collect grep matches into array */
     int gm_count = 0;
@@ -8436,8 +9658,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
          * platform-dependent (GNU execs grep once with no operands, BSD
          * skips), and the post-grep filter would drop every hit anyway. */
         gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
-        cbm_unlink(tmpfile);
-        cbm_unlink(filelist);
+        search_scratch_close(&scratch);
     } else {
         char cmd[CBM_SZ_4K];
         build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
@@ -8445,10 +9666,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
         FILE *fp = cbm_popen(cmd, "r");
         if (!fp) {
-            cbm_unlink(tmpfile);
-            if (scoped) {
-                cbm_unlink(filelist);
-            }
+            search_scratch_close(&scratch);
             free(root_path);
             free(pattern);
             free(project);
@@ -8459,10 +9677,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
                                   grep_limit, &gm_count);
         cbm_pclose(fp);
-        cbm_unlink(tmpfile);
-        if (scoped) {
-            cbm_unlink(filelist);
-        }
+        /* Both scratch files and the private directory go here — unlike the old
+         * code, the file list is removed even when the scan was not scoped. */
+        search_scratch_close(&scratch);
     }
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
@@ -8549,19 +9766,199 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── detect_changes ───────────────────────────────────────────── */
 
-/* Collect BFS seed ids: every symbol DEFINED in a changed file (everything but
- * the structural container labels — those have no CALLS edges). These anchor
- * the multi-source impact traversal. */
+/* Run shell-backed query helpers inside the same process-tree containment used
+ * by indexing. A plain popen owns only its shell stream: on disconnect there is
+ * no safe handle with which to stop a blocked git child or its descendants. */
+static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
+    char directory[CBM_SZ_1K];
+    const char *cache = cbm_resolve_cache_dir();
+    int written;
+    if (cache && cache[0]) {
+        written = snprintf(directory, sizeof(directory), "%s/logs", cache);
+        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+            return false;
+        }
+    } else {
+        written = snprintf(directory, sizeof(directory), "%s", cbm_tmpdir());
+        if (written <= 0 || written >= (int)sizeof(directory)) {
+            return false;
+        }
+    }
+    written = snprintf(out, CBM_SZ_2K, "%s/.mcp-command-XXXXXX", directory);
+    if (written <= 0 || written >= CBM_SZ_2K) {
+        out[0] = '\0';
+        return false;
+    }
+    int descriptor = cbm_mkstemp(out);
+    if (descriptor < 0) {
+        out[0] = '\0';
+        return false;
+    }
+#ifdef _WIN32
+    (void)_close(descriptor);
+#else
+    (void)close(descriptor);
+#endif
+    return true;
+}
+
+#ifdef _WIN32
+/* Resolve the OS-owned command processor without consulting PATH or mutable
+ * COMSPEC. cbm_subprocess receives this as lpApplicationName and validates the
+ * same absolute cmd.exe path before using the dedicated payload serializer. */
+static bool mcp_resolve_windows_cmd(char out[CBM_SZ_4K]) {
+    if (!out) {
+        return false;
+    }
+    out[0] = '\0';
+    wchar_t system_directory[MAX_PATH + 1];
+    UINT directory_length = GetSystemDirectoryW(system_directory, MAX_PATH + 1);
+    static const wchar_t suffix[] = L"\\cmd.exe";
+    if (directory_length == 0 || directory_length > MAX_PATH ||
+        (size_t)directory_length + (sizeof(suffix) / sizeof(suffix[0])) >
+            sizeof(system_directory) / sizeof(system_directory[0])) {
+        return false;
+    }
+    memcpy(system_directory + directory_length, suffix, sizeof(suffix));
+    char *candidate = cbm_wide_to_utf8(system_directory);
+    if (!candidate) {
+        return false;
+    }
+    bool resolved = cbm_canonical_path(candidate, out, CBM_SZ_4K) != 0;
+    free(candidate);
+    return resolved;
+}
+#endif
+
+static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *command,
+                                             char output_path[CBM_SZ_2K],
+                                             cbm_proc_result_t *result_out) {
+    if (!srv || !command || !output_path || !result_out || !mcp_command_output_path(output_path)) {
+        return -1;
+    }
+    /* Internal test seam: rejecting after output allocation exercises the same
+     * cleanup contract as a contained process-tree failure. */
+    if (srv->command_test_hook && !srv->command_test_hook(srv->command_test_context, command)) {
+        return -1;
+    }
+#ifdef _WIN32
+    char shell[CBM_SZ_4K];
+    if (!mcp_resolve_windows_cmd(shell)) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+        return -1;
+    }
+#else
+    const char *shell = "/bin/sh";
+    const char *argv[] = {"sh", "-c", command, NULL};
+#endif
+    cbm_proc_opts_t options = {
+        .bin = shell,
+#ifdef _WIN32
+        .windows_cmd_payload = command,
+#else
+        .argv = argv,
+#endif
+        .log_file = output_path,
+        .quiet_timeout_ms = 0,
+        .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
+        .delete_log_on_exit = false,
+    };
+    cbm_subprocess_t *process = NULL;
+    if (cbm_subprocess_spawn(&options, &process) != 0) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+        return -1;
+    }
+
+    cbm_proc_poll_t state;
+    for (;;) {
+        if (mcp_request_cancelled(srv)) {
+            (void)cbm_subprocess_request_cancel(process);
+        }
+        state = cbm_subprocess_poll(process, result_out);
+        if (state != CBM_PROC_POLL_RUNNING) {
+            break;
+        }
+        cbm_usleep(10000);
+    }
+    bool contained = state == CBM_PROC_POLL_TERMINAL && result_out->tree_quiesced &&
+                     !result_out->supervision_failed;
+    cbm_subprocess_destroy(process);
+    return contained ? 0 : -1;
+}
+
+/* Does `node`'s line range overlap any recorded hunk for `file`? Used to scope
+ * seed detection to the actually-changed lines rather than the whole file.
+ * Non-static (declared in mcp_internal.h) so tests can exercise the overlap
+ * logic directly, matching this file's existing white-box test hooks. */
+bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *hunks,
+                              int hunk_count, const char *file) {
+    for (int h = 0; h < hunk_count; h++) {
+        if (strcmp(hunks[h].path, file) == 0 && node->start_line <= hunks[h].end_line &&
+            node->end_line >= hunks[h].start_line) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Collect BFS seed ids for one changed file (everything but the structural
+ * container labels — those have no CALLS edges). These anchor the
+ * multi-source impact traversal.
+ *
+ * When `hunks` has at least one entry for `file`, only definitions whose line
+ * range overlaps a hunk become seeds — a one-line edit inside a single
+ * function no longer seeds every other definition in the file. When no hunk
+ * is recorded for `file` (a brand-new/untracked file has no comparable
+ * "before" state, or the hunk fetch failed/was skipped), every non-container
+ * definition in the file is a seed — the previous, whole-file behavior — so
+ * this is a precision improvement, not a new failure mode. */
+/* Structural container labels carry no CALLS edges and span the whole file, so
+ * they are never seeds. Shared by the seeding loop and the overlap probe. */
+static bool detect_is_seedable_label(const char *lb) {
+    return lb && strcmp(lb, "File") != 0 && strcmp(lb, "Folder") != 0 &&
+           strcmp(lb, "Project") != 0 && strcmp(lb, "Module") != 0 && strcmp(lb, "Package") != 0 &&
+           strcmp(lb, "Section") != 0;
+}
+
 static void detect_collect_seeds(cbm_store_t *store, const char *project, const char *file,
-                                 int64_t **seeds, int *n, int *cap) {
+                                 const cbm_changed_hunk_t *hunks, int hunk_count, int64_t **seeds,
+                                 int *n, int *cap) {
     cbm_node_t *nodes = NULL;
     int ncount = 0;
     cbm_store_find_nodes_by_file(store, project, file, &nodes, &ncount);
+    bool scope_to_hunks = false;
+    for (int h = 0; h < hunk_count; h++) {
+        if (strcmp(hunks[h].path, file) == 0) {
+            scope_to_hunks = true;
+            break;
+        }
+    }
+    /* A file can have hunks yet no SEEDABLE definition overlapping any of them:
+     * an import-only edit, a module-level constant, or a change above the first
+     * definition all land outside every definition's line range. Scoping would
+     * then drop the file from the seed set entirely — strictly worse recall
+     * than the whole-file behavior this replaces. Probe for an overlap first
+     * and keep whole-file seeding for that file when there is none.
+     *
+     * The probe must apply the same label filter as the seeding loop below:
+     * container nodes span the whole file (a Module node is lines 1..EOF), so
+     * counting them would report an overlap for every hunk and defeat the
+     * fallback entirely. */
+    if (scope_to_hunks) {
+        bool any_overlap = false;
+        for (int i = 0; i < ncount && !any_overlap; i++) {
+            any_overlap = detect_is_seedable_label(nodes[i].label) &&
+                          cbm_detect_node_in_hunks(&nodes[i], hunks, hunk_count, file);
+        }
+        scope_to_hunks = any_overlap;
+    }
     for (int i = 0; i < ncount; i++) {
-        const char *lb = nodes[i].label;
-        if (lb && strcmp(lb, "File") != 0 && strcmp(lb, "Folder") != 0 &&
-            strcmp(lb, "Project") != 0 && strcmp(lb, "Module") != 0 && strcmp(lb, "Package") != 0 &&
-            strcmp(lb, "Section") != 0) {
+        if (detect_is_seedable_label(nodes[i].label)) {
+            if (scope_to_hunks && !cbm_detect_node_in_hunks(&nodes[i], hunks, hunk_count, file)) {
+                continue;
+            }
             if (*n >= *cap) {
                 *cap = *cap ? *cap * 2 : 16;
                 *seeds = safe_realloc(*seeds, (size_t)*cap * sizeof(int64_t));
@@ -8709,7 +10106,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * "<base>"...HEAD`; a value starting with '-' would be read by git as an
      * option rather than a ref (e.g. `--output=<path>` writes the diff to an
      * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
+    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-' ||
+        !validate_windows_cmd_interpolation_arg(base_branch)) {
         free(project);
         free(base_branch);
         free(scope);
@@ -8727,7 +10125,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return res;
     }
 
-    if (!validate_search_path_arg(root_path)) {
+    if (!validate_search_path_arg(root_path) ||
+        !validate_windows_cmd_interpolation_arg(root_path)) {
         free(root_path);
         free(project);
         free(base_branch);
@@ -8761,17 +10160,38 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
              root_path, base_branch, root_path, root_path);
 #endif
 
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+    char output_path[CBM_SZ_2K] = {0};
+    cbm_proc_result_t git_result = {0};
+    int git_run = mcp_run_shell_command_cancellable(srv, cmd, output_path, &git_result);
+    bool git_cancelled = git_result.cancellation_requested || mcp_request_cancelled(srv);
+    if (git_cancelled) {
+        (void)cbm_unlink(output_path);
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result("detect_changes cancelled for this request", true);
+    }
+    if (git_run != 0) {
+        (void)cbm_unlink(output_path);
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg),
-                 "git diff failed: cannot execute command (%s). Check that git is installed.",
-                 strerror(errno));
+                 "git diff failed: the contained command could not complete. "
+                 "Check that git is installed.");
         free(root_path);
         free(project);
         free(base_branch);
         free(scope);
         return cbm_mcp_text_result(errmsg, true);
+    }
+    FILE *fp = cbm_fopen(output_path, "rb");
+    if (!fp) {
+        (void)cbm_unlink(output_path);
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result("git diff failed: contained output could not be read", true);
     }
 
     /* resolve_store already called via get_project_root above */
@@ -8798,7 +10218,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(base_branch);
         free(scope);
-        (void)cbm_pclose(fp);
+        (void)fclose(fp);
+        (void)cbm_unlink(output_path);
         return cbm_mcp_text_result(errbuf, true);
     }
     char *fmt = cbm_mcp_get_string_arg(args, "format");
@@ -8823,6 +10244,76 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     int64_t *seeds = NULL;
     int seed_count = 0;
     int seed_cap = 0;
+
+    /* Hunk line ranges (unified=0 diff), used to scope seed detection to the
+     * actually-changed lines instead of every definition in a changed file
+     * (see detect_collect_seeds). Best-effort: any failure here just leaves
+     * `hunks` empty and every file falls back to its previous whole-file
+     * seeding — this is a precision improvement, not a correctness
+     * dependency, so it is never treated as a request-level failure.
+     *
+     * Coordinate systems: `base...HEAD` hunks carry HEAD-side line numbers,
+     * the worktree diff carries worktree-side ones, and node line ranges come
+     * from the indexed snapshot. These agree while the index is fresh — the
+     * watcher reindexes on HEAD movement and on a dirty tree — but a stale
+     * index combined with insertions earlier in the file shifts the node lines
+     * relative to the hunks and can mis-scope. The failure is bounded by
+     * detect_collect_seeds' zero-overlap fallback: a file whose definitions all
+     * miss reverts to whole-file seeding rather than dropping out. */
+    cbm_changed_hunk_t *hunks = NULL;
+    int hunk_count = 0;
+    if (want_symbols) {
+        char hunk_cmd[CBM_SZ_2K];
+#ifdef _WIN32
+        snprintf(hunk_cmd, sizeof(hunk_cmd),
+                 "git -C \"%s\" diff --unified=0 \"%s\"...HEAD 2>NUL & "
+                 "git -C \"%s\" diff --unified=0 2>NUL",
+                 root_path, base_branch, root_path);
+#else
+        snprintf(hunk_cmd, sizeof(hunk_cmd),
+                 "{ git -C '%s' diff --unified=0 '%s'...HEAD 2>/dev/null; "
+                 "git -C '%s' diff --unified=0 2>/dev/null; }",
+                 root_path, base_branch, root_path);
+#endif
+        char hunk_output_path[CBM_SZ_2K] = {0};
+        cbm_proc_result_t hunk_result = {0};
+        int hunk_run =
+            mcp_run_shell_command_cancellable(srv, hunk_cmd, hunk_output_path, &hunk_result);
+        bool hunk_cancelled = hunk_result.cancellation_requested || mcp_request_cancelled(srv);
+        FILE *hfp = (!hunk_cancelled && hunk_run == 0) ? cbm_fopen(hunk_output_path, "rb") : NULL;
+        if (hfp) {
+            (void)fseek(hfp, 0, SEEK_END);
+            long hsz = ftell(hfp);
+            if (hsz > 0) {
+                (void)fseek(hfp, 0, SEEK_SET);
+                char *hbuf = malloc((size_t)hsz + SKIP_ONE);
+                if (hbuf) {
+                    size_t hread = fread(hbuf, SKIP_ONE, (size_t)hsz, hfp);
+                    hbuf[hread] = '\0';
+                    enum { HUNK_CAP = 4096 };
+                    hunks = safe_realloc(NULL, (size_t)HUNK_CAP * sizeof(cbm_changed_hunk_t));
+                    hunk_count = cbm_parse_hunks(hbuf, hunks, HUNK_CAP);
+                    /* A filled buffer means the diff was truncated: the hunks
+                     * past the cap are gone, so files captured only partially
+                     * would still look scoped and silently under-seed. Drop
+                     * scoping for the whole request rather than under-report a
+                     * large refactor — whole-file seeding is the safe side. */
+                    if (hunk_count >= HUNK_CAP) {
+                        cbm_log_info("detect_changes.hunks", "action", "scoping_disabled", "reason",
+                                     "hunk_cap_reached");
+                        free(hunks);
+                        hunks = NULL;
+                        hunk_count = 0;
+                    }
+                    free(hbuf);
+                }
+            }
+            (void)fclose(hfp);
+        }
+        if (hunk_output_path[0]) {
+            (void)cbm_unlink(hunk_output_path);
+        }
+    }
 
     char line[CBM_SZ_1K];
     while (fgets(line, sizeof(line), fp)) {
@@ -8866,10 +10357,13 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         }
         files[file_count++] = heap_strdup(path_line);
         if (want_symbols) {
-            detect_collect_seeds(store, project, path_line, &seeds, &seed_count, &seed_cap);
+            detect_collect_seeds(store, project, path_line, hunks, hunk_count, &seeds, &seed_count,
+                                 &seed_cap);
         }
     }
-    int git_status = cbm_pclose(fp);
+    (void)fclose(fp);
+    (void)cbm_unlink(output_path);
+    int git_status = git_result.exit_code;
 
     /* merge-base SHA: the exact commit the diff is measured against, so the
      * result is reproducible even as base_branch advances. Best-effort. */
@@ -8883,15 +10377,43 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         snprintf(mbcmd, sizeof(mbcmd), "git -C '%s' merge-base '%s' HEAD 2>/dev/null", root_path,
                  base_branch);
 #endif
-        FILE *mbfp = cbm_popen(mbcmd, "r");
-        if (mbfp) {
+        char mb_output_path[CBM_SZ_2K] = {0};
+        cbm_proc_result_t mb_result = {0};
+        int mb_run = mcp_run_shell_command_cancellable(srv, mbcmd, mb_output_path, &mb_result);
+        bool mb_cancelled = mb_result.cancellation_requested || mcp_request_cancelled(srv);
+        bool mb_containment_failed = mb_run != 0 && mb_output_path[0] != '\0';
+        FILE *mbfp =
+            mb_run == 0 && mb_result.exit_code == 0 ? cbm_fopen(mb_output_path, "rb") : NULL;
+        if (mbfp && !mb_cancelled) {
             if (fgets(merge_base, sizeof(merge_base), mbfp)) {
                 size_t l = strlen(merge_base);
                 while (l > 0 && (merge_base[l - 1] == '\n' || merge_base[l - 1] == '\r')) {
                     merge_base[--l] = '\0';
                 }
             }
-            (void)cbm_pclose(mbfp);
+        }
+        if (mbfp) {
+            (void)fclose(mbfp);
+        }
+        if (mb_output_path[0]) {
+            (void)cbm_unlink(mb_output_path);
+        }
+        if (mb_cancelled || mb_containment_failed) {
+            for (int i = 0; i < file_count; i++) {
+                free(files[i]);
+            }
+            free(files);
+            free(seeds);
+            free(hunks);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result(
+                mb_cancelled ? "detect_changes cancelled for this request"
+                             : "git merge-base failed: the contained command could not complete",
+                true);
         }
     }
 
@@ -9040,6 +10562,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     }
     free(files);
     free(seeds);
+    free(hunks);
     free(direction);
     free(root_path);
     free(project);
@@ -9125,6 +10648,28 @@ static char *adr_read_legacy_file(const char *root_path) {
     "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "               \
     "PATTERNS, TRADEOFFS, PHILOSOPHY."
 
+/* resolve_store opens file-backed projects query-only. A mutation must release
+ * that reader before opening a dedicated writer because atomic publication uses
+ * a self-contained DELETE-mode database that switches back to WAL on write. */
+static cbm_store_t *open_adr_store_for_write(cbm_mcp_server_t *srv, cbm_store_t *resolved,
+                                             cbm_store_t **owned_rw) {
+    if (!srv || !resolved || !owned_rw) {
+        return NULL;
+    }
+    const char *resolved_db_path = cbm_store_db_path(resolved);
+    if (!resolved_db_path) {
+        return resolved;
+    }
+    char *rw_path = heap_strdup(resolved_db_path);
+    if (!rw_path) {
+        return NULL;
+    }
+    invalidate_cached_store(srv);
+    *owned_rw = cbm_store_open_path(rw_path);
+    free(rw_path);
+    return *owned_rw;
+}
+
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
@@ -9134,59 +10679,127 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         mode_str = heap_strdup("get");
     }
 
+    /* `sections` used to be advertised as an input argument, but it was never
+     * consumed: mode=update still replaced the whole document. Reject the old
+     * shape explicitly before opening a store so a stale client cannot mistake
+     * a whole-document replacement for a section-scoped update. */
+    bool has_sections_arg = false;
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    if (args_doc) {
+        yyjson_val *args_root = yyjson_doc_get_root(args_doc);
+        has_sections_arg =
+            args_root && yyjson_is_obj(args_root) && yyjson_obj_get(args_root, "sections") != NULL;
+        yyjson_doc_free(args_doc);
+    }
+    if (has_sections_arg) {
+        free(project);
+        free(mode_str);
+        free(content);
+        return cbm_mcp_text_result(
+            "{\"status\":\"invalid_arguments\",\"error\":\"The sections argument is not an "
+            "update primitive and has been removed. No ADR write was performed.\"}",
+            true);
+    }
+
+    bool write_request =
+        content && (strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0);
+    bool mutation_held = false;
+    if (write_request && project) {
+        mutation_held = mcp_project_mutation_begin(srv, project);
+        if (!mutation_held) {
+            free(project);
+            free(mode_str);
+            free(content);
+            return cbm_mcp_text_result("project operation cancelled or blocked by an active index",
+                                       true);
+        }
+        if (mcp_request_cancelled(srv)) {
+            mcp_project_mutation_end(srv, project);
+            free(project);
+            free(mode_str);
+            free(content);
+            return cbm_mcp_text_result("project operation cancelled for this request", true);
+        }
+    }
+
     /* ADRs are stored in the SQLite store (project_summaries), the SAME
      * backend the UI /api/adr endpoints use — so writes via the MCP tool and
      * the UI are visible to each other (#256). */
-    cbm_store_t *resolved = resolve_store(srv, project);
+    store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
+    cbm_store_t *resolved =
+        resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status);
     if (!resolved) {
-        char *err = build_no_store_error(project);
-        char *res = cbm_mcp_text_result(err, true);
-        free(err);
+        char *res = NULL;
+        if (recovery_status == STORE_RECOVERY_BUSY) {
+            res = cbm_mcp_text_result("project is busy; retry after indexing", true);
+        } else if (recovery_status == STORE_RECOVERY_TRY_GUARD_UNAVAILABLE) {
+            res =
+                cbm_mcp_text_result("project recovery requires a nonblocking mutation guard", true);
+        } else {
+            char *err = build_no_store_error(project);
+            res = cbm_mcp_text_result(err, true);
+            free(err);
+        }
+        if (mutation_held) {
+            mcp_project_mutation_end(srv, project);
+        }
         free(project);
         free(mode_str);
         free(content);
         return res;
     }
 
-    /* resolve_store opens file-backed projects READ-ONLY (query stores must
-     * not mutate the DB). manage_adr is the only resolve_store caller that
-     * WRITES, so it needs a writable handle. For a file-backed project open a
-     * dedicated read-write handle to the same DB file (the project is verified
-     * to exist via resolve_store, so cbm_store_open_path won't create a ghost
-     * DB). For an in-memory / embedded store (db_path == NULL) the resolved
-     * store is already writable — use it directly. */
     cbm_store_t *store = resolved;
     cbm_store_t *owned_rw = NULL;
-    const char *resolved_db_path = cbm_store_db_path(resolved);
-    if (resolved_db_path) {
-        owned_rw = cbm_store_open_path(resolved_db_path);
-        if (!owned_rw) {
-            char *err = build_no_store_error(project);
-            char *res = cbm_mcp_text_result(err, true);
-            free(err);
+    if (write_request) {
+        store = open_adr_store_for_write(srv, resolved, &owned_rw);
+        if (!store) {
+            if (mutation_held) {
+                mcp_project_mutation_end(srv, project);
+            }
             free(project);
             free(mode_str);
             free(content);
-            return res;
+            return cbm_mcp_text_result("failed to open writable ADR store", true);
         }
-        store = owned_rw;
     }
 
     /* One-time migration: older versions wrote ADRs to a file at
-     * <root>/.codebase-memory/adr.md. If the store has no ADR yet but that
-     * legacy file exists, import it so nothing is lost on upgrade. */
+     * <root>/.codebase-memory/adr.md. A read never waits for the project lease:
+     * it returns the legacy content immediately and attempts migration only if
+     * a nonblocking acquire succeeds. */
     cbm_adr_t adr;
     memset(&adr, 0, sizeof(adr));
     bool have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
-    if (!have_adr) {
-        char *root_path = get_project_root(srv, project);
-        char *legacy = adr_read_legacy_file(root_path);
+    char *legacy = NULL;
+    if (!have_adr && !write_request) {
+        char *root_path = project_root_from_store(store, project);
+        legacy = adr_read_legacy_file(root_path);
         free(root_path);
-        if (legacy) {
-            if (cbm_store_adr_store(store, project, legacy) == CBM_STORE_OK) {
-                have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
+        if (legacy && mcp_project_mutation_try_begin(srv, project)) {
+            if (!mcp_request_cancelled(srv)) {
+                /* A publisher may have completed before the lease was granted.
+                 * File-backed stores must reopen after acquisition and trust
+                 * only that generation. Embedded stores have no publication
+                 * boundary, so retain their live handle. */
+                if (cbm_store_db_path(resolved)) {
+                    invalidate_cached_store(srv);
+                    resolved = NULL;
+                    store = NULL;
+                    resolved = resolve_store_internal(srv, project, true, false, NULL);
+                }
+                if (resolved) {
+                    store = open_adr_store_for_write(srv, resolved, &owned_rw);
+                    if (store) {
+                        have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
+                        if (!have_adr &&
+                            cbm_store_adr_store(store, project, legacy) == CBM_STORE_OK) {
+                            have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
+                        }
+                    }
+                }
             }
-            free(legacy);
+            mcp_project_mutation_end(srv, project);
         }
     }
 
@@ -9195,18 +10808,20 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root_obj);
 
     bool is_error = false;
-    if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
+    const char *adr_content = have_adr ? adr.content : legacy;
+    if (write_request) {
         if (cbm_store_adr_store(store, project, content) == CBM_STORE_OK) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
+            yyjson_mut_obj_add_str(doc, root_obj, "semantics", "whole_document_replaced");
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
             is_error = true;
         }
     } else if (strcmp(mode_str, "sections") == 0) {
-        adr_list_sections_from_content(doc, root_obj, have_adr ? adr.content : NULL);
+        adr_list_sections_from_content(doc, root_obj, adr_content);
     } else { /* get */
-        if (have_adr && adr.content) {
-            yyjson_mut_obj_add_strcpy(doc, root_obj, "content", adr.content);
+        if (adr_content) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "content", adr_content);
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "content", "");
             yyjson_mut_obj_add_str(doc, root_obj, "status", "no_adr");
@@ -9222,6 +10837,10 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (owned_rw) {
         cbm_store_close(owned_rw);
     }
+    if (mutation_held) {
+        mcp_project_mutation_end(srv, project);
+    }
+    free(legacy);
     free(project);
     free(mode_str);
     free(content);
@@ -9267,7 +10886,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
-char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
@@ -9328,6 +10947,57 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
     return cbm_mcp_text_result(msg, true);
+}
+
+/* File-backed query stores are request-scoped. Keeping one open between MCP
+ * calls pins an old database generation after another process atomically
+ * replaces the project DB. On Windows it can also prevent that replacement
+ * entirely. Embedded/in-memory stores have no path and retain their existing
+ * process lifetime. */
+static void release_request_store(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->owns_store || !srv->store || !cbm_store_db_path(srv->store)) {
+        return;
+    }
+    cbm_store_close(srv->store);
+    srv->store = NULL;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    /* The close above frees a connection's worth of page cache. Ask the
+     * allocator to hand those pages back now, which keeps a long-lived daemon
+     * flat across thousands of request-scoped stores (#581). This only became
+     * meaningful once the Windows interposer made the pages mimalloc's: an
+     * earlier attempt aimed at the CRT heap instead and could not release
+     * them. POSIX already purges on free, so this is a no-op there. */
+    cbm_mem_collect();
+}
+
+char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    /* Phase marks bracket the WHOLE request with no unlabelled gap, so growth
+     * cannot hide between them (CBM_MEM_PHASES=1; see foundation/mem.h). The
+     * "idle" label owns everything outside a request, which is what makes a
+     * request-path retainer distinguishable from background growth. */
+    cbm_mem_phase_mark("request.scope_begin");
+    bool request_scope = !srv || cbm_mcp_server_request_scope_begin(srv);
+    if (!request_scope) {
+        release_request_store(srv);
+        cbm_mem_phase_mark("idle");
+        return cbm_mcp_text_result("request cancellation scope unavailable", true);
+    }
+    cbm_mem_phase_mark("request.dispatch_tool");
+    char *result = dispatch_tool(srv, tool_name, args_json);
+    cbm_mem_phase_mark("request.scope_end");
+    if (srv) {
+        cbm_mcp_server_request_scope_end(srv);
+    }
+    cbm_mem_phase_mark("request.release_store");
+    release_request_store(srv);
+    cbm_mem_phase_mark("idle");
+    /* One census per completed request, so growth can be attributed to a POOL
+     * rather than inferred from a process total (#581). Emitted after the
+     * request store is released, which is the point where a well-behaved
+     * request has given everything back. */
+    cbm_mem_census_log("mcp.request");
+    return result;
 }
 
 /* ── Session detection + auto-index ────────────────────────────── */
@@ -9392,11 +11062,11 @@ static void *autoindex_thread(void *arg) {
 
     cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
 
-    /* #832: prefer the supervised worker subprocess. Indexing the whole session in
+    /* #832: use the supervised worker subprocess. Indexing the whole session in
      * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
      * pages worker threads abandon at exit); running it in a child that exits hands
-     * 100% of that memory back to the OS every cycle. Degrade to the in-process
-     * pipeline below when the supervisor is off (kill switch) or the spawn fails. */
+     * 100% of that memory back to the OS every cycle. In a marked host this is a
+     * safety boundary: preparation/start failure stops the operation. */
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = index_run_supervised_path(srv, srv->session_root);
         if (resp) {
@@ -9409,7 +11079,9 @@ static void *autoindex_thread(void *arg) {
             register_watcher_if_enabled(srv);
             return NULL;
         }
-        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+        cbm_log_error("autoindex.supervision_failed", "project", srv->session_project, "action",
+                      "fail_closed");
+        return NULL;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
@@ -9435,6 +11107,31 @@ static void *autoindex_thread(void *arg) {
     return NULL;
 }
 
+bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
+                                          int *file_count_out) {
+    if (file_count_out) {
+        *file_count_out = -1;
+    }
+    if (!root_path || !root_path[0] || file_limit < 0) {
+        return false;
+    }
+    enum { AUTO_INDEX_COUNT_TIMEOUT_MS = 5000 };
+    cbm_discover_opts_t options = {
+        .mode = CBM_MODE_FULL,
+        .ignore_file = NULL,
+        .max_file_size = 0,
+    };
+    int count = -1;
+    cbm_discover_status_t status = cbm_discover_count_bounded(
+        root_path, &options, file_limit, cbm_now_ms() + AUTO_INDEX_COUNT_TIMEOUT_MS, &count);
+    if (file_count_out) {
+        *file_count_out = status == CBM_DISCOVER_LIMIT_EXCEEDED
+                              ? (file_limit < INT_MAX ? file_limit + 1 : INT_MAX)
+                              : count;
+    }
+    return status == CBM_DISCOVER_OK;
+}
+
 /* Start auto-indexing if configured and project not yet indexed. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
@@ -9456,16 +11153,13 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         }
     }
 
-/* Default file limit for auto-indexing new projects */
-#define DEFAULT_AUTO_INDEX_LIMIT 50000
-
     /* Check auto_index config */
     bool auto_index = false;
-    int file_limit = DEFAULT_AUTO_INDEX_LIMIT;
+    int file_limit = CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
     if (srv->config) {
         auto_index = cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_INDEX, false);
-        file_limit =
-            cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT, DEFAULT_AUTO_INDEX_LIMIT);
+        file_limit = cbm_config_get_int(srv->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                        CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT);
     }
 
     if (!auto_index) {
@@ -9474,26 +11168,15 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Quick file count check to avoid OOM on massive repos */
-    if (!cbm_validate_shell_arg(srv->session_root)) {
-        cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
+    /* Quick tracked-file count check to avoid OOM on massive repos. */
+    int file_count = -1;
+    if (!cbm_mcp_auto_index_within_file_limit(srv->session_root, file_limit, &file_count)) {
+        char files[32];
+        (void)snprintf(files, sizeof(files), "%d", file_count);
+        cbm_log_warn("autoindex.skip", "reason",
+                     file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
+                     files, "limit", CBM_CONFIG_AUTO_INDEX_LIMIT);
         return;
-    }
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (fp) {
-        char line[CBM_SZ_64];
-        if (fgets(line, sizeof(line), fp)) {
-            int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
-            if (count > file_limit) {
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line, "limit",
-                             CBM_CONFIG_AUTO_INDEX_LIMIT);
-                cbm_pclose(fp);
-                return;
-            }
-        }
-        cbm_pclose(fp);
     }
 
     /* Launch auto-index in background */
@@ -9502,116 +11185,48 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
 }
 
-/* ── Background update check ──────────────────────────────────── */
-
-#define UPDATE_CHECK_URL "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
-
-static void *update_check_thread(void *arg) {
-    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
-
-    /* Use curl with 5s timeout to fetch latest release tag */
-    FILE *fp = cbm_popen("curl -sf --max-time 5 -H 'Accept: application/vnd.github+json' "
-                         "'" UPDATE_CHECK_URL "' 2>/dev/null",
-                         "r");
-    if (!fp) {
-        srv->update_checked = true;
-        return NULL;
-    }
-
-    char buf[CBM_SZ_4K];
-    size_t total = 0;
-    while (total < sizeof(buf) - SKIP_ONE) {
-        size_t n = fread(buf + total, SKIP_ONE, sizeof(buf) - SKIP_ONE - total, fp);
-        if (n == 0) {
-            break;
-        }
-        total += n;
-    }
-    buf[total] = '\0';
-    cbm_pclose(fp);
-
-    /* Parse tag_name from JSON response */
-    yyjson_doc *doc = yyjson_read(buf, total, 0);
-    if (!doc) {
-        srv->update_checked = true;
-        return NULL;
-    }
-
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *tag = yyjson_obj_get(root, "tag_name");
-    const char *tag_str = yyjson_get_str(tag);
-
-    if (tag_str) {
-        const char *current = cbm_cli_get_version();
-        if (cbm_compare_versions(tag_str, current) > 0) {
-            snprintf(srv->update_notice, sizeof(srv->update_notice),
-                     "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
-                     "Enjoying codebase-memory-mcp? Please leave a star: "
-                     "https://github.com/DeusData/codebase-memory-mcp",
-                     current, tag_str);
-            cbm_log_info("update.available", "current", current, "latest", tag_str);
-        }
-    }
-
-    yyjson_doc_free(doc);
-    srv->update_checked = true;
-    return NULL;
-}
-
-static void start_update_check(cbm_mcp_server_t *srv) {
-    if (srv->update_checked) {
-        return;
-    }
-    srv->update_checked = true; /* prevent double-launch */
-    if (cbm_thread_create(&srv->update_tid, 0, update_check_thread, srv) == 0) {
-        srv->update_thread_active = true;
-    }
-}
-
-/* Prepend update notice to a tool result, then clear it (one-shot). */
-static char *inject_update_notice(cbm_mcp_server_t *srv, char *result_json) {
-    if (srv->update_notice[0] == '\0') {
-        return result_json;
-    }
-
-    /* Parse existing result, prepend notice text, rebuild */
-    yyjson_doc *doc = yyjson_read(result_json, strlen(result_json), 0);
-    if (!doc) {
-        return result_json;
-    }
-
-    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
-    yyjson_doc_free(doc);
-    if (!root) {
-        yyjson_mut_doc_free(mdoc);
-        return result_json;
-    }
-    yyjson_mut_doc_set_root(mdoc, root);
-
-    /* Find the "content" array */
-    yyjson_mut_val *content = yyjson_mut_obj_get(root, "content");
-    if (content && yyjson_mut_is_arr(content)) {
-        /* Prepend a text content item with the update notice */
-        yyjson_mut_val *notice_item = yyjson_mut_obj(mdoc);
-        yyjson_mut_obj_add_str(mdoc, notice_item, "type", "text");
-        yyjson_mut_obj_add_str(mdoc, notice_item, "text", srv->update_notice);
-        yyjson_mut_arr_prepend(content, notice_item);
-    }
-
-    size_t len;
-    char *new_json = yyjson_mut_write(mdoc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &len);
-    yyjson_mut_doc_free(mdoc);
-
-    if (new_json) {
-        free(result_json);
-        srv->update_notice[0] = '\0'; /* clear — one-shot */
-        return new_json;
-    }
-    return result_json;
-}
-
 /* ── Server request handler ───────────────────────────────────── */
+
+bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice) {
+    if (!response_io || !*response_io || !notice || !notice[0]) {
+        return false;
+    }
+    yyjson_doc *document = yyjson_read(*response_io, strlen(*response_io), 0);
+    if (!document) {
+        return false;
+    }
+    yyjson_mut_doc *mutable_document = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root =
+        mutable_document ? yyjson_val_mut_copy(mutable_document, yyjson_doc_get_root(document))
+                         : NULL;
+    yyjson_doc_free(document);
+    if (!mutable_document || !root) {
+        yyjson_mut_doc_free(mutable_document);
+        return false;
+    }
+    yyjson_mut_doc_set_root(mutable_document, root);
+    yyjson_mut_val *result = yyjson_mut_is_obj(root) ? yyjson_mut_obj_get(root, "result") : NULL;
+    yyjson_mut_val *content =
+        result && yyjson_mut_is_obj(result) ? yyjson_mut_obj_get(result, "content") : NULL;
+    yyjson_mut_val *item =
+        content && yyjson_mut_is_arr(content) ? yyjson_mut_obj(mutable_document) : NULL;
+    bool added = item && yyjson_mut_obj_add_str(mutable_document, item, "type", "text") &&
+                 yyjson_mut_obj_add_str(mutable_document, item, "text", notice) &&
+                 yyjson_mut_arr_prepend(content, item);
+    if (!added) {
+        yyjson_mut_doc_free(mutable_document);
+        return false;
+    }
+    char *replacement =
+        yyjson_mut_write(mutable_document, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL);
+    yyjson_mut_doc_free(mutable_document);
+    if (!replacement) {
+        return false;
+    }
+    free(*response_io);
+    *response_io = replacement;
+    return true;
+}
 
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_jsonrpc_request_t req = {0};
@@ -9622,15 +11237,21 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     /* Notifications (no id) → handle cancellation, then no response */
     if (!req.has_id) {
         if (req.method && strcmp(req.method, "notifications/cancelled") == 0) {
-            if (srv->active_pipeline &&
-                cbm_mcp_cancel_request_matches(req.params_raw, srv->active_request_id,
-                                               srv->active_request_id_str)) {
-                cbm_pipeline_cancel(srv->active_pipeline);
+            if (cbm_mcp_cancel_request_matches(req.params_raw, srv->active_request_id,
+                                               srv->active_request_id_str) &&
+                cbm_mcp_server_cancel_active(srv)) {
                 cbm_log_info("mcp.cancelled", "match", "true");
             }
         }
         cbm_jsonrpc_request_free(&req);
         return NULL;
+    }
+
+    if (!cbm_mcp_server_request_scope_begin(srv)) {
+        int64_t request_id = req.id;
+        cbm_jsonrpc_request_free(&req);
+        return cbm_jsonrpc_format_error(request_id, JSONRPC_INTERNAL_ERROR,
+                                        "Request cancellation scope unavailable");
     }
 
     struct timespec req_t0;
@@ -9642,8 +11263,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
         detect_session(srv);
-        if (srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
-            start_update_check(srv);
+        if (srv->background_tasks && srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
             maybe_auto_index(srv);
         }
     } else if (strcmp(req.method, "ping") == 0) {
@@ -9686,7 +11306,6 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
         request_logged = true;
 
-        result_json = inject_update_notice(srv, result_json);
         free(tool_name);
         free(tool_args);
     } else {
@@ -9705,6 +11324,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
         cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
@@ -9722,6 +11342,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
         cbm_log_mcp_request(req.method, NULL, true, dur_us);
         free(request_error_json);
+        cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
@@ -9741,40 +11362,190 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     };
     char *out = cbm_jsonrpc_format_response(&resp);
     free(result_json);
+    cbm_mcp_server_request_scope_end(srv);
     cbm_jsonrpc_request_free(&req);
     return out;
 }
 
-/* Handle a Content-Length-framed message (LSP-style transport).
- * Reads headers, body, processes request, writes framed response. */
-static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *out, char **line,
-                                        size_t *cap, int content_len) {
-    /* Skip blank line(s) between header and body */
-    while (cbm_getline(line, cap, in) > 0) {
-        size_t hlen = strlen(*line);
-        while (hlen > 0 && ((*line)[hlen - SKIP_ONE] == '\n' || (*line)[hlen - SKIP_ONE] == '\r')) {
-            (*line)[--hlen] = '\0';
+/* Read through one newline without ever growing the buffer beyond max_bytes.
+ * Returns 1 for a line (including a final unterminated line), 0 for clean EOF,
+ * and -1 for I/O, allocation, or size failure. */
+static int read_bounded_line(FILE *in, char **line, size_t *cap, size_t max_bytes,
+                             size_t *out_len) {
+    if (!in || !line || !cap || !out_len || max_bytes == 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    size_t len = 0;
+    for (;;) {
+        int ch = fgetc(in);
+        if (ch == EOF) {
+            if (ferror(in)) {
+                return CBM_NOT_FOUND;
+            }
+            if (len == 0) {
+                return 0;
+            }
+            break;
         }
-        if (hlen == 0) {
+        if (len >= max_bytes) {
+            return CBM_NOT_FOUND;
+        }
+
+        size_t needed = len + 2; /* byte plus trailing NUL */
+        if (*cap < needed) {
+            size_t limit_cap = max_bytes + 1;
+            size_t new_cap = *cap ? *cap : (limit_cap < 256 ? limit_cap : 256);
+            while (new_cap < needed && new_cap < max_bytes + 1) {
+                size_t doubled = new_cap * 2;
+                new_cap = doubled > limit_cap ? limit_cap : doubled;
+            }
+            if (new_cap < needed) {
+                return CBM_NOT_FOUND;
+            }
+            char *grown = realloc(*line, new_cap);
+            if (!grown) {
+                return CBM_NOT_FOUND;
+            }
+            *line = grown;
+            *cap = new_cap;
+        }
+
+        (*line)[len++] = (char)ch;
+        if (ch == '\n') {
             break;
         }
     }
 
-    char *body = malloc((size_t)content_len + SKIP_ONE);
-    if (!body) {
-        return;
+    (*line)[len] = '\0';
+    *out_len = len;
+    return SKIP_ONE;
+}
+
+static bool parse_content_length(const char *line, size_t *out) {
+    if (!line || !out || strncmp(line, "Content-Length:", SLEN("Content-Length:")) != 0) {
+        return false;
     }
-    size_t nread = fread(body, SKIP_ONE, (size_t)content_len, in);
-    body[nread] = '\0';
 
-    char *resp = cbm_mcp_server_handle(srv, body);
-    free(body);
+    const char *cursor = line + MCP_CONTENT_PREFIX;
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if (!isdigit((unsigned char)*cursor)) {
+        return false;
+    }
 
-    if (resp) {
-        size_t rlen = strlen(resp);
-        (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", rlen, resp);
-        (void)fflush(out);
-        free(resp);
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(cursor, &end, CBM_DECIMAL_BASE);
+    if (errno == ERANGE || end == cursor) {
+        return false;
+    }
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+    if (*end != '\0' || parsed == 0 || parsed > MCP_MAX_MESSAGE_SIZE) {
+        return false;
+    }
+    *out = (size_t)parsed;
+    return true;
+}
+
+int cbm_mcp_read_message(FILE *in, char **message, bool *content_length_framed) {
+    if (!in || !message || !content_length_framed) {
+        return CBM_NOT_FOUND;
+    }
+    *message = NULL;
+    *content_length_framed = false;
+
+    char *line = NULL;
+    size_t cap = 0;
+    for (;;) {
+        size_t line_read = 0;
+        int line_status = read_bounded_line(in, &line, &cap, MCP_MAX_MESSAGE_SIZE, &line_read);
+        if (line_status <= 0) {
+            free(line);
+            return line_status;
+        }
+        if (memchr(line, '\0', line_read) != NULL) {
+            free(line);
+            return CBM_NOT_FOUND;
+        }
+
+        size_t len = line_read;
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+
+        if (strncmp(line, "Content-Length:", SLEN("Content-Length:")) != 0) {
+            *message = line;
+            return SKIP_ONE;
+        }
+
+        size_t content_len = 0;
+        if (line_read > MCP_MAX_HEADER_SIZE || !parse_content_length(line, &content_len)) {
+            free(line);
+            return CBM_NOT_FOUND;
+        }
+
+        bool found_separator = false;
+        size_t header_bytes = line_read;
+        for (;;) {
+            if (header_bytes >= MCP_MAX_HEADER_SIZE) {
+                free(line);
+                return CBM_NOT_FOUND;
+            }
+            size_t header_read = 0;
+            int header_status = read_bounded_line(in, &line, &cap,
+                                                  MCP_MAX_HEADER_SIZE - header_bytes, &header_read);
+            if (header_status <= 0) {
+                break;
+            }
+            if (memchr(line, '\0', header_read) != NULL) {
+                free(line);
+                return CBM_NOT_FOUND;
+            }
+            header_bytes += header_read;
+            size_t header_len = header_read;
+            while (header_len > 0 &&
+                   (line[header_len - SKIP_ONE] == '\n' || line[header_len - SKIP_ONE] == '\r')) {
+                line[--header_len] = '\0';
+            }
+            if (header_len == 0) {
+                found_separator = true;
+                break;
+            }
+        }
+        if (!found_separator) {
+            free(line);
+            return CBM_NOT_FOUND;
+        }
+        free(line);
+
+        char *body = malloc(content_len + SKIP_ONE);
+        if (!body) {
+            return CBM_NOT_FOUND;
+        }
+        size_t total = 0;
+        while (total < content_len) {
+            size_t nread = fread(body + total, SKIP_ONE, content_len - total, in);
+            if (nread == 0) {
+                free(body);
+                return CBM_NOT_FOUND;
+            }
+            total += nread;
+        }
+        if (memchr(body, '\0', content_len) != NULL) {
+            free(body);
+            return CBM_NOT_FOUND;
+        }
+        body[content_len] = '\0';
+        *message = body;
+        *content_length_framed = true;
+        return SKIP_ONE;
     }
 }
 
@@ -9844,8 +11615,6 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
 /* ── Event loop ───────────────────────────────────────────────── */
 
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
-    char *line = NULL;
-    size_t cap = 0;
     int fd = cbm_fileno(in);
 
     for (;;) {
@@ -9888,37 +11657,26 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         }
 #endif
 
-        if (cbm_getline(&line, &cap, in) <= 0) {
+        char *message = NULL;
+        bool content_length_framed = false;
+        if (cbm_mcp_read_message(in, &message, &content_length_framed) <= 0) {
             break;
         }
 
-        /* Trim trailing newline/CR */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-
-        /* Content-Length framing (LSP-style transport) */
-        if (strncmp(line, "Content-Length:", SLEN("Content-Length:")) == 0) {
-            int content_len = (int)strtol(line + MCP_CONTENT_PREFIX, NULL, CBM_DECIMAL_BASE);
-            if (content_len > 0 && content_len <= MCP_DEFAULT_LIMIT * CBM_SZ_1K * CBM_SZ_1K) {
-                handle_content_length_frame(srv, in, out, &line, &cap, content_len);
-            }
-            continue;
-        }
-
-        char *resp = cbm_mcp_server_handle(srv, line);
+        char *resp = cbm_mcp_server_handle(srv, message);
+        free(message);
         if (resp) {
-            (void)fprintf(out, "%s\n", resp);
+            if (content_length_framed) {
+                size_t response_len = strlen(resp);
+                (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", response_len, resp);
+            } else {
+                (void)fprintf(out, "%s\n", resp);
+            }
             (void)fflush(out);
             free(resp);
         }
     }
 
-    free(line);
     return 0;
 }
 

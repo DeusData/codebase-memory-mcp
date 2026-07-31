@@ -100,6 +100,18 @@ int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const 
 /* Restore database from another store (backup API). */
 int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src);
 
+/* Copy a transactionally-consistent snapshot, including committed WAL frames,
+ * from an existing DB into a same-directory staging path. */
+int cbm_store_backup_path(const char *source_path, const char *staging_path);
+
+/* Seal a staging DB into one self-contained main file before atomic publish.
+ * The store must have no concurrent users. */
+int cbm_store_prepare_for_publish(cbm_store_t *s);
+
+/* Checkpoint and detach sidecars from an existing destination immediately
+ * before replacement. Fails closed while another process prevents sealing. */
+int cbm_store_prepare_path_for_replace(const char *path);
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -200,6 +212,11 @@ cbm_store_t *cbm_store_open_memory(void);
 
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
+
+/* Open an existing file-backed database read-write without CREATE. Intended
+ * for coordinated mutations where a missing/typo path must never materialize
+ * a ghost database. Returns NULL when the file does not exist. */
+cbm_store_t *cbm_store_open_path_existing(const char *db_path);
 
 /* Open an existing file-backed database for querying only. Opened READ-ONLY
  * (no SQLITE_OPEN_CREATE, no write pragmas) so queries never mutate the DB and

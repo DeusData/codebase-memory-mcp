@@ -43,8 +43,12 @@ GCC_ONLY_FLAGS := -Wno-format-truncation -Wno-unused-result \
                   -Wno-stringop-truncation -Wno-alloc-size-larger-than
 endif
 
+# -Wdate-time: with -Werror, any use of __DATE__/__TIME__/__TIMESTAMP__ fails the
+# build. Build-time entropy is how one identical source tree produced a new hash
+# on every compile (see the local patch in vendored/mimalloc/src/options.c) —
+# once removed, it must not creep back through a new call site.
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
-                -Wno-unused-parameter -Wno-sign-compare \
+                -Wno-unused-parameter -Wno-sign-compare -Wdate-time \
                 $(GCC_ONLY_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
@@ -54,20 +58,44 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
+# Test seams are OPT-IN, never opt-out. Some suites drive behaviour that only a
+# test should be able to ask for (fork an orphan the watchdog must reap, publish
+# a lease-ownership marker). That code has no production caller and reads exactly
+# like malware to a generic classifier, so it must not be in a shipped binary.
+# Opt-IN means the failure mode of forgetting the flag is a CLEAN binary rather
+# than a leaky one — the opposite choice would make every future release depend
+# on someone remembering. scripts/test.sh passes TEST_SEAMS=1 for the suites that
+# need it; the test-runner always has them.
+TEST_SEAM_DEFINE :=
+ifeq ($(TEST_SEAMS),1)
+TEST_SEAM_DEFINE := -DCBM_ENABLE_TEST_SEAMS=1
+endif
+
 # Production flags (CFLAGS_EXTRA allows CI to inject -DCBM_VERSION)
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
 EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
-	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1
-CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
+	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
+# The build system is the single source of truth for "is this binary
+# instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
+# clang's feature-check spelling and every non-ASan sanitizer, so the
+# trap-UBSan leg once ran NATIVE timing budgets on an instrumented
+# binary. Any non-empty SANITIZE ⇒ sanitized budgets everywhere.
+ifneq ($(strip $(SANITIZE)),)
+SANITIZED_DEFINE = -DCBM_SANITIZED_BUILD=1
+else
+SANITIZED_DEFINE =
+endif
+CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
@@ -78,12 +106,42 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
+# advapi32 (owner-only activation-candidate ACLs), plus
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
+# Route Windows allocations through mimalloc (#581). mimalloc's own static
+# override is gated on _MSC_VER, which clang/MinGW never defines, so it
+# compiled out and the CRT won the link: ordinary malloc went to the CRT heap,
+# which keeps freed pages committed, leaving every allocator tuning in
+# cbm_mem_init POSIX-only. --wrap redirects the same population of allocations
+# that link-order override captures on POSIX, so the purge configuration
+# finally applies here too. src/foundation/mem_override_win.c supplies the
+# wrappers; its deallocating paths check mi_is_in_heap_region so a CRT-owned
+# pointer can never reach mi_free (#424).
+MIMALLOC_WRAP_SYMS := malloc calloc realloc free strdup strndup _msize \
+                      _aligned_malloc _aligned_free
+MIMALLOC_WRAP_FLAGS :=
 ifeq ($(IS_MINGW),yes)
-WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+MIMALLOC_WRAP_FLAGS := $(foreach sym,$(MIMALLOC_WRAP_SYMS),-Wl,--wrap=$(sym))
+endif
+# Linux wraps a smaller set for MEASUREMENT only (see mem_override_posix.c):
+# allocations already reach mimalloc here, but the profiler needs the same
+# observation point as Windows or the platform comparison is not like-for-like.
+# macOS ld has no --wrap, so it stays census-only.
+IS_LINUX := $(shell uname -s 2>/dev/null | grep -q Linux && echo yes || echo no)
+MIMALLOC_WRAP_SYMS_POSIX := malloc calloc realloc free strdup
+MIMALLOC_WRAP_FLAGS_POSIX :=
+ifeq ($(IS_LINUX),yes)
+MIMALLOC_WRAP_FLAGS_POSIX := $(foreach sym,$(MIMALLOC_WRAP_SYMS_POSIX),-Wl,--wrap=$(sym))
+endif
+ifeq ($(IS_MINGW),yes)
+# --no-insert-timestamp: the PE header otherwise carries the link wall clock, so
+# two Windows builds of identical source are never byte-identical and every
+# release is a brand-new file to a reputation system. Same motivation as the
+# mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -91,13 +149,30 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS)
+# W^X: demand a non-executable stack on ELF. This is belt to the braces of the
+# .note.GNU-stack annotation in vendored/nomic/code_vectors_blob.S — that note
+# fixes the CAUSE (an unannotated object makes ld assume the worst for the whole
+# link), this flag fixes the OUTCOME, and the composition gate proves it on the
+# shipped artifact. ELF-only: Apple's ld rejects -z noexecstack outright and it
+# is meaningless for PE, so it is gated rather than made "common".
+ELF_HARDENING_FLAGS :=
+ifeq ($(IS_LINUX),yes)
+ELF_HARDENING_FLAGS := -Wl,-z,noexecstack
+endif
+
+# The POSIX wrap shim exists only so the profiler can observe allocations. It
+# must never reach a sanitized build: the Linux/macOS test builds are CRT+ASan,
+# and redirecting malloc into mimalloc underneath ASan's own interception mixes
+# two allocators on the same pointers. Windows keeps its wrap flags everywhere,
+# because there the shim is what makes mimalloc own the allocations at all.
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
 
 FOUNDATION_SRCS = \
+	src/foundation/mem_override_win.c \
     src/foundation/arena.c \
     src/foundation/hash_table.c \
     src/foundation/str_intern.c \
@@ -117,7 +192,10 @@ FOUNDATION_SRCS = \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
     src/foundation/subprocess.c \
-    src/foundation/sha256.c
+    src/foundation/sha256.c \
+    src/foundation/macos_acl.c \
+    src/foundation/private_file_lock.c \
+    src/foundation/lock_registry.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -156,6 +234,13 @@ LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
+TS_RUNTIME_DEPS = \
+	$(TS_RUNTIME_SRC) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/include/tree_sitter/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/*.c) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/portable/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/unicode/*.h)
 
 # All 64 grammar shim files
 GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
@@ -180,6 +265,19 @@ CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+
+# Shared MCP daemon coordination and local transport
+DAEMON_SRCS = \
+    src/daemon/daemon.c \
+    src/daemon/project_lock.c \
+    src/daemon/version_cohort.c \
+    src/daemon/service.c \
+    src/daemon/runtime.c \
+    src/daemon/application.c \
+    src/daemon/frontend.c \
+    src/daemon/host.c \
+    src/daemon/bootstrap.c \
+    src/daemon/ipc.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
@@ -245,7 +343,7 @@ GIT_SRCS = src/git/git_context.c
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
-	src/cli/config_text_edit.c
+	src/cli/config_text_edit.c src/cli/activation_transaction.c
 
 # UI module (graph visualization)
 UI_SRCS = \
@@ -292,9 +390,20 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
 # BM25 search path in search_graph (see nodes_fts virtual table in store.c).
+#
+# SQLITE_OMIT_LOAD_EXTENSION: no cbm code calls sqlite3_load_extension or
+# sqlite3_enable_load_extension, and we never want a graph DB to be able to pull
+# a shared library into the process. Loading is off by default at runtime, but
+# "disabled by default" is a setting while "not compiled in" is a property —
+# this compiles the machinery out, removing the API surface and part of the
+# dlopen/dlsym import surface with it. The composition gate asserts the symbols
+# are absent from every release artifact.
+SQLITE3_OMIT_FLAGS = -DSQLITE_OMIT_LOAD_EXTENSION
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
-SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
+                 $(SQLITE3_OMIT_FLAGS)
+SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
+                      $(SQLITE3_OMIT_FLAGS)
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
@@ -304,9 +413,22 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+
+# Project headers, as prerequisites for the targets built in one compiler
+# invocation from sources (test-runner, test-repro-runner, test-runner-tsan,
+# codebase-memory-mcp, test-foundation). Those rules list only .c files, so
+# editing a header changed nothing make could see and the target was NOT
+# rebuilt — an incremental build then silently tested the OLD header value.
+# Found while revert-checking a constants.h change: the check passed because
+# nothing had recompiled.
+#
+# Vendored trees are deliberately excluded — they are pinned, they carry their
+# own explicit dep lists (LSP_UNITY_DEPS, TS_RUNTIME_DEPS), and globbing tens of
+# thousands of grammar headers would cost more than it protects.
+PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h tests/*.h tests/repro/*.h)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -319,8 +441,11 @@ TEST_FOUNDATION_SRCS = \
     tests/test_log.c \
     tests/test_str_util.c \
     tests/test_platform.c \
+    tests/test_diagnostics.c \
     tests/test_dump_verify.c \
-    tests/test_subprocess.c
+    tests/test_subprocess.c \
+    tests/test_private_file_lock.c \
+    tests/test_lock_registry.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -346,7 +471,19 @@ TEST_CYPHER_SRCS = \
     tests/test_cypher.c
 
 TEST_MCP_SRCS = \
-    tests/test_mcp.c
+    tests/test_mcp.c \
+    tests/test_index_supervisor.c
+
+TEST_DAEMON_SRCS = \
+    tests/test_daemon.c \
+    tests/test_project_lock.c \
+    tests/test_version_cohort.c \
+    tests/test_daemon_version.c \
+    tests/test_daemon_runtime.c \
+    tests/test_daemon_application.c \
+    tests/test_daemon_frontend.c \
+    tests/test_daemon_bootstrap.c \
+    tests/test_daemon_ipc.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
@@ -357,7 +494,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -404,7 +541,8 @@ TEST_TRACES_SRCS = tests/test_traces.c
 TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_plugin_emit.c \
 	tests/test_config_json_like.c \
-	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c
+	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
+	tests/test_activation_transaction.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
@@ -486,7 +624,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -514,14 +652,14 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
-$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
@@ -532,7 +670,7 @@ test-foundation: $(BUILD_DIR)/test-foundation
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+$(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
 $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
@@ -544,7 +682,7 @@ $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
-$(BUILD_DIR)/tsan_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+$(BUILD_DIR)/tsan_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
 $(BUILD_DIR)/tsan_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
@@ -566,7 +704,14 @@ $(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+# static.c is an AMALGAMATION: it #includes options.c and friends, none of which
+# make can see through the single named prerequisite, and the compile flags live
+# in this Makefile. Both gaps bit for real — the __DATE__ removal in options.c and
+# SQLITE_OMIT_LOAD_EXTENSION below each silently did nothing on an incremental
+# build because the object was considered up to date. Depend on the included
+# sources AND on this Makefile so a flag change rebuilds too.
+$(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) $(wildcard vendored/mimalloc/src/*.c) \
+                              $(wildcard vendored/mimalloc/include/*.h) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS) -c -o $@ $<
 
 # sqlite3 object files (vendored amalgamation)
@@ -580,7 +725,7 @@ $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
@@ -630,7 +775,7 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(SQLITE3_OBJ_TSAN) $(TRE_OBJ_TSAN) $(GRAMMAR_OBJS_TSAN) $(TS_RUNTIME_OBJ_TSAN) $(LSP_OBJ_TSAN) $(PP_OBJ_TSAN) $(LZ4_OBJ_TSAN) $(ZSTD_OBJ_TSAN) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -658,7 +803,7 @@ test-focused: $(BUILD_DIR)/test-runner
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
 		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -670,10 +815,37 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
 
-TEST_TSAN_SUITES ?= mem slab_alloc parallel
+# Every threaded production surface that runs clean AND stable under TSan:
+# allocator concurrency (mem, slab_alloc), the parallel extraction worker pool
+# (parallel, worker_pool, pipeline), the filesystem watcher (watcher), the
+# embedded HTTP server (httpd), diagnostics sampling (diagnostics), the MCP
+# server + mutation guard (mcp, mcp_mutation_guard), subprocess supervision
+# (subprocess), and the runnable daemon-coordination paths (daemon,
+# daemon_application). Was `mem slab_alloc parallel` — a keyhole that ran TSan
+# over no real threaded production code.
+#
+# Deliberately EXCLUDED (documented, not forgotten):
+#   daemon_runtime   — deadlocks under TSan: it forks after going
+#                      multi-threaded and the child re-enters the runtime, a
+#                      combination TSan's runtime does not support (hangs).
+#   daemon_ipc       — a TEST-harness data race (a helper thread writes a
+#                      main-thread stack slot without synchronization,
+#                      test_daemon_ipc.c:2088); production IPC is not implicated.
+#   daemon_frontend  — TEST-harness thread leaks (fixture threads left unjoined,
+#                      test_daemon_frontend.c:698) plus a fork-under-TSan fixture
+#                      failure. Test-quality work, tracked separately.
+# Re-enabling these three needs test-harness synchronization + a TSan-fork
+# strategy; it is out of scope for the current sanitizer-coverage pass.
+TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
+                    diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
 TSAN_OPTIONS ?= halt_on_error=1
+# A fixed concurrent envelope keeps TSan deterministic across developer hosts
+# and GitHub runners. Four workers still exercise real races without turning
+# sanitizer-instrumented allocator bookkeeping into a high-core lock convoy.
+# Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
+# invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
-$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -681,7 +853,15 @@ $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 
 		$(LDFLAGS_TSAN)
 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
-	cd $(CURDIR) && TSAN_OPTIONS="$(TSAN_OPTIONS)" $(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
+	@echo "ThreadSanitizer workers: 4"
+	cd $(CURDIR) && CBM_WORKERS=4 TSAN_OPTIONS="$(TSAN_OPTIONS)" \
+		$(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
+
+# Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
+# an explicit Make invocation requires a clean rendezvous and fails rather than
+# silently skipping an occupied one. Deterministic C tests cover Windows IPC.
+test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
 
 # ── Production binary ────────────────────────────────────────────
 
@@ -694,7 +874,7 @@ PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
@@ -719,7 +899,26 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+# Rebuild when the build CONFIGURATION changes, not only when sources do. The
+# product binary is compiled in ONE shot from sources, so after a TEST_SEAMS or
+# version flip make finds the binary newer than every source and skips the recipe
+# entirely, handing back a binary built with the PREVIOUS configuration. The
+# dangerous direction is a release build silently keeping test seams, which is a
+# property no reviewer can see by reading the diff. The stamp's CONTENT is the
+# configuration and it is rewritten only when that content changes, so ordinary
+# incremental builds are unaffected. (Single-quoted: the signature may contain
+# the escaped quotes of -DCBM_VERSION, which are literal inside '', but must not
+# contain a literal single quote.)
+BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)
+.PHONY: build-config-check
+build-config-check:
+$(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
+	@printf '%s\n' '$(BUILD_CONFIG_SIG)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; \
+	else mv -f $@.tmp $@; rm -f $(BUILD_DIR)/codebase-memory-mcp; \
+	echo "=== build config changed -> full rebuild: $(BUILD_CONFIG_SIG) ==="; fi
+
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -753,8 +952,9 @@ cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
 
+clean-c: export BUILD_DIR := $(BUILD_DIR)
 clean-c:
-	rm -rf $(BUILD_DIR)
+	@bash -c 'source scripts/path-safety.sh && cbm_remove_build_dir "$$PWD" "$$BUILD_DIR"'
 
 # ── Linting ─────────────────────────────────────────────────────
 
@@ -770,7 +970,7 @@ SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
 SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
-LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
+LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
             $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
             $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)

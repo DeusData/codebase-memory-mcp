@@ -51,6 +51,7 @@ jobs:
     with:
       skip_perf: true
       broad_platforms: true
+      shard_suites: true
 
   # ── Build all platforms ────────────────────────────────────────
   build:

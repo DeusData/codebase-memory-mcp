@@ -18,6 +18,7 @@
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+#include <foundation/platform.h>
 
 #include <stdarg.h>
 #include <string.h>
@@ -152,7 +153,7 @@ static int count_in_response(const char *resp, const char *key) {
 /* ── Direct store queries (more reliable than MCP for tests) ────── */
 
 static cbm_store_t *open_store(void) {
-    return cbm_store_open_path(g_dbpath);
+    return cbm_store_open_path_existing(g_dbpath);
 }
 
 static int get_node_count(void) {
@@ -208,39 +209,69 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
-    /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
-     * Cuts indexing time roughly in half on slow shared runners. */
-    char cmd[1024];
-    if (getenv("CI")) {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
-                 g_repodir, g_repodir);
+    /* The fixture is cloned from the network at most once per machine, into a
+     * persistent cache; every run local-clones from there (seconds, offline).
+     * The one-time clone is staged and committed with an atomic rename so a
+     * torn download can never masquerade as a valid cache. */
+    const char *cache_home = getenv("CBM_TEST_FIXTURE_CACHE");
+    char cache_root[512];
+    if (cache_home && cache_home[0]) {
+        snprintf(cache_root, sizeof(cache_root), "%s", cache_home);
     } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0])
+            home = ".";
+        snprintf(cache_root, sizeof(cache_root), "%s/.cache/cbm-test-fixtures", home);
+    }
+    char cache_repo[640];
+    snprintf(cache_repo, sizeof(cache_repo), "%s/fastapi-0.99.1", cache_root);
+    char cmd[1600];
+    if (!cbm_is_dir(cache_repo)) {
+        (void)cbm_mkdir_p(cache_root, 0700);
+        char cache_stage[700];
+        snprintf(cache_stage, sizeof(cache_stage), "%s.stage", cache_repo);
+        th_rmtree(cache_stage);
         snprintf(cmd, sizeof(cmd),
                  "git clone --depth=1 --branch 0.99.1 --quiet "
                  "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 g_repodir);
+                 cache_stage);
+        int fetch_rc = system(cmd);
+        if (fetch_rc != 0 || rename(cache_stage, cache_repo) != 0) {
+            th_rmtree(cache_stage);
+            if (!cbm_is_dir(cache_repo)) {
+                printf("  fixture clone failed (rc=%d) — network offline?\n", fetch_rc);
+                return -1;
+            }
+        }
     }
+    snprintf(cmd, sizeof(cmd), "git clone --quiet '%s' '%s' 2>&1", cache_repo, g_repodir);
     int rc = system(cmd);
     if (rc != 0) {
-        printf("  clone failed (rc=%d) — network offline?\n", rc);
+        printf("  fixture local clone failed (rc=%d)\n", rc);
         return -1;
     }
+    /* Index the same corpus everywhere: CI historically indexed a sparse
+     * checkout without docs/ and tests/ (the assertion thresholds are sized
+     * for it) while local runs indexed the full tree — twice the files for
+     * the identical assertions, and a local/CI divergence. Trimming the two
+     * directories is the portable equivalent of that sparse profile. */
+    char trim[600];
+    snprintf(trim, sizeof(trim), "%s/docs", g_repodir);
+    th_rmtree(trim);
+    snprintf(trim, sizeof(trim), "%s/tests", g_repodir);
+    th_rmtree(trim);
 
     g_project = cbm_project_name_from_path(g_repodir);
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int dbpath_length =
+        cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
+    if (dbpath_length <= 0 || (size_t)dbpath_length >= sizeof(g_dbpath) ||
+        !cbm_mkdir_p(cache_dir, 0700)) {
+        return -1;
+    }
 
     unlink(g_dbpath);
 

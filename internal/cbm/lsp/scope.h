@@ -3,7 +3,8 @@
 
 #include "type_rep.h"
 #include "../arena.h"
-#include <stdlib.h> /* getenv, atoi (cbm_lsp_max_walk_depth) */
+#include <stdatomic.h> /* relaxed cache for cbm_lsp_max_walk_depth */
+#include <stdlib.h>     /* getenv, atoi (cbm_lsp_max_walk_depth) */
 
 typedef struct {
     const char* name;
@@ -40,17 +41,22 @@ typedef struct CBMScope {
 
 // Resolved walk-depth cap: env override (CBM_LSP_MAX_WALK_DEPTH, if a positive
 // integer) else CBM_LSP_MAX_WALK_DEPTH. Read once and cached — the walkers call
-// this per node, so it must not hit getenv on the hot path. The cache is a
-// benign idempotent race under multi-threaded indexing (every thread computes
-// the same value).
+// this per node, so it must not hit getenv on the hot path. The cache is
+// idempotent under multi-threaded indexing (every worker computes the same
+// value), but a plain data race is undefined behavior even when the values
+// agree, so the slot is a relaxed atomic: on the hot path this is a plain load
+// with no fence, and a first-touch double-compute simply stores the same
+// value. This keeps the parallel extractor TSan-clean.
 static inline int cbm_lsp_max_walk_depth(void) {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value < 0) {
         const char* e = getenv("CBM_LSP_MAX_WALK_DEPTH");
         int v = (e && *e) ? atoi(e) : 0;
-        cached = (v > 0) ? v : CBM_LSP_MAX_WALK_DEPTH;
+        value = (v > 0) ? v : CBM_LSP_MAX_WALK_DEPTH;
+        atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
-    return cached;
+    return value;
 }
 
 CBMScope* cbm_scope_push(CBMArena* a, CBMScope* current);

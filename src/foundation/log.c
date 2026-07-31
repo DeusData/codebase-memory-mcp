@@ -255,6 +255,35 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     emit_line(line_buf);
 }
 
+void cbm_log_control_record(const char *msg, ...) {
+    /* No threshold check: a control record's whole purpose is surviving
+     * CBM_LOG_LEVEL suppression. Always JSON, independent of CBM_LOG_FORMAT,
+     * so consumers get one stable, fully escaped representation. */
+    char line_buf[CBM_SZ_4K];
+    size_t pos = 0;
+    va_list args;
+    va_start(args, msg);
+    append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
+    append_json_string(line_buf, sizeof(line_buf), &pos, "control");
+    append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
+    append_json_string(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
+    for (;;) {
+        const char *key = va_arg(args, const char *);
+        if (!key) {
+            break;
+        }
+        const char *val = va_arg(args, const char *);
+        append_char(line_buf, sizeof(line_buf), &pos, ',');
+        append_json_string(line_buf, sizeof(line_buf), &pos, key);
+        append_char(line_buf, sizeof(line_buf), &pos, ':');
+        append_json_string(line_buf, sizeof(line_buf), &pos, val ? val : "");
+    }
+    append_char(line_buf, sizeof(line_buf), &pos, '}');
+    va_end(args);
+    finish_line(line_buf, sizeof(line_buf), pos);
+    emit_line(line_buf);
+}
+
 void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t value) {
     char value_buf[CBM_SZ_32];
     snprintf(value_buf, sizeof(value_buf), "%" PRId64, value);

@@ -70,6 +70,15 @@ void cbm_log(CBMLogLevel level, const char *msg, ...);
 /* Convenience macros. */
 #define cbm_log_debug(msg, ...) cbm_log(CBM_LOG_DEBUG, msg, ##__VA_ARGS__, NULL)
 #define cbm_log_info(msg, ...) cbm_log(CBM_LOG_INFO, msg, ##__VA_ARGS__, NULL)
+
+/* Always-delivered internal control/discovery record. It bypasses the level
+ * threshold and always uses the JSON encoding, so exact values (paths with
+ * spaces or control bytes) survive unambiguously; it flows through the
+ * configured sink like every other record. Reserve it for the rare
+ * discovery/control events that ordinary log filtering must never suppress
+ * (e.g. diagnostics.start path announcement). */
+void cbm_log_control_record(const char *msg, ...);
+#define cbm_log_control(msg, ...) cbm_log_control_record(msg, ##__VA_ARGS__, NULL)
 #define cbm_log_warn(msg, ...) cbm_log(CBM_LOG_WARN, msg, ##__VA_ARGS__, NULL)
 #define cbm_log_error(msg, ...) cbm_log(CBM_LOG_ERROR, msg, ##__VA_ARGS__, NULL)
 

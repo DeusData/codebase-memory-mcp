@@ -1,0 +1,123 @@
+# Nightly compiler-cache warming for main's scope. GitHub cache isolation
+# lets a PR restore only caches written by its own ref or the base branch —
+# and nothing used to write test caches in main's scope (the test workflow
+# runs on pull_request and workflow_dispatch only), so the cross-ref
+# fallback restore keys in _test.yml had no warm source and every fresh PR
+# built cold. This build-only job (no tests) keeps main-scoped caches at
+# most a day stale; CCACHE_COMPILERCHECK=content turns staleness into
+# partial misses, never wrong output. The build commands and ccache
+# environment mirror scripts/test.sh's build phase exactly — a warm entry
+# only hits when flags and compiler content match, so fidelity here is what
+# makes the cache useful.
+name: Cache warm
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  warm-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cc: gcc, cxx: g++ }
+          - { os: ubuntu-24.04-arm, cc: gcc, cxx: g++ }
+          - { os: macos-14, cc: cc, cxx: c++ }
+          - { os: macos-15-intel, cc: cc, cxx: c++ }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: command -v ccache >/dev/null 2>&1 || brew install ccache
+
+      - name: Compiler cache (restore)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-
+            ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
+
+      - name: Build (test runner + product, no tests)
+        run: |
+          source scripts/env.sh
+          make -j"$(getconf _NPROCESSORS_ONLN)" -f Makefile.cbm \
+            build/c/test-runner cbm CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        run: ccache -sv || ccache -s
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+      - name: Compiler cache (save)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-${{ github.sha }}
+
+  warm-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-compiler-rt
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-ccache
+            make
+            git
+
+      - name: Compiler cache (restore)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-windows-latest-CLANG64-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-test-windows-latest-CLANG64-${{ github.ref }}-
+            ccache-test-windows-latest-CLANG64-
+
+      - name: Build (test runner + product, no tests)
+        run: |
+          source scripts/env.sh
+          make -j"$(nproc)" -f Makefile.cbm build/c/test-runner cbm CC=clang CXX=clang++
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        run: ccache -sv || ccache -s
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+      - name: Compiler cache (save)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-windows-latest-CLANG64-${{ github.ref }}-${{ github.sha }}

@@ -8,6 +8,8 @@
 #ifndef CBM_COMPAT_H
 #define CBM_COMPAT_H
 
+#include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 /* stdlib.h declares getenv (cbm_tmpdir) and, on Windows, _putenv_s (cbm_setenv/
@@ -115,18 +117,74 @@ char *cbm_mkdtemp(char *tmpl);
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl);
+
 #else
 #define cbm_mkstemp mkstemp
 #endif
+
+/* Rewrite an absolute path into the form the platform's file APIs accept at
+ * any length. On Windows, absolute drive paths beyond the legacy 260-char
+ * limit are canonicalized and given the extended-length \\?\ prefix
+ * (SQLite passes such UTF-8 paths through to CreateFileW unchanged). On
+ * POSIX, the path is copied verbatim. Returns false if the buffer is too
+ * small or the path cannot be canonicalized. */
+bool cbm_path_for_file_api(const char *path, char *out, size_t out_size);
 
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */
 #ifdef _WIN32
 static inline int cbm_setenv(const char *name, const char *value, int overwrite) {
     (void)overwrite;
-    return _putenv_s(name, value);
+    if (!name || !value) {
+        return EINVAL;
+    }
+    int name_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, NULL, 0);
+    int value_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
+    wchar_t *wide_name =
+        name_chars > 0 ? (wchar_t *)malloc((size_t)name_chars * sizeof(*wide_name)) : NULL;
+    wchar_t *wide_value =
+        value_chars > 0 ? (wchar_t *)malloc((size_t)value_chars * sizeof(*wide_value)) : NULL;
+    bool converted =
+        wide_name && wide_value &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wide_name, name_chars) > 0 &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide_value, value_chars) > 0;
+    if (!converted) {
+        free(wide_name);
+        free(wide_value);
+        return EINVAL;
+    }
+    /* Keep the CRT's narrow environment useful for legacy getenv callers,
+     * then repair the process-wide Windows environment with the actual UTF-16
+     * value. _putenv_s alone routes UTF-8 path bytes through the active ANSI
+     * code page, which corrupts non-ASCII cache roots inherited by children. */
+    int status = _putenv_s(name, value);
+    if (status == 0 && !SetEnvironmentVariableW(wide_name, wide_value)) {
+        status = EINVAL;
+    }
+    free(wide_name);
+    free(wide_value);
+    return status;
 }
 static inline int cbm_unsetenv(const char *name) {
-    return _putenv_s(name, "");
+    if (!name) {
+        return EINVAL;
+    }
+    int name_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, NULL, 0);
+    wchar_t *wide_name =
+        name_chars > 0 ? (wchar_t *)malloc((size_t)name_chars * sizeof(*wide_name)) : NULL;
+    if (!wide_name ||
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wide_name, name_chars) <= 0) {
+        free(wide_name);
+        return EINVAL;
+    }
+    int status = _putenv_s(name, "");
+    if (status == 0) {
+        SetLastError(ERROR_SUCCESS);
+        if (!SetEnvironmentVariableW(wide_name, NULL) && GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+            status = EINVAL;
+        }
+    }
+    free(wide_name);
+    return status;
 }
 #else
 #define cbm_setenv setenv

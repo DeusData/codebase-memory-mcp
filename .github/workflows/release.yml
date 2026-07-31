@@ -31,6 +31,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_tests:
+        description: "Skip the test phase entirely (re-release of an already test-green tree; build/smoke/soak/verify still run)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -61,15 +66,24 @@ jobs:
         run: scripts/check-plugin-drift.sh "${{ inputs.version }}"
 
   # ── 2. Tests (all platforms, full suite for release) ────────────
+  # skip_tests exists for RE-releases of a tree whose tests are already green:
+  # when only packaging/gating changed and the previous run proved the suites,
+  # re-running ~2h of tests adds no information. It skips ONLY this phase —
+  # build, smoke, soak and verify always run against the fresh artifacts.
   test:
+    if: ${{ !inputs.skip_tests }}
     needs: [lint]
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: ${{ inputs.skip_perf }}
       broad_platforms: true
+      shard_suites: true
 
   # ── 3. Build all platforms ──────────────────────────────────────
+  # !cancelled() && !failure(): run when `test` is deliberately skipped, but
+  # never when lint or test actually failed.
   build:
+    if: ${{ !cancelled() && !failure() }}
     needs: [test, plugin-release-metadata]
     permissions:
       contents: read
@@ -81,7 +95,15 @@ jobs:
       attest: true
 
   # ── 4. Smoke test every binary ──────────────────────────────────
+  # !cancelled() && !failure(): GitHub propagates "skipped" TRANSITIVELY down the
+  # needs graph, so with skip_tests=true a skipped `test` skipped smoke and soak
+  # too — even though `build` overrode the same condition and succeeded. Nothing
+  # failed and nothing said so; the pipeline simply carried on toward publishing
+  # artifacts that had never been smoke-tested or soaked. Every job downstream of
+  # an optional phase needs this override, or the phase being optional silently
+  # makes the phases after it optional as well.
   smoke:
+    if: ${{ !cancelled() && !failure() }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
     with:
@@ -89,7 +111,7 @@ jobs:
 
   # ── 5. Soak tests ──────────────────────────────────────────────
   soak:
-    if: ${{ inputs.soak_level != 'none' }}
+    if: ${{ !cancelled() && !failure() && inputs.soak_level != 'none' }}
     needs: [build]
     uses: ./.github/workflows/_soak.yml
     with:
@@ -98,9 +120,17 @@ jobs:
       version: ${{ inputs.version }}
 
   # ── 6. Create DRAFT release ────────────────────────────────────
+  # Requires smoke to have actually SUCCEEDED, not merely "not failed". The bare
+  # !cancelled() && !failure() form is fail-OPEN: a skipped smoke is neither
+  # cancelled nor failed, so a draft was one condition away from being cut from
+  # binaries nobody had run. soak may legitimately be 'skipped' (soak_level=none),
+  # so that one is enumerated explicitly rather than lumped in.
   release-draft:
     needs: [smoke, soak]
-    if: ${{ !cancelled() && !failure() }}
+    if: >-
+      ${{ !cancelled() && !failure()
+      && needs.smoke.result == 'success'
+      && (needs.soak.result == 'success' || needs.soak.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -124,39 +154,10 @@ jobs:
         with:
           subject-path: checksums.txt
 
+      # SBOM content lives in the canonical scripts/ci entry, not inline YAML
+      # (venue-parity contract): vendored versions are reviewable there.
       - name: Generate SBOM
-        run: |
-          python3 -c "
-          import json, glob, os
-          n_grammars = len([d for d in glob.glob('internal/cbm/vendored/grammars/*') if os.path.isdir(d)])
-          sbom = {
-            'spdxVersion': 'SPDX-2.3',
-            'dataLicense': 'CC0-1.0',
-            'SPDXID': 'SPDXRef-DOCUMENT',
-            'name': 'codebase-memory-mcp-${{ inputs.version }}',
-            'documentNamespace': 'https://github.com/DeusData/codebase-memory-mcp/releases/${{ inputs.version }}',
-            'creationInfo': {
-              'created': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-              'creators': ['Tool: codebase-memory-mcp-release-pipeline']
-            },
-            'packages': [
-              {'SPDXID': 'SPDXRef-Package-sqlite3', 'name': 'sqlite3', 'versionInfo': '3.51.3', 'licenseDeclared': 'blessing', 'downloadLocation': 'https://sqlite.org', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-yyjson', 'name': 'yyjson', 'versionInfo': '0.12.0', 'licenseDeclared': 'MIT', 'downloadLocation': 'https://github.com/ibireme/yyjson', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-mimalloc', 'name': 'mimalloc', 'versionInfo': '3.3.2', 'licenseDeclared': 'MIT', 'downloadLocation': 'https://github.com/microsoft/mimalloc', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-xxhash', 'name': 'xxhash', 'versionInfo': '0.8.3', 'licenseDeclared': 'BSD-2-Clause', 'downloadLocation': 'https://github.com/Cyan4973/xxHash', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-tre', 'name': 'tre', 'versionInfo': '0.8.0', 'licenseDeclared': 'BSD-2-Clause', 'downloadLocation': 'https://github.com/laurikari/tre', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-tree-sitter', 'name': 'tree-sitter', 'versionInfo': '0.24.4', 'licenseDeclared': 'MIT', 'downloadLocation': 'https://github.com/tree-sitter/tree-sitter', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-lz4', 'name': 'lz4', 'versionInfo': '1.10.0', 'licenseDeclared': 'BSD-2-Clause', 'downloadLocation': 'https://github.com/lz4/lz4', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-zstd', 'name': 'zstd', 'versionInfo': '1.5.7', 'licenseDeclared': 'BSD-3-Clause', 'downloadLocation': 'https://github.com/facebook/zstd', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-simplecpp', 'name': 'simplecpp', 'versionInfo': '1.x', 'licenseDeclared': '0BSD', 'downloadLocation': 'https://github.com/danmar/simplecpp', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-verstable', 'name': 'verstable', 'versionInfo': '2.2.1', 'licenseDeclared': 'MIT', 'downloadLocation': 'https://github.com/JacksonAllan/Verstable', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-wyhash', 'name': 'wyhash', 'versionInfo': 'final-4.3', 'licenseDeclared': 'Unlicense', 'downloadLocation': 'https://github.com/wangyi-fudan/wyhash', 'filesAnalyzed': False},
-              {'SPDXID': 'SPDXRef-Package-nomic-embed-code', 'name': 'nomic-embed-code-token-embeddings', 'versionInfo': '1.0', 'licenseDeclared': 'Apache-2.0', 'downloadLocation': 'https://huggingface.co/nomic-ai/nomic-embed-code', 'filesAnalyzed': False, 'comment': 'Derived int8 token embeddings; see vendored/nomic/NOTICE'},
-              {'SPDXID': 'SPDXRef-Package-tree-sitter-grammars', 'name': 'tree-sitter-grammars-aggregate', 'versionInfo': f'{n_grammars}-grammars', 'licenseDeclared': 'MIT', 'downloadLocation': 'NOASSERTION', 'filesAnalyzed': False, 'comment': f'Aggregate of {n_grammars} vendored tree-sitter grammars, compiled statically. Predominantly MIT; non-MIT families present include CC0-1.0 (clojure, fennel), Apache-2.0 (elixir, erlang, gleam, hcl, ini, jinja2, just, pkl, sway, wit), ISC (pine, templ), Unlicense (fish); first-party grammars (c) DeusData, MIT. This summary is non-exhaustive; the authoritative complete per-grammar license list is internal/cbm/vendored/grammars/MANIFEST.md, and full license texts ship in THIRD_PARTY_NOTICES.md inside each archive.'}
-            ]
-          }
-          json.dump(sbom, open('sbom.json', 'w'), indent=2)
-          "
+        run: python3 scripts/ci/generate-sbom.py "${{ inputs.version }}"
 
       - name: Attest SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -196,6 +197,8 @@ jobs:
         with:
           tag_name: ${{ inputs.version }}
           draft: true
+          # Semver prerelease (v0.9.1-rc.1): never the "latest" release on GitHub.
+          prerelease: ${{ contains(inputs.version, '-') }}
           files: |
             *.tar.gz
             *.zip
@@ -261,44 +264,23 @@ jobs:
           vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           files: binaries/*
 
+      # ZERO tolerance: any detection on any artifact blocks the release.
+      # False positives are resolved upstream (Microsoft false-positive
+      # submission for the exact hashes, then re-run this job — no rebuild),
+      # never by loosening this gate.
       - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
         run: scripts/ci/check-virustotal.sh
 
+      # Renders per-binary sha256 + VT links into the notes; only reachable
+      # after the zero-tolerance gate passed, so "0 detections" is verified.
       - name: Append VirusTotal scan links to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
-        run: |
-          # Hash the extracted binaries (not the archives — VT indexes binary hashes)
-          TABLE="\n\n## Security Verification\n\n"
-          TABLE+="All release binaries scanned with 70+ antivirus engines — **0 detections**.\n\n"
-          TABLE+="| Binary | SHA-256 | VirusTotal |\n"
-          TABLE+="|--------|---------|------------|\n"
-
-          for bin in binaries/codebase-memory-mcp-*; do
-            [ -f "$bin" ] || continue
-            name=$(basename "$bin")
-            # Skip UI variants and non-binary files
-            echo "$name" | grep -qE \
-              '^codebase-memory-mcp-(linux|darwin|windows)-(amd64|arm64)(\.exe)?$' || continue
-            sha256=$(sha256sum "$bin" 2>/dev/null | awk '{print $1}' \
-              || shasum -a 256 "$bin" | awk '{print $1}')
-            label=$(echo "$name" \
-              | sed 's/^codebase-memory-mcp-//' \
-              | sed 's/\.exe$//')
-            short="${sha256:0:20}..."
-            vt_url="https://www.virustotal.com/gui/file/${sha256}/detection"
-            TABLE+="| \`${label}\` | \`${short}\` | [0/72 ✅](${vt_url}) |\n"
-          done
-
-          CURRENT=$(gh release view "$VERSION" \
-            --json body --jq '.body // ""' --repo "$GITHUB_REPOSITORY")
-          printf '%s%b' "$CURRENT" "$TABLE" > /tmp/release_notes.md
-          gh release edit "$VERSION" \
-            --notes-file /tmp/release_notes.md --repo "$GITHUB_REPOSITORY"
+        run: bash scripts/ci/append-vt-notes.sh
 
   # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
   # Wrappers in pkg/npm and pkg/pypi download the released binary at
@@ -337,7 +319,7 @@ jobs:
 
       # ── npm ──────────────────────────────────────────────────
       - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -346,7 +328,16 @@ jobs:
         working-directory: pkg/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+          RELEASE_VERSION: ${{ inputs.version }}
+        # A prerelease must never become npm `latest` — plain `npm install`
+        # would serve the RC to everyone. Publish prereleases under the
+        # `next` dist-tag; testers opt in via `npm i codebase-memory-mcp@next`.
+        run: |
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            npm publish --access public --provenance --tag next
+          else
+            npm publish --access public --provenance
+          fi
 
       # ── PyPI ─────────────────────────────────────────────────
       - name: Setup Python
@@ -383,7 +374,9 @@ jobs:
   # not touch npm/PyPI, so retries are safe.
   publish-mcp-registry:
     needs: [publish-registries]
-    if: ${{ !cancelled() && !failure() && needs.publish-registries.result == 'success' }}
+    # Skipped for prereleases: the MCP Registry has no channel concept, so an
+    # RC would present itself as the current version to every registry consumer.
+    if: ${{ !cancelled() && !failure() && needs.publish-registries.result == 'success' && !contains(inputs.version, '-') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # GitHub OIDC auth to the MCP Registry

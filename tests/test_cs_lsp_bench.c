@@ -238,7 +238,7 @@ TEST(cslsp_bench_resolution_ratio) {
     /* Time budget. ASan+UBSan instrumentation slows the parse ~5-10×, so
      * scale the budget when a sanitizer is active. Native: 200 ms for a
      * ~260-line fixture; sanitized: 2000 ms. */
-#ifdef __SANITIZE_ADDRESS__
+#if defined(CBM_SANITIZED_BUILD) || defined(__SANITIZE_ADDRESS__)
     ASSERT(ms < 2000.0);
 #else
     ASSERT(ms < 200.0);

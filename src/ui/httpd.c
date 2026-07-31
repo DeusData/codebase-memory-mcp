@@ -6,8 +6,10 @@
  * single-threaded, localhost-only, strict CRLF, Connection: close).
  */
 #include "ui/httpd.h"
+#include "foundation/compat_thread.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -24,6 +26,7 @@ typedef SOCKET cbm_sock_t;
 #else
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -43,15 +46,32 @@ typedef int cbm_sock_t;
 #define CBM_SEND_FLAGS 0
 #endif
 
+/* A non-reading peer may occupy the sequential event loop only briefly. */
+#define CBM_HTTP_SEND_DEADLINE_MS 1000
+#define CBM_HTTP_SEND_SLICE_BYTES (64U * 1024U)
+#ifdef _WIN32
+/* Winsock select() is not reliably interrupted by shutdown() from another
+ * thread, so bound how long stop waits before re-checking the owner flag. */
+#define CBM_HTTP_WAIT_SLICE_MS 50
+#endif
+
 struct cbm_httpd {
     cbm_sock_t fd;
     int port;
     int recv_deadline_ms;
+    cbm_mutex_t active_mutex;
+    struct cbm_http_conn *active;
+    bool interrupted;
+    int send_buffer_for_test;
+    int send_deadline_for_test_ms;
 };
 
 struct cbm_http_conn {
     cbm_sock_t fd;
+    cbm_httpd_t *owner;
     int recv_deadline_ms;
+    int send_deadline_ms;
+    atomic_bool response_started;
     int response_status;
     size_t response_bytes;
 };
@@ -68,23 +88,28 @@ static int64_t now_ms(void) {
 #endif
 }
 
-/* Wait until the socket is readable. 1 = readable, 0 = timeout, -1 = error.
+/* Wait until the socket is readable/writable. 1 = ready, 0 = timeout, -1 = error.
  * Windows uses select() deliberately (WSAPoll has a Won't-Fix bug where
  * certain socket errors are never reported, which can stall an event loop). */
-static int wait_readable(cbm_sock_t fd, int timeout_ms) {
+static int wait_ready(cbm_sock_t fd, bool writing, int timeout_ms) {
 #ifdef _WIN32
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
+    fd_set ready;
+    fd_set errors;
+    FD_ZERO(&ready);
+    FD_ZERO(&errors);
+    FD_SET(fd, &ready);
+    FD_SET(fd, &errors);
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
-    int rc = select(0, &rfds, NULL, NULL, &tv);
-    return rc < 0 ? -1 : (rc > 0 ? 1 : 0);
+    int rc = select(0, writing ? NULL : &ready, writing ? &ready : NULL, &errors, &tv);
+    if (rc <= 0)
+        return rc < 0 ? -1 : 0;
+    return FD_ISSET(fd, &errors) ? -1 : 1;
 #else
     struct pollfd pfd;
     pfd.fd = fd;
-    pfd.events = POLLIN;
+    pfd.events = writing ? POLLOUT : POLLIN;
     pfd.revents = 0;
     int rc = poll(&pfd, 1, timeout_ms);
     if (rc < 0)
@@ -93,15 +118,95 @@ static int wait_readable(cbm_sock_t fd, int timeout_ms) {
 #endif
 }
 
-static int send_all(cbm_sock_t fd, const void *data, size_t len) {
+static int wait_readable(cbm_sock_t fd, int timeout_ms) {
+    return wait_ready(fd, false, timeout_ms);
+}
+
+static bool socket_would_block(void) {
+#ifdef _WIN32
+    int error = WSAGetLastError();
+    return error == WSAEWOULDBLOCK || error == WSAEINTR;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+static bool socket_set_nonblocking(cbm_sock_t fd) {
+#ifdef _WIN32
+    u_long enabled = 1;
+    return ioctlsocket(fd, FIONBIO, &enabled) == 0;
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+static void socket_shutdown(cbm_sock_t fd) {
+#ifdef _WIN32
+    (void)shutdown(fd, SD_BOTH);
+#else
+    (void)shutdown(fd, SHUT_RDWR);
+#endif
+}
+
+static bool connection_interrupted(cbm_http_conn_t *connection) {
+    cbm_httpd_t *owner = connection->owner;
+    if (!owner)
+        return false;
+    cbm_mutex_lock(&owner->active_mutex);
+    bool interrupted = owner->interrupted;
+    cbm_mutex_unlock(&owner->active_mutex);
+    return interrupted;
+}
+
+/* Wait against the caller's absolute deadline. Windows uses short select()
+ * slices because shutdown() from the stop thread does not reliably wake a
+ * Winsock select(); POSIX keeps its one-shot poll wait and shutdown fast path.
+ * 1 = ready, 0 = original deadline expired, -1 = interrupted/error. */
+static int wait_connection_ready(cbm_http_conn_t *connection, bool writing, int64_t deadline) {
+    for (;;) {
+        if (connection_interrupted(connection))
+            return -1;
+
+        int64_t remaining = deadline - now_ms();
+        if (remaining <= 0)
+            return 0;
+        int timeout_ms = remaining > INT_MAX ? INT_MAX : (int)remaining;
+#ifdef _WIN32
+        if (timeout_ms > CBM_HTTP_WAIT_SLICE_MS)
+            timeout_ms = CBM_HTTP_WAIT_SLICE_MS;
+#endif
+
+        int ready = wait_ready(connection->fd, writing, timeout_ms);
+        if (connection_interrupted(connection))
+            return -1;
+        if (ready != 0)
+            return ready;
+        /* A Windows slice or POSIX EINTR is not the caller's timeout. */
+    }
+}
+
+static int send_all(cbm_http_conn_t *connection, const void *data, size_t len, int64_t deadline) {
     const char *p = data;
     size_t off = 0;
     while (off < len) {
+        if (wait_connection_ready(connection, true, deadline) != 1)
+            return -1;
+        size_t available = len - off;
+        /* Bounded slices: a single nonblocking send() on Windows is absorbed
+         * wholesale into AFD kernel buffers regardless of SO_SNDBUF, so one
+         * giant call can never observe backpressure (and pins its full size
+         * in nonpaged pool). Slicing keeps absorption bounded by the send
+         * buffer so a non-reading peer hits EWOULDBLOCK deterministically. */
+        if (available > CBM_HTTP_SEND_SLICE_BYTES)
+            available = CBM_HTTP_SEND_SLICE_BYTES;
 #ifdef _WIN32
-        int n = send(fd, p + off, (int)(len - off), CBM_SEND_FLAGS);
+        int n = send(connection->fd, p + off, (int)available, CBM_SEND_FLAGS);
 #else
-        ssize_t n = send(fd, p + off, len - off, CBM_SEND_FLAGS);
+        ssize_t n = send(connection->fd, p + off, available, CBM_SEND_FLAGS);
 #endif
+        if (n < 0 && socket_would_block())
+            continue;
         if (n <= 0)
             return -1;
         off += (size_t)n;
@@ -142,7 +247,8 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     addr.sin_port = htons((unsigned short)port);
     addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 */
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 16) != 0) {
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 16) != 0 ||
+        !socket_set_nonblocking(fd)) {
         cbm_sock_close(fd);
         return NULL;
     }
@@ -163,6 +269,7 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     d->fd = fd;
     d->port = (int)ntohs(bound.sin_port);
     d->recv_deadline_ms = CBM_HTTP_RECV_DEADLINE_MS;
+    cbm_mutex_init(&d->active_mutex);
     return d;
 }
 
@@ -171,21 +278,83 @@ int cbm_httpd_port(const cbm_httpd_t *d) {
 }
 
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms) {
-    if (d && ms > 0)
+    if (d && ms > 0) {
+        cbm_mutex_lock(&d->active_mutex);
         d->recv_deadline_ms = ms;
+        cbm_mutex_unlock(&d->active_mutex);
+    }
 }
 
-void cbm_httpd_close(cbm_httpd_t *d) {
+void cbm_httpd_interrupt(cbm_httpd_t *d) {
     if (!d)
         return;
+    cbm_mutex_lock(&d->active_mutex);
+    d->interrupted = true;
+    if (d->active)
+        socket_shutdown(d->active->fd);
+    cbm_mutex_unlock(&d->active_mutex);
+}
+
+bool cbm_httpd_close(cbm_httpd_t *d) {
+    if (!d)
+        return true;
+    cbm_mutex_lock(&d->active_mutex);
+    d->interrupted = true;
+    if (d->active) {
+        socket_shutdown(d->active->fd);
+        cbm_mutex_unlock(&d->active_mutex);
+        return false;
+    }
+    cbm_mutex_unlock(&d->active_mutex);
     cbm_sock_close(d->fd);
+    cbm_mutex_destroy(&d->active_mutex);
     free(d);
+    return true;
+}
+
+void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms) {
+    /* Lets a test pin the send deadline far above (or below) the default so
+     * an observed abort has exactly ONE possible cause — the interruption
+     * tests once discriminated interrupt-abort from deadline-abort by wall
+     * clock, which sanitizer slowdown turns into a lottery. */
+    if (!d) {
+        return;
+    }
+    d->send_deadline_for_test_ms = ms;
+}
+
+void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes) {
+    if (!d)
+        return;
+    cbm_mutex_lock(&d->active_mutex);
+    d->send_buffer_for_test = bytes;
+    cbm_mutex_unlock(&d->active_mutex);
+}
+
+cbm_httpd_activity_t cbm_httpd_activity_for_test(cbm_httpd_t *d) {
+    if (!d)
+        return CBM_HTTPD_ACTIVITY_IDLE;
+    cbm_mutex_lock(&d->active_mutex);
+    cbm_httpd_activity_t activity = CBM_HTTPD_ACTIVITY_IDLE;
+    if (d->active) {
+        activity = atomic_load_explicit(&d->active->response_started, memory_order_acquire)
+                       ? CBM_HTTPD_ACTIVITY_RESPONDING
+                       : CBM_HTTPD_ACTIVITY_READING_REQUEST;
+    }
+    cbm_mutex_unlock(&d->active_mutex);
+    return activity;
 }
 
 /* ── Accept ───────────────────────────────────────────────────── */
 
 cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     if (!d)
+        return NULL;
+    cbm_mutex_lock(&d->active_mutex);
+    bool interrupted = d->interrupted;
+    int send_buffer = d->send_buffer_for_test;
+    cbm_mutex_unlock(&d->active_mutex);
+    if (interrupted)
         return NULL;
     if (wait_readable(d->fd, timeout_ms) != 1)
         return NULL;
@@ -196,9 +365,19 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
 
     int one = 1;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+    /* An explicit SO_SNDBUF also disables Windows dynamic send buffering,
+     * which otherwise grows kernel-side queuing past any fixed payload and
+     * removes the backpressure point the deadline/interrupt tests rely on. */
+    if (send_buffer > 0)
+        setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, (const char *)&send_buffer, sizeof(send_buffer));
 #ifdef SO_NOSIGPIPE
     setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
+
+    if (!socket_set_nonblocking(cfd)) {
+        cbm_sock_close(cfd);
+        return NULL;
+    }
 
     cbm_http_conn_t *c = calloc(1, sizeof(*c));
     if (!c) {
@@ -206,14 +385,37 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
         return NULL;
     }
     c->fd = cfd;
+    c->owner = d;
+    c->send_deadline_ms = d->send_deadline_for_test_ms > 0 ? d->send_deadline_for_test_ms
+                                                            : CBM_HTTP_SEND_DEADLINE_MS;
+    atomic_init(&c->response_started, false);
+
+    cbm_mutex_lock(&d->active_mutex);
+    if (d->interrupted || d->active) {
+        cbm_mutex_unlock(&d->active_mutex);
+        cbm_sock_close(cfd);
+        free(c);
+        return NULL;
+    }
     c->recv_deadline_ms = d->recv_deadline_ms;
+    d->active = c;
+    cbm_mutex_unlock(&d->active_mutex);
     return c;
 }
 
 void cbm_httpd_conn_close(cbm_http_conn_t *c) {
     if (!c)
         return;
-    cbm_sock_close(c->fd);
+    cbm_httpd_t *owner = c->owner;
+    if (owner) {
+        cbm_mutex_lock(&owner->active_mutex);
+        if (owner->active == c)
+            owner->active = NULL;
+        cbm_sock_close(c->fd);
+        cbm_mutex_unlock(&owner->active_mutex);
+    } else {
+        cbm_sock_close(c->fd);
+    }
     free(c);
 }
 
@@ -235,19 +437,21 @@ static bool header_name_is(const char *line, size_t name_len, const char *name) 
     return name[name_len] == '\0' ? true : false;
 }
 
-/* Copy a trimmed header value into out. */
-static void copy_header_value(const char *val, const char *val_end, char *out, size_t outsz) {
+/* Copy a trimmed header value into out. Oversize security headers are rejected,
+ * never silently converted into an apparently absent header. */
+static bool copy_header_value(const char *val, const char *val_end, char *out, size_t outsz) {
     while (val < val_end && (*val == ' ' || *val == '\t'))
         val++;
     while (val_end > val && (val_end[-1] == ' ' || val_end[-1] == '\t'))
         val_end--;
     size_t n = (size_t)(val_end - val);
     if (n >= outsz) {
-        out[0] = '\0'; /* oversize values are ignored, never truncated */
-        return;
+        out[0] = '\0';
+        return false;
     }
     memcpy(out, val, n);
     out[n] = '\0';
+    return true;
 }
 
 int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_t *body_offset,
@@ -302,6 +506,7 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
     /* Exactly HTTP/1.0 or HTTP/1.1 */
     if (vlen != 8 || memcmp(version, "HTTP/1.", 7) != 0 || (version[7] != '0' && version[7] != '1'))
         return 400;
+    req->http_minor = (unsigned char)(version[7] - '0');
 
     size_t tlen = (size_t)(sp2 - target);
     if (tlen == 0 || target[0] != '/')
@@ -329,6 +534,10 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
 
     /* ── Header fields ── */
     bool have_content_length = false;
+    bool have_origin = false;
+    bool have_host = false;
+    bool have_content_type = false;
+    bool have_accept_language = false;
     const char *p = line_end + 2;
     const char *head_stop = data + head_end - 2; /* start of final CRLF */
     while (p < head_stop) {
@@ -339,19 +548,34 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
         if (!colon)
             return 400;
         size_t nlen = (size_t)(colon - p);
+        if (nlen == 0)
+            return 400;
 
         if (header_name_is(p, nlen, "origin")) {
-            copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin));
+            if (have_origin || !copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin)))
+                return have_origin ? 400 : 431;
+            have_origin = true;
         } else if (header_name_is(p, nlen, "host")) {
-            copy_header_value(colon + 1, eol, req->host, sizeof(req->host));
+            if (have_host || !copy_header_value(colon + 1, eol, req->host, sizeof(req->host)))
+                return have_host ? 400 : 431;
+            have_host = true;
+        } else if (header_name_is(p, nlen, "content-type")) {
+            if (have_content_type ||
+                !copy_header_value(colon + 1, eol, req->content_type, sizeof(req->content_type)))
+                return have_content_type ? 400 : 431;
+            have_content_type = true;
         } else if (header_name_is(p, nlen, "accept-language")) {
-            copy_header_value(colon + 1, eol, req->accept_language, sizeof(req->accept_language));
+            if (have_accept_language || !copy_header_value(colon + 1, eol, req->accept_language,
+                                                           sizeof(req->accept_language)))
+                return have_accept_language ? 400 : 431;
+            have_accept_language = true;
         } else if (header_name_is(p, nlen, "transfer-encoding")) {
             /* Chunked (or any transfer coding) is not supported. */
             return 411;
         } else if (header_name_is(p, nlen, "content-length")) {
             char val[32];
-            copy_header_value(colon + 1, eol, val, sizeof(val));
+            if (!copy_header_value(colon + 1, eol, val, sizeof(val)))
+                return 431;
             if (val[0] == '\0')
                 return 400;
             uint64_t cl = 0;
@@ -391,12 +615,7 @@ int cbm_httpd_read_request(cbm_http_conn_t *c, cbm_http_req_t *req) {
 
     /* Read until the head parses (or fails to). */
     for (;;) {
-        int64_t remaining = deadline - now_ms();
-        if (remaining <= 0) {
-            free(head);
-            return 408;
-        }
-        int w = wait_readable(c->fd, (int)remaining);
+        int w = wait_connection_ready(c, false, deadline);
         if (w == 0) {
             free(head);
             return 408;
@@ -410,6 +629,8 @@ int cbm_httpd_read_request(cbm_http_conn_t *c, cbm_http_req_t *req) {
 #else
         ssize_t n = recv(c->fd, head + have, CBM_HTTP_MAX_HEAD - have, 0);
 #endif
+        if (n < 0 && socket_would_block())
+            continue;
         if (n <= 0) {
             free(head); /* peer vanished mid-request — nothing to answer */
             return -1;
@@ -442,13 +663,7 @@ int cbm_httpd_read_request(cbm_http_conn_t *c, cbm_http_req_t *req) {
         memcpy(body, head + body_off, got);
 
         while (got < clen) {
-            int64_t remaining = deadline - now_ms();
-            if (remaining <= 0) {
-                free(body);
-                free(head);
-                return 408;
-            }
-            int w = wait_readable(c->fd, (int)remaining);
+            int w = wait_connection_ready(c, false, deadline);
             if (w != 1) {
                 free(body);
                 free(head);
@@ -459,6 +674,8 @@ int cbm_httpd_read_request(cbm_http_conn_t *c, cbm_http_req_t *req) {
 #else
             ssize_t n = recv(c->fd, body + got, clen - got, 0);
 #endif
+            if (n < 0 && socket_would_block())
+                continue;
             if (n <= 0) {
                 free(body);
                 free(head);
@@ -505,12 +722,16 @@ static const char *status_reason(int status) {
         return "Length Required";
     case 413:
         return "Content Too Large";
+    case 415:
+        return "Unsupported Media Type";
     case 429:
         return "Too Many Requests";
     case 431:
         return "Request Header Fields Too Large";
     case 500:
         return "Internal Server Error";
+    case 503:
+        return "Service Unavailable";
     default:
         return "";
     }
@@ -520,6 +741,7 @@ void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_header
                         size_t len) {
     if (!c)
         return;
+    atomic_store_explicit(&c->response_started, true, memory_order_release);
     c->response_status = status;
     c->response_bytes = len;
     char head[1024];
@@ -532,10 +754,11 @@ void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_header
                       status, status_reason(status), extra_headers ? extra_headers : "", len);
     if (hn < 0 || hn >= (int)sizeof(head))
         return; /* oversized extra_headers — drop the response, conn closes */
-    if (send_all(c->fd, head, (size_t)hn) != 0)
+    int64_t deadline = now_ms() + c->send_deadline_ms;
+    if (send_all(c, head, (size_t)hn, deadline) != 0)
         return;
     if (len > 0)
-        (void)send_all(c->fd, data, len);
+        (void)send_all(c, data, len, deadline);
 }
 
 void cbm_http_replyf(cbm_http_conn_t *c, int status, const char *extra_headers, const char *fmt,

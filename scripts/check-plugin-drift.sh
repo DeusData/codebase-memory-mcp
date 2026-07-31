@@ -3,6 +3,31 @@
 # pre-generation tree. Single source of truth = the C emitter and server.json.
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/check-plugin-drift.sh [VERSION]
+
+Rebuild and regenerate plugin/, then fail if the generated tree differs from
+the checked-in tree. VERSION may be bare or v-prefixed and must match every
+version field in server.json; when omitted, server.json supplies the version.
+EOF
+}
+
+if [[ $# -gt 1 ]]; then
+  echo "check-plugin-drift.sh: unexpected argument '$2'. Please consult --help." >&2
+  exit 2
+fi
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  -*)
+    echo "check-plugin-drift.sh: unknown option '$1'. Please consult --help." >&2
+    exit 2
+    ;;
+esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 

@@ -851,6 +851,61 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+/* Nix attrpath qualification, end to end. A call inside a scoped binding must
+ * source to the QUALIFIED definition.
+ *
+ * This has to be a pipeline test rather than an extraction one. Definition QNs
+ * (extract_defs.c) and call-scope QNs (extract_unified.c) are computed by two
+ * separate functions. If they disagree by even one segment, the CALLS edge names
+ * a source node that was never minted and is dropped at write — with no error,
+ * and with every extraction-level assertion still passing. Only the store sees it.
+ *
+ * Both callers below are scoped, one by an enclosing attrset and one by a dotted
+ * attrpath, so this covers both routes into the qualified name. */
+TEST(pipeline_nix_scoped_binding_calls_resolve) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char nix_path[512];
+    snprintf(nix_path, sizeof(nix_path), "%s/lib.nix", g_tmpdir);
+    FILE *nf = fopen(nix_path, "w");
+    if (!nf) {
+        teardown_test_repo();
+        FAIL("failed to write nix fixture");
+    }
+    fprintf(nf, "{ prelude }:\n"
+                "let\n"
+                "  nixTarget = t: t + 1;\n"
+                "in\n"
+                "{\n"
+                "  setA = { nixCaller = x: nixTarget x; };\n"
+                "  outer.inner.nixDeepCaller = y: nixTarget y;\n"
+                "}\n");
+    fclose(nf);
+
+    char nix_db[512];
+    snprintf(nix_db, sizeof(nix_db), "%s/test_nix_calls.db", g_tmpdir);
+
+    cbm_pipeline_t *np = cbm_pipeline_new(g_tmpdir, nix_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(np);
+    ASSERT_EQ(cbm_pipeline_run(np), 0);
+
+    cbm_store_t *ns = cbm_store_open_path(nix_db);
+    ASSERT_NOT_NULL(ns);
+    const char *nix_project = cbm_pipeline_project_name(np);
+
+    /* Scoped by an enclosing attrset: the def QN is proj.lib.setA.nixCaller. */
+    ASSERT(cross_file_call_exists(ns, nix_project, "nixCaller", "nixTarget"));
+    /* Scoped by a dotted attrpath: proj.lib.outer.inner.nixDeepCaller. */
+    ASSERT(cross_file_call_exists(ns, nix_project, "nixDeepCaller", "nixTarget"));
+
+    cbm_store_close(ns);
+    cbm_pipeline_free(np);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: incremental re-index of an edited file must NOT drop inbound
  * cross-file CALLS edges whose source lives in an UNCHANGED file.
  *
@@ -2159,6 +2214,104 @@ TEST(pipeline_go_cross_package_call) {
         cbm_store_free_edges(edges, ec);
     cbm_store_free_nodes(targets, tc);
     cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* End-to-end (issue #551 item 1): two SwiftPM packages, Core and App,
+ * indexed under one root. App declares a local path dependency on Core and
+ * a target dependency on Core's product; App.swift does a bare
+ * `import Core`. This only resolves because Core's OWN Package.swift
+ * self-registers "Core" -> Core/Sources/Core in the shared pkgmap, landing
+ * App.swift's IMPORTS edge on that directory's Folder node -- proving real
+ * cross-package resolution. Asserts the EXACT provider node (the
+ * Core/Sources/Core Folder, found by its real QN, not a substring guess)
+ * and the exact edge (from App.swift's own file node to that provider) --
+ * stronger than repro_issue408.c/repro_issue56.c's own count/substring
+ * checks, which this test intentionally does not settle for. */
+TEST(pipeline_swift_cross_package_import) {
+    const char *files[] = {
+        "Core/Package.swift",
+        "Core/Sources/Core/Core.swift",
+        "App/Package.swift",
+        "App/Sources/App/App.swift",
+    };
+    const char *contents[] = {
+        ("let package = Package(\n"
+         "    name: \"Core\",\n"
+         "    products: [.library(name: \"Core\", targets: [\"Core\"])],\n"
+         "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+         ")\n"),
+
+        "public func coreValue() -> Int {\n    return 1\n}\n",
+
+        ("let package = Package(\n"
+         "    name: \"App\",\n"
+         "    dependencies: [.package(path: \"../Core\")],\n"
+         "    targets: [.target(name: \"App\", dependencies: [\n"
+         "        .product(name: \"Core\", package: \"Core\")\n"
+         "    ])]\n"
+         ")\n"),
+
+        ("import Core\n\n"
+         "func run() -> Int {\n    return coreValue()\n}\n"),
+    };
+
+    if (setup_lang_repo(files, contents, 4) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* The exact provider node: the Folder for Core/Sources/Core, which is
+     * exactly what Core/Package.swift's OWN self-registration resolves to
+     * (see cbm_pkgmap_build: pkg name "Core" -> fqn_module(entry_rel)).
+     * cbm_pipeline_fqn_module and cbm_pipeline_fqn_folder agree on this
+     * path (no extension on any segment to strip), so this is the same QN
+     * the structural pass gave the real Folder node -- not a guess. */
+    char *provider_qn = cbm_pipeline_fqn_folder(proj, "Core/Sources/Core");
+    ASSERT_NOT_NULL(provider_qn);
+    cbm_node_t provider = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, provider_qn, &provider), CBM_STORE_OK);
+    ASSERT_STR_EQ(provider.label, "Folder");
+    free(provider_qn);
+
+    /* The exact importing file node: App/Sources/App/App.swift. */
+    char *importer_qn = cbm_pipeline_fqn_compute(proj, "App/Sources/App/App.swift", "__file__");
+    ASSERT_NOT_NULL(importer_qn);
+    cbm_node_t importer = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, importer_qn, &importer), CBM_STORE_OK);
+    free(importer_qn);
+
+    /* The IMPORTS edge must run from THAT importer to THAT provider --
+     * not merely "some edge lands on a QN containing Core" (a node named
+     * e.g. "AppCore" would have false-passed the old substring check). */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, importer.id, "IMPORTS", &edges, &ec),
+             CBM_STORE_OK);
+
+    bool found_exact_edge = false;
+    for (int i = 0; i < ec; i++) {
+        if (edges[i].target_id == provider.id) {
+            found_exact_edge = true;
+        }
+    }
+    ASSERT_TRUE(found_exact_edge);
+
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_node_free_fields(&provider);
+    cbm_node_free_fields(&importer);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
@@ -5247,6 +5400,276 @@ static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
     return 0;
 }
 
+/* Helper: return the entry_rel registered for `name`, or NULL. */
+static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return e->items[i].entry_rel;
+    }
+    return NULL;
+}
+
+/* ── SwiftPM Package.swift manifest resolution (issue #551 item 1) ──
+ *
+ * parse_package_swift is a literal pattern-extractor (mirrors
+ * parse_cargo_toml), not a Swift evaluator. These call cbm_pkgmap_try_parse
+ * directly, covering the RED categories the maintainer asked for (local
+ * path deps, remote identities, products not aliasing, targets, target-name
+ * deps, literal + computed `path:`, and comment/string false positives)
+ * plus fail-closed ambiguous-name cases. See pipeline_swift_cross_package_import
+ * above for the full end-to-end proof. */
+
+TEST(pkgmap_swift_targets_registers_module) {
+    static const char src[] =
+        "// swift-tools-version:5.9\n"
+        "import PackageDescription\n"
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Products deliberately do NOT self-register a separate alias: a product
+ * name is not generally an importable module (SwiftPM lets it alias
+ * multiple targets, or none sharing its own name), so only the underlying
+ * target -- under its OWN name -- registers. */
+TEST(pkgmap_swift_products_do_not_register_alias) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    products: [.library(name: \"CoreKit\", targets: [\"CoreImpl\"])],\n"
+        "    targets: [.target(name: \"CoreImpl\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreImpl"), "Core/Sources/CoreImpl");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Regression: a target whose `name:` is the LAST argument, immediately
+ * followed by the call's own closing ')' with no trailing comma, must still
+ * register. swift_quoted_literal's terminator check used to compare against
+ * `end` with a strict '<', but every caller passes the wrapping call's own
+ * ')' position AS `end` -- so the literal's closing quote landing exactly
+ * on that boundary was wrongly rejected as "unterminated". Every other
+ * fixture in this file happens to follow `name:` with `dependencies:` or a
+ * comma, so this specific shape was previously untested and unnoticed. */
+TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\")]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A literal `path:` argument overrides the Sources/<name> convention. */
+TEST(pkgmap_swift_target_honors_literal_path) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", path: \"Vendor/CoreLegacy\")]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Vendor/CoreLegacy");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A `path:` argument that IS present but not a bare literal (computed) is
+ * unknowable -- SwiftPM would not use the Sources/<name> convention here,
+ * so guessing it anyway would mint a location likely to be wrong. Skip the
+ * target entirely (fail closed), even though its `name:` is a valid
+ * literal. */
+TEST(pkgmap_swift_target_computed_path_fails_closed) {
+    static const char src[] =
+        "let customPath = computePath()\n"
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", path: customPath)]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A `.target(` spelled inside a `//` line comment, a nesting-aware
+ * slash-star block comment, or a string literal must never be mistaken for a live
+ * declaration -- the bug a raw strstr scan cannot avoid. Only the one real
+ * target registers. */
+TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
+    static const char src[] =
+        "// .target(name: \"Decoy\")\n"
+        "/* outer /* nested */ still a comment: .target(name: \"NestedDecoy\") */\n"
+        "let manifestSnippet = \".target(name: \\\"StringDecoy\\\")\"\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "NestedDecoy"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "StringDecoy"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Local path + remote url dependencies (`.package(path:)` / `.package(url:)`)
+ * mint NO entries of their own -- mirroring package.json/Cargo.toml, only a
+ * manifest's OWN products/targets self-register. A local sibling's name is
+ * produced by ITS OWN Package.swift when the repo-wide walk reaches it
+ * (see repro_issue408.c's JS-workspace analog); a remote dependency has no
+ * local path to point at, so nothing is minted (fail-closed). */
+TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    dependencies: [\n"
+        "        .package(path: \"../Core\"),\n"
+        "        .package(url: \"https://github.com/example/RemoteKit.git\", from: \"1.0.0\")\n"
+        "    ],\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "RemoteKit"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Only App itself (the declaring target) registers -- a bare same-package
+ * target-name dependency ("Core") and a cross-package product dependency
+ * (Utils/UtilsPkg) name OTHER modules, not this manifest's own
+ * products/targets, so neither mints an entry. */
+TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\", dependencies: [\n"
+        "        \"Core\",\n"
+        "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+        "    ])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Utils"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "UtilsPkg"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Fail-closed on any `name:` that is not a bare literal: a computed
+ * variable, and a literal concatenated with a dynamic suffix (which a
+ * naive quote-scan would wrongly accept as "App"). Neither mints an entry,
+ * though the manifest is still recognized and parsed. */
+TEST(pkgmap_swift_ambiguous_target_name_fails_closed) {
+    static const char dynamic_src[] =
+        "let generatedName = \"App\" + String(buildNumber)\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: generatedName, dependencies: [])]\n"
+        ")\n";
+    static const char concat_src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\" + suffix, dependencies: [])]\n"
+        ")\n";
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", dynamic_src,
+                                     (int)strlen(dynamic_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", concat_src,
+                                     (int)strlen(concat_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* The repo-wide manifest walker must also recognize "Package.swift" -- a
+ * second code path (is_pkgmap_manifest_basename) from the direct
+ * cbm_pkgmap_try_parse calls above. */
+TEST(pkgmap_swift_scan_repo_finds_nested_manifest) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_swift_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/Core", tmpdir);
+    cbm_mkdir(dir);
+    write_temp_file(tmpdir, "Core/Package.swift",
+                    "let package = Package(\n"
+                    "    name: \"Core\",\n"
+                    "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                    ")\n");
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* The pkgmap repo walk must honor discovery exclusions (issue #792: a
  * gitignored huge subtree kept the pkgmap walk busy for 15 minutes).
  * Control run first (no exclusions → BOTH manifests parsed) so the
@@ -5549,6 +5972,121 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+/* Atomic-publish cancellation seam. Production invokes this hook after the
+ * staging database is complete, closed, and integrity-valid, but immediately
+ * before it can replace the last committed database. Keeping the hook on the
+ * pipeline instance avoids process-global failpoints and makes cancellation
+ * tests deterministic even when test runners gain concurrency. */
+extern void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+
+typedef struct {
+    const char *project;
+    const char *candidate;
+    char staging_path[768];
+    int calls;
+    bool staging_existed;
+    bool staging_was_valid;
+    int staged_candidates;
+} publish_cancel_ctx_t;
+
+typedef struct {
+    char staging_path[CBM_SZ_4K];
+    int calls;
+    bool staging_was_valid;
+} publish_observe_ctx_t;
+
+static void observe_publish_boundary(cbm_pipeline_t *p, const char *staging_path, void *arg) {
+    (void)p;
+    publish_observe_ctx_t *ctx = (publish_observe_ctx_t *)arg;
+    ctx->calls++;
+    if (!staging_path) {
+        return;
+    }
+    int n = snprintf(ctx->staging_path, sizeof(ctx->staging_path), "%s", staging_path);
+    if (n < 0 || (size_t)n >= sizeof(ctx->staging_path)) {
+        ctx->staging_path[0] = '\0';
+        return;
+    }
+    cbm_store_t *staging = cbm_store_open_path_existing(staging_path);
+    if (staging) {
+        ctx->staging_was_valid = cbm_store_check_integrity(staging);
+        cbm_store_close(staging);
+    }
+}
+
+typedef struct {
+    int calls;
+} publish_rename_fail_ctx_t;
+
+static int fail_publish_rename(const char *staging_path, const char *final_path, void *arg) {
+    publish_rename_fail_ctx_t *ctx = (publish_rename_fail_ctx_t *)arg;
+    ctx->calls++;
+    return staging_path && final_path ? CBM_NOT_FOUND : 0;
+}
+
+static bool pipeline_fixture_file_equals(const char *path, const char *expected) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    size_t expected_len = strlen(expected);
+    char actual[64];
+    size_t n = fread(actual, 1, sizeof(actual), f);
+    bool ok = n == expected_len && memcmp(actual, expected, expected_len) == 0 && fgetc(f) == EOF;
+    (void)fclose(f);
+    return ok;
+}
+
+static void cancel_at_publish_boundary(cbm_pipeline_t *p, const char *staging_path, void *arg) {
+    publish_cancel_ctx_t *ctx = (publish_cancel_ctx_t *)arg;
+    ctx->calls++;
+    if (staging_path && staging_path[0]) {
+        snprintf(ctx->staging_path, sizeof(ctx->staging_path), "%s", staging_path);
+        struct stat st;
+        ctx->staging_existed = stat(staging_path, &st) == 0;
+        if (ctx->staging_existed) {
+            cbm_store_t *staging = cbm_store_open_path(staging_path);
+            if (staging) {
+                ctx->staging_was_valid = cbm_store_check_integrity(staging);
+                ctx->staged_candidates = count_nodes_named(staging, ctx->project, ctx->candidate);
+                cbm_store_close(staging);
+            }
+        }
+    }
+    cbm_pipeline_cancel(p);
+}
+
+static bool sqlite_artifacts_absent(const char *db_path) {
+    struct stat st;
+    if (!db_path || !db_path[0] || stat(db_path, &st) == 0) {
+        return false;
+    }
+    char sidecar[832];
+    snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+    if (stat(sidecar, &st) == 0) {
+        return false;
+    }
+    snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+    if (stat(sidecar, &st) == 0) {
+        return false;
+    }
+    snprintf(sidecar, sizeof(sidecar), "%s-journal", db_path);
+    return stat(sidecar, &st) != 0;
+}
+
+static bool write_go_file(const char *dir, const char *name, const char *source) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    bool ok = fputs(source, f) >= 0;
+    fclose(f);
+    return ok;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5806,6 +6344,306 @@ TEST(incremental_new_file_added) {
     cleanup_incremental_repo();
     PASS();
 }
+
+/* Cancellation at the final publish boundary must never destroy the last good
+ * full index. Adding two files to the two-file baseline deliberately exceeds
+ * the incremental router's 1.5x file-count bound (4 > 2 + 2/2), forcing the
+ * full-reindex path while an existing committed DB is present. */
+TEST(cancelled_full_reindex_preserves_committed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    ASSERT_TRUE(cbm_store_check_integrity(live));
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    int baseline_helper = count_nodes_named(live, project, "Helper");
+    ASSERT_GT(baseline_nodes, 0);
+    ASSERT_GT(baseline_helper, 0);
+    ASSERT_EQ(count_nodes_named(live, project, "CandidateFull"), 0);
+    cbm_store_close(live);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "candidate_full.go",
+                              "package main\n\nfunc CandidateFull() int { return 41 }\n"));
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "force_full.go",
+                              "package main\n\nfunc ForceFullRoute() int { return 42 }\n"));
+
+    publish_cancel_ctx_t hook = {
+        .project = project,
+        .candidate = "CandidateFull",
+    };
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, cancel_at_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    int helper_after = count_nodes_named(live, project, "Helper");
+    int published_candidates = count_nodes_named(live, project, "CandidateFull");
+    cbm_store_close(live);
+    bool staging_cleaned = sqlite_artifacts_absent(hook.staging_path);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(hook.staging_existed);
+    ASSERT_TRUE(hook.staging_was_valid);
+    ASSERT_GT(hook.staged_candidates, 0); /* anti-vacuous: new full output was staged */
+    ASSERT_EQ(rc, -1);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    ASSERT_EQ(helper_after, baseline_helper);
+    ASSERT_EQ(published_candidates, 0);
+    ASSERT_TRUE(staging_cleaned);
+    PASS();
+}
+
+/* The same contract applies to the incremental path: the modified file is
+ * present in a complete staging DB at the hook, but cancellation leaves the
+ * prior committed snapshot queryable and removes every staging artifact. */
+TEST(cancelled_incremental_reindex_preserves_committed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    ASSERT_TRUE(cbm_store_check_integrity(live));
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    int baseline_helper = count_nodes_named(live, project, "Helper");
+    ASSERT_GT(baseline_nodes, 0);
+    ASSERT_GT(baseline_helper, 0);
+    ASSERT_EQ(count_nodes_named(live, project, "CandidateIncremental"), 0);
+    cbm_store_close(live);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "helper.go",
+                              "package main\n\n"
+                              "func Helper() string { return \"hello\" }\n\n"
+                              "func CandidateIncremental() int { return 43 }\n"));
+
+    publish_cancel_ctx_t hook = {
+        .project = project,
+        .candidate = "CandidateIncremental",
+    };
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, cancel_at_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    int helper_after = count_nodes_named(live, project, "Helper");
+    int published_candidates = count_nodes_named(live, project, "CandidateIncremental");
+    cbm_store_close(live);
+    bool staging_cleaned = sqlite_artifacts_absent(hook.staging_path);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(hook.staging_existed);
+    ASSERT_TRUE(hook.staging_was_valid);
+    ASSERT_GT(hook.staged_candidates, 0); /* anti-vacuous: changed output was staged */
+    ASSERT_EQ(rc, -1);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    ASSERT_EQ(helper_after, baseline_helper);
+    ASSERT_EQ(published_candidates, 0);
+    ASSERT_TRUE(staging_cleaned);
+    PASS();
+}
+
+TEST(backup_failed_publish_failure_preserves_final_sidecars) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char final_path[512];
+    char wal_path[544];
+    char shm_path[544];
+    char journal_path[544];
+    snprintf(final_path, sizeof(final_path), "%s/blocked.db", g_incr_tmpdir);
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", final_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", final_path);
+    snprintf(journal_path, sizeof(journal_path), "%s-journal", final_path);
+
+    /* Invalid SQLite makes backup fail. The live sidecars may contain the only
+     * recoverable state, so the rebuilt generation must be refused without
+     * changing any member of the old database family. */
+    ASSERT_EQ(th_write_file(final_path, "corrupt-main"), 0);
+    ASSERT_EQ(th_write_file(wal_path, "live-wal"), 0);
+    ASSERT_EQ(th_write_file(shm_path, "live-shm"), 0);
+    ASSERT_EQ(th_write_file(journal_path, "live-journal"), 0);
+
+    publish_observe_ctx_t hook = {0};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main");
+    bool wal_preserved = pipeline_fixture_file_equals(wal_path, "live-wal");
+    bool shm_preserved = pipeline_fixture_file_equals(shm_path, "live-shm");
+    bool journal_preserved = pipeline_fixture_file_equals(journal_path, "live-journal");
+
+    (void)cbm_unlink(final_path);
+    (void)cbm_unlink(wal_path);
+    (void)cbm_unlink(shm_path);
+    (void)cbm_unlink(journal_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(hook.staging_was_valid);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(final_preserved);
+    ASSERT_TRUE(wal_preserved);
+    ASSERT_TRUE(shm_preserved);
+    ASSERT_TRUE(journal_preserved);
+    PASS();
+}
+
+TEST(backup_failed_rename_failure_preserves_corrupt_main) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char final_path[512];
+    snprintf(final_path, sizeof(final_path), "%s/corrupt.db", g_incr_tmpdir);
+    ASSERT_EQ(th_write_file(final_path, "corrupt-main-before-rename"), 0);
+
+    publish_observe_ctx_t observe = {0};
+    publish_rename_fail_ctx_t rename_fail = {0};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &observe);
+    cbm_pipeline_set_rename_hook_for_tests(p, fail_publish_rename, &rename_fail);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main-before-rename");
+    (void)cbm_unlink(final_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(observe.calls, 1);
+    ASSERT_TRUE(observe.staging_was_valid);
+    ASSERT_EQ(rename_fail.calls, 1);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(final_preserved);
+    PASS();
+}
+
+#ifdef __linux__
+static void cleanup_long_db_fixture(char *deep_dir, const char *root, const char *db_path,
+                                    const char *staging_path) {
+    (void)cbm_unlink(db_path);
+    (void)cbm_remove_db_sidecars(db_path);
+
+    /* The unfixed full-dump path writes to the first 1023 bytes of the
+     * staging name. Remove that sibling so the RED test cleans up after
+     * itself as well as the fixed implementation. */
+    if (staging_path && strlen(staging_path) >= CBM_SZ_1K) {
+        char truncated[CBM_SZ_1K];
+        memcpy(truncated, staging_path, sizeof(truncated) - 1);
+        truncated[sizeof(truncated) - 1] = '\0';
+        (void)cbm_unlink(truncated);
+        (void)cbm_remove_db_sidecars(truncated);
+    }
+
+    size_t root_len = strlen(root);
+    while (strlen(deep_dir) > root_len) {
+        (void)cbm_rmdir(deep_dir);
+        char *slash = strrchr(deep_dir, '/');
+        if (!slash) {
+            break;
+        }
+        *slash = '\0';
+    }
+    (void)cbm_rmdir(root);
+}
+
+TEST(full_reindex_preserves_exact_long_db_path) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char *created_root = th_mktempdir("cbm_long_db");
+    ASSERT_NOT_NULL(created_root);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", created_root);
+
+    char deep_dir[1600];
+    snprintf(deep_dir, sizeof(deep_dir), "%s", root);
+    static const char component[] =
+        "/segment_abcdefghijklmnopqrstuvwxyz_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789";
+    while (strlen(deep_dir) < 1100) {
+        size_t used = strlen(deep_dir);
+        ASSERT_TRUE(used + sizeof(component) < sizeof(deep_dir));
+        memcpy(deep_dir + used, component, sizeof(component));
+    }
+    ASSERT_TRUE(cbm_mkdir_p(deep_dir, 0755));
+
+    char db_path[1600];
+    int db_n = snprintf(db_path, sizeof(db_path), "%s/graph.db", deep_dir);
+    ASSERT_TRUE(db_n > CBM_SZ_1K && (size_t)db_n < sizeof(db_path));
+
+    publish_observe_ctx_t hook = {0};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    int node_count = -1;
+    cbm_store_t *published = rc == 0 ? cbm_store_open_path_existing(db_path) : NULL;
+    if (published) {
+        node_count = cbm_store_count_nodes(published, project);
+        cbm_store_close(published);
+    }
+    bool stray_truncated_db = false;
+    if (strlen(hook.staging_path) >= CBM_SZ_1K) {
+        char truncated[CBM_SZ_1K];
+        memcpy(truncated, hook.staging_path, sizeof(truncated) - 1);
+        truncated[sizeof(truncated) - 1] = '\0';
+        stray_truncated_db = access(truncated, F_OK) == 0;
+    }
+
+    free(project);
+    cleanup_long_db_fixture(deep_dir, root, db_path, hook.staging_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(strlen(hook.staging_path) >= CBM_SZ_1K);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GT(node_count, 0);
+    ASSERT_FALSE(stray_truncated_db);
+    PASS();
+}
+#endif
 
 TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
@@ -6738,7 +7576,9 @@ TEST(pipeline_committed_counts_match_persisted) {
  * FIXED: the first futile cycle flips a shared flag; later pulls proceed with
  * the designed soft overshoot. Cycle count then can't exceed one cycle per
  * worker (workers already inside the gate when the flag flips) plus re-probes.
- * RED on the unfixed gate: cycles == file count (64) > cores+2.
+ * Four workers keep this semantic regression deterministic under TSan while
+ * still exercising the parallel path. RED on the unfixed gate: cycles == file
+ * count (64) > workers+2.
  * The counter (cbm_pp_bp_nap_cycles) makes this deterministic — no timing.
  *
  * The gate lives ONLY in the parallel extract path, so the fixture MUST exceed
@@ -6781,14 +7621,41 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     snprintf(db_path, sizeof(db_path), "%s/backpressure.db", g_tmpdir);
     cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+
+    /* This test measures the shared futility latch, not allocator scalability.
+     * High-core TSan runs can turn unrelated slab bookkeeping into an 18-way
+     * lock convoy. Four workers preserve the parallel semantic while making its
+     * bound host-independent. cbm_pipeline_run joins its workers before return,
+     * so restoring the process environment after freeing p cannot race them. */
+    enum { TEST_WORKERS = 4 };
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    if (old_workers && !saved_workers) {
+        cbm_mem_set_budget_for_tests(saved_budget);
+        cbm_pipeline_free(p);
+        teardown_test_repo();
+        FAIL("failed to save CBM_WORKERS");
+    }
+    if (cbm_setenv("CBM_WORKERS", "4", 1) != 0) {
+        free(saved_workers);
+        cbm_mem_set_budget_for_tests(saved_budget);
+        cbm_pipeline_free(p);
+        teardown_test_repo();
+        FAIL("failed to set CBM_WORKERS");
+    }
+
     int rc = cbm_pipeline_run(p);
     long cycles = cbm_pp_bp_nap_cycles();
 
     /* Restore the caller-visible budget BEFORE asserting. */
     cbm_mem_set_budget_for_tests(saved_budget);
     cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
     teardown_test_repo();
 
+    ASSERT_EQ(restore_workers_rc, 0);
     ASSERT_EQ(rc, 0);
     /* Engagement guard (anti-vacuous): the gate must have actually run — the
      * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
@@ -6799,7 +7666,7 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     }
     /* Futile napping must disengage: at most one in-flight cycle per worker
      * plus a small margin, never one per file (64). */
-    long bound = (long)cbm_system_info().total_cores + 2;
+    long bound = TEST_WORKERS + 2;
     if (cycles > bound) {
         char msg[128];
         snprintf(msg, sizeof(msg), "nap cycles %ld > bound %ld (gate re-paid per pull)", cycles,
@@ -6919,6 +7786,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
+    RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
@@ -6947,6 +7815,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
@@ -7056,6 +7925,17 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
     RUN_TEST(envscan_non_url_values_skipped);
+    /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
+    RUN_TEST(pkgmap_swift_targets_registers_module);
+    RUN_TEST(pkgmap_swift_products_do_not_register_alias);
+    RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);
+    RUN_TEST(pkgmap_swift_target_honors_literal_path);
+    RUN_TEST(pkgmap_swift_target_computed_path_fails_closed);
+    RUN_TEST(pkgmap_swift_target_in_comment_or_string_not_registered);
+    RUN_TEST(pkgmap_swift_dependencies_do_not_leak_entries);
+    RUN_TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry);
+    RUN_TEST(pkgmap_swift_ambiguous_target_name_fails_closed);
+    RUN_TEST(pkgmap_swift_scan_repo_finds_nested_manifest);
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
@@ -7095,6 +7975,13 @@ SUITE(pipeline) {
     RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
+    RUN_TEST(cancelled_full_reindex_preserves_committed_db);
+    RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
+    RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
+    RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);
+#ifdef __linux__
+    RUN_TEST(full_reindex_preserves_exact_long_db_path);
+#endif
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);

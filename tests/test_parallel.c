@@ -70,6 +70,35 @@ static int setup_parallel_repo(void) {
     fprintf(f, "package util\n\nfunc Help() {}\n");
     fclose(f);
 
+    /* Java interface/implements/extends trio: the parallel resolve path must
+     * make the same Interface-label edge split (IMPLEMENTS vs INHERITS) as
+     * the sequential semantic pass, and both must emit OVERRIDE for methods
+     * redefined from an explicit base. Without these files the IMPLEMENTS/
+     * INHERITS parity tests compare 0 == 0 and guard nothing (the demotion
+     * bug shipped: elasticsearch had 11k implements-as-INHERITS edges). */
+    snprintf(path, sizeof(path), "%s/probe", g_par_tmpdir);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/probe/Shape.java", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package probe;\npublic interface Shape {\n    double area();\n}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/probe/Circle.java", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package probe;\npublic class Circle implements Shape {\n"
+               "    @Override\n    public double area() { return 1.0; }\n}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/probe/Base.java", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package probe;\npublic class Base extends Circle {\n"
+               "    @Override\n    public double area() { return 0.0; }\n}\n");
+    fclose(f);
+
     return 0;
 }
 
@@ -84,6 +113,20 @@ static void teardown_parallel_repo(void) {
 }
 
 /* ── Run sequential pipeline on files, returning gbuf ─────────────── */
+
+/* Free the return-type table pass_calls may have built for a harness-owned
+ * ctx — mirrors the production teardown in pipeline.c; the harness never
+ * runs it, which leaked once the fixture gained typed (Java) methods. The
+ * fixture has no ObjectScript, so no macro table can exist here. */
+static void harness_ctx_free_tables(cbm_pipeline_ctx_t *ctx) {
+    if (ctx->return_type_table) {
+        for (int i = 0; i < ctx->return_type_table->count; i++) {
+            free((void *)ctx->return_type_table->entries[i].return_type);
+        }
+        free((void *)ctx->return_type_table);
+        ctx->return_type_table = NULL;
+    }
+}
 
 static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
                                   cbm_file_info_t *files, int file_count) {
@@ -106,6 +149,7 @@ static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
     cbm_pipeline_pass_usages(&ctx, files, file_count);
     cbm_pipeline_pass_semantic(&ctx, files, file_count);
 
+    harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
     return gbuf;
 }
@@ -178,6 +222,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts(const char *project, const cha
             cbm_free_result(result_cache[i]);
     free(result_cache);
 
+    harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
     return gbuf;
 }
@@ -313,6 +358,22 @@ TEST(parallel_implements_parity) {
     if (rc == -1)
         FAIL("setup failed");
     ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+/* Absolute counts on the fixture — parity alone passes vacuously at 0==0,
+ * which is how the parallel-path IMPLEMENTS demotion shipped unnoticed. */
+TEST(parallel_semantic_fixture_expected_counts) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    /* Circle implements Shape; Base extends Circle — in BOTH venues. */
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_seq_gbuf, "IMPLEMENTS"), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_par_gbuf, "IMPLEMENTS"), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_seq_gbuf, "INHERITS"), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_par_gbuf, "INHERITS"), 1);
+    /* Circle.area overrides Shape.area; Base.area overrides Circle.area. */
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_seq_gbuf, "OVERRIDE"), 2);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(g_par_gbuf, "OVERRIDE"), 2);
     PASS();
 }
 
@@ -1173,6 +1234,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_usage_parity);
     RUN_TEST(parallel_inherits_parity);
     RUN_TEST(parallel_implements_parity);
+    RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);

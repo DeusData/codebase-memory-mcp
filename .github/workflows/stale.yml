@@ -1,8 +1,24 @@
 name: Stale awaiting-reporter
 
+# Marks inactive `awaiting-reporter` issues as `stale`. It NEVER closes them:
+# closing an issue as "not planned" is a maintainer judgement, not an automated
+# one, so this workflow only surfaces a review queue and a human decides.
+#
 # Only touches issues that a maintainer has explicitly marked `awaiting-reporter`.
 # Never touches pull requests, and never touches issues without that label.
 # A reporter comment removes `stale` and resets the clock.
+#
+# WHY never close (2026-07-26): `awaiting-reporter` is applied by hand and means
+# "the reporter owes the next step". It was also being used to mean "we will come
+# back to this", which is a different thing. In that second case the automation was
+# closing issues the project itself owed work on — #56 was a confirmed bug with an
+# in-tree reproduction (tests/repro/repro_issue56.c, landed via #667) queued to close
+# as `not_planned` purely because a maintainer had the last word. A mislabel should
+# cost a stale tag, never a silently discarded bug.
+#
+# The `stale` label is therefore a review queue, not a countdown. Sweep it during
+# triage: clear the label where we owe the next step, and close by hand where the
+# thread is genuinely dead.
 
 on:
   schedule:
@@ -18,27 +34,28 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+      - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10.4.0
         with:
           only-labels: 'awaiting-reporter'
           stale-issue-label: 'stale'
           days-before-issue-stale: 21
-          days-before-issue-close: 14
+          # -1 disables automated closing entirely. Marking stale is the whole job.
+          days-before-issue-close: -1
           # Never act on pull requests with this workflow.
           days-before-pr-stale: -1
           days-before-pr-close: -1
+          # Belt-and-braces: these categories must never be auto-flagged even if
+          # `awaiting-reporter` is applied to them by mistake. `task` covers the
+          # umbrella/epic issues (incl. the pinned roadmap index #595), and
+          # `maintainer-notes` is the explicit "we owe the next step" escape hatch.
+          exempt-issue-labels: 'security,task,maintainer-notes'
           remove-stale-when-updated: true
-          close-issue-reason: not_planned
           operations-per-run: 60
           ascending: true
           stale-issue-message: >
             This issue has been waiting on more information for 21 days (a
             version, exact steps, or a public repro), so it's now marked
-            `stale`. It will be closed in 14 days if there's no update — just
-            add a comment to keep it open. We're happy to pick it back up the
-            moment we can reproduce it.
-          close-issue-message: >
-            Closing because we haven't received the requested details and can't
-            reproduce it as-is. This isn't a "won't fix" — please comment with
-            the info (version + a public repro) and we'll reopen and dig in.
-            Thanks for the report.
+            `stale`. **It will not be closed automatically** — a maintainer
+            reviews stale issues by hand. Adding a comment with the details
+            clears the label and puts it straight back in the queue. We're happy
+            to pick it back up the moment we can reproduce it.
