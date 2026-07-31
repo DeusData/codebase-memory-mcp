@@ -2811,8 +2811,17 @@ static bool prepare_publish_destination(const char *final_path, bool final_exist
         }
         return safe_to_replace;
     }
-    return cbm_store_prepare_path_for_replace(final_path) == CBM_STORE_OK &&
-           cbm_remove_db_sidecars(final_path) == 0;
+    if (cbm_store_prepare_path_for_replace(final_path) != CBM_STORE_OK) {
+        cbm_log_error("pipeline.publish_prepare.err", "phase", "destination_seal", "path",
+                      final_path);
+        return false;
+    }
+    if (cbm_remove_db_sidecars(final_path) != 0) {
+        cbm_log_error("pipeline.publish_prepare.err", "phase", "destination_sidecars", "path",
+                      final_path);
+        return false;
+    }
+    return true;
 }
 
 static int seal_staging_db(const char *staging_path) {
@@ -2916,10 +2925,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
 
-    if (!prepare_publish_destination(final_path, final_existed, backup_succeeded) ||
-        (p->rename_hook ? p->rename_hook(staging_path, final_path, p->rename_hook_ctx)
-                        : cbm_rename_replace(staging_path, final_path)) != 0) {
-        cbm_log_error("pipeline.err", "phase", "publish", "path", final_path);
+    bool destination_ready =
+        prepare_publish_destination(final_path, final_existed, backup_succeeded);
+    int rename_rc =
+        destination_ready
+            ? (p->rename_hook ? p->rename_hook(staging_path, final_path, p->rename_hook_ctx)
+                              : cbm_rename_replace(staging_path, final_path))
+            : CBM_NOT_FOUND;
+    if (!destination_ready || rename_rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "publish", "reason",
+                      destination_ready ? "rename_replace" : "destination_prepare", "path",
+                      final_path);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);

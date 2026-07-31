@@ -10,14 +10,29 @@
  * space is reclaimed on the next write cycle, not on every checkpoint.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/log.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static char g_publish_prepare_log[CBM_SZ_4K];
+
+static void capture_publish_prepare_log(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t used = strlen(g_publish_prepare_log);
+    size_t available = sizeof(g_publish_prepare_log) - used;
+    if (available > 1) {
+        snprintf(g_publish_prepare_log + used, available, "%s\n", line);
+    }
+}
 
 TEST(checkpoint_does_not_truncate_wal) {
     enum { N_ROWS = 100, PATH_BUF = 256, PATH_BUF_EXT = 300 };
@@ -192,8 +207,64 @@ TEST(remove_db_sidecars_rejects_truncated_suffix_path) {
     PASS();
 }
 
+/* An active WAL snapshot can prevent detaching the WAL journal after committed
+ * frames have been checkpointed. Publication must fail closed instead of
+ * unlinking sidecars that the reader still needs, and its diagnostic must
+ * distinguish journal detachment from checkpoint or rename failures. Sealing
+ * scans W WAL frames in O(W) time and uses O(1) caller memory; after the reader
+ * releases its snapshot, the journal transition succeeds. */
+TEST(prepare_for_replace_reports_journal_detach_blocked_by_active_reader) {
+    char *td = th_mktempdir("cbm_publish_reader");
+    ASSERT_NOT_NULL(td);
+    char db_path[CBM_SZ_512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", td);
+
+    cbm_store_t *writer = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_exec(writer, "INSERT INTO projects(name,indexed_at,root_path) "
+                                     "VALUES('p','2026-07-31','/tmp/p');"),
+              CBM_STORE_OK);
+
+    sqlite3 *reader = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db_path, &reader, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(reader, "BEGIN;", NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_stmt *snapshot = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(reader, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &snapshot,
+                                 NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(snapshot), SQLITE_ROW);
+    sqlite3_finalize(snapshot);
+
+    ASSERT_EQ(cbm_store_exec(writer, "INSERT INTO projects(name,indexed_at,root_path) "
+                                     "VALUES('after','2026-07-31','/tmp/after');"),
+              CBM_STORE_OK);
+    cbm_store_close(writer);
+
+    g_publish_prepare_log[0] = '\0';
+    CBMLogLevel prior_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(capture_publish_prepare_log);
+    int blocked_rc = cbm_store_prepare_path_for_replace(db_path);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(prior_level);
+
+    ASSERT_EQ(blocked_rc, CBM_STORE_ERR);
+    ASSERT_NOT_NULL(strstr(g_publish_prepare_log, "store.publish_prepare.err"));
+    ASSERT_NOT_NULL(strstr(g_publish_prepare_log, "journal_delete_step"));
+
+    ASSERT_EQ(sqlite3_exec(reader, "COMMIT;", NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(reader), SQLITE_OK);
+    ASSERT_EQ(cbm_store_prepare_path_for_replace(db_path), CBM_STORE_OK);
+
+    (void)cbm_remove_db_sidecars(db_path);
+    (void)cbm_unlink(db_path);
+    cbm_rmdir(td);
+    PASS();
+}
+
 SUITE(store_checkpoint) {
     RUN_TEST(checkpoint_does_not_truncate_wal);
     RUN_TEST(dump_install_ignores_stale_wal_sidecar);
     RUN_TEST(remove_db_sidecars_rejects_truncated_suffix_path);
+    RUN_TEST(prepare_for_replace_reports_journal_detach_blocked_by_active_reader);
 }

@@ -1838,18 +1838,38 @@ static int prepare_sqlite_for_publish(sqlite3 *db) {
     int rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log_frames,
                                        &checkpointed_frames);
     if (rc != SQLITE_OK || (log_frames >= 0 && checkpointed_frames != log_frames)) {
+        char rc_buf[ST_BUF_16];
+        char log_buf[ST_BUF_16];
+        char checkpointed_buf[ST_BUF_16];
+        snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
+        snprintf(log_buf, sizeof(log_buf), "%d", log_frames);
+        snprintf(checkpointed_buf, sizeof(checkpointed_buf), "%d", checkpointed_frames);
+        cbm_log_error("store.publish_prepare.err", "phase", "checkpoint_truncate", "rc", rc_buf,
+                      "log_frames", log_buf, "checkpointed_frames", checkpointed_buf, "detail",
+                      sqlite3_errmsg(db));
         return CBM_STORE_ERR;
     }
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(db, "PRAGMA journal_mode=DELETE;", CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK) {
+        char rc_buf[ST_BUF_16];
+        snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
+        cbm_log_error("store.publish_prepare.err", "phase", "journal_delete_prepare", "rc", rc_buf,
+                      "detail", sqlite3_errmsg(db));
         return CBM_STORE_ERR;
     }
     bool delete_mode = false;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
         const char *mode = (const char *)sqlite3_column_text(stmt, 0);
         delete_mode = mode && strcmp(mode, "delete") == 0;
+    }
+    if (!delete_mode) {
+        char rc_buf[ST_BUF_16];
+        snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
+        cbm_log_error("store.publish_prepare.err", "phase", "journal_delete_step", "rc", rc_buf,
+                      "detail", sqlite3_errmsg(db));
     }
     sqlite3_finalize(stmt);
     return delete_mode ? CBM_STORE_OK : CBM_STORE_ERR;

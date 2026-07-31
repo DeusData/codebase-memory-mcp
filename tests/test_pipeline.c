@@ -17098,7 +17098,9 @@ TEST(backup_failed_publish_failure_preserves_final_sidecars) {
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &hook);
+    pipeline_capture_logs_start();
     int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
     cbm_pipeline_free(p);
 
     bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main");
@@ -17119,6 +17121,8 @@ TEST(backup_failed_publish_failure_preserves_final_sidecars) {
     ASSERT_TRUE(wal_preserved);
     ASSERT_TRUE(shm_preserved);
     ASSERT_TRUE(journal_preserved);
+    ASSERT_NOT_NULL(strstr(logs, "reason=backup_failed_sidecars_preserved"));
+    ASSERT_NOT_NULL(strstr(logs, "reason=destination_prepare"));
     PASS();
 }
 
@@ -17137,7 +17141,9 @@ TEST(backup_failed_rename_failure_preserves_corrupt_main) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &observe);
     cbm_pipeline_set_rename_hook_for_tests(p, fail_publish_rename, &rename_fail);
+    pipeline_capture_logs_start();
     int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
     cbm_pipeline_free(p);
 
     bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main-before-rename");
@@ -17149,6 +17155,7 @@ TEST(backup_failed_rename_failure_preserves_corrupt_main) {
     ASSERT_EQ(rename_fail.calls, 1);
     ASSERT_TRUE(rc != 0);
     ASSERT_TRUE(final_preserved);
+    ASSERT_NOT_NULL(strstr(logs, "reason=rename_replace"));
     PASS();
 }
 
