@@ -3892,6 +3892,30 @@ def measure_mcp_overhead_probes(
     }
 
 
+def measure_indexed_query_probes_for_transport(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    tool_name: str,
+    count: int,
+    project: str,
+    timeout: int,
+    include_logs: bool,
+    client: McpClient | None = None,
+) -> dict[str, Any] | None:
+    """Measure a named file-backed project after its initial index exists."""
+    arguments = {"project": project}
+    if transport == "mcp":
+        if client is None:
+            raise RuntimeError("MCP indexed-query probes require an active client")
+        return measure_mcp_overhead_probes(
+            client, tool_name, count, include_logs, arguments
+        )
+    return measure_cli_overhead_probes(
+        binary, env, tool_name, count, timeout, include_logs, arguments
+    )
+
+
 def remove_project_dbs(cache_dir: Path) -> list[str]:
     removed: list[str] = []
     for path in cache_dir.iterdir():
@@ -6567,6 +6591,21 @@ def run_self_dogfood_case(
                     client,
                     index_mode=args.index_mode,
                 )
+                project_db = find_project_db(cache_dir)
+                project = str(
+                    initial.get("response", {}).get("project") or project_db.stem
+                )
+                indexed_query_probe = measure_indexed_query_probes_for_transport(
+                    args.transport,
+                    binary,
+                    case_env,
+                    args.indexed_query_tool,
+                    args.indexed_query_probes,
+                    project,
+                    args.timeout,
+                    args.include_logs,
+                    client,
+                )
                 mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
                 incremental = run_index_for_transport(
                     args.transport,
@@ -6578,10 +6617,7 @@ def run_self_dogfood_case(
                     client,
                     index_mode=args.index_mode,
                 )
-                project_db = find_project_db(cache_dir)
-                project = str(
-                    incremental.get("response", {}).get("project") or project_db.stem
-                )
+                project = str(incremental.get("response", {}).get("project") or project)
                 oracles = run_self_dogfood_oracles(
                     args.transport, binary, case_env, project, mutation, args, client
                 )
@@ -6595,6 +6631,18 @@ def run_self_dogfood_case(
                 args.include_logs,
                 index_mode=args.index_mode,
             )
+            project_db = find_project_db(cache_dir)
+            project = str(initial.get("response", {}).get("project") or project_db.stem)
+            indexed_query_probe = measure_indexed_query_probes_for_transport(
+                args.transport,
+                binary,
+                case_env,
+                args.indexed_query_tool,
+                args.indexed_query_probes,
+                project,
+                args.timeout,
+                args.include_logs,
+            )
             mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
             incremental = run_index_for_transport(
                 args.transport,
@@ -6605,10 +6653,7 @@ def run_self_dogfood_case(
                 args.include_logs,
                 index_mode=args.index_mode,
             )
-            project_db = find_project_db(cache_dir)
-            project = str(
-                incremental.get("response", {}).get("project") or project_db.stem
-            )
+            project = str(incremental.get("response", {}).get("project") or project)
             oracles = run_self_dogfood_oracles(
                 args.transport, binary, case_env, project, mutation, args
             )
@@ -6677,6 +6722,7 @@ def run_self_dogfood_case(
             "mutation": mutation,
             "removed_project_dbs": removed_dbs,
             "initial_fast_full": initial,
+            "indexed_query_probe": indexed_query_probe,
             "incremental": incremental,
             "fresh_fast_full_after_change": full_rebuild,
             "canonical_graph": canonical,
@@ -6850,6 +6896,8 @@ def run_self_dogfood(
             "transport": args.transport,
             "scenarios": scenarios,
             "repo_revision": source_revision,
+            "indexed_query_probes": args.indexed_query_probes,
+            "indexed_query_tool": args.indexed_query_tool,
         },
         "cleanup": {
             "requested": auto_root and not args.keep_work_root,
