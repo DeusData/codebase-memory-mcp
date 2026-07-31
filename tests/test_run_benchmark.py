@@ -68,6 +68,71 @@ class RunBenchmarkTest(unittest.TestCase):
             ],
         )
 
+    def test_indexed_query_probes_summarize_daemon_memory_census_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir)
+            daemon_log = cache / BENCHMARK.DAEMON_LOG_RELATIVE_PATH
+            daemon_log.parent.mkdir(parents=True)
+            daemon_log.write_text("level=info msg=preexisting rss_kb=999\n")
+            samples = iter(
+                [
+                    "level=info msg=mem.census at=mcp.request mi_area_kb=80 "
+                    "mi_live_kb=40 rss_kb=100\n",
+                    "level=info msg=mem.census at=mcp.request mi_area_kb=85 "
+                    "mi_live_kb=41 rss_kb=120\n",
+                ]
+            )
+            client = mock.Mock()
+
+            def call_tool(_tool: str, _arguments: dict[str, object]):
+                with daemon_log.open("a", encoding="utf-8") as stream:
+                    stream.write(next(samples))
+                return {"status": "ready"}, "", 17, 1.25
+
+            client.call_tool.side_effect = call_tool
+
+            result = BENCHMARK.measure_indexed_query_probes_for_transport(
+                "mcp",
+                Path("/candidate/cbm"),
+                {"CBM_CACHE_DIR": str(cache)},
+                "index_status",
+                2,
+                "stable-project",
+                30,
+                False,
+                client,
+            )
+
+        self.assertEqual(
+            result["daemon_mem_census"],
+            {
+                "count": 2,
+                "rss_kb": {
+                    "first": 100,
+                    "last": 120,
+                    "min": 100,
+                    "max": 120,
+                    "delta": 20,
+                },
+                "mi_area_kb": {
+                    "first": 80,
+                    "last": 85,
+                    "min": 80,
+                    "max": 85,
+                    "delta": 5,
+                },
+                "mi_live_kb": {
+                    "first": 40,
+                    "last": 41,
+                    "min": 40,
+                    "max": 41,
+                    "delta": 1,
+                },
+            },
+        )
+
     def test_find_project_db_ignores_dependency_databases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir)
