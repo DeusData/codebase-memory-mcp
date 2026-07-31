@@ -48,6 +48,7 @@ failures: list[str] = []
 # ── The canonical leg entries (the ONLY product-exercising calls allowed) ──
 CANONICAL = re.compile(
     r"scripts/(test|build|lint|clean|smoke-local|soak-legs|smoke-invariants|package-release)\.sh"
+    r"|scripts/check-plugin-drift\.sh"
     r"|test-infrastructure/vm/vm-smoke\.sh"
     r"|scripts/ci/[a-z0-9-]+\.(sh|ps1|py)"
     r"|scripts/security-[a-z0-9-]+\.sh"
@@ -339,6 +340,7 @@ if [ -d "$ROOT/scripts" ] && [ -f "$ROOT/scripts/test.sh" ]; then
 scripts/test.sh
 scripts/build.sh
 scripts/lint.sh
+scripts/check-plugin-drift.sh
 scripts/smoke-local.sh
 scripts/soak-legs.sh
 scripts/smoke-test.sh
@@ -373,6 +375,7 @@ test-infrastructure/vm/win.sh
 scripts/test.sh
 scripts/build.sh
 scripts/lint.sh
+scripts/check-plugin-drift.sh
 scripts/smoke-local.sh
 scripts/soak-legs.sh
 scripts/ci/preflight-docker.sh

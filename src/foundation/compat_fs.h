@@ -21,6 +21,7 @@ typedef struct cbm_dir cbm_dir_t;
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
     bool is_dir;
+    bool is_reparse_point;
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
 } cbm_dirent_t;
 
@@ -40,6 +41,17 @@ FILE *cbm_popen(const char *cmd, const char *mode);
 int cbm_pclose(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
+
+typedef struct {
+    bool exists;
+    bool is_dir;
+    bool is_regular_file;
+    bool is_reparse_point;
+} cbm_path_info_t;
+
+/* Query a path without following its final link component.
+ * Returns 0 for a successful query (including a missing path), -1 on error. */
+int cbm_path_info(const char *path, cbm_path_info_t *info);
 
 /* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
 bool cbm_mkdir_p(const char *path, int mode);
