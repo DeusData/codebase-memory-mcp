@@ -667,6 +667,56 @@ class RunBenchmarkTest(unittest.TestCase):
             self.assertEqual(len(first["artifact_sha256"]), 64)
             self.assertEqual(len(list(artifacts.glob("*.log.gz"))), 1)
 
+    def test_run_index_mcp_archives_worker_log_before_raising_decode_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = root / "cache"
+            cache.mkdir()
+            worker_log = cache / "logs with spaces" / ".worker-log-preserved"
+            worker_log.parent.mkdir()
+            worker_log.write_text(
+                "level=error msg=store.open_failed path=project.db\n",
+                encoding="utf-8",
+            )
+            artifact_dir = root / "durable-artifacts"
+
+            class FakeClient:
+                env = {"CBM_CACHE_DIR": str(cache)}
+
+                def call_tool_text(self, name, arguments):
+                    return (
+                        f"index worker ended with exit_nonzero; inspect log: {worker_log}\n",
+                        "",
+                        127,
+                        8.5,
+                    )
+
+            with mock.patch.dict(
+                os.environ, {BENCHMARK.BENCHMARK_ARTIFACT_DIR_ENV: str(artifact_dir)}
+            ):
+                with self.assertRaises(BENCHMARK.BenchmarkCommandError) as raised:
+                    BENCHMARK.run_index_mcp(
+                        FakeClient(), root / "repo", include_logs=True
+                    )
+
+            detail = raised.exception.detail
+            artifact = detail["measurement_log_artifacts"][0]
+            archived_path = artifact_dir / artifact["artifact_name"]
+            worker_log.unlink()
+
+            self.assertTrue(archived_path.is_file())
+            self.assertIn(
+                "msg=store.open_failed",
+                gzip.decompress(archived_path.read_bytes()).decode(),
+            )
+            self.assertEqual(detail["label"], "index_repository")
+            self.assertEqual(
+                detail["response_text_tail"][-1],
+                "index worker ended with exit_nonzero; inspect log: " + str(worker_log),
+            )
+
     def test_copy_git_revision_to_dir_excludes_dirty_and_untracked_source_state(
         self,
     ) -> None:
@@ -2663,9 +2713,9 @@ class RunBenchmarkTest(unittest.TestCase):
                 def __init__(self) -> None:
                     self.env = {"CBM_CACHE_DIR": str(cache_dir)}
 
-                def call_tool(
+                def call_tool_text(
                     self, name: str, arguments: dict[str, object]
-                ) -> tuple[dict[str, object], str, int, float]:
+                ) -> tuple[str, str, int, float]:
                     self.name = name
                     self.arguments = arguments
                     with daemon_log.open("a", encoding="utf-8") as stream:
@@ -2674,7 +2724,7 @@ class RunBenchmarkTest(unittest.TestCase):
                             f"log={current_worker_log}\n"
                         )
                     return (
-                        {"publish_kind": "incremental_exact"},
+                        '{"publish_kind":"incremental_exact"}',
                         "",
                         10,
                         25.0,

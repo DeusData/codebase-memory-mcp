@@ -3681,10 +3681,46 @@ def run_index_mcp(
     index_mode: str = "fast",
 ) -> dict[str, Any]:
     daemon_log, daemon_log_offset = daemon_log_window(client.env)
-    data, stderr, stdout_bytes, elapsed_ms = client.call_tool(
+    text, stderr, stdout_bytes, elapsed_ms = client.call_tool_text(
         "index_repository", index_tool_arguments(repo_dir, index_mode)
     )
     daemon_diagnostics = read_log_window(daemon_log, daemon_log_offset)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        diagnostics = f"{stderr}\n{daemon_diagnostics}\n{text}"
+        worker_log = failure_worker_log_path(diagnostics)
+        measurement_log_artifacts: list[dict[str, Any]] = []
+        archive_error = ""
+        artifact_dir_value = os.environ.get(BENCHMARK_ARTIFACT_DIR_ENV)
+        if worker_log and artifact_dir_value and worker_log.is_file():
+            try:
+                # Streaming archive is O(L) time and O(1) working memory for an
+                # L-byte worker log. It runs only on the already-failing path,
+                # before the case finally-block removes its isolated cache.
+                measurement_log_artifacts.append(
+                    archive_measurement_log(worker_log, Path(artifact_dir_value))
+                )
+            except OSError as archive_exc:
+                archive_error = f"{type(archive_exc).__name__}: {archive_exc}"
+        detail: dict[str, Any] = {
+            "label": "index_repository",
+            "elapsed_ms": round(elapsed_ms, 3),
+            "stdout_bytes": stdout_bytes,
+            "response_text_bytes": len(text.encode("utf-8")),
+            "response_text_tail": text_tail(text),
+            "stderr_tail": text_tail(stderr),
+            "daemon_log_tail": text_tail(daemon_diagnostics),
+            "worker_log_path": str(worker_log) if worker_log else "",
+            "measurement_log_artifacts": measurement_log_artifacts,
+        }
+        if archive_error:
+            detail["measurement_log_archive_error"] = archive_error
+        raise BenchmarkCommandError(
+            f"MCP tool index_repository returned non-JSON text; "
+            f"worker_log_archived={bool(measurement_log_artifacts)}",
+            detail,
+        ) from exc
     return build_index_result(
         data,
         stderr,
@@ -3693,6 +3729,27 @@ def run_index_mcp(
         include_logs,
         measurement_diagnostics=daemon_diagnostics,
     )
+
+
+def failure_worker_log_path(diagnostics: str) -> Path | None:
+    """Return the last worker-log path named by a failed supervisor response.
+
+    Diagnostic scanning is O(D) time and O(1) auxiliary state for D bytes. The
+    human-readable inspect-log form is line-delimited, so paths containing
+    spaces remain intact; structured log output retains its established
+    whitespace-delimited representation.
+    """
+    for line in reversed(diagnostics.splitlines()):
+        marker = "inspect log:"
+        if marker in line:
+            value = line.partition(marker)[2].strip().strip("'\"")
+            if value:
+                return Path(value)
+        if "index.supervisor." in line:
+            value = parse_log_text_field(line, "index.supervisor.", "log")
+            if value:
+                return Path(value)
+    return None
 
 
 def build_tool_probe_result(
