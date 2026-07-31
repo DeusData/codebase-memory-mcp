@@ -163,6 +163,10 @@ typedef struct {
     int prop_count;
 } cbm_node_pattern_t;
 
+enum {
+    CBM_CYPHER_HOPS_UNBOUNDED = -1,
+};
+
 /* Relationship pattern: -[:TYPE|TYPE2*min..max]-> */
 typedef struct {
     const char *variable; /* NULL if anonymous */
@@ -170,7 +174,7 @@ typedef struct {
     int type_count;
     const char *direction; /* "outbound", "inbound", "any" */
     int min_hops;          /* default 1 */
-    int max_hops;          /* 0 = unbounded */
+    int max_hops;          /* CBM_CYPHER_HOPS_UNBOUNDED when no upper bound */
 } cbm_rel_pattern_t;
 
 /* A pattern is alternating nodes and relationships:
@@ -324,9 +328,8 @@ typedef struct {
     bool truncated;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
-    /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-
-     * length hop range was clamped to the engine ceiling (#797) — without
-     * this, a clamped expansion is indistinguishable from "no such path". */
+    /* Non-NULL advisory (caller-visible, not an error). Correctness-affecting
+     * resource exhaustion is reported through error, never this field. */
     char *warning;
 } cbm_cypher_result_t;
 
@@ -377,6 +380,11 @@ void cbm_query_free(cbm_query_t *q);
  * subsequent queries on the calling thread. 0 = trip on the first hot-loop
  * check; a negative value restores the default budget. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test-only physical-plan seam. true forces the whole-pattern matcher for
+ * otherwise indexed single-segment patterns; false restores automatic choice. */
+void cbm_cypher_test_force_whole_pattern_provider(bool force);
+#endif
 /* Test-only logical work counter for aggregate group lookup. Tracking is
  * dormant until reset, so production queries do not retain per-query data. */
 void cbm_cypher_test_reset_group_lookup_probes(void);

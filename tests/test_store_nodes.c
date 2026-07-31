@@ -3035,15 +3035,55 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     ASSERT_EQ(active_function_count, 1);
     cbm_store_free_nodes(active_functions, active_function_count);
 
-    const char *edge_types[] = {"CALLS"};
+    enum { EDGE_TYPE_COUNT_BEYOND_LEGACY_CAP = 17 };
+    const char *edge_types[EDGE_TYPE_COUNT_BEYOND_LEGACY_CAP] = {
+        "NONMATCHING_00", "NONMATCHING_01", "NONMATCHING_02", "NONMATCHING_03", "NONMATCHING_04",
+        "NONMATCHING_05", "NONMATCHING_06", "NONMATCHING_07", "NONMATCHING_08", "NONMATCHING_09",
+        "NONMATCHING_10", "NONMATCHING_11", "NONMATCHING_12", "NONMATCHING_13", "NONMATCHING_14",
+        "NONMATCHING_15", "CALLS",
+    };
+
+    /* Every traversal consumer must honor the complete requested type set.
+     * The only matching type is deliberately beyond the former 16-type cap.
+     * JSON binding keeps SQL text/bind count O(1); matching remains O(T + E)
+     * for T total type-name bytes and the edges visited by SQLite. */
+    cbm_traverse_result_t canonical_trace = {0};
+    ASSERT_EQ(cbm_store_bfs(live, old_main_id, "outbound", edge_types,
+                            EDGE_TYPE_COUNT_BEYOND_LEGACY_CAP, 1, 10, &canonical_trace),
+              CBM_STORE_OK);
+    ASSERT_EQ(canonical_trace.visited_count, 1);
+    ASSERT_STR_EQ(canonical_trace.visited[0].node.name, "stable");
+    cbm_store_traverse_free(&canonical_trace);
+
+    cbm_store_edge_node_t *active_edge_nodes = NULL;
+    int active_edge_node_count = 0;
+    ASSERT_EQ(cbm_store_find_active_edge_nodes_by_qn(
+                  live, "test", "test.new_main", edge_types, EDGE_TYPE_COUNT_BEYOND_LEGACY_CAP,
+                  CBM_STORE_EDGE_DIR_OUTBOUND, &active_edge_nodes, &active_edge_node_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_edge_node_count, 1);
+    ASSERT_STR_EQ(active_edge_nodes[0].node.name, "stable");
+    cbm_store_free_edge_nodes(active_edge_nodes, active_edge_node_count);
+
     cbm_traverse_result_t active_trace = {0};
-    ASSERT_EQ(cbm_store_bfs_overlay_view(live, "test", "test.new_main", "outbound",
-                                         edge_types, 1, 1, 10, &active_trace),
+    ASSERT_EQ(cbm_store_bfs_overlay_view(live, "test", "test.new_main", "outbound", edge_types,
+                                         EDGE_TYPE_COUNT_BEYOND_LEGACY_CAP, 1, 10, &active_trace),
               CBM_STORE_OK);
     ASSERT_EQ(active_trace.visited_count, 1);
     ASSERT_STR_EQ(active_trace.root.name, "new_main");
     ASSERT_STR_EQ(active_trace.visited[0].node.name, "stable");
     cbm_store_traverse_free(&active_trace);
+
+    cbm_traverse_result_t multi_trace = {0};
+    bool multi_truncated = true;
+    ASSERT_EQ(cbm_store_bfs_multi(live, &old_main_id, 1, "outbound", edge_types,
+                                  EDGE_TYPE_COUNT_BEYOND_LEGACY_CAP, 1, 10, &multi_trace,
+                                  &multi_truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(multi_truncated);
+    ASSERT_EQ(multi_trace.visited_count, 1);
+    ASSERT_STR_EQ(multi_trace.visited[0].node.name, "stable");
+    cbm_store_traverse_free(&multi_trace);
 
     cbm_store_search_free(&active);
     cbm_store_search_free(&expected);

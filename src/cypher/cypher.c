@@ -9,8 +9,6 @@
 #include "foundation/compat.h"
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
-#include "foundation/limits.h"
-#include "foundation/log.h"
 #include "store/store.h"
 
 #include <yyjson/yyjson.h>
@@ -601,29 +599,56 @@ static int parse_node(parser_t *p, cbm_node_pattern_t *out) {
     return 0;
 }
 
-/* Parse *min..max hop range after the star token has been consumed */
-static void parse_hop_range(parser_t *p, int *min_hops, int *max_hops) {
+static int parse_hop_bound(parser_t *p, int *out) {
+    const cbm_token_t *token = advance(p);
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(token->text, &end, CBM_DECIMAL_BASE);
+    if (errno == ERANGE || !end || *end != '\0' || value > (unsigned long long)INT_MAX) {
+        snprintf(p->error, sizeof(p->error), "invalid hop range bound '%s' at pos %d", token->text,
+                 token->pos);
+        return CBM_NOT_FOUND;
+    }
+    *out = (int)value;
+    return 0;
+}
+
+/* Parse *min..max hop range after the star token has been consumed. */
+static int parse_hop_range(parser_t *p, int *min_hops, int *max_hops) {
     if (check(p, TOK_NUMBER)) {
-        int val = (int)strtol(peek(p)->text, NULL, CBM_DECIMAL_BASE);
-        advance(p);
+        int val = 0;
+        if (parse_hop_bound(p, &val) != 0) {
+            return CBM_NOT_FOUND;
+        }
         if (match(p, TOK_DOTDOT)) {
             *min_hops = val;
-            *max_hops =
-                check(p, TOK_NUMBER) ? (int)strtol(advance(p)->text, NULL, CBM_DECIMAL_BASE) : 0;
+            if (check(p, TOK_NUMBER)) {
+                if (parse_hop_bound(p, max_hops) != 0) {
+                    return CBM_NOT_FOUND;
+                }
+            } else {
+                *max_hops = CBM_CYPHER_HOPS_UNBOUNDED;
+            }
         } else {
-            /* *N means 1..N */
-            *min_hops = SKIP_ONE;
+            /* Cypher's single-bound form is exact: *N is equivalent to *N..N. */
+            *min_hops = val;
             *max_hops = val;
         }
     } else if (match(p, TOK_DOTDOT)) {
         *min_hops = SKIP_ONE;
-        *max_hops =
-            check(p, TOK_NUMBER) ? (int)strtol(advance(p)->text, NULL, CBM_DECIMAL_BASE) : 0;
+        if (check(p, TOK_NUMBER)) {
+            if (parse_hop_bound(p, max_hops) != 0) {
+                return CBM_NOT_FOUND;
+            }
+        } else {
+            *max_hops = CBM_CYPHER_HOPS_UNBOUNDED;
+        }
     } else {
         /* * alone = unbounded */
         *min_hops = SKIP_ONE;
-        *max_hops = 0;
+        *max_hops = CBM_CYPHER_HOPS_UNBOUNDED;
     }
+    return 0;
 }
 
 /* Parse relationship type list after ':' inside brackets. Returns -1 on error. */
@@ -690,6 +715,10 @@ static int parse_rel_bracket(parser_t *p, cbm_rel_pattern_t *out) {
     /* Optional variable */
     if (check(p, TOK_IDENT) && !check(p, TOK_COLON)) {
         out->variable = heap_strdup(advance(p)->text);
+        if (!out->variable) {
+            snprintf(p->error, sizeof(p->error), "out of memory parsing relationship variable");
+            return CBM_NOT_FOUND;
+        }
     }
     /* Optional :Types */
     if (match(p, TOK_COLON)) {
@@ -699,7 +728,15 @@ static int parse_rel_bracket(parser_t *p, cbm_rel_pattern_t *out) {
     }
     /* Optional *hop_range */
     if (match(p, TOK_STAR)) {
-        parse_hop_range(p, &out->min_hops, &out->max_hops);
+        if (out->variable) {
+            snprintf(p->error, sizeof(p->error),
+                     "unsupported Cypher feature: variable-length relationship variables; "
+                     "omit the relationship variable or use a fixed-length relationship");
+            return CBM_NOT_FOUND;
+        }
+        if (parse_hop_range(p, &out->min_hops, &out->max_hops) != 0) {
+            return CBM_NOT_FOUND;
+        }
     }
     if (!expect(p, TOK_RBRACKET)) {
         return CBM_NOT_FOUND;
@@ -2367,6 +2404,10 @@ static void binding_free(binding_t *b);
  * while a ceiling hit must never be reported by another request. */
 static _Thread_local int g_cypher_working_row_limit_hit = 0;
 static _Thread_local bool g_cypher_allocation_failed = false;
+static _Thread_local int g_cypher_trail_work_rows = 0;
+static _Thread_local int g_cypher_trail_work_limit = 0;
+static _Thread_local bool g_cypher_store_failed = false;
+static _Thread_local char g_cypher_store_error[CBM_SZ_256];
 
 static int binding_overflow_capacity(int current, int needed) {
     int next = current > 0 ? current : CYP_INIT_CAP8;
@@ -3410,6 +3451,9 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
 static _Thread_local bool g_cypher_timed_out = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local bool g_cypher_force_whole_pattern_provider = false;
+#endif
 static _Thread_local bool g_cypher_track_group_lookup_probes = false;
 static _Thread_local uint64_t g_cypher_group_lookup_probes = 0;
 
@@ -3441,6 +3485,12 @@ static bool cypher_deadline_exceeded(void) {
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
     g_cypher_deadline_override_ms = budget_ms;
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_cypher_test_force_whole_pattern_provider(bool force) {
+    g_cypher_force_whole_pattern_provider = force;
+}
+#endif
 
 void cbm_cypher_test_reset_group_lookup_probes(void) {
     g_cypher_group_lookup_probes = 0;
@@ -3887,9 +3937,9 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int cand
 /* Process edges: look up target node, filter by label/props, add binding.
  * `inbound` controls which end of the edge is the target id. */
 static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count, bool inbound,
-                          const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
-                          const char *rel_var, binding_t **new_bindings, int *new_count,
-                          int *new_capacity, int max_new, int *match_count,
+                          bool skip_self_loops, const cbm_node_pattern_t *target_node, binding_t *b,
+                          const char *to_var, const char *rel_var, binding_t **new_bindings,
+                          int *new_count, int *new_capacity, int max_new, int *match_count,
                           const cbm_where_clause_t *pattern_where) {
     /* When the terminal node variable is ALREADY bound (e.g. the second pattern
      * `(c)-[:CALLS]->(f)` where `f` came from an earlier MATCH), we must FILTER
@@ -3899,6 +3949,11 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
     cbm_node_t *bound_to = binding_get(b, to_var);
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
     for (int ei = 0; ei < edge_count; ei++) {
+        /* An undirected self-loop has only one orientation. The inbound half
+         * of an ANY-direction lookup must not emit the same relationship twice. */
+        if (skip_self_loops && edges[ei].source_id == edges[ei].target_id) {
+            continue;
+        }
         int64_t tid = inbound ? edges[ei].source_id : edges[ei].target_id;
         if (bound_to && tid != bound_to_id) {
             continue;
@@ -3976,93 +4031,58 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
     }
 }
 
-/* Expand variable-length relationship via BFS */
-/* Set when a variable-length hop range is clamped to the engine ceiling
- * during the CURRENT execution; cbm_cypher_execute turns it into
- * result->warning so callers can tell "clamped" from "no such path" (#797). */
-/* C11 _Thread_local directly: cypher.c stays windows.h-free (compat.h pulls
- * in windows.h, whose legacy `far` macro breaks this file's identifiers). */
-static _Thread_local int g_cypher_depth_clamped = 0;
+static bool cypher_trail_cancel(void *ctx) {
+    (void)ctx;
+    return cypher_deadline_exceeded();
+}
 
-static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
-                              cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                              const char *to_var, binding_t **new_bindings, int *new_count,
-                              int *new_capacity, int max_new, int *match_count,
+/* Expand variable-length relationships as exact relationship-unique trails.
+ * The adjacency snapshot is loaded once per pattern stage and reused across
+ * source bindings. Explicit hop bounds are semantics; unbounded forms stop
+ * naturally after every edge on a trail has been used. Work-budget, deadline,
+ * allocation, and store failures abort the whole query rather than returning a
+ * warning-only or otherwise incomplete answer. */
+static void expand_var_length(cbm_store_t *store, cbm_store_trail_graph_t *trail_graph,
+                              cbm_rel_pattern_t *rel, cbm_node_pattern_t *target_node, binding_t *b,
+                              cbm_node_t *src, const char *to_var, binding_t **new_bindings,
+                              int *new_count, int *new_capacity, int max_new, int *match_count,
                               const cbm_where_clause_t *pattern_where) {
-    /* Clamp BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms to the
-     * engine ceiling: an explicit N above the cap was previously honoured
-     * verbatim, driving cbm_store_bfs to an unbounded hop count (#887). WARN on
-     * clamp — never a silent truncation. */
-    int depth_cap = cbm_cypher_max_depth();
-    int max_depth = rel->max_hops > 0 ? rel->max_hops : depth_cap;
-    if (max_depth > depth_cap) {
-        char req_buf[16];
-        char cap_buf[16];
-        snprintf(req_buf, sizeof(req_buf), "%d", max_depth);
-        snprintf(cap_buf, sizeof(cap_buf), "%d", depth_cap);
-        cbm_log_warn("cypher.depth_capped", "requested", req_buf, "cap", cap_buf);
-        g_cypher_depth_clamped = depth_cap; /* surfaced as result->warning (#797) */
-        max_depth = depth_cap;
+    if (!trail_graph || g_cypher_store_failed || g_cypher_timed_out ||
+        g_cypher_working_row_limit_hit > 0) {
+        return;
     }
-    const char *dir = rel->direction ? rel->direction : "outbound";
-    if (b->use_active_overlay_edges && b->project && src->qualified_name &&
-        src->qualified_name[0]) {
-        int remaining = max_new - *new_count;
-        /* Fetch one sentinel candidate beyond the remaining budget. This keeps
-         * traversal output memory O(min(reachable, remaining + 1)) and makes
-         * exhaustion observable without re-walking the graph. Candidates are
-         * budgeted before predicates because the traversal has already paid
-         * their runtime and memory cost. */
-        int probe_limit = remaining + SKIP_ONE;
-        cbm_traverse_result_t tr = {0};
-        if (cbm_store_bfs_overlay_view(store, b->project, src->qualified_name, dir,
-                                       (const char **)rel->types, rel->type_count, max_depth,
-                                       probe_limit, &tr) == CBM_STORE_OK) {
-            if (tr.visited_count > remaining) {
-                g_cypher_working_row_limit_hit = max_new;
-            }
-            for (int v = 0; v < tr.visited_count; v++) {
-                cbm_node_hop_t *hop = &tr.visited[v];
-                if (hop->hop < rel->min_hops) {
-                    continue;
-                }
-                if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {
-                    continue;
-                }
-                if (!check_inline_props(&hop->node, target_node->props, target_node->prop_count,
-                                        store)) {
-                    continue;
-                }
-                binding_t nb = {0};
-                binding_copy(&nb, b);
-                binding_set(&nb, to_var, &hop->node);
-                if (pattern_where && !eval_where(pattern_where, &nb)) {
-                    binding_free(&nb);
-                    continue;
-                }
-                if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
-                    break;
-                }
-                (*match_count)++;
-            }
-        }
-        cbm_store_traverse_free(&tr);
+
+    int remaining_work = g_cypher_trail_work_limit - g_cypher_trail_work_rows;
+    if (remaining_work <= 0) {
+        g_cypher_working_row_limit_hit = g_cypher_trail_work_limit;
         return;
     }
     cbm_traverse_result_t tr = {0};
-    int remaining = max_new - *new_count;
-    /* Match the overlay path's one-row sentinel contract. cbm_store_bfs owns
-     * its visited set until cbm_store_traverse_free below. */
-    int probe_limit = remaining + SKIP_ONE;
-    cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, probe_limit, &tr);
-    if (tr.visited_count > remaining) {
-        g_cypher_working_row_limit_hit = max_new;
+    int work_rows = 0;
+    bool work_limit_hit = false;
+    bool cancelled = false;
+    int rc = cbm_store_trail_graph_traverse(
+        trail_graph, src->id, src->qualified_name, rel->min_hops, rel->max_hops, remaining_work,
+        cypher_trail_cancel, NULL, &tr, &work_rows, &work_limit_hit, &cancelled);
+    g_cypher_trail_work_rows += work_rows;
+    if (rc != CBM_STORE_OK) {
+        g_cypher_store_failed = true;
+        snprintf(g_cypher_store_error, sizeof(g_cypher_store_error), "%s",
+                 cbm_store_error(store) ? cbm_store_error(store) : "graph traversal failed");
+        cbm_store_traverse_free(&tr);
+        return;
+    }
+    if (cancelled) {
+        cbm_store_traverse_free(&tr);
+        return;
+    }
+    if (work_limit_hit) {
+        g_cypher_working_row_limit_hit = g_cypher_trail_work_limit;
+        cbm_store_traverse_free(&tr);
+        return;
     }
     for (int v = 0; v < tr.visited_count; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
-        if (hop->hop < rel->min_hops) {
-            continue;
-        }
         if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {
             continue;
         }
@@ -4123,8 +4143,8 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                 cbm_store_find_edges_by_source_type(store, src->id, rel->types[ti], &edges,
                                                     &edge_count);
             }
-            process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, new_capacity, max_new, match_count,
+            process_edges(store, edges, edge_count, is_inbound, false, target_node, b, to_var,
+                          rel_var, new_bindings, new_count, new_capacity, max_new, match_count,
                           pattern_where);
             cbm_store_free_edges(edges, edge_count);
         }
@@ -4134,7 +4154,7 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                 int edge_count = 0;
                 cbm_store_find_edges_by_target_type(store, src->id, rel->types[ti], &edges,
                                                     &edge_count);
-                process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
+                process_edges(store, edges, edge_count, true, true, target_node, b, to_var, rel_var,
                               new_bindings, new_count, new_capacity, max_new, match_count,
                               pattern_where);
                 cbm_store_free_edges(edges, edge_count);
@@ -4148,14 +4168,14 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         } else {
             cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count);
         }
-        process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
+        process_edges(store, edges, edge_count, is_inbound, false, target_node, b, to_var, rel_var,
                       new_bindings, new_count, new_capacity, max_new, match_count, pattern_where);
         cbm_store_free_edges(edges, edge_count);
         if (is_any) {
             edges = NULL;
             edge_count = 0;
             cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count);
-            process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
+            process_edges(store, edges, edge_count, true, true, target_node, b, to_var, rel_var,
                           new_bindings, new_count, new_capacity, max_new, match_count,
                           pattern_where);
             cbm_store_free_edges(edges, edge_count);
@@ -4163,9 +4183,299 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     }
 }
 
+typedef struct cypher_whole_match_ctx cypher_whole_match_ctx_t;
+
+typedef struct {
+    cypher_whole_match_ctx_t *match;
+    binding_t *binding;
+    int rel_index;
+} cypher_segment_visit_ctx_t;
+
+struct cypher_whole_match_ctx {
+    cbm_store_t *store;
+    cbm_pattern_t *pattern;
+    cbm_store_trail_graph_t *graph;
+    bool *used_edges;
+    const cbm_where_clause_t *pattern_where;
+    binding_t **outputs;
+    int *output_count;
+    int *output_capacity;
+    int max_outputs;
+    int complete_matches;
+    bool work_limit_hit;
+    bool cancelled;
+};
+
+static int cypher_match_pattern_segment(cypher_whole_match_ctx_t *ctx, int rel_index,
+                                        binding_t *binding, const cbm_node_t *source);
+
+static bool cypher_nodes_same_identity(const cbm_node_t *lhs, const cbm_node_t *rhs, bool overlay) {
+    if (!lhs || !rhs) {
+        return false;
+    }
+    if (overlay) {
+        return lhs->qualified_name && rhs->qualified_name &&
+               strcmp(lhs->qualified_name, rhs->qualified_name) == 0;
+    }
+    return lhs->id > 0 && lhs->id == rhs->id;
+}
+
+static bool cypher_edges_same_identity(const cbm_edge_t *lhs, const cbm_edge_t *rhs) {
+    /* Canonical edges use positive SQLite ids; active-overlay whole-pattern
+     * edges use stable negative query-local ids. Zero is never an identity.
+     * Equality is O(1) and does not compare potentially large property JSON. */
+    return lhs && rhs && lhs->id != 0 && lhs->id == rhs->id;
+}
+
+static int cypher_visit_segment_endpoint(const cbm_node_t *node, const cbm_edge_t *last_edge,
+                                         void *userdata) {
+    cypher_segment_visit_ctx_t *visit = userdata;
+    cypher_whole_match_ctx_t *ctx = visit->match;
+    cbm_rel_pattern_t *rel = &ctx->pattern->rels[visit->rel_index];
+    cbm_node_pattern_t *target = &ctx->pattern->nodes[visit->rel_index + SKIP_ONE];
+    const char *to_var = target->variable ? target->variable : "_n_t";
+    cbm_edge_t *bound_rel = rel->variable ? binding_get_edge(visit->binding, rel->variable) : NULL;
+    if (bound_rel && !cypher_edges_same_identity(bound_rel, last_edge)) {
+        return CBM_STORE_OK;
+    }
+    cbm_node_t *bound_target = target->variable ? binding_get(visit->binding, to_var) : NULL;
+    if (bound_target &&
+        !cypher_nodes_same_identity(bound_target, node, visit->binding->use_active_overlay_edges)) {
+        return CBM_STORE_OK;
+    }
+    if (target->label && !label_alt_matches(node->label, target->label)) {
+        return CBM_STORE_OK;
+    }
+    if (!check_inline_props(node, target->props, target->prop_count, ctx->store)) {
+        return CBM_STORE_OK;
+    }
+
+    binding_t next = {0};
+    binding_copy(&next, visit->binding);
+    binding_set(&next, to_var, node);
+    if (rel->variable && last_edge) {
+        binding_set_edge(&next, rel->variable, last_edge);
+    }
+    if (next.allocation_failed) {
+        binding_free(&next);
+        g_cypher_allocation_failed = true;
+        return CBM_STORE_ERR;
+    }
+
+    int rc = CBM_STORE_OK;
+    if (visit->rel_index + SKIP_ONE == ctx->pattern->rel_count) {
+        if (!ctx->pattern_where || eval_where(ctx->pattern_where, &next)) {
+            if (!binding_array_append(ctx->outputs, ctx->output_count, ctx->output_capacity,
+                                      ctx->max_outputs, &next)) {
+                rc = CBM_STORE_ERR;
+            } else {
+                ctx->complete_matches++;
+            }
+        }
+    } else {
+        cbm_node_t *next_source = binding_get(&next, to_var);
+        rc = cypher_match_pattern_segment(ctx, visit->rel_index + SKIP_ONE, &next, next_source);
+    }
+    binding_free(&next);
+    return rc;
+}
+
+static int cypher_match_pattern_segment(cypher_whole_match_ctx_t *ctx, int rel_index,
+                                        binding_t *binding, const cbm_node_t *source) {
+    if (!source || g_cypher_allocation_failed || g_cypher_working_row_limit_hit > 0 ||
+        g_cypher_store_failed || g_cypher_timed_out) {
+        return CBM_STORE_OK;
+    }
+    cbm_rel_pattern_t *rel = &ctx->pattern->rels[rel_index];
+    cypher_segment_visit_ctx_t visit = {.match = ctx, .binding = binding, .rel_index = rel_index};
+    int rc = cbm_store_trail_graph_visit(
+        ctx->graph, source->id, source->qualified_name,
+        rel->direction ? rel->direction : "outbound", (const char **)rel->types, rel->type_count,
+        rel->min_hops, rel->max_hops, ctx->used_edges, g_cypher_trail_work_limit,
+        &g_cypher_trail_work_rows, cypher_trail_cancel, NULL, cypher_visit_segment_endpoint, &visit,
+        &ctx->work_limit_hit, &ctx->cancelled);
+    if (ctx->work_limit_hit) {
+        g_cypher_working_row_limit_hit = g_cypher_trail_work_limit;
+    }
+    if (rc != CBM_STORE_OK && !g_cypher_allocation_failed && g_cypher_working_row_limit_hit == 0) {
+        g_cypher_store_failed = true;
+        snprintf(g_cypher_store_error, sizeof(g_cypher_store_error), "%s",
+                 cbm_store_error(ctx->store) ? cbm_store_error(ctx->store)
+                                             : "whole-pattern traversal failed");
+    }
+    return rc;
+}
+
+static bool cypher_collect_pattern_edge_types(const cbm_pattern_t *pattern, const char ***out_types,
+                                              int *out_count) {
+    *out_types = NULL;
+    *out_count = 0;
+    int total = 0;
+    for (int ri = 0; ri < pattern->rel_count; ri++) {
+        const cbm_rel_pattern_t *rel = &pattern->rels[ri];
+        if (rel->type_count == 0) {
+            /* One untyped segment may consume every relationship type, so a
+             * snapshot-level type predicate would be a semantic restriction. */
+            return true;
+        }
+        if (rel->type_count > INT_MAX - total) {
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+        total += rel->type_count;
+    }
+    if (total <= 0 || (size_t)total > SIZE_MAX / sizeof(**out_types)) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    const char **types = malloc((size_t)total * sizeof(*types));
+    if (!types) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    int count = 0;
+    for (int ri = 0; ri < pattern->rel_count; ri++) {
+        const cbm_rel_pattern_t *rel = &pattern->rels[ri];
+        for (int ti = 0; ti < rel->type_count; ti++) {
+            types[count++] = rel->types[ti];
+        }
+    }
+    *out_types = types;
+    *out_count = count;
+    return true;
+}
+
+static const char *cypher_pattern_snapshot_direction(const cbm_pattern_t *pattern) {
+    const char *selected = NULL;
+    for (int ri = 0; ri < pattern->rel_count; ri++) {
+        const char *direction =
+            pattern->rels[ri].direction ? pattern->rels[ri].direction : "outbound";
+        if (strcmp(direction, "any") == 0) {
+            return "any";
+        }
+        if (selected && strcmp(selected, direction) != 0) {
+            return "any";
+        }
+        selected = direction;
+    }
+    return selected ? selected : "any";
+}
+
+/* Multi-segment graph patterns require one relationship-identity scope.
+ * Descending into the next segment inside the trail visitor keeps one dense
+ * used-edge bitmap live until the complete pattern succeeds or backtracks.
+ * This avoids both staged semantic loss and O(partial_rows * path_length)
+ * copied histories. Single-segment patterns retain the indexed adjacency fast
+ * path below because graph-wide state cannot affect their result. */
+static void expand_pattern_rels_whole(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
+                                      int *bind_count, const char **var_name, bool is_optional,
+                                      const cbm_where_clause_t *pattern_where, int max_new) {
+    int output_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
+    if (output_capacity > max_new) {
+        output_capacity = max_new;
+    }
+    binding_t *outputs = malloc((size_t)output_capacity * sizeof(*outputs));
+    if (!outputs) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    int output_count = 0;
+    cbm_store_trail_graph_t *canonical_graph = NULL;
+    cbm_store_trail_graph_t *overlay_graph = NULL;
+    bool *canonical_used = NULL;
+    bool *overlay_used = NULL;
+    const char **pattern_edge_types = NULL;
+    int pattern_edge_type_count = 0;
+    if (!cypher_collect_pattern_edge_types(pat, &pattern_edge_types, &pattern_edge_type_count)) {
+        free(outputs);
+        return;
+    }
+    const char *snapshot_direction = cypher_pattern_snapshot_direction(pat);
+
+    for (int bi = 0; bi < *bind_count; bi++) {
+        binding_t *input = &(*bindings)[bi];
+        cbm_node_t *source = binding_get(input, *var_name);
+        if (!source) {
+            continue;
+        }
+        bool overlay = input->use_active_overlay_edges && input->project &&
+                       source->qualified_name && source->qualified_name[0];
+        cbm_store_trail_graph_t **graph_slot = overlay ? &overlay_graph : &canonical_graph;
+        bool **used_slot = overlay ? &overlay_used : &canonical_used;
+        if (!*graph_slot) {
+            int load_rc = overlay
+                              ? cbm_store_trail_graph_load_overlay_view(
+                                    store, input->project, snapshot_direction, pattern_edge_types,
+                                    pattern_edge_type_count, graph_slot)
+                              : cbm_store_trail_graph_load(store, input->project,
+                                                           snapshot_direction, pattern_edge_types,
+                                                           pattern_edge_type_count, graph_slot);
+            if (load_rc != CBM_STORE_OK) {
+                g_cypher_store_failed = true;
+                snprintf(g_cypher_store_error, sizeof(g_cypher_store_error), "%s",
+                         cbm_store_error(store) ? cbm_store_error(store)
+                                                : "whole-pattern graph setup failed");
+                break;
+            }
+            int edge_count = cbm_store_trail_graph_edge_count(*graph_slot);
+            *used_slot = calloc((size_t)(edge_count > 0 ? edge_count : SKIP_ONE), sizeof(bool));
+            if (!*used_slot) {
+                g_cypher_allocation_failed = true;
+                break;
+            }
+        }
+
+        cypher_whole_match_ctx_t ctx = {.store = store,
+                                        .pattern = pat,
+                                        .graph = *graph_slot,
+                                        .used_edges = *used_slot,
+                                        .pattern_where = pattern_where,
+                                        .outputs = &outputs,
+                                        .output_count = &output_count,
+                                        .output_capacity = &output_capacity,
+                                        .max_outputs = max_new};
+        (void)cypher_match_pattern_segment(&ctx, 0, input, source);
+        if (is_optional && ctx.complete_matches == 0 && !g_cypher_allocation_failed &&
+            !g_cypher_store_failed && g_cypher_working_row_limit_hit == 0 && !g_cypher_timed_out) {
+            binding_t null_extended = {0};
+            binding_copy(&null_extended, input);
+            (void)binding_array_append(&outputs, &output_count, &output_capacity, max_new,
+                                       &null_extended);
+        }
+        if (g_cypher_allocation_failed || g_cypher_store_failed ||
+            g_cypher_working_row_limit_hit > 0 || g_cypher_timed_out) {
+            break;
+        }
+    }
+
+    free(canonical_used);
+    free(overlay_used);
+    free(pattern_edge_types);
+    cbm_store_trail_graph_free(canonical_graph);
+    cbm_store_trail_graph_free(overlay_graph);
+    for (int bi = 0; bi < *bind_count; bi++) {
+        binding_free(&(*bindings)[bi]);
+    }
+    free(*bindings);
+    *bindings = outputs;
+    *bind_count = output_count;
+    cbm_node_pattern_t *last_node = &pat->nodes[pat->rel_count];
+    *var_name = last_node->variable ? last_node->variable : "_n_t";
+}
+
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
                                 int *bind_count, const char **var_name, bool is_optional,
                                 const cbm_where_clause_t *pattern_where, int max_new) {
+    bool use_whole_pattern_provider = pat->rel_count > SKIP_ONE;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    use_whole_pattern_provider =
+        use_whole_pattern_provider || g_cypher_force_whole_pattern_provider;
+#endif
+    if (use_whole_pattern_provider) {
+        expand_pattern_rels_whole(store, pat, bindings, bind_count, var_name, is_optional,
+                                  pattern_where, max_new);
+        return;
+    }
     for (int ri = 0; ri < pat->rel_count; ri++) {
         /* #601: stop expanding further hops once the wall-clock budget is spent
          * (an unbounded expansion is exactly what blows up here). */
@@ -4177,6 +4487,10 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         const char *to_var = target_node->variable ? target_node->variable : "_n_t";
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
+        bool is_empty_range =
+            rel->max_hops != CBM_CYPHER_HOPS_UNBOUNDED && rel->min_hops > rel->max_hops;
+        cbm_store_trail_graph_t *canonical_trails = NULL;
+        cbm_store_trail_graph_t *overlay_trails = NULL;
 
         int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
         if (new_capacity > max_new) {
@@ -4203,9 +4517,33 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
             const cbm_where_clause_t *candidate_where =
                 (ri == pat->rel_count - SKIP_ONE) ? pattern_where : NULL;
 
-            if (is_variable_length) {
-                expand_var_length(store, rel, target_node, b, src, to_var, &new_bindings,
-                                  &new_count, &new_capacity, max_new, &match_count,
+            if (is_empty_range) {
+                /* Reversed intervals are valid and have an empty match domain.
+                 * OPTIONAL handling below still null-extends the input row. */
+            } else if (is_variable_length) {
+                bool use_overlay = b->use_active_overlay_edges && b->project &&
+                                   src->qualified_name && src->qualified_name[0];
+                cbm_store_trail_graph_t **trail_slot =
+                    use_overlay ? &overlay_trails : &canonical_trails;
+                if (!*trail_slot) {
+                    const char *direction = rel->direction ? rel->direction : "outbound";
+                    int load_rc =
+                        use_overlay
+                            ? cbm_store_trail_graph_load_overlay_view(store, b->project, direction,
+                                                                      (const char **)rel->types,
+                                                                      rel->type_count, trail_slot)
+                            : cbm_store_trail_graph_load(store, b->project, direction, rel->types,
+                                                         rel->type_count, trail_slot);
+                    if (load_rc != CBM_STORE_OK) {
+                        g_cypher_store_failed = true;
+                        snprintf(g_cypher_store_error, sizeof(g_cypher_store_error), "%s",
+                                 cbm_store_error(store) ? cbm_store_error(store)
+                                                        : "graph traversal setup failed");
+                        break;
+                    }
+                }
+                expand_var_length(store, *trail_slot, rel, target_node, b, src, to_var,
+                                  &new_bindings, &new_count, &new_capacity, max_new, &match_count,
                                   candidate_where);
             } else {
                 expand_fixed_length(store, rel, target_node, b, src, to_var, &new_bindings,
@@ -4221,6 +4559,8 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                 (void)binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb);
             }
         }
+        cbm_store_trail_graph_free(canonical_trails);
+        cbm_store_trail_graph_free(overlay_trails);
 
         for (int bi = 0; bi < *bind_count; bi++) {
             binding_free(&(*bindings)[bi]);
@@ -6355,13 +6695,11 @@ static bool cypher_return_requires_canonical_identity(const cbm_return_clause_t 
 }
 
 static bool cypher_pattern_supports_active_relationships(const cbm_pattern_t *pat) {
-    if (!pat || pat->rel_count == 0) {
-        return true;
-    }
-    if (pat->rel_count != SKIP_ONE) {
-        return false;
-    }
-    return true;
+    /* Both the indexed one-segment path and the whole-pattern matcher consume
+     * the same active-overlay graph definition. Pattern length is therefore no
+     * longer a capability restriction; identity-bearing projections are still
+     * screened separately by cypher_return_requires_canonical_identity(). */
+    return pat != NULL;
 }
 
 static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
@@ -6392,9 +6730,12 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     if (used_active_nodes) {
         *used_active_nodes = false;
     }
-    g_cypher_depth_clamped = 0;
     g_cypher_working_row_limit_hit = 0;
     g_cypher_allocation_failed = false;
+    g_cypher_trail_work_rows = 0;
+    g_cypher_trail_work_limit = 0;
+    g_cypher_store_failed = false;
+    g_cypher_store_error[0] = '\0';
     cypher_deadline_arm();
     int max_rows = limits ? limits->max_output_rows : 0;
     int max_working_rows = limits ? limits->max_working_rows : 0;
@@ -6403,7 +6744,7 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         out->error =
             heap_strdup("query row limits are outside the supported range; use max_rows "
                         "0.." CBM_STRINGIFY(CBM_MAX_QUERY_ROWS) " and query_max_working_rows "
-                                                                "1.." CBM_STRINGIFY(
+                                                                "0 (default) or 1.." CBM_STRINGIFY(
                                                                     CBM_MAX_QUERY_WORKING_ROWS));
         return CBM_NOT_FOUND;
     }
@@ -6416,6 +6757,7 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     if (max_working_rows < max_rows) {
         max_working_rows = max_rows;
     }
+    g_cypher_trail_work_limit = max_working_rows;
 
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -6488,10 +6830,10 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     if (g_cypher_timed_out) {
         rb_free(&rb);
         cbm_query_free(q);
-        out->error =
-            heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
-                        "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
-                        "add LIMIT");
+        out->error = heap_strdup(
+            "query exceeded the execution time limit — narrow starting nodes with labels, "
+            "properties, or WHERE predicates; specify relationship types and directions; or "
+            "use the finite hop bound required by the task (LIMIT cannot reduce match work)");
         return CBM_NOT_FOUND;
     }
 
@@ -6500,6 +6842,16 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         cbm_query_free(q);
         out->error =
             heap_strdup("query could not allocate memory while building bindings or results");
+        return CBM_NOT_FOUND;
+    }
+
+    if (g_cypher_store_failed) {
+        char error[CBM_SZ_512];
+        snprintf(error, sizeof(error), "query graph traversal failed: %s",
+                 g_cypher_store_error[0] ? g_cypher_store_error : "store error");
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error = heap_strdup(error);
         return CBM_NOT_FOUND;
     }
 
@@ -6524,15 +6876,6 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     out->rows = rb.rows;
     out->row_count = rb.row_count;
     out->truncated = rb.truncated;
-    if (g_cypher_depth_clamped > 0) {
-        char wbuf[CBM_SZ_256];
-        snprintf(wbuf, sizeof(wbuf),
-                 "variable-length hop range clamped to the engine ceiling (%d) — an empty "
-                 "result may mean \"clamped\", not \"no such path\"",
-                 g_cypher_depth_clamped);
-        out->warning = heap_strdup(wbuf);
-    }
-
     cbm_query_free(q);
     return 0;
 }

@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <float.h>
 #include <sqlite3.h>
 
 /* ── Test helpers ──────────────────────────────────────────── */
@@ -613,6 +614,102 @@ TEST(pagerank_recompute_replaces) {
     ASSERT_EQ(count_table_rows(s, "pagerank"), 1);
     double r2 = get_pr(s, a);
     ASSERT_TRUE(fabs(r1 - r2) < 0.001);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_unconverged_iteration_budget_does_not_publish) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "unconverged", "/tmp/unconverged"), CBM_STORE_OK);
+    int64_t a = add_node(s, "unconverged", "a");
+    int64_t b = add_node(s, "unconverged", "b");
+    int64_t c = add_node(s, "unconverged", "c");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(c, 0);
+    ASSERT_GT(add_edge(s, "unconverged", a, b, "CALLS"), 0);
+    ASSERT_GT(add_edge(s, "unconverged", b, c, "CALLS"), 0);
+
+    /* A one-iteration numerical budget is not a semantic answer. With an
+     * effectively exact positive tolerance this graph cannot converge in one
+     * step, so no rank view may be published as complete. */
+    ASSERT_EQ(cbm_pagerank_compute(s, "unconverged", CBM_PAGERANK_DAMPING, DBL_MIN, 1,
+                                   &CBM_DEFAULT_EDGE_WEIGHTS, CBM_RANK_SCOPE_FULL),
+              CBM_STORE_ERR);
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 0);
+    ASSERT_EQ(count_table_rows(s, "linkrank"), 0);
+    ASSERT_EQ(count_table_rows(s, "node_degree"), 0);
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "unconverged"));
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_publication_failure_rolls_back_all_rank_views) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "atomic", "/tmp/atomic"), CBM_STORE_OK);
+    int64_t a = add_node(s, "atomic", "a");
+    int64_t b = add_node(s, "atomic", "b");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(add_edge(s, "atomic", a, b, "CALLS"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "atomic"), 2);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "atomic"));
+
+    int pagerank_rows = count_table_rows(s, "pagerank");
+    int linkrank_rows = count_table_rows(s, "linkrank");
+    int degree_rows = count_table_rows(s, "node_degree");
+    double old_rank = get_pr(s, b);
+    ASSERT_TRUE(old_rank > 0.0);
+
+    ASSERT_EQ(cbm_store_exec(s,
+                             "CREATE TRIGGER fail_linkrank_publish "
+                             "BEFORE INSERT ON linkrank BEGIN "
+                             "SELECT RAISE(FAIL, 'injected linkrank publication failure'); END;"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "atomic"), CBM_STORE_ERR);
+
+    /* The three rank tables and their complete metadata are one published
+     * generation. A failure in the second table must retain the entire prior
+     * generation rather than mixing new PageRank/degree with empty LinkRank. */
+    ASSERT_EQ(count_table_rows(s, "pagerank"), pagerank_rows);
+    ASSERT_EQ(count_table_rows(s, "linkrank"), linkrank_rows);
+    ASSERT_EQ(count_table_rows(s, "node_degree"), degree_rows);
+    ASSERT_FLOAT_EQ(get_pr(s, b), old_rank, CBM_PAGERANK_EPSILON);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "atomic"));
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_publication_respects_outer_transaction_rollback) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outer_txn", "/tmp/outer_txn"), CBM_STORE_OK);
+    int64_t a = add_node(s, "outer_txn", "a");
+    int64_t b = add_node(s, "outer_txn", "b");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(add_edge(s, "outer_txn", a, b, "CALLS"), 0);
+
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "outer_txn"), 2);
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+    ASSERT_EQ(count_table_rows(s, "linkrank"), 1);
+    ASSERT_EQ(count_table_rows(s, "node_degree"), 2);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "outer_txn"));
+    ASSERT_EQ(cbm_store_rollback(s), CBM_STORE_OK);
+
+    /* The publication savepoint must not commit its caller's transaction.
+     * Rolling back that outer transaction removes all three O(N + E) rank
+     * views and their completeness metadata as one logical generation. */
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 0);
+    ASSERT_EQ(count_table_rows(s, "linkrank"), 0);
+    ASSERT_EQ(count_table_rows(s, "node_degree"), 0);
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "outer_txn"));
+
     cbm_store_close(s);
     PASS();
 }
@@ -1420,6 +1517,9 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_refresh_default_defers_incremental_when_rank_views_stale);
     RUN_TEST(pagerank_refresh_invalid_policy_falls_back_to_at_publish);
     RUN_TEST(pagerank_recompute_replaces);
+    RUN_TEST(pagerank_unconverged_iteration_budget_does_not_publish);
+    RUN_TEST(pagerank_publication_failure_rolls_back_all_rank_views);
+    RUN_TEST(pagerank_publication_respects_outer_transaction_rollback);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);
     RUN_TEST(pagerank_project_scope_excludes_deps);

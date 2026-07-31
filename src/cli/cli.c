@@ -12961,7 +12961,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "true preserves existing ranking behavior. false skips all three coupled rank views and removes "
      "their stored rows so queries cannot consume stale scores; structural degree remains available. "
      "Disable for a lower-cost baseline: codebase-memory-mcp config set rank_enabled false"},
-    {"pagerank_max_iter", "20", NULL, "PageRank",
+    {"pagerank_max_iter", CBM_PAGERANK_MAX_ITER_STR, NULL, "PageRank",
      "Max iterations for PageRank algorithm before stopping (more = more accurate convergence)",
      "1-10000",
      "PageRank is an iterative algorithm — each iteration refines importance scores. "
