@@ -95,6 +95,12 @@ void cbm_thread_condition_destroy(cbm_thread_condition_t *condition);
  * predicate publication and wakeup form one indivisible state transition. */
 void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition);
 
+/* Atomically release mutex and wait until broadcast, then reacquire it.
+ * Callers must loop on their predicate because condition variables may wake
+ * spuriously. Unlike wait_until(), this has no polling or timeout wakeups. */
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait(cbm_thread_condition_t *condition,
+                                                             cbm_mutex_t *mutex);
+
 /* Atomically release mutex and wait until broadcast or an absolute monotonic
  * deadline from cbm_now_ms(). Reacquires mutex before returning. Callers must
  * loop on their predicate because condition variables may wake spuriously. */

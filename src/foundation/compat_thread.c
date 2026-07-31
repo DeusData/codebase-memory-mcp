@@ -211,6 +211,13 @@ void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition) {
     WakeAllConditionVariable(&condition->condition);
 }
 
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait(cbm_thread_condition_t *condition,
+                                                             cbm_mutex_t *mutex) {
+    return SleepConditionVariableCS(&condition->condition, &mutex->cs, INFINITE)
+               ? CBM_THREAD_CONDITION_WAIT_SIGNALED
+               : CBM_THREAD_CONDITION_WAIT_ERROR;
+}
+
 cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
     cbm_thread_condition_t *condition, cbm_mutex_t *mutex, uint64_t deadline_ms) {
     uint64_t now_ms = cbm_now_ms();
@@ -250,6 +257,13 @@ void cbm_thread_condition_destroy(cbm_thread_condition_t *condition) {
 
 void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition) {
     (void)pthread_cond_broadcast(&condition->condition);
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait(cbm_thread_condition_t *condition,
+                                                             cbm_mutex_t *mutex) {
+    return pthread_cond_wait(&condition->condition, &mutex->mtx) == 0
+               ? CBM_THREAD_CONDITION_WAIT_SIGNALED
+               : CBM_THREAD_CONDITION_WAIT_ERROR;
 }
 
 cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
