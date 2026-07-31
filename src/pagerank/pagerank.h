@@ -21,7 +21,12 @@ struct cbm_config;
 
 #define CBM_PAGERANK_DAMPING 0.85 /* Standard Google PageRank damping */
 #define CBM_PAGERANK_EPSILON 1e-6 /* L2 convergence threshold */
-#define CBM_PAGERANK_MAX_ITER 20  /* Max power iterations */
+/* NetworkX's established PageRank default. Unlike the historical 20-step
+ * value, this converges the repository's 100-node linear regression fixture at
+ * the default epsilon; exhaustion now fails instead of publishing partial
+ * ranks. Keep the registry string sourced from the same named constant. */
+#define CBM_PAGERANK_MAX_ITER 100
+#define CBM_PAGERANK_MAX_ITER_STR "100"
 
 /* Config keys for runtime tuning */
 #define CBM_CONFIG_PAGERANK_MAX_ITER "pagerank_max_iter"

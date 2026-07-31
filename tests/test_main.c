@@ -443,6 +443,9 @@ static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
     if (argc != 6 || strcmp(argv[1], "__cbm_runtime_hello_client") != 0) {
         return -1;
     }
+#ifndef _WIN32
+    (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
+#endif
     cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_ipc_endpoint_new(argv[3], argv[2]);
     cbm_daemon_build_identity_t identity = {
         .semantic_version = argv[4],
@@ -472,6 +475,9 @@ static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
     if (argc != 7 || strcmp(argv[1], "__cbm_runtime_activation_client") != 0) {
         return -1;
     }
+#ifndef _WIN32
+    (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
+#endif
     char *action_end = NULL;
     unsigned long action_value = strtoul(argv[6], &action_end, 10);
     bool action_valid = action_end != argv[6] && *action_end == '\0' &&

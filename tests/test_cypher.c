@@ -276,8 +276,63 @@ TEST(cypher_parse_variable_length_unbounded) {
     ASSERT_NOT_NULL(q);
 
     ASSERT_EQ(cbm_query_pattern(q).rels[0].min_hops, 1);
-    ASSERT_EQ(cbm_query_pattern(q).rels[0].max_hops, 0); /* 0 = unbounded */
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].max_hops, CBM_CYPHER_HOPS_UNBOUNDED);
 
+    cbm_query_free(q);
+    PASS();
+}
+
+TEST(cypher_parse_rejects_unsupported_variable_length_relationship_variable) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    ASSERT_NEQ(cbm_cypher_parse("MATCH (a)-[r:CALLS*]->(b) RETURN b.name", &q, &err), 0);
+    ASSERT_NULL(q);
+    ASSERT_NOT_NULL(err);
+    ASSERT_NOT_NULL(strstr(err, "variable-length relationship variables"));
+    free(err);
+    PASS();
+}
+
+TEST(cypher_parse_variable_length_single_bound_and_zero_range) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (f)-[:CALLS*3]->(g)", &q, &err), 0);
+    /* Cypher variable-length fixed bounds are exact: *N is *N..N. */
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].min_hops, 3);
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].max_hops, 3);
+    cbm_query_free(q);
+
+    q = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (f)-[:CALLS*0..0]->(g)", &q, &err), 0);
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].min_hops, 0);
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].max_hops, 0);
+    cbm_query_free(q);
+    PASS();
+}
+
+TEST(cypher_parse_hop_range_boundaries) {
+    const char *queries[] = {
+        "MATCH (f)-[:CALLS*2147483648]->(g)",
+        "MATCH (f)-[:CALLS*1..2147483648]->(g)",
+    };
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        cbm_query_t *q = NULL;
+        char *err = NULL;
+        ASSERT_NEQ(cbm_cypher_parse(queries[i], &q, &err), 0);
+        ASSERT_NULL(q);
+        ASSERT_NOT_NULL(err);
+        ASSERT_NOT_NULL(strstr(err, "hop range"));
+        free(err);
+    }
+
+    /* The openCypher TCK defines an empty interval as a valid pattern that
+     * produces no matches; it is not a parse error. */
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (f)-[:CALLS*3..2]->(g)", &q, &err), 0);
+    ASSERT_NOT_NULL(q);
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].min_hops, 3);
+    ASSERT_EQ(cbm_query_pattern(q).rels[0].max_hops, 2);
     cbm_query_free(q);
     PASS();
 }
@@ -670,7 +725,7 @@ TEST(cypher_cross_join_alloc_rejects_overflow) {
     /* 46341 * 46341 = 2147488281 > INT_MAX (2147483647): pre-fix the int product
      * wrapped negative -> tiny malloc -> heap OOB. Now rejected. */
     ASSERT_TRUE(cbm_cypher_cross_join_alloc(CROSS_JOIN_INT_OVERFLOW_FACTOR,
-                                           CROSS_JOIN_INT_OVERFLOW_FACTOR, false, &n) != 0);
+                                            CROSS_JOIN_INT_OVERFLOW_FACTOR, false, &n) != 0);
 
     /* A normal join still succeeds: bind_count * extra_count + 1 slots. */
     ASSERT_EQ(cbm_cypher_cross_join_alloc(NORMAL_BINDING_COUNT, NORMAL_EXTRA_COUNT, false, &n), 0);
@@ -708,12 +763,14 @@ TEST(cypher_exec_where_eq) {
  * missing/empty, the literal default is compared instead. */
 /* #797: variable-length / repeated-variable path semantics. Fixture:
  * loopy has a SELF-LOOP as one of its outbound CALLS edges plus a real
- * 2-chain loopy->mid->leaf. Correct openCypher semantics:
+ * 2-chain loopy->mid->leaf. Ordinary MATCH follows relationship-unique
+ * trail semantics:
  *  - a repeated node variable must unify: (a)-[:CALLS]->(a) matches ONLY
  *    the self-loop, not every edge;
  *  - relationship uniqueness within a path: the self-loop cannot be
- *    traversed repeatedly, so no *k..k path exists beyond the real chain;
- *  - the engine hop cap must not fabricate or silently truncate results. */
+ *    traversed repeatedly, but it may be used once before the real chain;
+ *  - an implementation work budget must error rather than fabricate or
+ *    silently truncate results. */
 TEST(cypher_exec_varlength_path_semantics_issue797) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -757,16 +814,35 @@ TEST(cypher_exec_varlength_path_semantics_issue797) {
     ASSERT_EQ(r1.row_count, 1);
     cbm_cypher_result_free(&r1);
 
-    /* Bug 2: *2..2 from loopy — only the REAL 2-chain (leaf); the self-loop
-     * must not be reused to pad paths (relationship uniqueness). */
+    /* Ordinary MATCH follows Cypher's relationship-unique trail semantics.
+     * There are two exact two-hop trails: self-loop then e1 reaches mid, and
+     * e1 then e2 reaches leaf. */
     cbm_cypher_result_t r2 = {0};
     ASSERT_EQ(cbm_cypher_execute(s,
                                  "MATCH (a {name: \"loopy\"})-[:CALLS*2..2]->(b) "
                                  "RETURN DISTINCT b.name",
                                  "test", 0, &r2),
               0);
-    ASSERT_EQ(r2.row_count, 1); /* leaf only */
+    ASSERT_EQ(r2.row_count, 2);
+    bool saw_mid = false;
+    bool saw_leaf = false;
+    for (int i = 0; i < r2.row_count; i++) {
+        saw_mid = saw_mid || strcmp(r2.rows[i][0], "mid") == 0;
+        saw_leaf = saw_leaf || strcmp(r2.rows[i][0], "leaf") == 0;
+    }
+    ASSERT_TRUE(saw_mid);
+    ASSERT_TRUE(saw_leaf);
     cbm_cypher_result_free(&r2);
+
+    /* A single fixed bound is exact, not the historical 1..N shorthand. */
+    cbm_cypher_result_t exact = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a {name: \"loopy\"})-[:CALLS*2]->(b) "
+                                 "RETURN DISTINCT b.name",
+                                 "test", 0, &exact),
+              0);
+    ASSERT_EQ(exact.row_count, 2);
+    cbm_cypher_result_free(&exact);
 
     /* Bug 2 amplifier: no directed path of length 5 exists at all. */
     cbm_cypher_result_t r3 = {0};
@@ -778,15 +854,222 @@ TEST(cypher_exec_varlength_path_semantics_issue797) {
     ASSERT_EQ(r3.row_count, 0);
     cbm_cypher_result_free(&r3);
 
-    /* Bug 3: a hop range beyond the engine ceiling must be an ADVERTISED
-     * clamp, not silently indistinguishable from "no such path". */
+    /* The finite graph proves no shortest endpoint at hop 150; execution
+     * terminates by graph exhaustion without an arbitrary hop cap. */
     cbm_cypher_result_t r4 = {0};
     ASSERT_EQ(
         cbm_cypher_execute(s, "MATCH (a)-[:CALLS*150..150]->(b) RETURN b.name", "test", 0, &r4), 0);
     ASSERT_EQ(r4.row_count, 0);
-    ASSERT_NOT_NULL(r4.warning);
-    ASSERT_NOT_NULL(strstr(r4.warning, "clamped"));
+    ASSERT_NULL(r4.warning);
     cbm_cypher_result_free(&r4);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_untyped_variable_length_matches_all_relationship_types) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t result = {0};
+
+    /* main is a Module with a DEFINES edge to HandleOrder and no CALLS edge.
+     * The second hop then follows HandleOrder's CALLS edges. Omitting the
+     * relationship type must therefore traverse both types, not inherit the
+     * separate store traversal API's default-CALLS policy. */
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a:Module {name: \"main\"})-[*1..2]->(b:Function) "
+                                 "RETURN b.name",
+                                 "test", 0, &result),
+              0);
+    ASSERT_EQ(result.row_count, 3);
+    bool saw_handle = false;
+    bool saw_validate = false;
+    bool saw_log = false;
+    for (int i = 0; i < result.row_count; i++) {
+        saw_handle = saw_handle || strcmp(result.rows[i][0], "HandleOrder") == 0;
+        saw_validate = saw_validate || strcmp(result.rows[i][0], "ValidateOrder") == 0;
+        saw_log = saw_log || strcmp(result.rows[i][0], "LogError") == 0;
+    }
+    ASSERT_TRUE(saw_handle);
+    ASSERT_TRUE(saw_validate);
+    ASSERT_TRUE(saw_log);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_relationship_uniqueness_spans_entire_pattern) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t loopy = {
+        .project = "test", .label = "Function", .name = "loopy", .qualified_name = "test.loopy"};
+    cbm_node_t mid = {
+        .project = "test", .label = "Function", .name = "mid", .qualified_name = "test.mid"};
+    cbm_node_t leaf = {
+        .project = "test", .label = "Function", .name = "leaf", .qualified_name = "test.leaf"};
+    int64_t loopy_id = cbm_store_upsert_node(s, &loopy);
+    int64_t mid_id = cbm_store_upsert_node(s, &mid);
+    int64_t leaf_id = cbm_store_upsert_node(s, &leaf);
+    ASSERT_GT(loopy_id, 0);
+    ASSERT_GT(mid_id, 0);
+    ASSERT_GT(leaf_id, 0);
+    cbm_edge_t loop = {
+        .project = "test", .source_id = loopy_id, .target_id = loopy_id, .type = "CALLS"};
+    cbm_edge_t to_mid = {
+        .project = "test", .source_id = loopy_id, .target_id = mid_id, .type = "CALLS"};
+    cbm_edge_t to_leaf = {
+        .project = "test", .source_id = mid_id, .target_id = leaf_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &loop), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &to_mid), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &to_leaf), 0);
+
+    /* Relationship uniqueness applies to the complete graph pattern, not to
+     * each relationship segment independently. Reusing loop twice is invalid;
+     * loop→to_mid and to_mid→to_leaf are the two valid fixed-hop trails. */
+    cbm_cypher_result_t fixed = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a {name: \"loopy\"})-[:CALLS]->(b)-[:CALLS]->(c) "
+                                 "RETURN c.name",
+                                 "test", 0, &fixed),
+              0);
+    ASSERT_EQ(fixed.row_count, 2);
+    cbm_cypher_result_free(&fixed);
+
+    /* The used-edge set must also cross a variable/fixed segment boundary.
+     * Valid trails are loop→to_mid, to_mid→to_leaf, and
+     * loop→to_mid→to_leaf; the per-segment endpoint product fabricates one
+     * extra loop→loop match. */
+    cbm_cypher_result_t mixed = {0};
+    ASSERT_EQ(cbm_cypher_execute(
+                  s, "MATCH (a {name: \"loopy\"})-[:CALLS*1..2]->(b)-[:CALLS]->(c) RETURN c.name",
+                  "test", 0, &mixed),
+              0);
+    ASSERT_EQ(mixed.row_count, 3);
+    cbm_cypher_result_free(&mixed);
+
+    /* A repeated relationship variable is an equijoin requiring both
+     * occurrences to bind the same logical relationship. The default
+     * DIFFERENT RELATIONSHIPS match mode simultaneously forbids reusing that
+     * relationship, so the intersection is empty. Do not overwrite r with a
+     * distinct second relationship and fabricate a result. */
+    cbm_cypher_result_t repeated_variable = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a {name: \"loopy\"})-[r:CALLS]->(b)-[r:CALLS]->(c) "
+                                 "RETURN c.name",
+                                 "test", 0, &repeated_variable),
+              0);
+    ASSERT_EQ(repeated_variable.row_count, 0);
+    cbm_cypher_result_free(&repeated_variable);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_parallel_relationship_identity) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t source = {
+        .project = "test", .label = "Function", .name = "source", .qualified_name = "test.source"};
+    cbm_node_t target = {
+        .project = "test", .label = "Function", .name = "target", .qualified_name = "test.target"};
+    int64_t source_id = cbm_store_upsert_node(s, &source);
+    int64_t target_id = cbm_store_upsert_node(s, &target);
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    /* The project graph intentionally upserts identical non-IMPORTS tuples.
+     * IMPORTS local_name is part of canonical identity, so these are the
+     * representable parallel relationships the matcher must preserve. */
+    cbm_edge_t first = {.project = "test",
+                        .source_id = source_id,
+                        .target_id = target_id,
+                        .type = "IMPORTS",
+                        .properties_json = "{\"local_name\":\"first\"}"};
+    cbm_edge_t second = {.project = "test",
+                         .source_id = source_id,
+                         .target_id = target_id,
+                         .type = "IMPORTS",
+                         .properties_json = "{\"local_name\":\"second\"}"};
+    int64_t first_id = cbm_store_insert_edge(s, &first);
+    int64_t second_id = cbm_store_insert_edge(s, &second);
+    ASSERT_GT(first_id, 0);
+    ASSERT_GT(second_id, 0);
+    ASSERT_NEQ(first_id, second_id);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (a {name: \"source\"})-[:IMPORTS]->(b) RETURN b.name",
+                                 "test", 0, &result),
+              0);
+    ASSERT_EQ(result.row_count, 2);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_undirected_self_loop_is_one_relationship_match) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t node = {
+        .project = "test", .label = "Function", .name = "loopy", .qualified_name = "test.loopy"};
+    int64_t node_id = cbm_store_upsert_node(s, &node);
+    ASSERT_GT(node_id, 0);
+    cbm_edge_t loop = {
+        .project = "test", .source_id = node_id, .target_id = node_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &loop), 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (a {name: \"loopy\"})-[:CALLS]-(b) RETURN b.name",
+                                 "test", 0, &result),
+              0);
+    ASSERT_EQ(result.row_count, 1);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_reversed_hop_interval_is_empty_not_error) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(
+        cbm_cypher_execute(s, "MATCH (a)-[:CALLS*3..2]->(b) RETURN b.name", "test", 0, &result), 0);
+    ASSERT_EQ(result.row_count, 0);
+    ASSERT_NULL(result.error);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_indexed_and_whole_pattern_providers_are_result_equivalent) {
+    cbm_store_t *s = setup_cypher_store();
+    const char *queries[] = {
+        "MATCH (a {name: \"HandleOrder\"})-[:CALLS]->(b) RETURN b.name ORDER BY b.name",
+        "MATCH (b {name: \"ValidateOrder\"})<-[:CALLS]-(a) RETURN a.name ORDER BY a.name",
+        "MATCH (a {name: \"HandleOrder\"})-[:CALLS]-(b) RETURN b.name ORDER BY b.name",
+    };
+    for (size_t qi = 0; qi < sizeof(queries) / sizeof(queries[0]); qi++) {
+        cbm_cypher_result_t indexed = {0};
+        cbm_cypher_result_t whole = {0};
+        cbm_cypher_test_force_whole_pattern_provider(false);
+        int indexed_rc = cbm_cypher_execute(s, queries[qi], "test", 0, &indexed);
+        cbm_cypher_test_force_whole_pattern_provider(true);
+        int whole_rc = cbm_cypher_execute(s, queries[qi], "test", 0, &whole);
+        cbm_cypher_test_force_whole_pattern_provider(false);
+        ASSERT_EQ(indexed_rc, 0);
+        ASSERT_EQ(whole_rc, 0);
+        ASSERT_EQ(indexed.row_count, whole.row_count);
+        ASSERT_EQ(indexed.col_count, whole.col_count);
+        for (int row = 0; row < indexed.row_count; row++) {
+            ASSERT_STR_EQ(indexed.rows[row][0], whole.rows[row][0]);
+        }
+        cbm_cypher_result_free(&indexed);
+        cbm_cypher_result_free(&whole);
+    }
 
     cbm_store_close(s);
     PASS();
@@ -949,8 +1232,7 @@ enum {
 
 static cbm_store_t *setup_wide_binding_store(void) {
     cbm_store_t *s = cbm_store_open_memory();
-    if (!s ||
-        cbm_store_upsert_project(s, "wide-bindings", "/tmp/wide-bindings") != CBM_STORE_OK) {
+    if (!s || cbm_store_upsert_project(s, "wide-bindings", "/tmp/wide-bindings") != CBM_STORE_OK) {
         cbm_store_close(s);
         return NULL;
     }
@@ -998,8 +1280,8 @@ static bool build_wide_binding_match(char *query, size_t query_capacity, size_t 
     }
     size_t used = (size_t)written;
     for (int i = 0; i + 1 < WIDE_BINDING_NODE_COUNT; i++) {
-        written = snprintf(query + used, query_capacity - used,
-                           "-[r%02d:CALLS]->(n%02d:Function)", i, i + 1);
+        written = snprintf(query + used, query_capacity - used, "-[r%02d:CALLS]->(n%02d:Function)",
+                           i, i + 1);
         if (written <= 0 || (size_t)written >= query_capacity - used) {
             return false;
         }
@@ -1017,8 +1299,8 @@ TEST(cypher_exec_binds_every_node_and_edge_variable_beyond_inline_capacity) {
     size_t used = 0;
     ASSERT_TRUE(build_wide_binding_match(query, sizeof(query), &used));
     int written = snprintf(query + used, sizeof(query) - used,
-                       " WHERE n00.name = 'node00' RETURN n%02d.name, type(r%02d)",
-                       WIDE_BINDING_NODE_COUNT - 1, WIDE_BINDING_NINTH_EDGE_INDEX);
+                           " WHERE n00.name = 'node00' RETURN n%02d.name, type(r%02d)",
+                           WIDE_BINDING_NODE_COUNT - 1, WIDE_BINDING_NINTH_EDGE_INDEX);
     ASSERT_GT(written, 0);
     ASSERT_LT((size_t)written, sizeof(query) - used);
 
@@ -1064,8 +1346,7 @@ TEST(cypher_exec_with_projects_every_variable_beyond_inline_capacity) {
     char query[WIDE_BINDING_QUERY_CAP];
     size_t used = 0;
     ASSERT_TRUE(build_wide_binding_match(query, sizeof(query), &used));
-    int written = snprintf(query + used, sizeof(query) - used,
-                           " WHERE n00.name = 'node00' WITH ");
+    int written = snprintf(query + used, sizeof(query) - used, " WHERE n00.name = 'node00' WITH ");
     ASSERT_GT(written, 0);
     ASSERT_LT((size_t)written, sizeof(query) - used);
     used += (size_t)written;
@@ -1121,14 +1402,13 @@ TEST(cypher_active_overlay_id_query_uses_canonical_identity) {
                                     .generation = 1,
                                     .nodes = &fresh_fn,
                                     .node_count = 1};
-    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation),
-              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation), CBM_STORE_OK);
 
     cbm_cypher_result_t active = {0};
     bool used_active = false;
     int rc = cbm_cypher_execute_active_nodes(
-        s, "MATCH (f:Function) WHERE f.name = \"FreshIdSource\" RETURN f.name", "test", 0,
-        &active, &used_active);
+        s, "MATCH (f:Function) WHERE f.name = \"FreshIdSource\" RETURN f.name", "test", 0, &active,
+        &used_active);
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(used_active);
     ASSERT_EQ(active.row_count, 1);
@@ -1137,9 +1417,8 @@ TEST(cypher_active_overlay_id_query_uses_canonical_identity) {
 
     cbm_cypher_result_t id_result = {0};
     used_active = true;
-    rc = cbm_cypher_execute_active_nodes(
-        s, "MATCH (f:Function) RETURN id(f), f.name LIMIT 10", "test", 0, &id_result,
-        &used_active);
+    rc = cbm_cypher_execute_active_nodes(s, "MATCH (f:Function) RETURN id(f), f.name LIMIT 10",
+                                         "test", 0, &id_result, &used_active);
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(!used_active);
     ASSERT_EQ(id_result.row_count, 4);
@@ -1147,6 +1426,91 @@ TEST(cypher_active_overlay_id_query_uses_canonical_identity) {
         ASSERT_STR_NEQ(id_result.rows[i][1], "FreshIdSource");
     }
     cbm_cypher_result_free(&id_result);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_active_overlay_whole_pattern_preserves_edge_identity) {
+    cbm_store_t *s = setup_cypher_store();
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t nodes[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "OverlayA",
+         .qualified_name = "test.OverlayA",
+         .file_path = "overlay.go"},
+        {.project = "test",
+         .label = "Function",
+         .name = "OverlayB",
+         .qualified_name = "test.OverlayB",
+         .file_path = "overlay.go"},
+        {.project = "test",
+         .label = "Function",
+         .name = "OverlayC",
+         .qualified_name = "test.OverlayC",
+         .file_path = "overlay.go"},
+        {.project = "test",
+         .label = "Function",
+         .name = "OverlayLoop",
+         .qualified_name = "test.OverlayLoop",
+         .file_path = "overlay.go"},
+    };
+    cbm_store_delta_edge_t edges[] = {
+        {.source_qn = "test.OverlayA",
+         .target_qn = "test.OverlayB",
+         .type = "CALLS",
+         .properties_json = "{}"},
+        {.source_qn = "test.OverlayB",
+         .target_qn = "test.OverlayC",
+         .type = "CALLS",
+         .properties_json = "{}"},
+        {.source_qn = "test.OverlayLoop",
+         .target_qn = "test.OverlayLoop",
+         .type = "CALLS",
+         .properties_json = "{}"},
+    };
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "overlay.go",
+                                    .generation = 1,
+                                    .nodes = nodes,
+                                    .node_count = 4,
+                                    .edges = edges,
+                                    .edge_count = 3};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation), CBM_STORE_OK);
+
+    cbm_cypher_result_t chain = {0};
+    bool used_active = false;
+    ASSERT_EQ(cbm_cypher_execute_active_nodes(
+                  s, "MATCH (a {name: \"OverlayA\"})-[:CALLS]->(b)-[:CALLS]->(c) RETURN c.name",
+                  "test", 0, &chain, &used_active),
+              CBM_STORE_OK);
+    ASSERT_TRUE(used_active);
+    ASSERT_EQ(chain.row_count, 1);
+    ASSERT_STR_EQ(chain.rows[0][0], "OverlayC");
+    cbm_cypher_result_free(&chain);
+
+    cbm_cypher_result_t reused = {0};
+    used_active = false;
+    ASSERT_EQ(cbm_cypher_execute_active_nodes(
+                  s, "MATCH (a {name: \"OverlayLoop\"})-[:CALLS]->(b)-[:CALLS]->(c) RETURN c.name",
+                  "test", 0, &reused, &used_active),
+              CBM_STORE_OK);
+    ASSERT_TRUE(used_active);
+    ASSERT_EQ(reused.row_count, 0);
+    cbm_cypher_result_free(&reused);
+
+    cbm_cypher_result_t repeated_variable = {0};
+    used_active = false;
+    ASSERT_EQ(cbm_cypher_execute_active_nodes(
+                  s, "MATCH (a {name: \"OverlayA\"})-[r:CALLS]->(b)-[r:CALLS]->(c) RETURN c.name",
+                  "test", 0, &repeated_variable, &used_active),
+              CBM_STORE_OK);
+    ASSERT_TRUE(used_active);
+    ASSERT_EQ(repeated_variable.row_count, 0);
+    cbm_cypher_result_free(&repeated_variable);
 
     cbm_store_close(s);
     PASS();
@@ -1529,17 +1893,12 @@ TEST(cypher_exec_variable_length_any_direction) {
     PASS();
 }
 
-/* Reproduce-first (#887): an EXPLICIT variable-length upper bound must still be
- * capped at the engine ceiling (cbm_cypher_max_depth(), default 10). On
- * origin/main, expand_var_length honoured an explicit `*1..N` verbatim (only the
- * unbounded `*` / `*..m` forms were capped), so `[:CALLS*1..N]` passed N straight
- * to cbm_store_bfs — an unbounded traversal (a DoS on cyclic graphs). RED before
- * the clamp: a *1..12 walk over a 13-node chain
- * returns all 12 hops (N01..N12). GREEN after: it stops at the depth-10 ceiling
- * (N01..N10); N11/N12 are never emitted. max_rows=64 keeps the binding-expansion
- * cap (bind_cap*10) well above the hop count, so DEPTH — not the binding cap — is
- * the bound under test. */
-TEST(cypher_exec_var_length_explicit_bound_capped) {
+/* An explicit variable-length upper bound is query semantics, not an output
+ * budget. The traversal must honor all 12 requested hops without a warning-only
+ * clamp. The store BFS uses a visited frontier, so cyclic graphs terminate at
+ * graph exhaustion in O(V + E) traversal work and O(V) visited memory rather
+ * than materializing O(V * requested_depth) (node, hop) pairs. */
+TEST(cypher_exec_var_length_bounds_preserve_reachability) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
@@ -1570,8 +1929,7 @@ TEST(cypher_exec_var_length_explicit_bound_capped) {
                                 "test", 64, &r);
     ASSERT_EQ(rc, 0);
 
-    /* Capped at 10 hops → exactly N01..N10; N11/N12 are beyond the ceiling. */
-    ASSERT_EQ(r.row_count, 10);
+    ASSERT_EQ(r.row_count, 12);
     bool saw_n10 = false;
     bool saw_n11 = false;
     bool saw_n12 = false;
@@ -1587,11 +1945,85 @@ TEST(cypher_exec_var_length_explicit_bound_capped) {
             saw_n12 = true;
         }
     }
-    ASSERT_TRUE(saw_n10);  /* within the ceiling — proves the traversal really ran */
-    ASSERT_FALSE(saw_n11); /* clamped away */
-    ASSERT_FALSE(saw_n12);
+    ASSERT_TRUE(saw_n10);
+    ASSERT_TRUE(saw_n11);
+    ASSERT_TRUE(saw_n12);
+    ASSERT_NULL(r.warning);
 
     cbm_cypher_result_free(&r);
+
+    /* An omitted upper bound means traverse to graph exhaustion, not silently
+     * stop at an implementation depth. The same finite chain therefore has the
+     * same complete reachable set. */
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a:Function {name: \"N00\"})-[:CALLS*1..]->"
+                                 "(x:Function) RETURN x.name",
+                                 "test", 64, &r),
+              0);
+    ASSERT_EQ(r.row_count, 12);
+    ASSERT_NULL(r.warning);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_var_length_zero_hops_returns_start_only) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a:Function {name: \"SubmitOrder\"})"
+                                 "-[:CALLS*0..0]->(b:Function) RETURN b.name",
+                                 "test", 0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "SubmitOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_var_length_preserves_all_requested_edge_types) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "types", "/tmp/types"), CBM_STORE_OK);
+    cbm_node_t root = {
+        .project = "types", .label = "Function", .name = "Root", .qualified_name = "types.Root"};
+    cbm_node_t target = {.project = "types",
+                         .label = "Function",
+                         .name = "Target",
+                         .qualified_name = "types.Target"};
+    cbm_node_t middle = {.project = "types",
+                         .label = "Function",
+                         .name = "Middle",
+                         .qualified_name = "types.Middle"};
+    int64_t root_id = cbm_store_upsert_node(s, &root);
+    int64_t middle_id = cbm_store_upsert_node(s, &middle);
+    int64_t target_id = cbm_store_upsert_node(s, &target);
+    ASSERT_GT(root_id, 0);
+    ASSERT_GT(middle_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_edge_t first = {
+        .project = "types", .source_id = root_id, .target_id = middle_id, .type = "TARGET"};
+    cbm_edge_t second = {
+        .project = "types", .source_id = middle_id, .target_id = target_id, .type = "TARGET"};
+    ASSERT_GT(cbm_store_insert_edge(s, &first), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &second), 0);
+
+    const char *typed_query =
+        "MATCH (a:Function {name: \"Root\"})"
+        "-[:T00|T01|T02|T03|T04|T05|T06|T07|T08|T09|T10|T11|T12|T13|T14|T15|TARGET*1..2]->"
+        "(b:Function) RETURN b.name";
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, typed_query, "types", 0, &r), 0);
+    ASSERT_EQ(r.row_count, 2);
+    bool saw_target = false;
+    for (int i = 0; i < r.row_count; i++) {
+        saw_target = saw_target || strcmp(r.rows[i][0], "Target") == 0;
+    }
+    ASSERT_TRUE(saw_target);
+    cbm_cypher_result_free(&r);
+
     cbm_store_close(s);
     PASS();
 }
@@ -2413,8 +2845,7 @@ TEST(cypher_apply_limit) {
 
     /* WITH has a separate skip/limit path and must preserve the same semantics. */
     memset(&r, 0, sizeof(r));
-    rc = cbm_cypher_execute(s, "MATCH (f:Function) WITH f LIMIT 0 RETURN f.name", "lim", 0,
-                            &r);
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WITH f LIMIT 0 RETURN f.name", "lim", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 0);
     cbm_cypher_result_free(&r);
@@ -2664,9 +3095,8 @@ TEST(cypher_exec_null_predicates_and_coalesce_preserve_empty_strings) {
     ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
 
     cbm_cypher_result_t empty_is_null = {0};
-    ASSERT_EQ(cbm_cypher_execute(
-                  s, "MATCH (f:Function) WHERE f.empty IS NULL RETURN f.name", "test", 0,
-                  &empty_is_null),
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.empty IS NULL RETURN f.name",
+                                 "test", 0, &empty_is_null),
               0);
     ASSERT_EQ(empty_is_null.row_count, 0);
     cbm_cypher_result_free(&empty_is_null);
@@ -3299,12 +3729,11 @@ TEST(cypher_exec_optional_match_no_result) {
 TEST(cypher_exec_optional_match_null_aggregates) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(
-        s,
-        "MATCH (f:Function) WHERE f.name = 'LogError' "
-        "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
-        "RETURN count(g), count(DISTINCT g), count(*), collect(g)",
-        "test", 0, &r);
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = 'LogError' "
+                                "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+                                "RETURN count(g), count(DISTINCT g), count(*), collect(g)",
+                                "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
     /* Cypher count(expression), count(DISTINCT expression), and collect()
@@ -3359,13 +3788,12 @@ TEST(cypher_exec_aggregates_distinguish_null_from_empty_string) {
     cbm_cypher_result_free(&r);
 
     memset(&r, 0, sizeof(r));
-    rc = cbm_cypher_execute(
-        s,
-        "MATCH (f:Function) WHERE f.name = 'LogError' "
-        "WITH f.empty_value AS empty, f.null_value AS explicit_null, "
-        "f.absent_value AS missing "
-        "RETURN count(empty), count(explicit_null), count(missing)",
-        "test", 0, &r);
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE f.name = 'LogError' "
+                            "WITH f.empty_value AS empty, f.null_value AS explicit_null, "
+                            "f.absent_value AS missing "
+                            "RETURN count(empty), count(explicit_null), count(missing)",
+                            "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
     ASSERT_STR_EQ(r.rows[0][0], "1");
@@ -3425,12 +3853,11 @@ TEST(cypher_exec_grouping_uses_node_identity_not_display_name) {
     ASSERT_GT(cbm_store_upsert_node(s, &second), 0);
 
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(
-        s,
-        "MATCH (f:Function) WHERE f.name = 'SharedName' "
-        "WITH f, count(*) AS rows "
-        "RETURN id(f), f.qualified_name, rows ORDER BY f.qualified_name",
-        "test", 0, &r);
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = 'SharedName' "
+                                "WITH f, count(*) AS rows "
+                                "RETURN id(f), f.qualified_name, rows ORDER BY f.qualified_name",
+                                "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2);
     ASSERT_STR_EQ(r.rows[0][1], "test.alpha.SharedName");
@@ -3562,10 +3989,8 @@ TEST(cypher_exec_relationship_cross_join_grows_past_fanout_heuristic) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "fanout", "/tmp/fanout");
 
-    cbm_node_t root = {.project = "fanout",
-                       .label = "Module",
-                       .name = "root",
-                       .qualified_name = "fanout.root"};
+    cbm_node_t root = {
+        .project = "fanout", .label = "Module", .name = "root", .qualified_name = "fanout.root"};
     ASSERT_GT(cbm_store_upsert_node(s, &root), 0);
 
     int64_t ids[12] = {0};
@@ -3844,10 +4269,9 @@ TEST(cypher_exec_union_deduplicates_complete_branches_before_output_cap) {
         ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
     }
 
-    const char *query =
-        "MATCH (f:Function) RETURN f.name "
-        "UNION "
-        "MATCH (m:Module) WHERE m.name = \"Missing\" RETURN m.name";
+    const char *query = "MATCH (f:Function) RETURN f.name "
+                        "UNION "
+                        "MATCH (m:Module) WHERE m.name = \"Missing\" RETURN m.name";
     cbm_cypher_limits_t limits = {.max_output_rows = 2, .max_working_rows = 3};
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute_with_limits(s, query, "union-cap", &limits, &r);
@@ -4462,6 +4886,8 @@ TEST(cypher_exec_deadline_aborts_runaway_query_issue601) {
     ASSERT_TRUE(rc != 0); /* CBM_NOT_FOUND (-1) — query aborted, not success */
     ASSERT_NOT_NULL(r.error);
     ASSERT_TRUE(strstr(r.error, "time limit") != NULL);
+    ASSERT_TRUE(strstr(r.error, "relationship types and directions") != NULL);
+    ASSERT_TRUE(strstr(r.error, "LIMIT cannot reduce match work") != NULL);
     ASSERT_EQ(r.row_count, 0);
 
     cbm_cypher_result_free(&r);
@@ -4553,6 +4979,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_relationship_any);
     RUN_TEST(cypher_parse_variable_length);
     RUN_TEST(cypher_parse_variable_length_unbounded);
+    RUN_TEST(cypher_parse_rejects_unsupported_variable_length_relationship_variable);
+    RUN_TEST(cypher_parse_variable_length_single_bound_and_zero_range);
+    RUN_TEST(cypher_parse_hop_range_boundaries);
     RUN_TEST(cypher_parse_multiple_edge_types);
     RUN_TEST(cypher_parse_where_clause);
     RUN_TEST(cypher_parse_where_regex);
@@ -4583,6 +5012,12 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
+    RUN_TEST(cypher_exec_untyped_variable_length_matches_all_relationship_types);
+    RUN_TEST(cypher_exec_relationship_uniqueness_spans_entire_pattern);
+    RUN_TEST(cypher_exec_preserves_parallel_relationship_identity);
+    RUN_TEST(cypher_exec_undirected_self_loop_is_one_relationship_match);
+    RUN_TEST(cypher_exec_reversed_hop_interval_is_empty_not_error);
+    RUN_TEST(cypher_exec_indexed_and_whole_pattern_providers_are_result_equivalent);
     RUN_TEST(cypher_exec_where_coalesce_issue874);
     RUN_TEST(cypher_exec_where_regex);
     RUN_TEST(cypher_exec_where_contains);
@@ -4595,6 +5030,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_with_projects_every_variable_beyond_inline_capacity);
     RUN_TEST(cypher_func_id);
     RUN_TEST(cypher_active_overlay_id_query_uses_canonical_identity);
+    RUN_TEST(cypher_active_overlay_whole_pattern_preserves_edge_identity);
     RUN_TEST(cypher_func_keys);
     RUN_TEST(cypher_func_properties);
     RUN_TEST(cypher_func_tointeger_tofloat);
@@ -4616,7 +5052,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);
     RUN_TEST(cypher_exec_variable_length_any_direction);
-    RUN_TEST(cypher_exec_var_length_explicit_bound_capped);
+    RUN_TEST(cypher_exec_var_length_bounds_preserve_reachability);
+    RUN_TEST(cypher_exec_var_length_zero_hops_returns_start_only);
+    RUN_TEST(cypher_exec_var_length_preserves_all_requested_edge_types);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);

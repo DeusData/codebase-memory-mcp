@@ -330,9 +330,6 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     double *lr_in = NULL;
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
-    bool pagerank_written = false;
-    bool linkrank_written = false;
-    bool node_degree_written = false;
 
     char **node_labels = NULL;   /* label per node, parallel to node_ids */
     char **node_projects = NULL; /* owning project per node, parallel to node_ids */
@@ -464,21 +461,30 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     new_rank = malloc((size_t)N * sizeof(double));
     if (!out_weight || !rank || !new_rank) goto cleanup;
 
-    /* DF-1: Allocate degree accumulators (OOM-safe: if any fails, skip degree) */
+    /* The three rank views are one published generation, so their O(N)
+     * computation buffers are one allocation unit. Partial allocation must
+     * fail before touching the prior published tables; checking only total_in
+     * while dereferencing total_out was an asymmetric-allocation crash. */
     total_in = calloc((size_t)N, sizeof(int));
     total_out = calloc((size_t)N, sizeof(int));
     calls_in = calloc((size_t)N, sizeof(int));
     calls_out = calloc((size_t)N, sizeof(int));
     w_in = calloc((size_t)N, sizeof(double));
+    lr_in = calloc((size_t)N, sizeof(double));
+    if (!total_in || !total_out || !calls_in || !calls_out || !w_in || !lr_in)
+        goto cleanup;
 
     for (int e = 0; e < E; e++) {
         int s = edges[e].src_idx;
         int d = edges[e].dst_idx;
         out_weight[s] += edges[e].weight;
-        /* Degree accumulators — guarded against OOM */
-        if (total_in) { total_out[s]++; total_in[d]++; }
-        if (w_in) { w_in[d] += edges[e].weight; }
-        if (edges[e].is_calls && calls_in) { calls_out[s]++; calls_in[d]++; }
+        total_out[s]++;
+        total_in[d]++;
+        w_in[d] += edges[e].weight;
+        if (edges[e].is_calls) {
+            calls_out[s]++;
+            calls_in[d]++;
+        }
     }
 
     /* ── Step 4: Power iteration ──────────────────────────── */
@@ -487,6 +493,7 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     double base = (1.0 - damping) / N;
     int iter;
+    bool converged = false;
     for (iter = 0; iter < max_iter; iter++) {
         for (int i = 0; i < N; i++) new_rank[i] = base;
 
@@ -520,146 +527,133 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
         /* Swap buffers */
         double *tmp = rank; rank = new_rank; new_rank = tmp;
 
-        if (delta < epsilon) { iter++; break; }
+        if (delta < epsilon) {
+            iter++;
+            converged = true;
+            break;
+        }
     }
+    /* max_iter is a numerical work budget, not permission to publish an
+     * unconverged approximation as a fresh derived view. Failure preserves the
+     * prior generation and lets callers raise the budget or relax epsilon.
+     * Runtime remains O(max_iter * (N + E)). */
+    if (!converged)
+        goto cleanup;
 
     /* Member-rank propagation is handled naturally by MEMBER_OF edges
      * (Method→Class) inserted during the pipeline. No post-hoc aggregation
      * needed — the power iteration above already propagated rank via
      * MEMBER_OF edges at the configured member_rank_factor weight. */
 
-    /* ── Step 5: Store PageRank in db ─────────────────────── */
-    char ts[CBM_ISO_TIMESTAMP_LEN];
-    iso_now(ts, sizeof(ts));
-
-    /* Rank tables do not include a scope column. Clear project and dependency
-     * ranks before writing any scope so narrower recomputes cannot leave stale
-     * rows from a previous full-scope compute. */
-    snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM pagerank WHERE %s",
-             scope_where(CBM_RANK_SCOPE_FULL));
-    if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        stmt = NULL;
-    }
-
-    /* Batch insert within transaction */
-    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-    /* Node projects were loaded with node_ids, preserving dependency attribution
-     * without doing an indexed SELECT per stored row. */
-    const char *ins_sql =
-        "INSERT OR REPLACE INTO pagerank "
-        "(node_id, project, rank, computed_at) "
-        "VALUES (?1, ?2, ?3, ?4)";
-    sqlite3_stmt *ins_stmt = NULL;
-    if (sqlite3_prepare_v2(db, ins_sql, -1, &ins_stmt, NULL) == SQLITE_OK) {
-        pagerank_written = true;
-        for (int i = 0; i < N; i++) {
-            sqlite3_bind_int64(ins_stmt, 1, node_ids[i]);
-            sqlite3_bind_text(ins_stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
-            sqlite3_bind_double(ins_stmt, 3, rank[i]);
-            sqlite3_bind_text(ins_stmt, 4, ts, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ins_stmt) != SQLITE_DONE) {
-                pagerank_written = false;
-            }
-            sqlite3_reset(ins_stmt);
-        }
-        sqlite3_finalize(ins_stmt);
-    }
-    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-
-    /* ── Step 6: Compute LinkRank for edges ───────────────── */
-    snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM linkrank WHERE %s",
-             scope_where(CBM_RANK_SCOPE_FULL));
-    if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        stmt = NULL;
-    }
-
-    if (total_in) {
-        lr_in = calloc((size_t)N, sizeof(double));
-    }
-
-    const char *lr_sql =
-        "INSERT OR REPLACE INTO linkrank "
-        "(edge_id, project, rank, computed_at) "
-        "VALUES (?1, ?2, ?3, ?4)";
-    sqlite3_stmt *lr_stmt = NULL;
-    bool have_lr_stmt = sqlite3_prepare_v2(db, lr_sql, -1, &lr_stmt, NULL) == SQLITE_OK;
-    if (have_lr_stmt) {
-        linkrank_written = true;
-        sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-    }
+    /* Compute LinkRank and incoming sums before publication so allocation or
+     * arithmetic setup cannot fail after the transaction begins. */
     for (int e = 0; e < E; e++) {
         int s_idx = edges[e].src_idx;
         double lr = 0.0;
         if (out_weight[s_idx] > 0.0) {
             lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
         }
-        if (lr_in) {
-            lr_in[edges[e].dst_idx] += lr;
-        }
-        if (have_lr_stmt) {
-            sqlite3_bind_int64(lr_stmt, 1, edges[e].edge_id);
-            sqlite3_bind_text(lr_stmt, 2, edges[e].project, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_double(lr_stmt, 3, lr);
-            sqlite3_bind_text(lr_stmt, 4, ts, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(lr_stmt) != SQLITE_DONE) {
-                linkrank_written = false;
-            }
-            sqlite3_reset(lr_stmt);
-        }
-    }
-    if (have_lr_stmt) {
-        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-        sqlite3_finalize(lr_stmt);
-        lr_stmt = NULL;
+        lr_in[edges[e].dst_idx] += lr;
     }
 
-    /* ── Step 7: Compute and store node_degree ──────────── */
-    if (total_in) {
-        /* Clear old degree data */
-        snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM node_degree WHERE %s",
-                 scope_where(CBM_RANK_SCOPE_FULL));
-        if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-            stmt = NULL;
+    /* ── Step 5: Atomically publish all rank views ────────── */
+    char ts[CBM_ISO_TIMESTAMP_LEN];
+    iso_now(ts, sizeof(ts));
+
+    /* Rank tables do not include a scope column. Clear project and dependency
+     * ranks before writing any scope so narrower recomputes cannot leave stale
+     * rows from a previous full-scope compute. A savepoint composes with an
+     * outer store transaction while making PageRank, LinkRank, node degree,
+     * and completeness metadata one generation. Publication performs O(N + E)
+     * writes and retains O(1) additional memory. */
+    if (cbm_store_exec(store, "SAVEPOINT cbm_rank_publish") != CBM_STORE_OK)
+        goto cleanup;
+    static const char *rank_tables[] = {"pagerank", "linkrank", "node_degree"};
+    for (size_t ti = 0; ti < sizeof(rank_tables) / sizeof(rank_tables[0]); ti++) {
+        int written = snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM %s WHERE %s", rank_tables[ti],
+                               scope_where(CBM_RANK_SCOPE_FULL));
+        if (written < 0 || (size_t)written >= sizeof(sql_buf) ||
+            sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) != SQLITE_OK) {
+            goto publish_rollback;
         }
-        /* Batch insert — O(N) within single transaction */
-        sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-        const char *deg_sql =
-            "INSERT OR REPLACE INTO node_degree "
-            "(node_id, project, total_in, total_out, calls_in, calls_out, "
-            " weighted_in, weighted_out, linkrank_in, computed_at) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
-        sqlite3_stmt *deg_stmt = NULL;
-        if (sqlite3_prepare_v2(db, deg_sql, -1, &deg_stmt, NULL) == SQLITE_OK) {
-            node_degree_written = true;
-            for (int i = 0; i < N; i++) {
-                sqlite3_bind_int64(deg_stmt, 1, node_ids[i]);
-                sqlite3_bind_text(deg_stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(deg_stmt, 3, total_in[i]);
-                sqlite3_bind_int(deg_stmt, 4, total_out[i]);
-                sqlite3_bind_int(deg_stmt, 5, calls_in ? calls_in[i] : 0);
-                sqlite3_bind_int(deg_stmt, 6, calls_out ? calls_out[i] : 0);
-                sqlite3_bind_double(deg_stmt, 7, w_in ? w_in[i] : 0.0);
-                sqlite3_bind_double(deg_stmt, 8, out_weight[i]);
-                sqlite3_bind_double(deg_stmt, 9, lr_in ? lr_in[i] : 0.0);
-                sqlite3_bind_text(deg_stmt, 10, ts, -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(deg_stmt) != SQLITE_DONE) {
-                    node_degree_written = false;
-                }
-                sqlite3_reset(deg_stmt);
-            }
-            sqlite3_finalize(deg_stmt);
-        }
-        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_finalize(stmt);
+        stmt = NULL;
     }
+
+    /* Node projects were loaded with node_ids, preserving dependency attribution
+     * without doing an indexed SELECT per stored row. */
+    const char *ins_sql = "INSERT OR REPLACE INTO pagerank "
+                          "(node_id, project, rank, computed_at) "
+                          "VALUES (?1, ?2, ?3, ?4)";
+    if (sqlite3_prepare_v2(db, ins_sql, -1, &stmt, NULL) != SQLITE_OK)
+        goto publish_rollback;
+    for (int i = 0; i < N; i++) {
+        sqlite3_bind_int64(stmt, 1, node_ids[i]);
+        sqlite3_bind_text(stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 3, rank[i]);
+        sqlite3_bind_text(stmt, 4, ts, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    const char *lr_sql = "INSERT OR REPLACE INTO linkrank "
+                         "(edge_id, project, rank, computed_at) "
+                         "VALUES (?1, ?2, ?3, ?4)";
+    if (sqlite3_prepare_v2(db, lr_sql, -1, &stmt, NULL) != SQLITE_OK)
+        goto publish_rollback;
+    for (int e = 0; e < E; e++) {
+        int s_idx = edges[e].src_idx;
+        double lr = 0.0;
+        if (out_weight[s_idx] > 0.0) {
+            lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
+        }
+        sqlite3_bind_int64(stmt, 1, edges[e].edge_id);
+        sqlite3_bind_text(stmt, 2, edges[e].project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 3, lr);
+        sqlite3_bind_text(stmt, 4, ts, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    const char *deg_sql = "INSERT OR REPLACE INTO node_degree "
+                          "(node_id, project, total_in, total_out, calls_in, calls_out, "
+                          " weighted_in, weighted_out, linkrank_in, computed_at) "
+                          "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+    if (sqlite3_prepare_v2(db, deg_sql, -1, &stmt, NULL) != SQLITE_OK)
+        goto publish_rollback;
+    for (int i = 0; i < N; i++) {
+        sqlite3_bind_int64(stmt, 1, node_ids[i]);
+        sqlite3_bind_text(stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, total_in[i]);
+        sqlite3_bind_int(stmt, 4, total_out[i]);
+        sqlite3_bind_int(stmt, 5, calls_in[i]);
+        sqlite3_bind_int(stmt, 6, calls_out[i]);
+        sqlite3_bind_double(stmt, 7, w_in[i]);
+        sqlite3_bind_double(stmt, 8, out_weight[i]);
+        sqlite3_bind_double(stmt, 9, lr_in[i]);
+        sqlite3_bind_text(stmt, 10, ts, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (cbm_store_mark_rank_derived_views_complete_in_transaction(
+            store, project, CBM_STORE_DERIVED_GENERATION_UNKNOWN) != CBM_STORE_OK) {
+        goto publish_rollback;
+    }
+    if (cbm_store_exec(store, "RELEASE cbm_rank_publish") != CBM_STORE_OK)
+        goto publish_rollback;
 
     /* ── Logging ──────────────────────────────────────────── */
     char iter_s[CBM_LOG_INT_BUF], n_s[CBM_LOG_INT_BUF], e_s[CBM_LOG_INT_BUF];
@@ -669,23 +663,14 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     cbm_log_info("pagerank.done", "project", project,
                  "nodes", n_s, "edges", e_s, "iterations", iter_s);
 
-    if (pagerank_written) {
-        (void)cbm_store_set_derived_view_state(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK,
-                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
-                                               CBM_STORE_DERIVED_STATUS_COMPLETE);
-    }
-    if (linkrank_written) {
-        (void)cbm_store_set_derived_view_state(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK,
-                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
-                                               CBM_STORE_DERIVED_STATUS_COMPLETE);
-    }
-    if (node_degree_written) {
-        (void)cbm_store_set_derived_view_state(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
-                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
-                                               CBM_STORE_DERIVED_STATUS_COMPLETE);
-    }
-
     result = N;
+    goto cleanup;
+
+publish_rollback:
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    (void)cbm_store_exec(store, "ROLLBACK TO cbm_rank_publish");
+    (void)cbm_store_exec(store, "RELEASE cbm_rank_publish");
 
 cleanup:
     if (stmt) sqlite3_finalize(stmt);  /* defensive: finalize any in-flight stmt */

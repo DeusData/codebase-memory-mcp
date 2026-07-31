@@ -952,6 +952,12 @@ int cbm_store_mark_derived_views_complete(cbm_store_t *s, const char *project, i
                                           const char *const *view_names, int view_count);
 int cbm_store_mark_rank_derived_views_stale(cbm_store_t *s, const char *project,
                                             int64_t generation);
+/* Mark the fixed PageRank/LinkRank/node-degree view set complete inside the
+ * caller's existing transaction or savepoint. This function never commits or
+ * rolls back; it lets rank-table rows and freshness metadata publish as one
+ * atomic generation. */
+int cbm_store_mark_rank_derived_views_complete_in_transaction(cbm_store_t *s, const char *project,
+                                                              int64_t generation);
 
 int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project, const char *view_name,
                                      cbm_derived_view_state_t *out);
@@ -1091,6 +1097,58 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
 int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *start_qn,
                                const char *direction, const char **edge_types, int edge_type_count,
                                int max_depth, int max_results, cbm_traverse_result_t *out);
+
+typedef struct cbm_store_trail_graph cbm_store_trail_graph_t;
+typedef bool (*cbm_store_trail_cancel_fn)(void *ctx);
+typedef int (*cbm_store_trail_visit_fn)(const cbm_node_t *node, const cbm_edge_t *last_edge,
+                                        void *ctx);
+
+/* Load one relationship-type-filtered adjacency snapshot and reuse it for
+ * every source binding in a Cypher pattern stage. This avoids both N+1 edge
+ * queries and reloading O(E) edges per binding. Overlay loading uses the same
+ * active-edge CTE as the other query surfaces. */
+int cbm_store_trail_graph_load(cbm_store_t *s, const char *project, const char *direction,
+                               const char **edge_types, int edge_type_count,
+                               cbm_store_trail_graph_t **out);
+int cbm_store_trail_graph_load_overlay_view(cbm_store_t *s, const char *project,
+                                            const char *direction, const char **edge_types,
+                                            int edge_type_count, cbm_store_trail_graph_t **out);
+int cbm_store_trail_graph_edge_count(const cbm_store_trail_graph_t *graph);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Physical adjacency slots retained by the snapshot. A directed snapshot has
+ * E slots; an undirected snapshot has 2E. Exposed for complexity assertions. */
+size_t cbm_store_trail_graph_arc_count(const cbm_store_trail_graph_t *graph);
+#endif
+void cbm_store_trail_graph_free(cbm_store_trail_graph_t *graph);
+
+/* Visit every relationship-unique endpoint while each selected edge remains
+ * marked in used_edges for the duration of the callback. A callback may invoke
+ * this function recursively for the next pattern segment using the same bitmap.
+ * Runtime is O(examined adjacency entries * type_count + materialization);
+ * active memory is O(edge_count + active path depth + nested segment count),
+ * excluding caller-owned output bindings. */
+int cbm_store_trail_graph_visit(cbm_store_trail_graph_t *graph, int64_t start_id,
+                                const char *start_qn, const char *direction,
+                                const char **edge_types, int edge_type_count, int min_depth,
+                                int max_depth, bool *used_edges, int max_work_rows, int *work_rows,
+                                cbm_store_trail_cancel_fn cancel, void *cancel_ctx,
+                                cbm_store_trail_visit_fn visitor, void *visitor_ctx,
+                                bool *work_limit_hit, bool *cancelled);
+
+/* Enumerate exact relationship-unique trails. Unlike shortest-path BFS, one
+ * endpoint may occur more than once when distinct trails reach it. max_depth
+ * < 0 terminates at edge exhaustion while zero means exactly zero hops.
+ * max_work_rows bounds examined trail
+ * extensions, and *work_limit_hit reports exhaustion so callers fail rather
+ * than return partial answers. The iterative DFS uses O(E + depth + result)
+ * memory instead of materializing O(work_rows * depth) path histories. Its
+ * runtime is O(E log E + examined adjacency entries + result materialization)
+ * for the loaded snapshot. Release out with cbm_store_traverse_free(). */
+int cbm_store_trail_graph_traverse(cbm_store_trail_graph_t *graph, int64_t start_id,
+                                   const char *start_qn, int min_depth, int max_depth,
+                                   int max_work_rows, cbm_store_trail_cancel_fn cancel,
+                                   void *cancel_ctx, cbm_traverse_result_t *out, int *work_rows,
+                                   bool *work_limit_hit, bool *cancelled);
 
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the

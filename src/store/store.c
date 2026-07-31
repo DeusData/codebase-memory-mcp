@@ -59,7 +59,10 @@ enum {
     ST_LIKE_POOL_MAX = 12,    /* max malloc'd LIKE strings alive during one search */
     ST_LIKE_HINT_MAX = 2,     /* max LIKE hints extracted per regex pattern */
     ST_SEARCH_CONNECTED_NAMES_LIMIT = 10,
-    ST_BFS_EDGE_TYPE_LIMIT = 16,
+    ST_TRAIL_DEPTH_UNBOUNDED = -1,
+    /* Clock/cancellation probes are intentionally amortized across trail
+     * extensions; checking every edge dominates small in-memory traversals. */
+    ST_TRAIL_CANCEL_CHECK_INTERVAL = 1024,
     ST_ARCH_BOUNDARY_RESULT_LIMIT = 10,
     ST_INIT_CAP_4 = 4,
     ST_HEADER_PREFIX = 3,
@@ -120,38 +123,76 @@ static int bind_text(sqlite3_stmt *s, int col, const char *v) {
 
 static const char ST_DEFAULT_EDGE_TYPE[] = "CALLS";
 
-static int store_build_edge_type_placeholders(char *buf, size_t buf_sz, int first_bind,
-                                              int edge_type_count, int *out_bind_count) {
-    if (!buf || buf_sz == 0 || first_bind <= 0 || !out_bind_count) {
+static int store_build_edge_type_filter(char *buf, size_t buf_sz, int bind_index) {
+    if (!buf || buf_sz == 0 || bind_index <= 0) {
         return CBM_STORE_ERR;
     }
-    int bind_count = edge_type_count > 0 ? edge_type_count : 1;
-    if (bind_count > ST_BFS_EDGE_TYPE_LIMIT) {
-        bind_count = ST_BFS_EDGE_TYPE_LIMIT;
+    int written = snprintf(buf, buf_sz, "SELECT value FROM json_each(?%d)", bind_index);
+    if (written < 0 || (size_t)written >= buf_sz) {
+        return CBM_STORE_ERR;
     }
-
-    int len = 0;
-    for (int i = 0; i < bind_count; i++) {
-        int n =
-            snprintf(buf + len, buf_sz - (size_t)len, "%s?%d", i > 0 ? "," : "", first_bind + i);
-        if (n < 0 || (size_t)n >= buf_sz - (size_t)len) {
-            return CBM_STORE_ERR;
-        }
-        len += n;
-    }
-    *out_bind_count = bind_count;
     return CBM_STORE_OK;
 }
 
-static void store_bind_edge_types(sqlite3_stmt *stmt, int first_bind, const char **edge_types,
-                                  int edge_type_count, int bind_count) {
-    if (edge_type_count > 0) {
-        for (int i = 0; i < bind_count; i++) {
-            bind_text(stmt, first_bind + i, edge_types[i]);
-        }
-    } else {
-        bind_text(stmt, first_bind, ST_DEFAULT_EDGE_TYPE);
+/* Encode the complete edge-type set into one JSON bind consumed by
+ * json_each(). SQL text and SQLite variable count stay O(1) while build time
+ * and temporary memory are O(total type-name bytes). NULL means allocation,
+ * size, or input failure; no requested suffix is silently discarded. */
+static char *store_edge_types_json(const char **edge_types, int edge_type_count) {
+    if (edge_type_count < 0 || (edge_type_count > 0 && !edge_types)) {
+        return NULL;
     }
+    int count = edge_type_count > 0 ? edge_type_count : SKIP_ONE;
+    size_t bytes = 3; /* '[', ']', and NUL */
+    for (int i = 0; i < count; i++) {
+        const char *type = edge_type_count > 0 ? edge_types[i] : ST_DEFAULT_EDGE_TYPE;
+        if (!type) {
+            return NULL;
+        }
+        size_t escaped = cbm_json_escaped_len(type);
+        size_t overhead = (i > 0 ? SKIP_ONE : 0) + PAIR_LEN;
+        if (escaped > SIZE_MAX - bytes || overhead > SIZE_MAX - bytes - escaped) {
+            return NULL;
+        }
+        bytes += escaped + overhead;
+    }
+    if (bytes > (size_t)INT_MAX) {
+        return NULL;
+    }
+    char *json = malloc(bytes);
+    if (!json) {
+        return NULL;
+    }
+    size_t used = 0;
+    json[used++] = '[';
+    for (int i = 0; i < count; i++) {
+        const char *type = edge_type_count > 0 ? edge_types[i] : ST_DEFAULT_EDGE_TYPE;
+        if (i > 0) {
+            json[used++] = ',';
+        }
+        json[used++] = '"';
+        int written = cbm_json_escape(json + used, (int)(bytes - used), type);
+        if (written < 0 || (size_t)written != cbm_json_escaped_len(type)) {
+            free(json);
+            return NULL;
+        }
+        used += (size_t)written;
+        json[used++] = '"';
+    }
+    json[used++] = ']';
+    json[used] = '\0';
+    return json;
+}
+
+static int store_bind_edge_type_filter(sqlite3_stmt *stmt, int bind_index, const char **edge_types,
+                                       int edge_type_count) {
+    char *json = store_edge_types_json(edge_types, edge_type_count);
+    if (!json) {
+        return SQLITE_NOMEM;
+    }
+    int rc = bind_text(stmt, bind_index, json);
+    free(json);
+    return rc;
 }
 
 /* ── Internal store structure ───────────────────────────────────── */
@@ -5019,6 +5060,20 @@ int cbm_store_mark_rank_derived_views_stale(cbm_store_t *s, const char *project,
                                               store_rank_derived_view_count());
 }
 
+int cbm_store_mark_rank_derived_views_complete_in_transaction(cbm_store_t *s, const char *project,
+                                                              int64_t generation) {
+    if (!s || !s->db || !project || !project[0] ||
+        generation < CBM_STORE_DERIVED_GENERATION_UNKNOWN) {
+        if (s) {
+            store_set_error(s, "mark_rank_derived_views_complete_in_transaction: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    return store_mark_derived_views_status_body(
+        s, project, generation, store_rank_derived_view_names, store_rank_derived_view_count(),
+        CBM_STORE_DERIVED_STATUS_COMPLETE);
+}
+
 int cbm_store_get_derived_view_state(cbm_store_t *s, const char *project, const char *view_name,
                                      cbm_derived_view_state_t *out) {
     if (!s || !s->db || !project || !project[0] || !view_name || !view_name[0] || !out) {
@@ -9555,11 +9610,10 @@ int cbm_store_find_active_edge_nodes_by_qn(cbm_store_t *s, const char *project,
     }
 
     char type_clause[CBM_SZ_512] = "";
-    int bind_type_count = 0;
     if (edge_type_count > 0) {
         char placeholders[CBM_SZ_256];
-        if (store_build_edge_type_placeholders(placeholders, sizeof(placeholders), ST_COL_5,
-                                               edge_type_count, &bind_type_count) != CBM_STORE_OK) {
+        if (store_build_edge_type_filter(placeholders, sizeof(placeholders), ST_COL_5) !=
+            CBM_STORE_OK) {
             store_set_error(s, "find_active_edge_nodes_by_qn edge type clause too large");
             return CBM_STORE_ERR;
         }
@@ -9613,8 +9667,11 @@ int cbm_store_find_active_edge_nodes_by_qn(cbm_store_t *s, const char *project,
     bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
     bind_text(stmt, ST_COL_3, project);
     bind_text(stmt, ST_COL_4, qualified_name);
-    if (edge_type_count > 0) {
-        store_bind_edge_types(stmt, ST_COL_5, edge_types, edge_type_count, bind_type_count);
+    if (edge_type_count > 0 &&
+        store_bind_edge_type_filter(stmt, ST_COL_5, edge_types, edge_type_count) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "find_active_edge_nodes_by_qn edge type filter bind failed");
+        return CBM_STORE_ERR;
     }
 
     int cap = ST_INIT_CAP_16;
@@ -10667,8 +10724,8 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
      * overlay ownership row per changed file in the same generation. */
     n = snprintf(buf + used, buf_sz - used,
                  ", active_edges AS ("
-                 "  SELECT s.qualified_name AS source_qn, t.qualified_name AS target_qn, e.type,"
-                 "         e.properties"
+                 "  SELECT e.project, s.qualified_name AS source_qn,"
+                 "         t.qualified_name AS target_qn, e.type, e.properties"
                  "  FROM edges e"
                  "  JOIN nodes s ON s.id = e.source_id"
                  "  JOIN nodes t ON t.id = e.target_id"
@@ -10677,7 +10734,7 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                  "    AND NOT EXISTS (SELECT 1 FROM active_file_tombstones af"
                  "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
                  "  UNION"
-                 "  SELECT e.source_qn, e.target_qn, e.type, e.properties"
+                 "  SELECT e.project, e.source_qn, e.target_qn, e.type, e.properties"
                  "  FROM overlay_edges e"
                  "  JOIN active_overlay_files af"
                  "    ON af.project = e.project AND af.rel_path = e.rel_path"
@@ -11607,12 +11664,7 @@ void cbm_store_search_free(cbm_search_output_t *out) {
     memset(out, 0, sizeof(*out));
 }
 
-/* ── BFS Traversal ────────────────────────────────────────────────
- * Note: upstream factored edge collection into bfs_collect_edges() and the
- * types-clause build into bfs_build_types_clause(), but both were unused after
- * the fork inlined the BFS with the bfs_et_count cap. They were removed to
- * satisfy -Werror=unused-function. The active implementation is the inline
- * logic within cbm_store_bfs() below. */
+/* ── BFS Traversal ──────────────────────────────────────────────── */
 
 static int store_bfs_direction_from_string(const char *direction) {
     if (direction && strcmp(direction, "inbound") == 0) {
@@ -11626,15 +11678,1003 @@ static int store_bfs_direction_from_string(const char *direction) {
 
 static _Atomic uint64_t store_bfs_temp_sequence = 1U;
 
+typedef struct {
+    int edge_index;
+    int64_t from_id;
+    int64_t to_id;
+    const char *from_qn;
+    const char *to_qn;
+} store_trail_arc_t;
+
+typedef struct {
+    int64_t id;
+    int64_t source_id;
+    int64_t target_id;
+    char *source_qn;
+    char *target_qn;
+    char *type;
+    char *properties;
+} store_trail_edge_t;
+
+struct cbm_store_trail_graph {
+    cbm_store_t *store; /* borrowed for result materialization */
+    bool overlay;
+    int direction;
+    char *project;
+    store_trail_edge_t *edges;
+    store_trail_arc_t *primary;
+    store_trail_arc_t *secondary; /* non-NULL only for direction="any" */
+    int edge_count;
+    bool pagerank_stale;
+    bool linkrank_stale;
+};
+
+typedef struct {
+    int64_t id;
+    const char *qn; /* borrowed from graph edge storage or caller start_qn */
+    int hop;
+} store_trail_endpoint_t;
+
+typedef struct {
+    int64_t id;
+    const char *qn;
+    int depth;
+    int phase;
+    int cursor;
+    int end;
+    int via_edge;
+} store_trail_frame_t;
+
+static int store_trail_arc_cmp(const void *lhs, const void *rhs) {
+    const store_trail_arc_t *a = lhs;
+    const store_trail_arc_t *b = rhs;
+    if (a->from_qn || b->from_qn) {
+        int cmp = strcmp(a->from_qn ? a->from_qn : "", b->from_qn ? b->from_qn : "");
+        if (cmp != 0) {
+            return cmp;
+        }
+    } else if (a->from_id != b->from_id) {
+        return a->from_id < b->from_id ? CBM_NOT_FOUND : SKIP_ONE;
+    }
+    if (a->edge_index != b->edge_index) {
+        return a->edge_index < b->edge_index ? CBM_NOT_FOUND : SKIP_ONE;
+    }
+    return 0;
+}
+
+static int store_trail_key_compare(const store_trail_arc_t *arc, int64_t id, const char *qn) {
+    if (qn) {
+        return strcmp(arc->from_qn, qn);
+    }
+    if (arc->from_id == id) {
+        return 0;
+    }
+    return arc->from_id < id ? CBM_NOT_FOUND : SKIP_ONE;
+}
+
+static void store_trail_arc_range(const store_trail_arc_t *arcs, int count, int64_t id,
+                                  const char *qn, int *begin, int *end) {
+    /* Sorted adjacency gives O(log E) lower/upper bounds. The previous linear
+     * upper-bound scan visited every incident edge once here and again during
+     * DFS, doubling high-degree neighbor-scan latency. */
+    int lo = 0;
+    int hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        if (store_trail_key_compare(&arcs[mid], id, qn) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    *begin = lo;
+    hi = count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        if (store_trail_key_compare(&arcs[mid], id, qn) <= 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    *end = lo;
+}
+
+static void store_trail_graph_dispose(cbm_store_trail_graph_t *graph) {
+    if (!graph) {
+        return;
+    }
+    for (int i = 0; i < graph->edge_count; i++) {
+        free(graph->edges[i].source_qn);
+        free(graph->edges[i].target_qn);
+        free(graph->edges[i].type);
+        free(graph->edges[i].properties);
+    }
+    free(graph->edges);
+    free(graph->primary);
+    free(graph->secondary);
+    free(graph->project);
+    free(graph);
+}
+
+void cbm_store_trail_graph_free(cbm_store_trail_graph_t *graph) {
+    store_trail_graph_dispose(graph);
+}
+
+static int store_trail_edges_reserve(cbm_store_t *s, store_trail_edge_t **edges, int *capacity,
+                                     int needed) {
+    if (needed <= *capacity) {
+        return CBM_STORE_OK;
+    }
+    int next = *capacity > 0 ? *capacity : ST_INIT_CAP_16;
+    while (next < needed) {
+        if (next > INT_MAX / PAIR_LEN) {
+            store_set_error(s, "trail edge count exceeds addressable storage");
+            return CBM_STORE_ERR;
+        }
+        next *= PAIR_LEN;
+    }
+    if ((size_t)next > SIZE_MAX / sizeof(**edges)) {
+        store_set_error(s, "trail edge allocation size overflow");
+        return CBM_STORE_ERR;
+    }
+    void *grown = realloc(*edges, (size_t)next * sizeof(**edges));
+    if (!grown) {
+        store_set_error(s, "trail edge snapshot out of memory");
+        return CBM_STORE_ERR;
+    }
+    *edges = grown;
+    *capacity = next;
+    return CBM_STORE_OK;
+}
+
+static int store_trail_graph_build_arcs(cbm_store_trail_graph_t *graph, int direction) {
+    if (graph->edge_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    size_t count = (size_t)graph->edge_count;
+    if (count > SIZE_MAX / sizeof(*graph->primary)) {
+        store_set_error(graph->store, "trail adjacency allocation size overflow");
+        return CBM_STORE_ERR;
+    }
+    graph->primary = malloc(count * sizeof(*graph->primary));
+    if (direction == CBM_STORE_EDGE_DIR_ANY) {
+        graph->secondary = malloc(count * sizeof(*graph->secondary));
+    }
+    if (!graph->primary || (direction == CBM_STORE_EDGE_DIR_ANY && !graph->secondary)) {
+        store_set_error(graph->store, "trail adjacency out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    bool primary_inbound = direction == CBM_STORE_EDGE_DIR_INBOUND;
+    for (int i = 0; i < graph->edge_count; i++) {
+        store_trail_edge_t *edge = &graph->edges[i];
+        store_trail_arc_t outbound = {.edge_index = i,
+                                      .from_id = edge->source_id,
+                                      .to_id = edge->target_id,
+                                      .from_qn = edge->source_qn,
+                                      .to_qn = edge->target_qn};
+        store_trail_arc_t inbound = {.edge_index = i,
+                                     .from_id = edge->target_id,
+                                     .to_id = edge->source_id,
+                                     .from_qn = edge->target_qn,
+                                     .to_qn = edge->source_qn};
+        graph->primary[i] = primary_inbound ? inbound : outbound;
+        if (graph->secondary) {
+            graph->secondary[i] = inbound;
+        }
+    }
+    qsort(graph->primary, count, sizeof(*graph->primary), store_trail_arc_cmp);
+    if (graph->secondary) {
+        qsort(graph->secondary, count, sizeof(*graph->secondary), store_trail_arc_cmp);
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_trail_graph_load_impl(cbm_store_t *s, const char *project, const char *direction,
+                                       const char **edge_types, int edge_type_count, bool overlay,
+                                       cbm_store_trail_graph_t **out) {
+    if (out) {
+        *out = NULL;
+    }
+    if (!s || !s->db || !out || !project || !project[0] || edge_type_count < 0 ||
+        (edge_type_count > 0 && !edge_types)) {
+        return CBM_STORE_ERR;
+    }
+    int dir = store_bfs_direction_from_string(direction);
+    cbm_store_trail_graph_t *graph = calloc(CBM_ALLOC_ONE, sizeof(*graph));
+    if (!graph) {
+        store_set_error(s, "trail graph out of memory");
+        return CBM_STORE_ERR;
+    }
+    graph->store = s;
+    graph->overlay = overlay;
+    graph->direction = dir;
+    graph->project = heap_strdup(project);
+    if (!graph->project) {
+        store_set_error(s, "trail graph project out of memory");
+        store_trail_graph_dispose(graph);
+        return CBM_STORE_ERR;
+    }
+
+    bool filter_types = edge_type_count > 0;
+    int type_bind = overlay ? ST_COL_4 : ST_COL_2;
+    const char *type_clause =
+        filter_types ? "AND e.type IN (SELECT value FROM json_each(?4)) " : "";
+    const char *canonical_type_clause =
+        filter_types ? "AND e.type IN (SELECT value FROM json_each(?2)) " : "";
+
+    char sql[ST_SQL_BUF];
+    int sql_len;
+    if (overlay) {
+        char active_cte[ST_SQL_BUF];
+        if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+            CBM_STORE_OK) {
+            store_set_error(s, "trail overlay active CTE SQL truncated");
+            store_trail_graph_dispose(graph);
+            return CBM_STORE_ERR;
+        }
+        sql_len = snprintf(sql, sizeof(sql),
+                           "%sSELECT e.source_qn, e.target_qn, e.type, e.properties "
+                           "FROM active_edges e WHERE e.project = ?3 "
+                           "%s"
+                           "ORDER BY e.source_qn, e.target_qn, e.type, e.properties",
+                           active_cte, type_clause);
+    } else {
+        sql_len =
+            snprintf(sql, sizeof(sql),
+                     "SELECT e.id, e.source_id, e.target_id, e.type, e.properties FROM edges e "
+                     "WHERE e.project = ?1 "
+                     "%s"
+                     "ORDER BY e.id",
+                     canonical_type_clause);
+    }
+    if (sql_len < 0 || (size_t)sql_len >= sizeof(sql)) {
+        store_set_error(s, "trail edge snapshot SQL truncated");
+        store_trail_graph_dispose(graph);
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "trail edge snapshot prepare");
+        store_trail_graph_dispose(graph);
+        return CBM_STORE_ERR;
+    }
+    if (overlay) {
+        bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+        bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+        bind_text(stmt, ST_COL_3, project);
+    } else {
+        bind_text(stmt, ST_COL_1, project);
+    }
+    if (filter_types &&
+        store_bind_edge_type_filter(stmt, type_bind, edge_types, edge_type_count) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "trail edge type filter bind failed");
+        store_trail_graph_dispose(graph);
+        return CBM_STORE_ERR;
+    }
+
+    int capacity = 0;
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (graph->edge_count == INT_MAX) {
+            sqlite3_finalize(stmt);
+            store_set_error(s, "trail edge count exceeds addressable storage");
+            store_trail_graph_dispose(graph);
+            return CBM_STORE_ERR;
+        }
+        if (store_trail_edges_reserve(s, &graph->edges, &capacity, graph->edge_count + SKIP_ONE) !=
+            CBM_STORE_OK) {
+            sqlite3_finalize(stmt);
+            store_trail_graph_dispose(graph);
+            return CBM_STORE_ERR;
+        }
+        store_trail_edge_t *edge = &graph->edges[graph->edge_count];
+        memset(edge, 0, sizeof(*edge));
+        if (overlay) {
+            edge->source_qn =
+                heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ST_COL_1 - 1)));
+            edge->target_qn =
+                heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ST_COL_2 - 1)));
+            edge->type =
+                heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ST_COL_3 - 1)));
+            edge->properties =
+                heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ST_COL_4 - 1)));
+            if (!edge->source_qn || !edge->target_qn || !edge->type || !edge->properties) {
+                sqlite3_finalize(stmt);
+                store_set_error(s, "trail overlay edge snapshot out of memory");
+                graph->edge_count++;
+                store_trail_graph_dispose(graph);
+                return CBM_STORE_ERR;
+            }
+        } else {
+            edge->id = sqlite3_column_int64(stmt, ST_COL_1 - 1);
+            edge->source_id = sqlite3_column_int64(stmt, ST_COL_2 - 1);
+            edge->target_id = sqlite3_column_int64(stmt, ST_COL_3 - 1);
+            edge->type =
+                heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ST_COL_4 - 1)));
+            edge->properties =
+                heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ST_COL_5 - 1)));
+            if (!edge->type || !edge->properties) {
+                sqlite3_finalize(stmt);
+                store_set_error(s, "trail edge snapshot out of memory");
+                graph->edge_count++;
+                store_trail_graph_dispose(graph);
+                return CBM_STORE_ERR;
+            }
+        }
+        graph->edge_count++;
+    }
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "trail edge snapshot step");
+        store_trail_graph_dispose(graph);
+        return CBM_STORE_ERR;
+    }
+    if (store_trail_graph_build_arcs(graph, dir) != CBM_STORE_OK) {
+        store_trail_graph_dispose(graph);
+        return CBM_STORE_ERR;
+    }
+    graph->pagerank_stale =
+        project && cbm_store_derived_view_is_stale(s, project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    graph->linkrank_stale =
+        project && cbm_store_derived_view_is_stale(s, project, CBM_STORE_DERIVED_VIEW_LINKRANK);
+    *out = graph;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_trail_graph_load(cbm_store_t *s, const char *project, const char *direction,
+                               const char **edge_types, int edge_type_count,
+                               cbm_store_trail_graph_t **out) {
+    return store_trail_graph_load_impl(s, project, direction, edge_types, edge_type_count, false,
+                                       out);
+}
+
+int cbm_store_trail_graph_load_overlay_view(cbm_store_t *s, const char *project,
+                                            const char *direction, const char **edge_types,
+                                            int edge_type_count, cbm_store_trail_graph_t **out) {
+    return store_trail_graph_load_impl(s, project, direction, edge_types, edge_type_count, true,
+                                       out);
+}
+
+int cbm_store_trail_graph_edge_count(const cbm_store_trail_graph_t *graph) {
+    return graph ? graph->edge_count : 0;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+size_t cbm_store_trail_graph_arc_count(const cbm_store_trail_graph_t *graph) {
+    if (!graph) {
+        return 0;
+    }
+    size_t count = (size_t)graph->edge_count;
+    if (!graph->secondary) {
+        return count;
+    }
+    return count <= SIZE_MAX - count ? count + count : SIZE_MAX;
+}
+#endif
+
+static bool store_trail_endpoint_reserve(cbm_store_t *s, store_trail_endpoint_t **endpoints,
+                                         int *capacity, int needed) {
+    if (needed <= *capacity) {
+        return true;
+    }
+    int next = *capacity > 0 ? *capacity : ST_INIT_CAP_16;
+    while (next < needed) {
+        if (next > INT_MAX / PAIR_LEN) {
+            store_set_error(s, "trail endpoint count exceeds addressable storage");
+            return false;
+        }
+        next *= PAIR_LEN;
+    }
+    if ((size_t)next > SIZE_MAX / sizeof(**endpoints)) {
+        store_set_error(s, "trail endpoint allocation size overflow");
+        return false;
+    }
+    void *grown = realloc(*endpoints, (size_t)next * sizeof(**endpoints));
+    if (!grown) {
+        store_set_error(s, "trail endpoints out of memory");
+        return false;
+    }
+    *endpoints = grown;
+    *capacity = next;
+    return true;
+}
+
+static bool store_trail_edge_is_loop(const cbm_store_trail_graph_t *graph, int edge_index) {
+    const store_trail_edge_t *edge = &graph->edges[edge_index];
+    return graph->overlay ? strcmp(edge->source_qn, edge->target_qn) == 0
+                          : edge->source_id == edge->target_id;
+}
+
+static const store_trail_arc_t *store_trail_frame_next(cbm_store_trail_graph_t *graph,
+                                                       store_trail_frame_t *frame) {
+    for (;;) {
+        if (frame->phase > SKIP_ONE) {
+            return NULL;
+        }
+        const store_trail_arc_t *arcs = frame->phase == 0 ? graph->primary : graph->secondary;
+        if (!arcs) {
+            return NULL;
+        }
+        if (frame->cursor < 0) {
+            store_trail_arc_range(arcs, graph->edge_count, frame->id, frame->qn, &frame->cursor,
+                                  &frame->end);
+        }
+        while (frame->cursor < frame->end) {
+            const store_trail_arc_t *arc = &arcs[frame->cursor++];
+            /* direction="any" has one outbound and one inbound arc per edge.
+             * A self-loop is the same orientation both ways and must not become
+             * two copies of one Cypher trail. */
+            if (frame->phase == SKIP_ONE && store_trail_edge_is_loop(graph, arc->edge_index)) {
+                continue;
+            }
+            return arc;
+        }
+        frame->phase++;
+        frame->cursor = CBM_NOT_FOUND;
+        frame->end = 0;
+    }
+}
+
+static bool store_trail_type_matches(const store_trail_edge_t *edge, const char **edge_types,
+                                     int edge_type_count) {
+    if (edge_type_count == 0) {
+        return true;
+    }
+    for (int i = 0; i < edge_type_count; i++) {
+        if (strcmp(edge->type, edge_types[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const store_trail_arc_t *store_trail_frame_next_for_segment(cbm_store_trail_graph_t *graph,
+                                                                   store_trail_frame_t *frame,
+                                                                   int direction,
+                                                                   const char **edge_types,
+                                                                   int edge_type_count) {
+    for (;;) {
+        int physical_phase = 0;
+        if (graph->direction == CBM_STORE_EDGE_DIR_ANY) {
+            physical_phase = direction == CBM_STORE_EDGE_DIR_INBOUND ? SKIP_ONE : frame->phase;
+            if (physical_phase > SKIP_ONE ||
+                (direction != CBM_STORE_EDGE_DIR_ANY && frame->phase > 0)) {
+                return NULL;
+            }
+        } else {
+            /* A direction-specialized snapshot stores the requested orientation
+             * in primary. This removes one E-slot adjacency array and qsort for
+             * uniformly directed whole patterns without changing edge ids. */
+            if (direction != graph->direction || frame->phase > 0) {
+                return NULL;
+            }
+        }
+        const store_trail_arc_t *arcs = physical_phase == 0 ? graph->primary : graph->secondary;
+        if (!arcs) {
+            return NULL;
+        }
+        if (frame->cursor < 0) {
+            store_trail_arc_range(arcs, graph->edge_count, frame->id, frame->qn, &frame->cursor,
+                                  &frame->end);
+        }
+        while (frame->cursor < frame->end) {
+            const store_trail_arc_t *arc = &arcs[frame->cursor++];
+            if (direction == CBM_STORE_EDGE_DIR_ANY && physical_phase == SKIP_ONE &&
+                store_trail_edge_is_loop(graph, arc->edge_index)) {
+                continue;
+            }
+            if (store_trail_type_matches(&graph->edges[arc->edge_index], edge_types,
+                                         edge_type_count)) {
+                return arc;
+            }
+        }
+        frame->phase++;
+        frame->cursor = CBM_NOT_FOUND;
+        frame->end = 0;
+    }
+}
+
+static int store_trail_load_node(cbm_store_trail_graph_t *graph, int64_t id, const char *qn,
+                                 cbm_node_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!graph->overlay) {
+        return cbm_store_find_node_by_id(graph->store, id, out);
+    }
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(graph->store, "trail active node CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_SQL_BUF];
+    int written = snprintf(sql, sizeof(sql),
+                           "%sSELECT n.id,n.project,n.label,n.name,n.qualified_name,n.file_path,"
+                           "n.start_line,n.end_line,n.properties FROM active_nodes n "
+                           "WHERE n.project=?3 AND n.qualified_name=?4 LIMIT 1",
+                           active_cte);
+    if (written < 0 || (size_t)written >= sizeof(sql)) {
+        store_set_error(graph->store, "trail active node SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(graph->store->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(graph->store, "trail active node prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, graph->project);
+    bind_text(stmt, ST_COL_4, qn);
+    int step_rc = sqlite3_step(stmt);
+    int rc = step_rc == SQLITE_ROW ? scan_node(graph->store, stmt, out) : CBM_STORE_NOT_FOUND;
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(graph->store, "trail active node step");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static bool store_trail_frames_reserve(cbm_store_t *store, store_trail_frame_t **frames,
+                                       int *capacity, int needed) {
+    if (needed <= *capacity) {
+        return true;
+    }
+    int next = *capacity > 0 ? *capacity : ST_INIT_CAP_16;
+    while (next < needed) {
+        if (next > INT_MAX / PAIR_LEN) {
+            store_set_error(store, "trail frame count exceeds addressable storage");
+            return false;
+        }
+        next *= PAIR_LEN;
+    }
+    if ((size_t)next > SIZE_MAX / sizeof(**frames)) {
+        store_set_error(store, "trail frame allocation size overflow");
+        return false;
+    }
+    void *grown = realloc(*frames, (size_t)next * sizeof(**frames));
+    if (!grown) {
+        store_set_error(store, "trail frames out of memory");
+        return false;
+    }
+    *frames = grown;
+    *capacity = next;
+    return true;
+}
+
+static void store_trail_unwind_segment(const store_trail_frame_t *frames, int stack_size,
+                                       bool *used_edges) {
+    for (int i = SKIP_ONE; i < stack_size; i++) {
+        if (frames[i].via_edge >= 0) {
+            used_edges[frames[i].via_edge] = false;
+        }
+    }
+}
+
+int cbm_store_trail_graph_visit(cbm_store_trail_graph_t *graph, int64_t start_id,
+                                const char *start_qn, const char *direction,
+                                const char **edge_types, int edge_type_count, int min_depth,
+                                int max_depth, bool *used_edges, int max_work_rows, int *work_rows,
+                                cbm_store_trail_cancel_fn cancel, void *cancel_ctx,
+                                cbm_store_trail_visit_fn visitor, void *visitor_ctx,
+                                bool *work_limit_hit, bool *cancelled) {
+    if (!graph || !used_edges || !work_rows || !work_limit_hit || !cancelled || !visitor ||
+        edge_type_count < 0 || (edge_type_count > 0 && !edge_types) || min_depth < 0 ||
+        max_depth < ST_TRAIL_DEPTH_UNBOUNDED || max_work_rows <= 0 ||
+        (graph->overlay ? (!start_qn || !start_qn[0]) : start_id <= 0)) {
+        return CBM_STORE_ERR;
+    }
+    if (max_depth >= 0 && min_depth > max_depth) {
+        return CBM_STORE_OK;
+    }
+    int dir = store_bfs_direction_from_string(direction);
+    int effective_depth =
+        max_depth >= 0 && max_depth < graph->edge_count ? max_depth : graph->edge_count;
+    cbm_node_t start_node = {0};
+    if (min_depth == 0) {
+        int load_rc = store_trail_load_node(graph, start_id, start_qn, &start_node);
+        if (load_rc != CBM_STORE_OK) {
+            return load_rc;
+        }
+        int visit_rc = visitor(&start_node, NULL, visitor_ctx);
+        cbm_node_free_fields(&start_node);
+        if (visit_rc != CBM_STORE_OK || *work_limit_hit || *cancelled) {
+            return visit_rc;
+        }
+    }
+    if (effective_depth <= 0) {
+        return CBM_STORE_OK;
+    }
+
+    store_trail_frame_t *frames = NULL;
+    int frame_capacity = 0;
+    if (!store_trail_frames_reserve(graph->store, &frames, &frame_capacity, SKIP_ONE)) {
+        return CBM_STORE_ERR;
+    }
+    int stack_size = SKIP_ONE;
+    frames[0] = (store_trail_frame_t){.id = start_id,
+                                      .qn = graph->overlay ? start_qn : NULL,
+                                      .depth = 0,
+                                      .phase = 0,
+                                      .cursor = CBM_NOT_FOUND,
+                                      .via_edge = CBM_NOT_FOUND};
+    int rc = CBM_STORE_OK;
+    while (stack_size > 0 && !*work_limit_hit && !*cancelled) {
+        if (cancel && (*work_rows % ST_TRAIL_CANCEL_CHECK_INTERVAL) == 0 && cancel(cancel_ctx)) {
+            *cancelled = true;
+            break;
+        }
+        store_trail_frame_t *frame = &frames[stack_size - SKIP_ONE];
+        const store_trail_arc_t *arc =
+            store_trail_frame_next_for_segment(graph, frame, dir, edge_types, edge_type_count);
+        if (!arc) {
+            if (frame->via_edge >= 0) {
+                used_edges[frame->via_edge] = false;
+            }
+            stack_size--;
+            continue;
+        }
+        if (*work_rows == max_work_rows) {
+            *work_limit_hit = true;
+            break;
+        }
+        (*work_rows)++;
+        if (used_edges[arc->edge_index]) {
+            continue;
+        }
+        used_edges[arc->edge_index] = true;
+        int next_depth = frame->depth + SKIP_ONE;
+        if (next_depth >= min_depth) {
+            cbm_node_t node = {0};
+            int load_rc = store_trail_load_node(graph, arc->to_id, arc->to_qn, &node);
+            if (load_rc != CBM_STORE_OK) {
+                used_edges[arc->edge_index] = false;
+                rc = load_rc;
+                break;
+            }
+            const store_trail_edge_t *stored = &graph->edges[arc->edge_index];
+            /* Active overlay relationships do not yet have canonical SQLite
+             * ids. Give them a stable, nonzero query-local identity derived
+             * from the dense snapshot index so repeated relationship
+             * variables can perform an exact equijoin without conflating
+             * distinct overlay edges. id() queries stay on the canonical view
+             * and therefore never expose this internal negative namespace. */
+            int64_t logical_id =
+                graph->overlay ? -(int64_t)(arc->edge_index + SKIP_ONE) : stored->id;
+            cbm_edge_t edge = {.id = logical_id,
+                               .project = graph->project,
+                               .source_id = stored->source_id,
+                               .target_id = stored->target_id,
+                               .type = stored->type,
+                               .properties_json = stored->properties};
+            int visit_rc = visitor(&node, &edge, visitor_ctx);
+            cbm_node_free_fields(&node);
+            if (visit_rc != CBM_STORE_OK) {
+                used_edges[arc->edge_index] = false;
+                rc = visit_rc;
+                break;
+            }
+        }
+        if (next_depth < effective_depth && !*work_limit_hit && !*cancelled) {
+            if (!store_trail_frames_reserve(graph->store, &frames, &frame_capacity,
+                                            stack_size + SKIP_ONE)) {
+                used_edges[arc->edge_index] = false;
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            frames[stack_size++] = (store_trail_frame_t){.id = arc->to_id,
+                                                         .qn = arc->to_qn,
+                                                         .depth = next_depth,
+                                                         .phase = 0,
+                                                         .cursor = CBM_NOT_FOUND,
+                                                         .via_edge = arc->edge_index};
+        } else {
+            used_edges[arc->edge_index] = false;
+        }
+    }
+    store_trail_unwind_segment(frames, stack_size, used_edges);
+    free(frames);
+    return rc;
+}
+
+static int store_trail_materialize(cbm_store_trail_graph_t *graph,
+                                   const store_trail_endpoint_t *endpoints, int endpoint_count,
+                                   cbm_traverse_result_t *out) {
+    if (endpoint_count <= 0) {
+        out->pagerank_stale = graph->pagerank_stale;
+        out->linkrank_stale = graph->linkrank_stale;
+        return CBM_STORE_OK;
+    }
+    uint64_t sequence =
+        atomic_fetch_add_explicit(&store_bfs_temp_sequence, 1U, memory_order_relaxed);
+    char table[ST_BUF_64];
+    snprintf(table, sizeof(table), "trail_endpoints_%llx", (unsigned long long)sequence);
+    char sql[ST_SQL_BUF];
+    int written = snprintf(sql, sizeof(sql),
+                           "CREATE TEMP TABLE %s("
+                           "seq INTEGER PRIMARY KEY,node_id INTEGER,qn TEXT,hop INTEGER NOT NULL);",
+                           table);
+    if (written < 0 || (size_t)written >= sizeof(sql) ||
+        exec_sql(graph->store, sql) != CBM_STORE_OK) {
+        store_set_error(graph->store, "trail endpoint temp table create failed");
+        return CBM_STORE_ERR;
+    }
+
+    int rc = CBM_STORE_ERR;
+    sqlite3_stmt *insert = NULL;
+    sqlite3_stmt *select = NULL;
+    written = snprintf(sql, sizeof(sql), "INSERT INTO %s(seq,node_id,qn,hop) VALUES (?1,?2,?3,?4);",
+                       table);
+    if (written < 0 || (size_t)written >= sizeof(sql) ||
+        sqlite3_prepare_v2(graph->store->db, sql, CBM_NOT_FOUND, &insert, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(graph->store, "trail endpoint insert prepare");
+        goto cleanup;
+    }
+    for (int i = 0; i < endpoint_count; i++) {
+        sqlite3_reset(insert);
+        sqlite3_clear_bindings(insert);
+        sqlite3_bind_int(insert, ST_COL_1, i);
+        if (graph->overlay) {
+            sqlite3_bind_null(insert, ST_COL_2);
+            bind_text(insert, ST_COL_3, endpoints[i].qn);
+        } else {
+            sqlite3_bind_int64(insert, ST_COL_2, endpoints[i].id);
+            sqlite3_bind_null(insert, ST_COL_3);
+        }
+        sqlite3_bind_int(insert, ST_COL_4, endpoints[i].hop);
+        if (sqlite3_step(insert) != SQLITE_DONE) {
+            store_set_error_sqlite(graph->store, "trail endpoint insert");
+            goto cleanup;
+        }
+    }
+    sqlite3_finalize(insert);
+    insert = NULL;
+
+    bool use_pagerank = !graph->pagerank_stale;
+    const char *pagerank_select =
+        use_pagerank ? "COALESCE(pr.rank,0.0) AS pr_rank " : "0.0 AS pr_rank ";
+    const char *pagerank_join = use_pagerank ? "LEFT JOIN pagerank pr ON pr.node_id=n.id " : "";
+    if (graph->overlay) {
+        char active_cte[ST_SQL_BUF];
+        if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+            CBM_STORE_OK) {
+            store_set_error(graph->store, "trail endpoint active CTE SQL truncated");
+            goto cleanup;
+        }
+        written = snprintf(
+            sql, sizeof(sql),
+            "%sSELECT n.id,n.project,n.label,n.name,n.qualified_name,n.file_path,"
+            "n.start_line,n.end_line,n.properties,t.hop,"
+            "%s"
+            "FROM %s t JOIN active_nodes n ON n.qualified_name=t.qn AND n.project=?3 "
+            "%s"
+            "ORDER BY t.hop,%sn.name,n.qualified_name,t.seq",
+            active_cte, pagerank_select, table, pagerank_join, use_pagerank ? "pr_rank DESC," : "");
+    } else {
+        written =
+            snprintf(sql, sizeof(sql),
+                     "SELECT n.id,n.project,n.label,n.name,n.qualified_name,n.file_path,"
+                     "n.start_line,n.end_line,n.properties,t.hop,"
+                     "%s"
+                     "FROM %s t JOIN nodes n ON n.id=t.node_id "
+                     "%s"
+                     "ORDER BY t.hop,%sn.name,n.id,t.seq",
+                     pagerank_select, table, pagerank_join, use_pagerank ? "pr_rank DESC," : "");
+    }
+    if (written < 0 || (size_t)written >= sizeof(sql) ||
+        sqlite3_prepare_v2(graph->store->db, sql, CBM_NOT_FOUND, &select, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(graph->store, "trail endpoint select prepare");
+        goto cleanup;
+    }
+    if (graph->overlay) {
+        bind_text(select, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+        bind_text(select, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+        bind_text(select, ST_COL_3, graph->project);
+    }
+    if ((size_t)endpoint_count > SIZE_MAX / sizeof(*out->visited)) {
+        store_set_error(graph->store, "trail result allocation size overflow");
+        goto cleanup;
+    }
+    out->visited = calloc((size_t)endpoint_count, sizeof(*out->visited));
+    if (!out->visited) {
+        store_set_error(graph->store, "trail result out of memory");
+        goto cleanup;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(select)) == SQLITE_ROW) {
+        if (out->visited_count >= endpoint_count) {
+            store_set_error(graph->store, "trail result exceeded endpoint count");
+            goto cleanup;
+        }
+        cbm_node_hop_t *hop = &out->visited[out->visited_count];
+        if (scan_node(graph->store, select, &hop->node) != CBM_STORE_OK) {
+            out->visited_count++;
+            goto cleanup;
+        }
+        hop->hop = sqlite3_column_int(select, ST_COL_10 - 1);
+        hop->pagerank_score = sqlite3_column_double(select, ST_COL_11 - 1);
+        out->visited_count++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(graph->store, "trail endpoint select step");
+        goto cleanup;
+    }
+    out->pagerank_stale = graph->pagerank_stale;
+    out->linkrank_stale = graph->linkrank_stale;
+    rc = CBM_STORE_OK;
+
+cleanup:
+    if (insert) {
+        sqlite3_finalize(insert);
+    }
+    if (select) {
+        sqlite3_finalize(select);
+    }
+    if (rc != CBM_STORE_OK) {
+        cbm_store_traverse_free(out);
+    }
+    written = snprintf(sql, sizeof(sql), "DROP TABLE IF EXISTS %s;", table);
+    if (written < 0 || (size_t)written >= sizeof(sql) ||
+        exec_sql(graph->store, sql) != CBM_STORE_OK) {
+        cbm_log_error("store.trail.cleanup.err", "detail", cbm_store_error(graph->store),
+                      "temp_table", table);
+        if (rc == CBM_STORE_OK) {
+            cbm_store_traverse_free(out);
+            rc = CBM_STORE_ERR;
+        }
+    }
+    return rc;
+}
+
+int cbm_store_trail_graph_traverse(cbm_store_trail_graph_t *graph, int64_t start_id,
+                                   const char *start_qn, int min_depth, int max_depth,
+                                   int max_work_rows, cbm_store_trail_cancel_fn cancel,
+                                   void *cancel_ctx, cbm_traverse_result_t *out, int *work_rows,
+                                   bool *work_limit_hit, bool *cancelled) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (work_rows) {
+        *work_rows = 0;
+    }
+    if (work_limit_hit) {
+        *work_limit_hit = false;
+    }
+    if (cancelled) {
+        *cancelled = false;
+    }
+    if (!graph || !out || !work_rows || !work_limit_hit || !cancelled || min_depth < 0 ||
+        max_depth < ST_TRAIL_DEPTH_UNBOUNDED || (max_depth >= 0 && min_depth > max_depth) ||
+        max_work_rows <= 0 || (graph->overlay ? (!start_qn || !start_qn[0]) : start_id <= 0)) {
+        return CBM_STORE_ERR;
+    }
+
+    int effective_depth =
+        max_depth >= 0 && max_depth < graph->edge_count ? max_depth : graph->edge_count;
+    if (effective_depth == INT_MAX) {
+        store_set_error(graph->store, "trail depth exceeds addressable frame storage");
+        return CBM_STORE_ERR;
+    }
+    int frame_count = effective_depth + SKIP_ONE;
+    if ((size_t)frame_count > SIZE_MAX / sizeof(store_trail_frame_t) ||
+        (size_t)graph->edge_count > SIZE_MAX / sizeof(bool)) {
+        store_set_error(graph->store, "trail traversal allocation size overflow");
+        return CBM_STORE_ERR;
+    }
+    store_trail_frame_t *frames = calloc((size_t)frame_count, sizeof(*frames));
+    bool *used_edges = calloc((size_t)graph->edge_count, sizeof(*used_edges));
+    if (!frames || (graph->edge_count > 0 && !used_edges)) {
+        free(frames);
+        free(used_edges);
+        store_set_error(graph->store, "trail traversal out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    store_trail_endpoint_t *endpoints = NULL;
+    int endpoint_count = 0;
+    int endpoint_capacity = 0;
+    int extensions = 0;
+    int stack_size = SKIP_ONE;
+    frames[0] = (store_trail_frame_t){
+        .id = start_id,
+        .qn = graph->overlay ? start_qn : NULL,
+        .depth = 0,
+        .phase = 0,
+        .cursor = CBM_NOT_FOUND,
+        .via_edge = CBM_NOT_FOUND,
+    };
+    if (min_depth == 0) {
+        if (!store_trail_endpoint_reserve(graph->store, &endpoints, &endpoint_capacity, SKIP_ONE)) {
+            free(frames);
+            free(used_edges);
+            return CBM_STORE_ERR;
+        }
+        endpoints[endpoint_count++] = (store_trail_endpoint_t){
+            .id = start_id, .qn = graph->overlay ? start_qn : NULL, .hop = 0};
+    }
+
+    while (effective_depth > 0 && stack_size > 0) {
+        if (cancel && extensions % ST_TRAIL_CANCEL_CHECK_INTERVAL == 0 && cancel(cancel_ctx)) {
+            *cancelled = true;
+            break;
+        }
+        store_trail_frame_t *frame = &frames[stack_size - SKIP_ONE];
+        const store_trail_arc_t *arc = store_trail_frame_next(graph, frame);
+        if (!arc) {
+            if (frame->via_edge >= 0) {
+                used_edges[frame->via_edge] = false;
+            }
+            stack_size--;
+            continue;
+        }
+        if (used_edges[arc->edge_index]) {
+            continue;
+        }
+        if (extensions == max_work_rows) {
+            *work_limit_hit = true;
+            break;
+        }
+        extensions++;
+        used_edges[arc->edge_index] = true;
+        int next_depth = frame->depth + SKIP_ONE;
+        if (next_depth >= min_depth) {
+            if (endpoint_count == INT_MAX) {
+                free(endpoints);
+                free(frames);
+                free(used_edges);
+                store_set_error(graph->store, "trail endpoint count exceeds addressable storage");
+                return CBM_STORE_ERR;
+            }
+            if (!store_trail_endpoint_reserve(graph->store, &endpoints, &endpoint_capacity,
+                                              endpoint_count + SKIP_ONE)) {
+                free(endpoints);
+                free(frames);
+                free(used_edges);
+                return CBM_STORE_ERR;
+            }
+            endpoints[endpoint_count++] = (store_trail_endpoint_t){
+                .id = arc->to_id,
+                .qn = arc->to_qn,
+                .hop = next_depth,
+            };
+        }
+        if (next_depth < effective_depth) {
+            frames[stack_size++] = (store_trail_frame_t){
+                .id = arc->to_id,
+                .qn = arc->to_qn,
+                .depth = next_depth,
+                .phase = 0,
+                .cursor = CBM_NOT_FOUND,
+                .via_edge = arc->edge_index,
+            };
+        } else {
+            used_edges[arc->edge_index] = false;
+        }
+    }
+    *work_rows = extensions;
+    free(frames);
+    free(used_edges);
+
+    int rc = CBM_STORE_OK;
+    if (!*work_limit_hit && !*cancelled) {
+        rc = store_trail_materialize(graph, endpoints, endpoint_count, out);
+    }
+    free(endpoints);
+    return rc;
+}
+
 /* Collect edges induced by the root and visited nodes through a per-call TEMP
  * table. A unique table avoids cross-talk when serialized SQLite calls from
  * concurrent requests interleave on one connection; it also removes the old
  * fixed-size comma-separated ID buffer and scales with the bounded result set. */
 static int store_bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_hop_t *visited,
                                    int visited_count, const char *types_clause,
-                                   const char **edge_types, int edge_type_count, int bind_count,
-                                   bool use_linkrank, cbm_edge_info_t **out_edges,
-                                   int *out_edge_count) {
+                                   const char **edge_types, int edge_type_count, bool use_linkrank,
+                                   cbm_edge_info_t **out_edges, int *out_edge_count) {
     *out_edges = NULL;
     *out_edge_count = 0;
 
@@ -11691,7 +12731,11 @@ static int store_bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_n
         store_set_error_sqlite(s, "bfs edges prepare");
         goto cleanup;
     }
-    store_bind_edge_types(stmt, ST_COL_1, edge_types, edge_type_count, bind_count);
+    if (store_bind_edge_type_filter(stmt, ST_COL_1, edge_types, edge_type_count) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "bfs edge type filter bind failed");
+        goto cleanup;
+    }
 
     int capacity = ST_INIT_CAP_8;
     int count = 0;
@@ -11781,13 +12825,9 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     bool use_pagerank = !result.pagerank_stale;
     bool use_linkrank = !result.linkrank_stale;
 
-    /* MERGE: fork delta — build edge type IN clause with ?N parameterized
-     * placeholders and cap at ST_BFS_EDGE_TYPE_LIMIT so the bind loop and clause
-     * stay consistent. edge_types[] come from MCP tool call args. */
     char types_clause[CBM_SZ_512];
-    int bfs_et_count = 0;
-    if (store_build_edge_type_placeholders(types_clause, sizeof(types_clause), ST_COL_1,
-                                           edge_type_count, &bfs_et_count) != CBM_STORE_OK) {
+    if (store_build_edge_type_filter(types_clause, sizeof(types_clause), ST_COL_1) !=
+        CBM_STORE_OK) {
         cbm_store_traverse_free(&result);
         store_set_error(s, "bfs edge type clause too large");
         return CBM_STORE_ERR;
@@ -11849,8 +12889,12 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         return CBM_STORE_ERR;
     }
 
-    /* Bind edge type parameters */
-    store_bind_edge_types(stmt, ST_COL_1, edge_types, edge_type_count, bfs_et_count);
+    if (store_bind_edge_type_filter(stmt, ST_COL_1, edge_types, edge_type_count) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs edge type filter bind failed");
+        return CBM_STORE_ERR;
+    }
 
     int cap = ST_INIT_CAP_16;
     int n = 0;
@@ -11902,7 +12946,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     /* Collect edges between visited nodes (including root) */
     if (n > 0) {
         rc = store_bfs_collect_edges(s, start_id, result.visited, n, types_clause, edge_types,
-                                     edge_type_count, bfs_et_count, use_linkrank, &result.edges,
+                                     edge_type_count, use_linkrank, &result.edges,
                                      &result.edge_count);
         if (rc != CBM_STORE_OK) {
             cbm_store_traverse_free(&result);
@@ -11940,9 +12984,8 @@ int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *
     bool use_pagerank = !result.pagerank_stale;
 
     char types_clause[CBM_SZ_512];
-    int bfs_et_count = 0;
-    if (store_build_edge_type_placeholders(types_clause, sizeof(types_clause), ST_COL_4,
-                                           edge_type_count, &bfs_et_count) != CBM_STORE_OK) {
+    if (store_build_edge_type_filter(types_clause, sizeof(types_clause), ST_COL_4) !=
+        CBM_STORE_OK) {
         cbm_store_traverse_free(&result);
         store_set_error(s, "bfs_overlay edge type clause too large");
         return CBM_STORE_ERR;
@@ -12010,7 +13053,12 @@ int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *
     bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
     bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
     bind_text(stmt, ST_COL_3, start_qn);
-    store_bind_edge_types(stmt, ST_COL_4, edge_types, edge_type_count, bfs_et_count);
+    if (store_bind_edge_type_filter(stmt, ST_COL_4, edge_types, edge_type_count) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs_overlay edge type filter bind failed");
+        return CBM_STORE_ERR;
+    }
 
     int cap = ST_INIT_CAP_16;
     int n = 0;
@@ -12121,10 +13169,8 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
     sqlite3_finalize(ins);
 
     char types_clause[CBM_SZ_512];
-    int bounded_edge_type_count = 0;
-    if (store_build_edge_type_placeholders(types_clause, sizeof(types_clause), ST_COL_1,
-                                           edge_type_count,
-                                           &bounded_edge_type_count) != CBM_STORE_OK) {
+    if (store_build_edge_type_filter(types_clause, sizeof(types_clause), ST_COL_1) !=
+        CBM_STORE_OK) {
         store_set_error(s, "bfs_multi edge type clause too large");
         (void)store_bfs_multi_clear_seeds(s);
         return CBM_STORE_ERR;
@@ -12192,7 +13238,12 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
         (void)store_bfs_multi_clear_seeds(s);
         return CBM_STORE_ERR;
     }
-    store_bind_edge_types(stmt, ST_COL_1, edge_types, edge_type_count, bounded_edge_type_count);
+    if (store_bind_edge_type_filter(stmt, ST_COL_1, edge_types, edge_type_count) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "bfs_multi edge type filter bind failed");
+        (void)store_bfs_multi_clear_seeds(s);
+        return CBM_STORE_ERR;
+    }
 
     int cap = ST_INIT_CAP_16;
     int n = 0;

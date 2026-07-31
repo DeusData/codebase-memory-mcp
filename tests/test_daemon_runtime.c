@@ -44,6 +44,8 @@
 #include <fcntl.h>
 #ifdef __APPLE__
 #include <libproc.h>
+#include <spawn.h>
+extern char **environ;
 #endif
 #include <signal.h>
 #include <sys/stat.h>
@@ -633,6 +635,69 @@ static bool runtime_test_append_image_marker(const char *path) {
 }
 #endif
 
+#if defined(__APPLE__) || defined(__linux__)
+/* Wait for a copied-image probe and preserve the termination cause in test
+ * output. This is O(1) time after the child terminates and O(1) memory; all
+ * POSIX image-launch helpers share it so a signal or wait failure cannot be
+ * collapsed into an unactionable boolean assertion. */
+static bool runtime_test_wait_image_probe(pid_t child, const char *operation, int *exit_code_out) {
+    if (child <= 0 || !operation || !exit_code_out) {
+        return false;
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) {
+        int wait_error = errno;
+        (void)fprintf(stderr, "runtime %s image wait failed: errno=%d (%s)\n", operation,
+                      wait_error, strerror(wait_error));
+        return false;
+    }
+    if (WIFSIGNALED(status)) {
+        (void)fprintf(stderr, "runtime %s image terminated by signal %d\n", operation,
+                      WTERMSIG(status));
+        return false;
+    }
+    if (!WIFEXITED(status)) {
+        (void)fprintf(stderr, "runtime %s image ended with unrecognized wait status\n", operation);
+        return false;
+    }
+    *exit_code_out = WEXITSTATUS(status);
+    return true;
+}
+
+/* Darwin's posix_spawn avoids copying the full ASan-instrumented parent address
+ * space before exec. That keeps copied-image probes O(1) in parent memory even
+ * late in the aggregate suite; Linux retains fork/exec because its production
+ * subprocess path does too. The copied runner installs its own named watchdog
+ * before performing any daemon exchange. */
+static pid_t runtime_test_spawn_image_probe(const char *image_path, const char *const arguments[]) {
+    if (!image_path || !arguments) {
+        return -1;
+    }
+#ifdef __APPLE__
+    pid_t child = -1;
+    int spawn_status =
+        posix_spawn(&child, image_path, NULL, NULL, (char *const *)arguments, environ);
+    if (spawn_status != 0) {
+        (void)fprintf(stderr, "runtime image spawn failed: error=%d (%s)\n", spawn_status,
+                      strerror(spawn_status));
+        return -1;
+    }
+    return child;
+#else
+    pid_t child = fork();
+    if (child == 0) {
+        execv(image_path, (char *const *)arguments);
+        _exit(127);
+    }
+    return child;
+#endif
+}
+#endif
+
 #ifdef __APPLE__
 static bool runtime_test_mac_ad_hoc_sign(const char *path) {
     if (!path) {
@@ -644,12 +709,8 @@ static bool runtime_test_mac_ad_hoc_sign(const char *path) {
               "--identifier", "org.deusdata.cbm.foreign-test", path, (char *)NULL);
         _exit(127);
     }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = child > 0 ? waitpid(child, &status, 0) : -1;
-    } while (waited < 0 && errno == EINTR);
-    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    int exit_code = -1;
+    return runtime_test_wait_image_probe(child, "code-signing", &exit_code) && exit_code == 0;
 }
 #endif
 
@@ -693,23 +754,12 @@ static bool runtime_test_run_hello_image(const char *image_path,
     }
     return read && exit_code <= INT_MAX;
 #elif defined(__APPLE__) || defined(__linux__)
-    pid_t child = fork();
-    if (child == 0) {
-        (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
-        execl(image_path, image_path, "__cbm_runtime_hello_client", fixture->parent, fixture->key,
-              identity->semantic_version, identity->build_fingerprint, (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = child > 0 ? waitpid(child, &status, 0) : -1;
-    } while (waited < 0 && errno == EINTR);
-    if (waited != child || !WIFEXITED(status)) {
-        return false;
-    }
-    *exit_code_out = WEXITSTATUS(status);
-    return true;
+    const char *arguments[] = {
+        image_path,   "__cbm_runtime_hello_client", fixture->parent,
+        fixture->key, identity->semantic_version,   identity->build_fingerprint,
+        NULL};
+    pid_t child = runtime_test_spawn_image_probe(image_path, arguments);
+    return runtime_test_wait_image_probe(child, "hello", exit_code_out);
 #else
     (void)image_path;
     (void)fixture;
@@ -761,24 +811,18 @@ static bool runtime_test_run_activation_image(const char *image_path,
 #elif defined(__APPLE__) || defined(__linux__)
     char action_text[16];
     int action_written = snprintf(action_text, sizeof(action_text), "%u", (unsigned int)action);
-    pid_t child = action_written > 0 && action_written < (int)sizeof(action_text) ? fork() : -1;
-    if (child == 0) {
-        (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
-        execl(image_path, image_path, "__cbm_runtime_activation_client", fixture->parent,
-              fixture->key, identity->semantic_version, identity->build_fingerprint, action_text,
-              (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = child > 0 ? waitpid(child, &status, 0) : -1;
-    } while (waited < 0 && errno == EINTR);
-    if (waited != child || !WIFEXITED(status)) {
-        return false;
-    }
-    *exit_code_out = WEXITSTATUS(status);
-    return true;
+    const char *arguments[] = {image_path,
+                               "__cbm_runtime_activation_client",
+                               fixture->parent,
+                               fixture->key,
+                               identity->semantic_version,
+                               identity->build_fingerprint,
+                               action_text,
+                               NULL};
+    pid_t child = action_written > 0 && action_written < (int)sizeof(action_text)
+                      ? runtime_test_spawn_image_probe(image_path, arguments)
+                      : -1;
+    return runtime_test_wait_image_probe(child, "activation", exit_code_out);
 #else
     (void)image_path;
     (void)fixture;
@@ -799,23 +843,16 @@ static bool runtime_test_run_mapped_hello_image(const char *image_path,
         return false;
     }
     *exit_code_out = -1;
-    pid_t child = fork();
-    if (child == 0) {
-        execl(image_path, image_path, "__cbm_runtime_mapped_hello_client", mapped_image_path,
-              fixture->parent, fixture->key, identity->semantic_version,
-              identity->build_fingerprint, (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    pid_t waited;
-    do {
-        waited = child > 0 ? waitpid(child, &status, 0) : -1;
-    } while (waited < 0 && errno == EINTR);
-    if (waited != child || !WIFEXITED(status)) {
-        return false;
-    }
-    *exit_code_out = WEXITSTATUS(status);
-    return true;
+    const char *arguments[] = {image_path,
+                               "__cbm_runtime_mapped_hello_client",
+                               mapped_image_path,
+                               fixture->parent,
+                               fixture->key,
+                               identity->semantic_version,
+                               identity->build_fingerprint,
+                               NULL};
+    pid_t child = runtime_test_spawn_image_probe(image_path, arguments);
+    return runtime_test_wait_image_probe(child, "mapped hello", exit_code_out);
 }
 #endif
 
