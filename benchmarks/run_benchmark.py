@@ -3164,6 +3164,76 @@ def parse_log_text_field(stderr: str, marker: str, field: str) -> str | None:
     return None
 
 
+def daemon_log_window(env: dict[str, str]) -> tuple[Path | None, int]:
+    cache_dir = env.get("CBM_CACHE_DIR")
+    path = Path(cache_dir) / DAEMON_LOG_RELATIVE_PATH if cache_dir else None
+    offset = path.stat().st_size if path and path.is_file() else 0
+    return path, offset
+
+
+def read_log_window(path: Path | None, offset: int) -> str:
+    if not path or not path.is_file():
+        return ""
+    try:
+        current_size = path.stat().st_size
+        with path.open("rb") as stream:
+            stream.seek(offset if current_size >= offset else 0)
+            return stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def update_int_summary(summary: dict[str, int], value: int) -> None:
+    if not summary:
+        summary.update(first=value, last=value, min=value, max=value)
+        return
+    summary["last"] = value
+    summary["min"] = min(summary["min"], value)
+    summary["max"] = max(summary["max"], value)
+
+
+def summarize_daemon_mem_census_since(
+    path: Path | None, offset: int
+) -> dict[str, Any] | None:
+    """Summarize B new log bytes in O(B) time and O(L + F) memory.
+
+    L is the longest log line and F is the fixed field count. Retained memory is
+    independent of the number of request samples, unlike storing every census.
+    """
+    if not path or not path.is_file():
+        return None
+    fields = ("rss_kb", "mi_area_kb", "mi_live_kb")
+    summaries: dict[str, dict[str, int]] = {field: {} for field in fields}
+    count = 0
+    try:
+        current_size = path.stat().st_size
+        with path.open("rb") as stream:
+            stream.seek(offset if current_size >= offset else 0)
+            for raw_line in stream:
+                line = raw_line.decode("utf-8", errors="replace")
+                if "msg=mem.census" not in line or "at=mcp.request" not in line:
+                    continue
+                parsed = {
+                    field: parse_log_int_field(line, "msg=mem.census", field)
+                    for field in fields
+                }
+                if any(value is None for value in parsed.values()):
+                    continue
+                for field, value in parsed.items():
+                    update_int_summary(summaries[field], int(value))
+                count += 1
+    except OSError:
+        return None
+    if count == 0:
+        return None
+    for summary in summaries.values():
+        summary["delta"] = summary["last"] - summary["first"]
+    return {
+        "count": count,
+        **summaries,
+    }
+
+
 def parse_exact_reason(stderr: str) -> str | None:
     detail = parse_exact_route_detail(stderr)
     reason = detail.get("reason")
@@ -3610,28 +3680,11 @@ def run_index_mcp(
     include_logs: bool,
     index_mode: str = "fast",
 ) -> dict[str, Any]:
-    daemon_log = (
-        Path(client.env["CBM_CACHE_DIR"]) / DAEMON_LOG_RELATIVE_PATH
-        if client.env.get("CBM_CACHE_DIR")
-        else None
-    )
-    daemon_log_offset = (
-        daemon_log.stat().st_size if daemon_log and daemon_log.is_file() else 0
-    )
+    daemon_log, daemon_log_offset = daemon_log_window(client.env)
     data, stderr, stdout_bytes, elapsed_ms = client.call_tool(
         "index_repository", index_tool_arguments(repo_dir, index_mode)
     )
-    daemon_diagnostics = ""
-    if daemon_log and daemon_log.is_file():
-        try:
-            current_size = daemon_log.stat().st_size
-            with daemon_log.open("rb") as stream:
-                stream.seek(
-                    daemon_log_offset if current_size >= daemon_log_offset else 0
-                )
-                daemon_diagnostics = stream.read().decode("utf-8", errors="replace")
-        except OSError:
-            daemon_diagnostics = ""
+    daemon_diagnostics = read_log_window(daemon_log, daemon_log_offset)
     return build_index_result(
         data,
         stderr,
@@ -3908,9 +3961,14 @@ def measure_indexed_query_probes_for_transport(
     if transport == "mcp":
         if client is None:
             raise RuntimeError("MCP indexed-query probes require an active client")
-        return measure_mcp_overhead_probes(
+        daemon_log, daemon_log_offset = daemon_log_window(env)
+        result = measure_mcp_overhead_probes(
             client, tool_name, count, include_logs, arguments
         )
+        census = summarize_daemon_mem_census_since(daemon_log, daemon_log_offset)
+        if result is not None and census is not None:
+            result["daemon_mem_census"] = census
+        return result
     return measure_cli_overhead_probes(
         binary, env, tool_name, count, timeout, include_logs, arguments
     )
