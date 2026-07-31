@@ -365,6 +365,8 @@ bool cbm_daemon_runtime_service_active_image_cache_hit_for_testing(
     const cbm_daemon_runtime_service_t *service);
 uint64_t cbm_daemon_runtime_service_peer_cache_hits_for_testing(
     const cbm_daemon_runtime_service_t *service);
+uint64_t cbm_daemon_runtime_service_application_worker_starts_for_testing(
+    const cbm_daemon_runtime_service_t *service);
 #endif
 
 /* Emergency/test teardown only. Normal lifetime is connection-owned: the

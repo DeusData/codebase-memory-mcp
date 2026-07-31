@@ -3218,6 +3218,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     bool first_exact = false;
     bool second_reserved = false;
     bool second_exact = false;
+    uint64_t application_worker_starts = 0;
     bool closed = false;
     bool exited = false;
 
@@ -3259,6 +3260,10 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
                        memcmp(response, second_request, sizeof(second_request)) == 0;
         free(response);
     }
+    if (second_exact) {
+        application_worker_starts =
+            cbm_daemon_runtime_service_application_worker_starts_for_testing(fixture.service);
+    }
     if (client) {
         closed = cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
         client = NULL;
@@ -3275,6 +3280,11 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     ASSERT_TRUE(second_reserved);
     ASSERT_EQ(second_token, first_token + 1U);
     ASSERT_TRUE(second_exact);
+    /* A connection owns one cancellable application worker. Request handling
+     * is necessarily O(R + handler work) for R sequential requests, but the
+     * worker keeps OS-thread create/join events O(1) for that connection
+     * instead of O(R), without adding application concurrency. */
+    ASSERT_EQ(application_worker_starts, 1);
     ASSERT_TRUE(closed);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.requests), 2);
