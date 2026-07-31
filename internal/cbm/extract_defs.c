@@ -1892,6 +1892,18 @@ static int collect_modifier_decorators(CBMArena *a, TSNode modifiers, const char
     return idx;
 }
 
+/* Comments are NAMED nodes in tree-sitter, so a comment interleaved in a
+ * decorator run would end the walk and silently drop every decorator above it:
+ *
+ *   @Post('login')                    <-- lost
+ *   @HttpCode(HttpStatus.OK)          <-- lost
+ *   // why this route is throttled    <-- walk stopped here
+ *   @Throttle({ ... })                <-- kept
+ *   async login(...)
+ *
+ * Documenting a decorator must not make it disappear from the graph, so treat
+ * comments as transparent — like the anonymous tokens already skipped below.
+ * (is_comment_node() is defined above, near the docstring helpers.) */
 static const char **extract_decorators(CBMArena *a, TSNode node, const char *source,
                                        CBMLanguage lang, const CBMLangSpec *spec) {
     if (!spec->decorator_node_types || !spec->decorator_node_types[0]) {
@@ -1903,10 +1915,11 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     while (!ts_node_is_null(prev)) {
         if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
             count++;
-        } else if (ts_node_is_named(prev)) {
+        } else if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
             /* A real preceding construct ends the decorator run. Anonymous
              * tokens (e.g. TS `export` between `@Decorator` and the
-             * `class_declaration`) are skipped so the decorator is still seen. */
+             * `class_declaration`) and comments are skipped so the decorator
+             * is still seen. */
             break;
         }
         prev = ts_node_prev_sibling(prev);
@@ -1943,7 +1956,7 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     while (!ts_node_is_null(prev) && idx < count) {
         if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
             result[idx++] = cbm_node_text(a, prev, source);
-        } else if (ts_node_is_named(prev)) {
+        } else if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
             break;
         }
         prev = ts_node_prev_sibling(prev);
@@ -3462,6 +3475,54 @@ static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source)
     return NULL;
 }
 
+/* C++/CUDA: true when name is a GoogleTest test-definition macro whose
+ * invocations parse as function definitions with bare-identifier parameters.
+ * Multiple such macros in one file all share the extracted name (e.g. "TEST"),
+ * causing qualified-name collisions and node loss (#1266). */
+static bool is_cpp_test_macro(const char *name) {
+    return strcmp(name, "TEST") == 0 || strcmp(name, "TEST_F") == 0 ||
+           strcmp(name, "TEST_P") == 0 || strcmp(name, "TYPED_TEST") == 0 ||
+           strcmp(name, "TYPED_TEST_P") == 0;
+}
+
+/* Compose a unique name from a GoogleTest-style macro invocation by appending
+ * the macro arguments: TEST(Suite, Case) -> "TEST_Suite_Case".
+ * Returns an arena-allocated string, or NULL when the parameters cannot be
+ * resolved (caller keeps the original name in that case). */
+static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
+                                         const char *source) {
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    if (ts_node_is_null(params)) {
+        params = find_c_params(node);
+    }
+    if (ts_node_is_null(params)) {
+        return NULL;
+    }
+
+    const char *args[2] = {NULL, NULL};
+    int count = 0;
+    uint32_t nc = ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < nc && count < 2; i++) {
+        TSNode child = ts_node_named_child(params, i);
+        if (ts_node_is_null(child)) {
+            continue;
+        }
+        TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
+        char *text = cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source);
+        if (text && text[0]) {
+            args[count++] = text;
+        }
+    }
+
+    if (count == 2) {
+        return cbm_arena_sprintf(a, "%s_%s_%s", macro, args[0], args[1]);
+    }
+    if (count == 1) {
+        return cbm_arena_sprintf(a, "%s_%s", macro, args[0]);
+    }
+    return NULL;
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -3481,6 +3542,20 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // any dot-prefixed Make target.
     if (ctx->language == CBM_LANG_MAKEFILE && name[0] == '.') {
         return;
+    }
+
+    /* C++/CUDA: GoogleTest macros (TEST, TEST_F, TEST_P, ...) parse as
+     * function definitions whose name resolves to the bare macro identifier.
+     * Multiple test cases per file collide on qualified name; derive a unique
+     * name from the macro arguments so each gets its own graph node (#1266). */
+    bool is_gtest = false;
+    if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
+        is_cpp_test_macro(name)) {
+        char *gtest_name = resolve_cpp_test_macro_name(a, name, node, ctx->source);
+        if (gtest_name) {
+            name = gtest_name;
+            is_gtest = true;
+        }
     }
 
     TSNode func_node = unwrap_template_inner(node, ctx->language);
@@ -3608,6 +3683,11 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->language == CBM_LANG_RUST) {
         def.qualified_name = cbm_rust_cfg_qualified_name(a, node, ctx->source, def.qualified_name);
         def.is_test = rust_def_is_test(def.decorators);
+    }
+
+    // C++/CUDA: GoogleTest macros are test functions (#1266).
+    if (is_gtest) {
+        def.is_test = true;
     }
 
     // Docstring
@@ -7224,10 +7304,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 // Ada subprograms nest (a procedure body's declarative part can
                 // contain inner subprogram bodies); descend so the nested defs
                 // are captured and same-file calls to them resolve to a CALLS edge.
+                // Nix: a library/module file's ROOT expression is normally itself a
+                // function_expression (`{ pkgs, lib, ... }: <body>`), so stopping here
+                // abandons the entire file — every binding in it is lost. Descend so
+                // the body's `name = args: ...` bindings are reached. Inner curried
+                // lambdas (`f = a: b: ...`) resolve no name and mint nothing, so the
+                // extra descent adds defs without adding noise.
                 bool descend_into_func =
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
-                     ctx->language == CBM_LANG_ADA);
+                     ctx->language == CBM_LANG_ADA || ctx->language == CBM_LANG_NIX);
                 if (!descend_into_func) {
                     continue;
                 }

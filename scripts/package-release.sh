@@ -172,7 +172,7 @@ if [ "$GOOS" = "windows" ]; then
     # Gate the artifact AFTER strip: strip is the last byte-changing step, so
     # this inspects exactly what goes into the archive. Runs here rather than in
     # a workflow step so the local artifact-flow smoke enforces the same thing.
-    scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
+    bash scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
         "$PACK_DIR/codebase-memory-mcp.exe" || exit 2
     cp LICENSE install.ps1 "$PACK_DIR/"
     scripts/gen-third-party-notices.sh "$PACK_DIR/THIRD_PARTY_NOTICES.md"
@@ -187,7 +187,7 @@ else
     [ -f "$BUILD_DIR/codebase-memory-mcp" ] ||
         { echo "package-release: build first; missing $BUILD_DIR/codebase-memory-mcp" >&2; exit 2; }
     strip_release_binary "$BUILD_DIR/codebase-memory-mcp" || exit 2
-    scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
+    bash scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
         "$BUILD_DIR/codebase-memory-mcp" || exit 2
     cp LICENSE install.sh "$BUILD_DIR/"
     scripts/gen-third-party-notices.sh "$BUILD_DIR/THIRD_PARTY_NOTICES.md"

@@ -5754,6 +5754,27 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
     free(vars);
 }
 
+/* Arithmetic-only compatibility seam for callers and tests that need to
+ * validate the historical full-product allocation boundary. The executor
+ * below deliberately does not allocate this product: it grows only to its
+ * max_new working-row budget. O(1) time and O(1) memory. */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n) {
+    if (!out_n || bind_count < 0 || extra_count < 0) {
+        return CBM_NOT_FOUND;
+    }
+    size_t per_binding = extra_count > 0 ? (size_t)extra_count : (opt ? 1U : 0U);
+    if (per_binding > 0 && (size_t)bind_count > (size_t)INT_MAX / per_binding) {
+        return CBM_NOT_FOUND;
+    }
+    size_t rows = (size_t)bind_count * per_binding;
+    size_t alloc_n = rows + 1U;
+    if (alloc_n > SIZE_MAX / sizeof(binding_t)) {
+        return CBM_NOT_FOUND;
+    }
+    *out_n = alloc_n;
+    return 0;
+}
+
 /* Cross-join node-only pattern into existing bindings */
 static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
                              int extra_count, const char *nvar, bool opt,
