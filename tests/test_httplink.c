@@ -738,7 +738,7 @@ TEST(httplink_read_source_lines) {
 
     char fpath[512];
     snprintf(fpath, sizeof(fpath), "%s/test.go", tmpdir);
-    FILE *f = fopen(fpath, "w");
+    FILE *f = cbm_fopen(fpath, "wb");
     if (!f) {
         printf("  SKIP: cannot write\n");
         return -1;
@@ -773,7 +773,7 @@ TEST(httplink_read_source_file_limited) {
 
     char fpath[512];
     snprintf(fpath, sizeof(fpath), "%s/app.js", tmpdir);
-    FILE *f = fopen(fpath, "w");
+    FILE *f = cbm_fopen(fpath, "wb");
     if (!f) {
         printf("  SKIP: cannot write\n");
         cbm_rmdir(tmpdir);

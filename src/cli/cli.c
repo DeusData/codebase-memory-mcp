@@ -8325,6 +8325,13 @@ static void cbm_agent_installed_binary_path(const char *home, char *binary_path,
 #endif
 }
 
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_agent_installed_binary_path_for_testing(const char *home, char *binary_path,
+                                                 size_t binary_path_size) {
+    cbm_agent_installed_binary_path(home, binary_path, binary_path_size);
+}
+#endif
+
 static void install_managed_agent_instructions(const char *label, const char *instructions_path,
                                                bool dry_run) {
     if (g_install_plan) {

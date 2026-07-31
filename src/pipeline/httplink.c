@@ -5,6 +5,7 @@
  */
 
 #include "pipeline/httplink.h"
+#include "foundation/compat_fs.h"
 #include "foundation/hash_table.h"
 #include "foundation/yaml.h"
 #include "foundation/platform.h"
@@ -1464,7 +1465,11 @@ char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int
         return NULL;
     }
 
-    FILE *f = fopen(full_path, "r");
+    /* Read source bytes through the shared UTF-8/long-path seam. Binary mode
+     * keeps byte handling identical on every platform; the line API below
+     * normalizes either LF or CRLF explicitly instead of relying on CRT text
+     * translation. Runtime remains O(bytes read), with O(result bytes) memory. */
+    FILE *f = cbm_fopen(full_path, "rb");
     free(full_path);
     if (!f) {
         return NULL;
@@ -1488,6 +1493,9 @@ char *cbm_read_source_lines_disk(const char *root_dir, const char *rel_path, int
         int llen = (int)strlen(line_buf);
         /* Strip trailing newline */
         if (llen > 0 && line_buf[llen - 1] == '\n') {
+            line_buf[--llen] = '\0';
+        }
+        if (llen > 0 && line_buf[llen - 1] == '\r') {
             line_buf[--llen] = '\0';
         }
 
@@ -1679,7 +1687,7 @@ cbm_httplink_config_t cbm_httplink_load_config(const char *dir) {
     }
 
     /* Read file */
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return cfg;
     }

@@ -343,7 +343,7 @@ static bool make_tree_pid_path(char path[64]) {
         return false;
     }
     (void)close(fd);
-    return unlink(path) == 0; /* child creates it only after both traps are installed */
+    return unlink(path) == 0; /* probe recreates it only after its signal traps are installed */
 }
 
 static bool wait_for_tree_pids(const char *path, cbm_subprocess_t *process, pid_t *parent_pid,
@@ -359,6 +359,29 @@ static bool wait_for_tree_pids(const char *path, cbm_subprocess_t *process, pid_
             if (fields == 2 && parent_value > 1 && grandchild_value > 1) {
                 *parent_pid = (pid_t)parent_value;
                 *grandchild_pid = (pid_t)grandchild_value;
+                return true;
+            }
+        }
+        cbm_proc_result_t ignored;
+        if (cbm_subprocess_poll(process, &ignored) != CBM_PROC_POLL_RUNNING) {
+            return false;
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline);
+    return false;
+}
+
+static bool wait_for_process_pid(const char *path, cbm_subprocess_t *process, pid_t *pid,
+                                 int timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
+    do {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            long value = 0;
+            int fields = fscanf(f, "%ld", &value);
+            fclose(f);
+            if (fields == 1 && value > 1) {
+                *pid = (pid_t)value;
                 return true;
             }
         }
@@ -410,6 +433,20 @@ static int spawn_ignoring_tree(const char *pid_path, int quiet_timeout_ms, int c
     opts.bin = "/bin/sh";
     opts.argv = argv;
     opts.quiet_timeout_ms = quiet_timeout_ms;
+    opts.cancel_grace_ms = cancel_grace_ms;
+    return cbm_subprocess_spawn(&opts, out);
+}
+
+static int spawn_ignoring_process(const char *pid_path, int cancel_grace_ms,
+                                  cbm_subprocess_t **out) {
+    /* Keep this probe to one owned process. The zombie-only assertion must not
+     * depend on when the host init process reaps an orphaned grandchild. Ignored
+     * signal dispositions survive exec, so /bin/sleep remains TERM-resistant. */
+    const char *script = "trap '' TERM; echo \"$$\" > \"$1\"; exec /bin/sleep 60";
+    const char *argv[] = {"/bin/sh", "-c", script, "cbm-process", pid_path, NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
     opts.cancel_grace_ms = cancel_grace_ms;
     return cbm_subprocess_spawn(&opts, out);
 }
@@ -722,15 +759,14 @@ TEST(subprocess_zombie_only_group_is_quiesced_without_extending_settle) {
     char pid_path[64];
     ASSERT_TRUE(make_tree_pid_path(pid_path));
     cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(spawn_ignoring_tree(pid_path, 0, 100, &process), 0);
+    ASSERT_EQ(spawn_ignoring_process(pid_path, 100, &process), 0);
     ASSERT_NOT_NULL(process);
 
     pid_t parent_pid = -1;
-    pid_t grandchild_pid = -1;
-    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 1000);
+    bool ready = wait_for_process_pid(pid_path, process, &parent_pid, 1000);
     /* This direct test child joins the owned PGID, exits, and remains deliberately
      * unreaped. kill(-pgid, 0) therefore keeps succeeding past the force deadline
-     * even after no group member can execute. */
+     * after the single owned process is reaped and no group member can execute. */
     pid_t zombie_pid = ready ? create_zombie_group_member(parent_pid) : -1;
     bool cancel_accepted = zombie_pid > 1 && cbm_subprocess_request_cancel(process);
     cbm_proc_result_t result = {0};
@@ -738,7 +774,7 @@ TEST(subprocess_zombie_only_group_is_quiesced_without_extending_settle) {
     int zombie_status = 0;
     bool zombie_reaped = zombie_pid > 1 && waitpid(zombie_pid, &zombie_status, 0) == zombie_pid;
     if (!terminal) {
-        force_probe_cleanup(parent_pid, grandchild_pid);
+        force_probe_cleanup(parent_pid, -1);
         cbm_proc_result_t cleanup_result;
         if (poll_until_terminal(process, 1000, &cleanup_result)) {
             cbm_subprocess_destroy(process);

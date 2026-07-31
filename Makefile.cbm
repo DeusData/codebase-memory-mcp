@@ -208,7 +208,11 @@ endif
 # is meaningless for PE, so it is gated rather than made "common".
 ELF_HARDENING_FLAGS :=
 ifeq ($(IS_LINUX),yes)
+# A Linux container may cross-compile a PE binary. IS_LINUX identifies the
+# build host, so the compiler-derived target guard is also required.
+ifneq ($(IS_MINGW),yes)
 ELF_HARDENING_FLAGS := -Wl,-z,noexecstack
+endif
 endif
 
 # The POSIX wrap shim exists only so the profiler can observe allocations. It
@@ -1116,6 +1120,10 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
                     diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
 TSAN_OPTIONS ?= halt_on_error=1
+# Keep the project suppression separate from the caller's ordinary TSan knobs.
+# Advanced runs can point this at a combined suppression file without replacing
+# halt/report/history settings supplied through TSAN_OPTIONS.
+TSAN_PROJECT_OPTIONS ?= suppressions=$(CURDIR)/tests/tsan.supp
 TSAN_WORKERS ?= 4
 # A fixed concurrent envelope keeps TSan deterministic across developer hosts
 # and GitHub runners. Four workers still exercise real races without turning
@@ -1132,7 +1140,8 @@ $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 
 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
 	@echo "Running ThreadSanitizer with $(TSAN_WORKERS) workers. Reports go to stderr."
-	cd $(CURDIR) && CBM_WORKERS=$(TSAN_WORKERS) TSAN_OPTIONS="$(TSAN_OPTIONS)" \
+	cd $(CURDIR) && CBM_WORKERS=$(TSAN_WORKERS) \
+		TSAN_OPTIONS="$(TSAN_OPTIONS):$(TSAN_PROJECT_OPTIONS)" \
 		$(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
 
 # ── Leak detection ───────────────────────────────────────────────

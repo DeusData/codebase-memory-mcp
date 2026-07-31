@@ -380,7 +380,8 @@ TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar) {
 
 /* The persistent lock sidecar is reused across edits by design, but an
  * uninstall must not leave it behind. cbm_yaml_remove_lock_sidecar removes a
- * safe sidecar, treats an absent one as success, and refuses a symlink. */
+ * safe sidecar, treats an absent one as success, and preserves entries that do
+ * not have the exact shape owned by the editor. */
 TEST(config_yaml_edit_remove_lock_sidecar) {
     yaml_fixture_t fixture;
     ASSERT_EQ(yaml_fixture_init(&fixture, "model: fast\n"), 0);
@@ -397,7 +398,7 @@ TEST(config_yaml_edit_remove_lock_sidecar) {
     /* Absent sidecar: success (idempotent). */
     ASSERT_EQ(cbm_yaml_remove_lock_sidecar(fixture.path), 0);
 
-    /* Symlinked sidecar: refuse and preserve. */
+    /* Symlinked sidecar: refuse and preserve both link and target. */
     char decoy[1024];
     ASSERT(snprintf(decoy, sizeof(decoy), "%s.decoy", fixture.path) > 0);
     ASSERT_EQ(th_write_file(decoy, "keep\n"), 0);
@@ -405,6 +406,13 @@ TEST(config_yaml_edit_remove_lock_sidecar) {
     ASSERT(cbm_yaml_remove_lock_sidecar(fixture.path) != 0);
     ASSERT_EQ(lstat(lock_path, &state), 0);
     ASSERT_EQ(lstat(decoy, &state), 0);
+    ASSERT_EQ(unlink(lock_path), 0);
+
+    /* A colliding regular file with non-editor permissions is foreign too. */
+    ASSERT_EQ(th_write_file(lock_path, "foreign\n"), 0);
+    ASSERT_EQ(chmod(lock_path, 0644), 0);
+    ASSERT(cbm_yaml_remove_lock_sidecar(fixture.path) != 0);
+    ASSERT_EQ(lstat(lock_path, &state), 0);
 
     th_cleanup(fixture.dir);
     PASS();

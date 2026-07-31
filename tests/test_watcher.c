@@ -1487,16 +1487,13 @@ TEST(watcher_detects_git_commit) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    if (wt_git(tmpdir, "init -q") != 0) {
+    char file_path[512];
+    if (wt_git(tmpdir, "init -q") != 0 ||
+        th_write_file(wt_path(file_path, sizeof(file_path), tmpdir, "file.txt"), "hello\n") != 0 ||
+        wt_git(tmpdir, "add file.txt") != 0 || wt_git(tmpdir, "commit -q -m init") != 0) {
         th_rmtree(tmpdir);
-        FAIL("git init failed");
+        FAIL("git fixture setup failed");
     }
-    {
-        char p[300];
-        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
-    }
-    wt_git(tmpdir, "add file.txt");
-    wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -1509,12 +1506,13 @@ TEST(watcher_detects_git_commit) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make a change: new commit */
-    {
-        char p[300];
-        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    if (th_append_file(file_path, "world\n") != 0 || wt_git(tmpdir, "add file.txt") != 0 ||
+        wt_git(tmpdir, "commit -q -m add-world") != 0) {
+        cbm_watcher_free(w);
+        cbm_store_close(store);
+        th_rmtree(tmpdir);
+        FAIL("git fixture mutation failed");
     }
-    wt_git(tmpdir, "add file.txt");
-    wt_git(tmpdir, "commit -q -m add-world");
 
     /* Touch to bypass interval, then poll */
     cbm_watcher_touch(w, "temp-repo");
@@ -2985,15 +2983,11 @@ TEST(watcher_dirty_hash_stable) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-        system(cmd);
+    char file_path[512];
+    if (wt_git(tmpdir, "init -q") != 0 ||
+        th_write_file(wt_path(file_path, sizeof(file_path), tmpdir, "file.txt"), "hello\n") != 0 ||
+        wt_git(tmpdir, "add file.txt") != 0 || wt_git(tmpdir, "commit -q -m init") != 0) {
+        th_rmtree(tmpdir);
         FAIL("git fixture setup failed");
     }
 
@@ -3007,8 +3001,7 @@ TEST(watcher_dirty_hash_stable) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make dirty */
-    snprintf(cmd, sizeof(cmd), "echo 'dirty' >> '%s/file.txt'", tmpdir);
-    system(cmd);
+    ASSERT_EQ(th_append_file(file_path, "dirty\n"), 0);
 
     /* First poll after edit → reindex */
     cbm_watcher_touch(w, "dhs-repo");
@@ -3030,8 +3023,7 @@ TEST(watcher_dirty_hash_stable) {
 
     cbm_watcher_free(w);
     cbm_store_close(store);
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -3043,17 +3035,15 @@ TEST(watcher_dirty_content_change_retriggered) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    /* Commit two files so dirtying each produces a distinct porcelain output */
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "echo 'world' > file2.txt && "
-             "git add file.txt file2.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-        system(cmd);
+    char file_path[512];
+    char file2_path[512];
+    /* Commit two files so dirtying each produces a distinct porcelain output. */
+    if (wt_git(tmpdir, "init -q") != 0 ||
+        th_write_file(wt_path(file_path, sizeof(file_path), tmpdir, "file.txt"), "hello\n") != 0 ||
+        th_write_file(wt_path(file2_path, sizeof(file2_path), tmpdir, "file2.txt"), "world\n") != 0 ||
+        wt_git(tmpdir, "add file.txt file2.txt") != 0 ||
+        wt_git(tmpdir, "commit -q -m init") != 0) {
+        th_rmtree(tmpdir);
         FAIL("git fixture setup failed");
     }
 
@@ -3067,8 +3057,7 @@ TEST(watcher_dirty_content_change_retriggered) {
     ASSERT_EQ(index_call_count, 0);
 
     /* First edit — dirty file.txt only; porcelain = " M file.txt" */
-    snprintf(cmd, sizeof(cmd), "echo 'edit-A' >> '%s/file.txt'", tmpdir);
-    system(cmd);
+    ASSERT_EQ(th_append_file(file_path, "edit-A\n"), 0);
     cbm_watcher_touch(w, "dcc-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1); /* first dirty detection */
@@ -3080,8 +3069,7 @@ TEST(watcher_dirty_content_change_retriggered) {
 
     /* Second edit — also dirty file2.txt; porcelain now has two modified files
      * → different hash → must trigger a second reindex */
-    snprintf(cmd, sizeof(cmd), "echo 'edit-B' >> '%s/file2.txt'", tmpdir);
-    system(cmd);
+    ASSERT_EQ(th_append_file(file2_path, "edit-B\n"), 0);
     cbm_watcher_touch(w, "dcc-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 2); /* new dirty hash → second reindex */
@@ -3093,8 +3081,7 @@ TEST(watcher_dirty_content_change_retriggered) {
 
     cbm_watcher_free(w);
     cbm_store_close(store);
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -3112,25 +3099,20 @@ TEST(watcher_watch_path_change_resets_state) {
         FAIL("cbm_mkdtemp failed for fixture B");
     }
 
-    char cmd[512];
-    /* Init repo A */
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'repoA' > a.txt && "
-             "git add a.txt && git commit -q -m 'init-A'",
-             tmpdirA);
-    if (system(cmd) != 0) {
+    char path_a[512];
+    char path_b[512];
+    /* Init repo A. */
+    if (wt_git(tmpdirA, "init -q") != 0 ||
+        th_write_file(wt_path(path_a, sizeof(path_a), tmpdirA, "a.txt"), "repoA\n") != 0 ||
+        wt_git(tmpdirA, "add a.txt") != 0 || wt_git(tmpdirA, "commit -q -m init-A") != 0) {
         th_rmtree(tmpdirA);
         th_rmtree(tmpdirB);
         FAIL("git fixture A setup failed");
     }
     /* Init repo B (already clean — nothing to detect after baseline) */
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'repoB' > b.txt && "
-             "git add b.txt && git commit -q -m 'init-B'",
-             tmpdirB);
-    if (system(cmd) != 0) {
+    if (wt_git(tmpdirB, "init -q") != 0 ||
+        th_write_file(wt_path(path_b, sizeof(path_b), tmpdirB, "b.txt"), "repoB\n") != 0 ||
+        wt_git(tmpdirB, "add b.txt") != 0 || wt_git(tmpdirB, "commit -q -m init-B") != 0) {
         th_rmtree(tmpdirA);
         th_rmtree(tmpdirB);
         FAIL("git fixture B setup failed");
@@ -3149,8 +3131,7 @@ TEST(watcher_watch_path_change_resets_state) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make A dirty and trigger reindex so state has accumulated head+hash */
-    snprintf(cmd, sizeof(cmd), "echo 'dirty-A' >> '%s/a.txt'", tmpdirA);
-    system(cmd);
+    ASSERT_EQ(th_append_file(path_a, "dirty-A\n"), 0);
     cbm_watcher_touch(w, "project-X");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
@@ -3169,16 +3150,15 @@ TEST(watcher_watch_path_change_resets_state) {
     ASSERT_EQ(index_call_count, 1); /* B is clean */
 
     /* Now dirty B → detect */
-    snprintf(cmd, sizeof(cmd), "echo 'dirty-B' >> '%s/b.txt'", tmpdirB);
-    system(cmd);
+    ASSERT_EQ(th_append_file(path_b, "dirty-B\n"), 0);
     cbm_watcher_touch(w, "project-X");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 2); /* B's dirty state detected */
 
     cbm_watcher_free(w);
     cbm_store_close(store);
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", tmpdirA, tmpdirB);
-    system(cmd);
+    th_rmtree(tmpdirA);
+    th_rmtree(tmpdirB);
     PASS();
 }
 
@@ -3189,15 +3169,11 @@ TEST(watcher_watch_idempotent) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "cd '%s' && git init -q && git config user.email test@test && "
-             "git config user.name test && echo 'hello' > file.txt && "
-             "git add file.txt && git commit -q -m 'init'",
-             tmpdir);
-    if (system(cmd) != 0) {
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-        system(cmd);
+    char file_path[512];
+    if (wt_git(tmpdir, "init -q") != 0 ||
+        th_write_file(wt_path(file_path, sizeof(file_path), tmpdir, "file.txt"), "hello\n") != 0 ||
+        wt_git(tmpdir, "add file.txt") != 0 || wt_git(tmpdir, "commit -q -m init") != 0) {
+        th_rmtree(tmpdir);
         FAIL("git fixture setup failed");
     }
 
@@ -3213,8 +3189,7 @@ TEST(watcher_watch_idempotent) {
     ASSERT_EQ(index_call_count, 0);
 
     /* Make dirty and trigger reindex */
-    snprintf(cmd, sizeof(cmd), "echo 'dirty' >> '%s/file.txt'", tmpdir);
-    system(cmd);
+    ASSERT_EQ(th_append_file(file_path, "dirty\n"), 0);
     cbm_watcher_touch(w, "wid-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
@@ -3230,8 +3205,7 @@ TEST(watcher_watch_idempotent) {
 
     cbm_watcher_free(w);
     cbm_store_close(store);
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
-    system(cmd);
+    th_rmtree(tmpdir);
     PASS();
 }
 

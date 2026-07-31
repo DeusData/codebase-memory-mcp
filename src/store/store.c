@@ -1314,6 +1314,15 @@ bool cbm_store_backing_file_replaced(const cbm_store_t *s) {
            !cbm_file_identity_equal(&s->opened_file_identity, &current);
 }
 
+bool cbm_store_backing_file_identity(const cbm_store_t *s, uint64_t *volume, uint64_t *file_id) {
+    if (!s || !volume || !file_id || !s->db_path || !s->opened_file_identity.valid) {
+        return false;
+    }
+    *volume = s->opened_file_identity.volume;
+    *file_id = s->opened_file_identity.file;
+    return true;
+}
+
 /* Build a SQLite "file:" URI with immutable=1 from a filesystem path.
  * immutable=1 bypasses WAL and locking and reads the main DB file directly —
  * used only as a fallback for read-only filesystems where the wal-index

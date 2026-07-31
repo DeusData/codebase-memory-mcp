@@ -2506,6 +2506,10 @@ struct cbm_mcp_server {
     /* Request-thread-owned tools/list docstring. Graph workers may only mark
      * it stale atomically; they must never read, replace, or free the pointer. */
     char *query_graph_tool_description;
+    char query_graph_tool_description_project[CBM_SZ_256];
+    char *query_graph_tool_description_db_path;
+    cbm_file_identity_t query_graph_tool_description_db_identity;
+    bool query_graph_tool_description_file_backed;
     atomic_bool query_graph_tool_description_stale;
     /* Set by any publication path (any thread); drained only by the request
      * thread after it finishes writing a response. Best-effort: correctness
@@ -3055,6 +3059,58 @@ static const char *mcp_copy_schema_project_name(cbm_mcp_server_t *srv, char *out
     return written >= 0 && (size_t)written < out_size ? out : NULL;
 }
 
+static void clear_query_graph_description_identity(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    srv->query_graph_tool_description_project[0] = '\0';
+    free(srv->query_graph_tool_description_db_path);
+    srv->query_graph_tool_description_db_path = NULL;
+    memset(&srv->query_graph_tool_description_db_identity, 0,
+           sizeof(srv->query_graph_tool_description_db_identity));
+    srv->query_graph_tool_description_file_backed = false;
+}
+
+static void capture_query_graph_description_identity(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->store) {
+        return;
+    }
+    const char *db_path = cbm_store_db_path(srv->store);
+    char project[CBM_SZ_256];
+    const char *selected = mcp_copy_schema_project_name(srv, project, sizeof(project));
+    clear_query_graph_description_identity(srv);
+    if (selected) {
+        int project_length =
+            snprintf(srv->query_graph_tool_description_project,
+                     sizeof(srv->query_graph_tool_description_project), "%s", selected);
+        if (project_length < 0 ||
+            (size_t)project_length >= sizeof(srv->query_graph_tool_description_project)) {
+            clear_query_graph_description_identity(srv);
+            return;
+        }
+    }
+    /* Process-owned in-memory stores have no external generation to probe.
+     * Their existing atomic mutation invalidation remains O(1), so retaining
+     * the project name is enough to keep repeated tools/list calls cached. */
+    if (!db_path) {
+        return;
+    }
+    /* Keep the backing kind even if metadata capture fails. Treating an
+     * unidentifiable file-backed store as process-owned would cache its schema
+     * forever; an invalid identity instead makes the next relist rebuild. */
+    srv->query_graph_tool_description_file_backed = true;
+    char *db_path_copy = heap_strdup(db_path);
+    uint64_t db_volume = 0;
+    uint64_t db_file = 0;
+    if (!db_path_copy || !cbm_store_backing_file_identity(srv->store, &db_volume, &db_file)) {
+        free(db_path_copy);
+        return;
+    }
+    srv->query_graph_tool_description_db_path = db_path_copy;
+    srv->query_graph_tool_description_db_identity =
+        (cbm_file_identity_t){.volume = db_volume, .file = db_file, .valid = true};
+}
+
 /* Build the query_graph docstring once per published graph state. It belongs in
  * MCP tools/list so reconnects and relists can restore actionable schema after
  * context compaction; it must never be appended to tools/call results. Full
@@ -3169,22 +3225,44 @@ static const char *query_graph_tool_description(cbm_mcp_server_t *srv, const too
     }
     if (srv->query_graph_tool_description) {
         /* A sibling CLI/MCP/HTTP worker cannot flip this process's stale bit.
-         * Probe the cached query-only store's stable file identity on each
-         * relist so an atomic database replacement invalidates the inline
-         * schema before it is served. resolve_store is O(1) on the unchanged
-         * fast path and closes/reopens only on this request-owning thread. */
+         * Compare the cached database's stable file identity on each relist so
+         * atomic replacement invalidates the inline schema before it is served.
+         * This O(path bytes) probe keeps no SQLite handle pinned between
+         * requests and avoids reopening the database when the generation is
+         * unchanged; replacement alone takes the slower reopen/schema path.
+         * Process-owned in-memory descriptions have no external generation
+         * and retain the existing O(1) atomic-invalidation path. */
         char project_buf[CBM_SZ_256];
         const char *project = mcp_copy_schema_project_name(srv, project_buf, sizeof(project_buf));
-        if (project) {
-            (void)resolve_store(srv, project);
+        cbm_file_identity_t current_identity = {0};
+        bool same_project =
+            (!project && srv->query_graph_tool_description_project[0] == '\0') ||
+            (project && strcmp(project, srv->query_graph_tool_description_project) == 0);
+        bool process_owned_store = same_project && !srv->query_graph_tool_description_file_backed;
+        bool unchanged =
+            process_owned_store ||
+            (same_project && srv->query_graph_tool_description_db_identity.valid &&
+             srv->query_graph_tool_description_db_path &&
+             cbm_file_identity_read(srv->query_graph_tool_description_db_path, &current_identity) &&
+             cbm_file_identity_equal(&srv->query_graph_tool_description_db_identity,
+                                     &current_identity));
+        if (!unchanged) {
+            atomic_store(&srv->query_graph_tool_description_stale, true);
+            if (project) {
+                (void)resolve_store(srv, project);
+            }
         }
     }
     if (atomic_exchange(&srv->query_graph_tool_description_stale, false)) {
         free(srv->query_graph_tool_description);
         srv->query_graph_tool_description = NULL;
+        clear_query_graph_description_identity(srv);
     }
     if (!srv->query_graph_tool_description) {
         srv->query_graph_tool_description = build_query_graph_tool_description(srv, tool_def);
+        if (srv->query_graph_tool_description) {
+            capture_query_graph_description_identity(srv);
+        }
     }
     return srv->query_graph_tool_description ? srv->query_graph_tool_description
                                              : tool_def->description;
@@ -3622,6 +3700,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     free(srv->query_graph_tool_description);
+    clear_query_graph_description_identity(srv);
     free(srv->allowed_root);
     free(srv->active_request_id_str);
     cbm_mutex_destroy(&srv->request_scope_mutex);
@@ -14543,6 +14622,7 @@ typedef enum {
     SEARCH_CODE_SCAN_RECURSIVE_GREP = 0,
     SEARCH_CODE_SCAN_FILELIST_GREP = 1,
     SEARCH_CODE_SCAN_GIT_GREP = 2,
+    SEARCH_CODE_SCAN_EXACT_PATH = 3,
 } search_code_scan_mode_t;
 
 /* Return true when git can operate on root_path as a worktree. This is a
@@ -14584,6 +14664,13 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
         const char *ignore_case = case_sensitive ? "" : " -i";
         n = snprintf(cmd, cmd_sz, "git -C \"%s\" grep -n%s --untracked %s -f \"%s\" -- . 2>NUL",
                      root_path, ignore_case, git_flag, tmpfile);
+    } else if (scan_mode == SEARCH_CODE_SCAN_EXACT_PATH) {
+        n = snprintf(
+            cmd, cmd_sz,
+            "powershell -Command \"Select-String -LiteralPath '%s' -Pattern "
+            "(Get-Content -Encoding UTF8 -LiteralPath '%s')%s%s -ErrorAction SilentlyContinue "
+            "| ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+            root_path, tmpfile, simple_match, case_match);
     } else if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
         /* #687: PowerShell consumes newline-delimited literal paths; unlike
          * cmd/xargs, spaces remain part of a single filename. */
@@ -15027,7 +15114,22 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
  * and return a dynamically-allocated grep_match_t array. */
 /* Strip root path prefix from a file path. */
 static const char *strip_root_prefix(const char *path, const char *root, size_t root_len) {
-    if (strncmp(path, root, root_len) != 0) {
+    size_t path_len = strlen(path);
+    bool root_ends_separator = root_len > 0 && root[root_len - SKIP_ONE] == '/';
+    bool boundary = root_ends_separator || root_len == path_len ||
+                    (root_len < path_len && path[root_len] == '/');
+    bool has_root = root_len <= path_len && memcmp(path, root, root_len) == 0 && boundary;
+#ifdef _WIN32
+    /* Canonical root and PowerShell normally have byte-identical UTF-8, so the
+     * O(root bytes), allocation-free path above handles every row. Preserve
+     * Windows' Unicode case-insensitive root policy as an uncommon fallback;
+     * this avoids two UTF-16 allocations per ordinary scanner hit. */
+    if (!has_root) {
+        has_root = canonical_path_has_root(root, path);
+    }
+#endif
+    /* Never strip a lexical sibling such as /repo-other. */
+    if (!has_root) {
         return path;
     }
     const char *p = path + root_len;
@@ -15038,8 +15140,8 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
 }
 
 static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_t root_len,
-                                          bool has_path_filter, cbm_regex_t *path_regex,
-                                          int grep_limit, int *out_count) {
+                                          search_code_scan_mode_t scan_mode, bool has_path_filter,
+                                          cbm_regex_t *path_regex, int grep_limit, int *out_count) {
     int gm_cap = CBM_SZ_64;
     int gm_count = 0;
     grep_match_t *gm = malloc(gm_cap * sizeof(grep_match_t));
@@ -15057,8 +15159,12 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
         /* PowerShell output uses tab as delimiter (paths may contain colons
          * on Windows, e.g. C:\dir\file). Unix grep uses colon. */
 #ifdef _WIN32
-        char sep = '\t';
+        /* PowerShell emits an explicit tab-delimited contract. git grep emits
+         * relative file:line:content rows even on Windows, so parsing every
+         * Windows scan as PowerShell silently discarded Git-worktree hits. */
+        char sep = scan_mode == SEARCH_CODE_SCAN_GIT_GREP ? ':' : '\t';
 #else
+        (void)scan_mode;
         char sep = ':';
 #endif
         char *sep1 = strchr(line, (unsigned char)sep);
@@ -15630,6 +15736,20 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
+    /* External scanners may report a resolved spelling even when the client
+     * supplied a symlinked, relative, or platform-shell spelling. Use the
+     * shared canonical path seam on every OS so traversal and prefix removal
+     * agree. This is O(path bytes) once per search. */
+    char canonical_root[CBM_PATH_MAX];
+    if (cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root))) {
+        cbm_normalize_path_sep(canonical_root);
+        char *normalized_root = heap_strdup(canonical_root);
+        if (normalized_root) {
+            free(root_path);
+            root_path = normalized_root;
+        }
+    }
+
     if (!validate_search_args(root_path, file_pattern)) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
@@ -15751,6 +15871,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                 true);
         }
         grep_target = grep_root;
+        scan_mode = SEARCH_CODE_SCAN_EXACT_PATH;
     } else if (!file_pattern && search_code_git_worktree_available(root_path)) {
         scan_mode = SEARCH_CODE_SCAN_GIT_GREP;
     } else if (file_pattern &&
@@ -15812,8 +15933,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* Collect grep matches into array */
     int gm_count = 0;
-    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
-                                            &path_regex, grep_limit, &gm_count);
+    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), scan_mode,
+                                            has_path_filter, &path_regex, grep_limit, &gm_count);
     cbm_pclose(fp);
     search_scratch_close(&scratch);
 
@@ -17343,6 +17464,17 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     cbm_mem_collect();
 }
 
+/* End every server-level JSON-RPC request through one ownership boundary.
+ * Error responses are completed requests too: retaining either the nested
+ * cancellation depth or a file-backed SQLite handle after returning them
+ * makes later cancellation state incorrect and can block Windows publication.
+ * Both operations are O(1) apart from the allocator's existing collection at
+ * an actually released file-backed store. */
+static void mcp_protocol_request_scope_end(cbm_mcp_server_t *srv) {
+    release_request_store(srv);
+    cbm_mcp_server_request_scope_end(srv);
+}
+
 /* Apply the one-shot context contract after every tool dispatcher returns.
  * Handlers remain responsible only for their own payload. Rebuilding the
  * standard one-block MCP result also keeps text, structuredContent, isError,
@@ -18532,6 +18664,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             /* Error already formatted as JSON-RPC with correct id — return directly */
             CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown",
                          prof_mcp_request_total);
+            mcp_protocol_request_scope_end(srv);
             cbm_jsonrpc_request_free(&req);
             return err_out;
         }
@@ -18557,6 +18690,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
                 ((long long)(error_t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
             cbm_log_mcp_request(req.method, NULL, true, error_dur_us);
             CBM_PROF_END("mcp_request_total", req.method, prof_mcp_request_total);
+            mcp_protocol_request_scope_end(srv);
             cbm_jsonrpc_request_free(&req);
             return error;
         }
@@ -18591,6 +18725,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             free(tool_name);
             free(tool_args);
             CBM_PROF_END("mcp_request_total", req.method, prof_mcp_request_total);
+            mcp_protocol_request_scope_end(srv);
             cbm_jsonrpc_request_free(&req);
             return err;
         }
@@ -18642,7 +18777,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
         cbm_log_mcp_request(req.method, NULL, true, dur_us);
-        cbm_mcp_server_request_scope_end(srv);
+        mcp_protocol_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
     }
@@ -18655,6 +18790,13 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_log_mcp_request(req.method, NULL, false, dur_us);
     }
 
+    /* tools/list and resources/read can resolve a file-backed project store
+     * just like tools/call. Release it after their payload is fully materialized
+     * so every protocol surface obeys the request-scoped ownership contract;
+     * on Windows this also permits an index worker to atomically publish the
+     * next database generation. Embedded/in-memory stores remain process-owned. */
+    mcp_protocol_request_scope_end(srv);
+
     cbm_jsonrpc_response_t resp = {
         .id = req.id,
         .id_str = req.id_str,
@@ -18665,7 +18807,6 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     char *out = cbm_jsonrpc_format_response(&resp);
     CBM_PROF_END("mcp_request", "format_response", prof_mcp_response_format);
     free(result_json);
-    cbm_mcp_server_request_scope_end(srv);
     CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown", prof_mcp_request_total);
     cbm_jsonrpc_request_free(&req);
     return out;
