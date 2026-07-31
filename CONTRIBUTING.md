@@ -145,7 +145,7 @@ src/
   watcher/          Git-based background auto-sync
   cli/              CLI subcommands (install, update, uninstall, config)
   ui/               Graph visualization HTTP server (first-party httpd)
-internal/cbm/       Tree-sitter AST extraction (64 languages, vendored C grammars)
+internal/cbm/       Language registry, AST extraction, and vendored grammars
 vendored/           sqlite3, yyjson, mimalloc, xxhash, tre, nomic
 graph-ui/           React/Three.js frontend for graph visualization
 scripts/            Build, test, lint, security audit scripts

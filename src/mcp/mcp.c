@@ -38,6 +38,7 @@ enum {
     MCP_TOOLS_PAGE_SIZE = 8,
     MCP_PROJECTS_PAGE_SIZE = 50,
     MCP_PROJECTS_PAGE_MAX = 200,
+    MCP_HELP_TOOLS_WRAP_COL = 74, /* --help tool list stays readable on 80-col terminals */
     MCP_MAX_CROSS_REPO_TARGETS = 4096,
 };
 #define MCP_MS_TO_US 1000LL
@@ -99,6 +100,7 @@ enum {
 #include <yyjson/yyjson.h>
 #include <ctype.h>
 #include <limits.h> // INT_MIN, INT_MAX
+#include <stdarg.h> // va_list, for the bounded help-list appender
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -1037,6 +1039,9 @@ static const tool_def_t TOOLS[] = {
      "(gitignore/.cbmignore/skip-lists) — by design, not failures.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
+     "\"project\":{\"type\":\"string\",\"description\":"
+     "\"Existing indexed project name whose stored repository path should be re-indexed. "
+     "Pass repo_path instead when indexing a repository for the first time.\"},"
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"full\",\"moderate\",\"fast\",\"cross-repo-intelligence\"],"
      "\"default\":\"full\",\"description\":\"All modes run type-aware LSP call/usage "
@@ -1077,7 +1082,9 @@ static const tool_def_t TOOLS[] = {
                                                              "default; json returns legacy "
                                                              "objects. Omit to use "
                                                              "default_response_format.\"}"
-                                                             "},\"required\":[\"repo_path\"]}"},
+                                                             "},\"anyOf\":["
+                                                             "{\"required\":[\"repo_path\"]},"
+                                                             "{\"required\":[\"project\"]}]}"},
 
     {"search_graph", "Search graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Prefer this "
@@ -1399,13 +1406,11 @@ static const tool_def_t TOOLS[] = {
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
      "\"Indexed project name whose ADR data should be read or updated.\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"get returns ADRs, "
-     "update writes content, sections returns selected "
-     "sections.\"},\"content\":{\"type\":\"string\","
-     "\"description\":\"ADR markdown/content for update mode.\"},"
-     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Section "
-     "names to return in sections mode.\"}},\"required\":[\"project\"]"
-     "}"},
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"update replaces "
+     "the entire ADR document; sections only lists existing "
+     "headings\"},\"content\":{\"type\":\"string\",\"description\":\"Complete replacement document "
+     "required by update\"}},\"additionalProperties\":false,"
+     "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces",
      "Accept runtime trace events and report the event count. Graph edge creation from traces is "
@@ -1474,6 +1479,12 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
      "},\"required\":[\"qualified_name\"]}"},
 };
 static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STREAMLINED_TOOLS[0]);
+
+/* Streamlined protocol tools that are callable but do not need a separate
+ * tool_def_t because their schema is a fixed empty object. */
+static const char *const HELP_ONLY_TOOL_NAMES[] = {"_hidden_tools"};
+static const int HELP_ONLY_TOOL_COUNT =
+    (int)(sizeof(HELP_ONLY_TOOL_NAMES) / sizeof(HELP_ONLY_TOOL_NAMES[0]));
 
 static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 static const char MCP_HIDDEN_TOOL_INPUT_SCHEMA[] = "{\"type\":\"object\",\"properties\":{}}";
@@ -1616,6 +1627,77 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
         }
     }
     return NULL;
+}
+
+/* Registry enumeration used by top-level CLI help. Include the classic
+ * registry, streamlined-only aliases, and the streamlined reveal tool so help
+ * remains a lossless description of callable surfaces. O(1) per lookup. */
+int cbm_mcp_tool_count(void) {
+    return TOOL_COUNT + STREAMLINED_TOOL_COUNT + HELP_ONLY_TOOL_COUNT;
+}
+
+const char *cbm_mcp_tool_name(int index) {
+    if (index < 0) {
+        return NULL;
+    }
+    if (index < TOOL_COUNT) {
+        return TOOLS[index].name;
+    }
+    index -= TOOL_COUNT;
+    if (index < STREAMLINED_TOOL_COUNT) {
+        return STREAMLINED_TOOLS[index].name;
+    }
+    index -= STREAMLINED_TOOL_COUNT;
+    return index < HELP_ONLY_TOOL_COUNT ? HELP_ONLY_TOOL_NAMES[index] : NULL;
+}
+
+/* Append at out[len] and return bytes actually written. vsnprintf returns the
+ * length it would have written, so clamping preserves len < cap locally even
+ * if later tool names exceed the capacity estimate. */
+static size_t help_append(char *out, size_t cap, size_t len, const char *fmt, ...) {
+    if (len + 1 >= cap) {
+        return 0;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(out + len, cap - len, fmt, args);
+    va_end(args);
+    if (written <= 0) {
+        return 0;
+    }
+    size_t room = cap - len - 1;
+    return (size_t)written > room ? room : (size_t)written;
+}
+
+/* Render every registered surface in O(N + S) time and O(S) memory, where N
+ * is the tool count and S is the total tool-name length. */
+char *cbm_mcp_tools_help_list(void) {
+    int tool_count = cbm_mcp_tool_count();
+    size_t cap = SLEN("Tools:") + 2; /* trailing newline + NUL */
+    for (int i = 0; i < tool_count; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        cap += strlen(name) + SLEN(" ,\n "); /* worst case including a wrap */
+    }
+    char *out = malloc(cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t len = help_append(out, cap, 0, "Tools:");
+    size_t col = len;
+    for (int i = 0; i < tool_count; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        const char *sep = (i + 1 < tool_count) ? "," : "";
+        size_t item = SLEN(" ") + strlen(name) + strlen(sep);
+        if (i > 0 && col + item > MCP_HELP_TOOLS_WRAP_COL) {
+            len += help_append(out, cap, len, "\n ");
+            col = 1;
+        }
+        size_t wrote = help_append(out, cap, len, " %s%s", name, sep);
+        len += wrote;
+        col += wrote;
+    }
+    (void)help_append(out, cap, len, "\n");
+    return out;
 }
 
 static bool mcp_tool_name_is_known(const char *tool_name) {
@@ -13240,6 +13322,21 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
     return rewritten;
 }
 
+/* #1211: list_projects returns names while index_repository historically
+ * required repo_path. Reuse get_project_root so path/slug/session resolution
+ * and store ownership stay centralized instead of reconstructing a DB path
+ * here. Runtime is the existing store lookup plus one project metadata row;
+ * retained memory is O(root_path bytes), owned by the caller. */
+static char *resolved_repo_path_from_project_arg(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    if (!project) {
+        return NULL;
+    }
+    char *root_path = get_project_root(srv, project);
+    free(project);
+    return root_path;
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     CBM_PROF_START(prof_index_total);
     CBM_PROF_START(prof_index_args);
@@ -13254,6 +13351,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
     cbm_normalize_path_sep(repo_path);
+
+    if (!repo_path) {
+        repo_path = resolved_repo_path_from_project_arg(srv, args);
+        cbm_normalize_path_sep(repo_path);
+    }
 
     if (!repo_path) {
         free(mode_str);
@@ -16821,6 +16923,27 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     /* Claim the per-project mutation gate only AFTER the project is resolved:
      * guarding the unresolved value would take the gate on the wrong key (or
      * skip it entirely when project arrived NULL and came from the session). */
+    /* `sections` used to be advertised as an input argument, but it was never
+     * consumed: mode=update still replaced the whole document. Reject the old
+     * shape explicitly before opening a store so a stale client cannot mistake
+     * a whole-document replacement for a section-scoped update. */
+    bool has_sections_arg = false;
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    if (args_doc) {
+        yyjson_val *args_root = yyjson_doc_get_root(args_doc);
+        has_sections_arg =
+            args_root && yyjson_is_obj(args_root) && yyjson_obj_get(args_root, "sections") != NULL;
+        yyjson_doc_free(args_doc);
+    }
+    if (has_sections_arg) {
+        free(project);
+        free(mode_str);
+        free(content);
+        return cbm_mcp_text_result(
+            "{\"status\":\"invalid_arguments\",\"error\":\"The sections argument is not an "
+            "update primitive and has been removed. No ADR write was performed.\"}",
+            true);
+    }
     bool mutation_held = false;
     if (project) {
         mutation_held = mcp_project_mutation_begin(srv, project);
@@ -16929,6 +17052,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
         if (cbm_store_adr_store(store, project, content) == CBM_STORE_OK) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
+            yyjson_mut_obj_add_str(doc, root_obj, "semantics", "whole_document_replaced");
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
             is_error = true;

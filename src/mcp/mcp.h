@@ -129,6 +129,15 @@ bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
  * NULL if the tool is unknown. Backs the CLI flag parser + per-tool --help. */
 const char *cbm_mcp_tool_input_schema(const char *tool_name);
 
+/* Registry accessors: the number of tools tools/list advertises, and the name
+ * of tool `index` (static, do not free; NULL when out of range). */
+int cbm_mcp_tool_count(void);
+const char *cbm_mcp_tool_name(int index);
+
+/* Render the top-level --help "Tools:" block from the registry so the help
+ * text cannot drift from tools/list (#1361). Heap-allocated; caller frees. */
+char *cbm_mcp_tools_help_list(void);
+
 /* Format the initialize response. params_json is the raw initialize params
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);

@@ -12570,12 +12570,13 @@ void cbm_cli_print_main_help(void) {
     printf("  Conditional/explicit targets are changed only when their documented\n");
     printf("  platform, marker, or explicit existing config path is present.\n");
     printf("  Claude Desktop is an additional detected MCP-only desktop surface.\n");
-    printf("\nDefault MCP tools: search_graph, query_graph, trace_path,\n");
-    printf("  search_code, get_code, _hidden_tools\n");
-    printf("\nAdvanced and CLI-callable tools: index_repository, get_code_snippet,\n");
-    printf("  get_graph_schema, get_architecture, list_projects, delete_project,\n");
-    printf("  index_status, check_index_coverage, detect_changes, manage_adr,\n");
-    printf("  ingest_traces, index_dependencies\n");
+    /* Render from the same registry as MCP tools/list. This keeps the testable
+     * cli.c help surface synchronized as tools are added or renamed. */
+    char *tools_help = cbm_mcp_tools_help_list();
+    if (tools_help) {
+        printf("\n%s", tools_help);
+        free(tools_help);
+    }
 }
 
 double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val) {

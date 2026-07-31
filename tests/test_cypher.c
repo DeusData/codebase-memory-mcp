@@ -626,6 +626,67 @@ TEST(cypher_exec_match_all_functions) {
     PASS();
 }
 
+/* Regression: an OPTIONAL MATCH whose label matches zero nodes drove
+ * cross_join_nodes with extra_count == 0. The old allocation
+ * (bind_count * 0 + 1) reserved a single binding slot, but the OPTIONAL
+ * fallback then wrote one binding per existing row — a heap buffer overflow
+ * once the first MATCH bound more than one node (ASan: heap-buffer-overflow).
+ * The fork executor avoids that full-product allocation entirely: it grows
+ * geometrically only to the max_new working-row budget. The compatibility
+ * arithmetic for the former allocation contract is exercised independently by
+ * cypher_cross_join_alloc_rejects_overflow below.
+ * The query text is agent-controlled via the MCP query tool. */
+TEST(cypher_exec_optional_empty_label_no_overflow) {
+    cbm_store_t *s = setup_cypher_store(); /* 4 Function nodes */
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (b:NoSuchLabel) RETURN a.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    /* One row per Function, each with b left unbound (dead-code semantics). */
+    ASSERT_EQ(r.row_count, 4);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Arithmetic-boundary companion to the zero-label overflow above. Upstream's
+ * historical allocation contract sized a full node cross-join from
+ * bind_count * extra_count; as a plain int, that product could wrap past
+ * INT_MAX to a negative/garbage malloc size (the large-graph #627 failure
+ * mode). The fork executor instead caps geometric growth at max_new, while
+ * cbm_cypher_cross_join_alloc preserves and validates the former arithmetic
+ * contract in O(1) time and O(1) memory. Test that seam directly without
+ * allocating billions of bindings. */
+TEST(cypher_cross_join_alloc_rejects_overflow) {
+    enum {
+        CROSS_JOIN_INT_OVERFLOW_FACTOR = 46341,
+        NORMAL_BINDING_COUNT = 4,
+        NORMAL_EXTRA_COUNT = 3,
+    };
+    size_t n = 0;
+
+    /* 46341 * 46341 = 2147488281 > INT_MAX (2147483647): pre-fix the int product
+     * wrapped negative -> tiny malloc -> heap OOB. Now rejected. */
+    ASSERT_TRUE(cbm_cypher_cross_join_alloc(CROSS_JOIN_INT_OVERFLOW_FACTOR,
+                                           CROSS_JOIN_INT_OVERFLOW_FACTOR, false, &n) != 0);
+
+    /* A normal join still succeeds: bind_count * extra_count + 1 slots. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(NORMAL_BINDING_COUNT, NORMAL_EXTRA_COUNT, false, &n), 0);
+    ASSERT_EQ(n, (size_t)(NORMAL_BINDING_COUNT * NORMAL_EXTRA_COUNT + 1));
+
+    /* OPTIONAL with no extra nodes reserves one fallback row per binding + 1. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(NORMAL_BINDING_COUNT, 0, true, &n), 0);
+    ASSERT_EQ(n, (size_t)(NORMAL_BINDING_COUNT + 1));
+
+    /* Non-OPTIONAL with no extra nodes: just the sentinel slot. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(NORMAL_BINDING_COUNT, 0, false, &n), 0);
+    ASSERT_EQ(n, (size_t)1);
+
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4072,6 +4133,51 @@ TEST(cypher_exec_unwind_cross_product_obeys_working_row_budget) {
     PASS();
 }
 
+/* Regression: an UNWIND literal list whose element is longer than the 2KB
+ * assembly buffer used to overflow the stack. snprintf reports the length it
+ * WOULD have written, so blen ran past sizeof(buf) and the trailing
+ * buf[blen++]=']' / buf[blen]='\0' wrote out of bounds (ASan: stack-buffer-
+ * overflow). The query text is agent-controlled via the MCP query tool. */
+TEST(cypher_parse_unwind_oversized_literal_no_overflow) {
+    char query[4096];
+    char big[3000];
+    memset(big, 'a', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    snprintf(query, sizeof(query), "UNWIND [\"%s\"] AS x MATCH (f) RETURN f.name", big);
+
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(query, &q, &err);
+    /* Must not crash and must produce a NUL-terminated, in-bounds expression. */
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->unwind_expr);
+    ASSERT_STR_EQ(q->unwind_alias, "x");
+    cbm_query_free(q);
+    PASS();
+}
+
+/* Regression: many oversized elements accumulate blen well past the buffer,
+ * which also underflowed the (size_t)(cap - blen) length passed to snprintf. */
+TEST(cypher_parse_unwind_many_elements_no_overflow) {
+    /* 200 elements (~20 chars each) accumulate well past the 2KB assembly
+     * buffer, which also underflowed the (size_t)(cap - blen) length. */
+    char query[8192];
+    int off = snprintf(query, sizeof(query), "UNWIND [");
+    for (int i = 0; i < 200; i++) {
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "%s\"element_value_%d\"",
+                        i ? "," : "", i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, "] AS x MATCH (f) RETURN f.name");
+
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(query, &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->unwind_expr);
+    cbm_query_free(q);
+    PASS();
+}
+
 /* ── Issue #389 group: Cypher feature reproductions ─────────────────
  * Each asserts the CORRECT behavior; a failure reproduces the bug. */
 
@@ -4464,6 +4570,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_file_contains_pushes_down_beyond_seed_window);
     RUN_TEST(cypher_exec_output_cap_does_not_limit_predicate_scan);
     RUN_TEST(cypher_exec_match_all_functions);
+    RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
+    RUN_TEST(cypher_cross_join_alloc_rejects_overflow);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_rejects_list_index_after_function_result);
     RUN_TEST(cypher_rejects_unconsumed_trailing_tokens);
@@ -4641,6 +4749,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_unwind_empty_list_returns_no_rows);
     RUN_TEST(cypher_exec_unwind_variable_without_parameter_scope_fails_loudly);
     RUN_TEST(cypher_exec_unwind_cross_product_obeys_working_row_budget);
+    RUN_TEST(cypher_parse_unwind_oversized_literal_no_overflow);
+    RUN_TEST(cypher_parse_unwind_many_elements_no_overflow);
     RUN_TEST(cypher_wide_return_projection_bounded);
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);

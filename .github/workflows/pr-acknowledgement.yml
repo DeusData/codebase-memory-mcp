@@ -1,0 +1,67 @@
+name: PR acknowledgement
+
+# Posts one acknowledgement comment when a pull request is opened, so a
+# contributor learns the current review status immediately instead of inferring
+# it from silence.
+#
+# The message text lives in `.github/pr-acknowledgement.md`. Edit that file to
+# change what is said; blank it (or delete it) to turn acknowledgements off
+# without touching this workflow. No code change is needed to switch it.
+#
+# SECURITY — this uses `pull_request_target`, which runs against the BASE repo
+# with a token that can write. That is required: a `pull_request` trigger gives
+# fork PRs a read-only token, so commenting on exactly the contributions we most
+# want to acknowledge would fail.
+#
+# The safety rule that makes it sound: this job NEVER checks out, builds, or
+# executes pull-request code. `actions/checkout` here resolves to the base
+# commit (the default under `pull_request_target`), and it is used only to read
+# the message file out of our own tree. Do not add a `ref:` pointing at the PR
+# head, and do not add a build step. Nothing from the PR is interpolated into a
+# shell command either — the body comes from a file, and the PR number is passed
+# through the environment rather than expanded inline.
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  acknowledge:
+    runs-on: ubuntu-latest
+    # Bots do not read comments, and acknowledging our own PRs is noise.
+    if: >-
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.author_association != 'OWNER'
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Base commit only — never the PR head. See the security note above.
+          persist-credentials: false
+
+      - name: Post acknowledgement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MESSAGE_FILE=.github/pr-acknowledgement.md
+
+          if [ ! -f "$MESSAGE_FILE" ]; then
+            echo "No $MESSAGE_FILE in the base tree — acknowledgements are off."
+            exit 0
+          fi
+
+          # An empty or whitespace-only file is the documented off switch.
+          if [ -z "$(tr -d '[:space:]' < "$MESSAGE_FILE")" ]; then
+            echo "$MESSAGE_FILE is blank — acknowledgements are off."
+            exit 0
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$MESSAGE_FILE"
+          echo "Acknowledged PR #${PR_NUMBER}."

@@ -80,7 +80,15 @@ jobs:
       attest: true
 
   # ── 4. Smoke test every binary ──────────────────────────────────
+  # !cancelled() && !failure(): GitHub propagates "skipped" TRANSITIVELY down the
+  # needs graph, so with skip_tests=true a skipped `test` skipped smoke and soak
+  # too — even though `build` overrode the same condition and succeeded. Nothing
+  # failed and nothing said so; the pipeline simply carried on toward publishing
+  # artifacts that had never been smoke-tested or soaked. Every job downstream of
+  # an optional phase needs this override, or the phase being optional silently
+  # makes the phases after it optional as well.
   smoke:
+    if: ${{ !cancelled() && !failure() }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
     with:
@@ -88,7 +96,7 @@ jobs:
 
   # ── 5. Soak tests ──────────────────────────────────────────────
   soak:
-    if: ${{ inputs.soak_level != 'none' }}
+    if: ${{ !cancelled() && !failure() && inputs.soak_level != 'none' }}
     needs: [build]
     uses: ./.github/workflows/_soak.yml
     with:
@@ -97,9 +105,17 @@ jobs:
       version: ${{ inputs.version }}
 
   # ── 6. Create DRAFT release ────────────────────────────────────
+  # Requires smoke to have actually SUCCEEDED, not merely "not failed". The bare
+  # !cancelled() && !failure() form is fail-OPEN: a skipped smoke is neither
+  # cancelled nor failed, so a draft was one condition away from being cut from
+  # binaries nobody had run. soak may legitimately be 'skipped' (soak_level=none),
+  # so that one is enumerated explicitly rather than lumped in.
   release-draft:
     needs: [smoke, soak]
-    if: ${{ !cancelled() && !failure() }}
+    if: >-
+      ${{ !cancelled() && !failure()
+      && needs.smoke.result == 'success'
+      && (needs.soak.result == 'success' || needs.soak.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -249,7 +265,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
-        run: scripts/ci/append-vt-notes.sh
+        run: bash scripts/ci/append-vt-notes.sh
 
   # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
   # Wrappers in pkg/npm and pkg/pypi download the released binary at
@@ -288,7 +304,7 @@ jobs:
 
       # ── npm ──────────────────────────────────────────────────
       - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
