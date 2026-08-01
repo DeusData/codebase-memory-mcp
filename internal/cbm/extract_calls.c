@@ -2244,6 +2244,17 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                     }
                 }
             }
+            /* Python attribute calls (prior_cp.get(...)): flag as method so weak
+             * short-name resolution can be suppressed (G2 / WP-B C2), mirroring
+             * the TS/JS receiver-aware guard above. Bare calls stay false. */
+            if (ctx->language == CBM_LANG_PYTHON &&
+                strcmp(ts_node_type(node), "call") == 0) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) &&
+                    (strcmp(ts_node_type(fn), "attribute") == 0)) {
+                    call.is_method = true;
+                }
+            }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             // ObjectScript stores args under oref_method/method_args, not the

@@ -256,6 +256,16 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
 
+/* Decide whether a resolved Python call edge is weak-strategy same-name noise to
+ * drop (Yui WP-B C2 / G2): true only for Python, only for weak short-name
+ * strategies (suffix_match / unique_name / field_type_hint / fuzzy), and only when
+ * (a) the call is a member call (x.get / prior_cp.get), OR (b) the bare callee is
+ * a high-fan-in generic name (get / run / execute) — e.g. a Callable parameter
+ * named `run` invoked as run(). Keeps import_map / same_module / lsp_* / etc.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_python_suppress_weak_generic_call(bool is_python, bool is_method, const char *callee_name,
+                                           const char *strategy);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

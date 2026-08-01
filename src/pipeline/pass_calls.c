@@ -421,7 +421,7 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         return;
     }
     if (suppress_plain_calls) {
-        return; /* weak TS/JS member-call match with an unresolved receiver (#606) */
+        return; /* weak TS/JS or Python same-name match (#606 / G2) */
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
@@ -585,6 +585,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
     bool tsjs_drop_plain_call =
         cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+    /* Python weak same-name suppression (G2): member calls + bare get/run/execute. */
+    bool py_drop_plain_call = cbm_python_suppress_weak_generic_call(
+        lang == CBM_LANG_PYTHON, call->is_method, call->callee_name, res.strategy);
+    bool drop_plain_call = tsjs_drop_plain_call || py_drop_plain_call;
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -611,7 +615,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, tsjs_drop_plain_call);
+                         imp_count, drop_plain_call);
     return SKIP_ONE;
 }
 
