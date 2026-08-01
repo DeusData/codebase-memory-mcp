@@ -1418,16 +1418,26 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
          * Contentless FTS5 requires the special 'delete-all' command instead of
          * DELETE FROM to wipe prior rows (there's no underlying content table).
          * Falls back to plain names if cbm_camel_split is unavailable (which
-         * shouldn't happen because we always register it, but we stay defensive). */
+         * shouldn't happen because we always register it, but we stay defensive).
+         *
+         * `docstring` is pulled out of the properties JSON so prose in comments
+         * is searchable, not just identifiers. It matters most for non-English
+         * codebases: identifiers are almost always English, so a query written
+         * in the team's own language matched nothing at all before. The
+         * unicode61 tokenizer already handles non-Latin scripts. */
         CBM_PROF_START(t_fts);
         cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
         if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path, "
+                           "docstring) "
+                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path, "
+                           "COALESCE(json_extract(properties, '$.docstring'), '') "
                            "FROM nodes;") != CBM_STORE_OK) {
             cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path, "
+                           "docstring) "
+                           "SELECT id, name, qualified_name, label, file_path, "
+                           "COALESCE(json_extract(properties, '$.docstring'), '') FROM nodes;");
         }
         CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 

@@ -2769,6 +2769,18 @@ static sqlite3_destructor_type mcp_sqlite_transient(void) {
 }
 #define MCP_SQLITE_TRANSIENT (mcp_sqlite_transient())
 
+/* A byte that may sit inside a query token.  ASCII alphanumerics and '_' as
+ * before, plus every byte >= 0x80: those are UTF-8 lead/continuation bytes, so
+ * treating them as separators (the previous behaviour) silently dropped every
+ * non-Latin word from the query — a Cyrillic, Greek or CJK search reached the
+ * index as an empty match and returned unranked noise.  We do not need to
+ * decode UTF-8 here, only to keep multi-byte sequences intact: the FTS5
+ * unicode61 tokenizer applies the real word-boundary rules on both sides. */
+static int bm25_is_token_byte(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c >= 0x80;
+}
+
 static int bm25_build_match(const char *query, char *out, size_t out_size) {
     if (!query || !out || out_size < BM25_MIN_BUF) {
         return 0;
@@ -2777,16 +2789,14 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
     int tokens = 0;
     const char *p = query;
     while (*p) {
-        while (*p && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                       (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && !bm25_is_token_byte((unsigned char)*p)) {
             p++;
         }
         if (!*p) {
             break;
         }
         const char *tok_start = p;
-        while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                      (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && bm25_is_token_byte((unsigned char)*p)) {
             p++;
         }
         size_t tok_len = (size_t)(p - tok_start);

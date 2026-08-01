@@ -337,9 +337,22 @@ static int init_schema(cbm_store_t *s) {
      * Fails silently if FTS5 is not compiled in (SQLITE_ENABLE_FTS5). */
     {
         char *fts_err = NULL;
+
+        /* Schema upgrade (#docstring-fts): databases created before the
+         * `docstring` column exists carry a 4-column nodes_fts, and
+         * CREATE ... IF NOT EXISTS would leave them that way — the backfill
+         * INSERT would then fail on every index run. The table is
+         * contentless, so dropping it loses no source data: the next
+         * backfill repopulates it from `nodes`. Detect the old shape by
+         * probing the new column and drop only on failure. */
+        if (sqlite3_exec(s->db, "SELECT docstring FROM nodes_fts LIMIT 0;", NULL, NULL, NULL) !=
+            SQLITE_OK) {
+            sqlite3_exec(s->db, "DROP TABLE IF EXISTS nodes_fts;", NULL, NULL, NULL);
+        }
+
         int fts_rc = sqlite3_exec(s->db,
                                   "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5("
-                                  "  name, qualified_name, label, file_path,"
+                                  "  name, qualified_name, label, file_path, docstring,"
                                   "  content='',"
                                   "  tokenize='unicode61 remove_diacritics 2'"
                                   ");",

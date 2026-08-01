@@ -690,12 +690,16 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         rc = CBM_STORE_ERR;
     }
     if (cbm_store_exec(hash_store,
-                       "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                       "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                       "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path, "
+                       "docstring) "
+                       "SELECT id, cbm_camel_split(name), qualified_name, label, file_path, "
+                       "COALESCE(json_extract(properties, '$.docstring'), '') "
                        "FROM nodes;") != CBM_STORE_OK) {
         if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;") !=
+                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path, "
+                           "docstring) "
+                           "SELECT id, name, qualified_name, label, file_path, "
+                           "COALESCE(json_extract(properties, '$.docstring'), '') FROM nodes;") !=
             CBM_STORE_OK) {
             rc = CBM_STORE_ERR;
         }

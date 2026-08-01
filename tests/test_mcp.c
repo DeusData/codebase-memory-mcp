@@ -2203,6 +2203,68 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
+/* Identifiers are English almost everywhere, so a team that documents in its
+ * own language had no working full-text query: the docstring never reached the
+ * FTS index, and the query tokenizer dropped every non-ASCII byte on the way
+ * in.  Both halves are exercised here — a Cyrillic query must find the node
+ * whose only Cyrillic text lives in its docstring. */
+TEST(tool_search_graph_query_matches_non_ascii_docstring) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "non-ascii-doc";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/non-ascii-doc");
+
+    cbm_node_t documented = {0};
+    documented.project = proj;
+    documented.label = "Function";
+    documented.name = "handle_payment";
+    documented.qualified_name = "non-ascii-doc.src.billing.handle_payment";
+    documented.file_path = "src/billing.c";
+    documented.start_line = 1;
+    documented.end_line = 9;
+    documented.properties_json = "{\"docstring\":\"Провести платёж по счёту\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &documented), 0);
+
+    cbm_node_t undocumented = {0};
+    undocumented.project = proj;
+    undocumented.label = "Function";
+    undocumented.name = "unrelated_helper";
+    undocumented.qualified_name = "non-ascii-doc.src.util.unrelated_helper";
+    undocumented.file_path = "src/util.c";
+    undocumented.start_line = 1;
+    undocumented.end_line = 3;
+    ASSERT_GT(cbm_store_upsert_node(st, &undocumented), 0);
+
+    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    ASSERT_EQ(cbm_store_exec(st,
+                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                             "file_path, docstring) "
+                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path, "
+                             "COALESCE(json_extract(properties, '$.docstring'), '') "
+                             "FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"non-ascii-doc\",\"query\":\"платёж\",\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+    ASSERT_NOT_NULL(strstr(inner, "handle_payment"));
+    ASSERT_NULL(strstr(inner, "unrelated_helper"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Resource discovery methods this server doesn't populate must return EMPTY
  * lists, not -32601 Method-not-found: clients like Cline probe them on connect
  * and surface the errors as a failed connection (#958). */
@@ -10332,6 +10394,7 @@ SUITE(mcp) {
     RUN_TEST(tool_output_regression_gate);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(tool_search_graph_query_matches_non_ascii_docstring);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
