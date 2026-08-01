@@ -188,7 +188,9 @@ static int write_test_file(const char *path, const char *content) {
 /* Helper: read a file into static buffer */
 static const char *read_test_file(const char *path) {
     static char buf[8192];
-    FILE *f = fopen(path, "r");
+    /* Exercise the production UTF-8 path seam: O(path bytes) runtime work,
+     * latency, and transient memory on Windows; direct fopen on POSIX. */
+    FILE *f = cbm_fopen(path, "r");
     if (!f)
         return NULL;
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -198,7 +200,7 @@ static const char *read_test_file(const char *path) {
 }
 
 static char *read_test_file_alloc(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f)
         return NULL;
     if (fseek(f, 0, SEEK_END) != 0) {
@@ -12274,8 +12276,7 @@ static void cli_env_restore(cli_env_snapshot_t *snap) {
 }
 
 static int test_path_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
+    return cbm_file_exists(path);
 }
 
 static char *make_overlong_nested_path(const char *base, const char *leaf) {
