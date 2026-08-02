@@ -3456,11 +3456,11 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
                 mcp_tool_allowed(srv ? srv->tool_profile : CBM_MCP_TOOL_PROFILE_ALL,
                                  TOOLS[i].name) &&
                 mcp_tool_page_accept(&page)) {
-                const char *description = strcmp(TOOLS[i].name, "query_graph") == 0
-                                              ? query_graph_catalog_description(
-                                                    srv, &TOOLS[i],
-                                                    &stateless_query_graph_description)
-                                              : NULL;
+                const char *description =
+                    strcmp(TOOLS[i].name, "query_graph") == 0
+                        ? query_graph_catalog_description(srv, &TOOLS[i],
+                                                          &stateless_query_graph_description)
+                        : NULL;
                 emit_tool(doc, tools, &TOOLS[i], description);
             }
         }
@@ -3485,11 +3485,11 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
                                  TOOLS[i].name) &&
                 (reveal_hidden || cbm_mcp_tool_config_enabled(srv, TOOLS[i].name))) {
                 if (mcp_tool_page_accept(&page)) {
-                    const char *description = strcmp(TOOLS[i].name, "query_graph") == 0
-                                                  ? query_graph_catalog_description(
-                                                        srv, &TOOLS[i],
-                                                        &stateless_query_graph_description)
-                                                  : NULL;
+                    const char *description =
+                        strcmp(TOOLS[i].name, "query_graph") == 0
+                            ? query_graph_catalog_description(srv, &TOOLS[i],
+                                                              &stateless_query_graph_description)
+                            : NULL;
                     emit_tool(doc, tools, &TOOLS[i], description);
                 }
             }
@@ -3539,11 +3539,11 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
             if (mcp_tool_allowed(srv ? srv->tool_profile : CBM_MCP_TOOL_PROFILE_ALL,
                                  TOOLS[i].name) &&
                 mcp_tool_page_accept(&page)) {
-                const char *description = strcmp(TOOLS[i].name, "query_graph") == 0
-                                              ? query_graph_catalog_description(
-                                                    srv, &TOOLS[i],
-                                                    &stateless_query_graph_description)
-                                              : NULL;
+                const char *description =
+                    strcmp(TOOLS[i].name, "query_graph") == 0
+                        ? query_graph_catalog_description(srv, &TOOLS[i],
+                                                          &stateless_query_graph_description)
+                        : NULL;
                 emit_tool(doc, tools, &TOOLS[i], description);
             }
         }
@@ -7696,9 +7696,10 @@ static const char **semantic_keywords_allocate(size_t keyword_count) {
  * exact search, with O(Q) transient pointer memory and no capability-changing
  * keyword cap. Results are published atomically and must be freed whenever
  * non-NULL, even when the count is zero. */
-static semantic_query_status_t run_semantic_query_core(
-    const char *args, cbm_store_t *store, const char *project, int limit,
-    cbm_vector_result_t **out_vresults, int *out_vcount, bool *out_present) {
+static semantic_query_status_t run_semantic_query_core(const char *args, cbm_store_t *store,
+                                                       const char *project, int limit,
+                                                       cbm_vector_result_t **out_vresults,
+                                                       int *out_vcount, bool *out_present) {
     *out_vresults = NULL;
     *out_vcount = 0;
     if (out_present) {
@@ -7708,7 +7709,7 @@ static semantic_query_status_t run_semantic_query_core(
     if (!args_doc) {
         return SEMANTIC_QUERY_RESOURCE_ERROR;
     }
-    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    yyjson_val *args_root = yyjson_doc_get_root(args_doc);
     yyjson_val *sq_val = args_root ? yyjson_obj_get(args_root, "semantic_query") : NULL;
     if (out_present && sq_val) {
         *out_present = true;
@@ -7718,8 +7719,7 @@ static semantic_query_status_t run_semantic_query_core(
         status = SEMANTIC_QUERY_INVALID_INPUT;
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
         size_t keyword_count = yyjson_arr_size(sq_val);
-        if (keyword_count > (size_t)INT_MAX ||
-            keyword_count > SIZE_MAX / sizeof(const char *)) {
+        if (keyword_count > (size_t)INT_MAX || keyword_count > SIZE_MAX / sizeof(const char *)) {
             status = SEMANTIC_QUERY_RESOURCE_ERROR;
         } else {
             const char **keywords = semantic_keywords_allocate(keyword_count);
@@ -7790,9 +7790,10 @@ static char *semantic_query_error_response(semantic_query_status_t status, cbm_s
         true);
 }
 
-static semantic_query_status_t run_semantic_query(
-    yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args, cbm_store_t *store,
-    const char *project, int limit, bool *out_present, int *out_count) {
+static semantic_query_status_t run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                                  const char *args, cbm_store_t *store,
+                                                  const char *project, int limit, bool *out_present,
+                                                  int *out_count) {
     cbm_vector_result_t *vresults = NULL;
     int vcount = 0;
     bool present = false;
@@ -7976,7 +7977,7 @@ static char *append_semantic_query_to_json(const char *base_json, const char *ar
     }
     yyjson_doc *doc = yyjson_read(base_json, strlen(base_json), 0);
     if (!doc) {
-        if (status && semantic_present) {
+        if (status) {
             *status = SEMANTIC_QUERY_RESOURCE_ERROR;
         }
         return NULL;
@@ -7984,7 +7985,7 @@ static char *append_semantic_query_to_json(const char *base_json, const char *ar
     yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
     if (!mdoc) {
         yyjson_doc_free(doc);
-        if (status && semantic_present) {
+        if (status) {
             *status = SEMANTIC_QUERY_RESOURCE_ERROR;
         }
         return NULL;
@@ -7993,7 +7994,7 @@ static char *append_semantic_query_to_json(const char *base_json, const char *ar
     yyjson_doc_free(doc);
     if (!root) {
         yyjson_mut_doc_free(mdoc);
-        if (status && semantic_present) {
+        if (status) {
             *status = SEMANTIC_QUERY_RESOURCE_ERROR;
         }
         return NULL;

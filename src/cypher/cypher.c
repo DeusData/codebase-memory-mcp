@@ -22,9 +22,9 @@ enum {
     CYP_MAX_TOKEN = 10, /* max token lookahead */
     CYP_PAIR = 2,
     CYP_TRIPLE = 3,
-    CYP_INIT_CAP4 = 4, /* initial small array capacity */
+    CYP_INIT_CAP4 = 4,             /* initial small array capacity */
     CYP_JSON_CONTROL_LIMIT = 0x20, /* JSON escapes bytes below U+0020 */
-    CYP_INIT_CAP8 = 8, /* initial medium array capacity */
+    CYP_INIT_CAP8 = 8,             /* initial medium array capacity */
     /* Keep common bindings allocation-free. Wider queries spill into geometric
      * overflow storage instead of silently losing variables. */
     CYP_INLINE_NODE_VARS = 16,
@@ -283,8 +283,7 @@ static void lex_set_error(cbm_lex_result_t *r, const char *message) {
  * retains O(T) token metadata for T tokens. Overflow/OOM leaves the old owner
  * intact and aborts the entire lex rather than publishing a partial token. */
 static bool lex_reserve_token(cbm_lex_result_t *r) {
-    if (!r || r->failed || r->count < 0 || r->capacity < 0 ||
-        r->count > INT_MAX - SKIP_ONE) {
+    if (!r || r->failed || r->count < 0 || r->capacity < 0 || r->count > INT_MAX - SKIP_ONE) {
         lex_set_error(r, "Cypher token count is too large to represent");
         return false;
     }
@@ -298,9 +297,8 @@ static bool lex_reserve_token(cbm_lex_result_t *r) {
         lex_set_error(r, "Cypher token storage is too large to represent");
         return false;
     }
-    cbm_token_t *grown =
-        lex_realloc(CYP_LEX_ALLOC_TOKEN_ARRAY, r->tokens,
-                    (size_t)next_capacity * sizeof(*r->tokens));
+    cbm_token_t *grown = lex_realloc(CYP_LEX_ALLOC_TOKEN_ARRAY, r->tokens,
+                                     (size_t)next_capacity * sizeof(*r->tokens));
     if (!grown) {
         lex_set_error(r, "out of memory growing Cypher token storage");
         return false;
@@ -1729,8 +1727,7 @@ static const char *parse_value_literal(parser_t *p) {
                 return NULL;
             }
             const char *parts[] = {v->text, ".", pr->text};
-            const char *joined =
-                cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
+            const char *joined = cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
             if (!joined) {
                 snprintf(p->error, sizeof(p->error), "could not allocate CASE value reference");
             }
@@ -1844,8 +1841,7 @@ static bool is_exact_string_value_func(const char *function) {
 }
 
 static bool is_numeric_bool_value_func(const char *function) {
-    return function && (strcmp(function, "toInteger") == 0 ||
-                        strcmp(function, "toFloat") == 0 ||
+    return function && (strcmp(function, "toInteger") == 0 || strcmp(function, "toFloat") == 0 ||
                         strcmp(function, "toBoolean") == 0);
 }
 
@@ -2179,8 +2175,7 @@ static bool order_expression_is_projected(const cbm_return_clause_t *r, const ch
         }
         if (item->func) {
             const char *parts[] = {item->func, "(", item->variable ? item->variable : "", ")"};
-            if (cypher_text_equals_parts(expression, parts,
-                                         sizeof(parts) / sizeof(parts[0]))) {
+            if (cypher_text_equals_parts(expression, parts, sizeof(parts) / sizeof(parts[0]))) {
                 return true;
             }
         } else if (item->kase) {
@@ -2189,8 +2184,7 @@ static bool order_expression_is_projected(const cbm_return_clause_t *r, const ch
             }
         } else if (item->property) {
             const char *parts[] = {item->variable, ".", item->property};
-            if (cypher_text_equals_parts(expression, parts,
-                                         sizeof(parts) / sizeof(parts[0]))) {
+            if (cypher_text_equals_parts(expression, parts, sizeof(parts) / sizeof(parts[0]))) {
                 return true;
             }
         } else if (item->variable) {
@@ -2360,8 +2354,7 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
 
     while (check(p, TOK_DASH) || check(p, TOK_LT)) {
         if (pat->rel_count >= rel_cap) {
-            cbm_rel_pattern_t *grown =
-                parse_grow_zeroed(pat->rels, &rel_cap, sizeof(*pat->rels));
+            cbm_rel_pattern_t *grown = parse_grow_zeroed(pat->rels, &rel_cap, sizeof(*pat->rels));
             if (!grown) {
                 snprintf(p->error, sizeof(p->error),
                          "MATCH relationship list is too large or out of memory");
@@ -2873,7 +2866,7 @@ typedef struct {
     bool var_name_owned[CYP_INLINE_NODE_VARS];   /* WITH aliases are heap-owned */
     bool var_is_null[CYP_INLINE_NODE_VARS];      /* projected null differs from an empty string */
     cypher_value_kind_t var_kinds[CYP_INLINE_NODE_VARS]; /* projected logical type */
-    cbm_node_t var_nodes[CYP_INLINE_NODE_VARS];  /* node data */
+    cbm_node_t var_nodes[CYP_INLINE_NODE_VARS];          /* node data */
     binding_node_overflow_t *var_overflow;
     int var_overflow_capacity;
     int var_count;
@@ -3384,8 +3377,7 @@ static cypher_json_prop_status_t cypher_json_property_view(const char *json, con
         }
         const char *member_key = cursor + SKIP_ONE;
         size_t member_key_length = (size_t)(key_end - member_key);
-        bool matches = member_key_length == key_length &&
-                       memcmp(member_key, key, key_length) == 0;
+        bool matches = member_key_length == key_length && memcmp(member_key, key, key_length) == 0;
         cursor = cypher_json_skip_ws(key_end + SKIP_ONE);
         if (*cursor++ != ':') {
             return CYP_JSON_PROP_INVALID;
@@ -3393,7 +3385,6 @@ static cypher_json_prop_status_t cypher_json_property_view(const char *json, con
         cursor = cypher_json_skip_ws(cursor);
         const char *value_start = cursor;
         const char *value_end = NULL;
-        bool is_null = false;
         cypher_value_kind_t kind = CYP_VALUE_STRING;
         if (*cursor == '"') {
             const char *string_end = cypher_json_string_end(cursor);
@@ -3444,9 +3435,9 @@ static cypher_json_prop_status_t cypher_json_property_view(const char *json, con
                 cursor++;
             }
             value_end = cursor;
-            is_null = (size_t)(value_end - value_start) == sizeof("null") - SKIP_ONE &&
-                      memcmp(value_start, "null", sizeof("null") - SKIP_ONE) == 0;
             size_t raw_length = (size_t)(value_end - value_start);
+            bool is_null = raw_length == sizeof("null") - SKIP_ONE &&
+                           memcmp(value_start, "null", sizeof("null") - SKIP_ONE) == 0;
             if (is_null) {
                 kind = CYP_VALUE_NULL;
             } else if ((raw_length == sizeof("true") - SKIP_ONE &&
@@ -3463,8 +3454,8 @@ static cypher_json_prop_status_t cypher_json_property_view(const char *json, con
             }
         }
         if (matches) {
-            cypher_value_set_borrowed_kind(value, value_start,
-                                           (size_t)(value_end - value_start), kind);
+            cypher_value_set_borrowed_kind(value, value_start, (size_t)(value_end - value_start),
+                                           kind);
             return CYP_JSON_PROP_FOUND;
         }
         cursor = cypher_json_skip_ws(cursor);
@@ -3534,8 +3525,8 @@ static const char *node_prop_ex(const cbm_node_t *n, const char *prop, cbm_store
     static _Thread_local int buf_idx = 0;
     char *out = bufs[buf_idx];
     buf_idx = (buf_idx + SKIP_ONE) % CYP_BUF_8;
-    size_t copy_length = value.length < CBM_SZ_512 - SKIP_ONE ? value.length
-                                                               : CBM_SZ_512 - SKIP_ONE;
+    size_t copy_length =
+        value.length < CBM_SZ_512 - SKIP_ONE ? value.length : CBM_SZ_512 - SKIP_ONE;
     memcpy(out, value.data, copy_length);
     out[copy_length] = '\0';
     cypher_value_free(&value);
@@ -3582,8 +3573,7 @@ static void node_prop_value(const cbm_node_t *n, const char *prop, cbm_store_t *
         } else {
             cbm_store_node_degree(store, n->id, &in_degree, &out_degree);
         }
-        cypher_value_set_int(value,
-                             strcmp(prop, "in_degree") == 0 ? in_degree : out_degree);
+        cypher_value_set_int(value, strcmp(prop, "in_degree") == 0 ? in_degree : out_degree);
         return;
     }
     if (n->properties_json && n->properties_json[0] == '{') {
@@ -3645,8 +3635,8 @@ static const char *edge_prop_ex(const cbm_edge_t *e, const char *prop, bool *is_
     static CBM_TLS char ebufs[CYP_BUF_8][CBM_SZ_512];
     static CBM_TLS int ebuf_idx = 0;
     char *buf = ebufs[ebuf_idx++ & CYP_EBUF_MASK];
-    size_t copy_length = value.length < CBM_SZ_512 - SKIP_ONE ? value.length
-                                                               : CBM_SZ_512 - SKIP_ONE;
+    size_t copy_length =
+        value.length < CBM_SZ_512 - SKIP_ONE ? value.length : CBM_SZ_512 - SKIP_ONE;
     memcpy(buf, value.data, copy_length);
     buf[copy_length] = '\0';
     cypher_value_free(&value);
@@ -3980,8 +3970,8 @@ static bool eval_comparison_op(const char *op, cypher_value_t *actual, const cha
     if (strcmp(op, "ENDS WITH") == 0) {
         size_t expected_length = strlen(expected);
         return actual->length >= expected_length &&
-               memcmp(actual->data + actual->length - expected_length, expected,
-                      expected_length) == 0;
+               memcmp(actual->data + actual->length - expected_length, expected, expected_length) ==
+                   0;
     }
     if (strcmp(op, ">") == 0 || strcmp(op, "<") == 0 || strcmp(op, ">=") == 0 ||
         strcmp(op, "<=") == 0) {
@@ -4448,8 +4438,7 @@ enum {
     CYP_AGG_ALLOC_DISTINCT_INDEX,
 };
 #ifdef CBM_ENABLE_TEST_SEAMS
-_Static_assert((int)CBM_CYPHER_TEST_AGG_ALLOC_DISTINCT_INDEX ==
-                   CYP_AGG_ALLOC_DISTINCT_INDEX,
+_Static_assert((int)CBM_CYPHER_TEST_AGG_ALLOC_DISTINCT_INDEX == CYP_AGG_ALLOC_DISTINCT_INDEX,
                "aggregate allocation seam values must match");
 static _Thread_local bool g_cypher_force_whole_pattern_provider = false;
 static _Thread_local int g_cypher_test_agg_alloc_site = CYP_AGG_ALLOC_NONE;
@@ -4668,10 +4657,10 @@ static void binding_get_virtual_value(binding_t *b, const char *var, const char 
     for (int i = 0; i < b->var_count; i++) {
         const char *bound_name = binding_node_name_at(b, i);
         const char *property_parts[] = {var, ".", prop ? prop : ""};
-        bool matches = prop ? cypher_text_equals_parts(
-                                  bound_name, property_parts,
-                                  sizeof(property_parts) / sizeof(property_parts[0]))
-                            : strcmp(bound_name, var) == 0;
+        bool matches =
+            prop ? cypher_text_equals_parts(bound_name, property_parts,
+                                            sizeof(property_parts) / sizeof(property_parts[0]))
+                 : strcmp(bound_name, var) == 0;
         if (matches) {
             const cbm_node_t *node = binding_const_node_at(b, i);
             bool is_null = binding_node_is_null_at(b, i);
@@ -4685,7 +4674,7 @@ static void binding_get_virtual_value(binding_t *b, const char *var, const char 
     if (e) {
         /* Bare `RETURN r` on an edge: surface the full properties JSON
          * (or "{}" if none) so callers can inspect timestamps, weights,
-        * etc. without naming each property. */
+         * etc. without naming each property. */
         if (prop) {
             edge_prop_value(e, prop, value);
             return;
@@ -4722,8 +4711,8 @@ static const char *binding_get_virtual_ex(binding_t *b, const char *var, const c
     static CBM_TLS char buffers[CYP_BUF_8][CBM_SZ_512];
     static CBM_TLS int buffer_index = 0;
     char *out = buffers[buffer_index++ & CYP_EBUF_MASK];
-    size_t copy_length = value.length < CBM_SZ_512 - SKIP_ONE ? value.length
-                                                               : CBM_SZ_512 - SKIP_ONE;
+    size_t copy_length =
+        value.length < CBM_SZ_512 - SKIP_ONE ? value.length : CBM_SZ_512 - SKIP_ONE;
     memcpy(out, value.data, copy_length);
     out[copy_length] = '\0';
     cypher_value_free(&value);
@@ -4735,39 +4724,53 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
     return binding_get_virtual_ex(b, var, prop, &is_null);
 }
 
-/* Append one aggregation grouping component. Entity values group by canonical
- * store identity, not display name; scalar values use a length prefix so a
- * delimiter inside user data cannot merge otherwise distinct tuples. */
-static bool group_key_append_value(cypher_string_builder_t *key, binding_t *binding,
-                                   const char *var, bool preserve_entity_identity,
-                                   const cypher_value_t *value) {
-    char prefix[CBM_SZ_64];
-    int written = 0;
-    if (preserve_entity_identity) {
-        cbm_node_t *node = binding_get(binding, var);
-        if (node && node->id > 0) {
-            written = snprintf(prefix, sizeof(prefix), "N:%lld|", (long long)node->id);
-        } else {
-            cbm_edge_t *edge = binding_get_edge(binding, var);
-            if (edge && edge->id > 0) {
-                written = snprintf(prefix, sizeof(prefix), "E:%lld|", (long long)edge->id);
-            }
-        }
-    }
-    if (written > 0) {
-        return (size_t)written < sizeof(prefix) &&
-               cypher_string_builder_append(key, prefix, (size_t)written);
-    }
+/* Append one scalar grouping component. A length prefix prevents delimiters in
+ * user data from merging distinct tuples. Runtime and added key storage are
+ * O(V) for value bytes V, with O(1) auxiliary memory beyond the shared builder. */
+static bool group_key_append_scalar_value(cypher_string_builder_t *key,
+                                          const cypher_value_t *value) {
     if (value->is_null) {
         return cypher_string_builder_append(key, "Z|", sizeof("Z|") - SKIP_ONE);
     }
-    written = snprintf(prefix, sizeof(prefix), "V:%zu:", value->length);
+    char prefix[CBM_SZ_64];
+    int written = snprintf(prefix, sizeof(prefix), "V:%zu:", value->length);
     if (written < 0 || (size_t)written >= sizeof(prefix) ||
         !cypher_string_builder_append(key, prefix, (size_t)written) ||
         !cypher_string_builder_append(key, value->data, value->length)) {
         return false;
     }
     return cypher_string_builder_append(key, "|", sizeof("|") - SKIP_ONE);
+}
+
+/* Append one binding-aware grouping component. Bare graph entities group by
+ * canonical store identity rather than display text; other expressions reuse
+ * the exact scalar encoding above. Identity lookup is O(B) for B live binding
+ * slots and uses O(1) auxiliary memory. */
+static bool group_key_append_value(cypher_string_builder_t *key, binding_t *binding,
+                                   const char *var, bool preserve_entity_identity,
+                                   const cypher_value_t *value) {
+    if (!preserve_entity_identity) {
+        return group_key_append_scalar_value(key, value);
+    }
+    if (!binding || !var) {
+        return false;
+    }
+    char prefix[CBM_SZ_64];
+    int written = 0;
+    cbm_node_t *node = binding_get(binding, var);
+    if (node && node->id > 0) {
+        written = snprintf(prefix, sizeof(prefix), "N:%lld|", (long long)node->id);
+    } else {
+        cbm_edge_t *edge = binding_get_edge(binding, var);
+        if (edge && edge->id > 0) {
+            written = snprintf(prefix, sizeof(prefix), "E:%lld|", (long long)edge->id);
+        }
+    }
+    if (written > 0) {
+        return (size_t)written < sizeof(prefix) &&
+               cypher_string_builder_append(key, prefix, (size_t)written);
+    }
+    return group_key_append_scalar_value(key, value);
 }
 
 /* ── String function application ──────────────────────────────── */
@@ -4831,8 +4834,8 @@ static bool cypher_value_parse_number(cypher_value_t *value, yyjson_read_flag fl
         return false;
     }
     cypher_value_normalize_leading_zeroes(value, &begin, &limit);
-    const char *end = yyjson_read_number(begin, result, flags | YYJSON_READ_ALLOW_EXT_NUMBER, NULL,
-                                         NULL);
+    const char *end =
+        yyjson_read_number(begin, result, flags | YYJSON_READ_ALLOW_EXT_NUMBER, NULL, NULL);
     return end && cypher_parse_consumed_value(value, end);
 }
 
@@ -4932,10 +4935,9 @@ static void cypher_value_apply_numeric_bool_cast(const char *function, cypher_va
 
     if (strcmp(function, "toFloat") == 0) {
         yyjson_val number = {0};
-        bool converted =
-            (input_kind == CYP_VALUE_INTEGER || input_kind == CYP_VALUE_FLOAT ||
-             input_kind == CYP_VALUE_STRING) &&
-            cypher_value_parse_number(value, YYJSON_READ_NOFLAG, &number);
+        bool converted = (input_kind == CYP_VALUE_INTEGER || input_kind == CYP_VALUE_FLOAT ||
+                          input_kind == CYP_VALUE_STRING) &&
+                         cypher_value_parse_number(value, YYJSON_READ_NOFLAG, &number);
         double floating = converted ? yyjson_get_num(&number) : 0.0;
         converted = converted && isfinite(floating);
         cypher_value_free(value);
@@ -6109,7 +6111,7 @@ static bool rb_apply_distinct(result_builder_t *rb) {
             }
             cypher_value_t value;
             cypher_value_set_cstr(&value, row[column], false);
-            complete = group_key_append_value(&key, NULL, NULL, false, &value);
+            complete = group_key_append_scalar_value(&key, &value);
         }
         if (!complete) {
             break;
@@ -6754,12 +6756,10 @@ static bool aggregate_entity_key(binding_t *binding, const cbm_return_item_t *it
  * first-seen order remains available to COLLECT. Every allocation is owned or
  * rolled back before the count/index publishes the new entry. */
 static bool aggregate_value_list_add(aggregate_value_list_t *list, binding_t *binding,
-                                     const cbm_return_item_t *item,
-                                     const cypher_value_t *value, bool distinct,
-                                     bool *inserted) {
+                                     const cbm_return_item_t *item, const cypher_value_t *value,
+                                     bool distinct, bool *inserted) {
     if (!list || !binding || !item || !value || !value->data || !inserted || list->count < 0 ||
-        list->capacity < 0 || list->count > list->capacity ||
-        list->count > INT_MAX - SKIP_ONE) {
+        list->capacity < 0 || list->count > list->capacity || list->count > INT_MAX - SKIP_ONE) {
         g_cypher_allocation_failed = true;
         return false;
     }
@@ -6787,8 +6787,7 @@ static bool aggregate_value_list_add(aggregate_value_list_t *list, binding_t *bi
     }
 
     if (!has_entity_key) {
-        owned_value =
-            cypher_agg_strndup(value->data, value->length, CYP_AGG_ALLOC_VALUE_COPY);
+        owned_value = cypher_agg_strndup(value->data, value->length, CYP_AGG_ALLOC_VALUE_COPY);
         if (!owned_value) {
             g_cypher_allocation_failed = true;
             return false;
@@ -6808,8 +6807,7 @@ static bool aggregate_value_list_add(aggregate_value_list_t *list, binding_t *bi
     if (has_entity_key) {
         owned_entity_key =
             cypher_agg_strndup(entity_key, entity_key_length, CYP_AGG_ALLOC_VALUE_COPY);
-        owned_value =
-            cypher_agg_strndup(value->data, value->length, CYP_AGG_ALLOC_VALUE_COPY);
+        owned_value = cypher_agg_strndup(value->data, value->length, CYP_AGG_ALLOC_VALUE_COPY);
         if (!owned_entity_key || !owned_value) {
             free(owned_entity_key);
             free(owned_value);
@@ -6849,9 +6847,8 @@ static bool aggregate_value_list_add(aggregate_value_list_t *list, binding_t *bi
     }
 
     aggregate_value_entry_t *entry = &list->entries[list->count];
-    *entry = (aggregate_value_entry_t){.value = owned_value,
-                                       .length = value->length,
-                                       .entity_key = owned_entity_key};
+    *entry = (aggregate_value_entry_t){
+        .value = owned_value, .length = value->length, .entity_key = owned_entity_key};
     if (distinct) {
         const char *owned_key = entry->entity_key ? entry->entity_key : entry->value;
         (void)cbm_ht_set(list->distinct_index, owned_key, (void *)(uintptr_t)SKIP_ONE);
@@ -6876,7 +6873,7 @@ static bool aggregate_value_list_add(aggregate_value_list_t *list, binding_t *bi
  * JSON escape spelling. Runtime is O(length), auxiliary memory is O(1), and
  * the caller's geometric builder owns the only retained output allocation. */
 static bool cypher_string_builder_append_json_string(cypher_string_builder_t *builder,
-                                                      const char *text, size_t length) {
+                                                     const char *text, size_t length) {
     if (!builder || !text ||
         !cypher_string_builder_append(builder, "\"", sizeof("\"") - SKIP_ONE)) {
         return false;
@@ -6888,38 +6885,38 @@ static bool cypher_string_builder_append_json_string(cypher_string_builder_t *bu
         size_t escape_length = PAIR_LEN;
         char unicode_escape[sizeof("\\u00FF")];
         switch (byte) {
-            case '"':
-                escape = "\\\"";
-                break;
-            case '\\':
-                escape = "\\\\";
-                break;
-            case '\b':
-                escape = "\\b";
-                break;
-            case '\f':
-                escape = "\\f";
-                break;
-            case '\n':
-                escape = "\\n";
-                break;
-            case '\r':
-                escape = "\\r";
-                break;
-            case '\t':
-                escape = "\\t";
-                break;
-            default:
-                if (byte < CYP_JSON_CONTROL_LIMIT) {
-                    int written = snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04X",
-                                           (unsigned int)byte);
-                    if (written < 0 || (size_t)written >= sizeof(unicode_escape)) {
-                        return false;
-                    }
-                    escape = unicode_escape;
-                    escape_length = (size_t)written;
+        case '"':
+            escape = "\\\"";
+            break;
+        case '\\':
+            escape = "\\\\";
+            break;
+        case '\b':
+            escape = "\\b";
+            break;
+        case '\f':
+            escape = "\\f";
+            break;
+        case '\n':
+            escape = "\\n";
+            break;
+        case '\r':
+            escape = "\\r";
+            break;
+        case '\t':
+            escape = "\\t";
+            break;
+        default:
+            if (byte < CYP_JSON_CONTROL_LIMIT) {
+                int written =
+                    snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04X", (unsigned int)byte);
+                if (written < 0 || (size_t)written >= sizeof(unicode_escape)) {
+                    return false;
                 }
-                break;
+                escape = unicode_escape;
+                escape_length = (size_t)written;
+            }
+            break;
         }
         if (!escape) {
             continue;
@@ -6940,8 +6937,7 @@ static bool cypher_string_builder_append_json_string(cypher_string_builder_t *bu
  * Each item is JSON-escaped from its exact value span. Total runtime and
  * retained output are O(total item bytes + item count), with one reusable
  * geometric builder and O(1) scalar scratch. */
-static bool format_collect_list_exact(const aggregate_value_list_t *list,
-                                      cypher_value_t *output) {
+static bool format_collect_list_exact(const aggregate_value_list_t *list, cypher_value_t *output) {
     cypher_string_builder_t builder = {0};
     if (!list || !output || list->count < 0 || !cypher_string_builder_reset(&builder) ||
         !cypher_string_builder_append(&builder, "[", sizeof("[") - SKIP_ONE)) {
@@ -6950,8 +6946,8 @@ static bool format_collect_list_exact(const aggregate_value_list_t *list,
     }
     for (int i = 0; i < list->count; i++) {
         if ((i > 0 && !cypher_string_builder_append(&builder, ",", sizeof(",") - SKIP_ONE)) ||
-            !cypher_string_builder_append_json_string(
-                &builder, list->entries[i].value, list->entries[i].length)) {
+            !cypher_string_builder_append_json_string(&builder, list->entries[i].value,
+                                                      list->entries[i].length)) {
             cypher_string_builder_free(&builder);
             return false;
         }
@@ -6973,10 +6969,9 @@ static bool format_collect_list_exact(const aggregate_value_list_t *list,
 /* Format every aggregate through one value interface shared by RETURN and
  * WITH. Numeric/count spellings fit the bounded inline representation by type;
  * COLLECT transfers an exact query-sized owner. */
-static bool format_aggregate_value_exact(const char *func, int count, double sum,
-                                         double min_value, double max_value,
-                                         aggregate_value_list_t *value_lists, int ci,
-                                         cypher_value_t *output) {
+static bool format_aggregate_value_exact(const char *func, int count, double sum, double min_value,
+                                         double max_value, aggregate_value_list_t *value_lists,
+                                         int ci, cypher_value_t *output) {
     if (!func || !output) {
         g_cypher_allocation_failed = true;
         return false;
@@ -6985,8 +6980,8 @@ static bool format_aggregate_value_exact(const char *func, int count, double sum
         return format_collect_list_exact(&value_lists[ci], output);
     }
     memset(output, 0, sizeof(*output));
-    if (count == 0 && (strcmp(func, "AVG") == 0 || strcmp(func, "MIN") == 0 ||
-                       strcmp(func, "MAX") == 0)) {
+    if (count == 0 &&
+        (strcmp(func, "AVG") == 0 || strcmp(func, "MIN") == 0 || strcmp(func, "MAX") == 0)) {
         output->data = "";
         output->is_null = true;
         output->kind = CYP_VALUE_NULL;
@@ -6996,8 +6991,7 @@ static bool format_aggregate_value_exact(const char *func, int count, double sum
     if (strcmp(func, "SUM") == 0) {
         written = snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", sum);
     } else if (strcmp(func, "AVG") == 0) {
-        written =
-            snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", sum / count);
+        written = snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", sum / count);
     } else if (strcmp(func, "MIN") == 0) {
         written = snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", min_value);
     } else if (strcmp(func, "MAX") == 0) {
@@ -7310,9 +7304,9 @@ static bool with_agg_init_group(with_agg_t *entry, cbm_return_clause_t *wc, bind
                                            CYP_AGG_ALLOC_GROUP_ENTRY);
     entry->group_node_ids =
         cypher_agg_calloc((size_t)item_count, sizeof(int64_t), CYP_AGG_ALLOC_GROUP_ENTRY);
-    if (!entry->group_key || !entry->group_vals || !entry->group_nulls ||
-        !entry->group_kinds || !entry->sums || !entry->counts || !entry->mins ||
-        !entry->maxs || !entry->value_lists || !entry->group_node_ids) {
+    if (!entry->group_key || !entry->group_vals || !entry->group_nulls || !entry->group_kinds ||
+        !entry->sums || !entry->counts || !entry->mins || !entry->maxs || !entry->value_lists ||
+        !entry->group_node_ids) {
         g_cypher_allocation_failed = true;
         with_agg_entry_free(entry, item_count);
         return false;
@@ -7420,10 +7414,9 @@ static bool with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, bindin
             continue;
         }
         agg->counts[ci]++;
-        bool is_numeric = strcmp(wc->items[ci].func, "SUM") == 0 ||
-                          strcmp(wc->items[ci].func, "AVG") == 0 ||
-                          strcmp(wc->items[ci].func, "MIN") == 0 ||
-                          strcmp(wc->items[ci].func, "MAX") == 0;
+        bool is_numeric =
+            strcmp(wc->items[ci].func, "SUM") == 0 || strcmp(wc->items[ci].func, "AVG") == 0 ||
+            strcmp(wc->items[ci].func, "MIN") == 0 || strcmp(wc->items[ci].func, "MAX") == 0;
         if (is_numeric) {
             if (!cypher_value_own(&value)) {
                 cypher_value_free(&value);
@@ -7451,10 +7444,8 @@ static void with_add_vbinding_var_sized(binding_t *vb, const char *alias, size_t
     if (!binding_reserve_node_index(vb, index)) {
         return;
     }
-    char *owned_alias =
-        alias_length > SIZE_MAX - SKIP_ONE ? NULL : malloc(alias_length + SKIP_ONE);
-    char *owned_value =
-        value_length > SIZE_MAX - SKIP_ONE ? NULL : malloc(value_length + SKIP_ONE);
+    char *owned_alias = alias_length > SIZE_MAX - SKIP_ONE ? NULL : malloc(alias_length + SKIP_ONE);
+    char *owned_value = value_length > SIZE_MAX - SKIP_ONE ? NULL : malloc(value_length + SKIP_ONE);
     if (owned_alias) {
         memcpy(owned_alias, alias, alias_length);
         owned_alias[alias_length] = '\0';
@@ -7514,8 +7505,8 @@ static void execute_unwind_literal(cbm_query_t *q, binding_t **bindings, int *bi
             }
             binding_t row = {0};
             binding_copy(&row, &source[bi]);
-            with_add_vbinding_var_sized(&row, q->unwind_alias, strlen(q->unwind_alias),
-                                        item.data, item.length, item.is_null, item.kind);
+            with_add_vbinding_var_sized(&row, q->unwind_alias, strlen(q->unwind_alias), item.data,
+                                        item.length, item.is_null, item.kind);
             cypher_value_free(&item);
             if (!binding_array_append(&expanded, &expanded_count, &expanded_cap, max_working_rows,
                                       &row)) {
@@ -7562,8 +7553,7 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
     }
 
     for (int bi = 0; bi < bind_count; bi++) {
-        if (!cypher_string_builder_reset(&key) ||
-            !with_agg_build_key(wc, &bindings[bi], &key)) {
+        if (!cypher_string_builder_reset(&key) || !with_agg_build_key(wc, &bindings[bi], &key)) {
             break;
         }
         int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, &group_index, wc,
@@ -7598,8 +7588,8 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         vb.project = (bind_count > 0) ? bindings[0].project : NULL;
         vb.use_active_overlay_edges =
             (bind_count > 0) ? bindings[0].use_active_overlay_edges : false;
-        for (int ci = 0;
-             ci < wc->count && !g_cypher_allocation_failed && !vb.allocation_failed; ci++) {
+        for (int ci = 0; ci < wc->count && !g_cypher_allocation_failed && !vb.allocation_failed;
+             ci++) {
             if (is_aggregate_func(wc->items[ci].func)) {
                 int aggregate_count =
                     wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0
@@ -7656,9 +7646,9 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
             } else {
                 char func_buf[CBM_SZ_512];
                 const char *val = project_item(&bindings[bi], item, func_buf, sizeof(func_buf));
-                const char *value = val ? val : "";
-                with_add_vbinding_var_sized(&vb, aliases[ci], alias_lengths[ci], value,
-                                            strlen(value), false, CYP_VALUE_STRING);
+                const char *projected_text = val ? val : "";
+                with_add_vbinding_var_sized(&vb, aliases[ci], alias_lengths[ci], projected_text,
+                                            strlen(projected_text), false, CYP_VALUE_STRING);
             }
             /* A whole-node projection must remain a node binding across the
              * WITH boundary. Retain its canonical id so the next MATCH stage
@@ -7703,8 +7693,7 @@ static bool with_proj_key(const cbm_return_clause_t *wc, const char **aliases, b
     for (int ci = 0; ci < wc->count; ci++) {
         cypher_value_t value;
         binding_get_virtual_value(binding, aliases[ci], NULL, &value);
-        bool appended =
-            group_key_append_value(key, binding, aliases[ci], true, &value);
+        bool appended = group_key_append_value(key, binding, aliases[ci], true, &value);
         cypher_value_free(&value);
         if (!appended) {
             return false;
@@ -7718,8 +7707,8 @@ static bool with_proj_key(const cbm_return_clause_t *wc, const char **aliases, b
  * bytes, exact key construction plus hash lookup is expected O(T) time and
  * O(T) memory; representational/OOM failures abort instead of publishing a
  * partially deduplicated or quadratically rescanned result. */
-static void with_apply_distinct(cbm_return_clause_t *wc, const char **aliases,
-                                binding_t *vbindings, int *vcount) {
+static void with_apply_distinct(cbm_return_clause_t *wc, const char **aliases, binding_t *vbindings,
+                                int *vcount) {
     int original_count = *vcount;
     const char **owned_keys = cypher_calloc_elements(original_count, sizeof(*owned_keys));
     aggregate_group_index_t index = aggregate_group_index_create();
@@ -7916,8 +7905,8 @@ static void build_star_columns(result_builder_t *rb, const char **vars, int vc) 
     if (!col_names) {
         return;
     }
-    static const char *const suffixes[CYP_NODE_COLS] = {
-        ".name", ".qualified_name", ".label", ".file_path"};
+    static const char *const suffixes[CYP_NODE_COLS] = {".name", ".qualified_name", ".label",
+                                                        ".file_path"};
     for (int v = 0; v < vc && !g_cypher_allocation_failed; v++) {
         for (int ci = 0; ci < CYP_NODE_COLS; ci++) {
             const char *parts[] = {vars[v], suffixes[ci]};
@@ -8085,10 +8074,9 @@ static bool ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret,
             continue;
         }
         entry->counts[ci]++;
-        bool is_numeric = strcmp(ret->items[ci].func, "SUM") == 0 ||
-                          strcmp(ret->items[ci].func, "AVG") == 0 ||
-                          strcmp(ret->items[ci].func, "MIN") == 0 ||
-                          strcmp(ret->items[ci].func, "MAX") == 0;
+        bool is_numeric =
+            strcmp(ret->items[ci].func, "SUM") == 0 || strcmp(ret->items[ci].func, "AVG") == 0 ||
+            strcmp(ret->items[ci].func, "MIN") == 0 || strcmp(ret->items[ci].func, "MAX") == 0;
         if (is_numeric) {
             if (!cypher_value_own(&value)) {
                 cypher_value_free(&value);
@@ -8159,13 +8147,12 @@ static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, res
             lengths[ci] = row[ci] ? strlen(row[ci]) : 0;
             continue;
         }
-        int aggregate_count =
-            ret->items[ci].distinct && strcmp(ret->items[ci].func, "COUNT") == 0
-                ? agg->value_lists[ci].count
-                : agg->counts[ci];
-        if (!format_aggregate_value_exact(
-                ret->items[ci].func, aggregate_count, agg->sums[ci], agg->mins[ci],
-                agg->maxs[ci], agg->value_lists, ci, &formatted_values[ci])) {
+        int aggregate_count = ret->items[ci].distinct && strcmp(ret->items[ci].func, "COUNT") == 0
+                                  ? agg->value_lists[ci].count
+                                  : agg->counts[ci];
+        if (!format_aggregate_value_exact(ret->items[ci].func, aggregate_count, agg->sums[ci],
+                                          agg->mins[ci], agg->maxs[ci], agg->value_lists, ci,
+                                          &formatted_values[ci])) {
             complete = false;
             break;
         }
@@ -8187,12 +8174,9 @@ static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, res
 static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                result_builder_t *rb) {
     const char **key_values = cypher_calloc_elements(ret->count, sizeof(*key_values));
-    size_t *key_value_lengths =
-        cypher_calloc_elements(ret->count, sizeof(*key_value_lengths));
-    cypher_value_t *direct_values =
-        cypher_calloc_elements(ret->count, sizeof(*direct_values));
-    char (*func_buffers)[CBM_SZ_512] =
-        cypher_calloc_elements(ret->count, sizeof(*func_buffers));
+    size_t *key_value_lengths = cypher_calloc_elements(ret->count, sizeof(*key_value_lengths));
+    cypher_value_t *direct_values = cypher_calloc_elements(ret->count, sizeof(*direct_values));
+    char (*func_buffers)[CBM_SZ_512] = cypher_calloc_elements(ret->count, sizeof(*func_buffers));
     cypher_string_builder_t key = {0};
     if (!key_values || !key_value_lengths || !direct_values || !func_buffers ||
         !cypher_string_builder_reset(&key)) {
@@ -8352,8 +8336,7 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
     }
     const char **vals = cypher_calloc_elements(ret->count, sizeof(*vals));
     size_t *value_lengths = cypher_calloc_elements(ret->count, sizeof(*value_lengths));
-    cypher_value_t *direct_values =
-        cypher_calloc_elements(ret->count, sizeof(*direct_values));
+    cypher_value_t *direct_values = cypher_calloc_elements(ret->count, sizeof(*direct_values));
     char (*func_bufs)[CBM_SZ_512] = cypher_calloc_elements(ret->count, sizeof(*func_bufs));
     if (!vals || !value_lengths || !direct_values || !func_bufs) {
         free(vals);
@@ -8363,7 +8346,7 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
         return;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap && !g_cypher_allocation_failed;
-        bi++) {
+         bi++) {
         for (int ci = 0; ci < ret->count; ci++) {
             cbm_return_item_t *item = &ret->items[ci];
             if (project_item_exact_value(&bindings[bi], item, &direct_values[ci])) {
@@ -8398,8 +8381,7 @@ static void build_default_columns(result_builder_t *rb, const char **vars, int v
         return;
     }
     for (int v = 0; v < vc; v++) {
-        static const char *const suffixes[CYP_EDGE_COLS] = {
-            ".name", ".qualified_name", ".label"};
+        static const char *const suffixes[CYP_EDGE_COLS] = {".name", ".qualified_name", ".label"};
         size_t base = (size_t)v * CYP_EDGE_COLS;
         for (int ci = 0; ci < CYP_EDGE_COLS; ci++) {
             const char *parts[] = {vars[v], suffixes[ci]};

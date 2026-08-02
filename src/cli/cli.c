@@ -115,7 +115,7 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #ifndef CBM_VERSION
 #define CBM_VERSION CBM_VERSION_DEVELOPMENT
 #endif
-#include <errno.h>  // EEXIST
+#include <errno.h> // EEXIST
 #include <math.h>
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
 #include <limits.h> // UINT_MAX
@@ -6966,19 +6966,25 @@ static const cbm_config_numeric_domain_t CBM_CONFIG_NUMERIC_DOMAINS[] = {
     {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_CONFIG_NUMERIC_INTEGER, CBM_PAGERANK_MAX_ITER_MIN,
      CBM_PAGERANK_MAX_ITER_MAX, true, true, true, false, CBM_PAGERANK_MAX_ITER, 0.0},
     {CBM_CONFIG_PAGERANK_DAMPING, CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_DAMPING_MIN,
-     CBM_PAGERANK_DAMPING_MAX, true, true, true, true,
-     CBM_PAGERANK_DAMPING_RECOMMENDED_MIN, CBM_PAGERANK_DAMPING_RECOMMENDED_MAX},
-    {CBM_CONFIG_PAGERANK_EPSILON, CBM_CONFIG_NUMERIC_REAL,
-     CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE, CBM_PAGERANK_EPSILON_MAX, false, true, true, true,
-     CBM_PAGERANK_EPSILON_RECOMMENDED_MIN, CBM_PAGERANK_EPSILON_RECOMMENDED_MAX},
-#define CBM_PAGERANK_CONFIG_DOMAIN(edge_type, default_token, config_token, field)              \
-    {CBM_CONFIG_EDGE_WEIGHT_##config_token, CBM_CONFIG_NUMERIC_REAL,                          \
-     CBM_PAGERANK_EDGE_WEIGHT_MIN, CBM_PAGERANK_EDGE_WEIGHT_MAX, true, true, true, true,      \
-     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MIN,                                   \
+     CBM_PAGERANK_DAMPING_MAX, true, true, true, true, CBM_PAGERANK_DAMPING_RECOMMENDED_MIN,
+     CBM_PAGERANK_DAMPING_RECOMMENDED_MAX},
+    {CBM_CONFIG_PAGERANK_EPSILON, CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE,
+     CBM_PAGERANK_EPSILON_MAX, false, true, true, true, CBM_PAGERANK_EPSILON_RECOMMENDED_MIN,
+     CBM_PAGERANK_EPSILON_RECOMMENDED_MAX},
+#define CBM_PAGERANK_CONFIG_DOMAIN(edge_type, default_token, config_token, field) \
+    {CBM_CONFIG_EDGE_WEIGHT_##config_token,                                       \
+     CBM_CONFIG_NUMERIC_REAL,                                                     \
+     CBM_PAGERANK_EDGE_WEIGHT_MIN,                                                \
+     CBM_PAGERANK_EDGE_WEIGHT_MAX,                                                \
+     true,                                                                        \
+     true,                                                                        \
+     true,                                                                        \
+     true,                                                                        \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MIN,                       \
      CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MAX},
     CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_CONFIG_DOMAIN)
 #undef CBM_PAGERANK_CONFIG_DOMAIN
-    {NULL, CBM_CONFIG_NUMERIC_REAL, 0.0, 0.0, false, false, false, false, 0.0, 0.0},
+        {NULL, CBM_CONFIG_NUMERIC_REAL, 0.0, 0.0, false, false, false, false, 0.0, 0.0},
 };
 
 const cbm_config_numeric_domain_t *cbm_config_numeric_domain(const char *key) {
@@ -7014,17 +7020,15 @@ static bool cbm_config_numeric_domain_matches(const cbm_config_numeric_domain_t 
             return false;
         }
     }
-    bool above_minimum = domain->accepted_minimum_inclusive
-                             ? parsed >= domain->accepted_minimum
-                             : parsed > domain->accepted_minimum;
-    bool below_maximum = domain->accepted_maximum_inclusive
-                             ? parsed <= domain->accepted_maximum
-                             : parsed < domain->accepted_maximum;
+    bool above_minimum = domain->accepted_minimum_inclusive ? parsed >= domain->accepted_minimum
+                                                            : parsed > domain->accepted_minimum;
+    bool below_maximum = domain->accepted_maximum_inclusive ? parsed <= domain->accepted_maximum
+                                                            : parsed < domain->accepted_maximum;
     return above_minimum && below_maximum;
 }
 
-static void cbm_config_format_numeric_value(const cbm_config_numeric_domain_t *domain,
-                                            double value, char *out, size_t out_size) {
+static void cbm_config_format_numeric_value(const cbm_config_numeric_domain_t *domain, double value,
+                                            char *out, size_t out_size) {
     if (!domain || !out || out_size == 0) {
         return;
     }
@@ -7118,10 +7122,9 @@ static cbm_config_range_result_t cbm_config_numeric_range_matches(const char *ra
     }
 
     bool above_minimum = minimum_inclusive ? parsed >= minimum : parsed > minimum;
-    bool below_maximum = maximum_unbounded ||
-                         (maximum_inclusive ? parsed <= maximum : parsed < maximum);
-    return above_minimum && below_maximum ? CBM_CONFIG_RANGE_MATCHES
-                                          : CBM_CONFIG_RANGE_MISMATCHES;
+    bool below_maximum =
+        maximum_unbounded || (maximum_inclusive ? parsed <= maximum : parsed < maximum);
+    return above_minimum && below_maximum ? CBM_CONFIG_RANGE_MATCHES : CBM_CONFIG_RANGE_MISMATCHES;
 }
 
 /* Numeric registry ranges historically mixed hard correctness/resource
@@ -7202,10 +7205,8 @@ static void cbm_config_set_error(const char *key, const char *value, char *out, 
     } else if (domain) {
         char minimum[CBM_SZ_32];
         char maximum[CBM_SZ_32];
-        cbm_config_format_numeric_value(domain, domain->accepted_minimum, minimum,
-                                        sizeof(minimum));
-        cbm_config_format_numeric_value(domain, domain->accepted_maximum, maximum,
-                                        sizeof(maximum));
+        cbm_config_format_numeric_value(domain, domain->accepted_minimum, minimum, sizeof(minimum));
+        cbm_config_format_numeric_value(domain, domain->accepted_maximum, maximum, sizeof(maximum));
         (void)snprintf(out, out_size, "%s must be %s %s and %s %s, got '%s'", key,
                        domain->accepted_minimum_inclusive ? ">=" : ">", minimum,
                        domain->accepted_maximum_inclusive ? "<=" : "<", maximum,
