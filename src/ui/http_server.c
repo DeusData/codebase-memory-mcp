@@ -2050,4 +2050,5 @@ void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *srv,
     srv->mutation_end = end;
     srv->mutation_context = begin ? context : NULL;
     cbm_mcp_server_set_project_mutation_guard(srv->mcp, begin, end, begin ? context : NULL);
+    cbm_mcp_server_set_project_mutation_try_guard(srv->mcp, begin);
 }

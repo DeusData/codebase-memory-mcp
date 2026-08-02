@@ -12523,7 +12523,7 @@ int cbm_store_trail_graph_visit(cbm_store_trail_graph_t *graph, int64_t start_id
                                 bool *work_limit_hit, bool *cancelled) {
     if (!graph || !used_edges || !work_rows || !work_limit_hit || !cancelled || !visitor ||
         edge_type_count < 0 || (edge_type_count > 0 && !edge_types) || min_depth < 0 ||
-        max_depth < ST_TRAIL_DEPTH_UNBOUNDED || max_work_rows <= 0 ||
+        max_depth < ST_TRAIL_DEPTH_UNBOUNDED || max_work_rows <= 0 || *work_rows < 0 ||
         (graph->overlay ? (!start_qn || !start_qn[0]) : start_id <= 0)) {
         return CBM_STORE_ERR;
     }
@@ -12546,6 +12546,15 @@ int cbm_store_trail_graph_visit(cbm_store_trail_graph_t *graph, int64_t start_id
         }
     }
     if (effective_depth <= 0) {
+        return CBM_STORE_OK;
+    }
+    /* Nested pattern segments share one monotonic query-wide counter. Treat a
+     * saturated or already-over-budget counter as exhausted; exact equality
+     * would resume traversal after any defensive overshoot. This is O(1),
+     * allocates nothing, and occurs after the zero-hop callback because a
+     * zero-hop candidate examines no relationship extension. */
+    if (*work_rows >= max_work_rows) {
+        *work_limit_hit = true;
         return CBM_STORE_OK;
     }
 
@@ -12577,7 +12586,7 @@ int cbm_store_trail_graph_visit(cbm_store_trail_graph_t *graph, int64_t start_id
             stack_size--;
             continue;
         }
-        if (*work_rows == max_work_rows) {
+        if (*work_rows >= max_work_rows) {
             *work_limit_hit = true;
             break;
         }
@@ -12873,7 +12882,7 @@ int cbm_store_trail_graph_traverse(cbm_store_trail_graph_t *graph, int64_t start
         if (used_edges[arc->edge_index]) {
             continue;
         }
-        if (extensions == max_work_rows) {
+        if (extensions >= max_work_rows) {
             *work_limit_hit = true;
             break;
         }
@@ -15768,7 +15777,7 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase = "SELECT id, qualified_name FROM nodes WHERE project=?1 AND label IN "
-                        "('Function','Method','Class')";
+                        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     int nsql = scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", nbase,
                                  arch_path_scope_sql())
                       : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id", nbase);
@@ -15958,7 +15967,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char qsqlbuf[ST_SQL_BUF];
     const char *base = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
-                       "('Function','Method','Class')";
+                       "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     int nsql = scoped ? snprintf(qsqlbuf, sizeof(qsqlbuf), "%s%s", base, arch_path_scope_sql())
                       : snprintf(qsqlbuf, sizeof(qsqlbuf), "%s", base);
     if (nsql <= 0 || (size_t)nsql >= sizeof(qsqlbuf)) {
@@ -18035,7 +18044,7 @@ static int arch_cluster_count_nodes(cbm_store_t *s, const char *project, bool sc
                                     const char *norm, const char *like, int64_t *total) {
     char sql[ST_SQL_BUF];
     const char *base = "SELECT COUNT(*) FROM nodes "
-                       "WHERE project=?1 AND label IN ('Function','Method','Class')";
+                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     int written = scoped ? snprintf(sql, sizeof(sql), "%s%s", base, arch_path_scope_sql())
                          : snprintf(sql, sizeof(sql), "%s", base);
     if (written <= 0 || (size_t)written >= sizeof(sql)) {
@@ -18092,7 +18101,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
 
     char nsqlbuf[ST_SQL_BUF];
     const char *base = "SELECT id, name, qualified_name FROM nodes "
-                       "WHERE project=?1 AND label IN ('Function','Method','Class')";
+                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     int nsql_len =
         scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", base, arch_path_scope_sql())
                : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id", base);
@@ -19106,36 +19115,137 @@ enum {
     VS_VEC_DIM = 768,
     VS_SPARSE_NNZE = 8,
     VS_RI_SEED = 0x52494E44,
-    VS_MAX_KW = 32,
     VS_STR_BUF = 16,
 };
+typedef int8_t vs_vector_t[VS_VEC_DIM];
 
-/* Try to look up an enriched int8 vector for `token` in the token_vectors
- * table.  On success, writes the de-quantized float representation to
- * `out` and returns true. */
-static bool vs_load_enriched_vector(cbm_store_t *s, const char *project, const char *token,
-                                    float *out) {
-    sqlite3_stmt *tv_stmt = NULL;
-    const char *tv_sql = "SELECT vector, idf FROM token_vectors"
-                         " WHERE project = ?1 AND token = ?2 LIMIT 1";
-    if (sqlite3_prepare_v2(s->db, tv_sql, SQLITE_AUTO_LEN, &tv_stmt, NULL) != SQLITE_OK) {
+typedef enum {
+    VS_ALLOC_KEYWORDS = 1,
+    VS_ALLOC_RESULT_STRING,
+    VS_ALLOC_RESULT_RESERVE,
+} vs_alloc_site_t;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+_Static_assert((int)CBM_STORE_TEST_VECTOR_ALLOC_KEYWORDS == (int)VS_ALLOC_KEYWORDS,
+               "vector allocation test-site values must match");
+_Static_assert((int)CBM_STORE_TEST_VECTOR_ALLOC_RESULT_STRING == (int)VS_ALLOC_RESULT_STRING,
+               "vector allocation test-site values must match");
+_Static_assert((int)CBM_STORE_TEST_VECTOR_ALLOC_RESULT_RESERVE == (int)VS_ALLOC_RESULT_RESERVE,
+               "vector allocation test-site values must match");
+static _Thread_local cbm_store_test_vector_alloc_site_t vs_test_alloc_site =
+    CBM_STORE_TEST_VECTOR_ALLOC_NONE;
+static _Thread_local int vs_test_alloc_successes_before_failure = -1;
+
+void cbm_store_test_fail_vector_allocation(cbm_store_test_vector_alloc_site_t site,
+                                           int successful_before) {
+    vs_test_alloc_site = site;
+    vs_test_alloc_successes_before_failure = successful_before;
+}
+
+static bool vs_test_allocation_should_fail(vs_alloc_site_t site) {
+    if ((int)vs_test_alloc_site != (int)site || vs_test_alloc_successes_before_failure < 0) {
         return false;
     }
-    bool found = false;
-    sqlite3_bind_text(tv_stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    sqlite3_bind_text(tv_stmt, ST_COL_2, token, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    if (sqlite3_step(tv_stmt) == SQLITE_ROW) {
-        const int8_t *vec = (const int8_t *)sqlite3_value_blob(sqlite3_column_value(tv_stmt, 0));
-        int vec_len = sqlite3_column_bytes(tv_stmt, 0);
-        if (vec && vec_len == VS_VEC_DIM) {
-            for (int d = 0; d < VS_VEC_DIM; d++) {
-                out[d] = (float)vec[d] / CBM_STORE_INT8_MAX;
-            }
-            found = true;
-        }
+    if (vs_test_alloc_successes_before_failure == 0) {
+        vs_test_alloc_successes_before_failure = -1;
+        return true;
     }
-    sqlite3_finalize(tv_stmt);
-    return found;
+    vs_test_alloc_successes_before_failure--;
+    return false;
+}
+#else
+static bool vs_test_allocation_should_fail(vs_alloc_site_t site) {
+    (void)site;
+    return false;
+}
+#endif
+
+static void *vs_calloc(vs_alloc_site_t site, size_t count, size_t element_size) {
+    return vs_test_allocation_should_fail(site) ? NULL : calloc(count, element_size);
+}
+
+static void *vs_realloc(vs_alloc_site_t site, void *allocation, size_t bytes) {
+    return vs_test_allocation_should_fail(site) ? NULL : realloc(allocation, bytes);
+}
+
+static char *vs_strdup(vs_alloc_site_t site, const char *text) {
+    return vs_test_allocation_should_fail(site) ? NULL : heap_strdup(text);
+}
+
+typedef struct {
+    cbm_store_t *store;
+    sqlite3_stmt *stmt;
+    bool table_unavailable;
+} vs_token_reader_t;
+
+/* Prepare one reusable token lookup. Legacy stores without token_vectors use
+ * sparse-random fallback; any other prepare failure remains actionable. */
+static int vs_token_reader_open(cbm_store_t *s, vs_token_reader_t *reader) {
+    memset(reader, 0, sizeof(*reader));
+    reader->store = s;
+    const char *tv_sql = "SELECT vector, idf FROM token_vectors"
+                         " WHERE project = ?1 AND token = ?2 LIMIT 1";
+    if (sqlite3_prepare_v2(s->db, tv_sql, SQLITE_AUTO_LEN, &reader->stmt, NULL) == SQLITE_OK) {
+        return CBM_STORE_OK;
+    }
+    bool table_unavailable = store_table_unavailable(s, "token_vectors");
+    if (!table_unavailable) {
+        store_set_error_sqlite(s, "vector_search token vector prepare");
+    }
+    sqlite3_finalize(reader->stmt);
+    reader->stmt = NULL;
+    if (table_unavailable) {
+        reader->table_unavailable = true;
+        return CBM_STORE_OK;
+    }
+    return CBM_STORE_ERR;
+}
+
+static void vs_token_reader_close(vs_token_reader_t *reader) {
+    if (reader && reader->stmt) {
+        sqlite3_finalize(reader->stmt);
+        reader->stmt = NULL;
+    }
+}
+
+/* Look up one enriched vector through the reusable statement. A missing row
+ * requests sparse-random fallback; malformed data or SQLite errors fail the
+ * query rather than silently changing its meaning. */
+static int vs_token_reader_load(vs_token_reader_t *reader, const char *project,
+                                const char *token, float *out, bool *found) {
+    *found = false;
+    if (reader->table_unavailable) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_reset(reader->stmt);
+    sqlite3_clear_bindings(reader->stmt);
+    if (sqlite3_bind_text(reader->stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC) !=
+            SQLITE_OK ||
+        sqlite3_bind_text(reader->stmt, ST_COL_2, token, SQLITE_AUTO_LEN, SQLITE_STATIC) !=
+            SQLITE_OK) {
+        store_set_error_sqlite(reader->store, "vector_search token vector bind");
+        return CBM_STORE_ERR;
+    }
+    int step_rc = sqlite3_step(reader->stmt);
+    if (step_rc == SQLITE_DONE) {
+        return CBM_STORE_OK;
+    }
+    if (step_rc != SQLITE_ROW) {
+        store_set_error_sqlite(reader->store, "vector_search token vector step");
+        return CBM_STORE_ERR;
+    }
+    const int8_t *vec =
+        (const int8_t *)sqlite3_value_blob(sqlite3_column_value(reader->stmt, 0));
+    int vec_len = sqlite3_column_bytes(reader->stmt, 0);
+    if (!vec || vec_len != VS_VEC_DIM) {
+        store_set_error(reader->store, "vector_search token vector has invalid dimension");
+        return CBM_STORE_ERR;
+    }
+    for (int d = 0; d < VS_VEC_DIM; d++) {
+        out[d] = (float)vec[d] / CBM_STORE_INT8_MAX;
+    }
+    *found = true;
+    return CBM_STORE_OK;
 }
 
 /* Sparse-random-index fallback for tokens not present in the enriched table. */
@@ -19179,143 +19289,280 @@ static bool vs_normalize_and_quantize(const float *src, int8_t *dst) {
     return true;
 }
 
-/* Build int8 query vectors for each keyword.  Returns the number of
- * successfully built vectors (may be less than keyword_count when some
- * keywords produce zero-magnitude vectors). */
-static int vs_build_keyword_vectors(cbm_store_t *s, const char *project, const char **keywords,
-                                    int keyword_count, int8_t (*kw_vecs)[VS_VEC_DIM]) {
+static double vs_vector_magnitude(const int8_t vector[VS_VEC_DIM]) {
+    int32_t squared_magnitude = 0;
+    for (int d = 0; d < VS_VEC_DIM; d++) {
+        squared_magnitude += (int32_t)vector[d] * (int32_t)vector[d];
+    }
+    return sqrt((double)squared_magnitude);
+}
+
+/* Build int8 query vectors for each keyword and publish the successful count
+ * through actual_out. Some fallback vectors can quantize to zero and are
+ * skipped. Query-sized storage is owned by the caller, so no keyword is
+ * silently discarded by an implementation cap. */
+static int vs_build_keyword_vectors(vs_token_reader_t *reader, const char *project,
+                                    const char **keywords, int keyword_count,
+                                    vs_vector_t *kw_vecs, double *kw_norms, int *actual_out) {
     int actual_kw = 0;
-    for (int k = 0; k < keyword_count && actual_kw < VS_MAX_KW; k++) {
+    for (int k = 0; k < keyword_count; k++) {
         if (!keywords[k] || !keywords[k][0]) {
             continue;
         }
         float kw_f[VS_VEC_DIM];
         memset(kw_f, 0, sizeof(kw_f));
-        if (!vs_load_enriched_vector(s, project, keywords[k], kw_f)) {
+        bool found = false;
+        if (vs_token_reader_load(reader, project, keywords[k], kw_f, &found) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+        if (!found) {
             vs_fill_sparse_random(keywords[k], kw_f);
         }
         if (vs_normalize_and_quantize(kw_f, kw_vecs[actual_kw])) {
+            kw_norms[actual_kw] = vs_vector_magnitude(kw_vecs[actual_kw]);
             actual_kw++;
         }
     }
-    return actual_kw;
+    *actual_out = actual_kw;
+    return CBM_STORE_OK;
 }
 
 /* Compute the per-keyword min cosine score between a node's int8 vector and
- * each of the query vectors.  Returns 0.0 if the node vector is unavailable
- * or mis-sized. */
-static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
-                                  const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
+ * each query vector. Returns false for an unavailable, mis-sized, or zero-norm
+ * node vector so invalid data cannot outrank a valid negative-cosine match. */
+static bool vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
+                                const vs_vector_t *kw_vecs, const double *kw_norms, int actual_kw,
+                                double *score_out) {
     if (!node_vec || node_vec_len != VS_VEC_DIM) {
-        return 0.0;
+        return false;
+    }
+    double node_norm = vs_vector_magnitude(node_vec);
+    if (node_norm <= CBM_STORE_DENOM_EPS_D) {
+        return false;
     }
     double min_score = CBM_STORE_UNIT_POS_D;
     for (int k = 0; k < actual_kw; k++) {
         int32_t dot = 0;
-        int32_t ma = 0;
-        int32_t mb = 0;
         for (int d = 0; d < VS_VEC_DIM; d++) {
             dot += (int32_t)kw_vecs[k][d] * (int32_t)node_vec[d];
-            ma += (int32_t)kw_vecs[k][d] * (int32_t)kw_vecs[k][d];
-            mb += (int32_t)node_vec[d] * (int32_t)node_vec[d];
         }
-        double denom = sqrt((double)ma) * sqrt((double)mb);
+        double denom = kw_norms[k] * node_norm;
         double cos_k = denom > CBM_STORE_DENOM_EPS_D ? (double)dot / denom : 0.0;
         if (cos_k < min_score) {
             min_score = cos_k;
         }
     }
-    return min_score;
+    *score_out = min_score;
+    return true;
 }
 
-/* Append one candidate row read from the scan statement into the result
- * vector.  Grows the results array geometrically on demand.  Returns the
- * (possibly grown) results pointer, or NULL on allocation failure. */
-static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *count, int *cap,
-                                             sqlite3_stmt *stmt,
-                                             const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
-    if (*count >= *cap) {
-        int nc = *cap < CBM_SZ_16 ? CBM_SZ_16 : *cap * ST_COL_2;
-        cbm_vector_result_t *grown = realloc(results, (size_t)nc * sizeof(cbm_vector_result_t));
-        if (!grown) {
-            return NULL;
-        }
-        results = grown;
-        *cap = nc;
-    }
+static void vs_result_clear(cbm_vector_result_t *result) {
+    free(result->name);
+    free(result->qualified_name);
+    free(result->file_path);
+    free(result->label);
+    memset(result, 0, sizeof(*result));
+}
+
+/* Copy one SQLite row into an unpublished candidate. Failure frees every
+ * field copied so far, leaving caller-owned result storage untouched. */
+static bool vs_result_copy_fields(sqlite3_stmt *stmt, cbm_vector_result_t *candidate) {
     const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
     const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
     const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_3);
     const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_4);
-    char *name_copy = heap_strdup(name ? name : "");
-    char *qn_copy = heap_strdup(qn ? qn : "");
-    char *fp_copy = heap_strdup(fp ? fp : "");
-    char *label_copy = heap_strdup(label ? label : "");
+    char *name_copy = vs_strdup(VS_ALLOC_RESULT_STRING, name ? name : "");
+    char *qn_copy = vs_strdup(VS_ALLOC_RESULT_STRING, qn ? qn : "");
+    char *fp_copy = vs_strdup(VS_ALLOC_RESULT_STRING, fp ? fp : "");
+    char *label_copy = vs_strdup(VS_ALLOC_RESULT_STRING, label ? label : "");
     if (!name_copy || !qn_copy || !fp_copy || !label_copy) {
         free(name_copy);
         free(qn_copy);
         free(fp_copy);
         free(label_copy);
-        return NULL;
+        return false;
     }
-    int idx = (*count)++;
-    results[idx].node_id = sqlite3_column_int64(stmt, 0);
-    results[idx].name = name_copy;
-    results[idx].qualified_name = qn_copy;
-    results[idx].file_path = fp_copy;
-    results[idx].label = label_copy;
-    const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_6);
-    int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_6);
-    results[idx].score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
-    return results;
+    candidate->name = name_copy;
+    candidate->qualified_name = qn_copy;
+    candidate->file_path = fp_copy;
+    candidate->label = label_copy;
+    return true;
+}
+
+/* Geometric reserve retains the old owner on failure. Capacity is capped at
+ * the caller's requested top-K size, so retained result memory is O(K). */
+static bool vs_results_reserve(cbm_vector_result_t **results, int *capacity, int needed,
+                               int max_capacity) {
+    if (needed <= *capacity) {
+        return true;
+    }
+    int next = *capacity > 0 ? *capacity : ST_INIT_CAP_16;
+    if (next > max_capacity) {
+        next = max_capacity;
+    }
+    while (next < needed) {
+        if (next > INT_MAX / ST_GROWTH) {
+            return false;
+        }
+        next *= ST_GROWTH;
+        if (next > max_capacity) {
+            next = max_capacity;
+        }
+    }
+    if ((size_t)next > SIZE_MAX / sizeof(**results)) {
+        return false;
+    }
+    void *grown =
+        vs_realloc(VS_ALLOC_RESULT_RESERVE, *results, (size_t)next * sizeof(**results));
+    if (!grown) {
+        return false;
+    }
+    *results = grown;
+    *capacity = next;
+    return true;
+}
+
+/* A higher score is better; node id supplies deterministic tie ordering. */
+static bool vs_result_is_better(const cbm_vector_result_t *left,
+                                const cbm_vector_result_t *right) {
+    return left->score > right->score ||
+           (left->score == right->score && left->node_id < right->node_id);
+}
+
+static bool vs_result_is_worse(const cbm_vector_result_t *left,
+                               const cbm_vector_result_t *right) {
+    return vs_result_is_better(right, left);
+}
+
+/* Keep the worst retained result at heap root for O(log K) replacement. */
+static void vs_heap_sift_up(cbm_vector_result_t *results, size_t index) {
+    while (index > 0) {
+        size_t parent = (index - SKIP_ONE) / PAIR_LEN;
+        if (!vs_result_is_worse(&results[index], &results[parent])) {
+            break;
+        }
+        cbm_vector_result_t swap = results[index];
+        results[index] = results[parent];
+        results[parent] = swap;
+        index = parent;
+    }
+}
+
+static void vs_heap_sift_down(cbm_vector_result_t *results, int count, size_t index) {
+    size_t heap_count = (size_t)count;
+    for (;;) {
+        size_t left = index * PAIR_LEN + SKIP_ONE;
+        if (left >= heap_count) {
+            return;
+        }
+        size_t worst = left;
+        size_t right = left + SKIP_ONE;
+        if (right < heap_count && vs_result_is_worse(&results[right], &results[left])) {
+            worst = right;
+        }
+        if (!vs_result_is_worse(&results[worst], &results[index])) {
+            return;
+        }
+        cbm_vector_result_t swap = results[index];
+        results[index] = results[worst];
+        results[worst] = swap;
+        index = worst;
+    }
+}
+
+static int vs_result_rank_compare(const void *left_ptr, const void *right_ptr) {
+    const cbm_vector_result_t *left = left_ptr;
+    const cbm_vector_result_t *right = right_ptr;
+    if (vs_result_is_better(left, right)) {
+        return -1;
+    }
+    if (vs_result_is_better(right, left)) {
+        return 1;
+    }
+    return 0;
 }
 
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count) {
+    if (!out || !out_count) {
+        return CBM_STORE_ERR;
+    }
     *out = NULL;
     *out_count = 0;
     if (!s || !project || !keywords || keyword_count <= 0) {
         return CBM_STORE_ERR;
     }
 
-    int8_t kw_vecs[VS_MAX_KW][VS_VEC_DIM];
-    int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
+    if ((size_t)keyword_count > SIZE_MAX / sizeof(vs_vector_t) ||
+        (size_t)keyword_count > SIZE_MAX / sizeof(double)) {
+        store_set_error(s, "vector_search keyword allocation size overflow");
+        return CBM_STORE_ERR;
+    }
+    vs_vector_t *kw_vecs =
+        vs_calloc(VS_ALLOC_KEYWORDS, (size_t)keyword_count, sizeof(*kw_vecs));
+    double *kw_norms = vs_calloc(VS_ALLOC_KEYWORDS, (size_t)keyword_count, sizeof(*kw_norms));
+    if (!kw_vecs || !kw_norms) {
+        free(kw_vecs);
+        free(kw_norms);
+        store_set_error(s, "vector_search keyword allocation failed");
+        return CBM_STORE_ERR;
+    }
+    vs_token_reader_t token_reader;
+    if (vs_token_reader_open(s, &token_reader) != CBM_STORE_OK) {
+        free(kw_vecs);
+        free(kw_norms);
+        return CBM_STORE_ERR;
+    }
+    int actual_kw = 0;
+    int keyword_rc = vs_build_keyword_vectors(&token_reader, project, keywords, keyword_count,
+                                              kw_vecs, kw_norms, &actual_kw);
+    vs_token_reader_close(&token_reader);
+    if (keyword_rc != CBM_STORE_OK) {
+        free(kw_vecs);
+        free(kw_norms);
+        return CBM_STORE_ERR;
+    }
     if (actual_kw == 0) {
+        free(kw_vecs);
+        free(kw_norms);
         return CBM_STORE_OK;
     }
 
-    /* Scan all node vectors, compute per-keyword cosine, take min.
-     * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
-     * then re-score with min across all keywords in the append helper. */
-    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label,"
-                      "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
+    /* Stream every eligible vector: first-keyword oversampling can discard the
+     * true all-keyword winner. An exact bounded min-heap retains top K in
+     * O(N * (D + Q*D + log K)) runtime and O(Q*D + K + copied result bytes)
+     * memory for N nodes, Q keywords, vector dimension D, and output size K. */
+    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label, v.vector"
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"
-                      " WHERE v.project = ?2"
-                      " AND n.label IN ('Function','Method','Class')"
-                      " ORDER BY score DESC"
-                      " LIMIT ?3";
+                      " WHERE v.project = ?1"
+                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
 
     sqlite3_stmt *stmt = NULL;
     int prep_rc = sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL);
     if (prep_rc != SQLITE_OK) {
+        free(kw_vecs);
+        free(kw_norms);
         store_set_error_sqlite(s, "vector_search prepare");
         return CBM_STORE_ERR;
     }
 
-    /* Use first keyword for SQL pre-filter, fetch more candidates for re-ranking */
-    int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
-    sqlite3_bind_blob(stmt, SKIP_ONE, kw_vecs[0], VS_VEC_DIM, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
+    int final_limit = limit > 0 ? limit : CBM_SZ_16;
+    if (sqlite3_bind_text(stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        free(kw_vecs);
+        free(kw_norms);
+        store_set_error_sqlite(s, "vector_search bind");
+        return CBM_STORE_ERR;
+    }
 
     {
         char kw_buf[VS_STR_BUF];
-        char fl_buf[VS_STR_BUF];
+        char limit_buf[VS_STR_BUF];
         snprintf(kw_buf, sizeof(kw_buf), "%d", actual_kw);
-        snprintf(fl_buf, sizeof(fl_buf), "%d", fetch_limit);
-        cbm_log_info("vector_search.exec", "kw_count", kw_buf, "fetch_limit", fl_buf, "project",
+        snprintf(limit_buf, sizeof(limit_buf), "%d", final_limit);
+        cbm_log_info("vector_search.exec", "kw_count", kw_buf, "result_limit", limit_buf, "project",
                      project);
     }
 
@@ -19325,14 +19572,42 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     int step_rc = 0;
     bool result_oom = false;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        cbm_vector_result_t *grown =
-            vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
-        if (!grown) {
+        const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_5);
+        int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_5);
+        double score = 0.0;
+        if (!vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, kw_norms, actual_kw, &score)) {
+            continue;
+        }
+        cbm_vector_result_t candidate = {
+            .node_id = sqlite3_column_int64(stmt, 0),
+            .score = score,
+        };
+        bool retain = count < final_limit || vs_result_is_better(&candidate, &results[0]);
+        if (!retain) {
+            continue;
+        }
+        if (!vs_result_copy_fields(stmt, &candidate)) {
             result_oom = true;
             break;
         }
-        results = grown;
+        if (count < final_limit) {
+            if (!vs_results_reserve(&results, &cap, count + SKIP_ONE, final_limit)) {
+                vs_result_clear(&candidate);
+                result_oom = true;
+                break;
+            }
+            results[count] = candidate;
+            vs_heap_sift_up(results, count);
+            count++;
+        } else {
+            vs_result_clear(&results[0]);
+            results[0] = candidate;
+            vs_heap_sift_down(results, count, 0);
+        }
     }
+
+    free(kw_vecs);
+    free(kw_norms);
 
     if (result_oom) {
         sqlite3_finalize(stmt);
@@ -19342,9 +19617,10 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     }
 
     if (step_rc != SQLITE_DONE) {
-        char rc_buf[VS_STR_BUF];
-        snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
-        cbm_log_warn("vector_search.step_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
+        store_set_error_sqlite(s, "vector_search step");
+        sqlite3_finalize(stmt);
+        cbm_store_free_vector_results(results, count);
+        return CBM_STORE_ERR;
     }
     {
         char cnt_buf[VS_STR_BUF];
@@ -19353,27 +19629,8 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     }
     sqlite3_finalize(stmt);
 
-    /* Re-sort by min-score (SQL sorted by first keyword only) */
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        for (int j = i + SKIP_ONE; j < count; j++) {
-            if (results[j].score > results[i].score) {
-                cbm_vector_result_t tmp = results[i];
-                results[i] = results[j];
-                results[j] = tmp;
-            }
-        }
-    }
-
-    /* Trim to requested limit */
-    int final_limit = limit > 0 ? limit : CBM_SZ_16;
-    if (count > final_limit) {
-        for (int i = final_limit; i < count; i++) {
-            free(results[i].name);
-            free(results[i].qualified_name);
-            free(results[i].file_path);
-            free(results[i].label);
-        }
-        count = final_limit;
+    if (count > SKIP_ONE) {
+        qsort(results, (size_t)count, sizeof(*results), vs_result_rank_compare);
     }
 
     *out = results;

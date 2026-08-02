@@ -22,6 +22,11 @@ enum {
 #define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/walk_path.h"
+#include "foundation/compat.h"
+#include "foundation/compat_thread.h"
+#include "foundation/hash_table.h"
+#include "foundation/limits.h"
 #include "foundation/log.h"
 #include "foundation/str_util.h"
 
@@ -29,6 +34,9 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_regex.h"
 #include "foundation/platform.h" /* cbm_normalize_path_sep */
+#include <inttypes.h>
+#include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,13 +65,43 @@ static cbm_regex_t envfile_re;     /* KEY=https://... */
 static cbm_regex_t toml_re;        /* key = "https://..." */
 static cbm_regex_t properties_re;  /* key=https://... */
 static int patterns_compiled = 0;
+static cbm_mutex_t patterns_mutex;
+
+enum {
+    ENVSCAN_PATTERN_MUTEX_UNINITIALIZED = 0,
+    ENVSCAN_PATTERN_MUTEX_INITIALIZING = 1,
+    ENVSCAN_PATTERN_MUTEX_INITIALIZED = 2,
+    ENVSCAN_PATTERN_MUTEX_WAIT_MICROSECONDS = 1000,
+};
+
+static atomic_int patterns_mutex_state = ENVSCAN_PATTERN_MUTEX_UNINITIALIZED;
+
+static void envscan_patterns_mutex_initialize(void) {
+    int state = atomic_load(&patterns_mutex_state);
+    if (state == ENVSCAN_PATTERN_MUTEX_INITIALIZED) {
+        return;
+    }
+    state = ENVSCAN_PATTERN_MUTEX_UNINITIALIZED;
+    if (atomic_compare_exchange_strong(&patterns_mutex_state, &state,
+                                       ENVSCAN_PATTERN_MUTEX_INITIALIZING)) {
+        cbm_mutex_init(&patterns_mutex);
+        atomic_store(&patterns_mutex_state, ENVSCAN_PATTERN_MUTEX_INITIALIZED);
+        return;
+    }
+    while (atomic_load(&patterns_mutex_state) != ENVSCAN_PATTERN_MUTEX_INITIALIZED) {
+        cbm_usleep(ENVSCAN_PATTERN_MUTEX_WAIT_MICROSECONDS);
+    }
+}
 
 /* POSIX ERE doesn't support \w or \S — use bracket expressions */
 #define W "[A-Za-z0-9_]" /* word char */
 #define NW "[^ \t\"']"   /* non-whitespace, non-quote */
 
 static void compile_patterns(void) {
+    envscan_patterns_mutex_initialize();
+    cbm_mutex_lock(&patterns_mutex);
     if (patterns_compiled) {
+        cbm_mutex_unlock(&patterns_mutex);
         return;
     }
 
@@ -81,13 +119,20 @@ static void compile_patterns(void) {
                 CBM_REG_EXTENDED);
 
     patterns_compiled = SKIP_ONE;
+    cbm_mutex_unlock(&patterns_mutex);
 }
 
 /* Free all compiled regex patterns. Safe to call even if never compiled.
  * Call this in test teardown or at process exit to suppress leak reports. */
 void cbm_envscan_free_patterns(void) {
-    if (!patterns_compiled)
+    if (atomic_load(&patterns_mutex_state) != ENVSCAN_PATTERN_MUTEX_INITIALIZED) {
         return;
+    }
+    cbm_mutex_lock(&patterns_mutex);
+    if (!patterns_compiled) {
+        cbm_mutex_unlock(&patterns_mutex);
+        return;
+    }
     cbm_regfree(&dockerfile_re);
     cbm_regfree(&yaml_kv_re);
     cbm_regfree(&yaml_setenv_re);
@@ -97,6 +142,7 @@ void cbm_envscan_free_patterns(void) {
     cbm_regfree(&toml_re);
     cbm_regfree(&properties_re);
     patterns_compiled = 0;
+    cbm_mutex_unlock(&patterns_mutex);
 }
 
 #undef W
@@ -233,87 +279,111 @@ static file_type_t detect_file_type(const char *name) {
 
 /* ── Line scanner ──────────────────────────────────────────────── */
 
+typedef enum {
+    ENVSCAN_LINE_NO_MATCH = 0,
+    ENVSCAN_LINE_MATCH = 1,
+    ENVSCAN_LINE_KEY_UNREPRESENTABLE = 2,
+    ENVSCAN_LINE_VALUE_UNREPRESENTABLE = 3,
+} envscan_line_result_t;
+
 /* Extract key/value from a regex match with two capture groups.
- * Returns 1 on success, 0 if groups are empty or too large. */
-static int extract_kv_groups(const char *trimmed, const cbm_regmatch_t *m, int key_grp, int val_grp,
-                             char *key_out, size_t key_sz, char *val_out, size_t val_sz) {
+ * Oversized fields are distinguished from no-match so the caller can explain
+ * the fixed output API's representational boundary without logging values. */
+static envscan_line_result_t extract_kv_groups(const char *trimmed, const cbm_regmatch_t *m,
+                                               int key_grp, int val_grp, char *key_out,
+                                               size_t key_sz, char *val_out, size_t val_sz) {
     int klen = (m[key_grp].rm_eo - m[key_grp].rm_so);
     int vlen = (m[val_grp].rm_eo - m[val_grp].rm_so);
-    if (klen <= 0 || klen >= (int)key_sz || vlen <= 0 || vlen >= (int)val_sz) {
-        return 0;
+    if (klen <= 0 || vlen <= 0) {
+        return ENVSCAN_LINE_NO_MATCH;
+    }
+    if ((size_t)klen >= key_sz) {
+        return ENVSCAN_LINE_KEY_UNREPRESENTABLE;
+    }
+    if ((size_t)vlen >= val_sz) {
+        return ENVSCAN_LINE_VALUE_UNREPRESENTABLE;
     }
     memcpy(key_out, trimmed + m[key_grp].rm_so, klen);
     key_out[klen] = '\0';
     memcpy(val_out, trimmed + m[val_grp].rm_so, vlen);
     val_out[vlen] = '\0';
-    return SKIP_ONE;
+    return ENVSCAN_LINE_MATCH;
 }
 
 /* Try to scan a Dockerfile line. */
-static int scan_dockerfile_line(const char *line, char *key, size_t ksz, char *val, size_t vsz) {
+static envscan_line_result_t scan_dockerfile_line(const char *line, char *key, size_t ksz,
+                                                  char *val, size_t vsz) {
     cbm_regmatch_t m[ENV_REGEX_MAX];
     if (cbm_regexec(&dockerfile_re, line, ENV_GRP_4, m, 0) != 0) {
-        return 0;
+        return ENVSCAN_LINE_NO_MATCH;
     }
-    if (!extract_kv_groups(line, m, ENV_GRP_2, ENV_GRP_3, key, ksz, val, vsz)) {
-        return 0;
+    envscan_line_result_t result =
+        extract_kv_groups(line, m, ENV_GRP_2, ENV_GRP_3, key, ksz, val, vsz);
+    if (result != ENVSCAN_LINE_MATCH) {
+        return result;
     }
     size_t vl = strlen(val);
     while (vl > 0 && (val[vl - SKIP_ONE] == '"' || val[vl - SKIP_ONE] == '\'')) {
         val[--vl] = '\0';
     }
-    return SKIP_ONE;
+    return ENVSCAN_LINE_MATCH;
 }
 
 /* Try to scan a YAML line. */
-static int scan_yaml_line(const char *line, char *key, size_t ksz, char *val, size_t vsz) {
+static envscan_line_result_t scan_yaml_line(const char *line, char *key, size_t ksz, char *val,
+                                            size_t vsz) {
     cbm_regmatch_t m[ENV_REGEX_MAX];
-    if (cbm_regexec(&yaml_kv_re, line, ENV_GRP_3, m, 0) == 0 &&
-        extract_kv_groups(line, m, ENV_GRP_1, ENV_GRP_2, key, ksz, val, vsz)) {
-        return SKIP_ONE;
+    if (cbm_regexec(&yaml_kv_re, line, ENV_GRP_3, m, 0) == 0) {
+        envscan_line_result_t result =
+            extract_kv_groups(line, m, ENV_GRP_1, ENV_GRP_2, key, ksz, val, vsz);
+        if (result != ENVSCAN_LINE_NO_MATCH) {
+            return result;
+        }
     }
-    if (cbm_regexec(&yaml_setenv_re, line, ENV_GRP_3, m, 0) == 0 &&
-        extract_kv_groups(line, m, ENV_GRP_1, ENV_GRP_2, key, ksz, val, vsz)) {
-        return SKIP_ONE;
+    if (cbm_regexec(&yaml_setenv_re, line, ENV_GRP_3, m, 0) == 0) {
+        return extract_kv_groups(line, m, ENV_GRP_1, ENV_GRP_2, key, ksz, val, vsz);
     }
-    return 0;
+    return ENVSCAN_LINE_NO_MATCH;
 }
 
 /* Try to scan a Terraform line. */
-static int scan_terraform_line(const char *line, char *key, size_t ksz, char *val, size_t vsz) {
+static envscan_line_result_t scan_terraform_line(const char *line, char *key, size_t ksz, char *val,
+                                                 size_t vsz) {
     cbm_regmatch_t m[ENV_REGEX_MAX];
     if (cbm_regexec(&terraform_re, line, ENV_GRP_3, m, 0) != 0) {
-        return 0;
+        return ENVSCAN_LINE_NO_MATCH;
     }
     int vlen = (m[ENV_GRP_2].rm_eo - m[ENV_GRP_2].rm_so);
-    if (vlen <= 0 || vlen >= (int)vsz) {
-        return 0;
+    if (vlen <= 0) {
+        return ENVSCAN_LINE_NO_MATCH;
+    }
+    if ((size_t)vlen >= vsz) {
+        return ENVSCAN_LINE_VALUE_UNREPRESENTABLE;
     }
     cbm_str_copy(key, ksz, "_tf_default");
     memcpy(val, line + m[ENV_GRP_2].rm_so, vlen);
     val[vlen] = '\0';
-    return SKIP_ONE;
+    return ENVSCAN_LINE_MATCH;
 }
 
 /* Try single-regex scan (shell, envfile, toml, properties). */
-static int scan_regex_line(cbm_regex_t *re, const char *line, int kg, int vg, char *key, size_t ksz,
-                           char *val, size_t vsz) {
+static envscan_line_result_t scan_regex_line(cbm_regex_t *re, const char *line, int kg, int vg,
+                                             char *key, size_t ksz, char *val, size_t vsz) {
     cbm_regmatch_t m[ENV_REGEX_MAX];
-    if (cbm_regexec(re, line, ENV_GRP_5, m, 0) == 0 &&
-        extract_kv_groups(line, m, kg, vg, key, ksz, val, vsz)) {
-        return SKIP_ONE;
+    if (cbm_regexec(re, line, ENV_GRP_5, m, 0) == 0) {
+        return extract_kv_groups(line, m, kg, vg, key, ksz, val, vsz);
     }
-    return 0;
+    return ENVSCAN_LINE_NO_MATCH;
 }
 
-static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key_sz, char *val_out,
-                     size_t val_sz) {
+static envscan_line_result_t scan_line(const char *line, file_type_t ft, char *key_out,
+                                       size_t key_sz, char *val_out, size_t val_sz) {
     const char *trimmed = line;
     while (*trimmed == ' ' || *trimmed == '\t') {
         trimmed++;
     }
     if (*trimmed == '#' || (trimmed[0] == '/' && trimmed[SKIP_ONE] == '/')) {
-        return 0;
+        return ENVSCAN_LINE_NO_MATCH;
     }
 
     switch (ft) {
@@ -336,49 +406,11 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
         return scan_regex_line(&properties_re, trimmed, ENV_GRP_1, ENV_GRP_2, key_out, key_sz,
                                val_out, val_sz);
     default:
-        return 0;
+        return ENVSCAN_LINE_NO_MATCH;
     }
 }
 
 /* ── Containment ───────────────────────────────────────────────── */
-
-/* Join dir + name, rejecting rather than truncating.
- *
- * Silent truncation here was not merely a lost path. The root-relative suffix
- * used to be derived as `full_path + strlen(root_path)`, so once the real root
- * was longer than this fixed buffer that pointer landed past the end of the
- * array — out-of-bounds arithmetic on every entry below it. Refusing the path is
- * what keeps envscan_relative_suffix in bounds by construction. */
-static bool envscan_join_path(char *out, size_t out_sz, const char *dir, const char *name) {
-    if (out_sz == 0) {
-        return false;
-    }
-    int written = snprintf(out, out_sz, "%s/%s", dir, name);
-    if (written <= 0 || (size_t)written >= out_sz) {
-        out[0] = '\0';
-        cbm_log_warn("envscan.path_too_long", "dir", dir, "name", name);
-        return false;
-    }
-    return true;
-}
-
-/* Root-relative suffix of a path built beneath root_path.
- *
- * The prefix comparison is not a formality: it succeeding is precisely what
- * proves `path` holds at least root_len bytes, which is what makes
- * `path + root_len` a valid pointer. Never compute this suffix from an
- * unverified strlen. Returns NULL when `path` is not under the root. */
-static const char *envscan_relative_suffix(const char *path, const char *root_path,
-                                           size_t root_len) {
-    if (strncmp(path, root_path, root_len) != 0) {
-        return NULL;
-    }
-    const char *rel = path + root_len;
-    while (*rel == '/') {
-        rel++;
-    }
-    return rel;
-}
 
 /* Stat WITHOUT following links, so a repository-controlled symlink cannot lead
  * the walk outside the project. The previous stat() resolved the link, reported
@@ -427,8 +459,15 @@ static int envscan_safe_stat(const char *abs_path, struct stat *st) {
  * leaves the root for any other reason. `canonical_root` is resolved once per
  * scan because cbm_canonical_path costs a syscall per component. */
 static bool envscan_within_root(const char *candidate, const char *canonical_root) {
-    char resolved[CBM_SZ_4K];
-    if (!cbm_canonical_path(candidate, resolved, sizeof(resolved))) {
+    char inline_resolved[CBM_SZ_4K];
+    char *resolved = inline_resolved;
+    bool resolved_owned = false;
+    if (strlen(candidate) >= sizeof(inline_resolved) ||
+        !cbm_canonical_path(candidate, inline_resolved, sizeof(inline_resolved))) {
+        resolved = cbm_canonical_path_alloc(candidate);
+        resolved_owned = true;
+    }
+    if (!resolved) {
         return false;
     }
 #ifdef _WIN32
@@ -436,12 +475,19 @@ static bool envscan_within_root(const char *candidate, const char *canonical_roo
 #endif
     size_t root_len = strlen(canonical_root);
     if (root_len == 0 || envscan_path_ncmp(resolved, canonical_root, root_len) != 0) {
+        if (resolved_owned) {
+            free(resolved);
+        }
         return false;
     }
     /* Demand a real component boundary, so root "/repo" does not admit
      * "/repo-elsewhere". */
-    return canonical_root[root_len - 1] == '/' || resolved[root_len] == '\0' ||
-           resolved[root_len] == '/';
+    bool contained = canonical_root[root_len - 1] == '/' || resolved[root_len] == '\0' ||
+                     resolved[root_len] == '/';
+    if (resolved_owned) {
+        free(resolved);
+    }
+    return contained;
 }
 
 /* ── Public API ────────────────────────────────────────────────── */
@@ -475,31 +521,76 @@ static FILE *envscan_open_file(const char *full_path) {
 #endif
 }
 
-/* Scan a single file for env URL bindings. Returns number of bindings added. */
+static void envscan_log_file_skip(const char *path, const char *reason, const char *constraint,
+                                  int64_t file_bytes, int64_t read_bytes, int64_t limit_bytes) {
+    char file_buf[CBM_SZ_32];
+    char read_buf[CBM_SZ_32];
+    char limit_buf[CBM_SZ_32];
+    snprintf(file_buf, sizeof(file_buf), "%" PRId64, file_bytes);
+    snprintf(read_buf, sizeof(read_buf), "%" PRId64, read_bytes);
+    snprintf(limit_buf, sizeof(limit_buf), "%" PRId64, limit_bytes);
+    cbm_log_warn("envscan.file_skipped", "path", path, "reason", reason, "constraint", constraint,
+                 "file_bytes", file_buf, "read_bytes", read_buf, "limit_bytes", limit_buf);
+}
+
+/* Scan one complete logical line at a time. cbm_getline is the repository's
+ * portable exact line reader, so a URL spanning the old 2 KiB chunk boundary
+ * is neither dropped nor parsed as two different lines. A single reusable line
+ * buffer costs O(L) live memory for longest line L; file work is O(B + R), for
+ * B bytes and delegated regex cost R. The shared file policy bounds B and
+ * growth races after fstat. */
 static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
                          cbm_env_binding_t *out, int max_out) {
     FILE *f = envscan_open_file(full_path);
     if (!f) {
+        envscan_log_file_skip(full_path, "open_failed", "filesystem", -1, -1, -1);
         return 0;
     }
 
     struct stat fst;
-    if (fstat(fileno(f), &fst) != 0 || fst.st_size > (long)CBM_SZ_1K * CBM_SZ_1K) {
+    long file_limit = cbm_max_file_bytes();
+    if (fstat(cbm_fileno(f), &fst) != 0) {
         (void)fclose(f);
+        envscan_log_file_skip(full_path, "size_failed", "filesystem", -1, -1, file_limit);
+        return 0;
+    }
+    if (fst.st_size < 0 || fst.st_size > file_limit) {
+        int64_t file_bytes = fst.st_size < 0 ? -1 : (int64_t)fst.st_size;
+        (void)fclose(f);
+        envscan_log_file_skip(full_path, "oversized", "CBM_MAX_FILE_BYTES", file_bytes, 0,
+                              file_limit);
         return 0;
     }
 
     int count = 0;
-    char line[CBM_SZ_2K];
-    while (fgets(line, sizeof(line), f) && count < max_out) {
-        size_t ll = strlen(line);
+    int64_t bytes_read = 0;
+    char *line = NULL;
+    size_t line_capacity = 0;
+    ssize_t line_length;
+    while (count < max_out && (line_length = cbm_getline(&line, &line_capacity, f)) >= 0) {
+        if ((uint64_t)line_length > (uint64_t)(file_limit - bytes_read)) {
+            envscan_log_file_skip(full_path, "grew_oversized", "CBM_MAX_FILE_BYTES",
+                                  (int64_t)fst.st_size, bytes_read + line_length, file_limit);
+            break;
+        }
+        bytes_read += line_length;
+        size_t ll = (size_t)line_length;
         while (ll > 0 && (line[ll - SKIP_ONE] == '\n' || line[ll - SKIP_ONE] == '\r')) {
             line[--ll] = '\0';
         }
 
         char key[CBM_SZ_128];
         char value[CBM_SZ_512];
-        if (!scan_line(line, ft, key, sizeof(key), value, sizeof(value))) {
+        envscan_line_result_t line_result =
+            scan_line(line, ft, key, sizeof(key), value, sizeof(value));
+        if (line_result != ENVSCAN_LINE_MATCH) {
+            if (line_result == ENVSCAN_LINE_KEY_UNREPRESENTABLE) {
+                envscan_log_file_skip(full_path, "binding_unrepresentable", "key_capacity",
+                                      (int64_t)fst.st_size, bytes_read, (int64_t)sizeof(key) - 1);
+            } else if (line_result == ENVSCAN_LINE_VALUE_UNREPRESENTABLE) {
+                envscan_log_file_skip(full_path, "binding_unrepresentable", "value_capacity",
+                                      (int64_t)fst.st_size, bytes_read, (int64_t)sizeof(value) - 1);
+            }
             continue;
         }
         if (strncmp(value, "http://", SLEN("http://")) != 0 &&
@@ -509,12 +600,23 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
         if (cbm_is_secret_binding(key, value) || cbm_is_secret_value(value)) {
             continue;
         }
+        if (strlen(rel) >= sizeof(out[count].file_path)) {
+            envscan_log_file_skip(full_path, "binding_unrepresentable", "file_path_capacity",
+                                  (int64_t)fst.st_size, bytes_read,
+                                  (int64_t)sizeof(out[count].file_path) - 1);
+            continue;
+        }
 
         cbm_str_copy(out[count].key, sizeof(out[count].key), key);
         cbm_str_copy(out[count].value, sizeof(out[count].value), value);
         cbm_str_copy(out[count].file_path, sizeof(out[count].file_path), rel);
         count++;
     }
+    if (ferror(f)) {
+        envscan_log_file_skip(full_path, "read_failed", "filesystem_consistency",
+                              (int64_t)fst.st_size, bytes_read, file_limit);
+    }
+    free(line);
     (void)fclose(f);
     return count;
 }
@@ -522,62 +624,138 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
 /* Process a single directory entry for env scanning. Returns bindings added.
  * `root_len` is strlen of the root the walk started from, verified against
  * path_stack[0] by the caller; `canonical_root` is that root resolved once. */
-static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char *root_path,
-                             size_t root_len, const char *canonical_root, cbm_env_binding_t *out,
-                             int max_out, char path_stack[][CBM_SZ_512], int *stack_top,
-                             char **excluded_dirs, int excluded_count) {
-    char full_path[CBM_SZ_512];
-    if (!envscan_join_path(full_path, sizeof(full_path), dir_path, ent->name)) {
-        return 0;
-    }
-    const char *rel = envscan_relative_suffix(full_path, root_path, root_len);
-    if (!rel) {
-        return 0;
-    }
+enum {
+    ENVSCAN_WALK_STACK_INITIAL_CAPACITY = 16,
+    ENVSCAN_WALK_STACK_GROWTH_FACTOR = 2,
+    ENVSCAN_IDENTITY_HEX_LENGTH = (int)(sizeof(uint64_t) * 2U),
+    ENVSCAN_IDENTITY_KEY_LENGTH = ENVSCAN_IDENTITY_HEX_LENGTH * 2 + 1,
+    ENVSCAN_IDENTITY_KEY_CAPACITY = ENVSCAN_IDENTITY_KEY_LENGTH + 1,
+};
 
-    struct stat st;
-    if (envscan_safe_stat(full_path, &st) != 0) {
-        return 0;
+typedef struct {
+    cbm_dir_t *dir;
+    size_t abs_parent_length;
+    size_t rel_parent_length;
+    char *identity_key;
+} envscan_walk_frame_t;
+
+typedef struct {
+    envscan_walk_frame_t *frames;
+    size_t count;
+    size_t capacity;
+#ifndef _WIN32
+    CBMHashTable *active_identities;
+#endif
+} envscan_walk_stack_t;
+
+typedef enum {
+    ENVSCAN_WALK_PUSH_FAILED = -1,
+    ENVSCAN_WALK_PUSH_CYCLE = 0,
+    ENVSCAN_WALK_PUSHED = 1,
+} envscan_walk_push_result_t;
+
+#ifndef _WIN32
+static char envscan_active_identity_present;
+
+static bool envscan_identity_key(const cbm_file_identity_t *identity,
+                                 char key[ENVSCAN_IDENTITY_KEY_CAPACITY]) {
+    if (!identity || !identity->valid) {
+        return false;
     }
-    if (S_ISDIR(st.st_mode)) {
-        if (is_ignored_dir(ent->name) ||
-            cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count)) {
-            return 0;
+    int written = snprintf(key, ENVSCAN_IDENTITY_KEY_CAPACITY, "%0*" PRIx64 ":%0*" PRIx64,
+                           ENVSCAN_IDENTITY_HEX_LENGTH, identity->volume,
+                           ENVSCAN_IDENTITY_HEX_LENGTH, identity->file);
+    return written == ENVSCAN_IDENTITY_KEY_LENGTH;
+}
+#endif
+
+static envscan_walk_push_result_t envscan_walk_stack_push(envscan_walk_stack_t *stack,
+                                                          cbm_dir_t *dir, size_t abs_parent_length,
+                                                          size_t rel_parent_length,
+                                                          const cbm_file_identity_t *identity) {
+    if (!stack || !dir) {
+        return ENVSCAN_WALK_PUSH_FAILED;
+    }
+    char *owned_identity_key = NULL;
+#ifndef _WIN32
+    char identity_key[ENVSCAN_IDENTITY_KEY_CAPACITY];
+    if (!stack->active_identities || !envscan_identity_key(identity, identity_key)) {
+        return ENVSCAN_WALK_PUSH_FAILED;
+    }
+    if (cbm_ht_has(stack->active_identities, identity_key)) {
+        return ENVSCAN_WALK_PUSH_CYCLE;
+    }
+    owned_identity_key = cbm_strdup(identity_key);
+    if (!owned_identity_key) {
+        return ENVSCAN_WALK_PUSH_FAILED;
+    }
+#else
+    (void)identity;
+#endif
+    if (stack->count == stack->capacity) {
+        size_t new_capacity = stack->capacity == 0
+                                  ? ENVSCAN_WALK_STACK_INITIAL_CAPACITY
+                                  : stack->capacity * ENVSCAN_WALK_STACK_GROWTH_FACTOR;
+        if (new_capacity < stack->capacity ||
+            new_capacity > SIZE_MAX / sizeof(envscan_walk_frame_t)) {
+            free(owned_identity_key);
+            return ENVSCAN_WALK_PUSH_FAILED;
         }
-        if (*stack_top >= CBM_SZ_256) {
-            cbm_log_warn("envscan.directory_budget_exhausted", "path", full_path);
-            return 0;
+        envscan_walk_frame_t *grown = realloc(stack->frames, new_capacity * sizeof(*grown));
+        if (!grown) {
+            free(owned_identity_key);
+            return ENVSCAN_WALK_PUSH_FAILED;
         }
-        if (!envscan_within_root(full_path, canonical_root)) {
-            cbm_log_warn("envscan.dir_outside_root", "path", full_path, "root", canonical_root);
-            return 0;
-        }
-        /* Checked copy. The stack rows are the same width as full_path, so this
-         * cannot truncate today — but check anyway rather than lean on that
-         * coincidence: a truncated row is exactly what reintroduced the
-         * out-of-bounds suffix arithmetic. */
-        int written = snprintf(path_stack[*stack_top], sizeof(path_stack[0]), "%s", full_path);
-        if (written <= 0 || (size_t)written >= sizeof(path_stack[0])) {
-            cbm_log_warn("envscan.path_too_long", "dir", dir_path, "name", ent->name);
-            return 0;
-        }
-        (*stack_top)++;
-        return 0;
+        stack->frames = grown;
+        stack->capacity = new_capacity;
     }
-    /* Only regular files are config files. Without this, the lstat above still
-     * lets a FIFO through, and opening one blocks the pass until a writer
-     * appears. */
-    if (!S_ISREG(st.st_mode)) {
-        return 0;
+#ifndef _WIN32
+    cbm_ht_set(stack->active_identities, owned_identity_key, &envscan_active_identity_present);
+    if (!cbm_ht_has(stack->active_identities, owned_identity_key)) {
+        free(owned_identity_key);
+        return ENVSCAN_WALK_PUSH_FAILED;
     }
-    if (is_secret_file(ent->name)) {
-        return 0;
+#endif
+    stack->frames[stack->count++] = (envscan_walk_frame_t){
+        .dir = dir,
+        .abs_parent_length = abs_parent_length,
+        .rel_parent_length = rel_parent_length,
+        .identity_key = owned_identity_key,
+    };
+    return ENVSCAN_WALK_PUSHED;
+}
+
+static void envscan_walk_stack_pop(envscan_walk_stack_t *stack, cbm_walk_path_t *abs_path,
+                                   cbm_walk_path_t *rel_path) {
+    if (!stack || stack->count == 0) {
+        return;
     }
-    file_type_t ft = detect_file_type(ent->name);
-    if (ft == FT_UNKNOWN) {
-        return 0;
+    envscan_walk_frame_t *frame = &stack->frames[stack->count - 1U];
+    cbm_closedir(frame->dir);
+#ifndef _WIN32
+    if (frame->identity_key) {
+        (void)cbm_ht_delete(stack->active_identities, frame->identity_key);
     }
-    return scan_env_file(full_path, rel, ft, out, max_out);
+#endif
+    free(frame->identity_key);
+    cbm_walk_path_restore(abs_path, frame->abs_parent_length);
+    cbm_walk_path_restore(rel_path, frame->rel_parent_length);
+    stack->count--;
+}
+
+static void envscan_walk_stack_free(envscan_walk_stack_t *stack, cbm_walk_path_t *abs_path,
+                                    cbm_walk_path_t *rel_path) {
+    if (!stack) {
+        return;
+    }
+    while (stack->count > 0) {
+        envscan_walk_stack_pop(stack, abs_path, rel_path);
+    }
+#ifndef _WIN32
+    cbm_ht_free(stack->active_identities);
+#endif
+    free(stack->frames);
+    memset(stack, 0, sizeof(*stack));
 }
 
 int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
@@ -587,52 +765,129 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
     }
     compile_patterns();
 
-    int count = 0;
-    char path_stack[CBM_SZ_256][CBM_SZ_512];
-    int stack_top = SKIP_ONE;
-    /* Reject an over-long root instead of truncating it in. The old strncpy left
-     * path_stack[0] SHORTER than root_path, and every suffix pointer derived from
-     * strlen(root_path) was then past the end of its buffer. Establishing
-     * root_len from the copy that actually fit is what removes that class. */
-    int written = snprintf(path_stack[0], sizeof(path_stack[0]), "%s", root_path);
-    if (written <= 0 || (size_t)written >= sizeof(path_stack[0])) {
-        cbm_log_warn("envscan.root_too_long", "root", root_path);
+    cbm_walk_path_t abs_path = {0};
+    cbm_walk_path_t rel_path = {0};
+    if (!cbm_walk_path_init(&abs_path, root_path) || !cbm_walk_path_init(&rel_path, "")) {
+        cbm_walk_path_free(&rel_path);
+        cbm_walk_path_free(&abs_path);
+        cbm_log_warn("envscan.walk_skipped", "path", root_path, "reason", "path_allocation_failed");
         return 0;
     }
-    size_t root_len = (size_t)written;
-
-    /* Resolved once per scan: every directory the walk wants to descend is
-     * checked against this, and resolving costs a syscall per component. */
-    char canonical_root[CBM_SZ_4K];
-    if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root))) {
-        /* Unresolvable root — nothing to walk. Previously opendir simply failed
-         * on the first iteration, so the result is the same: zero bindings. */
+    char *canonical_root = cbm_canonical_path_alloc(root_path);
+    if (!canonical_root) {
+        cbm_walk_path_free(&rel_path);
+        cbm_walk_path_free(&abs_path);
         return 0;
     }
 #ifdef _WIN32
     cbm_normalize_path_sep(canonical_root);
 #endif
 
-    while (stack_top > 0 && count < max_out) {
-        stack_top--;
-        char dir_path[CBM_SZ_512];
-        int copied = snprintf(dir_path, sizeof(dir_path), "%s", path_stack[stack_top]);
-        if (copied <= 0 || (size_t)copied >= sizeof(dir_path)) {
+    envscan_walk_stack_t stack = {0};
+#ifndef _WIN32
+    stack.active_identities = cbm_ht_create(ENVSCAN_WALK_STACK_INITIAL_CAPACITY);
+#endif
+    cbm_file_identity_t root_identity = {0};
+#ifndef _WIN32
+    bool root_identity_ok = cbm_file_identity_read(abs_path.data, &root_identity);
+#else
+    bool root_identity_ok = true;
+#endif
+    cbm_dir_t *root = root_identity_ok ? cbm_opendir(abs_path.data) : NULL;
+    envscan_walk_push_result_t root_push =
+        root ? envscan_walk_stack_push(&stack, root, abs_path.length, rel_path.length,
+                                       &root_identity)
+             : ENVSCAN_WALK_PUSH_FAILED;
+    if (root_push != ENVSCAN_WALK_PUSHED) {
+        if (root) {
+            cbm_closedir(root);
+        }
+        cbm_log_warn("envscan.walk_skipped", "path", root_path, "reason",
+                     "root_open_identity_or_stack_failed");
+        free(canonical_root);
+        envscan_walk_stack_free(&stack, &abs_path, &rel_path);
+        cbm_walk_path_free(&rel_path);
+        cbm_walk_path_free(&abs_path);
+        return 0;
+    }
+
+    /* Exact iterative DFS. Each accepted descent is a no-follow directory edge;
+     * POSIX active identities reject alias/bind cycles and Windows rejects
+     * reparse points. Runtime is expected O(E + N + C + B + R), for visited
+     * entries E, name bytes N, canonical-containment work C, scanned bytes B,
+     * and regex work R. C is filesystem-dependent and can be O(E * P) when
+     * resolving every directory path of maximum length P; retaining it preserves
+     * the inherited escape check. Live auxiliary memory is O(D + P + L): active
+     * depth/handles D, longest paths P, and longest logical line L. */
+    int count = 0;
+    while (stack.count > 0 && count < max_out) {
+        envscan_walk_frame_t *frame = &stack.frames[stack.count - 1U];
+        cbm_dirent_t *entry = cbm_readdir(frame->dir);
+        if (!entry) {
+            envscan_walk_stack_pop(&stack, &abs_path, &rel_path);
+            continue;
+        }
+        const char *name = entry->name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
+            continue;
+        }
+        size_t abs_parent_length = abs_path.length;
+        size_t rel_parent_length = rel_path.length;
+        if (!cbm_walk_path_append(&abs_path, name) || !cbm_walk_path_append(&rel_path, name)) {
+            cbm_walk_path_restore(&abs_path, abs_parent_length);
+            cbm_walk_path_restore(&rel_path, rel_parent_length);
+            cbm_log_warn("envscan.walk_entry_skipped", "dir", abs_path.data, "entry", name,
+                         "reason", "path_allocation_failed");
             continue;
         }
 
-        cbm_dir_t *d = cbm_opendir(dir_path);
-        if (!d) {
-            continue;
+        struct stat state;
+        int stat_result = envscan_safe_stat(abs_path.data, &state);
+        if (stat_result == 0 && S_ISDIR(state.st_mode)) {
+            bool ignored = is_ignored_dir(name);
+            bool excluded =
+                cbm_pipeline_relpath_is_excluded(rel_path.data, excluded_dirs, excluded_count);
+            bool contained =
+                !ignored && !excluded && envscan_within_root(abs_path.data, canonical_root);
+            if (contained) {
+                cbm_file_identity_t identity = {0};
+#ifndef _WIN32
+                identity.volume = (uint64_t)state.st_dev;
+                identity.file = (uint64_t)state.st_ino;
+                identity.valid = true;
+#endif
+                cbm_dir_t *child = cbm_opendir(abs_path.data);
+                envscan_walk_push_result_t pushed =
+                    child ? envscan_walk_stack_push(&stack, child, abs_parent_length,
+                                                    rel_parent_length, &identity)
+                          : ENVSCAN_WALK_PUSH_FAILED;
+                if (pushed == ENVSCAN_WALK_PUSHED) {
+                    continue;
+                }
+                if (child) {
+                    cbm_closedir(child);
+                }
+                cbm_log_warn("envscan.walk_entry_skipped", "path", abs_path.data, "reason",
+                             pushed == ENVSCAN_WALK_PUSH_CYCLE ? "directory_cycle"
+                                                               : "directory_open_or_stack_failed");
+            } else if (!ignored && !excluded) {
+                cbm_log_warn("envscan.dir_outside_root", "path", abs_path.data, "root",
+                             canonical_root);
+            }
+        } else if (stat_result == 0 && S_ISREG(state.st_mode) && !is_secret_file(name)) {
+            file_type_t file_type = detect_file_type(name);
+            if (file_type != FT_UNKNOWN) {
+                count += scan_env_file(abs_path.data, rel_path.data, file_type, out + count,
+                                       max_out - count);
+            }
         }
-        cbm_dirent_t *ent;
-        while ((ent = cbm_readdir(d)) && count < max_out) {
-            count += process_env_entry(ent, dir_path, root_path, root_len, canonical_root,
-                                       out + count, max_out - count, path_stack, &stack_top,
-                                       excluded_dirs, excluded_count);
-        }
-        cbm_closedir(d);
+        cbm_walk_path_restore(&abs_path, abs_parent_length);
+        cbm_walk_path_restore(&rel_path, rel_parent_length);
     }
+    free(canonical_root);
+    envscan_walk_stack_free(&stack, &abs_path, &rel_path);
+    cbm_walk_path_free(&rel_path);
+    cbm_walk_path_free(&abs_path);
     return count;
 }
 

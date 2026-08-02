@@ -184,6 +184,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused);
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
+static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const CBMLangSpec *spec);
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
@@ -817,15 +818,22 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         /* Nix: a named function is a `function_expression` (lambda `x: body`) with
          * no name of its own — the binding name lives on the enclosing `binding`'s
          * `attrpath` field (`name = x: ...`). Resolve through the parent binding to
-         * the attrpath's `attr` identifier so `addOne = x: ...` mints a Function
-         * def. A lambda whose parent is not a binding (e.g. an inline `map (x: x)`
-         * argument) resolves null and stays out of func_types. */
+         * the attrpath's LAST `attr` so `addOne = x: ...` mints a Function def. A
+         * lambda whose parent is not a binding (e.g. an inline `map (x: x)`
+         * argument) resolves null and stays out of func_types.
+         *
+         * The last segment, not the first: an attrpath is a PATH, and `a.b.fn = …`
+         * is sugar for `a = { b = { fn = …; }; };`. Both spellings must mint the
+         * same name (`fn`) and the same QN (`proj.mod.a.b.fn`) — the leading
+         * segments are scope, supplied by cbm_nix_attrpath_scope. Taking the first
+         * segment named `a.b.fn` "a", which collided with every other binding
+         * whose path began `a`. */
         if (lang == CBM_LANG_NIX && strcmp(kind, "function_expression") == 0) {
             TSNode parent = ts_node_parent(node);
             if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "binding") == 0) {
                 TSNode attrpath = ts_node_child_by_field_name(parent, TS_FIELD("attrpath"));
                 if (!ts_node_is_null(attrpath)) {
-                    TSNode attr = ts_node_child_by_field_name(attrpath, TS_FIELD("attr"));
+                    TSNode attr = cbm_nix_attrpath_last_attr(attrpath);
                     return ts_node_is_null(attr) ? attrpath : attr;
                 }
             }
@@ -3531,7 +3539,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         return;
     }
 
-    char *name = cbm_func_name_node_text(a, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(a, name_node, ctx->source, ctx->language);
     if (!name || !name[0] || strcmp(name, "function") == 0) {
         return;
     }
@@ -3558,17 +3566,33 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    /* Nix `"${foo}" = x: …`: an interpolated attrpath segment has no statically
+     * knowable name. Minting it would produce a def literally named `"${foo}"`
+     * that nothing can ever look up or resolve a call against. An absent node is
+     * the honest answer — same reasoning as the Makefile guard above. */
+    if (ctx->language == CBM_LANG_NIX && cbm_nix_attr_is_interpolated(name_node)) {
+        return;
+    }
+
     TSNode func_node = unwrap_template_inner(node, ctx->language);
 
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
 
     def.name = name;
+    /* Nix: a binding's name is a path. The leaf is the name; the leading segments
+     * are scope, so `a.b.fn = …` gets the same QN as `a = { b = { fn = …; }; }`.
+     * Without this every binding whose path shares a leaf name collapsed onto one
+     * node, silently discarding the later definition and its CALLS edges. */
+    const char *qn_name = name;
+    if (ctx->language == CBM_LANG_NIX) {
+        qn_name = cbm_nix_qn_name(a, node, ctx->source, name);
+    }
     /* Java/Go derive the module from the containing directory (package), so the
      * filename stem is NOT baked into the QN (Go func in myapp/db/conn.go ->
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
     def.qualified_name =
-        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name, ctx->language);
     /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
@@ -3576,10 +3600,19 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * resolution (ADL, namespace-function lookup) can never see it. Class methods
      * never reach here (they go through extract_class_methods), so a set
      * enclosing scope here is always a namespace. The out-of-line method path
-     * below overrides this for `Ns::Cls::method` definitions. */
+     * below overrides this for `Ns::Cls::method` definitions.
+     *
+     * Nix joins this list for the same reason: a binding inside an attrset is
+     * scoped by it, so `setA = { fn = ...; }` is proj.file.setA.fn. Uses qn_name,
+     * not name, so an attrpath's own leading segments compose with the enclosing
+     * scope. Note the call-scope side (compute_func_qn in extract_unified.c) is
+     * NOT language-gated — it qualifies whenever a scope is pushed — so this gate
+     * and the scope-push rule must move together, or a call QN names a def QN that
+     * was never minted and the edge is dropped at write. */
     if (ctx->enclosing_class_qn &&
-        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA)) {
-        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
+        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
+         ctx->language == CBM_LANG_NIX)) {
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
     def.label = "Function";
     def.file_path = ctx->rel_path;
@@ -4582,7 +4615,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
                             const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
 
-    char *name = cbm_func_name_node_text(a, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(a, name_node, ctx->source, ctx->language);
     if (!name || !name[0]) {
         return;
     }
@@ -4996,7 +5029,12 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 // --- Variable extraction ---
 
 // Helper to push a Variable definition
-static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
+/* `qn_name` is the name as it should appear in the qualified name, which differs
+ * from `name` only where a language scopes a variable below the module — Nix,
+ * whose binding names are attrpaths (`a.b.c = …` is name `c`, QN suffix `a.b.c`).
+ * Pass NULL to use `name` for both. */
+static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                            TSNode node) {
     if (!name || !name[0] || strcmp(name, "_") == 0) {
         return;
     }
@@ -5006,14 +5044,18 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     def.name = name;
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
-    def.qualified_name =
-        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+    def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
+                                                     qn_name ? qn_name : name, ctx->language);
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = cbm_is_exported(name, ctx->language);
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
+    push_var_def_qn(ctx, name, NULL, node);
 }
 
 // Helper: extract name from a declarator chain (C/C++/ObjC)
@@ -5692,10 +5734,99 @@ static void extract_vars_config(CBMExtractCtx *ctx, TSNode node, CBMArena *a, co
 
 /* ── Variable name extraction dispatcher ────────────────────────── */
 
+/* Nix: a module-level `binding` whose value is neither a lambda nor an attribute
+ * set. Both of those are already represented — a lambda-valued binding is minted
+ * as a Function by the def walk, and an attrset-valued one is a scope
+ * (is_namespace_scope_kind) — so minting either again here would double-count it.
+ *
+ * The name is the attrpath's leaf and the QN carries the whole path, matching how
+ * the def walk names functions; `services.nginx.enable = true` is name `enable`,
+ * QN proj.file.services.nginx.enable. */
+static void extract_vars_nix(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
+    if (strcmp(ts_node_type(node), "binding") != 0) {
+        return;
+    }
+    TSNode value = ts_node_child_by_field_name(node, TS_FIELD("expression"));
+    if (ts_node_is_null(value)) {
+        return;
+    }
+    if (strcmp(ts_node_type(value), "function_expression") == 0) {
+        return; /* already a Function */
+    }
+    if (cbm_nix_binding_is_attrset_scope(node)) {
+        return; /* a scope, not a value */
+    }
+    TSNode attrpath = ts_node_child_by_field_name(node, TS_FIELD("attrpath"));
+    TSNode leaf = cbm_nix_attrpath_last_attr(attrpath);
+    if (ts_node_is_null(leaf) || cbm_nix_attr_is_interpolated(leaf)) {
+        return;
+    }
+    char *name = cbm_node_text(a, leaf, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+    cbm_nix_strip_attr_quotes(name);
+    const char *scope = cbm_nix_attrpath_scope(a, attrpath, ctx->source);
+    const char *qn_name = scope ? cbm_arena_sprintf(a, "%s.%s", scope, name) : name;
+    push_var_def_qn(ctx, name, qn_name, node);
+}
+
+/* Mint every direct binding of one Nix binding container. */
+static void extract_nix_binding_set(CBMExtractCtx *ctx, TSNode set, const CBMLangSpec *spec) {
+    if (ts_node_is_null(set)) {
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(set);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(set, i);
+        if (strcmp(ts_node_type(child), "binding") == 0) {
+            extract_var_names(ctx, child, spec);
+        }
+    }
+}
+
+/* Walk past a Nix file's header lambda(s) to the container(s) holding its
+ * file-scope bindings, minting each. Handles the curried header (`final: prev:`)
+ * and both containers of a `let … in { … }` file: the let's own bindings are file
+ * scope in the same sense a C++ file-static is, and the returned attrset's are the
+ * exported surface. Anything deeper is nested and deliberately skipped. */
+static void extract_nix_module_vars(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
+    TSNode cur = ts_node_named_child_count(root) > 0 ? ts_node_named_child(root, 0) : root;
+    /* Descend the finite AST chain of header lambdas: `{ pkgs, ... }: <body>`,
+     * `final: prev: <body>`. Each step moves to a strict child, so termination
+     * follows from the parsed tree without an arbitrary capability ceiling.
+     * Runtime is O(H), memory O(1), for H curried header lambdas. */
+    while (!ts_node_is_null(cur) && strcmp(ts_node_type(cur), "function_expression") == 0) {
+        TSNode body = ts_node_child_by_field_name(cur, TS_FIELD("body"));
+        if (ts_node_is_null(body)) {
+            return;
+        }
+        cur = body;
+    }
+    if (ts_node_is_null(cur)) {
+        return;
+    }
+    if (strcmp(ts_node_type(cur), "let_expression") == 0) {
+        extract_nix_binding_set(ctx, cbm_find_child_by_kind(cur, "binding_set"), spec);
+        cur = ts_node_child_by_field_name(cur, TS_FIELD("body"));
+        if (ts_node_is_null(cur)) {
+            return;
+        }
+    }
+    const char *k = ts_node_type(cur);
+    if (strcmp(k, "attrset_expression") == 0 || strcmp(k, "rec_attrset_expression") == 0) {
+        extract_nix_binding_set(ctx, cbm_find_child_by_kind(cur, "binding_set"), spec);
+    }
+}
+
 static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     (void)spec;
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
+    if (ctx->language == CBM_LANG_NIX) {
+        extract_vars_nix(ctx, node, a);
+        return;
+    }
 
     switch (ctx->language) {
     /* Mainstream + C-family + Rust */
@@ -5926,6 +6057,22 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
     if (ctx->language == CBM_LANG_YAML || ctx->language == CBM_LANG_TOML ||
         ctx->language == CBM_LANG_INI || ctx->language == CBM_LANG_JSON) {
         walk_variables_iter(ctx, root, spec);
+        return;
+    }
+
+    /* Nix: the file's top level sits behind its header lambda(s), so the root's
+     * only child is a function_expression and the generic loop below would see
+     * nothing. Resolve past the header to the binding container(s) that actually
+     * constitute file scope, and mint only THEIR direct bindings.
+     *
+     * That bound is the point. Every Nix binding's parent is a binding_set at any
+     * depth, so admitting them all would mint a node per `enable = true` in a
+     * NixOS module's settings tree — the per-leaf flood the Helm values.yaml case
+     * above exists to avoid. C++ mints file-scope declarations and never locals;
+     * this is the same rule applied to a language whose file scope is behind a
+     * lambda. */
+    if (ctx->language == CBM_LANG_NIX) {
+        extract_nix_module_vars(ctx, root, spec);
         return;
     }
 
@@ -6583,14 +6730,31 @@ static bool is_template_class_node(TSNode node, CBMLanguage lang) {
  * namespace emits no def of its own — it only extends the enclosing scope for
  * its members. C#/PHP need the same treatment paired with their LSP resolvers
  * (a def-only change breaks their existing namespace handling), done separately. */
-static bool is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
+static bool is_namespace_scope_kind(CBMLanguage lang, const char *kind, TSNode node) {
     if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
         return strcmp(kind, "namespace_definition") == 0;
+    }
+    /* Nix: a binding whose value is an attribute set is a named scope that is not
+     * itself a definition — the same shape as a C++ namespace. `setA = { fn = …; }`
+     * makes `fn` proj.file.setA.fn, so two attrsets can each hold a `fn` without
+     * the second silently overwriting the first.
+     *
+     * Deliberately NOT `let` bindings: those are lexical, and C++ does not qualify
+     * by block scope either. Takes the node because the decision depends on the
+     * binding's VALUE, which the kind string alone cannot express. */
+    if (lang == CBM_LANG_NIX && strcmp(kind, "binding") == 0) {
+        return cbm_nix_binding_is_attrset_scope(node);
     }
     return false;
 }
 
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char *saved_enclosing) {
+    /* Nix scopes are `binding` nodes, which carry an `attrpath` rather than a
+     * `name` field. Shared with the unified extractor's own compute_class_qn so
+     * the def QN and the call-scope QN cannot drift. */
+    if (ctx->language == CBM_LANG_NIX) {
+        return cbm_nix_binding_scope_qn(ctx, node, saved_enclosing);
+    }
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
         name_node = cbm_find_child_by_kind(node, "identifier");
@@ -7331,7 +7495,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * is walked normally — functions AND classes, unlike a class body which
          * routes methods through extract_class_methods. Do NOT emit a def or run
          * the class/func paths on the namespace node itself. */
-        if (is_namespace_scope_kind(ctx->language, kind)) {
+        if (is_namespace_scope_kind(ctx->language, kind, node)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
             wd_push_children_reverse(&s, node, new_enclosing);
             continue;

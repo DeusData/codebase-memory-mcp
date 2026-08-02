@@ -1249,6 +1249,25 @@ TEST(store_trail_graph_visit_unwinds_used_edges_on_every_exit) {
     ASSERT_FALSE(used[0]);
     ASSERT_FALSE(used[1]);
 
+    /* A nested segment shares the query-wide work counter. If an earlier
+     * segment already exhausted or crossed the budget, exact equality is too
+     * fragile: the visitor must fail closed without examining another arc and
+     * must leave every caller-owned edge mark unchanged. */
+    memset(used, 0, sizeof(used));
+    work_rows = 2;
+    work_limit_hit = false;
+    cancelled = false;
+    ctx.visits = 0;
+    ASSERT_EQ(cbm_store_trail_graph_visit(graph, a_id, NULL, "outbound", types, 1, 1, 2, used, 1,
+                                          &work_rows, NULL, NULL, store_trail_visit_test_cb, &ctx,
+                                          &work_limit_hit, &cancelled),
+              CBM_STORE_OK);
+    ASSERT_TRUE(work_limit_hit);
+    ASSERT_EQ(work_rows, 2);
+    ASSERT_EQ(ctx.visits, 0);
+    ASSERT_FALSE(used[0]);
+    ASSERT_FALSE(used[1]);
+
     memset(used, 0, sizeof(used));
     work_rows = 0;
     work_limit_hit = false;

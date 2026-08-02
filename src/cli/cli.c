@@ -116,6 +116,7 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #define CBM_VERSION CBM_VERSION_DEVELOPMENT
 #endif
 #include <errno.h>  // EEXIST
+#include <math.h>
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
 #include <limits.h> // UINT_MAX
 #include <stdint.h> // uintptr_t
@@ -6910,10 +6911,13 @@ static bool cbm_config_parse_decimal_int(const char *value, int *out) {
     return true;
 }
 
+static bool cbm_config_value_is_valid(const char *key, const char *value);
+
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
     const char *val = cbm_config_get(cfg, key, NULL);
     int parsed = 0;
-    if (!cbm_config_parse_decimal_int(val, &parsed)) {
+    if (!val || !cbm_config_value_is_valid(key, val) ||
+        !cbm_config_parse_decimal_int(val, &parsed)) {
         return default_val;
     }
     return parsed;
@@ -6938,46 +6942,228 @@ static bool cbm_config_value_matches_enum(const char *range, const char *value) 
     return false;
 }
 
-static bool cbm_config_decimal_integer_in_range(const char *value, long minimum, long maximum) {
-    int parsed = 0;
-    if (!cbm_config_parse_decimal_int(value, &parsed)) {
+typedef enum {
+    CBM_CONFIG_RANGE_NOT_NUMERIC = 0,
+    CBM_CONFIG_RANGE_MATCHES,
+    CBM_CONFIG_RANGE_MISMATCHES,
+} cbm_config_range_result_t;
+
+static bool cbm_config_parse_finite_double(const char *value, const char **end_out, double *out) {
+    if (!value || !end_out || !out) {
         return false;
     }
-    return parsed >= minimum && parsed <= maximum;
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    if (end == value || !isfinite(parsed)) {
+        return false;
+    }
+    *end_out = end;
+    *out = parsed;
+    return true;
+}
+
+static const cbm_config_numeric_domain_t CBM_CONFIG_NUMERIC_DOMAINS[] = {
+    {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_CONFIG_NUMERIC_INTEGER, CBM_PAGERANK_MAX_ITER_MIN,
+     CBM_PAGERANK_MAX_ITER_MAX, true, true, true, false, CBM_PAGERANK_MAX_ITER, 0.0},
+    {CBM_CONFIG_PAGERANK_DAMPING, CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_DAMPING_MIN,
+     CBM_PAGERANK_DAMPING_MAX, true, true, true, true,
+     CBM_PAGERANK_DAMPING_RECOMMENDED_MIN, CBM_PAGERANK_DAMPING_RECOMMENDED_MAX},
+    {CBM_CONFIG_PAGERANK_EPSILON, CBM_CONFIG_NUMERIC_REAL,
+     CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE, CBM_PAGERANK_EPSILON_MAX, false, true, true, true,
+     CBM_PAGERANK_EPSILON_RECOMMENDED_MIN, CBM_PAGERANK_EPSILON_RECOMMENDED_MAX},
+#define CBM_PAGERANK_CONFIG_DOMAIN(edge_type, default_token, config_token, field)              \
+    {CBM_CONFIG_EDGE_WEIGHT_##config_token, CBM_CONFIG_NUMERIC_REAL,                          \
+     CBM_PAGERANK_EDGE_WEIGHT_MIN, CBM_PAGERANK_EDGE_WEIGHT_MAX, true, true, true, true,      \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MIN,                                   \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MAX},
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_CONFIG_DOMAIN)
+#undef CBM_PAGERANK_CONFIG_DOMAIN
+    {NULL, CBM_CONFIG_NUMERIC_REAL, 0.0, 0.0, false, false, false, false, 0.0, 0.0},
+};
+
+const cbm_config_numeric_domain_t *cbm_config_numeric_domain(const char *key) {
+    if (!key) {
+        return NULL;
+    }
+    for (size_t i = 0; CBM_CONFIG_NUMERIC_DOMAINS[i].key; i++) {
+        if (strcmp(CBM_CONFIG_NUMERIC_DOMAINS[i].key, key) == 0) {
+            return &CBM_CONFIG_NUMERIC_DOMAINS[i];
+        }
+    }
+    return NULL;
+}
+
+/* Typed comparisons are the executable contract for migrated numeric keys.
+ * Validation is O(D + |value|) time for D numeric domains, O(1) memory, and
+ * rejects NaN/Inf before an algorithm can observe them. */
+static bool cbm_config_numeric_domain_matches(const cbm_config_numeric_domain_t *domain,
+                                              const char *value) {
+    if (!domain || !value) {
+        return false;
+    }
+    double parsed = 0.0;
+    if (domain->kind == CBM_CONFIG_NUMERIC_INTEGER) {
+        int integer = 0;
+        if (!cbm_config_parse_decimal_int(value, &integer)) {
+            return false;
+        }
+        parsed = (double)integer;
+    } else {
+        const char *end = NULL;
+        if (!cbm_config_parse_finite_double(value, &end, &parsed) || *end != '\0') {
+            return false;
+        }
+    }
+    bool above_minimum = domain->accepted_minimum_inclusive
+                             ? parsed >= domain->accepted_minimum
+                             : parsed > domain->accepted_minimum;
+    bool below_maximum = domain->accepted_maximum_inclusive
+                             ? parsed <= domain->accepted_maximum
+                             : parsed < domain->accepted_maximum;
+    return above_minimum && below_maximum;
+}
+
+static void cbm_config_format_numeric_value(const cbm_config_numeric_domain_t *domain,
+                                            double value, char *out, size_t out_size) {
+    if (!domain || !out || out_size == 0) {
+        return;
+    }
+    if (domain->kind == CBM_CONFIG_NUMERIC_INTEGER) {
+        (void)snprintf(out, out_size, "%d", (int)value);
+        return;
+    }
+
+    /* libc has no portable shortest-double formatter. Try the bounded set of
+     * standard %g precisions and retain the first representation that strtod
+     * maps back to the exact value. This avoids binary artifacts for ordinary
+     * values (0.7 stays 0.7) without rounding DBL_MAX into infinity. Runtime is
+     * O(DBL_DECIMAL_DIG), therefore O(1), with O(1) stack storage. */
+    for (int precision = 1; precision <= DBL_DECIMAL_DIG; precision++) {
+        int written = snprintf(out, out_size, "%.*g", precision, value);
+        if (written < 0 || (size_t)written >= out_size) {
+            break;
+        }
+        char *end = NULL;
+        errno = 0;
+        double parsed = strtod(out, &end);
+        if (errno != ERANGE && end && *end == '\0' && parsed == value) {
+            return;
+        }
+    }
+    (void)snprintf(out, out_size, "%.*g", DBL_DECIMAL_DIG, value);
+}
+
+/* Interpret the registry's complete numeric range declarations. Historical
+ * "minimum-maximum" declarations are closed intervals; conventional bracket
+ * notation additionally expresses open bounds without key-specific validators
+ * or magic epsilon values. Non-numeric guidance remains descriptive only.
+ * Runtime is O(|range| + |value|), memory is O(1). */
+static cbm_config_range_result_t cbm_config_numeric_range_matches(const char *range,
+                                                                  const char *value) {
+    if (!range || !value || !range[0]) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+
+    const char *cursor = range;
+    bool minimum_inclusive = true;
+    bool maximum_inclusive = true;
+    bool bracketed = cursor[0] == '[' || cursor[0] == '(';
+    if (bracketed) {
+        minimum_inclusive = cursor[0] == '[';
+        cursor++;
+    }
+
+    double minimum = 0.0;
+    const char *minimum_end = NULL;
+    if (!cbm_config_parse_finite_double(cursor, &minimum_end, &minimum)) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+    char separator = bracketed ? ',' : '-';
+    if (*minimum_end != separator) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+
+    double maximum = 0.0;
+    const char *maximum_end = NULL;
+    bool maximum_unbounded = bracketed && strcmp(minimum_end + 1, "+inf)") == 0;
+    if (!maximum_unbounded &&
+        !cbm_config_parse_finite_double(minimum_end + 1, &maximum_end, &maximum)) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+    if (bracketed) {
+        if (!maximum_unbounded &&
+            ((*maximum_end != ']' && *maximum_end != ')') || maximum_end[1] != '\0')) {
+            return CBM_CONFIG_RANGE_NOT_NUMERIC;
+        }
+        maximum_inclusive = !maximum_unbounded && *maximum_end == ']';
+    } else if (*maximum_end != '\0') {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+    if (!maximum_unbounded && minimum > maximum) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+
+    double parsed = 0.0;
+    if (!strchr(range, '.')) {
+        int integer = 0;
+        if (!cbm_config_parse_decimal_int(value, &integer)) {
+            return CBM_CONFIG_RANGE_MISMATCHES;
+        }
+        parsed = (double)integer;
+    } else {
+        const char *value_end = NULL;
+        if (!cbm_config_parse_finite_double(value, &value_end, &parsed) || *value_end != '\0') {
+            return CBM_CONFIG_RANGE_MISMATCHES;
+        }
+    }
+
+    bool above_minimum = minimum_inclusive ? parsed >= minimum : parsed > minimum;
+    bool below_maximum = maximum_unbounded ||
+                         (maximum_inclusive ? parsed <= maximum : parsed < maximum);
+    return above_minimum && below_maximum ? CBM_CONFIG_RANGE_MATCHES
+                                          : CBM_CONFIG_RANGE_MISMATCHES;
+}
+
+/* Numeric registry ranges historically mixed hard correctness/resource
+ * contracts with tuning guidance. Keep the established hard contracts and
+ * make every PageRank numeric domain executable, without turning unrelated
+ * advisory maxima into new capability limits. */
+static bool cbm_config_numeric_range_is_contract(const cbm_config_entry_t *entry) {
+    return strcmp(entry->category, "PageRank") == 0 ||
+           strcmp(entry->key, CBM_CONFIG_EXTRACT_TIMEOUT_MS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_QUERY_MAX_ROWS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_QUERY_MAX_WORKING_ROWS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_DEP_MAX_FILES) == 0;
+}
+
+static bool cbm_config_value_matches_declared_range(const cbm_config_entry_t *entry,
+                                                    const char *value) {
+    const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(entry->key);
+    if (domain) {
+        return cbm_config_numeric_domain_matches(domain, value);
+    }
+    if (entry->range && strchr(entry->range, '|')) {
+        return cbm_config_value_matches_enum(entry->range, value);
+    }
+    if (!cbm_config_numeric_range_is_contract(entry)) {
+        return true;
+    }
+    return cbm_config_numeric_range_matches(entry->range, value) != CBM_CONFIG_RANGE_MISMATCHES;
 }
 
 static bool cbm_config_value_is_valid(const char *key, const char *value) {
+    if (!key || !value) {
+        return false;
+    }
     if (cbm_config_renamed_key(key)) {
-        return false;
-    }
-    if (key && strcmp(key, CBM_CONFIG_QUERY_MAX_ROWS) == 0 &&
-        !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_QUERY_ROWS)) {
-        return false;
-    }
-    if (key && strcmp(key, CBM_CONFIG_QUERY_MAX_WORKING_ROWS) == 0 &&
-        !cbm_config_decimal_integer_in_range(value, 1, CBM_MAX_QUERY_WORKING_ROWS)) {
-        return false;
-    }
-    if (key && strcmp(key, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS) == 0 &&
-        !cbm_config_decimal_integer_in_range(value, 1, CBM_GITHISTORY_MAX_COUPLINGS_LIMIT)) {
-        return false;
-    }
-    if (key && strcmp(key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0 &&
-        !cbm_config_decimal_integer_in_range(value, CBM_MIN_ARCH_CLUSTER_NODE_BUDGET,
-                                             CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)) {
-        return false;
-    }
-    if (key && strcmp(key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 &&
-        !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_AUTO_DEP_LIMIT)) {
-        return false;
-    }
-    if (key && strcmp(key, CBM_CONFIG_DEP_MAX_FILES) == 0 &&
-        !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_DEP_MAX_FILES)) {
         return false;
     }
     for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
-            return cbm_config_value_matches_enum(CBM_CONFIG_REGISTRY[i].range, value);
+            return cbm_config_value_matches_declared_range(&CBM_CONFIG_REGISTRY[i], value);
         }
     }
     return true; /* preserve extension/private keys not owned by this registry */
@@ -7003,6 +7189,7 @@ static void cbm_config_set_error(const char *key, const char *value, char *out, 
     const char *renamed_key = cbm_config_renamed_key(key);
     const char *effective_key = renamed_key ? renamed_key : key;
     const cbm_config_entry_t *entry = cbm_config_registry_entry(effective_key);
+    const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(effective_key);
 
     if (renamed_key && rename) {
         (void)snprintf(out, out_size,
@@ -7012,6 +7199,17 @@ static void cbm_config_set_error(const char *key, const char *value, char *out, 
     } else if (renamed_key) {
         (void)snprintf(out, out_size, "config key '%s' was renamed to '%s'; use %s=%s", key,
                        renamed_key, renamed_key, value ? value : "");
+    } else if (domain) {
+        char minimum[CBM_SZ_32];
+        char maximum[CBM_SZ_32];
+        cbm_config_format_numeric_value(domain, domain->accepted_minimum, minimum,
+                                        sizeof(minimum));
+        cbm_config_format_numeric_value(domain, domain->accepted_maximum, maximum,
+                                        sizeof(maximum));
+        (void)snprintf(out, out_size, "%s must be %s %s and %s %s, got '%s'", key,
+                       domain->accepted_minimum_inclusive ? ">=" : ">", minimum,
+                       domain->accepted_maximum_inclusive ? "<=" : "<", maximum,
+                       value ? value : "");
     } else if (rename && entry && entry->range) {
         (void)snprintf(out, out_size, "%s must be %s, got '%s'; '%s' was renamed to '%s'", key,
                        entry->range, value, value, rename->new_value);
@@ -7070,12 +7268,49 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name);
 static void cbm_config_print_presets(void);
 
+static int cbm_config_describe(const char *key) {
+    const cbm_config_entry_t *entry = cbm_config_registry_entry(key);
+    if (!entry) {
+        (void)fprintf(stderr, "Unknown config key: %s\n", key ? key : "");
+        return CLI_TRUE;
+    }
+    printf("%s\n", entry->key);
+    printf("  category: %s\n", entry->category ? entry->category : "");
+    printf("  default: %s\n", entry->default_val ? entry->default_val : "");
+    const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(entry->key);
+    if (domain) {
+        char value[CBM_SZ_32];
+        cbm_config_format_numeric_value(domain, domain->accepted_minimum, value, sizeof(value));
+        printf("  accepted_minimum: %s (%s)\n", value,
+               domain->accepted_minimum_inclusive ? "inclusive" : "exclusive");
+        cbm_config_format_numeric_value(domain, domain->accepted_maximum, value, sizeof(value));
+        printf("  accepted_maximum: %s (%s)\n", value,
+               domain->accepted_maximum_inclusive ? "inclusive" : "exclusive");
+        if (domain->has_recommended_minimum) {
+            cbm_config_format_numeric_value(domain, domain->recommended_minimum, value,
+                                            sizeof(value));
+            printf("  recommended_minimum: %s\n", value);
+        }
+        if (domain->has_recommended_maximum) {
+            cbm_config_format_numeric_value(domain, domain->recommended_maximum, value,
+                                            sizeof(value));
+            printf("  recommended_maximum: %s\n", value);
+        }
+    } else {
+        printf("  accepted: %s\n", entry->range ? entry->range : "any value");
+    }
+    printf("  description: %s\n", entry->description ? entry->description : "");
+    printf("  guidance: %s\n", entry->guidance ? entry->guidance : "");
+    return 0;
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     if (argc == 0 || (argv && (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0))) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
         printf("Commands:\n");
         printf("  list             Show common effective config values\n");
         printf("  get <key>        Get a config value\n");
+        printf("  describe <key>   Show its default, accepted extent, and tuning guidance\n");
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n");
         printf("  preset list      List exact named capability/API configurations\n");
@@ -7090,6 +7325,14 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
+    }
+
+    if (strcmp(argv[0], "describe") == 0) {
+        if (argc < MIN_ARGC_GET) {
+            (void)fprintf(stderr, "Usage: config describe <key>\n");
+            return CLI_TRUE;
+        }
+        return cbm_config_describe(argv[CLI_SKIP_ONE]);
     }
 
     const char *home = cbm_get_home_dir();
@@ -12547,7 +12790,7 @@ void cbm_cli_print_main_help(void) {
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");
-    printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp config <list|get|describe|set|reset>\n");
     printf("  codebase-memory-mcp config preset <list|apply>\n");
     printf("  codebase-memory-mcp daemon <start|stop|status>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
@@ -12581,15 +12824,15 @@ void cbm_cli_print_main_help(void) {
 
 double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val) {
     const char *val = cbm_config_get(cfg, key, NULL);
-    if (!val) {
+    if (!val || !cbm_config_value_is_valid(key, val)) {
         return default_val;
     }
-    char *endptr;
-    double v = strtod(val, &endptr);
-    if (endptr == val || *endptr != '\0') {
+    const char *end = NULL;
+    double parsed = 0.0;
+    if (!cbm_config_parse_finite_double(val, &end, &parsed) || *end != '\0') {
         return default_val;
     }
-    return v;
+    return parsed;
 }
 
 typedef struct {
@@ -12958,116 +13201,137 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {CBM_CONFIG_RANK_ENABLED, "true", NULL, "PageRank",
      "Compute PageRank, LinkRank, and precomputed node-degree views after indexing",
      "true|false",
+     CBM_CONFIG_GUIDANCE_LEADING
      "true preserves existing ranking behavior. false skips all three coupled rank views and removes "
      "their stored rows so queries cannot consume stale scores; structural degree remains available. "
      "Disable for a lower-cost baseline: codebase-memory-mcp config set rank_enabled false"},
-    {"pagerank_max_iter", CBM_PAGERANK_MAX_ITER_STR, NULL, "PageRank",
-     "Max iterations for PageRank algorithm before stopping (more = more accurate convergence)",
-     "1-10000",
-     "PageRank is an iterative algorithm — each iteration refines importance scores. "
-     "20 iterations converges in ~5ms for 16K-node codebases. Typical convergence is 10-15 iters. "
-     "Raise to 50-100 for very large codebases (>100K nodes). "
-     "Diminishing returns above convergence — set too high wastes CPU at reindex time."},
-    {"pagerank_damping", "0.85", NULL, "PageRank",
+    {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER_STR, NULL, "PageRank",
+     "Maximum PageRank iterations allowed while seeking convergence",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "The default " CBM_PAGERANK_MAX_ITER_STR " matches the algorithm's tested convergence budget. Each iteration is O(V + E); "
+     "reaching the budget without convergence returns an error and preserves previously published "
+     "rank rows. Recommended: start at " CBM_PAGERANK_MAX_ITER_RECOMMENDED_START " and use the smallest measured budget safely above the "
+     "logged convergence iteration. Any positive int is accepted; lowering too far may reject valid "
+     "large graphs, while runtime is linear in the budget."},
+    {CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING_STR, NULL, "PageRank",
      "Damping factor — fraction of importance that follows edges vs. teleports randomly (the 'bored surfer')",
-     "0.0-1.0",
-     "0.85 is the standard Google PageRank value. Higher (0.9) spreads importance further along long "
-     "call chains; lower (0.7-0.8) keeps importance local to direct callers. Out-of-range and NaN "
-     "values are clamped to 0.85 at compute time, so an invalid value never crashes indexing."},
-    {"pagerank_epsilon", "0.000001", NULL, "PageRank",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_DAMPING_RECOMMENDED_RANGE "; default " CBM_PAGERANK_DAMPING_STR " is the standard Google PageRank value. Higher values spread "
+     "importance further along long call chains; lower values keep importance local. Config writes reject "
+     "out-of-range and non-finite values; invalid legacy/raw values use the " CBM_PAGERANK_DAMPING_STR " default."},
+    {CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON_STR, NULL, "PageRank",
      "Convergence threshold — PageRank stops early when the L2 change between iterations drops below this",
-     "0.0-1.0",
-     "1e-6 default. Lower (1e-8) iterates longer for marginally finer convergence (rarely needed); "
-     "higher (1e-4) stops sooner with slightly less precise rankings. Must be > 0 — non-positive and "
-     "NaN values are clamped to 1e-6. Rarely needs tuning; pair with pagerank_max_iter as the hard cap."},
-    {"rank_scope", "full", NULL, "PageRank",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_EPSILON_RECOMMENDED_RANGE "; default " CBM_PAGERANK_EPSILON_STR ". Lower values iterate longer for marginally "
+     "finer convergence; higher values stop sooner with less precise rankings. Must be > 0 — non-positive and "
+     "non-finite values are rejected. Values above 1 are allowed but normally stop immediately; pair "
+     "with pagerank_max_iter as the work budget."},
+    {CBM_CONFIG_RANK_SCOPE, "full", NULL, "PageRank",
      "Project/dependency scope used when computing PageRank and LinkRank",
      "full|project|deps",
+     CBM_CONFIG_GUIDANCE_USER_TUNABLE
      "'full' (default): score the project plus its dependency sub-projects. "
      "'project': score only the requested project's own symbols. "
      "'deps': score only dependency sub-project symbols."},
-    {"rank_refresh", CBM_RANK_REFRESH_DEFAULT, NULL, "PageRank",
+    {CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFAULT, NULL, "PageRank",
      "When to recompute PageRank/LinkRank after indexing",
      CBM_RANK_REFRESH_AT_PUBLISH "|" CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES "|"
      CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
+     CBM_CONFIG_GUIDANCE_LEADING
      "'defer_all_incremental_reindexes' (default): incremental reindexes, including containment "
      "publishes and full rebuilds reached through incremental fallback, may defer rank recompute "
      "after marking rank views stale; search/trace omit stale rank until a later refresh. "
      "'at_publish': recompute after graph changes, dependency reindexes, or missing rank views. "
      "'defer_exact_delta_reindexes': only small exact-delta reindexes may skip synchronous rank "
      "recompute, after marking rank views stale."},
-    {"edge_weight_calls", "1.0", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_CALLS, CBM_PAGERANK_WEIGHT_CALLS_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows along direct function/method call edges (CALLS)",
-     "0.0-100.0",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
      "PageRank works like Google PageRank: importance flows along edges. Higher weight = more "
-     "importance flows when one function calls another. 1.0 is the anchor — all other weights "
-     "are relative to it. Increase to 2.0 for call-heavy C/Rust codebases. "
+     "importance flows when one function calls another. Recommended range " CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_CALLS_DEFAULT_STR " is the "
+     "anchor and all other weights are relative to it. Increase to 2.0 for call-heavy C/Rust codebases. "
      "Decrease to 0.5 for event-driven systems where direct calls aren't the primary coupling."},
-    {"edge_weight_usage", "0.7", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_USAGE, CBM_PAGERANK_WEIGHT_USAGE_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows along type-reference edges: type annotations, attribute access, isinstance (USAGE)",
-     "0.0-100.0",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
      "USAGE edges are created when code references a type (e.g. 'x: MyClass', 'isinstance(x, Foo)'). "
-     "These are dense in TypeScript/Python and can inflate UI utilities over core functions. "
+     "Recommended range " CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_USAGE_DEFAULT_STR ". These are dense in TypeScript/Python and can inflate UI utilities over core functions. "
      "Reduce to 0.2-0.3 if type annotations are dominating your architecture results."},
-    {"edge_weight_defines_method", "0.5", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD, CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows from a class to each method it defines (DEFINES_METHOD)",
-     "0.0-100.0",
-     "Every class has one DEFINES_METHOD edge per method. Higher = classes with many methods rank "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT_STR ". Every class has one DEFINES_METHOD edge per method. Higher = classes with many methods rank "
      "higher relative to standalone functions. Lower to 0.1 to treat functions and class methods equally."},
-    {"edge_weight_imports", "0.3", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_IMPORTS, CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows along module import edges (IMPORTS)",
-     "0.0-100.0",
-     "Created when file A imports file/module B. Higher promotes widely-imported utility modules "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT_STR ". Created when file A imports file/module B. Higher promotes widely-imported utility modules "
      "(e.g. a shared 'utils.py' imported by 50 files). Raise to 0.6-0.8 to emphasize shared infrastructure; "
      "keep low if star-imports create many spurious edges."},
-    {"edge_weight_decorates", "0.2", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_DECORATES, CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows from a decorator to the function it decorates (DECORATES)",
-     "0.0-100.0",
-     "Created when @decorator is applied to a function. Raise to 0.5+ in Python web frameworks "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT_STR ". Created when @decorator is applied to a function. Raise above 0.5 in Python web frameworks "
      "where @route, @cached, @requires_auth are semantically important architectural markers."},
-    {"edge_weight_writes", "0.15", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_WRITES, CBM_PAGERANK_WEIGHT_WRITES_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows when a function writes to a variable or file (WRITES)",
-     "0.0-100.0",
-     "Tracks side effects: function writes to a shared variable or file. Raise for ETL or "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_WRITES_DEFAULT_STR ". Tracks side effects: function writes to a shared variable or file. Raise for ETL or "
      "data-pipeline codebases where write targets (databases, output files) are the primary output."},
-    {"edge_weight_defines", "0.1", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_DEFINES, CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows from a file/module to each symbol it defines (DEFINES — structural)",
-     "0.0-100.0",
-     "Every function has exactly one DEFINES edge from its containing file. This is purely structural "
-     "bookkeeping — keep very low (0.01-0.1). Raising this inflates ALL symbols in a file equally, "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT_STR ". Every function has exactly one DEFINES edge from its containing file. "
+     "This is purely structural bookkeeping; raising it inflates ALL symbols in a file equally, "
      "which is rarely what you want."},
-    {"edge_weight_configures", "0.1", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_CONFIGURES, CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows from config files to the code they configure (CONFIGURES)",
-     "0.0-100.0",
-     "Created when a config file references a code symbol (e.g. a YAML file referencing a handler "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT_STR ". Created when a config file references a code symbol (e.g. a YAML file referencing a handler "
      "class). Raise to 0.3+ for infrastructure projects where config -> code coupling is important."},
-    {"edge_weight_tests", "0.05", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_TESTS, CBM_PAGERANK_WEIGHT_TESTS_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows from test code to the production function it tests (TESTS)",
-     "0.0-100.0",
-     "Intentionally very low so test files don't inflate production function rankings. A function "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_TESTS_DEFAULT_STR ". Keep this low so test files don't inflate production function rankings. A function "
      "with 100 tests would otherwise rank at the top of every project. Raise only if you want "
      "heavily-tested functions to rank higher (useful for spotting critical code paths)."},
-    {"edge_weight_http_calls", "0.5", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS, CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows along cross-service HTTP call edges (HTTP_CALLS)",
-     "0.0-100.0",
-     "Created when code makes an HTTP call to another service endpoint. Raise to 1.0-2.0 for "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT_STR ". Created when code makes an HTTP call to another service endpoint. Raise to 1.0-2.0 for "
      "microservice architectures where HTTP calls ARE the primary coupling between components "
      "and you want service entry points to appear prominently in architecture results."},
-    {"edge_weight_async_calls", "0.8", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS, CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows along async function call edges (ASYNC_CALLS)",
-     "0.0-100.0",
-     "Like edge_weight_calls but for async/await call patterns. Slightly lower than sync calls "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT_STR ". Like edge_weight_calls but for async/await call patterns. Slightly lower than sync calls "
      "by default. Reduce to 0.3 for heavily async Node.js or Python asyncio codebases where "
      "awaited spans are dense and create noise in the rankings."},
-    {"edge_weight_default", "0.1", NULL, "PageRank",
+    {CBM_CONFIG_EDGE_WEIGHT_DEFAULT, CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT_STR, NULL, "PageRank",
      "Fallback importance weight for edge types not listed above",
-     "0.0-100.0",
-     "Safety net for any edge types added in future without explicit weights. "
-     "Rarely affects results. Keep low."},
-    {"edge_weight_member_of", "0.5", NULL, "PageRank",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT_STR ". This is the safety net for edge types added without explicit "
+     "weights; it rarely affects results."},
+    {CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF, CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT_STR, NULL, "PageRank",
      "How much importance flows from a method back up to its parent class (MEMBER_OF — reverse structural)",
-     "0.0-100.0",
-     "Set to 0 to disable (method importance stays in the method, not the class). "
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT_STR ". Set to 0 to disable (method importance stays in the method, not the class). "
      "Higher values propagate method-level importance up to the parent class — "
      "raise to 0.8 to make heavily-called classes rank higher than individual methods."},
     /* ── Watcher ── */
@@ -13256,7 +13520,7 @@ int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default
     char default_buf[CBM_SZ_32];
     snprintf(default_buf, sizeof(default_buf), "%d", default_val);
     const char *val = cbm_config_get_effective(cfg, key, default_buf);
-    if (!val || !val[0]) {
+    if (!val || !val[0] || !cbm_config_value_is_valid(key, val)) {
         return default_val;
     }
     int parsed = 0;

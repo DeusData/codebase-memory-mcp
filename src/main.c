@@ -259,17 +259,21 @@ static bool main_test_worker_project_lock_marker(const main_local_cli_mutation_t
 }
 #endif
 
-static bool main_local_cli_mutation_begin(void *context, const char *project) {
+static bool main_local_cli_mutation_begin_internal(void *context, const char *project, bool wait) {
     main_local_cli_mutation_t *mutation = context;
     if (!mutation || !mutation->manager || !project || !project[0]) {
         return false;
     }
     for (;;) {
-        uint64_t now = cbm_now_ms();
-        uint64_t deadline = now > UINT64_MAX - 100U ? UINT64_MAX : now + 100U;
         cbm_project_lock_lease_t *lease = NULL;
-        cbm_private_file_lock_status_t status =
-            cbm_project_lock_acquire(mutation->manager, project, deadline, NULL, &lease);
+        cbm_private_file_lock_status_t status;
+        if (wait) {
+            uint64_t now = cbm_now_ms();
+            uint64_t deadline = now > UINT64_MAX - 100U ? UINT64_MAX : now + 100U;
+            status = cbm_project_lock_acquire(mutation->manager, project, deadline, NULL, &lease);
+        } else {
+            status = cbm_project_lock_try_acquire(mutation->manager, project, &lease);
+        }
         if (status == CBM_PRIVATE_FILE_LOCK_OK && lease) {
             main_local_cli_lease_t *held = calloc(1, sizeof(*held));
             if (held) {
@@ -300,6 +304,9 @@ static bool main_local_cli_mutation_begin(void *context, const char *project) {
                           "refuse_mutation");
             return false;
         }
+        if (!wait) {
+            return false;
+        }
         if (mutation->feedback && !mutation->waiting_reported) {
             (void)fprintf(mutation->feedback, "Waiting for another CBM mutation of %s...\n",
                           project);
@@ -307,6 +314,14 @@ static bool main_local_cli_mutation_begin(void *context, const char *project) {
             mutation->waiting_reported = true;
         }
     }
+}
+
+static bool main_local_cli_mutation_begin(void *context, const char *project) {
+    return main_local_cli_mutation_begin_internal(context, project, true);
+}
+
+static bool main_local_cli_mutation_try_begin(void *context, const char *project) {
+    return main_local_cli_mutation_begin_internal(context, project, false);
 }
 
 static void main_local_cli_mutation_end(void *context, const char *project) {
@@ -830,6 +845,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             if (project_locks) {
                 cbm_mcp_server_set_project_mutation_guard(srv, main_local_cli_mutation_begin,
                                                           main_local_cli_mutation_end, &mutation);
+                cbm_mcp_server_set_project_mutation_try_guard(srv,
+                                                              main_local_cli_mutation_try_begin);
             }
             /* Match the stdio MCP server: this in-process server honors registry
              * defaults and config/env overrides such as auto_index and

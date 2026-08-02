@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <float.h>
+#include <limits.h>
+#include <stddef.h>
 #include <sqlite3.h>
 
 /* ── Test helpers ──────────────────────────────────────────── */
@@ -749,6 +751,59 @@ TEST(pagerank_publication_failure_rolls_back_all_rank_views) {
     PASS();
 }
 
+TEST(pagerank_scan_failure_preserves_prior_rank_generation) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "scan_fail", "/tmp/scan_fail"), CBM_STORE_OK);
+    int64_t a = add_node(s, "scan_fail", "a");
+    int64_t b = add_node(s, "scan_fail", "b");
+    int64_t c = add_node(s, "scan_fail", "c");
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(c, 0);
+    ASSERT_GT(add_edge(s, "scan_fail", a, b, "CALLS"), 0);
+    ASSERT_GT(add_edge(s, "scan_fail", b, c, "CALLS"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "scan_fail"), 3);
+
+    int pagerank_rows = count_table_rows(s, "pagerank");
+    int linkrank_rows = count_table_rows(s, "linkrank");
+    int degree_rows = count_table_rows(s, "node_degree");
+    double old_rank = get_pr(s, c);
+    ASSERT_TRUE(old_rank > 0.0);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "scan_fail"));
+
+    const cbm_pagerank_test_scan_t scans[] = {
+        CBM_PAGERANK_TEST_SCAN_NODES,
+        CBM_PAGERANK_TEST_SCAN_EDGES,
+    };
+    for (size_t i = 0; i < sizeof(scans) / sizeof(scans[0]); i++) {
+        cbm_pagerank_test_fail_scan_after(scans[i], 1);
+        ASSERT_EQ(cbm_pagerank_compute_default(s, "scan_fail"), CBM_STORE_ERR);
+        ASSERT_EQ(count_table_rows(s, "pagerank"), pagerank_rows);
+        ASSERT_EQ(count_table_rows(s, "linkrank"), linkrank_rows);
+        ASSERT_EQ(count_table_rows(s, "node_degree"), degree_rows);
+        ASSERT_FLOAT_EQ(get_pr(s, c), old_rank, CBM_PAGERANK_EPSILON);
+        ASSERT_TRUE(cbm_pagerank_views_complete(s, "scan_fail"));
+    }
+
+    cbm_store_close(s);
+
+    /* A failpoint armed for an empty target scan must expire at SQLITE_DONE.
+     * Add an edge only after that successful computation so any leaked
+     * thread-local state becomes an observable failure on the next scan. */
+    s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "scan_done", "/tmp/scan_done"), CBM_STORE_OK);
+    a = add_node(s, "scan_done", "a");
+    ASSERT_GT(a, 0);
+    cbm_pagerank_test_fail_scan_after(CBM_PAGERANK_TEST_SCAN_EDGES, 0);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "scan_done"), 1);
+    ASSERT_GT(add_edge(s, "scan_done", a, a, "CALLS"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "scan_done"), 1);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pagerank_publication_respects_outer_transaction_rollback) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -898,6 +953,21 @@ TEST(pagerank_null_safety) {
     PASS();
 }
 
+TEST(pagerank_id_map_capacity_rejects_unrepresentable_node_counts) {
+    int capacity = 0;
+    ASSERT_TRUE(cbm_pagerank_test_id_map_capacity(1, &capacity));
+    ASSERT_EQ(capacity, CBM_HASHMAP_LOAD_FACTOR + SKIP_ONE);
+
+    const int max_nodes = (INT_MAX - SKIP_ONE) / CBM_HASHMAP_LOAD_FACTOR;
+    ASSERT_TRUE(cbm_pagerank_test_id_map_capacity(max_nodes, &capacity));
+    ASSERT_EQ(capacity, max_nodes * CBM_HASHMAP_LOAD_FACTOR + SKIP_ONE);
+    ASSERT_FALSE(cbm_pagerank_test_id_map_capacity(max_nodes + SKIP_ONE, &capacity));
+    ASSERT_FALSE(cbm_pagerank_test_id_map_capacity(0, &capacity));
+    ASSERT_FALSE(cbm_pagerank_test_id_map_capacity(-1, &capacity));
+    ASSERT_FALSE(cbm_pagerank_test_id_map_capacity(1, NULL));
+    PASS();
+}
+
 /* ── 2. Edge cases from igraph/NetworkX ──────────────────── */
 
 TEST(pagerank_self_loop) {
@@ -1010,6 +1080,82 @@ TEST(pagerank_zero_weight_edges) {
     cbm_pagerank_compute(s, "zw", CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
                          CBM_PAGERANK_MAX_ITER, &zero_w, CBM_RANK_SCOPE_FULL);
     ASSERT_TRUE(fabs(get_pr(s, a) - get_pr(s, b)) < 0.01);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The canonical mapping must connect every exact edge type to the same struct
+ * field used by defaults, config loading, and validation. Each case enables
+ * only its mapped field, making a mapping drift observable as a dangling edge.
+ * The generated case table is compile-time-only; each tiny graph retains the
+ * algorithm's O(I * (V + E)) runtime and O(V + E) memory. */
+TEST(pagerank_edge_weight_field_map_is_complete) {
+    static const struct {
+        const char *edge_type;
+        size_t field_offset;
+        const char *name;
+    } cases[] = {
+#define CBM_PAGERANK_MAPPING_CASE(edge_type, default_token, config_token, field)              \
+    {edge_type, offsetof(cbm_edge_weights_t, field), #config_token},
+        CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_MAPPING_CASE)
+#undef CBM_PAGERANK_MAPPING_CASE
+        {"FUTURE_EDGE_KIND", offsetof(cbm_edge_weights_t, default_weight), "unknown-fallback"},
+    };
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char project[CBM_SZ_128];
+        int written = snprintf(project, sizeof(project), "weight-map-%s", cases[i].name);
+        ASSERT_TRUE(written > 0 && (size_t)written < sizeof(project));
+        cbm_store_upsert_project(s, project, "/tmp/weight-map");
+        int64_t source = add_node(s, project, "source");
+        int64_t target = add_node(s, project, "target");
+        add_edge(s, project, source, target, cases[i].edge_type);
+
+        cbm_edge_weights_t weights = {0};
+        double *mapped_weight = (double *)((unsigned char *)&weights + cases[i].field_offset);
+        *mapped_weight = 1.0;
+        ASSERT_EQ(cbm_pagerank_compute(s, project, CBM_PAGERANK_DAMPING,
+                                       CBM_PAGERANK_EPSILON, CBM_PAGERANK_MAX_ITER, &weights,
+                                       CBM_RANK_SCOPE_PROJECT),
+                  2);
+        ASSERT_TRUE(get_pr(s, target) > get_pr(s, source));
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Direct API callers bypass config-set validation. A non-finite weight must
+ * therefore fall back to that field's named default instead of poisoning the
+ * weighted out-degree and either publishing non-finite ranks or exhausting
+ * the O(max_iter * (V + E)) convergence budget. */
+TEST(pagerank_invalid_custom_weight_falls_back_to_field_default) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "invalid-weight", "/tmp/invalid-weight");
+    int64_t source = add_node(s, "invalid-weight", "source");
+    int64_t calls_target = add_node(s, "invalid-weight", "calls-target");
+    int64_t imports_target = add_node(s, "invalid-weight", "imports-target");
+    add_edge(s, "invalid-weight", source, calls_target, "CALLS");
+    add_edge(s, "invalid-weight", source, imports_target, "IMPORTS");
+    add_edge(s, "invalid-weight", calls_target, source, "CALLS");
+
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "invalid-weight"), 3);
+    double expected_source = get_pr(s, source);
+    double expected_calls = get_pr(s, calls_target);
+    double expected_imports = get_pr(s, imports_target);
+
+    cbm_edge_weights_t weights = CBM_DEFAULT_EDGE_WEIGHTS;
+    weights.calls = NAN;
+    ASSERT_EQ(cbm_pagerank_compute(s, "invalid-weight", CBM_PAGERANK_DAMPING,
+                                   CBM_PAGERANK_EPSILON, CBM_PAGERANK_MAX_ITER, &weights,
+                                   CBM_DEFAULT_RANK_SCOPE),
+              3);
+    ASSERT_TRUE(fabs(get_pr(s, source) - expected_source) < CBM_PAGERANK_EPSILON);
+    ASSERT_TRUE(fabs(get_pr(s, calls_target) - expected_calls) < CBM_PAGERANK_EPSILON);
+    ASSERT_TRUE(fabs(get_pr(s, imports_target) - expected_imports) < CBM_PAGERANK_EPSILON);
+
     cbm_store_close(s);
     PASS();
 }
@@ -1326,7 +1472,8 @@ TEST(architecture_key_functions_no_pagerank) {
 /* ── 6. Phase 8.5: config-backed edge weights ────────────── */
 
 TEST(pagerank_config_custom_weights) {
-    /* Verify custom edge weights struct produces different rankings */
+    /* Verify the public config path, not only the direct weights struct, maps
+     * edge kinds into the compute core and materially changes rankings. */
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "cw", "/tmp/cw");
     int64_t a = add_node(s, "cw", "source");
@@ -1339,16 +1486,21 @@ TEST(pagerank_config_custom_weights) {
     double rc_default = get_pr(s, c);
     double rb_default = get_pr(s, b);
     ASSERT_TRUE(rc_default > rb_default);
-    /* Custom: boost IMPORTS to 2.0, drop CALLS to 0.1 */
-    cbm_edge_weights_t custom = CBM_DEFAULT_EDGE_WEIGHTS;
-    custom.imports = 2.0;
-    custom.calls = 0.1;
-    cbm_pagerank_compute(s, "cw", CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
-                         CBM_PAGERANK_MAX_ITER, &custom, CBM_RANK_SCOPE_FULL);
+    /* Custom: boost IMPORTS to 2.0, drop CALLS to 0.1. */
+    char tmpdir[CBM_PATH_MAX];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-weight-cfg-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_IMPORTS, "2.0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "0.1"), 0);
+    ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cw", cfg), 3);
     double rc_custom = get_pr(s, c);
     double rb_custom = get_pr(s, b);
     /* Now imported node should get more rank */
     ASSERT_TRUE(rb_custom > rc_custom);
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
     cbm_store_close(s);
     PASS();
 }
@@ -1585,6 +1737,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_unconverged_iteration_budget_does_not_publish);
     RUN_TEST(pagerank_publication_failure_rolls_back_all_rank_views);
+    RUN_TEST(pagerank_scan_failure_preserves_prior_rank_generation);
     RUN_TEST(pagerank_publication_respects_outer_transaction_rollback);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);
@@ -1592,6 +1745,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_rank_scope_config_controls_scope_and_clears_stale_rows);
     RUN_TEST(pagerank_dangling_nodes);
     RUN_TEST(pagerank_null_safety);
+    RUN_TEST(pagerank_id_map_capacity_rejects_unrepresentable_node_counts);
     /* Edge cases from igraph/NetworkX (13 tests) */
     RUN_TEST(pagerank_self_loop);
     RUN_TEST(pagerank_disconnected_components);
@@ -1600,6 +1754,8 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_multigraph_edges);
     RUN_TEST(pagerank_large_graph_stability);
     RUN_TEST(pagerank_zero_weight_edges);
+    RUN_TEST(pagerank_edge_weight_field_map_is_complete);
+    RUN_TEST(pagerank_invalid_custom_weight_falls_back_to_field_default);
     RUN_TEST(pagerank_custom_damping_high);
     RUN_TEST(pagerank_custom_damping_low);
     RUN_TEST(pagerank_max_iter_zero);

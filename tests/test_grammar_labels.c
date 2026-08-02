@@ -200,7 +200,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"gn", "Module:1"},
     {"just", "Function:1,Module:1"},
     {"hcl", "Class:1,Module:1"},
-    {"nix", "Module:1"},
+    {"nix", "Module:1,Variable:2"},
     {"gomod", "Module:1"},
     {"gotemplate", "Module:1"},
     {"graphql", "Class:1,Field:1,Module:1"},

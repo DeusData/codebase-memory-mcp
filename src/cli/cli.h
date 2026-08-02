@@ -473,7 +473,37 @@ typedef struct {
     const char *guidance;
 } cbm_config_entry_t;
 
+typedef enum {
+    CBM_CONFIG_NUMERIC_INTEGER = 0,
+    CBM_CONFIG_NUMERIC_REAL,
+} cbm_config_numeric_kind_t;
+
+/* Typed numeric metadata is the executable contract for migrated config
+ * entries. Textual ranges remain available for enums and legacy entries, but
+ * numeric consumers must not recover bounds by reparsing presentation text. */
+typedef struct {
+    const char *key;
+    cbm_config_numeric_kind_t kind;
+    double accepted_minimum;
+    double accepted_maximum;
+    bool accepted_minimum_inclusive;
+    bool accepted_maximum_inclusive;
+    bool has_recommended_minimum;
+    bool has_recommended_maximum;
+    double recommended_minimum;
+    double recommended_maximum;
+} cbm_config_numeric_domain_t;
+
+/* User-facing tuning levels live in registry guidance so every existing
+ * consumer emits them without a parallel key-to-tier map. Leading knobs change
+ * major capability/cost/freshness policy; user-tunable knobs express ordinary
+ * intent; advanced knobs require workload measurement or algorithm knowledge. */
+#define CBM_CONFIG_GUIDANCE_LEADING "Tuning level: leading (high priority). "
+#define CBM_CONFIG_GUIDANCE_USER_TUNABLE "Tuning level: user-tunable. "
+#define CBM_CONFIG_GUIDANCE_ADVANCED "Tuning level: advanced. "
+
 extern const cbm_config_entry_t CBM_CONFIG_REGISTRY[];
+const cbm_config_numeric_domain_t *cbm_config_numeric_domain(const char *key);
 
 const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val);
 bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool default_val);

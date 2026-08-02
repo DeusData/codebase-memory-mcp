@@ -11679,6 +11679,92 @@ TEST(cli_config_get_int) {
     PASS();
 }
 
+/* The registry is the public contract for algorithm knobs. Config writes must
+ * enforce that contract once, before PageRank or any other consumer observes
+ * the value; otherwise NaN/Inf weights can poison an O(I * (V + E)) run and an
+ * invalid non-positive iteration budget cannot converge. Positive iteration
+ * budgets and finite nonnegative weights remain uncapped. Validation itself is
+ * O(K + |value|) for K registry entries and uses O(1) memory. */
+TEST(cli_config_pagerank_numeric_ranges_are_enforced) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-pagerank-ranges-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER,
+                             CBM_STRINGIFY(CBM_PAGERANK_MAX_ITER_MIN)),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "10000"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "10001"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER,
+                             CBM_STRINGIFY(CBM_PAGERANK_MAX_ITER_MAX)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "0"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "1.5"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "2147483648"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING,
+                             CBM_STRINGIFY(CBM_PAGERANK_DAMPING_MIN)),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING,
+                             CBM_STRINGIFY(CBM_PAGERANK_DAMPING_MAX)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "-0.1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "1.1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "nan"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "inf"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON_STR), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "1.0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "2.0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON,
+                             CBM_STRINGIFY(CBM_PAGERANK_EPSILON_MAX)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "0"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "nan"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,
+                             CBM_STRINGIFY(CBM_PAGERANK_EDGE_WEIGHT_MIN)),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "100.0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "100.1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,
+                             CBM_STRINGIFY(CBM_PAGERANK_EDGE_WEIGHT_MAX)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "-0.1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "nan"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "inf"), 0);
+
+    cbm_config_close(cfg);
+
+    /* Typed readers use the same registry validation so hand-edited legacy
+     * rows cannot bypass setter validation and poison algorithm state. */
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_PAGERANK_MAX_ITER, "0"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_PAGERANK_DAMPING, "nan"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_PAGERANK_EPSILON, "0"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_EDGE_WEIGHT_CALLS, "inf"), 0);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER),
+              CBM_PAGERANK_MAX_ITER);
+    ASSERT_TRUE(cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING) ==
+                CBM_PAGERANK_DAMPING);
+    ASSERT_TRUE(cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON) ==
+                CBM_PAGERANK_EPSILON);
+    ASSERT_TRUE(cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,
+                                      CBM_DEFAULT_EDGE_WEIGHTS.calls) ==
+                CBM_DEFAULT_EDGE_WEIGHTS.calls);
+    cbm_config_close(cfg);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_query_row_limits_enforce_advertised_ranges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-query-limits-XXXXXX");
@@ -13575,6 +13661,143 @@ TEST(cli_config_registry_architecture_defaults_use_shared_definitions) {
     ASSERT_TRUE(atof(resolution->default_val) == CBM_DEFAULT_ARCH_RESOLUTION);
     PASS();
 }
+TEST(cli_config_registry_pagerank_guidance_names_actual_defaults) {
+    const struct {
+        const char *key;
+        double actual_default;
+        cbm_config_numeric_kind_t kind;
+        double accepted_minimum;
+        double accepted_maximum;
+        bool accepted_minimum_inclusive;
+        bool accepted_maximum_inclusive;
+        bool has_recommended_maximum;
+        double recommended_minimum;
+        double recommended_maximum;
+    } cases[] = {
+        {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER, CBM_CONFIG_NUMERIC_INTEGER,
+         CBM_PAGERANK_MAX_ITER_MIN, CBM_PAGERANK_MAX_ITER_MAX, true, true, false,
+         CBM_PAGERANK_MAX_ITER, 0.0},
+        {CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING, CBM_CONFIG_NUMERIC_REAL,
+         CBM_PAGERANK_DAMPING_MIN, CBM_PAGERANK_DAMPING_MAX, true, true, true,
+         CBM_PAGERANK_DAMPING_RECOMMENDED_MIN, CBM_PAGERANK_DAMPING_RECOMMENDED_MAX},
+        {CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON, CBM_CONFIG_NUMERIC_REAL,
+         CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE, CBM_PAGERANK_EPSILON_MAX, false, true, true,
+         CBM_PAGERANK_EPSILON_RECOMMENDED_MIN, CBM_PAGERANK_EPSILON_RECOMMENDED_MAX},
+#define CBM_PAGERANK_REGISTRY_CASE(edge_type, default_token, config_token, field)            \
+    {CBM_CONFIG_EDGE_WEIGHT_##config_token, CBM_DEFAULT_EDGE_WEIGHTS.field,                  \
+     CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_EDGE_WEIGHT_MIN,                                 \
+     CBM_PAGERANK_EDGE_WEIGHT_MAX, true, true, true,                                         \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MIN,                                  \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MAX},
+        CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_REGISTRY_CASE)
+#undef CBM_PAGERANK_REGISTRY_CASE
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const cbm_config_entry_t *entry = NULL;
+        for (int j = 0; CBM_CONFIG_REGISTRY[j].key; j++) {
+            if (strcmp(CBM_CONFIG_REGISTRY[j].key, cases[i].key) == 0) {
+                entry = &CBM_CONFIG_REGISTRY[j];
+                break;
+            }
+        }
+        ASSERT_NOT_NULL(entry);
+        char *end = NULL;
+        double documented_default = strtod(entry->default_val, &end);
+        ASSERT_NOT_NULL(end);
+        ASSERT_TRUE(*end == '\0');
+        ASSERT_TRUE(documented_default == cases[i].actual_default);
+        ASSERT_NULL(entry->range);
+
+        const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(cases[i].key);
+        ASSERT_NOT_NULL(domain);
+        ASSERT_EQ(domain->kind, cases[i].kind);
+        ASSERT_TRUE(domain->accepted_minimum == cases[i].accepted_minimum);
+        ASSERT_TRUE(domain->accepted_maximum == cases[i].accepted_maximum);
+        ASSERT_EQ(domain->accepted_minimum_inclusive, cases[i].accepted_minimum_inclusive);
+        ASSERT_EQ(domain->accepted_maximum_inclusive, cases[i].accepted_maximum_inclusive);
+        ASSERT_TRUE(domain->has_recommended_minimum);
+        ASSERT_EQ(domain->has_recommended_maximum, cases[i].has_recommended_maximum);
+        ASSERT_TRUE(domain->recommended_minimum == cases[i].recommended_minimum);
+        if (domain->has_recommended_maximum) {
+            ASSERT_TRUE(domain->recommended_maximum == cases[i].recommended_maximum);
+        }
+        ASSERT_TRUE(documented_default >= domain->accepted_minimum);
+        ASSERT_TRUE(documented_default <= domain->accepted_maximum);
+        ASSERT_TRUE(documented_default >= domain->recommended_minimum);
+        ASSERT_TRUE(!domain->has_recommended_maximum ||
+                    documented_default <= domain->recommended_maximum);
+
+        char expected_guidance[CBM_SZ_64];
+        int n = snprintf(expected_guidance, sizeof(expected_guidance), "default %s",
+                         entry->default_val);
+        ASSERT_TRUE(n > 0 && (size_t)n < sizeof(expected_guidance));
+        ASSERT_NOT_NULL(strstr(entry->guidance, expected_guidance));
+        ASSERT_NOT_NULL(strstr(entry->guidance, "Recommended"));
+        ASSERT_TRUE(strncmp(entry->guidance, CBM_CONFIG_GUIDANCE_ADVANCED,
+                            strlen(CBM_CONFIG_GUIDANCE_ADVANCED)) == 0);
+    }
+    PASS();
+}
+TEST(cli_config_registry_pagerank_policy_tuning_levels_are_explicit) {
+    static const struct {
+        const char *key;
+        const char *level;
+    } cases[] = {
+        {CBM_CONFIG_RANK_ENABLED, CBM_CONFIG_GUIDANCE_LEADING},
+        {CBM_CONFIG_RANK_REFRESH, CBM_CONFIG_GUIDANCE_LEADING},
+        {CBM_CONFIG_RANK_SCOPE, CBM_CONFIG_GUIDANCE_USER_TUNABLE},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const cbm_config_entry_t *entry = NULL;
+        for (int j = 0; CBM_CONFIG_REGISTRY[j].key; j++) {
+            if (strcmp(CBM_CONFIG_REGISTRY[j].key, cases[i].key) == 0) {
+                entry = &CBM_CONFIG_REGISTRY[j];
+                break;
+            }
+        }
+        ASSERT_NOT_NULL(entry);
+        ASSERT_TRUE(strncmp(entry->guidance, cases[i].level, strlen(cases[i].level)) == 0);
+    }
+    PASS();
+}
+TEST(cli_config_describe_emits_registry_contract) {
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    ASSERT_TRUE(saved_stdout >= 0);
+    int fds[2];
+    ASSERT_EQ(cbm_pipe(fds), 0);
+    ASSERT_TRUE(dup2(fds[1], STDOUT_FILENO) >= 0);
+    close(fds[1]);
+
+    char *args[] = {"describe", CBM_CONFIG_PAGERANK_DAMPING};
+    int rc = cbm_cmd_config(2, args);
+
+    fflush(stdout);
+    ASSERT_TRUE(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    close(saved_stdout);
+
+    static char output[CBM_SZ_4K];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(output) - 1 &&
+           (n = read(fds[0], output + used, sizeof(output) - 1 - used)) > 0) {
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    output[used] = '\0';
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(output, CBM_CONFIG_PAGERANK_DAMPING));
+    ASSERT_NOT_NULL(strstr(output, "default: " CBM_PAGERANK_DAMPING_STR));
+    ASSERT_NOT_NULL(strstr(output, "accepted_minimum: 0"));
+    ASSERT_NOT_NULL(strstr(output, "accepted_maximum: 1"));
+    ASSERT_NOT_NULL(strstr(output, "recommended_minimum: 0.7"));
+    ASSERT_NOT_NULL(strstr(output, "recommended_maximum: 0.9"));
+    ASSERT_NOT_NULL(strstr(output, CBM_CONFIG_GUIDANCE_ADVANCED));
+    PASS();
+}
 TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -13850,7 +14073,7 @@ TEST(cli_main_help_lists_config_preset_subcommand) {
     help_buf[used] = '\0';
 
     /* Existing config line still present ... */
-    ASSERT_NOT_NULL(strstr(help_buf, "config <list|get|set|reset>"));
+    ASSERT_NOT_NULL(strstr(help_buf, "config <list|get|describe|set|reset>"));
     /* ... and the preset subcommand is advertised beside it. */
     ASSERT_NOT_NULL(strstr(help_buf, "config preset <list|apply>"));
     /* Daemon lifecycle control is implemented (main_run_daemon_ctl) and named
@@ -14201,6 +14424,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_pagerank_numeric_ranges_are_enforced);
     RUN_TEST(cli_config_query_row_limits_enforce_advertised_ranges);
     RUN_TEST(cli_config_githistory_max_couplings_enforces_advertised_range);
     RUN_TEST(cli_config_cluster_node_budget_uses_shared_broad_range);
@@ -14259,6 +14483,9 @@ SUITE(cli) {
     RUN_TEST(cli_config_registry_query_limits_use_shared_definitions);
     RUN_TEST(cli_config_registry_search_previews_use_shared_definitions);
     RUN_TEST(cli_config_registry_architecture_defaults_use_shared_definitions);
+    RUN_TEST(cli_config_registry_pagerank_guidance_names_actual_defaults);
+    RUN_TEST(cli_config_registry_pagerank_policy_tuning_levels_are_explicit);
+    RUN_TEST(cli_config_describe_emits_registry_contract);
     RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
     RUN_TEST(cli_config_registry_auto_index_deps_defaults_disabled);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);

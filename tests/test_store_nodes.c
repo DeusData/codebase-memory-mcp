@@ -13,14 +13,311 @@
 #include <foundation/constants.h>
 #include <foundation/platform.h>
 #include <store/store.h>
+#include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-/* ── Schema / Open / Close ──────────────────────────────────────── */
+/* ── Label allowlist / SQL drift guard ──────────────────────────── */
+
+/* CONTRACT PIN. `cbm_label_is_type_like()` is documented in cbm.h as the single
+ * source of truth for type-like labels, "instead of scattering
+ * `|| strcmp(label,\"Struct\")==0` across the tree". A SQL string literal cannot
+ * call it, so four queries in store.c and the BM25 ranking in mcp.c hardcoded
+ * their own label lists — and silently stopped matching once Struct (Rust, Go,
+ * Swift, D) began being emitted. get_architecture and vector search dropped
+ * every struct in the project; search_code under-ranked them.
+ *
+ * This pins the SQL mirrors to the C predicate in BOTH directions, so the next
+ * type-like label fails here instead of quietly shrinking query results. */
+TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
+    /* Every label the C predicate accepts must appear in the SQL fragment. */
+    static const char *const type_like[] = {"Class", "Struct", "Interface",
+                                            "Enum",  "Type",   "Trait"};
+    for (size_t i = 0; i < sizeof(type_like) / sizeof(type_like[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_type_like(type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", type_like[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+        ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* And nothing the predicate rejects may be smuggled into the type-like
+     * fragment — otherwise the SQL would widen past the C contract. */
+    static const char *const not_type_like[] = {"Function", "Method", "Module",
+                                                "File",     "Folder", "Variable"};
+    for (size_t i = 0; i < sizeof(not_type_like) / sizeof(not_type_like[0]); i++) {
+        ASSERT_FALSE(cbm_label_is_type_like(not_type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", not_type_like[i]);
+        ASSERT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+    }
+    /* The callable fragment carries exactly Function and Method on top. */
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Function'"));
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Method'"));
+    PASS();
+}
 
 enum { STORE_TEST_SQLITE_AUTO_LEN = -1 };
+
+/* ── Exact vector-search ranking ────────────────────────────────── */
+
+enum {
+    STORE_TEST_VECTOR_DIM = 768,
+    STORE_TEST_KEYWORD_COUNT_BEYOND_OLD_CAP = 33,
+    STORE_TEST_OLD_PREFILTER_MULTIPLIER = 5,
+    STORE_TEST_VECTOR_BIND_ID = 1,
+    STORE_TEST_VECTOR_BIND_PROJECT = 2,
+    STORE_TEST_VECTOR_BIND_VALUE = 3,
+    STORE_TEST_VECTOR_BIND_TOKEN = 3,
+    STORE_TEST_VECTOR_BIND_TOKEN_VALUE = 4,
+};
+
+static bool store_test_install_vector_tables(cbm_store_t *s) {
+    sqlite3 *db = cbm_store_get_db(s);
+    return db &&
+           sqlite3_exec(db,
+                        "CREATE TABLE node_vectors ("
+                        "node_id INTEGER PRIMARY KEY, project TEXT NOT NULL, vector BLOB NOT NULL);"
+                        "CREATE TABLE token_vectors ("
+                        "id INTEGER PRIMARY KEY, project TEXT NOT NULL, token TEXT NOT NULL,"
+                        "vector BLOB NOT NULL, idf INTEGER NOT NULL);",
+                        NULL, NULL, NULL) == SQLITE_OK;
+}
+
+static bool store_test_insert_node_vector(cbm_store_t *s, const char *project, const char *name,
+                                          const int8_t vector[STORE_TEST_VECTOR_DIM]) {
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = name,
+                       .qualified_name = name,
+                       .file_path = "src/vector_fixture.c"};
+    int64_t node_id = cbm_store_upsert_node(s, &node);
+    sqlite3_stmt *stmt = NULL;
+    sqlite3 *db = cbm_store_get_db(s);
+    if (node_id <= 0 ||
+        sqlite3_prepare_v2(db, "INSERT INTO node_vectors(node_id,project,vector) VALUES(?1,?2,?3)",
+                           STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, STORE_TEST_VECTOR_BIND_ID, node_id);
+    sqlite3_bind_text(stmt, STORE_TEST_VECTOR_BIND_PROJECT, project, STORE_TEST_SQLITE_AUTO_LEN,
+                      SQLITE_STATIC);
+    sqlite3_bind_blob(stmt, STORE_TEST_VECTOR_BIND_VALUE, vector, STORE_TEST_VECTOR_DIM,
+                      SQLITE_STATIC);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+static bool store_test_insert_raw_token_vector(cbm_store_t *s, int id, const char *project,
+                                               const char *token, const void *vector,
+                                               int vector_bytes) {
+    sqlite3_stmt *stmt = NULL;
+    sqlite3 *db = cbm_store_get_db(s);
+    const char *sql = "INSERT INTO token_vectors(id,project,token,vector,idf) "
+                      "VALUES(?1,?2,?3,?4,1)";
+    if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int(stmt, STORE_TEST_VECTOR_BIND_ID, id);
+    sqlite3_bind_text(stmt, STORE_TEST_VECTOR_BIND_PROJECT, project, STORE_TEST_SQLITE_AUTO_LEN,
+                      SQLITE_STATIC);
+    sqlite3_bind_text(stmt, STORE_TEST_VECTOR_BIND_TOKEN, token, STORE_TEST_SQLITE_AUTO_LEN,
+                      SQLITE_STATIC);
+    sqlite3_bind_blob(stmt, STORE_TEST_VECTOR_BIND_TOKEN_VALUE, vector, vector_bytes,
+                      SQLITE_STATIC);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+static bool store_test_insert_token_vector(cbm_store_t *s, int id, const char *project,
+                                           const char *token,
+                                           const int8_t vector[STORE_TEST_VECTOR_DIM]) {
+    return store_test_insert_raw_token_vector(s, id, project, token, vector,
+                                              STORE_TEST_VECTOR_DIM);
+}
+
+TEST(store_vector_search_ranks_every_candidate_for_all_keywords) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *project = "vector-exact-candidates";
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/vector-exact-candidates"), CBM_STORE_OK);
+    ASSERT_TRUE(store_test_install_vector_tables(s));
+
+    int8_t first[STORE_TEST_VECTOR_DIM] = {0};
+    int8_t second[STORE_TEST_VECTOR_DIM] = {0};
+    first[0] = INT8_MAX;
+    second[1] = INT8_MAX;
+    ASSERT_TRUE(store_test_insert_token_vector(s, 1, project, "first", first));
+    ASSERT_TRUE(store_test_insert_token_vector(s, 2, project, "second", second));
+
+    /* The old first-keyword prefilter fetched exactly five rows for limit=1.
+     * Six decoys therefore hid the true all-keyword winner despite its higher
+     * min-cosine score. Exact top-K selection must inspect every candidate. */
+    for (int i = 0; i <= STORE_TEST_OLD_PREFILTER_MULTIPLIER; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "decoy_%d", i);
+        ASSERT_TRUE(store_test_insert_node_vector(s, project, name, first));
+    }
+    int8_t balanced[STORE_TEST_VECTOR_DIM] = {0};
+    balanced[0] = 90;
+    balanced[1] = 90;
+    ASSERT_TRUE(store_test_insert_node_vector(s, project, "balanced_winner", balanced));
+
+    const char *keywords[] = {"first", "second"};
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_vector_search(s, project, keywords, 2, 1, &results, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(results[0].name, "balanced_winner");
+    cbm_store_free_vector_results(results, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_vector_search_uses_every_nonempty_keyword) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *project = "vector-all-keywords";
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/vector-all-keywords"), CBM_STORE_OK);
+    ASSERT_TRUE(store_test_install_vector_tables(s));
+
+    int8_t first_axis[STORE_TEST_VECTOR_DIM] = {0};
+    int8_t second_axis[STORE_TEST_VECTOR_DIM] = {0};
+    first_axis[0] = INT8_MAX;
+    second_axis[1] = INT8_MAX;
+    char keyword_storage[STORE_TEST_KEYWORD_COUNT_BEYOND_OLD_CAP][32];
+    const char *keywords[STORE_TEST_KEYWORD_COUNT_BEYOND_OLD_CAP];
+    for (int i = 0; i < STORE_TEST_KEYWORD_COUNT_BEYOND_OLD_CAP; i++) {
+        snprintf(keyword_storage[i], sizeof(keyword_storage[i]), "keyword_%d", i);
+        keywords[i] = keyword_storage[i];
+        const int8_t *vector = i + 1 == STORE_TEST_KEYWORD_COUNT_BEYOND_OLD_CAP ? second_axis
+                                                                               : first_axis;
+        ASSERT_TRUE(store_test_insert_token_vector(s, i + 1, project, keywords[i], vector));
+    }
+    ASSERT_TRUE(store_test_insert_node_vector(s, project, "first_axis_only", first_axis));
+    int8_t balanced[STORE_TEST_VECTOR_DIM] = {0};
+    balanced[0] = 90;
+    balanced[1] = 90;
+    ASSERT_TRUE(store_test_insert_node_vector(s, project, "all_keywords_winner", balanced));
+
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_vector_search(s, project, keywords,
+                                      STORE_TEST_KEYWORD_COUNT_BEYOND_OLD_CAP, 1, &results, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(results[0].name, "all_keywords_winner");
+    cbm_store_free_vector_results(results, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_vector_search_allocation_failures_are_atomic) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *project = "vector-allocation-failures";
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/vector-allocation-failures"),
+              CBM_STORE_OK);
+    ASSERT_TRUE(store_test_install_vector_tables(s));
+
+    int8_t vector[STORE_TEST_VECTOR_DIM] = {0};
+    vector[0] = INT8_MAX;
+    ASSERT_TRUE(store_test_insert_token_vector(s, 1, project, "keyword", vector));
+    enum { STORE_TEST_ROWS_PAST_FIRST_GROWTH = 17 };
+    for (int i = 0; i < STORE_TEST_ROWS_PAST_FIRST_GROWTH; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "allocation_row_%d", i);
+        ASSERT_TRUE(store_test_insert_node_vector(s, project, name, vector));
+    }
+
+    struct {
+        cbm_store_test_vector_alloc_site_t site;
+        int successful_before;
+    } cases[] = {
+        {CBM_STORE_TEST_VECTOR_ALLOC_KEYWORDS, 0},
+        {CBM_STORE_TEST_VECTOR_ALLOC_KEYWORDS, 1},
+        {CBM_STORE_TEST_VECTOR_ALLOC_RESULT_STRING, 0},
+        {CBM_STORE_TEST_VECTOR_ALLOC_RESULT_STRING, STORE_TEST_ROWS_PAST_FIRST_GROWTH * 4 - 4},
+        {CBM_STORE_TEST_VECTOR_ALLOC_RESULT_RESERVE, 0},
+        {CBM_STORE_TEST_VECTOR_ALLOC_RESULT_RESERVE, 1},
+    };
+    const char *keywords[] = {"keyword"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cbm_vector_result_t *results = (cbm_vector_result_t *)s;
+        int count = -1;
+        cbm_store_test_fail_vector_allocation(cases[i].site, cases[i].successful_before);
+        ASSERT_EQ(cbm_store_vector_search(s, project, keywords, 1,
+                                          STORE_TEST_ROWS_PAST_FIRST_GROWTH, &results, &count),
+                  CBM_STORE_ERR);
+        ASSERT_NULL(results);
+        ASSERT_EQ(count, 0);
+        ASSERT_NOT_NULL(strstr(cbm_store_error(s), "allocation failed"));
+    }
+    cbm_store_test_fail_vector_allocation(CBM_STORE_TEST_VECTOR_ALLOC_NONE, -1);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_vector_search_excludes_zero_magnitude_nodes) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *project = "vector-zero-node";
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/vector-zero-node"), CBM_STORE_OK);
+    ASSERT_TRUE(store_test_install_vector_tables(s));
+
+    int8_t keyword_vector[STORE_TEST_VECTOR_DIM] = {0};
+    int8_t zero_vector[STORE_TEST_VECTOR_DIM] = {0};
+    int8_t opposite_vector[STORE_TEST_VECTOR_DIM] = {0};
+    keyword_vector[0] = INT8_MAX;
+    opposite_vector[0] = -INT8_MAX;
+    ASSERT_TRUE(store_test_insert_token_vector(s, 1, project, "keyword", keyword_vector));
+    ASSERT_TRUE(store_test_insert_node_vector(s, project, "undefined_zero_vector", zero_vector));
+    ASSERT_TRUE(store_test_insert_node_vector(s, project, "valid_negative_similarity",
+                                              opposite_vector));
+
+    const char *keywords[] = {"keyword"};
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_vector_search(s, project, keywords, 1, 1, &results, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(results[0].name, "valid_negative_similarity");
+    cbm_store_free_vector_results(results, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_vector_search_rejects_malformed_enriched_keyword_vector) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *project = "vector-malformed-keyword";
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/vector-malformed-keyword"), CBM_STORE_OK);
+    ASSERT_TRUE(store_test_install_vector_tables(s));
+
+    const int8_t malformed_vector[] = {INT8_MAX};
+    ASSERT_TRUE(store_test_insert_raw_token_vector(s, 1, project, "malformed", malformed_vector,
+                                                   (int)sizeof(malformed_vector)));
+    int8_t node_vector[STORE_TEST_VECTOR_DIM] = {0};
+    node_vector[0] = INT8_MAX;
+    ASSERT_TRUE(store_test_insert_node_vector(s, project, "candidate", node_vector));
+
+    const char *keywords[] = {"malformed"};
+    cbm_vector_result_t *results = (cbm_vector_result_t *)s;
+    int count = -1;
+    ASSERT_EQ(cbm_store_vector_search(s, project, keywords, 1, 1, &results, &count),
+              CBM_STORE_ERR);
+    ASSERT_NULL(results);
+    ASSERT_EQ(count, 0);
+    ASSERT_NOT_NULL(strstr(cbm_store_error(s), "token vector"));
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── Schema / Open / Close ──────────────────────────────────────── */
 enum {
     STORE_TEST_BIND_PROJECT = 1,
     STORE_TEST_BIND_GENERATION = 2,
@@ -6878,6 +7175,12 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
+    RUN_TEST(store_vector_search_ranks_every_candidate_for_all_keywords);
+    RUN_TEST(store_vector_search_uses_every_nonempty_keyword);
+    RUN_TEST(store_vector_search_allocation_failures_are_atomic);
+    RUN_TEST(store_vector_search_excludes_zero_magnitude_nodes);
+    RUN_TEST(store_vector_search_rejects_malformed_enriched_keyword_vector);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);

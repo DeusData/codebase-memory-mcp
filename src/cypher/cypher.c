@@ -9,6 +9,7 @@
 #include "foundation/compat.h"
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
+#include "foundation/str_util.h"
 #include "store/store.h"
 
 #include <yyjson/yyjson.h>
@@ -22,6 +23,7 @@ enum {
     CYP_PAIR = 2,
     CYP_TRIPLE = 3,
     CYP_INIT_CAP4 = 4, /* initial small array capacity */
+    CYP_JSON_CONTROL_LIMIT = 0x20, /* JSON escapes bytes below U+0020 */
     CYP_INIT_CAP8 = 8, /* initial medium array capacity */
     /* Keep common bindings allocation-free. Wider queries spill into geometric
      * overflow storage instead of silently losing variables. */
@@ -38,13 +40,106 @@ enum {
 #define CYP_DBL_MAX 1e308
 
 #include <ctype.h>
+#include <errno.h>
 #include "foundation/compat_regex.h"
 #include <limits.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define CYPHER_ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
+
+/* Each lexer-keyword function has one source of truth for its stable schema
+ * spelling, executor canonical spelling, and token. Compile-time expansion
+ * keeps lexer lookup and token dispatch O(1) over the same fixed set, adds no
+ * retained memory, and prevents the MCP contract from drifting from parser
+ * recognition. Identifier-form functions use the schema arrays directly. */
+#define CYPHER_AGGREGATE_FUNCTIONS(X) \
+    X("count", "COUNT", TOK_COUNT)    \
+    X("sum", "SUM", TOK_SUM)          \
+    X("avg", "AVG", TOK_AVG)          \
+    X("min", "MIN", TOK_MIN_KW)       \
+    X("max", "MAX", TOK_MAX_KW)       \
+    X("collect", "COLLECT", TOK_COLLECT)
+
+#define CYPHER_KEYWORD_SCALAR_FUNCTIONS(X) \
+    X("toLower", "toLower", TOK_TOLOWER)   \
+    X("toUpper", "toUpper", TOK_TOUPPER)   \
+    X("toString", "toString", TOK_TOSTRING)
+
+/* One stable language registry for descriptions, conformance tests, and
+ * identifier-form function recognition. These arrays describe executable
+ * capability only; they never depend on an indexed repository or language.
+ * Access is O(1), and description generation is O(C) for this fixed registry
+ * with output-proportional memory owned by the caller's serializer. */
+static const char *const CYPHER_CAPABILITY_CLAUSES[] = {
+    "MATCH",    "OPTIONAL MATCH", "WHERE", "WITH",  "UNWIND", "RETURN",
+    "DISTINCT", "ORDER BY",       "SKIP",  "LIMIT", "UNION",  "UNION ALL",
+};
+static const char *const CYPHER_CAPABILITY_PATTERNS[] = {
+    "node labels, label alternation, and inline properties",
+    "typed, type-alternative, untyped, directed, and undirected relationships",
+    "exact, bounded, lower-only, upper-only, and unbounded variable-length relationships",
+    "multiple MATCH/OPTIONAL MATCH stages",
+};
+static const char *const CYPHER_CAPABILITY_PREDICATES[] = {
+    "comparisons", "boolean AND/OR/XOR/NOT", "IN",          "CONTAINS/STARTS WITH/ENDS WITH",
+    "regex =~",    "IS NULL/IS NOT NULL",    "label tests", "single-hop EXISTS patterns",
+};
+#define CYPHER_CAPABILITY_NAME(schema_name, canonical_name, token) schema_name,
+static const char *const CYPHER_CAPABILITY_AGGREGATES[] = {
+    CYPHER_AGGREGATE_FUNCTIONS(CYPHER_CAPABILITY_NAME)};
+static const char *const CYPHER_CAPABILITY_KEYWORD_SCALARS[] = {
+    CYPHER_KEYWORD_SCALAR_FUNCTIONS(CYPHER_CAPABILITY_NAME)};
+#undef CYPHER_CAPABILITY_NAME
+static const char *const CYPHER_CAPABILITY_NAMED_SCALARS[] = {
+    "labels",    "type", "id",     "keys", "properties", "toInteger", "toFloat",
+    "toBoolean", "size", "length", "trim", "ltrim",      "rtrim",     "reverse",
+};
+static const char *const CYPHER_CAPABILITY_MULTI_ARGUMENT[] = {
+    "coalesce", "substring", "replace", "left", "right",
+};
+static const char *const CYPHER_CAPABILITY_SEMANTICS[] = {
+    "read-only execution",
+    "relationship-unique trails for ordinary variable-length matching",
+    "exact selection and ordering before output shaping",
+    "unsupported syntax fails with a supported rewrite",
+};
+static const char *const CYPHER_CAPABILITY_UNSUPPORTED[] = {
+    "write/admin/CALL clauses", "parameters",
+    "path variables",           "variable-length relationship bindings",
+    "list/map comprehensions",
+};
+
+static const cbm_cypher_capability_schema_t CYPHER_CAPABILITY_SCHEMA = {
+    .schema_id = CBM_CYPHER_CAPABILITY_SCHEMA_ID,
+    .version = CBM_CYPHER_CAPABILITY_SCHEMA_VERSION,
+    .clauses = CYPHER_CAPABILITY_CLAUSES,
+    .clause_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_CLAUSES),
+    .patterns = CYPHER_CAPABILITY_PATTERNS,
+    .pattern_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_PATTERNS),
+    .predicates = CYPHER_CAPABILITY_PREDICATES,
+    .predicate_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_PREDICATES),
+    .aggregate_functions = CYPHER_CAPABILITY_AGGREGATES,
+    .aggregate_function_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_AGGREGATES),
+    .keyword_scalar_functions = CYPHER_CAPABILITY_KEYWORD_SCALARS,
+    .keyword_scalar_function_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_KEYWORD_SCALARS),
+    .named_scalar_functions = CYPHER_CAPABILITY_NAMED_SCALARS,
+    .named_scalar_function_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_NAMED_SCALARS),
+    .multi_argument_functions = CYPHER_CAPABILITY_MULTI_ARGUMENT,
+    .multi_argument_function_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_MULTI_ARGUMENT),
+    .semantics = CYPHER_CAPABILITY_SEMANTICS,
+    .semantic_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_SEMANTICS),
+    .unsupported = CYPHER_CAPABILITY_UNSUPPORTED,
+    .unsupported_count = CYPHER_ARRAY_COUNT(CYPHER_CAPABILITY_UNSUPPORTED),
+};
+
+const cbm_cypher_capability_schema_t *cbm_cypher_capability_schema(void) {
+    return &CYPHER_CAPABILITY_SCHEMA;
+}
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -60,76 +155,247 @@ static char *heap_strdup(const char *s) {
     return d;
 }
 
-static char *heap_strndup(const char *s, size_t n) {
-    char *d = malloc(n + SKIP_ONE);
-    if (d) {
-        memcpy(d, s, n);
-        d[n] = '\0';
+/* Join a small, caller-owned set of string parts without format buffers.
+ * Sizing and copying are each O(L) for total output length L, with one exact
+ * O(L) allocation. NULL parts and representational overflow fail atomically. */
+static char *cypher_join_parts(const char *const *parts, size_t part_count) {
+    if (!parts || part_count == 0) {
+        return NULL;
     }
-    return d;
+    size_t total = 0;
+    for (size_t i = 0; i < part_count; i++) {
+        if (!parts[i]) {
+            return NULL;
+        }
+        size_t length = strlen(parts[i]);
+        if (length > SIZE_MAX - total) {
+            return NULL;
+        }
+        total += length;
+    }
+    if (total > SIZE_MAX - SKIP_ONE) {
+        return NULL;
+    }
+    char *joined = malloc(total + SKIP_ONE);
+    if (!joined) {
+        return NULL;
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < part_count; i++) {
+        size_t length = strlen(parts[i]);
+        memcpy(joined + offset, parts[i], length);
+        offset += length;
+    }
+    joined[offset] = '\0';
+    return joined;
 }
+
+/* Compare an existing expression with the same canonical part composition
+ * used by the parser/column builder, avoiding temporary allocation. O(L)
+ * runtime and O(1) auxiliary memory for total expression length L. */
+static bool cypher_text_equals_parts(const char *text, const char *const *parts,
+                                     size_t part_count) {
+    if (!text || !parts || part_count == 0) {
+        return false;
+    }
+    const char *cursor = text;
+    for (size_t i = 0; i < part_count; i++) {
+        if (!parts[i]) {
+            return false;
+        }
+        size_t length = strlen(parts[i]);
+        if (strncmp(cursor, parts[i], length) != 0) {
+            return false;
+        }
+        cursor += length;
+    }
+    return *cursor == '\0';
+}
+
+static int cypher_geometric_capacity(int current, int needed);
 
 /* ══════════════════════════════════════════════════════════════════
  *  LEXER
  * ══════════════════════════════════════════════════════════════════ */
 
-static void lex_push(cbm_lex_result_t *r, cbm_token_type_t type, const char *text, int pos) {
-    if (r->count >= r->capacity) {
-        r->capacity = r->capacity ? r->capacity * PAIR_LEN : CBM_SZ_32;
-        r->tokens = safe_realloc(r->tokens, r->capacity * sizeof(cbm_token_t));
+enum {
+    CYP_LEX_ALLOC_NONE = 0,
+    CYP_LEX_ALLOC_TOKEN_ARRAY,
+    CYP_LEX_ALLOC_TOKEN_TEXT,
+    CYP_LEX_ALLOC_STRING_TEXT,
+};
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+_Static_assert((int)CBM_CYPHER_TEST_LEX_ALLOC_NONE == CYP_LEX_ALLOC_NONE,
+               "lexer allocation seam values must match");
+_Static_assert((int)CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_ARRAY == CYP_LEX_ALLOC_TOKEN_ARRAY,
+               "lexer allocation seam values must match");
+_Static_assert((int)CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_TEXT == CYP_LEX_ALLOC_TOKEN_TEXT,
+               "lexer allocation seam values must match");
+_Static_assert((int)CBM_CYPHER_TEST_LEX_ALLOC_STRING_TEXT == CYP_LEX_ALLOC_STRING_TEXT,
+               "lexer allocation seam values must match");
+static CBM_TLS int g_cypher_test_lex_alloc_site = CYP_LEX_ALLOC_NONE;
+static CBM_TLS int g_cypher_test_lex_alloc_successes_before_failure = -1;
+
+void cbm_cypher_test_fail_lex_allocation(cbm_cypher_test_lex_alloc_site_t site,
+                                         int successful_before) {
+    g_cypher_test_lex_alloc_site = (int)site;
+    g_cypher_test_lex_alloc_successes_before_failure = successful_before;
+}
+#endif
+
+static bool lex_allocation_should_fail(int site) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cypher_test_lex_alloc_site != site ||
+        g_cypher_test_lex_alloc_successes_before_failure < 0) {
+        return false;
     }
-    r->tokens[r->count++] = (cbm_token_t){.type = type, .text = heap_strdup(text), .pos = pos};
+    if (g_cypher_test_lex_alloc_successes_before_failure == 0) {
+        g_cypher_test_lex_alloc_site = CYP_LEX_ALLOC_NONE;
+        g_cypher_test_lex_alloc_successes_before_failure = -1;
+        return true;
+    }
+    g_cypher_test_lex_alloc_successes_before_failure--;
+#else
+    (void)site;
+#endif
+    return false;
+}
+
+static void *lex_malloc(int site, size_t bytes) {
+    return lex_allocation_should_fail(site) ? NULL : malloc(bytes);
+}
+
+static void *lex_realloc(int site, void *allocation, size_t bytes) {
+    return lex_allocation_should_fail(site) ? NULL : realloc(allocation, bytes);
+}
+
+static void lex_set_error(cbm_lex_result_t *r, const char *message) {
+    if (r) {
+        r->failed = true;
+    }
+    if (r && !r->error) {
+        r->error = heap_strdup(message);
+    }
+}
+
+/* Geometric token-vector growth performs O(T) total pointer-copy work and
+ * retains O(T) token metadata for T tokens. Overflow/OOM leaves the old owner
+ * intact and aborts the entire lex rather than publishing a partial token. */
+static bool lex_reserve_token(cbm_lex_result_t *r) {
+    if (!r || r->failed || r->count < 0 || r->capacity < 0 ||
+        r->count > INT_MAX - SKIP_ONE) {
+        lex_set_error(r, "Cypher token count is too large to represent");
+        return false;
+    }
+    if (r->count < r->capacity) {
+        return true;
+    }
+    int needed = r->count + SKIP_ONE;
+    int next_capacity =
+        r->capacity > 0 ? cypher_geometric_capacity(r->capacity, needed) : CBM_SZ_32;
+    if (next_capacity < needed || (size_t)next_capacity > SIZE_MAX / sizeof(*r->tokens)) {
+        lex_set_error(r, "Cypher token storage is too large to represent");
+        return false;
+    }
+    cbm_token_t *grown =
+        lex_realloc(CYP_LEX_ALLOC_TOKEN_ARRAY, r->tokens,
+                    (size_t)next_capacity * sizeof(*r->tokens));
+    if (!grown) {
+        lex_set_error(r, "out of memory growing Cypher token storage");
+        return false;
+    }
+    r->tokens = grown;
+    r->capacity = next_capacity;
+    return true;
+}
+
+static void lex_push_owned(cbm_lex_result_t *r, cbm_token_type_t type, char *text, int pos) {
+    if (!text) {
+        lex_set_error(r, "out of memory copying Cypher token text");
+        return;
+    }
+    if (!lex_reserve_token(r)) {
+        free(text);
+        return;
+    }
+    r->tokens[r->count++] = (cbm_token_t){.type = type, .text = text, .pos = pos};
 }
 
 static void lex_push_n(cbm_lex_result_t *r, cbm_token_type_t type, const char *start, size_t len,
                        int pos) {
-    if (r->count >= r->capacity) {
-        r->capacity = r->capacity ? r->capacity * PAIR_LEN : CBM_SZ_32;
-        r->tokens = safe_realloc(r->tokens, r->capacity * sizeof(cbm_token_t));
+    if (!r || r->failed) {
+        return;
     }
-    r->tokens[r->count++] =
-        (cbm_token_t){.type = type, .text = heap_strndup(start, len), .pos = pos};
+    if (len > SIZE_MAX - SKIP_ONE) {
+        lex_set_error(r, "Cypher token text is too large to represent");
+        return;
+    }
+    char *text = lex_malloc(CYP_LEX_ALLOC_TOKEN_TEXT, len + SKIP_ONE);
+    if (text) {
+        memcpy(text, start, len);
+        text[len] = '\0';
+    }
+    lex_push_owned(r, type, text, pos);
 }
 
-/* Parse a string literal (with escape handling) into the token list.
- * *pos points at the character after the opening quote; updated past closing quote. */
+static void lex_push(cbm_lex_result_t *r, cbm_token_type_t type, const char *text, int pos) {
+    lex_push_n(r, type, text, strlen(text), pos);
+}
+
+/* Parse a string literal with escape handling. A validation/count pass finds
+ * the unescaped closing quote before allocation; one exact allocation and one
+ * decode pass then produce the owned token. Runtime is O(L), retained and peak
+ * literal memory are exactly O(decoded L), and malformed input allocates no
+ * speculative remaining-query buffer. */
 static void lex_string_literal(const char *input, int len, int *pos, char quote,
                                cbm_lex_result_t *out) {
     int start = *pos;
-    char buf[CBM_SZ_4K];
-    int blen = 0;
-    const int max_blen = CBM_SZ_4K - 1;
-    while (*pos < len && input[*pos] != quote) {
+    int cursor = start;
+    size_t decoded_length = 0;
+    while (cursor < len && input[cursor] != quote) {
+        if (input[cursor] == '\\' && cursor + SKIP_ONE < len) {
+            cursor += PAIR_LEN;
+        } else {
+            cursor++;
+        }
+        decoded_length++;
+    }
+    if (cursor >= len) {
+        lex_set_error(out, "unterminated string literal in Cypher query");
+        return;
+    }
+    char *text = lex_malloc(CYP_LEX_ALLOC_STRING_TEXT, decoded_length + SKIP_ONE);
+    if (!text) {
+        lex_set_error(out, "out of memory decoding Cypher string literal");
+        return;
+    }
+    size_t decoded_index = 0;
+    while (*pos < cursor) {
         if (input[*pos] == '\\' && *pos + SKIP_ONE < len) {
             (*pos)++;
-            if (blen < max_blen) {
-                switch (input[*pos]) {
-                case 'n':
-                    buf[blen++] = '\n';
-                    break;
-                case 't':
-                    buf[blen++] = '\t';
-                    break;
-                case '\\':
-                    buf[blen++] = '\\';
-                    break;
-                default:
-                    buf[blen++] = input[*pos];
-                    break;
-                }
+            switch (input[*pos]) {
+            case 'n':
+                text[decoded_index++] = '\n';
+                break;
+            case 't':
+                text[decoded_index++] = '\t';
+                break;
+            case '\\':
+                text[decoded_index++] = '\\';
+                break;
+            default:
+                text[decoded_index++] = input[*pos];
+                break;
             }
         } else {
-            if (blen < max_blen) {
-                buf[blen++] = input[*pos];
-            }
+            text[decoded_index++] = input[*pos];
         }
         (*pos)++;
     }
-    buf[blen] = '\0';
-    if (*pos < len) {
-        (*pos)++; /* skip closing quote */
-    }
-    lex_push(out, TOK_STRING, buf, start - SKIP_ONE);
+    (*pos)++; /* skip closing quote */
+    text[decoded_index] = '\0';
+    lex_push_owned(out, TOK_STRING, text, start - SKIP_ONE);
 }
 
 /* Keyword table (case-insensitive lookup) */
@@ -149,7 +415,6 @@ static const kw_entry_t keywords[] = {
     {"OR", TOK_OR},
     {"AS", TOK_AS},
     {"DISTINCT", TOK_DISTINCT},
-    {"COUNT", TOK_COUNT},
     {"CONTAINS", TOK_CONTAINS},
     {"STARTS", TOK_STARTS},
     {"WITH", TOK_WITH},
@@ -166,19 +431,12 @@ static const kw_entry_t keywords[] = {
     {"SKIP", TOK_SKIP},
     {"UNION", TOK_UNION},
     {"UNWIND", TOK_UNWIND},
-    {"SUM", TOK_SUM},
-    {"AVG", TOK_AVG},
-    {"MIN", TOK_MIN_KW},
-    {"MAX", TOK_MAX_KW},
-    {"COLLECT", TOK_COLLECT},
+#define CYPHER_KEYWORD_ENTRY(schema_name, canonical_name, token) {canonical_name, token},
+    CYPHER_AGGREGATE_FUNCTIONS(CYPHER_KEYWORD_ENTRY)
     /* Phase 5: string functions + CASE */
-    {"toLower", TOK_TOLOWER},
-    {"toUpper", TOK_TOUPPER},
-    {"toString", TOK_TOSTRING},
-    {"tolower", TOK_TOLOWER},
-    {"toupper", TOK_TOUPPER},
-    {"tostring", TOK_TOSTRING},
-    {"CASE", TOK_CASE},
+    CYPHER_KEYWORD_SCALAR_FUNCTIONS(CYPHER_KEYWORD_ENTRY)
+#undef CYPHER_KEYWORD_ENTRY
+        {"CASE", TOK_CASE},
     {"WHEN", TOK_WHEN},
     {"THEN", TOK_THEN},
     {"ELSE", TOK_ELSE},
@@ -214,10 +472,12 @@ static const kw_entry_t keywords[] = {
     {"UNIQUE", TOK_UNIQUE},
     {NULL, 0}};
 
-static cbm_token_type_t keyword_lookup(const char *word) {
-    /* Case-insensitive compare */
+static cbm_token_type_t keyword_lookup_n(const char *word, size_t word_length) {
+    /* Length-aware lookup avoids copying or truncating identifiers merely to
+     * compare against this finite registry. */
     for (const kw_entry_t *kw = keywords; kw->name; kw++) {
-        if (strcasecmp(word, kw->name) == 0) {
+        size_t keyword_length = strlen(kw->name);
+        if (word_length == keyword_length && strncasecmp(word, kw->name, word_length) == 0) {
             return kw->type;
         }
     }
@@ -297,15 +557,9 @@ static bool lex_try_ident(const char *input, int len, int *i, cbm_lex_result_t *
     while (*i < len && (isalnum((unsigned char)input[*i]) || input[*i] == '_')) {
         (*i)++;
     }
-    char word[CBM_SZ_256];
-    int wlen = *i - start;
-    if (wlen >= (int)sizeof(word)) {
-        wlen = (int)sizeof(word) - SKIP_ONE;
-    }
-    memcpy(word, input + start, wlen);
-    word[wlen] = '\0';
-    cbm_token_type_t type = keyword_lookup(word);
-    lex_push_n(out, type, input + start, *i - start, start);
+    size_t word_length = (size_t)(*i - start);
+    cbm_token_type_t type = keyword_lookup_n(input + start, word_length);
+    lex_push_n(out, type, input + start, word_length, start);
     return true;
 }
 
@@ -326,7 +580,8 @@ static bool lex_try_number(const char *input, int len, int *i, cbm_lex_result_t 
 }
 
 /* Skip whitespace and comments. Returns true if something was skipped. */
-static bool lex_skip_whitespace_comments(const char *input, int len, int *i) {
+static bool lex_skip_whitespace_comments(const char *input, int len, int *i,
+                                         cbm_lex_result_t *out) {
     if (isspace((unsigned char)input[*i])) {
         (*i)++;
         return true;
@@ -345,12 +600,18 @@ static bool lex_skip_whitespace_comments(const char *input, int len, int *i) {
         return true;
     }
     if (*i + SKIP_ONE < len && input[*i] == '/' && input[*i + SKIP_ONE] == '*') {
+        int comment_start = *i;
         *i += PAIR_LEN;
         while (*i + SKIP_ONE < len && !(input[*i] == '*' && input[*i + SKIP_ONE] == '/')) {
             (*i)++;
         }
         if (*i + SKIP_ONE < len) {
             *i += PAIR_LEN;
+        } else {
+            char message[CBM_SZ_128];
+            snprintf(message, sizeof(message), "unterminated block comment at byte %d",
+                     comment_start);
+            lex_set_error(out, message);
         }
         return true;
     }
@@ -358,16 +619,25 @@ static bool lex_skip_whitespace_comments(const char *input, int len, int *i) {
 }
 
 int cbm_lex(const char *input, cbm_lex_result_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
     memset(out, 0, sizeof(*out));
     if (!input) {
+        lex_set_error(out, "Cypher query is NULL");
         return CBM_NOT_FOUND;
     }
 
-    int len = (int)strlen(input);
+    size_t input_length = strlen(input);
+    if (input_length > (size_t)INT_MAX) {
+        lex_set_error(out, "Cypher query length is too large to represent");
+        return CBM_NOT_FOUND;
+    }
+    int len = (int)input_length;
     int i = 0;
 
-    while (i < len) {
-        if (lex_skip_whitespace_comments(input, len, &i)) {
+    while (i < len && !out->failed) {
+        if (lex_skip_whitespace_comments(input, len, &i, out)) {
             continue;
         }
 
@@ -409,13 +679,22 @@ int cbm_lex(const char *input, cbm_lex_result_t *out) {
             continue;
         }
 
-        /* Unknown character — skip */
-        i++;
+        char message[CBM_SZ_128];
+        unsigned char unknown = (unsigned char)c;
+        if (isprint(unknown)) {
+            snprintf(message, sizeof(message), "unsupported character '%c' at byte %d", c, i);
+        } else {
+            snprintf(message, sizeof(message), "unsupported byte 0x%02X at byte %d", unknown, i);
+        }
+        lex_set_error(out, message);
     }
 
+    if (out->failed) {
+        return CBM_NOT_FOUND;
+    }
     /* Add EOF */
     lex_push(out, TOK_EOF, "", i);
-    return 0;
+    return out->failed ? CBM_NOT_FOUND : 0;
 }
 
 void cbm_lex_free(cbm_lex_result_t *r) {
@@ -440,6 +719,45 @@ typedef struct {
     int pos;
     char error[CBM_SZ_512];
 } parser_t;
+
+static void parser_append_function_names(char *out, size_t out_size, int *offset,
+                                         const char *const *names, size_t name_count, bool *first) {
+    for (size_t i = 0; i < name_count; i++) {
+        CBM_SNPRINTF_APPEND(out, out_size, *offset, "%s%s", *first ? "" : ", ", names[i]);
+        *first = false;
+    }
+}
+
+/* Build actionable parser diagnostics from the same immutable registry used
+ * by recognition and MCP descriptions. C is a fixed capability count, so the
+ * error path costs O(C) time and O(1) stack memory with bounded writes and no
+ * allocation that could obscure the original parse failure. WHERE currently
+ * accepts only the multi-argument scalar subset on its left-hand side. */
+static void parser_set_unsupported_function_error(parser_t *p, const char *name,
+                                                  bool where_context) {
+    const cbm_cypher_capability_schema_t *schema = cbm_cypher_capability_schema();
+    int offset = 0;
+    bool first = true;
+    CBM_SNPRINTF_APPEND(p->error, sizeof(p->error), offset,
+                        "unsupported function '%s'%s "
+                        "(supported: ",
+                        name ? name : "?", where_context ? " in WHERE" : "");
+    if (!where_context) {
+        parser_append_function_names(p->error, sizeof(p->error), &offset,
+                                     schema->aggregate_functions, schema->aggregate_function_count,
+                                     &first);
+        parser_append_function_names(p->error, sizeof(p->error), &offset,
+                                     schema->keyword_scalar_functions,
+                                     schema->keyword_scalar_function_count, &first);
+        parser_append_function_names(p->error, sizeof(p->error), &offset,
+                                     schema->named_scalar_functions,
+                                     schema->named_scalar_function_count, &first);
+    }
+    parser_append_function_names(p->error, sizeof(p->error), &offset,
+                                 schema->multi_argument_functions,
+                                 schema->multi_argument_function_count, &first);
+    CBM_SNPRINTF_APPEND(p->error, sizeof(p->error), offset, ")");
+}
 
 static const cbm_token_t *peek(parser_t *p) {
     if (p->pos >= p->count) {
@@ -558,6 +876,10 @@ static int parse_node(parser_t *p, cbm_node_pattern_t *out) {
         /* Lookahead: if next is COLON, this is a variable */
         /* Or if next is RPAREN/LBRACE, this is a variable without label */
         out->variable = heap_strdup(advance(p)->text);
+        if (!out->variable) {
+            snprintf(p->error, sizeof(p->error), "could not allocate node variable");
+            return CBM_NOT_FOUND;
+        }
     }
 
     /* Optional :Label, with openCypher label alternation :A|B|C (#242).
@@ -567,23 +889,39 @@ static int parse_node(parser_t *p, cbm_node_pattern_t *out) {
         if (!label) {
             return CBM_NOT_FOUND;
         }
-        char lbuf[CBM_SZ_256];
-        int ll = snprintf(lbuf, sizeof(lbuf), "%s", label->text);
+        int first_label_token = p->pos - SKIP_ONE;
+        size_t label_length = strlen(label->text);
         while (match(p, TOK_PIPE)) {
             const cbm_token_t *alt = expect(p, TOK_IDENT);
             if (!alt) {
                 return CBM_NOT_FOUND;
             }
-            int w = snprintf(lbuf + ll, (ll < (int)sizeof(lbuf)) ? sizeof(lbuf) - (size_t)ll : 0,
-                             "|%s", alt->text);
-            if (w > 0) {
-                ll += w;
+            size_t alternate_length = strlen(alt->text);
+            if (label_length > SIZE_MAX - SKIP_ONE ||
+                alternate_length > SIZE_MAX - (label_length + SKIP_ONE)) {
+                snprintf(p->error, sizeof(p->error), "node label alternation is too large");
+                return CBM_NOT_FOUND;
             }
-            if (ll >= (int)sizeof(lbuf)) {
-                break; /* buffer full */
-            }
+            label_length += SKIP_ONE + alternate_length;
         }
-        out->label = heap_strdup(lbuf);
+        if (label_length > SIZE_MAX - SKIP_ONE) {
+            snprintf(p->error, sizeof(p->error), "node label alternation is too large");
+            return CBM_NOT_FOUND;
+        }
+        char *joined_label = malloc(label_length + SKIP_ONE);
+        if (!joined_label) {
+            snprintf(p->error, sizeof(p->error), "could not allocate node label alternation");
+            return CBM_NOT_FOUND;
+        }
+        size_t offset = 0;
+        for (int token_index = first_label_token; token_index < p->pos; token_index++) {
+            const cbm_token_t *part = &p->tokens[token_index];
+            size_t part_length = strlen(part->text);
+            memcpy(joined_label + offset, part->text, part_length);
+            offset += part_length;
+        }
+        joined_label[offset] = '\0';
+        out->label = joined_label;
     }
 
     /* Optional {props} */
@@ -1176,10 +1514,7 @@ static int parse_condition_lhs(parser_t *p, cbm_condition_t *c) {
         p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
         /* Unrecognised function call in WHERE — fail loudly with the supported
          * set instead of the misleading "unexpected operator" (#874). */
-        snprintf(p->error, sizeof(p->error),
-                 "unsupported function '%s' in WHERE (supported: coalesce, substring, replace, "
-                 "left, right)",
-                 peek(p)->text);
+        parser_set_unsupported_function_error(p, peek(p)->text, true);
         return CBM_NOT_FOUND;
     }
 
@@ -1334,45 +1669,50 @@ static int parse_where(parser_t *p, cbm_where_clause_t **out) {
 
 /* Helper: is token an aggregate function? */
 static bool is_aggregate_tok(cbm_token_type_t t) {
-    return (t == TOK_COUNT || t == TOK_SUM || t == TOK_AVG || t == TOK_MIN_KW || t == TOK_MAX_KW ||
-            t == TOK_COLLECT) != 0;
+    switch (t) {
+#define CYPHER_TOKEN_CASE(schema_name, canonical_name, token) case token:
+        CYPHER_AGGREGATE_FUNCTIONS(CYPHER_TOKEN_CASE)
+#undef CYPHER_TOKEN_CASE
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* Helper: is token a string function? */
 static bool is_string_func_tok(cbm_token_type_t t) {
-    return (t == TOK_TOLOWER || t == TOK_TOUPPER || t == TOK_TOSTRING) != 0;
+    switch (t) {
+#define CYPHER_TOKEN_CASE(schema_name, canonical_name, token) case token:
+        CYPHER_KEYWORD_SCALAR_FUNCTIONS(CYPHER_TOKEN_CASE)
+#undef CYPHER_TOKEN_CASE
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* Token type to function name */
 static const char *agg_func_name(cbm_token_type_t t) {
     switch (t) {
-    case TOK_COUNT:
-        return "COUNT";
-    case TOK_SUM:
-        return "SUM";
-    case TOK_AVG:
-        return "AVG";
-    case TOK_MIN_KW:
-        return "MIN";
-    case TOK_MAX_KW:
-        return "MAX";
-    case TOK_COLLECT:
-        return "COLLECT";
+#define CYPHER_TOKEN_NAME(schema_name, canonical_name, token) \
+    case token:                                               \
+        return canonical_name;
+        CYPHER_AGGREGATE_FUNCTIONS(CYPHER_TOKEN_NAME)
+#undef CYPHER_TOKEN_NAME
     default:
-        return "COUNT";
+        return NULL;
     }
 }
 
 static const char *str_func_name(cbm_token_type_t t) {
     switch (t) {
-    case TOK_TOLOWER:
-        return "toLower";
-    case TOK_TOUPPER:
-        return "toUpper";
-    case TOK_TOSTRING:
-        return "toString";
+#define CYPHER_TOKEN_NAME(schema_name, canonical_name, token) \
+    case token:                                               \
+        return canonical_name;
+        CYPHER_KEYWORD_SCALAR_FUNCTIONS(CYPHER_TOKEN_NAME)
+#undef CYPHER_TOKEN_NAME
     default:
-        return "";
+        return NULL;
     }
 }
 
@@ -1382,15 +1722,25 @@ static const char *parse_value_literal(parser_t *p) {
         return heap_strdup(advance(p)->text);
     }
     if (check(p, TOK_IDENT)) {
-        char buf[CBM_SZ_256];
         const cbm_token_t *v = advance(p);
         if (match(p, TOK_DOT)) {
             const cbm_token_t *pr = expect(p, TOK_IDENT);
-            snprintf(buf, sizeof(buf), "%s.%s", v->text, pr ? pr->text : "");
-        } else {
-            snprintf(buf, sizeof(buf), "%s", v->text);
+            if (!pr) {
+                return NULL;
+            }
+            const char *parts[] = {v->text, ".", pr->text};
+            const char *joined =
+                cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
+            if (!joined) {
+                snprintf(p->error, sizeof(p->error), "could not allocate CASE value reference");
+            }
+            return joined;
         }
-        return heap_strdup(buf);
+        const char *value = heap_strdup(v->text);
+        if (!value) {
+            snprintf(p->error, sizeof(p->error), "could not allocate CASE value");
+        }
+        return value;
     }
     if (check(p, TOK_TRUE)) {
         advance(p);
@@ -1474,25 +1824,29 @@ static bool cyp_ci_eq(const char *a, const char *b) {
  * casts toInteger/toFloat/toBoolean — or NULL if unrecognised (case-insensitive).
  * toLower/toUpper/toString are separate keyword tokens handled elsewhere. */
 static const char *scalar_func_canonical(const char *s) {
-    static const char *const names[] = {
-        "labels", "type",   "id",   "keys",  "properties", "toInteger", "toFloat", "toBoolean",
-        "size",   "length", "trim", "ltrim", "rtrim",      "reverse",   NULL};
-    for (int i = 0; names[i]; i++) {
-        if (cyp_ci_eq(s, names[i])) {
-            return names[i];
+    const cbm_cypher_capability_schema_t *schema = cbm_cypher_capability_schema();
+    for (size_t i = 0; i < schema->named_scalar_function_count; i++) {
+        if (cyp_ci_eq(s, schema->named_scalar_functions[i])) {
+            return schema->named_scalar_functions[i];
         }
     }
     return NULL;
 }
 
-/* True for single-argument functions that transform a scalar string value
- * (vs. entity-introspection funcs that act on the bound node/edge). */
-static bool is_scalar_value_func(const char *f) {
-    return f && (strcmp(f, "toLower") == 0 || strcmp(f, "toUpper") == 0 ||
-                 strcmp(f, "toString") == 0 || strcmp(f, "toInteger") == 0 ||
-                 strcmp(f, "toFloat") == 0 || strcmp(f, "toBoolean") == 0 ||
-                 strcmp(f, "size") == 0 || strcmp(f, "length") == 0 || strcmp(f, "trim") == 0 ||
-                 strcmp(f, "ltrim") == 0 || strcmp(f, "rtrim") == 0 || strcmp(f, "reverse") == 0);
+/* String transforms whose exact output can be derived directly from a
+ * cypher_value_t without a bounded compatibility buffer. */
+static bool is_exact_string_value_func(const char *function) {
+    return function && (strcmp(function, "toLower") == 0 || strcmp(function, "toUpper") == 0 ||
+                        strcmp(function, "toString") == 0 || strcmp(function, "size") == 0 ||
+                        strcmp(function, "length") == 0 || strcmp(function, "trim") == 0 ||
+                        strcmp(function, "ltrim") == 0 || strcmp(function, "rtrim") == 0 ||
+                        strcmp(function, "reverse") == 0);
+}
+
+static bool is_numeric_bool_value_func(const char *function) {
+    return function && (strcmp(function, "toInteger") == 0 ||
+                        strcmp(function, "toFloat") == 0 ||
+                        strcmp(function, "toBoolean") == 0);
 }
 
 static int parse_var_dot_prop(parser_t *p, cbm_return_item_t *item) {
@@ -1537,10 +1891,10 @@ static int parse_named_func_item(parser_t *p, cbm_return_item_t *item) {
 
 /* Canonical name for a multi-argument scalar function, or NULL. */
 static const char *multiarg_func_canonical(const char *s) {
-    static const char *const names[] = {"coalesce", "substring", "replace", "left", "right", NULL};
-    for (int i = 0; names[i]; i++) {
-        if (cyp_ci_eq(s, names[i])) {
-            return names[i];
+    const cbm_cypher_capability_schema_t *schema = cbm_cypher_capability_schema();
+    for (size_t i = 0; i < schema->multi_argument_function_count; i++) {
+        if (cyp_ci_eq(s, schema->multi_argument_functions[i])) {
+            return schema->multi_argument_functions[i];
         }
     }
     return NULL;
@@ -1617,7 +1971,7 @@ static int parse_aggregate_item(parser_t *p, cbm_return_item_t *item) {
     cbm_token_type_t ft = peek(p)->type;
     advance(p);
     expect(p, TOK_LPAREN);
-    /* Optional DISTINCT inside the call: COUNT(DISTINCT x) (#239). */
+    /* Optional DISTINCT inside a supported aggregate call. */
     item->distinct = match(p, TOK_DISTINCT);
     if (match(p, TOK_STAR)) {
         item->variable = heap_strdup("*");
@@ -1680,11 +2034,7 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
      * the caller knows the query used an unsupported feature (#373). */
     if (!item->func && !item->kase && (check(p, TOK_LPAREN) || check(p, TOK_LBRACKET))) {
         if (check(p, TOK_LPAREN)) {
-            snprintf(p->error, sizeof(p->error),
-                     "unsupported function '%s' (supported: count, sum, avg, min, max, collect, "
-                     "toLower, toUpper, toString, toInteger, toFloat, toBoolean, size, length, "
-                     "trim, ltrim, rtrim, reverse, labels, type, id, keys, properties)",
-                     item->variable ? item->variable : "?");
+            parser_set_unsupported_function_error(p, item->variable, false);
         } else {
             set_unsupported_list_index_error(p);
         }
@@ -1702,78 +2052,109 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
     return 0;
 }
 
+static void free_return_item(cbm_return_item_t *item);
+static void free_order_item(cbm_order_item_t *item);
 static void free_return_clause(cbm_return_clause_t *r);
 
-/* Parse one ORDER BY expression. */
-/* Parse aggregate function call for ORDER BY */
-static void parse_order_by_agg(parser_t *p, char *buf, size_t buf_sz) {
+/* Parse one ORDER BY expression into exact owned storage. */
+static char *parse_order_by_agg(parser_t *p) {
     const char *fn = agg_func_name(peek(p)->type);
     advance(p);
-    expect(p, TOK_LPAREN);
+    if (!expect(p, TOK_LPAREN)) {
+        return NULL;
+    }
+    const char *argument = NULL;
     if (match(p, TOK_STAR)) {
-        snprintf(buf, buf_sz, "%s(*)", fn);
+        argument = "*";
     } else {
         const cbm_token_t *var = expect(p, TOK_IDENT);
-        snprintf(buf, buf_sz, "%s(%s)", fn, var ? var->text : "");
+        if (!var) {
+            return NULL;
+        }
+        argument = var->text;
     }
-    expect(p, TOK_RPAREN);
+    if (!expect(p, TOK_RPAREN)) {
+        return NULL;
+    }
+    const char *parts[] = {fn, "(", argument, ")"};
+    return cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
 }
 
 /* Parse var[.prop] for ORDER BY */
-static void parse_order_by_var(parser_t *p, char *buf, size_t buf_sz) {
+static char *parse_order_by_var(parser_t *p) {
     const cbm_token_t *var = expect(p, TOK_IDENT);
     if (!var) {
-        return;
+        return NULL;
     }
-    snprintf(buf, buf_sz, "%s", var->text);
     if (match(p, TOK_DOT)) {
         const cbm_token_t *prop = expect(p, TOK_IDENT);
-        if (prop) {
-            snprintf(buf, buf_sz, "%s.%s", var->text, prop->text);
+        if (!prop) {
+            return NULL;
         }
+        const char *parts[] = {var->text, ".", prop->text};
+        return cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
     }
+    return heap_strdup(var->text);
 }
 
-/* Parse ORDER BY expression into buf. Returns buf. */
-static char *parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
-    buf[0] = '\0';
+static char *parse_order_by_expr(parser_t *p) {
     if (is_aggregate_tok(peek(p)->type)) {
-        parse_order_by_agg(p, buf, buf_sz);
-    } else {
-        parse_order_by_var(p, buf, buf_sz);
+        return parse_order_by_agg(p);
     }
-    return buf;
+    return parse_order_by_var(p);
 }
 
 static int parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
     if (!expect(p, TOK_BY)) {
         return CBM_NOT_FOUND;
     }
+    /* Geometric metadata growth is O(K) total pointer-copy work and O(K)
+     * retained memory for K sort keys; each item publishes atomically. */
+    int capacity = 0;
     do {
-        if (r->order_count >= CBM_SZ_32) {
-            snprintf(p->error, sizeof(p->error), "ORDER BY supports at most %d expressions",
-                     CBM_SZ_32);
-            return CBM_NOT_FOUND;
-        }
         if (r->order_count > 0 && !match(p, TOK_COMMA)) {
             break;
         }
-        char order_buf[CBM_SZ_256] = "";
-        parse_order_by_expr(p, order_buf, sizeof(order_buf));
-        if (!order_buf[0]) {
-            snprintf(p->error, sizeof(p->error), "expected ORDER BY expression");
+        char *order_expression = parse_order_by_expr(p);
+        if (!order_expression) {
+            if (!p->error[0]) {
+                snprintf(p->error, sizeof(p->error),
+                         "could not allocate or parse ORDER BY expression");
+            }
             return CBM_NOT_FOUND;
         }
-        r->order_items = safe_realloc(r->order_items, (size_t)(r->order_count + SKIP_ONE) *
-                                                          sizeof(cbm_order_item_t));
-        cbm_order_item_t *item = &r->order_items[r->order_count++];
-        item->expression = heap_strdup(order_buf);
-        item->direction = NULL;
+        cbm_order_item_t item = {.expression = order_expression, .direction = NULL};
+        bool has_direction = false;
         if (match(p, TOK_ASC)) {
-            item->direction = heap_strdup("ASC");
+            has_direction = true;
+            item.direction = heap_strdup("ASC");
         } else if (match(p, TOK_DESC)) {
-            item->direction = heap_strdup("DESC");
+            has_direction = true;
+            item.direction = heap_strdup("DESC");
         }
+        if (has_direction && !item.direction) {
+            snprintf(p->error, sizeof(p->error), "could not allocate ORDER BY expression");
+            free_order_item(&item);
+            return CBM_NOT_FOUND;
+        }
+        if (r->order_count >= capacity) {
+            int next_capacity = cypher_geometric_capacity(capacity, r->order_count + SKIP_ONE);
+            if ((size_t)next_capacity > SIZE_MAX / sizeof(*r->order_items)) {
+                snprintf(p->error, sizeof(p->error), "ORDER BY is too wide to represent");
+                free_order_item(&item);
+                return CBM_NOT_FOUND;
+            }
+            cbm_order_item_t *grown =
+                realloc(r->order_items, (size_t)next_capacity * sizeof(*grown));
+            if (!grown) {
+                snprintf(p->error, sizeof(p->error), "could not grow ORDER BY expressions");
+                free_order_item(&item);
+                return CBM_NOT_FOUND;
+            }
+            r->order_items = grown;
+            capacity = next_capacity;
+        }
+        r->order_items[r->order_count++] = item;
     } while (check(p, TOK_COMMA));
     return 0;
 }
@@ -1796,19 +2177,26 @@ static bool order_expression_is_projected(const cbm_return_clause_t *r, const ch
                 return true;
             }
         }
-        char projected[CBM_SZ_256] = "";
         if (item->func) {
-            snprintf(projected, sizeof(projected), "%s(%s)", item->func,
-                     item->variable ? item->variable : "");
+            const char *parts[] = {item->func, "(", item->variable ? item->variable : "", ")"};
+            if (cypher_text_equals_parts(expression, parts,
+                                         sizeof(parts) / sizeof(parts[0]))) {
+                return true;
+            }
         } else if (item->kase) {
-            snprintf(projected, sizeof(projected), "CASE");
+            if (strcmp(expression, "CASE") == 0) {
+                return true;
+            }
         } else if (item->property) {
-            snprintf(projected, sizeof(projected), "%s.%s", item->variable, item->property);
+            const char *parts[] = {item->variable, ".", item->property};
+            if (cypher_text_equals_parts(expression, parts,
+                                         sizeof(parts) / sizeof(parts[0]))) {
+                return true;
+            }
         } else if (item->variable) {
-            snprintf(projected, sizeof(projected), "%s", item->variable);
-        }
-        if (strcmp(projected, expression) == 0) {
-            return true;
+            if (strcmp(item->variable, expression) == 0) {
+                return true;
+            }
         }
     }
     return false;
@@ -1824,12 +2212,21 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
     }
 
     cbm_return_clause_t *r = calloc(CBM_ALLOC_ONE, sizeof(cbm_return_clause_t));
+    if (!r) {
+        snprintf(p->error, sizeof(p->error), "could not allocate RETURN/WITH clause");
+        return CBM_NOT_FOUND;
+    }
     /* -1 = no LIMIT clause (return all). An explicit `LIMIT 0` parses to 0 below
      * and must return 0 rows — distinguishing the two requires a sentinel, since
      * calloc zeroes limit and `limit > 0` would treat LIMIT 0 as "no limit". */
     r->limit = -1;
     int cap = CYP_INIT_CAP8;
-    r->items = malloc(cap * sizeof(cbm_return_item_t));
+    r->items = malloc((size_t)cap * sizeof(cbm_return_item_t));
+    if (!r->items) {
+        snprintf(p->error, sizeof(p->error), "could not allocate RETURN/WITH projection items");
+        free(r);
+        return CBM_NOT_FOUND;
+    }
 
     r->distinct = match(p, TOK_DISTINCT);
 
@@ -1847,28 +2244,34 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
 
         cbm_return_item_t item = {0};
         if (parse_return_item(p, &item) < 0) {
-            free(r->items);
-            free(r);
+            free_return_item(&item);
+            free_return_clause(r);
             return CBM_NOT_FOUND;
         }
 
         if (r->count >= cap) {
-            cap *= PAIR_LEN;
-            r->items = safe_realloc(r->items, cap * sizeof(cbm_return_item_t));
+            if (cap > INT_MAX / PAIR_LEN ||
+                (size_t)(cap * PAIR_LEN) > SIZE_MAX / sizeof(cbm_return_item_t)) {
+                snprintf(p->error, sizeof(p->error),
+                         "RETURN/WITH projection is too wide to represent");
+                free_return_item(&item);
+                free_return_clause(r);
+                return CBM_NOT_FOUND;
+            }
+            int next_cap = cap * PAIR_LEN;
+            cbm_return_item_t *grown = realloc(r->items, (size_t)next_cap * sizeof(*grown));
+            if (!grown) {
+                snprintf(p->error, sizeof(p->error), "could not grow RETURN/WITH projection items");
+                free_return_item(&item);
+                free_return_clause(r);
+                return CBM_NOT_FOUND;
+            }
+            r->items = grown;
+            cap = next_cap;
         }
         r->items[r->count++] = item;
 
     } while (check(p, TOK_COMMA));
-
-    /* Projection is materialized per row into fixed-width stack arrays sized at
-     * CBM_SZ_32 columns (execute_return_simple and its siblings). Bound the
-     * parsed item count to that width so an over-wide RETURN is rejected here
-     * instead of writing past those arrays downstream. */
-    if (r->count > CBM_SZ_32) {
-        free(r->items);
-        free(r);
-        return CBM_NOT_FOUND;
-    }
 
 tail:
     /* Optional ORDER BY */
@@ -1914,39 +2317,84 @@ static int parse_return(parser_t *p, cbm_return_clause_t **out) {
     return parse_return_or_with(p, out, false);
 }
 
+static void free_pattern(cbm_pattern_t *pat);
+
+/* Grow a parser-owned zeroed element vector without losing its live owner.
+ * Geometric growth keeps total element-copy/initialization work O(count) and
+ * retained memory O(count); overflow/OOM leaves the old vector releasable. */
+static void *parse_grow_zeroed(void *elements, int *capacity, size_t element_size) {
+    if (!elements || !capacity || *capacity <= 0 || element_size == 0 ||
+        *capacity > INT_MAX / PAIR_LEN) {
+        return NULL;
+    }
+    int next = *capacity * PAIR_LEN;
+    if ((size_t)next > SIZE_MAX / element_size) {
+        return NULL;
+    }
+    void *grown = realloc(elements, (size_t)next * element_size);
+    if (!grown) {
+        return NULL;
+    }
+    memset((char *)grown + ((size_t)*capacity * element_size), 0,
+           (size_t)(next - *capacity) * element_size);
+    *capacity = next;
+    return grown;
+}
+
 /* Parse a single MATCH pattern into pat */
 static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     memset(pat, 0, sizeof(*pat));
     int node_cap = CYP_INIT_CAP4;
     int rel_cap = CYP_INIT_CAP4;
-    pat->nodes = malloc(node_cap * sizeof(cbm_node_pattern_t));
+    pat->nodes = calloc((size_t)node_cap, sizeof(cbm_node_pattern_t));
     pat->rels = calloc(rel_cap, sizeof(cbm_rel_pattern_t));
-
-    if (parse_node(p, &pat->nodes[0]) < 0) {
-        return CBM_NOT_FOUND;
+    if (!pat->nodes || !pat->rels) {
+        snprintf(p->error, sizeof(p->error), "out of memory parsing MATCH pattern");
+        goto fail;
     }
+
     pat->node_count = SKIP_ONE;
+    if (parse_node(p, &pat->nodes[0]) < 0) {
+        goto fail;
+    }
 
     while (check(p, TOK_DASH) || check(p, TOK_LT)) {
         if (pat->rel_count >= rel_cap) {
-            rel_cap *= PAIR_LEN;
-            pat->rels = safe_realloc(pat->rels, rel_cap * sizeof(cbm_rel_pattern_t));
+            cbm_rel_pattern_t *grown =
+                parse_grow_zeroed(pat->rels, &rel_cap, sizeof(*pat->rels));
+            if (!grown) {
+                snprintf(p->error, sizeof(p->error),
+                         "MATCH relationship list is too large or out of memory");
+                goto fail;
+            }
+            pat->rels = grown;
         }
-        if (parse_rel(p, &pat->rels[pat->rel_count]) < 0) {
-            return CBM_NOT_FOUND;
+        int relationship_index = pat->rel_count++;
+        if (parse_rel(p, &pat->rels[relationship_index]) < 0) {
+            goto fail;
         }
-        pat->rel_count++;
 
         if (pat->node_count >= node_cap) {
-            node_cap *= PAIR_LEN;
-            pat->nodes = safe_realloc(pat->nodes, node_cap * sizeof(cbm_node_pattern_t));
+            cbm_node_pattern_t *grown =
+                parse_grow_zeroed(pat->nodes, &node_cap, sizeof(*pat->nodes));
+            if (!grown) {
+                snprintf(p->error, sizeof(p->error),
+                         "MATCH node list is too large or out of memory");
+                goto fail;
+            }
+            pat->nodes = grown;
         }
-        if (parse_node(p, &pat->nodes[pat->node_count]) < 0) {
-            return CBM_NOT_FOUND;
+        int node_index = pat->node_count++;
+        if (parse_node(p, &pat->nodes[node_index]) < 0) {
+            goto fail;
         }
-        pat->node_count++;
     }
     return 0;
+
+fail:
+    free_pattern(pat);
+    memset(pat, 0, sizeof(*pat));
+    return CBM_NOT_FOUND;
 }
 
 /* Parse UNWIND [...] AS var into a normalized JSON array. The executor consumes
@@ -1970,10 +2418,19 @@ static int parse_unwind_clause(parser_t *p, cbm_query_t *q) {
                 value = yyjson_mut_strcpy(doc, advance(p)->text);
             } else if (check(p, TOK_NUMBER)) {
                 value = yyjson_mut_rawcpy(doc, advance(p)->text);
+            } else if (check(p, TOK_TRUE)) {
+                advance(p);
+                value = yyjson_mut_true(doc);
+            } else if (check(p, TOK_FALSE)) {
+                advance(p);
+                value = yyjson_mut_false(doc);
+            } else if (check(p, TOK_NULL_KW)) {
+                advance(p);
+                value = yyjson_mut_null(doc);
             } else {
                 yyjson_mut_doc_free(doc);
                 snprintf(p->error, sizeof(p->error),
-                         "UNWIND literal lists support string and number values");
+                         "UNWIND literal lists support scalar JSON values");
                 return CBM_NOT_FOUND;
             }
             if (!value || !yyjson_mut_arr_append(list, value)) {
@@ -2282,27 +2739,43 @@ static void free_case_expr(cbm_case_expr_t *k) {
     free(k);
 }
 
+static void free_return_item(cbm_return_item_t *item) {
+    if (!item) {
+        return;
+    }
+    safe_str_free(&item->variable);
+    safe_str_free(&item->property);
+    safe_str_free(&item->alias);
+    safe_str_free(&item->func);
+    free_case_expr(item->kase);
+    for (int j = 0; j < item->arg_count; j++) {
+        safe_str_free(&item->args[j].variable);
+        safe_str_free(&item->args[j].property);
+        safe_str_free(&item->args[j].literal);
+    }
+    free(item->args);
+    memset(item, 0, sizeof(*item));
+}
+
+static void free_order_item(cbm_order_item_t *item) {
+    if (!item) {
+        return;
+    }
+    safe_str_free(&item->expression);
+    safe_str_free(&item->direction);
+    memset(item, 0, sizeof(*item));
+}
+
 static void free_return_clause(cbm_return_clause_t *r) {
     if (!r) {
         return;
     }
     for (int i = 0; i < r->count; i++) {
-        safe_str_free(&r->items[i].variable);
-        safe_str_free(&r->items[i].property);
-        safe_str_free(&r->items[i].alias);
-        safe_str_free(&r->items[i].func);
-        free_case_expr(r->items[i].kase);
-        for (int j = 0; j < r->items[i].arg_count; j++) {
-            safe_str_free(&r->items[i].args[j].variable);
-            safe_str_free(&r->items[i].args[j].property);
-            safe_str_free(&r->items[i].args[j].literal);
-        }
-        free(r->items[i].args);
+        free_return_item(&r->items[i]);
     }
     free(r->items);
     for (int i = 0; i < r->order_count; i++) {
-        safe_str_free(&r->order_items[i].expression);
-        safe_str_free(&r->order_items[i].direction);
+        free_order_item(&r->order_items[i]);
     }
     free(r->order_items);
     free(r);
@@ -2364,10 +2837,26 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
  *  EXECUTOR
  * ══════════════════════════════════════════════════════════════════ */
 
+/* Logical kind travels beside the existing exact string representation. It
+ * adds O(1) work and one enum per live value/binding slot, while allowing
+ * scalar semantics to distinguish JSON strings from numbers and booleans
+ * without reparsing or creating a second value/evaluator hierarchy. */
+typedef enum {
+    CYP_VALUE_NULL = 0,
+    CYP_VALUE_STRING,
+    CYP_VALUE_INTEGER,
+    CYP_VALUE_FLOAT,
+    CYP_VALUE_BOOLEAN,
+    CYP_VALUE_COMPOSITE,
+    CYP_VALUE_NODE,
+    CYP_VALUE_RELATIONSHIP,
+} cypher_value_kind_t;
+
 typedef struct {
     const char *name;
     bool name_owned;
     bool is_null;
+    cypher_value_kind_t kind;
     cbm_node_t node;
 } binding_node_overflow_t;
 
@@ -2383,6 +2872,7 @@ typedef struct {
     const char *var_names[CYP_INLINE_NODE_VARS]; /* variable names (nodes) */
     bool var_name_owned[CYP_INLINE_NODE_VARS];   /* WITH aliases are heap-owned */
     bool var_is_null[CYP_INLINE_NODE_VARS];      /* projected null differs from an empty string */
+    cypher_value_kind_t var_kinds[CYP_INLINE_NODE_VARS]; /* projected logical type */
     cbm_node_t var_nodes[CYP_INLINE_NODE_VARS];  /* node data */
     binding_node_overflow_t *var_overflow;
     int var_overflow_capacity;
@@ -2409,7 +2899,73 @@ static _Thread_local int g_cypher_trail_work_limit = 0;
 static _Thread_local bool g_cypher_store_failed = false;
 static _Thread_local char g_cypher_store_error[CBM_SZ_256];
 
-static int binding_overflow_capacity(int current, int needed) {
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} cypher_string_builder_t;
+
+/* Query-local geometric string construction. Appending total L bytes performs
+ * O(L) total copy work and retains O(L) memory with constant-factor slack. */
+static bool cypher_string_builder_reserve(cypher_string_builder_t *builder, size_t needed) {
+    if (needed <= builder->capacity) {
+        return true;
+    }
+    size_t next = builder->capacity ? builder->capacity : CBM_SZ_128;
+    while (next < needed) {
+        if (next > SIZE_MAX / PAIR_LEN) {
+            next = needed;
+            break;
+        }
+        next *= PAIR_LEN;
+    }
+    char *grown = realloc(builder->data, next);
+    if (!grown) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    builder->data = grown;
+    builder->capacity = next;
+    return true;
+}
+
+static bool cypher_string_builder_reset(cypher_string_builder_t *builder) {
+    builder->length = 0;
+    if (!cypher_string_builder_reserve(builder, SKIP_ONE)) {
+        return false;
+    }
+    builder->data[0] = '\0';
+    return true;
+}
+
+static bool cypher_string_builder_append(cypher_string_builder_t *builder, const char *bytes,
+                                         size_t length) {
+    if (!bytes || builder->length > SIZE_MAX - SKIP_ONE ||
+        length > SIZE_MAX - SKIP_ONE - builder->length) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    size_t needed = builder->length + length + SKIP_ONE;
+    if (!cypher_string_builder_reserve(builder, needed)) {
+        return false;
+    }
+    memcpy(builder->data + builder->length, bytes, length);
+    builder->length += length;
+    builder->data[builder->length] = '\0';
+    return true;
+}
+
+static void cypher_string_builder_free(cypher_string_builder_t *builder) {
+    free(builder->data);
+    memset(builder, 0, sizeof(*builder));
+}
+
+static bool cypher_string_builder_append_json_string(cypher_string_builder_t *builder,
+                                                     const char *text, size_t length);
+
+/* Return a geometrically grown element capacity. If doubling an int would
+ * overflow, the exact already-validated requirement is the only safe value. */
+static int cypher_geometric_capacity(int current, int needed) {
     int next = current > 0 ? current : CYP_INIT_CAP8;
     while (next < needed) {
         if (next > INT_MAX / PAIR_LEN) {
@@ -2428,7 +2984,7 @@ static bool binding_reserve_node_index(binding_t *b, int index) {
     if (needed <= b->var_overflow_capacity) {
         return true;
     }
-    int next = binding_overflow_capacity(b->var_overflow_capacity, needed);
+    int next = cypher_geometric_capacity(b->var_overflow_capacity, needed);
     if ((size_t)next > SIZE_MAX / sizeof(*b->var_overflow)) {
         b->allocation_failed = true;
         return false;
@@ -2453,7 +3009,7 @@ static bool binding_reserve_edge_index(binding_t *b, int index) {
     if (needed <= b->edge_overflow_capacity) {
         return true;
     }
-    int next = binding_overflow_capacity(b->edge_overflow_capacity, needed);
+    int next = cypher_geometric_capacity(b->edge_overflow_capacity, needed);
     if ((size_t)next > SIZE_MAX / sizeof(*b->edge_overflow)) {
         b->allocation_failed = true;
         return false;
@@ -2485,6 +3041,11 @@ static bool binding_node_is_null_at(const binding_t *b, int index) {
                                         : b->var_overflow[index - CYP_INLINE_NODE_VARS].is_null;
 }
 
+static cypher_value_kind_t binding_node_kind_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_NODE_VARS ? b->var_kinds[index]
+                                        : b->var_overflow[index - CYP_INLINE_NODE_VARS].kind;
+}
+
 static cbm_node_t *binding_node_at(binding_t *b, int index) {
     return index < CYP_INLINE_NODE_VARS ? &b->var_nodes[index]
                                         : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
@@ -2511,17 +3072,19 @@ static const cbm_edge_t *binding_const_edge_at(const binding_t *b, int index) {
 }
 
 static void binding_set_node_metadata(binding_t *b, int index, const char *name, bool name_owned,
-                                      bool is_null) {
+                                      bool is_null, cypher_value_kind_t kind) {
     if (index < CYP_INLINE_NODE_VARS) {
         b->var_names[index] = name;
         b->var_name_owned[index] = name_owned;
         b->var_is_null[index] = is_null;
+        b->var_kinds[index] = is_null ? CYP_VALUE_NULL : kind;
         return;
     }
     binding_node_overflow_t *slot = &b->var_overflow[index - CYP_INLINE_NODE_VARS];
     slot->name = name;
     slot->name_owned = name_owned;
     slot->is_null = is_null;
+    slot->kind = is_null ? CYP_VALUE_NULL : kind;
 }
 
 static void binding_set_edge_name(binding_t *b, int index, const char *name) {
@@ -2579,6 +3142,343 @@ static bool binding_array_append(binding_t **rows, int *count, int *capacity, in
 }
 
 /* Return a string field from a node by property name.  NULL-safe. */
+typedef struct {
+    const char *data; /* borrowed unless owned is non-NULL */
+    size_t length;
+    char *owned;
+    bool is_null;
+    cypher_value_kind_t kind;
+    char inline_text[CBM_SZ_64];
+} cypher_value_t;
+
+typedef enum {
+    CYP_JSON_PROP_NOT_FOUND = 0,
+    CYP_JSON_PROP_FOUND,
+    CYP_JSON_PROP_INVALID,
+} cypher_json_prop_status_t;
+
+static void cypher_value_set_borrowed(cypher_value_t *value, const char *data, size_t length,
+                                      bool is_null) {
+    memset(value, 0, sizeof(*value));
+    value->data = data ? data : "";
+    value->length = data ? length : 0;
+    value->is_null = is_null;
+    value->kind = is_null ? CYP_VALUE_NULL : CYP_VALUE_STRING;
+}
+
+static void cypher_value_set_borrowed_kind(cypher_value_t *value, const char *data, size_t length,
+                                           cypher_value_kind_t kind) {
+    bool is_null = kind == CYP_VALUE_NULL;
+    cypher_value_set_borrowed(value, is_null ? "" : data, is_null ? 0 : length, is_null);
+    value->kind = kind;
+}
+
+static void cypher_value_set_cstr(cypher_value_t *value, const char *text, bool is_null) {
+    cypher_value_set_borrowed(value, text, text ? strlen(text) : 0, is_null);
+}
+
+static void cypher_value_set_int64(cypher_value_t *value, int64_t number);
+
+static void cypher_value_set_int(cypher_value_t *value, int number) {
+    cypher_value_set_int64(value, (int64_t)number);
+}
+
+/* Serialize through yyjson's public number writer so query-visible numeric
+ * text is locale-independent and shares the same representation as UNWIND
+ * JSON values. yyjson documents 21 bytes for integers and 40 for doubles;
+ * cypher_value_t's existing CBM_SZ_64 inline storage covers both contracts.
+ * Runtime and auxiliary/retained memory are O(1). */
+static bool cypher_value_set_number(cypher_value_t *value, const yyjson_val *number,
+                                    cypher_value_kind_t kind) {
+    if (!value || !number || (kind != CYP_VALUE_INTEGER && kind != CYP_VALUE_FLOAT)) {
+        return false;
+    }
+    memset(value, 0, sizeof(*value));
+    char *end = yyjson_write_number(number, value->inline_text);
+    if (!end || end < value->inline_text ||
+        (size_t)(end - value->inline_text) >= sizeof(value->inline_text)) {
+        g_cypher_allocation_failed = true;
+        value->data = "";
+        value->is_null = true;
+        value->kind = CYP_VALUE_NULL;
+        return false;
+    }
+    value->data = value->inline_text;
+    value->length = (size_t)(end - value->inline_text);
+    /* The established result-cell surface renders integral doubles like `%g`
+     * ("2", not yyjson's type-preserving "2.0"). Keep that stable text while
+     * the separate query-local kind continues to record FLOAT. */
+    if (kind == CYP_VALUE_FLOAT && value->length >= sizeof(".0") - SKIP_ONE &&
+        memcmp(value->inline_text + value->length - (sizeof(".0") - SKIP_ONE), ".0",
+               sizeof(".0") - SKIP_ONE) == 0) {
+        value->length -= sizeof(".0") - SKIP_ONE;
+    }
+    value->inline_text[value->length] = '\0';
+    value->kind = kind;
+    return true;
+}
+
+static void cypher_value_set_int64(cypher_value_t *value, int64_t number) {
+    yyjson_val json_number = {0};
+    if (!yyjson_set_sint(&json_number, number) ||
+        !cypher_value_set_number(value, &json_number, CYP_VALUE_INTEGER)) {
+        g_cypher_allocation_failed = true;
+    }
+}
+
+static void cypher_value_set_double(cypher_value_t *value, double number) {
+    yyjson_val json_number = {0};
+    if (!isfinite(number) || !yyjson_set_real(&json_number, number) ||
+        !cypher_value_set_number(value, &json_number, CYP_VALUE_FLOAT)) {
+        g_cypher_allocation_failed = true;
+        cypher_value_set_cstr(value, "", true);
+    }
+}
+
+static bool cypher_value_own(cypher_value_t *value) {
+    if (value->owned || value->is_null) {
+        return true;
+    }
+    if (value->length > SIZE_MAX - SKIP_ONE) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    char *copy = malloc(value->length + SKIP_ONE);
+    if (!copy) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    memcpy(copy, value->data, value->length);
+    copy[value->length] = '\0';
+    value->owned = copy;
+    value->data = copy;
+    return true;
+}
+
+static void cypher_value_free(cypher_value_t *value) {
+    if (!value) {
+        return;
+    }
+    free(value->owned);
+    memset(value, 0, sizeof(*value));
+}
+
+static void cypher_value_move(cypher_value_t *destination, cypher_value_t *source) {
+    *destination = *source;
+    if (source->data == source->inline_text) {
+        destination->data = destination->inline_text;
+    }
+    memset(source, 0, sizeof(*source));
+}
+
+/* Adapt yyjson's representation at the one executor boundary that consumes a
+ * parsed JSON value. The Cypher kind remains independent of yyjson's packed
+ * ABI tags, while conversion stays O(N) runtime in serialized value bytes and
+ * O(N) retained memory only for arrays/objects; scalar values are borrowed or
+ * use the existing fixed numeric representation. */
+static bool cypher_value_set_yyjson(cypher_value_t *value, const yyjson_val *json) {
+    if (!value || !json) {
+        return false;
+    }
+    if (yyjson_is_null(json)) {
+        cypher_value_set_cstr(value, "", true);
+        return true;
+    }
+    if (yyjson_is_str(json)) {
+        const char *text = yyjson_get_str(json);
+        cypher_value_set_borrowed_kind(value, text ? text : "", text ? strlen(text) : 0,
+                                       CYP_VALUE_STRING);
+        return true;
+    }
+    if (yyjson_is_bool(json)) {
+        const char *text = yyjson_get_bool(json) ? "true" : "false";
+        cypher_value_set_borrowed_kind(value, text, strlen(text), CYP_VALUE_BOOLEAN);
+        return true;
+    }
+    if (yyjson_is_num(json)) {
+        cypher_value_kind_t kind = yyjson_is_real(json) ? CYP_VALUE_FLOAT : CYP_VALUE_INTEGER;
+        return cypher_value_set_number(value, json, kind);
+    }
+    if (yyjson_is_arr(json) || yyjson_is_obj(json)) {
+        size_t length = 0;
+        char *serialized = yyjson_val_write(json, YYJSON_WRITE_NOFLAG, &length);
+        if (!serialized) {
+            return false;
+        }
+        memset(value, 0, sizeof(*value));
+        value->data = serialized;
+        value->length = length;
+        value->owned = serialized;
+        value->kind = CYP_VALUE_COMPOSITE;
+        return true;
+    }
+    return false;
+}
+
+static const char *cypher_json_skip_ws(const char *cursor) {
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    return cursor;
+}
+
+static bool cypher_json_is_empty_object(const char *json) {
+    if (!json) {
+        return true;
+    }
+    const char *cursor = cypher_json_skip_ws(json);
+    if (*cursor++ != '{') {
+        return false;
+    }
+    cursor = cypher_json_skip_ws(cursor);
+    if (*cursor++ != '}') {
+        return false;
+    }
+    return *cypher_json_skip_ws(cursor) == '\0';
+}
+
+/* Return the closing quote for a JSON string, honoring escape pairs. */
+static const char *cypher_json_string_end(const char *opening_quote) {
+    if (!opening_quote || *opening_quote != '"') {
+        return NULL;
+    }
+    for (const char *cursor = opening_quote + SKIP_ONE; *cursor; cursor++) {
+        if (*cursor == '\\') {
+            if (!cursor[SKIP_ONE]) {
+                return NULL;
+            }
+            cursor++;
+        } else if (*cursor == '"') {
+            return cursor;
+        }
+    }
+    return NULL;
+}
+
+/* Find one exact top-level JSON object member and return a borrowed raw-value
+ * view. Runtime is O(J + K) for JSON bytes J and key bytes K, with O(1)
+ * auxiliary memory and no pattern allocation. String escape bytes and complete
+ * array/object spelling are preserved to match the established Cypher surface. */
+static cypher_json_prop_status_t cypher_json_property_view(const char *json, const char *key,
+                                                           cypher_value_t *value) {
+    cypher_value_set_cstr(value, "", true);
+    if (!json || !key) {
+        return CYP_JSON_PROP_NOT_FOUND;
+    }
+    size_t key_length = strlen(key);
+    const char *cursor = cypher_json_skip_ws(json);
+    if (*cursor++ != '{') {
+        return CYP_JSON_PROP_INVALID;
+    }
+    for (;;) {
+        cursor = cypher_json_skip_ws(cursor);
+        if (*cursor == '}') {
+            return CYP_JSON_PROP_NOT_FOUND;
+        }
+        if (*cursor != '"') {
+            return CYP_JSON_PROP_INVALID;
+        }
+        const char *key_end = cypher_json_string_end(cursor);
+        if (!key_end) {
+            return CYP_JSON_PROP_INVALID;
+        }
+        const char *member_key = cursor + SKIP_ONE;
+        size_t member_key_length = (size_t)(key_end - member_key);
+        bool matches = member_key_length == key_length &&
+                       memcmp(member_key, key, key_length) == 0;
+        cursor = cypher_json_skip_ws(key_end + SKIP_ONE);
+        if (*cursor++ != ':') {
+            return CYP_JSON_PROP_INVALID;
+        }
+        cursor = cypher_json_skip_ws(cursor);
+        const char *value_start = cursor;
+        const char *value_end = NULL;
+        bool is_null = false;
+        cypher_value_kind_t kind = CYP_VALUE_STRING;
+        if (*cursor == '"') {
+            const char *string_end = cypher_json_string_end(cursor);
+            if (!string_end) {
+                return CYP_JSON_PROP_INVALID;
+            }
+            value_start = cursor + SKIP_ONE;
+            value_end = string_end;
+            cursor = string_end + SKIP_ONE;
+        } else if (*cursor == '[' || *cursor == '{') {
+            kind = CYP_VALUE_COMPOSITE;
+            int array_depth = 0;
+            int object_depth = 0;
+            for (; *cursor; cursor++) {
+                if (*cursor == '"') {
+                    const char *string_end = cypher_json_string_end(cursor);
+                    if (!string_end) {
+                        return CYP_JSON_PROP_INVALID;
+                    }
+                    cursor = string_end;
+                    continue;
+                }
+                if (*cursor == '[') {
+                    array_depth++;
+                } else if (*cursor == ']') {
+                    if (--array_depth < 0) {
+                        return CYP_JSON_PROP_INVALID;
+                    }
+                } else if (*cursor == '{') {
+                    object_depth++;
+                } else if (*cursor == '}') {
+                    if (--object_depth < 0) {
+                        return CYP_JSON_PROP_INVALID;
+                    }
+                }
+                if (array_depth == 0 && object_depth == 0) {
+                    cursor++;
+                    value_end = cursor;
+                    break;
+                }
+            }
+            if (!value_end) {
+                return CYP_JSON_PROP_INVALID;
+            }
+        } else {
+            while (*cursor && *cursor != ',' && *cursor != '}' &&
+                   !isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            value_end = cursor;
+            is_null = (size_t)(value_end - value_start) == sizeof("null") - SKIP_ONE &&
+                      memcmp(value_start, "null", sizeof("null") - SKIP_ONE) == 0;
+            size_t raw_length = (size_t)(value_end - value_start);
+            if (is_null) {
+                kind = CYP_VALUE_NULL;
+            } else if ((raw_length == sizeof("true") - SKIP_ONE &&
+                        memcmp(value_start, "true", raw_length) == 0) ||
+                       (raw_length == sizeof("false") - SKIP_ONE &&
+                        memcmp(value_start, "false", raw_length) == 0)) {
+                kind = CYP_VALUE_BOOLEAN;
+            } else if (memchr(value_start, '.', raw_length) ||
+                       memchr(value_start, 'e', raw_length) ||
+                       memchr(value_start, 'E', raw_length)) {
+                kind = CYP_VALUE_FLOAT;
+            } else {
+                kind = CYP_VALUE_INTEGER;
+            }
+        }
+        if (matches) {
+            cypher_value_set_borrowed_kind(value, value_start,
+                                           (size_t)(value_end - value_start), kind);
+            return CYP_JSON_PROP_FOUND;
+        }
+        cursor = cypher_json_skip_ws(cursor);
+        if (*cursor == ',') {
+            cursor++;
+            continue;
+        }
+        if (*cursor == '}') {
+            return CYP_JSON_PROP_NOT_FOUND;
+        }
+        return CYP_JSON_PROP_INVALID;
+    }
+}
+
 static const char *node_string_field(const cbm_node_t *n, const char *prop, bool *is_null) {
     static const struct {
         const char *key;
@@ -2600,7 +3500,7 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop, bool
             /* SQLite-backed optional core columns are normalized to an empty
              * string on read, which is their established null representation.
              * Dynamic JSON properties retain an exact empty-vs-null distinction
-             * and are handled separately by json_extract_prop_ex(). */
+             * and are handled separately by cypher_json_property_view(). */
             *is_null = val == NULL || val[0] == '\0';
             return val ? val : "";
         }
@@ -2610,91 +3510,36 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop, bool
 
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
-static const char *json_extract_prop_ex(const char *json, const char *key, char *buf, size_t buf_sz,
-                                        bool *is_null);
 static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
+static void node_prop_value(const cbm_node_t *n, const char *prop, cbm_store_t *store,
+                            const char *project, bool use_active_overlay_edges,
+                            cypher_value_t *value);
 
 static const char *node_prop_ex(const cbm_node_t *n, const char *prop, cbm_store_t *store,
                                 const char *project, bool use_active_overlay_edges, bool *is_null) {
-    *is_null = true;
-    if (!n || !prop) {
+    cypher_value_t value;
+    node_prop_value(n, prop, store, project, use_active_overlay_edges, &value);
+    *is_null = value.is_null;
+    if (value.is_null) {
+        cypher_value_free(&value);
         return "";
     }
-    const char *str = node_string_field(n, prop, is_null);
-    bool may_be_projected_stub = store && n->id > 0 && !n->file_path && !n->label;
-    if (str && (!*is_null || !may_be_projected_stub)) {
-        return str;
+    /* Preserve direct NUL-terminated node fields without scratch copying. */
+    if (!value.owned && value.data != value.inline_text && value.data[value.length] == '\0') {
+        return value.data;
     }
-    /* Computed and JSON-derived values live in rotating thread-local buffers:
-     * a single row (or an ORDER-BY comparison) reads several of these before any
-     * of them is copied out, so returning one shared static buffer would alias
-     * every column to the last value read. Mirrors edge_prop's rotation. */
+    /* Legacy string consumers receive a bounded compatibility view. Exact
+     * projection/aggregation paths consume cypher_value_t directly below. */
     static _Thread_local char bufs[CYP_BUF_8][CBM_SZ_512];
     static _Thread_local int buf_idx = 0;
     char *out = bufs[buf_idx];
     buf_idx = (buf_idx + SKIP_ONE) % CYP_BUF_8;
-
-    if (strcmp(prop, "start_line") == 0) {
-        snprintf(out, CBM_SZ_512, "%d", n->start_line);
-        *is_null = false;
-        return out;
-    }
-    if (strcmp(prop, "end_line") == 0) {
-        snprintf(out, CBM_SZ_512, "%d", n->end_line);
-        *is_null = false;
-        return out;
-    }
-    /* Virtual computed properties: in_degree/out_degree via the same
-     * all-but-INHERITS edge contract as cbm_store_node_degree(). */
-    if (store && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0)) {
-        int in_deg = 0;
-        int out_deg = 0;
-        if (use_active_overlay_edges && project && n->qualified_name && n->qualified_name[0]) {
-            (void)cbm_store_active_node_degree_by_qn(store, project, n->qualified_name, &in_deg,
-                                                     &out_deg);
-        } else {
-            cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
-        }
-        int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
-        snprintf(out, CBM_SZ_512, "%d", val);
-        *is_null = false;
-        return out;
-    }
-    /* Fall back to any value stored in the node's properties JSON — exposes the
-     * extraction metrics (complexity, cognitive, loop_count, loop_depth,
-     * transitive_loop_depth, recursive) and any other persisted property to
-     * WHERE/RETURN, e.g. WHERE n.loop_depth >= 2. */
-    if (n->properties_json && n->properties_json[0] == '{') {
-        const char *v = json_extract_prop_ex(n->properties_json, prop, out, CBM_SZ_512, is_null);
-        if (!*is_null) {
-            return v;
-        }
-    }
-    /* WITH aggregation carries a node group var by id + name only (the group key
-     * is the node name), so every other property is absent on the stub. Detect
-     * the stub (id set, but the full string fields were never populated) and
-     * re-fetch the node so RETURN g.file_path / g.label / g.<metric> project
-     * correctly instead of returning blank. The gate is heuristic, not an exact
-     * stub discriminator: a real bound node with NULL label AND file_path would
-     * also match, but in that case the worst case is one redundant indexed fetch
-     * that returns the same value — never a wrong result. */
-    if (may_be_projected_stub) {
-        cbm_node_t full = {0};
-        if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
-            bool full_is_null = true;
-            const char *rv =
-                node_prop_ex(&full, prop, NULL, project, use_active_overlay_edges, &full_is_null);
-            if (!full_is_null) {
-                snprintf(out, CBM_SZ_512, "%s", rv);
-            }
-            node_fields_free(&full);
-            if (!full_is_null) {
-                *is_null = false;
-                return out;
-            }
-        }
-    }
-    return "";
+    size_t copy_length = value.length < CBM_SZ_512 - SKIP_ONE ? value.length
+                                                               : CBM_SZ_512 - SKIP_ONE;
+    memcpy(out, value.data, copy_length);
+    out[copy_length] = '\0';
+    cypher_value_free(&value);
+    return out;
 }
 
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store,
@@ -2703,107 +3548,108 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     return node_prop_ex(n, prop, store, project, use_active_overlay_edges, &is_null);
 }
 
-/* Extract a string value from JSON properties_json by key.
- * Writes result to buf (up to buf_sz). Returns buf if found, "" otherwise.
- * Handles both string values ("key":"value") and numeric values ("key":1.5). */
-static const char *json_extract_prop_ex(const char *json, const char *key, char *buf, size_t buf_sz,
-                                        bool *is_null) {
-    *is_null = true;
-    if (!json || !key) {
-        buf[0] = '\0';
-        return buf;
+/* Resolve one node property as an exact-length value. Borrowed core/JSON
+ * storage remains valid with the bound node; only projected-stub re-fetches
+ * take an owned copy before releasing the temporary store row. */
+static void node_prop_value(const cbm_node_t *n, const char *prop, cbm_store_t *store,
+                            const char *project, bool use_active_overlay_edges,
+                            cypher_value_t *value) {
+    cypher_value_set_cstr(value, "", true);
+    if (!n || !prop) {
+        return;
     }
-    /* Build search pattern: "key": */
-    char pattern[CBM_SZ_256];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-    const char *p = strstr(json, pattern);
-    if (!p) {
-        buf[0] = '\0';
-        return buf;
+    bool field_is_null = true;
+    const char *field = node_string_field(n, prop, &field_is_null);
+    bool may_be_projected_stub = store && n->id > 0 && !n->file_path && !n->label;
+    if (field && (!field_is_null || !may_be_projected_stub)) {
+        cypher_value_set_cstr(value, field, field_is_null);
+        return;
     }
-    p += strlen(pattern);
-    /* Skip whitespace */
-    while (*p == ' ' || *p == '\t') {
-        p++;
+    if (strcmp(prop, "start_line") == 0) {
+        cypher_value_set_int(value, n->start_line);
+        return;
     }
-    if (strncmp(p, "null", 4) == 0 &&
-        (p[4] == ',' || p[4] == '}' || isspace((unsigned char)p[4]))) {
-        buf[0] = '\0';
-        return buf;
+    if (strcmp(prop, "end_line") == 0) {
+        cypher_value_set_int(value, n->end_line);
+        return;
     }
-    *is_null = false;
-    if (*p == '"') {
-        /* String value — honor backslash escapes: without this, an embedded \"
-         * cuts the value short at the first escaped quote. */
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < buf_sz - SKIP_ONE) {
-            if (*p == '\\' && p[SKIP_ONE] && i + SKIP_ONE < buf_sz - SKIP_ONE) {
-                buf[i++] = *p++; /* keep the escape pair intact */
-            }
-            buf[i++] = *p++;
+    if (store && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0)) {
+        int in_degree = 0;
+        int out_degree = 0;
+        if (use_active_overlay_edges && project && n->qualified_name && n->qualified_name[0]) {
+            (void)cbm_store_active_node_degree_by_qn(store, project, n->qualified_name, &in_degree,
+                                                     &out_degree);
+        } else {
+            cbm_store_node_degree(store, n->id, &in_degree, &out_degree);
         }
-        buf[i] = '\0';
-    } else if (*p == '[' || *p == '{') {
-        /* Array/object value — copy the whole balanced construct. A scan-to-comma
-         * truncates at the first comma INSIDE the value: e.g. a decorators array
-         * ["@Roles('OWNER', 'ADMIN')","@Get()"] came back as ["@Roles('OWNER'. */
-        char open = *p;
-        char close = (open == '[') ? ']' : '}';
-        int depth = 0;
-        int in_str = 0;
-        size_t i = 0;
-        while (*p && i < buf_sz - SKIP_ONE) {
-            char c = *p;
-            if (in_str) {
-                if (c == '\\' && p[SKIP_ONE] && i + SKIP_ONE < buf_sz - SKIP_ONE) {
-                    buf[i++] = *p++; /* escape pair stays intact */
-                } else if (c == '"') {
-                    in_str = 0;
-                }
-            } else if (c == '"') {
-                in_str = 1;
-            } else if (c == open) {
-                depth++;
-            } else if (c == close) {
-                depth--;
-            }
-            buf[i++] = *p++;
-            if (!in_str && depth == 0) {
-                break; /* outer bracket closed */
-            }
-        }
-        buf[i] = '\0';
-    } else {
-        /* Numeric or other scalar value */
-        size_t i = 0;
-        while (*p && *p != ',' && *p != '}' && *p != ' ' && i < buf_sz - SKIP_ONE) {
-            buf[i++] = *p++;
-        }
-        buf[i] = '\0';
+        cypher_value_set_int(value,
+                             strcmp(prop, "in_degree") == 0 ? in_degree : out_degree);
+        return;
     }
-    return buf;
+    if (n->properties_json && n->properties_json[0] == '{') {
+        cypher_json_prop_status_t status =
+            cypher_json_property_view(n->properties_json, prop, value);
+        if (status == CYP_JSON_PROP_FOUND) {
+            return;
+        }
+        if (status == CYP_JSON_PROP_INVALID) {
+            g_cypher_store_failed = true;
+            snprintf(g_cypher_store_error, sizeof(g_cypher_store_error),
+                     "node %lld has invalid properties JSON", (long long)n->id);
+            return;
+        }
+    }
+    if (may_be_projected_stub) {
+        cbm_node_t full = {0};
+        if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
+            node_prop_value(&full, prop, NULL, project, use_active_overlay_edges, value);
+            if (!value->is_null) {
+                (void)cypher_value_own(value);
+            }
+            node_fields_free(&full);
+        }
+    }
+}
+
+static void edge_prop_value(const cbm_edge_t *edge, const char *prop, cypher_value_t *value) {
+    cypher_value_set_cstr(value, "", true);
+    if (!edge || !prop) {
+        return;
+    }
+    if (strcmp(prop, "type") == 0) {
+        cypher_value_set_cstr(value, edge->type ? edge->type : "", edge->type == NULL);
+        return;
+    }
+    cypher_json_prop_status_t status =
+        cypher_json_property_view(edge->properties_json, prop, value);
+    if (status == CYP_JSON_PROP_INVALID) {
+        g_cypher_store_failed = true;
+        snprintf(g_cypher_store_error, sizeof(g_cypher_store_error),
+                 "edge %lld has invalid properties JSON", (long long)edge->id);
+    }
 }
 
 /* Get edge property by name. Uses rotating thread-local buffers to allow
  * multiple concurrent calls (e.g. projecting r.url_path, r.confidence
  * in the same row). */
 static const char *edge_prop_ex(const cbm_edge_t *e, const char *prop, bool *is_null) {
-    *is_null = true;
-    if (!e || !prop) {
+    cypher_value_t value;
+    edge_prop_value(e, prop, &value);
+    *is_null = value.is_null;
+    if (value.is_null) {
         return "";
     }
-    if (strcmp(prop, "type") == 0) {
-        *is_null = e->type == NULL;
-        return e->type ? e->type : "";
+    if (!value.owned && value.data != value.inline_text && value.data[value.length] == '\0') {
+        return value.data;
     }
-    /* Rotate through per-thread buffers so columns cannot alias and concurrent
-     * MCP requests cannot race over projection scratch storage. CBM_TLS is the
-     * project's portable thread-local qualifier (foundation/compat.h). */
     static CBM_TLS char ebufs[CYP_BUF_8][CBM_SZ_512];
     static CBM_TLS int ebuf_idx = 0;
     char *buf = ebufs[ebuf_idx++ & CYP_EBUF_MASK];
-    json_extract_prop_ex(e->properties_json, prop, buf, CBM_SZ_512, is_null);
+    size_t copy_length = value.length < CBM_SZ_512 - SKIP_ONE ? value.length
+                                                               : CBM_SZ_512 - SKIP_ONE;
+    memcpy(buf, value.data, copy_length);
+    buf[copy_length] = '\0';
+    cypher_value_free(&value);
     return buf;
 }
 
@@ -2964,7 +3810,8 @@ static void binding_copy(binding_t *dst, const binding_t *src) {
             dst->allocation_failed = true;
             return;
         }
-        binding_set_node_metadata(dst, i, dst_name, owned, binding_node_is_null_at(src, i));
+        binding_set_node_metadata(dst, i, dst_name, owned, binding_node_is_null_at(src, i),
+                                  binding_node_kind_at(src, i));
         dst->var_count++;
     }
     for (int i = 0; i < src->edge_var_count; i++) {
@@ -2991,7 +3838,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
             node_fields_free(slot);
             *slot = replacement;
             binding_set_node_metadata(b, i, binding_node_name_at(b, i),
-                                      binding_node_name_owned_at(b, i), false);
+                                      binding_node_name_owned_at(b, i), false, CYP_VALUE_NODE);
             return;
         }
     }
@@ -3003,87 +3850,145 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
         b->allocation_failed = true;
         return;
     }
-    binding_set_node_metadata(b, index, var, false, false); /* borrowed from the AST */
+    binding_set_node_metadata(b, index, var, false, false,
+                              CYP_VALUE_NODE); /* borrowed from the AST */
     b->var_count++;
 }
 
 static const char *binding_get_virtual_ex(binding_t *b, const char *var, const char *prop,
                                           bool *is_null);
-static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *item, char *buf,
-                                      size_t bufsz, bool *is_null);
+static void binding_get_virtual_value(binding_t *b, const char *var, const char *prop,
+                                      cypher_value_t *value);
+static void eval_multiarg_value(binding_t *binding, const cbm_return_item_t *item,
+                                cypher_value_t *value);
 
 /* Resolve the actual property value and preserve the Cypher distinction between
  * null and a valid empty string. This is the shared lookup used by projection,
  * aggregation, WHERE, and scalar functions. */
-static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b, bool *is_null) {
-    *is_null = true;
+static void resolve_condition_value(const cbm_condition_t *c, binding_t *b, cypher_value_t *value) {
     /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
-     * Evaluated through the same code path as RETURN projections. The value is
-     * consumed by eval_condition before any other condition is resolved, so a
-     * single thread-local buffer per call is safe. */
+     * Reuse the exact projection evaluator so WHERE cannot observe a shorter
+     * value than RETURN, WITH, or aggregate grouping. */
     if (c->func) {
-        static _Thread_local char func_buf[CBM_SZ_512];
         cbm_return_item_t item = {0};
         item.variable = c->variable;
         item.property = c->property;
         item.func = c->func;
         item.args = c->args;
         item.arg_count = c->arg_count;
-        return eval_multiarg_func(b, &item, func_buf, sizeof(func_buf), is_null);
+        eval_multiarg_value(b, &item, value);
+        return;
     }
-
-    cbm_edge_t *e = binding_get_edge(b, c->variable);
-    if (e) {
-        if (c->property) {
-            return edge_prop_ex(e, c->property, is_null);
-        }
-        *is_null = false;
-        return e->properties_json ? e->properties_json : "{}";
-    }
-    cbm_node_t *n = binding_get(b, c->variable);
-    if (!n) {
-        return ""; /* unbound variable */
-    }
-    if (c->property) {
-        return node_prop_ex(n, c->property, b->store, b->project, b->use_active_overlay_edges,
-                            is_null);
-    }
-    /* Bare alias (e.g. post-WITH virtual var) — use node name directly */
-    *is_null = false;
-    return n->name ? n->name : "";
+    binding_get_virtual_value(b, c->variable, c->property, value);
 }
 
-/* Evaluate a comparison operator between actual and expected strings. */
-static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
+static bool cypher_value_equals_cstr(const cypher_value_t *actual, const char *expected) {
+    size_t expected_length = expected ? strlen(expected) : 0;
+    return actual->length == expected_length &&
+           memcmp(actual->data, expected ? expected : "", expected_length) == 0;
+}
+
+/* Build the KMP failure table shared by CONTAINS and replace(). For pattern
+ * length P, this is O(P) runtime and O(P) temporary memory. */
+static size_t *cypher_kmp_prefix_create(const char *pattern, size_t pattern_length) {
+    if (!pattern || pattern_length == 0 || pattern_length > SIZE_MAX / sizeof(size_t)) {
+        if (pattern_length > SIZE_MAX / sizeof(size_t)) {
+            g_cypher_allocation_failed = true;
+        }
+        return NULL;
+    }
+    size_t *prefix = calloc(pattern_length, sizeof(*prefix));
+    if (!prefix) {
+        g_cypher_allocation_failed = true;
+        return NULL;
+    }
+    for (size_t i = SKIP_ONE, matched = 0; i < pattern_length; i++) {
+        while (matched > 0 && pattern[i] != pattern[matched]) {
+            matched = prefix[matched - SKIP_ONE];
+        }
+        if (pattern[i] == pattern[matched]) {
+            matched++;
+        }
+        prefix[i] = matched;
+    }
+    return prefix;
+}
+
+/* Portable linear-time substring search over a non-NUL-terminated value view.
+ * For actual length A and expected length E, runtime is O(A + E), auxiliary
+ * memory O(E), and allocation failure aborts the query rather than changing a
+ * CONTAINS answer. */
+static bool cypher_value_contains_cstr(const cypher_value_t *actual, const char *expected) {
+    size_t expected_length = expected ? strlen(expected) : 0;
+    if (expected_length == 0) {
+        return true;
+    }
+    if (expected_length > actual->length) {
+        return false;
+    }
+    size_t *prefix = cypher_kmp_prefix_create(expected, expected_length);
+    if (!prefix) {
+        return false;
+    }
+    bool found = false;
+    for (size_t i = 0, matched = 0; i < actual->length; i++) {
+        while (matched > 0 && actual->data[i] != expected[matched]) {
+            matched = prefix[matched - SKIP_ONE];
+        }
+        if (actual->data[i] == expected[matched]) {
+            matched++;
+        }
+        if (matched == expected_length) {
+            found = true;
+            break;
+        }
+    }
+    free(prefix);
+    return found;
+}
+
+/* Evaluate a comparison operator against an exact-length value. Equality and
+ * string predicates avoid materialization; regex/numeric library calls take
+ * one exact owned copy because their portable APIs require NUL termination. */
+static bool eval_comparison_op(const char *op, cypher_value_t *actual, const char *expected) {
     if (strcmp(op, "=") == 0) {
-        return strcmp(actual, expected) == 0;
+        return cypher_value_equals_cstr(actual, expected);
     }
     if (strcmp(op, "<>") == 0) {
-        return strcmp(actual, expected) != 0;
+        return !cypher_value_equals_cstr(actual, expected);
     }
     if (strcmp(op, "=~") == 0) {
+        if (!cypher_value_own(actual)) {
+            return false;
+        }
         cbm_regex_t re;
         if (cbm_regcomp(&re, expected, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
             return false;
         }
-        int rc = cbm_regexec(&re, actual, 0, NULL, 0);
+        int rc = cbm_regexec(&re, actual->data, 0, NULL, 0);
         cbm_regfree(&re);
         return rc == 0;
     }
     if (strcmp(op, "CONTAINS") == 0) {
-        return strstr(actual, expected) != NULL;
+        return cypher_value_contains_cstr(actual, expected);
     }
     if (strcmp(op, "STARTS WITH") == 0) {
-        return strncmp(actual, expected, strlen(expected)) == 0;
+        size_t expected_length = strlen(expected);
+        return actual->length >= expected_length &&
+               memcmp(actual->data, expected, expected_length) == 0;
     }
     if (strcmp(op, "ENDS WITH") == 0) {
-        size_t alen = strlen(actual);
-        size_t elen = strlen(expected);
-        return alen >= elen && strcmp(actual + alen - elen, expected) == 0;
+        size_t expected_length = strlen(expected);
+        return actual->length >= expected_length &&
+               memcmp(actual->data + actual->length - expected_length, expected,
+                      expected_length) == 0;
     }
     if (strcmp(op, ">") == 0 || strcmp(op, "<") == 0 || strcmp(op, ">=") == 0 ||
         strcmp(op, "<=") == 0) {
-        double a = strtod(actual, NULL);
+        if (!cypher_value_own(actual)) {
+            return false;
+        }
+        double a = strtod(actual->data, NULL);
         double exp_val = strtod(expected, NULL);
         if (op[0] == '>' && op[CYP_CHAR_IDX1] == '=') {
             return a >= exp_val;
@@ -3154,28 +4059,31 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
-    bool actual_is_null = true;
-    const char *actual = resolve_condition_value(c, b, &actual_is_null);
+    cypher_value_t actual;
+    resolve_condition_value(c, b, &actual);
     /* Legacy two-argument coalesce representation: fall back only for null,
      * never for a present empty string. */
-    if (c->coalesce_default && actual_is_null) {
-        actual = c->coalesce_default;
-        actual_is_null = false;
+    if (c->coalesce_default && actual.is_null) {
+        cypher_value_free(&actual);
+        cypher_value_set_cstr(&actual, c->coalesce_default, false);
     }
 
     bool result;
 
     /* IS NULL / IS NOT NULL */
     if (strcmp(c->op, "IS NULL") == 0) {
-        result = actual_is_null;
+        result = actual.is_null;
+        cypher_value_free(&actual);
         return c->negated ? !result : result;
     }
     if (strcmp(c->op, "IS NOT NULL") == 0) {
-        result = !actual_is_null;
+        result = !actual.is_null;
+        cypher_value_free(&actual);
         return c->negated ? !result : result;
     }
     /* A null comparison is unknown and therefore does not pass WHERE. */
-    if (actual_is_null) {
+    if (actual.is_null) {
+        cypher_value_free(&actual);
         return false;
     }
 
@@ -3183,15 +4091,17 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     if (strcmp(c->op, "IN") == 0) {
         result = false;
         for (int i = 0; i < c->in_value_count; i++) {
-            if (strcmp(actual, c->in_values[i]) == 0) {
+            if (cypher_value_equals_cstr(&actual, c->in_values[i])) {
                 result = true;
                 break;
             }
         }
+        cypher_value_free(&actual);
         return c->negated ? !result : result;
     }
 
-    result = eval_comparison_op(c->op, actual, c->value);
+    result = eval_comparison_op(c->op, &actual, c->value);
+    cypher_value_free(&actual);
     return c->negated ? !result : result;
 }
 
@@ -3372,58 +4282,98 @@ typedef enum { CYP_NODE_SCAN_CANONICAL = 0, CYP_NODE_SCAN_ACTIVE_OVERLAY } cyphe
 static void rb_init(result_builder_t *rb) {
     memset(rb, 0, sizeof(*rb));
     rb->row_cap = CBM_SZ_32;
-    rb->rows = malloc(rb->row_cap * sizeof(const char **));
+    rb->rows = calloc((size_t)rb->row_cap, sizeof(*rb->rows));
     if (!rb->rows) {
         rb->row_cap = 0;
         g_cypher_allocation_failed = true;
     }
 }
 
-static void rb_set_columns(result_builder_t *rb, const char **cols, int count) {
-    rb->columns = malloc((count > 0 ? (size_t)count : SKIP_ONE) * sizeof(const char *));
-    if (!rb->columns) {
+/* Allocate at least one zeroed element while preserving exact query-sized
+ * cardinality. Runtime and memory are O(count); representational overflow and
+ * OOM become one query-wide allocation failure rather than partial output. */
+static void *cypher_calloc_elements(int count, size_t element_size) {
+    size_t allocation_count = count > 0 ? (size_t)count : SKIP_ONE;
+    if (count < 0 || element_size == 0 || allocation_count > SIZE_MAX / element_size) {
+        g_cypher_allocation_failed = true;
+        return NULL;
+    }
+    void *memory = calloc(allocation_count, element_size);
+    if (!memory) {
+        g_cypher_allocation_failed = true;
+    }
+    return memory;
+}
+
+/* Transfer an exact-size column vector to the result builder. Generated
+ * column names already have result lifetime, so adopting them avoids an
+ * otherwise redundant O(total_name_bytes) copy and peak allocation. On
+ * success rb owns both the vector and every string in it. */
+static bool rb_adopt_columns(result_builder_t *rb, const char **columns, int count) {
+    if (!rb || !columns || count < 0 || rb->columns) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    rb->columns = columns;
+    rb->col_count = count;
+    return true;
+}
+
+/* Append one row, optionally transferring individual exact string owners into
+ * the result. Transferred slots are set to NULL; untransferred values are
+ * copied as before. This keeps ordinary borrowed projections simple while
+ * avoiding a second O(value bytes) allocation for constructed aggregates. */
+static void rb_add_row_sized_owned(result_builder_t *rb, const char **values, const size_t *lengths,
+                                   char **owned_values) {
+    if (g_cypher_allocation_failed || !rb || !values || rb->col_count < 0) {
         g_cypher_allocation_failed = true;
         return;
     }
-    memset(rb->columns, 0, (count > 0 ? (size_t)count : SKIP_ONE) * sizeof(const char *));
-    for (int i = 0; i < count; i++) {
-        rb->columns[i] = heap_strdup(cols[i]);
-        if (cols[i] && !rb->columns[i]) {
-            for (int j = 0; j < i; j++) {
-                safe_str_free(&rb->columns[j]);
-            }
-            free(rb->columns);
-            rb->columns = NULL;
+    if (rb->row_count >= rb->row_cap) {
+        if (rb->row_cap > INT_MAX / PAIR_LEN) {
             g_cypher_allocation_failed = true;
             return;
         }
-    }
-    rb->col_count = count;
-}
-
-static void rb_add_row(result_builder_t *rb, const char **values) {
-    if (g_cypher_allocation_failed) {
-        return;
-    }
-    if (rb->row_count >= rb->row_cap) {
         int next = rb->row_cap > 0 ? rb->row_cap * PAIR_LEN : CBM_SZ_32;
+        if ((size_t)next > SIZE_MAX / sizeof(*rb->rows)) {
+            g_cypher_allocation_failed = true;
+            return;
+        }
         void *grown = realloc(rb->rows, (size_t)next * sizeof(const char **));
         if (!grown) {
             g_cypher_allocation_failed = true;
             return;
         }
         rb->rows = grown;
+        memset(rb->rows + rb->row_cap, 0, (size_t)(next - rb->row_cap) * sizeof(*rb->rows));
         rb->row_cap = next;
     }
-    const char **row =
-        malloc((rb->col_count > 0 ? (size_t)rb->col_count : SKIP_ONE) * sizeof(const char *));
+    const char **row = cypher_calloc_elements(rb->col_count, sizeof(*row));
     if (!row) {
-        g_cypher_allocation_failed = true;
         return;
     }
-    memset(row, 0, (rb->col_count > 0 ? (size_t)rb->col_count : SKIP_ONE) * sizeof(const char *));
     for (int i = 0; i < rb->col_count; i++) {
-        row[i] = values[i] ? heap_strdup(values[i]) : heap_strdup("");
+        const char *source = values[i] ? values[i] : "";
+        size_t length = lengths ? lengths[i] : strlen(source);
+        if (owned_values && owned_values[i]) {
+            row[i] = owned_values[i];
+            owned_values[i] = NULL;
+            continue;
+        }
+        if (length > SIZE_MAX - SKIP_ONE) {
+            g_cypher_allocation_failed = true;
+            for (int j = 0; j < i; j++) {
+                safe_str_free(&row[j]);
+            }
+            free(row);
+            return;
+        }
+        char *copy = malloc(length + SKIP_ONE);
+        if (copy) {
+            memcpy(copy, source, length);
+            copy[length] = '\0';
+        }
+        row[i] = copy;
         if (!row[i]) {
             for (int j = 0; j < i; j++) {
                 safe_str_free(&row[j]);
@@ -3434,6 +4384,43 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
         }
     }
     rb->rows[rb->row_count++] = row;
+}
+
+static void rb_add_row_sized(result_builder_t *rb, const char **values, const size_t *lengths) {
+    rb_add_row_sized_owned(rb, values, lengths, NULL);
+}
+
+static void rb_add_row(result_builder_t *rb, const char **values) {
+    rb_add_row_sized(rb, values, NULL);
+}
+
+/* Cypher UNION requires identical column counts and names. Validation is O(C)
+ * once per branch for C columns, O(1) memory, and precedes every row copy. */
+static bool rb_union_schema_matches(const result_builder_t *first, const result_builder_t *branch,
+                                    int branch_number, char *error, size_t error_size) {
+    if (!first || !branch || !error || error_size == 0) {
+        return false;
+    }
+    if (first->col_count != branch->col_count) {
+        snprintf(error, error_size,
+                 "UNION branches must return identical column counts and names; first branch "
+                 "has %d columns but branch %d has %d",
+                 first->col_count, branch_number, branch->col_count);
+        return false;
+    }
+    for (int column = 0; column < first->col_count; column++) {
+        const char *first_name = first->columns ? first->columns[column] : NULL;
+        const char *branch_name = branch->columns ? branch->columns[column] : NULL;
+        if (!first_name || !branch_name || strcmp(first_name, branch_name) != 0) {
+            snprintf(error, error_size,
+                     "UNION branches must return identical column counts and names; column %d "
+                     "is '%s' in the first branch but '%s' in branch %d",
+                     column + SKIP_ONE, first_name ? first_name : "<missing>",
+                     branch_name ? branch_name : "<missing>", branch_number);
+            return false;
+        }
+    }
+    return true;
 }
 
 /* ── Main execution ─────────────────────────────────────────────── */
@@ -3451,11 +4438,35 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
 static _Thread_local bool g_cypher_timed_out = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
+enum {
+    CYP_AGG_ALLOC_NONE = 0,
+    CYP_AGG_ALLOC_INITIAL,
+    CYP_AGG_ALLOC_GROUP_ENTRY,
+    CYP_AGG_ALLOC_GROUP_ARRAY_GROWTH,
+    CYP_AGG_ALLOC_VALUE_ARRAY_GROWTH,
+    CYP_AGG_ALLOC_VALUE_COPY,
+    CYP_AGG_ALLOC_DISTINCT_INDEX,
+};
 #ifdef CBM_ENABLE_TEST_SEAMS
+_Static_assert((int)CBM_CYPHER_TEST_AGG_ALLOC_DISTINCT_INDEX ==
+                   CYP_AGG_ALLOC_DISTINCT_INDEX,
+               "aggregate allocation seam values must match");
 static _Thread_local bool g_cypher_force_whole_pattern_provider = false;
+static _Thread_local int g_cypher_test_agg_alloc_site = CYP_AGG_ALLOC_NONE;
+static _Thread_local int g_cypher_test_agg_alloc_successes_before_failure = -1;
+static _Thread_local bool g_cypher_track_aggregate_list_growths = false;
+static _Thread_local uint64_t g_cypher_aggregate_list_growths = 0;
+static _Thread_local int g_cypher_test_label_alt_growths_before_failure = -1;
 #endif
 static _Thread_local bool g_cypher_track_group_lookup_probes = false;
 static _Thread_local uint64_t g_cypher_group_lookup_probes = 0;
+static _Thread_local bool g_cypher_track_aggregate_distinct_probes = false;
+static _Thread_local uint64_t g_cypher_aggregate_distinct_probes = 0;
+static _Thread_local bool g_cypher_track_row_distinct_probes = false;
+static _Thread_local uint64_t g_cypher_row_distinct_probes = 0;
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int g_cypher_row_distinct_key_copies_before_failure = -1;
+#endif
 
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
@@ -3490,7 +4501,59 @@ void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
 void cbm_cypher_test_force_whole_pattern_provider(bool force) {
     g_cypher_force_whole_pattern_provider = force;
 }
+
+void cbm_cypher_test_fail_aggregation_allocation(cbm_cypher_test_agg_alloc_site_t site,
+                                                 int successful_before) {
+    g_cypher_test_agg_alloc_site = (int)site;
+    g_cypher_test_agg_alloc_successes_before_failure = successful_before;
+}
+
+void cbm_cypher_test_reset_aggregate_list_growths(void) {
+    g_cypher_aggregate_list_growths = 0;
+    g_cypher_track_aggregate_list_growths = true;
+}
+
+uint64_t cbm_cypher_test_aggregate_list_growths(void) {
+    g_cypher_track_aggregate_list_growths = false;
+    return g_cypher_aggregate_list_growths;
+}
+
+void cbm_cypher_test_fail_label_alternation_growth(int successful_before) {
+    g_cypher_test_label_alt_growths_before_failure = successful_before;
+}
 #endif
+
+static bool cypher_label_alt_growth_should_fail(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cypher_test_label_alt_growths_before_failure < 0) {
+        return false;
+    }
+    if (g_cypher_test_label_alt_growths_before_failure == 0) {
+        g_cypher_test_label_alt_growths_before_failure = -1;
+        return true;
+    }
+    g_cypher_test_label_alt_growths_before_failure--;
+#endif
+    return false;
+}
+
+static bool cypher_agg_allocation_should_fail(int site) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cypher_test_agg_alloc_site != site ||
+        g_cypher_test_agg_alloc_successes_before_failure < 0) {
+        return false;
+    }
+    if (g_cypher_test_agg_alloc_successes_before_failure == 0) {
+        g_cypher_test_agg_alloc_site = CYP_AGG_ALLOC_NONE;
+        g_cypher_test_agg_alloc_successes_before_failure = -1;
+        return true;
+    }
+    g_cypher_test_agg_alloc_successes_before_failure--;
+#else
+    (void)site;
+#endif
+    return false;
+}
 
 void cbm_cypher_test_reset_group_lookup_probes(void) {
     g_cypher_group_lookup_probes = 0;
@@ -3500,6 +4563,46 @@ void cbm_cypher_test_reset_group_lookup_probes(void) {
 uint64_t cbm_cypher_test_group_lookup_probes(void) {
     g_cypher_track_group_lookup_probes = false;
     return g_cypher_group_lookup_probes;
+}
+
+void cbm_cypher_test_reset_aggregate_distinct_probes(void) {
+    g_cypher_aggregate_distinct_probes = 0;
+    g_cypher_track_aggregate_distinct_probes = true;
+}
+
+uint64_t cbm_cypher_test_aggregate_distinct_probes(void) {
+    g_cypher_track_aggregate_distinct_probes = false;
+    return g_cypher_aggregate_distinct_probes;
+}
+
+void cbm_cypher_test_reset_row_distinct_probes(void) {
+    g_cypher_row_distinct_probes = 0;
+    g_cypher_track_row_distinct_probes = true;
+}
+
+uint64_t cbm_cypher_test_row_distinct_probes(void) {
+    g_cypher_track_row_distinct_probes = false;
+    return g_cypher_row_distinct_probes;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_cypher_test_fail_row_distinct_key_copy(int successful_before) {
+    g_cypher_row_distinct_key_copies_before_failure = successful_before;
+}
+#endif
+
+static bool row_distinct_key_copy_should_fail(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cypher_row_distinct_key_copies_before_failure < 0) {
+        return false;
+    }
+    if (g_cypher_row_distinct_key_copies_before_failure == 0) {
+        g_cypher_row_distinct_key_copies_before_failure = -1;
+        return true;
+    }
+    g_cypher_row_distinct_key_copies_before_failure--;
+#endif
+    return false;
 }
 
 /* Aggregate rows stay in first-seen order for deterministic output, while this
@@ -3549,29 +4652,32 @@ static void aggregate_group_index_free(aggregate_group_index_t *index) {
 
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
 
-static const char *binding_get_virtual_ex(binding_t *b, const char *var, const char *prop,
-                                          bool *is_null) {
-    *is_null = true;
+static void binding_get_virtual_value(binding_t *b, const char *var, const char *prop,
+                                      cypher_value_t *value) {
+    cypher_value_set_cstr(value, "", true);
     if (!var) {
-        return "";
+        return;
     }
     /* COUNT(*) counts rows, so its synthetic argument is always non-null. */
     if (strcmp(var, "*") == 0 && !prop) {
-        *is_null = false;
-        return "";
+        cypher_value_set_cstr(value, "", false);
+        return;
     }
-    /* Check virtual vars first (from WITH projection) */
-    char full[CBM_SZ_256];
-    if (prop) {
-        snprintf(full, sizeof(full), "%s.%s", var, prop);
-    } else {
-        snprintf(full, sizeof(full), "%s", var);
-    }
+    /* Compare virtual names from WITH against canonical parts directly, so a
+     * long variable.property identity is never formatted through scratch. */
     for (int i = 0; i < b->var_count; i++) {
-        if (strcmp(binding_node_name_at(b, i), full) == 0) {
+        const char *bound_name = binding_node_name_at(b, i);
+        const char *property_parts[] = {var, ".", prop ? prop : ""};
+        bool matches = prop ? cypher_text_equals_parts(
+                                  bound_name, property_parts,
+                                  sizeof(property_parts) / sizeof(property_parts[0]))
+                            : strcmp(bound_name, var) == 0;
+        if (matches) {
             const cbm_node_t *node = binding_const_node_at(b, i);
-            *is_null = binding_node_is_null_at(b, i);
-            return node->name ? node->name : "";
+            bool is_null = binding_node_is_null_at(b, i);
+            cypher_value_set_cstr(value, node->name ? node->name : "", is_null);
+            value->kind = is_null ? CYP_VALUE_NULL : binding_node_kind_at(b, i);
+            return;
         }
     }
     /* Fall through to normal lookup */
@@ -3579,23 +4685,49 @@ static const char *binding_get_virtual_ex(binding_t *b, const char *var, const c
     if (e) {
         /* Bare `RETURN r` on an edge: surface the full properties JSON
          * (or "{}" if none) so callers can inspect timestamps, weights,
-         * etc. without naming each property. */
+        * etc. without naming each property. */
         if (prop) {
-            return edge_prop_ex(e, prop, is_null);
+            edge_prop_value(e, prop, value);
+            return;
         }
-        *is_null = false;
-        return e->properties_json ? e->properties_json : "{}";
+        cypher_value_set_borrowed_kind(value, e->properties_json ? e->properties_json : "{}",
+                                       strlen(e->properties_json ? e->properties_json : "{}"),
+                                       CYP_VALUE_RELATIONSHIP);
+        return;
     }
     cbm_node_t *n = binding_get(b, var);
     if (n) {
         if (prop) {
-            return node_prop_ex(n, prop, b->store, b->project, b->use_active_overlay_edges,
-                                is_null);
+            node_prop_value(n, prop, b->store, b->project, b->use_active_overlay_edges, value);
+            return;
         }
-        *is_null = false;
-        return n->name ? n->name : "";
+        cypher_value_set_borrowed_kind(value, n->name ? n->name : "",
+                                       strlen(n->name ? n->name : ""), CYP_VALUE_NODE);
+        return;
     }
-    return "";
+}
+
+static const char *binding_get_virtual_ex(binding_t *b, const char *var, const char *prop,
+                                          bool *is_null) {
+    cypher_value_t value;
+    binding_get_virtual_value(b, var, prop, &value);
+    *is_null = value.is_null;
+    if (value.is_null) {
+        cypher_value_free(&value);
+        return "";
+    }
+    if (!value.owned && value.data != value.inline_text && value.data[value.length] == '\0') {
+        return value.data;
+    }
+    static CBM_TLS char buffers[CYP_BUF_8][CBM_SZ_512];
+    static CBM_TLS int buffer_index = 0;
+    char *out = buffers[buffer_index++ & CYP_EBUF_MASK];
+    size_t copy_length = value.length < CBM_SZ_512 - SKIP_ONE ? value.length
+                                                               : CBM_SZ_512 - SKIP_ONE;
+    memcpy(out, value.data, copy_length);
+    out[copy_length] = '\0';
+    cypher_value_free(&value);
+    return out;
 }
 
 static const char *binding_get_virtual(binding_t *b, const char *var, const char *prop) {
@@ -3606,131 +4738,213 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
 /* Append one aggregation grouping component. Entity values group by canonical
  * store identity, not display name; scalar values use a length prefix so a
  * delimiter inside user data cannot merge otherwise distinct tuples. */
-static int group_key_append(char *key, size_t key_sz, int pos, binding_t *binding, const char *var,
-                            const char *prop, const char *value, bool is_null) {
-    if ((size_t)pos >= key_sz - SKIP_ONE) {
-        return (int)key_sz - SKIP_ONE;
-    }
-    size_t remaining = key_sz - (size_t)pos;
+static bool group_key_append_value(cypher_string_builder_t *key, binding_t *binding,
+                                   const char *var, bool preserve_entity_identity,
+                                   const cypher_value_t *value) {
+    char prefix[CBM_SZ_64];
     int written = 0;
-    if (!prop) {
+    if (preserve_entity_identity) {
         cbm_node_t *node = binding_get(binding, var);
         if (node && node->id > 0) {
-            written = snprintf(key + pos, remaining, "N:%lld|", (long long)node->id);
+            written = snprintf(prefix, sizeof(prefix), "N:%lld|", (long long)node->id);
         } else {
             cbm_edge_t *edge = binding_get_edge(binding, var);
             if (edge && edge->id > 0) {
-                written = snprintf(key + pos, remaining, "E:%lld|", (long long)edge->id);
+                written = snprintf(prefix, sizeof(prefix), "E:%lld|", (long long)edge->id);
             }
         }
     }
-    if (written == 0) {
-        written = is_null ? snprintf(key + pos, remaining, "Z|")
-                          : snprintf(key + pos, remaining, "V:%zu:%s|", strlen(value), value);
+    if (written > 0) {
+        return (size_t)written < sizeof(prefix) &&
+               cypher_string_builder_append(key, prefix, (size_t)written);
     }
-    if (written < 0) {
-        return pos;
+    if (value->is_null) {
+        return cypher_string_builder_append(key, "Z|", sizeof("Z|") - SKIP_ONE);
     }
-    if ((size_t)written >= remaining) {
-        return (int)key_sz - SKIP_ONE;
+    written = snprintf(prefix, sizeof(prefix), "V:%zu:", value->length);
+    if (written < 0 || (size_t)written >= sizeof(prefix) ||
+        !cypher_string_builder_append(key, prefix, (size_t)written) ||
+        !cypher_string_builder_append(key, value->data, value->length)) {
+        return false;
     }
-    return pos + written;
+    return cypher_string_builder_append(key, "|", sizeof("|") - SKIP_ONE);
 }
 
 /* ── String function application ──────────────────────────────── */
 
-static const char *apply_string_func(const char *func, const char *val, char *buf, size_t buf_sz) {
-    if (!func || !val) {
-        return val ? val : "";
+static bool cypher_parse_consumed_value(const cypher_value_t *value, const char *end) {
+    if (!value || !end || end == value->data) {
+        return false;
     }
-    if (strcmp(func, "toLower") == 0) {
-        size_t i = 0;
-        for (; i < buf_sz - SKIP_ONE && val[i]; i++) {
-            buf[i] = (char)tolower((unsigned char)val[i]);
+    const char *limit = value->data + value->length;
+    while (end < limit && isspace((unsigned char)*end)) {
+        end++;
+    }
+    return end == limit;
+}
+
+/* yyjson's extended-number grammar deliberately rejects redundant leading
+ * zeroes even though both merge parents accepted them through strto*. Remove
+ * only zeroes followed by another decimal digit, retaining one zero before a
+ * decimal point/exponent and preserving an optional sign. The value is already
+ * an owned compatibility copy, so normalization is O(N) in-place with O(1)
+ * auxiliary memory and cannot mutate a binding or stored property. */
+static void cypher_value_normalize_leading_zeroes(cypher_value_t *value, const char **begin,
+                                                  const char **limit) {
+    char *number = (char *)*begin;
+    char *digits = number;
+    if (digits < *limit && (*digits == '+' || *digits == '-')) {
+        digits++;
+    }
+    char *retained = digits;
+    while (retained + SKIP_ONE < *limit && retained[0] == '0' &&
+           isdigit((unsigned char)retained[SKIP_ONE])) {
+        retained++;
+    }
+    if (retained == digits) {
+        return;
+    }
+    size_t removed = (size_t)(retained - digits);
+    memmove(digits, retained, (size_t)(*limit - retained) + SKIP_ONE);
+    value->length -= removed;
+    *limit -= removed;
+}
+
+/* Parse one complete numeric slice through yyjson's public standalone number
+ * API. YYJSON_READ_ALLOW_EXT_NUMBER retains useful forms accepted by both
+ * merge parents (`+42`, `.5`, `1.`); the shared normalization above retains
+ * redundant leading zeroes without accepting a
+ * numeric prefix such as `12junk`. The existing owned NUL-terminated copy is
+ * needed only for borrowed query slices. Runtime is O(N); worst-case temporary
+ * memory is O(N), while yyjson's fast converter itself does not allocate. */
+static bool cypher_value_parse_number(cypher_value_t *value, yyjson_read_flag flags,
+                                      yyjson_val *result) {
+    if (!value || !result || value->is_null || !cypher_value_own(value)) {
+        return false;
+    }
+    const char *begin = value->data;
+    const char *limit = value->data + value->length;
+    while (begin < limit && isspace((unsigned char)*begin)) {
+        begin++;
+    }
+    if (begin == limit) {
+        return false;
+    }
+    cypher_value_normalize_leading_zeroes(value, &begin, &limit);
+    const char *end = yyjson_read_number(begin, result, flags | YYJSON_READ_ALLOW_EXT_NUMBER, NULL,
+                                         NULL);
+    return end && cypher_parse_consumed_value(value, end);
+}
+
+/* yyjson classifies parsed numbers as signed, unsigned, or correctly-rounded
+ * double. Integer subtypes are range-checked exactly. For real values, the
+ * type-derived exclusive +2^(bits-1) bound makes the subsequent cast defined;
+ * -2^(bits-1) is inclusive. Runtime and auxiliary memory are O(1). */
+static bool cypher_number_to_int64(const yyjson_val *number, int64_t *result) {
+    if (!number || !result) {
+        return false;
+    }
+    if (yyjson_is_sint(number)) {
+        *result = yyjson_get_sint(number);
+        return true;
+    }
+    if (yyjson_is_uint(number)) {
+        uint64_t parsed = yyjson_get_uint(number);
+        if (parsed > (uint64_t)INT64_MAX) {
+            return false;
         }
-        buf[i] = '\0';
-        return buf;
+        *result = (int64_t)parsed;
+        return true;
     }
-    if (strcmp(func, "toUpper") == 0) {
-        size_t i = 0;
-        for (; i < buf_sz - SKIP_ONE && val[i]; i++) {
-            buf[i] = (char)toupper((unsigned char)val[i]);
-        }
-        buf[i] = '\0';
-        return buf;
+    if (!yyjson_is_real(number)) {
+        return false;
     }
-    if (strcmp(func, "toString") == 0) {
-        return val; /* already strings */
+    double truncated = trunc(yyjson_get_real(number));
+    const int magnitude_bits = (int)(sizeof(int64_t) * CHAR_BIT - SKIP_ONE);
+    const double positive_limit = ldexp(1.0, magnitude_bits);
+    if (!isfinite(truncated) || truncated < -positive_limit || truncated >= positive_limit) {
+        return false;
     }
-    if (strcmp(func, "toInteger") == 0) {
-        char *end = NULL;
-        long long v = strtoll(val, &end, CBM_DECIMAL_BASE);
-        if (end == val) {
-            /* Not an integer literal — accept a float string and truncate. */
-            char *fend = NULL;
-            double d = strtod(val, &fend);
-            if (fend == val) {
-                return ""; /* non-numeric → null */
+    *result = (int64_t)truncated;
+    return true;
+}
+
+/* Apply the documented scalar conversions to one typed exact value. The
+ * public result remains the established string representation; logical kind
+ * exists only query-locally and survives WITH. Conversion is O(N) runtime for
+ * N input bytes, O(N) worst-case compatibility memory, and O(1) retained
+ * memory because every result fits cypher_value_t.inline_text. */
+static void cypher_value_apply_numeric_bool_cast(const char *function, cypher_value_t *value) {
+    if (!function || !value || value->is_null) {
+        return;
+    }
+    cypher_value_kind_t input_kind = value->kind;
+    if (strcmp(function, "toBoolean") == 0) {
+        const char *boolean_text = NULL;
+        if (input_kind == CYP_VALUE_BOOLEAN || input_kind == CYP_VALUE_STRING) {
+            if (value->length == sizeof("true") - SKIP_ONE &&
+                strncasecmp(value->data, "true", value->length) == 0) {
+                boolean_text = "true";
+            } else if (value->length == sizeof("false") - SKIP_ONE &&
+                       strncasecmp(value->data, "false", value->length) == 0) {
+                boolean_text = "false";
             }
-            v = (long long)d;
+        } else if (input_kind == CYP_VALUE_INTEGER) {
+            yyjson_val number = {0};
+            int64_t integer = 0;
+            if (cypher_value_parse_number(value, YYJSON_READ_BIGNUM_AS_RAW, &number) &&
+                cypher_number_to_int64(&number, &integer)) {
+                boolean_text = integer == 0 ? "false" : "true";
+            }
         }
-        snprintf(buf, buf_sz, "%lld", v);
-        return buf;
+        cypher_value_free(value);
+        cypher_value_set_cstr(value, boolean_text ? boolean_text : "", boolean_text == NULL);
+        if (boolean_text) {
+            value->kind = CYP_VALUE_BOOLEAN;
+        }
+        return;
     }
-    if (strcmp(func, "toFloat") == 0) {
-        char *end = NULL;
-        double d = strtod(val, &end);
-        if (end == val) {
-            return ""; /* non-numeric → null */
+
+    if (strcmp(function, "toInteger") == 0) {
+        int64_t integer = 0;
+        bool converted = false;
+        if (input_kind == CYP_VALUE_BOOLEAN) {
+            bool is_true = value->length == sizeof("true") - SKIP_ONE &&
+                           strncasecmp(value->data, "true", value->length) == 0;
+            bool is_false = value->length == sizeof("false") - SKIP_ONE &&
+                            strncasecmp(value->data, "false", value->length) == 0;
+            converted = is_true || is_false;
+            integer = is_true ? 1 : 0;
+        } else if (input_kind == CYP_VALUE_INTEGER || input_kind == CYP_VALUE_STRING ||
+                   input_kind == CYP_VALUE_FLOAT) {
+            yyjson_val number = {0};
+            converted = cypher_value_parse_number(value, YYJSON_READ_BIGNUM_AS_RAW, &number) &&
+                        cypher_number_to_int64(&number, &integer);
         }
-        snprintf(buf, buf_sz, "%g", d);
-        return buf;
+        cypher_value_free(value);
+        if (!converted) {
+            cypher_value_set_cstr(value, "", true);
+        } else {
+            cypher_value_set_int64(value, integer);
+        }
+        return;
     }
-    if (strcmp(func, "toBoolean") == 0) {
-        if (cyp_ci_eq(val, "true")) {
-            return "true";
+
+    if (strcmp(function, "toFloat") == 0) {
+        yyjson_val number = {0};
+        bool converted =
+            (input_kind == CYP_VALUE_INTEGER || input_kind == CYP_VALUE_FLOAT ||
+             input_kind == CYP_VALUE_STRING) &&
+            cypher_value_parse_number(value, YYJSON_READ_NOFLAG, &number);
+        double floating = converted ? yyjson_get_num(&number) : 0.0;
+        converted = converted && isfinite(floating);
+        cypher_value_free(value);
+        if (!converted) {
+            cypher_value_set_cstr(value, "", true);
+            return;
         }
-        if (cyp_ci_eq(val, "false")) {
-            return "false";
-        }
-        return ""; /* not a boolean → null */
+        cypher_value_set_double(value, floating);
     }
-    if (strcmp(func, "size") == 0 || strcmp(func, "length") == 0) {
-        snprintf(buf, buf_sz, "%zu", strlen(val));
-        return buf;
-    }
-    if (strcmp(func, "trim") == 0 || strcmp(func, "ltrim") == 0 || strcmp(func, "rtrim") == 0) {
-        bool do_left = (strcmp(func, "trim") == 0 || strcmp(func, "ltrim") == 0);
-        bool do_right = (strcmp(func, "trim") == 0 || strcmp(func, "rtrim") == 0);
-        const char *start = val;
-        const char *end = val + strlen(val);
-        while (do_left && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) {
-            start++;
-        }
-        while (do_right && end > start &&
-               (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) {
-            end--;
-        }
-        size_t n = (size_t)(end - start);
-        if (n >= buf_sz) {
-            n = buf_sz - SKIP_ONE;
-        }
-        memcpy(buf, start, n);
-        buf[n] = '\0';
-        return buf;
-    }
-    if (strcmp(func, "reverse") == 0) {
-        size_t len = strlen(val);
-        if (len >= buf_sz) {
-            len = buf_sz - SKIP_ONE;
-        }
-        for (size_t i = 0; i < len; i++) {
-            buf[i] = val[len - SKIP_ONE - i];
-        }
-        buf[len] = '\0';
-        return buf;
-    }
-    return val;
 }
 
 /* ── CASE expression evaluation ───────────────────────────────── */
@@ -3777,18 +4991,32 @@ static bool label_alt_matches(const char *actual, const char *pat) {
     return false;
 }
 
+static bool cypher_record_store_failure(cbm_store_t *store, const char *operation) {
+    g_cypher_store_failed = true;
+    snprintf(g_cypher_store_error, sizeof(g_cypher_store_error), "%s: %s", operation,
+             cbm_store_error(store) ? cbm_store_error(store) : "store error");
+    return false;
+}
+
 /* Seed nodes for a label alternation "A|B|C": union the per-label results.
  * Node-struct fields are moved (shallow) into out_nodes; each per-label array
- * container is freed. */
-static void scan_alternation_labels(cbm_store_t *store, const char *project, const char *labels,
+ * container is freed. Geometric capacity makes total relocation work O(N)
+ * for N returned nodes and retains O(N) node structs. Any failure releases
+ * both the accumulated and current per-label ownership sets. */
+static bool scan_alternation_labels(cbm_store_t *store, const char *project, const char *labels,
                                     int candidate_limit, cypher_node_scan_mode_t scan_mode,
                                     cbm_node_t **out_nodes, int *out_count) {
+    if (!store || !project || !labels || !out_nodes || !out_count) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
     *out_nodes = NULL;
     *out_count = 0;
     int cap = 0;
     char *copy = heap_strdup(labels);
     if (!copy) {
-        return;
+        g_cypher_allocation_failed = true;
+        return false;
     }
     char *save = NULL;
     for (char *tok = strtok_r(copy, "|", &save); tok; tok = strtok_r(NULL, "|", &save)) {
@@ -3798,16 +5026,64 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
         }
         cbm_node_t *part = NULL;
         int pc = 0;
+        int rc = CBM_STORE_OK;
         if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-            cbm_store_find_nodes_by_label_overlay_view_limited(store, project, tok, remaining,
-                                                               &part, &pc);
+            rc = cbm_store_find_nodes_by_label_overlay_view_limited(store, project, tok, remaining,
+                                                                    &part, &pc);
         } else {
-            cbm_store_find_nodes_by_label_limited(store, project, tok, remaining, &part, &pc);
+            rc = cbm_store_find_nodes_by_label_limited(store, project, tok, remaining, &part, &pc);
+        }
+        if (rc != CBM_STORE_OK || pc < 0) {
+            cbm_store_free_nodes(part, pc > 0 ? pc : 0);
+            cbm_store_free_nodes(*out_nodes, *out_count);
+            *out_nodes = NULL;
+            *out_count = 0;
+            free(copy);
+            return cypher_record_store_failure(store, "label alternation scan failed");
+        }
+        if (pc > 0 && !part) {
+            cbm_store_free_nodes(*out_nodes, *out_count);
+            *out_nodes = NULL;
+            *out_count = 0;
+            g_cypher_allocation_failed = true;
+            free(copy);
+            return false;
         }
         if (pc > 0 && part) {
-            if (*out_count + pc > cap) {
-                cap = (*out_count + pc) * PAIR_LEN;
-                *out_nodes = safe_realloc(*out_nodes, (size_t)cap * sizeof(cbm_node_t));
+            if (*out_count > INT_MAX - pc) {
+                cbm_store_free_nodes(part, pc);
+                cbm_store_free_nodes(*out_nodes, *out_count);
+                *out_nodes = NULL;
+                *out_count = 0;
+                g_cypher_allocation_failed = true;
+                free(copy);
+                return false;
+            }
+            int required = *out_count + pc;
+            if (required > cap) {
+                int next_cap = cypher_geometric_capacity(cap, required);
+                if ((size_t)next_cap > SIZE_MAX / sizeof(cbm_node_t) ||
+                    cypher_label_alt_growth_should_fail()) {
+                    cbm_store_free_nodes(part, pc);
+                    cbm_store_free_nodes(*out_nodes, *out_count);
+                    *out_nodes = NULL;
+                    *out_count = 0;
+                    g_cypher_allocation_failed = true;
+                    free(copy);
+                    return false;
+                }
+                cbm_node_t *grown = realloc(*out_nodes, (size_t)next_cap * sizeof(cbm_node_t));
+                if (!grown) {
+                    cbm_store_free_nodes(part, pc);
+                    cbm_store_free_nodes(*out_nodes, *out_count);
+                    *out_nodes = NULL;
+                    *out_count = 0;
+                    g_cypher_allocation_failed = true;
+                    free(copy);
+                    return false;
+                }
+                *out_nodes = grown;
+                cap = next_cap;
             }
             memcpy(*out_nodes + *out_count, part, (size_t)pc * sizeof(cbm_node_t));
             *out_count += pc;
@@ -3815,6 +5091,7 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
         free(part); /* container only — node fields moved to out_nodes */
     }
     free(copy);
+    return true;
 }
 
 static const char *condition_file_contains_value(const cbm_condition_t *cond,
@@ -3871,25 +5148,40 @@ static const char *where_file_contains_conjunct(const cbm_where_clause_t *where,
     return value;
 }
 
-static void scan_pattern_nodes(cbm_store_t *store, const char *project, int candidate_limit,
+static bool scan_pattern_nodes(cbm_store_t *store, const char *project, int candidate_limit,
                                int working_row_budget, cbm_node_pattern_t *first,
                                const cbm_where_clause_t *where, const char *variable,
                                cypher_node_scan_mode_t scan_mode, cbm_node_t **out_nodes,
                                int *out_count) {
     if (first->label && strchr(first->label, '|')) {
-        scan_alternation_labels(store, project, first->label, candidate_limit, scan_mode, out_nodes,
-                                out_count);
+        if (!scan_alternation_labels(store, project, first->label, candidate_limit, scan_mode,
+                                     out_nodes, out_count)) {
+            return false;
+        }
     } else if (first->label) {
+        int rc = CBM_STORE_OK;
         if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-            cbm_store_find_nodes_by_label_overlay_view_limited(
+            rc = cbm_store_find_nodes_by_label_overlay_view_limited(
                 store, project, first->label, candidate_limit, out_nodes, out_count);
         } else {
-            cbm_store_find_nodes_by_label_limited(store, project, first->label, candidate_limit,
-                                                  out_nodes, out_count);
+            rc = cbm_store_find_nodes_by_label_limited(store, project, first->label,
+                                                       candidate_limit, out_nodes, out_count);
+        }
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_nodes(*out_nodes, *out_count);
+            *out_nodes = NULL;
+            *out_count = 0;
+            return cypher_record_store_failure(store, "label scan failed");
         }
     } else if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-        cbm_store_find_nodes_by_label_overlay_view_limited(store, project, NULL, candidate_limit,
-                                                           out_nodes, out_count);
+        int rc = cbm_store_find_nodes_by_label_overlay_view_limited(
+            store, project, NULL, candidate_limit, out_nodes, out_count);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_nodes(*out_nodes, *out_count);
+            *out_nodes = NULL;
+            *out_count = 0;
+            return cypher_record_store_failure(store, "active-node scan failed");
+        }
     } else {
         const char *file_contains = where_file_contains_conjunct(where, variable);
         cbm_search_params_t params = {.project = project,
@@ -3898,11 +5190,23 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int cand
                                       .max_degree = CYP_FOUND_NONE,
                                       .limit = candidate_limit};
         cbm_search_output_t sout = {0};
-        cbm_store_search(store, &params, &sout);
-        *out_count = sout.count;
-        *out_nodes = malloc(sout.count * sizeof(cbm_node_t));
+        if (cbm_store_search(store, &params, &sout) != CBM_STORE_OK) {
+            cbm_store_search_free(&sout);
+            return cypher_record_store_failure(store, "node scan failed");
+        }
+        if (sout.count < 0 || (size_t)sout.count > SIZE_MAX / sizeof(cbm_node_t)) {
+            cbm_store_search_free(&sout);
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+        cbm_node_t *nodes = sout.count > 0 ? malloc((size_t)sout.count * sizeof(*nodes)) : NULL;
+        if (sout.count > 0 && !nodes) {
+            cbm_store_search_free(&sout);
+            g_cypher_allocation_failed = true;
+            return false;
+        }
         for (int i = 0; i < sout.count; i++) {
-            (*out_nodes)[i] = sout.results[i].node;
+            nodes[i] = sout.results[i].node;
             sout.results[i].node.name = NULL;
             sout.results[i].node.project = NULL;
             sout.results[i].node.label = NULL;
@@ -3910,6 +5214,8 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int cand
             sout.results[i].node.file_path = NULL;
             sout.results[i].node.properties_json = NULL;
         }
+        *out_nodes = nodes;
+        *out_count = sout.count;
         cbm_store_search_free(&sout);
     }
     if (working_row_budget > 0 && *out_count > working_row_budget) {
@@ -3930,6 +5236,7 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int cand
         }
         *out_count = kept;
     }
+    return true;
 }
 
 /* ── Expand one pattern's relationships on a set of bindings ──── */
@@ -3948,6 +5255,14 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
      * the result of dead-code queries and produced wrong rows (#627). */
     cbm_node_t *bound_to = binding_get(b, to_var);
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
+    /* The budget caps MATERIALISATION, not detection: `match_count` must stay
+     * truthful even after `new_count` hits `max_new`. Gating the loop itself
+     * (`ei < edge_count && *new_count < max_new`) stopped fetching entirely, so
+     * a saturated source reported `match_count == 0` despite having neighbours —
+     * and the OPTIONAL fallback in expand_pattern_rels then emitted an unbound
+     * "no match" row for it. `WHERE x IS NULL` reads those rows as "nothing
+     * points here", i.e. it reported live code as dead. Losing rows is
+     * recoverable; asserting a match does not exist when it does is not. */
     for (int ei = 0; ei < edge_count; ei++) {
         /* An undirected self-loop has only one orientation. The inbound half
          * of an ANY-direction lookup must not emit the same relationship twice. */
@@ -3981,10 +5296,10 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             binding_free(&nb);
             continue;
         }
+        (*match_count)++; /* a real matching neighbour exists, budget or not */
         if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
             return;
         }
-        (*match_count)++;
     }
 }
 
@@ -3999,6 +5314,9 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
                                   ? bound_to->qualified_name
                                   : NULL;
     int64_t bound_to_id = bound_to ? bound_to->id : 0;
+    /* Keep match detection in the required O(row_count) scan with O(1)
+     * auxiliary memory: materialisation may stop at max_new, but qualifying a
+     * row must still make OPTIONAL aware that a match exists. */
     for (int ri = 0; ri < row_count; ri++) {
         cbm_node_t *found = &rows[ri].node;
         if (bound_to_qn) {
@@ -4024,10 +5342,10 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
             binding_free(&nb);
             continue;
         }
+        (*match_count)++; /* qualifying match exists even if the row budget is full */
         if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
             return;
         }
-        (*match_count)++;
     }
 }
 
@@ -4096,10 +5414,13 @@ static void expand_var_length(cbm_store_t *store, cbm_store_trail_graph_t *trail
             binding_free(&nb);
             continue;
         }
+        /* Counting during the existing O(visited_count) result scan adds O(1)
+         * work and memory per candidate while keeping OPTIONAL truth separate
+         * from the bounded materialised-row array. */
+        (*match_count)++;
         if (!binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
             break;
         }
-        (*match_count)++;
     }
     cbm_store_traverse_free(&tr);
 }
@@ -4492,6 +5813,10 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         cbm_store_trail_graph_t *canonical_trails = NULL;
         cbm_store_trail_graph_t *overlay_trails = NULL;
 
+        /* Start at O(min(bind_count, max_new)) slots and grow geometrically.
+         * This preserves O(output_rows) memory and amortized O(1) append work;
+         * preallocating max_new + bind_count for every hop increases peak
+         * memory and duplicates binding_array_append's checked ownership path. */
         int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
         if (new_capacity > max_new) {
             new_capacity = max_new;
@@ -4551,7 +5876,10 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                                     candidate_where);
             }
 
-            /* OPTIONAL MATCH: keep binding with empty target if no matches */
+            /* OPTIONAL MATCH: no qualifying relationship exists for this source,
+             * so keep one null-extended binding. The shared checked append path
+             * grows geometrically and turns budget/OOM failures into query errors;
+             * it never returns a silently shortened result. */
             if (is_optional && match_count == 0) {
                 binding_t nb = {0};
                 binding_copy(&nb, b);
@@ -4632,13 +5960,21 @@ static int rb_compare_ordered_rows(const char **a, const char **b, const int *co
     return 0;
 }
 
+/* Stable merge sort over R rows and K keys: O(K * R log R) worst-case
+ * comparisons, O(K * R) numeric classification, and O(R + K) scratch. */
 static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *ret) {
     if (ret->order_count <= 0 || rb->row_count < PAIR_LEN) {
         return;
     }
-    int columns[CBM_SZ_32];
-    bool numeric[CBM_SZ_32];
-    bool descending[CBM_SZ_32];
+    int *columns = cypher_calloc_elements(ret->order_count, sizeof(*columns));
+    bool *numeric = cypher_calloc_elements(ret->order_count, sizeof(*numeric));
+    bool *descending = cypher_calloc_elements(ret->order_count, sizeof(*descending));
+    if (!columns || !numeric || !descending) {
+        free(columns);
+        free(numeric);
+        free(descending);
+        return;
+    }
     int key_count = 0;
     for (int i = 0; i < ret->order_count; i++) {
         int col = rb_find_order_column(rb, ret, ret->order_items[i].expression);
@@ -4652,11 +5988,17 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
         key_count++;
     }
     if (key_count == 0) {
+        free(columns);
+        free(numeric);
+        free(descending);
         return;
     }
 
-    const char ***scratch = malloc((size_t)rb->row_count * sizeof(*scratch));
+    const char ***scratch = cypher_calloc_elements(rb->row_count, sizeof(*scratch));
     if (!scratch) {
+        free(columns);
+        free(numeric);
+        free(descending);
         return;
     }
     const char ***src = rb->rows;
@@ -4696,6 +6038,9 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
         memcpy(rb->rows, src, (size_t)rb->row_count * sizeof(*rb->rows));
     }
     free(scratch);
+    free(columns);
+    free(numeric);
+    free(descending);
 }
 
 static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
@@ -4730,37 +6075,95 @@ static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
     }
 }
 
-static void rb_apply_distinct(result_builder_t *rb) {
+/* Stable first-seen row DISTINCT. Length-prefixed column values make the hash
+ * key injective without delimiter assumptions. Classifying all R rows before
+ * mutating owners makes allocation failure atomic. For total projected bytes
+ * B and unique encoded bytes U, expected runtime is O(B), temporary memory is
+ * O(U + R), and final row compaction is O(R). */
+static bool rb_apply_distinct(result_builder_t *rb) {
+    if (!rb || rb->row_count < 0 || rb->col_count < 0 || (rb->row_count > 0 && !rb->rows)) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
     if (rb->row_count <= SKIP_ONE) {
-        return;
+        return true;
     }
-    int kept = SKIP_ONE;
-    for (int i = SKIP_ONE; i < rb->row_count; i++) {
-        bool dup = false;
-        for (int j = 0; j < kept && !dup; j++) {
-            bool same = true;
-            for (int c = 0; c < rb->col_count && same; c++) {
-                if (strcmp(rb->rows[i][c], rb->rows[j][c]) != 0) {
-                    same = false;
-                }
-            }
-            if (same) {
-                dup = true;
-            }
+
+    int original_row_count = rb->row_count;
+    CBMHashTable *seen = cbm_ht_create(0);
+    bool *duplicates = cypher_calloc_elements(original_row_count, sizeof(*duplicates));
+    char **owned_keys = cypher_calloc_elements(original_row_count, sizeof(*owned_keys));
+    cypher_string_builder_t key = {0};
+    bool complete = seen && duplicates && owned_keys && cypher_string_builder_reset(&key);
+    for (int row_index = 0; complete && row_index < original_row_count; row_index++) {
+        const char **row = rb->rows[row_index];
+        if (!row) {
+            complete = false;
+            break;
         }
-        if (!dup) {
-            if (kept != i) {
-                rb->rows[kept] = rb->rows[i];
+        complete = cypher_string_builder_reset(&key);
+        for (int column = 0; complete && column < rb->col_count; column++) {
+            if (!row[column]) {
+                complete = false;
+                break;
             }
-            kept++;
-        } else {
-            for (int c = 0; c < rb->col_count; c++) {
-                safe_str_free(&rb->rows[i][c]);
-            }
-            free(rb->rows[i]);
+            cypher_value_t value;
+            cypher_value_set_cstr(&value, row[column], false);
+            complete = group_key_append_value(&key, NULL, NULL, false, &value);
+        }
+        if (!complete) {
+            break;
+        }
+        if (g_cypher_track_row_distinct_probes) {
+            g_cypher_row_distinct_probes++;
+        }
+        if (cbm_ht_has(seen, key.data)) {
+            duplicates[row_index] = true;
+            continue;
+        }
+        owned_keys[row_index] =
+            row_distinct_key_copy_should_fail() ? NULL : malloc(key.length + SKIP_ONE);
+        if (!owned_keys[row_index]) {
+            complete = false;
+            break;
+        }
+        memcpy(owned_keys[row_index], key.data, key.length + SKIP_ONE);
+        (void)cbm_ht_set(seen, owned_keys[row_index], (void *)(uintptr_t)SKIP_ONE);
+        if (g_cypher_track_row_distinct_probes) {
+            g_cypher_row_distinct_probes++;
+        }
+        if (!cbm_ht_has(seen, owned_keys[row_index])) {
+            complete = false;
+            break;
         }
     }
-    rb->row_count = kept;
+
+    if (complete) {
+        int kept = 0;
+        for (int row_index = 0; row_index < original_row_count; row_index++) {
+            const char **row = rb->rows[row_index];
+            if (!duplicates[row_index]) {
+                rb->rows[kept++] = row;
+                continue;
+            }
+            for (int column = 0; column < rb->col_count; column++) {
+                safe_str_free(&row[column]);
+            }
+            free(row);
+        }
+        rb->row_count = kept;
+    } else {
+        g_cypher_allocation_failed = true;
+    }
+
+    cbm_ht_free(seen);
+    for (int row_index = 0; owned_keys && row_index < original_row_count; row_index++) {
+        free(owned_keys[row_index]);
+    }
+    cypher_string_builder_free(&key);
+    free(owned_keys);
+    free(duplicates);
+    return complete;
 }
 
 static void rb_free(result_builder_t *rb) {
@@ -4779,204 +6182,320 @@ static void rb_free(result_builder_t *rb) {
 
 /* ── Get projection value for a binding + return item ─────────── */
 
-/* Build a JSON list of a node's non-null property keys: keys(n). */
-static const char *node_keys_list(const cbm_node_t *n, char *buf, size_t buf_sz) {
+static bool cypher_keys_append(cypher_string_builder_t *builder, CBMHashTable *seen,
+                               const char *key, size_t key_length, bool *first) {
+    if (seen) {
+        if (cbm_ht_has(seen, key)) {
+            return true;
+        }
+        (void)cbm_ht_set(seen, key, (void *)(uintptr_t)SKIP_ONE);
+        if (!cbm_ht_has(seen, key)) {
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+    }
+    if ((!*first && !cypher_string_builder_append(builder, ",", sizeof(",") - SKIP_ONE)) ||
+        !cypher_string_builder_append_json_string(builder, key, key_length)) {
+        return false;
+    }
+    *first = false;
+    return true;
+}
+
+/* Build an exact JSON list of a node's non-null canonical and dynamic property
+ * keys. yyjson decodes each stored key once; the shared expected-O(1) hash
+ * table removes canonical/dynamic or duplicate-JSON collisions without a
+ * quadratic scan. For JSON bytes J, serialized key bytes K, and distinct key
+ * bytes P, runtime is O(J + K) expected and peak memory is O(J + K + P).
+ * The common empty-object case skips both the JSON document and hash table,
+ * retaining only the O(K) exact result builder. */
+static bool node_keys_value(const cbm_node_t *node, cypher_value_t *value) {
+    cypher_value_set_cstr(value, "[]", false);
+    value->kind = CYP_VALUE_COMPOSITE;
+    if (!node) {
+        return true;
+    }
     const struct {
-        const char *k;
+        const char *key;
         bool present;
-    } ks[] = {
-        {"name", n->name && n->name[0]},
-        {"qualified_name", n->qualified_name && n->qualified_name[0]},
-        {"label", n->label && n->label[0]},
-        {"file_path", n->file_path && n->file_path[0]},
-        {"start_line", n->start_line > 0},
-        {"end_line", n->end_line > 0},
+    } core_keys[] = {
+        {"name", node->name && node->name[0]},
+        {"qualified_name", node->qualified_name && node->qualified_name[0]},
+        {"label", node->label && node->label[0]},
+        {"file_path", node->file_path && node->file_path[0]},
+        {"start_line", node->start_line > 0},
+        {"end_line", node->end_line > 0},
     };
-    size_t pos = 0;
-    bool first = true;
-    if (pos < buf_sz - SKIP_ONE) {
-        buf[pos++] = '[';
-    }
-    for (size_t i = 0; i < sizeof(ks) / sizeof(ks[0]) && pos < buf_sz - SKIP_ONE; i++) {
-        if (!ks[i].present) {
-            continue;
-        }
-        int w = snprintf(buf + pos, buf_sz - pos, "%s\"%s\"", first ? "" : ",", ks[i].k);
-        if (w < 0 || (size_t)w >= buf_sz - pos) {
-            break;
-        }
-        pos += (size_t)w;
-        first = false;
-    }
-    if (pos < buf_sz - SKIP_ONE) {
-        buf[pos++] = ']';
-    }
-    buf[pos] = '\0';
-    return buf;
-}
-
-/* Resolve a function argument to its string value (literal or var.prop). */
-static const char *eval_func_arg_ex(binding_t *b, const cbm_func_arg_t *a, bool *is_null) {
-    if (a->literal) {
-        *is_null = false;
-        return a->literal;
-    }
-    return binding_get_virtual_ex(b, a->variable, a->property, is_null);
-}
-
-static const char *eval_func_arg(binding_t *b, const cbm_func_arg_t *a) {
-    bool is_null = true;
-    return eval_func_arg_ex(b, a, &is_null);
-}
-
-/* Evaluate a multi-argument scalar function into func_buf (or a direct value). */
-static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *item, char *buf,
-                                      size_t bufsz, bool *is_null) {
-    if (is_null) {
-        *is_null = false;
-    }
-    const char *f = item->func;
-    int n = item->arg_count;
-    if (strcmp(f, "coalesce") == 0) {
-        for (int i = 0; i < n; i++) {
-            bool arg_is_null = true;
-            const char *v = eval_func_arg_ex(b, &item->args[i], &arg_is_null);
-            if (!arg_is_null) {
-                return v;
-            }
-        }
-        if (is_null) {
-            *is_null = true;
-        }
-        return "";
-    }
-    if (strcmp(f, "substring") == 0 && n >= 2) {
-        const char *s = eval_func_arg(b, &item->args[0]);
-        long start = strtol(eval_func_arg(b, &item->args[1]), NULL, CBM_DECIMAL_BASE);
-        size_t slen = strlen(s);
-        if (start < 0 || (size_t)start >= slen) {
-            return "";
-        }
-        size_t take = slen - (size_t)start;
-        if (n >= 3) {
-            long len = strtol(eval_func_arg(b, &item->args[2]), NULL, CBM_DECIMAL_BASE);
-            if (len < 0) {
-                len = 0;
-            }
-            if ((size_t)len < take) {
-                take = (size_t)len;
-            }
-        }
-        if (take >= bufsz) {
-            take = bufsz - SKIP_ONE;
-        }
-        memcpy(buf, s + start, take);
-        buf[take] = '\0';
-        return buf;
-    }
-    if ((strcmp(f, "left") == 0 || strcmp(f, "right") == 0) && n >= 2) {
-        const char *s = eval_func_arg(b, &item->args[0]);
-        long k = strtol(eval_func_arg(b, &item->args[1]), NULL, CBM_DECIMAL_BASE);
-        if (k < 0) {
-            k = 0;
-        }
-        size_t slen = strlen(s);
-        size_t take = (size_t)k < slen ? (size_t)k : slen;
-        if (take >= bufsz) {
-            take = bufsz - SKIP_ONE;
-        }
-        memcpy(buf, (strcmp(f, "left") == 0) ? s : s + (slen - take), take);
-        buf[take] = '\0';
-        return buf;
-    }
-    if (strcmp(f, "replace") == 0 && n >= 3) {
-        const char *s = eval_func_arg(b, &item->args[0]);
-        const char *from = eval_func_arg(b, &item->args[1]);
-        const char *to = eval_func_arg(b, &item->args[2]);
-        size_t fromlen = strlen(from);
-        size_t tolen = strlen(to);
-        size_t pos = 0;
-        const char *pp = s;
-        if (fromlen == 0) {
-            snprintf(buf, bufsz, "%s", s);
-            return buf;
-        }
-        while (*pp && pos < bufsz - SKIP_ONE) {
-            if (strncmp(pp, from, fromlen) == 0) {
-                size_t cpy = tolen;
-                if (pos + cpy >= bufsz) {
-                    cpy = bufsz - SKIP_ONE - pos;
-                }
-                memcpy(buf + pos, to, cpy);
-                pos += cpy;
-                pp += fromlen;
+    yyjson_doc *document = NULL;
+    const char *json = node->properties_json;
+    bool complete = true;
+    if (json && json[0] && !cypher_json_is_empty_object(json)) {
+        yyjson_read_err error = {0};
+        document = yyjson_read_opts((char *)json, strlen(json), 0, NULL, &error);
+        if (!document) {
+            if (error.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION) {
+                g_cypher_allocation_failed = true;
             } else {
-                buf[pos++] = *pp++;
+                g_cypher_store_failed = true;
+                snprintf(g_cypher_store_error, sizeof(g_cypher_store_error),
+                         "node %lld has invalid properties JSON at byte %zu", (long long)node->id,
+                         error.pos);
+            }
+            complete = false;
+        }
+    }
+    yyjson_val *object = document ? yyjson_doc_get_root(document) : NULL;
+    if (complete && document && !yyjson_is_obj(object)) {
+        g_cypher_store_failed = true;
+        snprintf(g_cypher_store_error, sizeof(g_cypher_store_error),
+                 "node %lld properties JSON is not an object", (long long)node->id);
+        complete = false;
+    }
+    cypher_string_builder_t builder = {0};
+    CBMHashTable *seen = complete && document ? cbm_ht_create(0) : NULL;
+    complete = complete && (!document || seen) && cypher_string_builder_reset(&builder) &&
+               cypher_string_builder_append(&builder, "[", sizeof("[") - SKIP_ONE);
+    bool first = true;
+    for (size_t i = 0; complete && i < sizeof(core_keys) / sizeof(core_keys[0]); i++) {
+        if (core_keys[i].present) {
+            complete = cypher_keys_append(&builder, seen, core_keys[i].key,
+                                          strlen(core_keys[i].key), &first);
+        }
+    }
+    if (complete && object) {
+        size_t index = 0;
+        size_t maximum = 0;
+        yyjson_val *key = NULL;
+        yyjson_val *member = NULL;
+        yyjson_obj_foreach(object, index, maximum, key, member) {
+            if (yyjson_is_null(member)) {
+                continue;
+            }
+            const char *key_text = yyjson_get_str(key);
+            size_t key_length = yyjson_get_len(key);
+            if (!key_text || strlen(key_text) != key_length) {
+                g_cypher_store_failed = true;
+                snprintf(g_cypher_store_error, sizeof(g_cypher_store_error),
+                         "node %lld has a property key containing NUL", (long long)node->id);
+                complete = false;
+                break;
+            }
+            if (!cypher_keys_append(&builder, seen, key_text, key_length, &first)) {
+                complete = false;
+                break;
             }
         }
-        buf[pos] = '\0';
-        return buf;
     }
-    return ""; /* wrong arity → null */
+    if (complete) {
+        complete = cypher_string_builder_append(&builder, "]", sizeof("]") - SKIP_ONE);
+    }
+    cbm_ht_free(seen);
+    yyjson_doc_free(document);
+    if (!complete) {
+        if (!g_cypher_store_failed) {
+            g_cypher_allocation_failed = true;
+        }
+        cypher_string_builder_free(&builder);
+        return false;
+    }
+    memset(value, 0, sizeof(*value));
+    value->data = builder.data;
+    value->length = builder.length;
+    value->owned = builder.data;
+    value->kind = CYP_VALUE_COMPOSITE;
+    builder.data = NULL;
+    cypher_string_builder_free(&builder);
+    return true;
+}
+
+/* Serialize a zero- or one-element JSON string list without a semantic size
+ * cap. Runtime and retained memory are O(N) for N input bytes; the geometric
+ * builder owns the only output allocation and transfers it atomically. */
+static bool cypher_value_set_single_json_string_list(const char *text, cypher_value_t *value) {
+    cypher_value_set_cstr(value, "[]", false);
+    value->kind = CYP_VALUE_COMPOSITE;
+    if (!text) {
+        return true;
+    }
+    cypher_string_builder_t builder = {0};
+    bool complete = cypher_string_builder_reset(&builder) &&
+                    cypher_string_builder_append(&builder, "[", sizeof("[") - SKIP_ONE) &&
+                    cypher_string_builder_append_json_string(&builder, text, strlen(text)) &&
+                    cypher_string_builder_append(&builder, "]", sizeof("]") - SKIP_ONE);
+    if (!complete) {
+        g_cypher_allocation_failed = true;
+        cypher_string_builder_free(&builder);
+        return false;
+    }
+    memset(value, 0, sizeof(*value));
+    value->data = builder.data;
+    value->length = builder.length;
+    value->owned = builder.data;
+    value->kind = CYP_VALUE_COMPOSITE;
+    builder.data = NULL;
+    cypher_string_builder_free(&builder);
+    return true;
+}
+
+/* Resolve one literal or var.property argument without a compatibility buffer. */
+static void eval_func_arg_value(binding_t *binding, const cbm_func_arg_t *argument,
+                                cypher_value_t *value) {
+    if (argument->literal) {
+        cypher_value_set_cstr(value, argument->literal, false);
+    } else {
+        binding_get_virtual_value(binding, argument->variable, argument->property, value);
+    }
+}
+
+/* strtol() requires a NUL-terminated input. Materialize only the numeric
+ * argument being parsed, then release it immediately. */
+static long eval_func_arg_long(binding_t *binding, const cbm_func_arg_t *argument) {
+    cypher_value_t value;
+    eval_func_arg_value(binding, argument, &value);
+    if (!cypher_value_own(&value)) {
+        cypher_value_free(&value);
+        return 0;
+    }
+    long result = strtol(value.data, NULL, CBM_DECIMAL_BASE);
+    cypher_value_free(&value);
+    return result;
+}
+
+static size_t cypher_nonnegative_long_clamp(long value, size_t maximum) {
+    if (value <= 0) {
+        return 0;
+    }
+    return (uintmax_t)value >= (uintmax_t)maximum ? maximum : (size_t)value;
+}
+
+/* Evaluate the accepted multi-argument scalar functions into one exact value.
+ * substring/left/right retain O(1) slice state over their source. replace uses
+ * shared KMP matching, so source S, pattern P, and output O cost O(S + P + O)
+ * runtime, O(P + O) peak auxiliary/result memory, and no semantic byte cap.
+ * Allocation failure sets the query-wide failure state and publishes no row. */
+static void eval_multiarg_value(binding_t *binding, const cbm_return_item_t *item,
+                                cypher_value_t *value) {
+    cypher_value_set_cstr(value, "", false);
+    const char *function = item->func;
+    int argument_count = item->arg_count;
+    if (strcmp(function, "coalesce") == 0) {
+        for (int i = 0; i < argument_count; i++) {
+            eval_func_arg_value(binding, &item->args[i], value);
+            if (!value->is_null) {
+                return;
+            }
+            cypher_value_free(value);
+        }
+        cypher_value_set_cstr(value, "", true);
+        return;
+    }
+    if (strcmp(function, "substring") == 0 && argument_count >= 2) {
+        eval_func_arg_value(binding, &item->args[0], value);
+        value->is_null = false; /* preserve the established scalar null behavior */
+        long start = eval_func_arg_long(binding, &item->args[1]);
+        if (g_cypher_allocation_failed || start < 0 || (uintmax_t)start >= value->length) {
+            cypher_value_free(value);
+            cypher_value_set_cstr(value, "", false);
+            return;
+        }
+        size_t offset = (size_t)start;
+        size_t take = value->length - offset;
+        if (argument_count >= 3) {
+            take = cypher_nonnegative_long_clamp(eval_func_arg_long(binding, &item->args[2]), take);
+        }
+        value->data += offset;
+        value->length = take;
+        return;
+    }
+    if ((strcmp(function, "left") == 0 || strcmp(function, "right") == 0) && argument_count >= 2) {
+        eval_func_arg_value(binding, &item->args[0], value);
+        value->is_null = false;
+        size_t take = cypher_nonnegative_long_clamp(eval_func_arg_long(binding, &item->args[1]),
+                                                    value->length);
+        if (strcmp(function, "right") == 0) {
+            value->data += value->length - take;
+        }
+        value->length = take;
+        return;
+    }
+    if (strcmp(function, "replace") == 0 && argument_count >= 3) {
+        cypher_value_t source;
+        cypher_value_t pattern;
+        cypher_value_t replacement;
+        eval_func_arg_value(binding, &item->args[0], &source);
+        eval_func_arg_value(binding, &item->args[1], &pattern);
+        eval_func_arg_value(binding, &item->args[2], &replacement);
+        source.is_null = false;
+        pattern.is_null = false;
+        replacement.is_null = false;
+        if (pattern.length == 0 || source.length == 0 || pattern.length > source.length) {
+            cypher_value_move(value, &source);
+            cypher_value_free(&pattern);
+            cypher_value_free(&replacement);
+            return;
+        }
+
+        size_t *prefix = cypher_kmp_prefix_create(pattern.data, pattern.length);
+        cypher_string_builder_t output = {0};
+        bool complete = prefix != NULL;
+        size_t last_emit = 0;
+        for (size_t i = 0, matched = 0; complete && i < source.length; i++) {
+            while (matched > 0 && source.data[i] != pattern.data[matched]) {
+                matched = prefix[matched - SKIP_ONE];
+            }
+            if (source.data[i] == pattern.data[matched]) {
+                matched++;
+            }
+            if (matched == pattern.length) {
+                size_t match_start = i + SKIP_ONE - pattern.length;
+                complete =
+                    (output.data || cypher_string_builder_reset(&output)) &&
+                    cypher_string_builder_append(&output, source.data + last_emit,
+                                                 match_start - last_emit) &&
+                    cypher_string_builder_append(&output, replacement.data, replacement.length);
+                last_emit = i + SKIP_ONE;
+                matched = 0; /* Cypher replace consumes non-overlapping matches. */
+            }
+        }
+        if (complete && last_emit == 0) {
+            free(prefix);
+            cypher_value_move(value, &source);
+            cypher_value_free(&pattern);
+            cypher_value_free(&replacement);
+            return;
+        }
+        if (complete) {
+            complete = cypher_string_builder_append(&output, source.data + last_emit,
+                                                    source.length - last_emit);
+        }
+        free(prefix);
+        cypher_value_free(&source);
+        cypher_value_free(&pattern);
+        cypher_value_free(&replacement);
+        if (complete) {
+            value->owned = output.data;
+            value->data = output.data;
+            value->length = output.length;
+            value->is_null = false;
+            output.data = NULL;
+        }
+        cypher_string_builder_free(&output);
+        return;
+    }
+    /* Preserve the existing wrong-arity/unknown-function empty scalar. */
+    return;
 }
 
 static const char *project_item(binding_t *b, cbm_return_item_t *item, char *func_buf,
                                 size_t buf_sz) {
+    if (!b || !item || !func_buf || buf_sz == 0) {
+        g_cypher_allocation_failed = true;
+        return "";
+    }
     if (item->kase) {
         return eval_case_expr(item->kase, b);
     }
-    if (item->args) {
-        bool is_null = true;
-        return eval_multiarg_func(b, item, func_buf, buf_sz, &is_null);
-    }
-    /* Entity-introspection functions operate on the bound node/edge itself,
-     * not on a scalar property value. */
-    if (item->func) {
-        if (strcmp(item->func, "labels") == 0) {
-            cbm_node_t *n = binding_get(b, item->variable);
-            if (n && n->label) {
-                snprintf(func_buf, buf_sz, "[\"%s\"]", n->label);
-                return func_buf;
-            }
-            return "[]";
-        }
-        if (strcmp(item->func, "type") == 0) {
-            cbm_edge_t *e = binding_get_edge(b, item->variable);
-            return (e && e->type) ? e->type : "";
-        }
-        if (strcmp(item->func, "id") == 0) {
-            cbm_node_t *n = binding_get(b, item->variable);
-            if (n) {
-                snprintf(func_buf, buf_sz, "%lld", (long long)n->id);
-                return func_buf;
-            }
-            cbm_edge_t *e = binding_get_edge(b, item->variable);
-            if (e) {
-                snprintf(func_buf, buf_sz, "%lld", (long long)e->id);
-                return func_buf;
-            }
-            return "";
-        }
-        if (strcmp(item->func, "keys") == 0) {
-            cbm_node_t *n = binding_get(b, item->variable);
-            return n ? node_keys_list(n, func_buf, buf_sz) : "[]";
-        }
-        if (strcmp(item->func, "properties") == 0) {
-            cbm_node_t *n = binding_get(b, item->variable);
-            if (n) {
-                return n->properties_json ? n->properties_json : "{}";
-            }
-            cbm_edge_t *e = binding_get_edge(b, item->variable);
-            if (e) {
-                return e->properties_json ? e->properties_json : "{}";
-            }
-            return "{}";
-        }
-    }
     const char *raw = binding_get_virtual(b, item->variable, item->property);
-    if (is_scalar_value_func(item->func)) {
-        return apply_string_func(item->func, raw, func_buf, buf_sz);
-    }
     /* Copy into the caller's per-column buffer. `raw` may point to node_prop's
      * rotating scratch buffer, which the next column's projection would overwrite
      * before rb_add_row copies the assembled row — aliasing every such column to
@@ -4993,24 +6512,509 @@ static const char *project_item(binding_t *b, cbm_return_item_t *item, char *fun
     return raw ? raw : "";
 }
 
-/* Check if a function name is an aggregate */
-static bool is_aggregate_func(const char *func) {
-    return func &&
-           (strcmp(func, "COUNT") == 0 || strcmp(func, "SUM") == 0 || strcmp(func, "AVG") == 0 ||
-            strcmp(func, "MIN") == 0 || strcmp(func, "MAX") == 0 || strcmp(func, "COLLECT") == 0);
-}
+/* Project exact multi-argument, direct, and string-scalar values. String input
+ * bytes N cost O(N) runtime for case conversion, trimming, and reversal;
+ * size/length and toString are O(1). Trimming retains an O(1) borrowed slice.
+ * Case conversion and reversal own exactly O(N) bytes only when mutation is
+ * required. Returns false only when the item still requires entity or CASE
+ * evaluation. */
+static bool project_item_exact_value(binding_t *binding, cbm_return_item_t *item,
+                                     cypher_value_t *value) {
+    if (item->args) {
+        eval_multiarg_value(binding, item, value);
+        return true;
+    }
+    if (item->func && strcmp(item->func, "labels") == 0) {
+        cbm_node_t *node = binding_get(binding, item->variable);
+        (void)cypher_value_set_single_json_string_list(node ? node->label : NULL, value);
+        return true;
+    }
+    if (item->func && strcmp(item->func, "keys") == 0) {
+        (void)node_keys_value(binding_get(binding, item->variable), value);
+        return true;
+    }
+    if (item->func && strcmp(item->func, "type") == 0) {
+        cbm_edge_t *edge = binding_get_edge(binding, item->variable);
+        cypher_value_set_cstr(value, edge && edge->type ? edge->type : "", edge == NULL);
+        return true;
+    }
+    if (item->func && strcmp(item->func, "id") == 0) {
+        cbm_node_t *node = binding_get(binding, item->variable);
+        cbm_edge_t *edge = node ? NULL : binding_get_edge(binding, item->variable);
+        if (!node && !edge) {
+            cypher_value_set_cstr(value, "", true);
+        } else {
+            cypher_value_set_int64(value, node ? node->id : edge->id);
+        }
+        return true;
+    }
+    if (item->func && strcmp(item->func, "properties") == 0) {
+        cbm_node_t *node = binding_get(binding, item->variable);
+        cbm_edge_t *edge = node ? NULL : binding_get_edge(binding, item->variable);
+        const char *json = node ? node->properties_json : (edge ? edge->properties_json : NULL);
+        cypher_value_set_borrowed_kind(value, json ? json : "{}", strlen(json ? json : "{}"),
+                                       CYP_VALUE_COMPOSITE);
+        return true;
+    }
+    if (is_numeric_bool_value_func(item->func)) {
+        binding_get_virtual_value(binding, item->variable, item->property, value);
+        cypher_value_apply_numeric_bool_cast(item->func, value);
+        return true;
+    }
+    bool direct = !item->func && !item->kase && !item->args;
+    bool exact_string_func = !item->args && is_exact_string_value_func(item->func);
+    if (!direct && !exact_string_func) {
+        return false;
+    }
+    binding_get_virtual_value(binding, item->variable, item->property, value);
+    if (direct) {
+        return true;
+    }
+    if (strcmp(item->func, "toString") == 0) {
+        value->kind = value->is_null ? CYP_VALUE_NULL : CYP_VALUE_STRING;
+        return true;
+    }
+    if (value->is_null &&
+        (strcmp(item->func, "toLower") == 0 || strcmp(item->func, "toUpper") == 0)) {
+        return true;
+    }
 
-/* Append `val` to a string list only if not already present — i.e. maintain a
- * set of distinct values. Used by COUNT(DISTINCT x) (#239). */
-static void distinct_list_add(char ***list, int *count, const char *val) {
-    for (int i = 0; i < *count; i++) {
-        if (strcmp((*list)[i], val) == 0) {
-            return;
+    if (strcmp(item->func, "size") == 0 || strcmp(item->func, "length") == 0) {
+        size_t length = value->length;
+        cypher_value_free(value);
+        int written = snprintf(value->inline_text, sizeof(value->inline_text), "%zu", length);
+        if (written < 0 || (size_t)written >= sizeof(value->inline_text)) {
+            g_cypher_allocation_failed = true;
+            cypher_value_set_cstr(value, "", true);
+            return true;
+        }
+        value->data = value->inline_text;
+        value->length = (size_t)written;
+        value->kind = CYP_VALUE_INTEGER;
+        return true;
+    }
+
+    value->is_null = false; /* preserve established empty-input scalar behavior */
+    value->kind = CYP_VALUE_STRING;
+    if (strcmp(item->func, "trim") == 0 || strcmp(item->func, "ltrim") == 0 ||
+        strcmp(item->func, "rtrim") == 0) {
+        bool trim_left = strcmp(item->func, "rtrim") != 0;
+        bool trim_right = strcmp(item->func, "ltrim") != 0;
+        size_t begin = 0;
+        size_t end = value->length;
+        while (trim_left && begin < end &&
+               (value->data[begin] == ' ' || value->data[begin] == '\t' ||
+                value->data[begin] == '\n' || value->data[begin] == '\r')) {
+            begin++;
+        }
+        while (trim_right && end > begin &&
+               (value->data[end - SKIP_ONE] == ' ' || value->data[end - SKIP_ONE] == '\t' ||
+                value->data[end - SKIP_ONE] == '\n' || value->data[end - SKIP_ONE] == '\r')) {
+            end--;
+        }
+        value->data += begin;
+        value->length = end - begin;
+        return true;
+    }
+
+    if (!cypher_value_own(value)) {
+        return true;
+    }
+    if (strcmp(item->func, "reverse") == 0) {
+        size_t left = 0;
+        size_t right = value->length;
+        while (left < right) {
+            right--;
+            if (left >= right) {
+                break;
+            }
+            char byte = value->owned[left];
+            value->owned[left] = value->owned[right];
+            value->owned[right] = byte;
+            left++;
+        }
+    } else {
+        bool lower = strcmp(item->func, "toLower") == 0;
+        for (size_t i = 0; i < value->length; i++) {
+            value->owned[i] = lower ? (char)tolower((unsigned char)value->owned[i])
+                                    : (char)toupper((unsigned char)value->owned[i]);
         }
     }
-    int idx = (*count)++;
-    *list = safe_realloc(*list, (size_t)(idx + SKIP_ONE) * sizeof(char *));
-    (*list)[idx] = heap_strdup(val);
+    return true;
+}
+
+/* Check if a function name is an aggregate */
+static bool is_aggregate_func(const char *func) {
+    if (!func) {
+        return false;
+    }
+#define CYPHER_CANONICAL_MATCH(schema_name, canonical_name, token) \
+    if (strcmp(func, canonical_name) == 0) {                       \
+        return true;                                               \
+    }
+    CYPHER_AGGREGATE_FUNCTIONS(CYPHER_CANONICAL_MATCH)
+#undef CYPHER_CANONICAL_MATCH
+    return false;
+}
+
+static void *cypher_agg_malloc(size_t size, int site) {
+    return cypher_agg_allocation_should_fail(site) ? NULL : malloc(size);
+}
+
+static void *cypher_agg_calloc(size_t count, size_t size, int site) {
+    return cypher_agg_allocation_should_fail(site) ? NULL : calloc(count, size);
+}
+
+/* Raw realloc retains the caller's owner on failure. Callers publish the
+ * returned pointer only after success, so an injected or real OOM cannot lose
+ * the existing aggregate array. */
+static void *cypher_agg_realloc(void *memory, size_t size, int site) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (site == CYP_AGG_ALLOC_VALUE_ARRAY_GROWTH && g_cypher_track_aggregate_list_growths) {
+        g_cypher_aggregate_list_growths++;
+    }
+#endif
+    return cypher_agg_allocation_should_fail(site) ? NULL : realloc(memory, size);
+}
+
+static char *cypher_agg_strdup(const char *value, int site) {
+    return cypher_agg_allocation_should_fail(site) ? NULL : heap_strdup(value);
+}
+
+static char *cypher_agg_strndup(const char *value, size_t length, int site) {
+    if (!value || length > SIZE_MAX - SKIP_ONE || cypher_agg_allocation_should_fail(site)) {
+        return NULL;
+    }
+    char *copy = malloc(length + SKIP_ONE);
+    if (copy) {
+        memcpy(copy, value, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
+
+typedef struct {
+    char *value;
+    size_t length;
+    char *entity_key; /* NULL for scalar values; otherwise owns the index key. */
+} aggregate_value_entry_t;
+
+typedef struct {
+    aggregate_value_entry_t *entries;
+    int count;
+    int capacity;
+    CBMHashTable *distinct_index; /* borrows entry value/entity_key strings */
+} aggregate_value_list_t;
+
+static void aggregate_value_list_free(aggregate_value_list_t *list) {
+    if (!list) {
+        return;
+    }
+    /* The index borrows entry strings, so release it before its keys. */
+    cbm_ht_free(list->distinct_index);
+    for (int i = 0; i < list->count; i++) {
+        free(list->entries[i].entity_key);
+        free(list->entries[i].value);
+    }
+    free(list->entries);
+    memset(list, 0, sizeof(*list));
+}
+
+/* Return a bounded canonical identity for a bare graph entity. A property or
+ * virtual scalar has no entity identity and uses its exact value as the set
+ * key. Node and relationship identifiers are signed 64-bit values, so the
+ * fixed representation is a type bound rather than a query-data limit. */
+static bool aggregate_entity_key(binding_t *binding, const cbm_return_item_t *item,
+                                 char key[CBM_SZ_64], size_t *key_length) {
+    if (!binding || !item || !item->variable || item->property) {
+        return false;
+    }
+    int written = 0;
+    cbm_node_t *node = binding_get(binding, item->variable);
+    if (node && node->id > 0) {
+        written = snprintf(key, CBM_SZ_64, "N:%lld", (long long)node->id);
+    } else {
+        cbm_edge_t *edge = binding_get_edge(binding, item->variable);
+        if (edge && edge->id > 0) {
+            written = snprintf(key, CBM_SZ_64, "E:%lld", (long long)edge->id);
+        }
+    }
+    if (written <= 0 || written >= CBM_SZ_64) {
+        return false;
+    }
+    *key_length = (size_t)written;
+    return true;
+}
+
+/* Append an aggregate value, optionally through an exact membership index.
+ * The value vector grows geometrically, so append is amortized O(1) metadata
+ * work plus O(value bytes). DISTINCT performs one expected-O(1) hash probe
+ * over an exact scalar value or canonical entity id; total expected runtime is
+ * O(total input bytes), retained memory is O(total unique value bytes), and
+ * first-seen order remains available to COLLECT. Every allocation is owned or
+ * rolled back before the count/index publishes the new entry. */
+static bool aggregate_value_list_add(aggregate_value_list_t *list, binding_t *binding,
+                                     const cbm_return_item_t *item,
+                                     const cypher_value_t *value, bool distinct,
+                                     bool *inserted) {
+    if (!list || !binding || !item || !value || !value->data || !inserted || list->count < 0 ||
+        list->capacity < 0 || list->count > list->capacity ||
+        list->count > INT_MAX - SKIP_ONE) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    *inserted = false;
+
+    char entity_key[CBM_SZ_64];
+    size_t entity_key_length = 0;
+    bool has_entity_key =
+        distinct && aggregate_entity_key(binding, item, entity_key, &entity_key_length);
+    char *owned_value = NULL;
+    char *owned_entity_key = NULL;
+
+    if (distinct && !list->distinct_index) {
+        if (cypher_agg_allocation_should_fail(CYP_AGG_ALLOC_DISTINCT_INDEX)) {
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+        /* Capacity zero lets the shared table allocate only when the first
+         * unique key is inserted instead of reserving per aggregate group. */
+        list->distinct_index = cbm_ht_create(0);
+        if (!list->distinct_index) {
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+    }
+
+    if (!has_entity_key) {
+        owned_value =
+            cypher_agg_strndup(value->data, value->length, CYP_AGG_ALLOC_VALUE_COPY);
+        if (!owned_value) {
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+    }
+    const char *probe_key = has_entity_key ? entity_key : owned_value;
+    if (distinct) {
+        if (g_cypher_track_aggregate_distinct_probes) {
+            g_cypher_aggregate_distinct_probes++;
+        }
+        if (cbm_ht_has(list->distinct_index, probe_key)) {
+            free(owned_value);
+            return true;
+        }
+    }
+
+    if (has_entity_key) {
+        owned_entity_key =
+            cypher_agg_strndup(entity_key, entity_key_length, CYP_AGG_ALLOC_VALUE_COPY);
+        owned_value =
+            cypher_agg_strndup(value->data, value->length, CYP_AGG_ALLOC_VALUE_COPY);
+        if (!owned_entity_key || !owned_value) {
+            free(owned_entity_key);
+            free(owned_value);
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+    }
+
+    if (list->count == list->capacity) {
+        int next_capacity = list->capacity == 0 ? CBM_SZ_8 : list->capacity;
+        if (list->capacity != 0) {
+            if (list->capacity > INT_MAX / PAIR_LEN) {
+                free(owned_entity_key);
+                free(owned_value);
+                g_cypher_allocation_failed = true;
+                return false;
+            }
+            next_capacity = list->capacity * PAIR_LEN;
+        }
+        if ((size_t)next_capacity > SIZE_MAX / sizeof(*list->entries)) {
+            free(owned_entity_key);
+            free(owned_value);
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+        aggregate_value_entry_t *grown =
+            cypher_agg_realloc(list->entries, (size_t)next_capacity * sizeof(*grown),
+                               CYP_AGG_ALLOC_VALUE_ARRAY_GROWTH);
+        if (!grown) {
+            free(owned_entity_key);
+            free(owned_value);
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+        list->entries = grown;
+        list->capacity = next_capacity;
+    }
+
+    aggregate_value_entry_t *entry = &list->entries[list->count];
+    *entry = (aggregate_value_entry_t){.value = owned_value,
+                                       .length = value->length,
+                                       .entity_key = owned_entity_key};
+    if (distinct) {
+        const char *owned_key = entry->entity_key ? entry->entity_key : entry->value;
+        (void)cbm_ht_set(list->distinct_index, owned_key, (void *)(uintptr_t)SKIP_ONE);
+        if (g_cypher_track_aggregate_distinct_probes) {
+            g_cypher_aggregate_distinct_probes++;
+        }
+        if (!cbm_ht_has(list->distinct_index, owned_key)) {
+            free(entry->entity_key);
+            free(entry->value);
+            memset(entry, 0, sizeof(*entry));
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+    }
+    list->count++;
+    *inserted = true;
+    return true;
+}
+
+/* Append one exact byte span as a JSON string. Contiguous ordinary bytes are
+ * copied in runs; quotes, backslashes, and control bytes use their canonical
+ * JSON escape spelling. Runtime is O(length), auxiliary memory is O(1), and
+ * the caller's geometric builder owns the only retained output allocation. */
+static bool cypher_string_builder_append_json_string(cypher_string_builder_t *builder,
+                                                      const char *text, size_t length) {
+    if (!builder || !text ||
+        !cypher_string_builder_append(builder, "\"", sizeof("\"") - SKIP_ONE)) {
+        return false;
+    }
+    size_t run_start = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char byte = (unsigned char)text[i];
+        const char *escape = NULL;
+        size_t escape_length = PAIR_LEN;
+        char unicode_escape[sizeof("\\u00FF")];
+        switch (byte) {
+            case '"':
+                escape = "\\\"";
+                break;
+            case '\\':
+                escape = "\\\\";
+                break;
+            case '\b':
+                escape = "\\b";
+                break;
+            case '\f':
+                escape = "\\f";
+                break;
+            case '\n':
+                escape = "\\n";
+                break;
+            case '\r':
+                escape = "\\r";
+                break;
+            case '\t':
+                escape = "\\t";
+                break;
+            default:
+                if (byte < CYP_JSON_CONTROL_LIMIT) {
+                    int written = snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04X",
+                                           (unsigned int)byte);
+                    if (written < 0 || (size_t)written >= sizeof(unicode_escape)) {
+                        return false;
+                    }
+                    escape = unicode_escape;
+                    escape_length = (size_t)written;
+                }
+                break;
+        }
+        if (!escape) {
+            continue;
+        }
+        if ((i > run_start &&
+             !cypher_string_builder_append(builder, text + run_start, i - run_start)) ||
+            !cypher_string_builder_append(builder, escape, escape_length)) {
+            return false;
+        }
+        run_start = i + SKIP_ONE;
+    }
+    return (run_start >= length ||
+            cypher_string_builder_append(builder, text + run_start, length - run_start)) &&
+           cypher_string_builder_append(builder, "\"", sizeof("\"") - SKIP_ONE);
+}
+
+/* Serialize an aggregate-owned string list without a fixed output ceiling.
+ * Each item is JSON-escaped from its exact value span. Total runtime and
+ * retained output are O(total item bytes + item count), with one reusable
+ * geometric builder and O(1) scalar scratch. */
+static bool format_collect_list_exact(const aggregate_value_list_t *list,
+                                      cypher_value_t *output) {
+    cypher_string_builder_t builder = {0};
+    if (!list || !output || list->count < 0 || !cypher_string_builder_reset(&builder) ||
+        !cypher_string_builder_append(&builder, "[", sizeof("[") - SKIP_ONE)) {
+        cypher_string_builder_free(&builder);
+        return false;
+    }
+    for (int i = 0; i < list->count; i++) {
+        if ((i > 0 && !cypher_string_builder_append(&builder, ",", sizeof(",") - SKIP_ONE)) ||
+            !cypher_string_builder_append_json_string(
+                &builder, list->entries[i].value, list->entries[i].length)) {
+            cypher_string_builder_free(&builder);
+            return false;
+        }
+    }
+    if (!cypher_string_builder_append(&builder, "]", sizeof("]") - SKIP_ONE)) {
+        cypher_string_builder_free(&builder);
+        return false;
+    }
+    memset(output, 0, sizeof(*output));
+    output->data = builder.data;
+    output->length = builder.length;
+    output->owned = builder.data;
+    output->kind = CYP_VALUE_COMPOSITE;
+    builder.data = NULL;
+    cypher_string_builder_free(&builder);
+    return true;
+}
+
+/* Format every aggregate through one value interface shared by RETURN and
+ * WITH. Numeric/count spellings fit the bounded inline representation by type;
+ * COLLECT transfers an exact query-sized owner. */
+static bool format_aggregate_value_exact(const char *func, int count, double sum,
+                                         double min_value, double max_value,
+                                         aggregate_value_list_t *value_lists, int ci,
+                                         cypher_value_t *output) {
+    if (!func || !output) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    if (strcmp(func, "COLLECT") == 0) {
+        return format_collect_list_exact(&value_lists[ci], output);
+    }
+    memset(output, 0, sizeof(*output));
+    if (count == 0 && (strcmp(func, "AVG") == 0 || strcmp(func, "MIN") == 0 ||
+                       strcmp(func, "MAX") == 0)) {
+        output->data = "";
+        output->is_null = true;
+        output->kind = CYP_VALUE_NULL;
+        return true;
+    }
+    int written = 0;
+    if (strcmp(func, "SUM") == 0) {
+        written = snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", sum);
+    } else if (strcmp(func, "AVG") == 0) {
+        written =
+            snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", sum / count);
+    } else if (strcmp(func, "MIN") == 0) {
+        written = snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", min_value);
+    } else if (strcmp(func, "MAX") == 0) {
+        written = snprintf(output->inline_text, sizeof(output->inline_text), "%.10g", max_value);
+    } else {
+        written = snprintf(output->inline_text, sizeof(output->inline_text), "%d", count);
+    }
+    if (written < 0 || (size_t)written >= sizeof(output->inline_text)) {
+        g_cypher_allocation_failed = true;
+        output->data = "";
+        output->is_null = true;
+        return false;
+    }
+    output->data = output->inline_text;
+    output->length = (size_t)written;
+    output->kind = strcmp(func, "COUNT") == 0 ? CYP_VALUE_INTEGER : CYP_VALUE_FLOAT;
+    return true;
 }
 
 static int compare_ordered_bindings(binding_t *a, binding_t *b, const cbm_order_item_t *keys,
@@ -5143,18 +7147,73 @@ static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbind
     bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
 }
 
-/* Resolve the alias or compute a default name for a WITH/RETURN item */
-static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_buf,
-                                      size_t buf_sz) {
+/* Return one owned canonical output name shared by RETURN and WITH. Keeping a
+ * single derivation prevents the two public projection surfaces from drifting
+ * as expression support grows. Runtime and memory are O(name bytes). */
+static char *cypher_item_name_owned(const cbm_return_item_t *item) {
+    if (!item) {
+        return NULL;
+    }
     if (item->alias) {
-        return item->alias;
+        return heap_strdup(item->alias);
+    }
+    if (item->func) {
+        const char *parts[] = {item->func, "(", item->variable ? item->variable : "", ")"};
+        return cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
+    }
+    if (item->kase) {
+        return heap_strdup("CASE");
     }
     if (item->property) {
-        snprintf(name_buf, buf_sz, "%s.%s", item->variable, item->property);
-    } else {
-        snprintf(name_buf, buf_sz, "%s", item->variable);
+        const char *parts[] = {item->variable, ".", item->property};
+        return cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
     }
-    return name_buf;
+    return heap_strdup(item->variable);
+}
+
+/* Compute each WITH output name once per query clause, rather than formatting
+ * a bounded name for every projected row. Construction is O(C + A) time and
+ * O(C + A) memory for C items and A total alias bytes; callers reuse cached
+ * lengths while each virtual binding takes its required independent copy. */
+static bool build_with_aliases(const cbm_return_clause_t *wc, const char ***aliases_out,
+                               size_t **lengths_out) {
+    if (!wc || !aliases_out || !lengths_out || wc->count < 0) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    const char **aliases = cypher_calloc_elements(wc->count, sizeof(*aliases));
+    size_t *lengths = cypher_calloc_elements(wc->count, sizeof(*lengths));
+    if (!aliases || !lengths) {
+        free(aliases);
+        free(lengths);
+        return false;
+    }
+    for (int i = 0; i < wc->count; i++) {
+        aliases[i] = cypher_item_name_owned(&wc->items[i]);
+        if (!aliases[i]) {
+            for (int j = 0; j < i; j++) {
+                safe_str_free(&aliases[j]);
+            }
+            free(aliases);
+            free(lengths);
+            g_cypher_allocation_failed = true;
+            return false;
+        }
+        lengths[i] = strlen(aliases[i]);
+    }
+    *aliases_out = aliases;
+    *lengths_out = lengths;
+    return true;
+}
+
+static void free_string_vector(const char **strings, int count) {
+    if (!strings) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&strings[i]);
+    }
+    free(strings);
 }
 
 /* ── WITH clause: project bindings through aggregation or rename ── */
@@ -5164,28 +7223,131 @@ typedef struct {
     const char *group_key; /* owned; also borrowed by aggregate_group_index_t */
     const char **group_vals;
     bool *group_nulls;
+    cypher_value_kind_t *group_kinds;
     double *sums;
     int *counts;
     double *mins, *maxs;
-    char ***distinct_lists;  /* per-item set of seen values for COUNT(DISTINCT) */
-    int *distinct_n;         /* per-item distinct count (#239) */
+    aggregate_value_list_t *value_lists; /* COLLECT and aggregate DISTINCT state */
     int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
 } with_agg_t;
 
 /* Build a group key from non-aggregate WITH items */
-static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
-    int kl = 0;
+static bool with_agg_build_key(cbm_return_clause_t *wc, binding_t *b,
+                               cypher_string_builder_t *key) {
     for (int ci = 0; ci < wc->count; ci++) {
-        if (wc->items[ci].func) {
+        if (is_aggregate_func(wc->items[ci].func)) {
             continue;
         }
-        bool is_null = true;
-        const char *v =
-            binding_get_virtual_ex(b, wc->items[ci].variable, wc->items[ci].property, &is_null);
-        kl = group_key_append(key, key_sz, kl, b, wc->items[ci].variable, wc->items[ci].property, v,
-                              is_null);
+        cbm_return_item_t *item = &wc->items[ci];
+        bool direct = !item->func && !item->kase && !item->args;
+        cypher_value_t value;
+        char function_buffer[CBM_SZ_512];
+        if (!project_item_exact_value(b, item, &value)) {
+            const char *text = project_item(b, item, function_buffer, sizeof(function_buffer));
+            cypher_value_set_cstr(&value, text ? text : "", false);
+        }
+        bool appended =
+            group_key_append_value(key, b, item->variable, direct && !item->property, &value);
+        cypher_value_free(&value);
+        if (!appended) {
+            return false;
+        }
     }
-    return kl;
+    return true;
+}
+
+static void with_agg_entry_free(with_agg_t *entry, int item_count) {
+    if (!entry) {
+        return;
+    }
+    safe_str_free(&entry->group_key);
+    for (int ci = 0; ci < item_count; ci++) {
+        if (entry->group_vals) {
+            safe_str_free(&entry->group_vals[ci]);
+        }
+        if (entry->value_lists) {
+            aggregate_value_list_free(&entry->value_lists[ci]);
+        }
+    }
+    free(entry->group_vals);
+    free(entry->group_nulls);
+    free(entry->group_kinds);
+    free(entry->sums);
+    free(entry->counts);
+    free(entry->mins);
+    free(entry->maxs);
+    free(entry->value_lists);
+    free(entry->group_node_ids);
+    memset(entry, 0, sizeof(*entry));
+}
+
+/* Construct a WITH group atomically. Each group retains O(item_count) state;
+ * failure releases the initialized prefix and leaves one zeroed slot. */
+static bool with_agg_init_group(with_agg_t *entry, cbm_return_clause_t *wc, binding_t *binding,
+                                const char *key) {
+    if (!entry || !wc || !binding || !key || wc->count <= 0 ||
+        (size_t)wc->count > SIZE_MAX / sizeof(void *) ||
+        (size_t)wc->count > SIZE_MAX / sizeof(double) ||
+        (size_t)wc->count > SIZE_MAX / sizeof(cypher_value_kind_t) ||
+        (size_t)wc->count > SIZE_MAX / sizeof(int64_t)) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    int item_count = wc->count;
+    memset(entry, 0, sizeof(*entry));
+    entry->group_key = cypher_agg_strdup(key, CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->group_vals =
+        cypher_agg_calloc((size_t)item_count, sizeof(const char *), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->group_nulls =
+        cypher_agg_calloc((size_t)item_count, sizeof(bool), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->group_kinds = cypher_agg_calloc((size_t)item_count, sizeof(*entry->group_kinds),
+                                           CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->sums = cypher_agg_calloc((size_t)item_count, sizeof(double), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->counts = cypher_agg_calloc((size_t)item_count, sizeof(int), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->mins = cypher_agg_malloc((size_t)item_count * sizeof(double), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->maxs = cypher_agg_malloc((size_t)item_count * sizeof(double), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->value_lists = cypher_agg_calloc((size_t)item_count, sizeof(*entry->value_lists),
+                                           CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->group_node_ids =
+        cypher_agg_calloc((size_t)item_count, sizeof(int64_t), CYP_AGG_ALLOC_GROUP_ENTRY);
+    if (!entry->group_key || !entry->group_vals || !entry->group_nulls ||
+        !entry->group_kinds || !entry->sums || !entry->counts || !entry->mins ||
+        !entry->maxs || !entry->value_lists || !entry->group_node_ids) {
+        g_cypher_allocation_failed = true;
+        with_agg_entry_free(entry, item_count);
+        return false;
+    }
+    for (int ci = 0; ci < item_count; ci++) {
+        entry->mins[ci] = CYP_DBL_MAX;
+        entry->maxs[ci] = -CYP_DBL_MAX;
+        char value_buffer[CBM_SZ_512];
+        cypher_value_t projected;
+        cypher_value_set_cstr(&projected, "0", false);
+        if (!is_aggregate_func(wc->items[ci].func)) {
+            if (!project_item_exact_value(binding, &wc->items[ci], &projected)) {
+                const char *value =
+                    project_item(binding, &wc->items[ci], value_buffer, sizeof(value_buffer));
+                cypher_value_set_cstr(&projected, value ? value : "", false);
+            }
+            entry->group_nulls[ci] = projected.is_null;
+            entry->group_kinds[ci] = projected.kind;
+            if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
+                cbm_node_t *group_node = binding_get(binding, wc->items[ci].variable);
+                if (group_node) {
+                    entry->group_node_ids[ci] = group_node->id;
+                }
+            }
+        }
+        entry->group_vals[ci] =
+            cypher_agg_strndup(projected.data, projected.length, CYP_AGG_ALLOC_GROUP_ENTRY);
+        cypher_value_free(&projected);
+        if (!entry->group_vals[ci]) {
+            g_cypher_allocation_failed = true;
+            with_agg_entry_free(entry, item_count);
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Find or create an aggregation group. Returns index. */
@@ -5207,117 +7369,107 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         }
     }
     if (*agg_cnt >= *agg_cap) {
-        *agg_cap *= PAIR_LEN;
-        *aggs = safe_realloc(*aggs, *agg_cap * sizeof(with_agg_t));
-    }
-    int found = (*agg_cnt)++;
-    (*aggs)[found].group_key = heap_strdup(key);
-    (*aggs)[found].group_vals = calloc(wc->count, sizeof(const char *));
-    (*aggs)[found].group_nulls = calloc(wc->count, sizeof(bool));
-    (*aggs)[found].sums = calloc(wc->count, sizeof(double));
-    (*aggs)[found].counts = calloc(wc->count, sizeof(int));
-    (*aggs)[found].mins = calloc(wc->count, sizeof(double));
-    (*aggs)[found].maxs = calloc(wc->count, sizeof(double));
-    (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
-    (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
-    (*aggs)[found].group_node_ids = calloc(wc->count, sizeof(int64_t));
-    for (int ci = 0; ci < wc->count; ci++) {
-        (*aggs)[found].mins[ci] = CYP_DBL_MAX;
-        (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
-    }
-    for (int ci = 0; ci < wc->count; ci++) {
-        if (wc->items[ci].func) {
-            (*aggs)[found].group_vals[ci] = heap_strdup("0");
-            continue;
+        if (*agg_cap > INT_MAX / PAIR_LEN ||
+            (size_t)(*agg_cap * PAIR_LEN) > SIZE_MAX / sizeof(**aggs)) {
+            g_cypher_allocation_failed = true;
+            return CBM_NOT_FOUND;
         }
-        bool is_null = true;
-        const char *v =
-            binding_get_virtual_ex(b, wc->items[ci].variable, wc->items[ci].property, &is_null);
-        (*aggs)[found].group_vals[ci] = heap_strdup(v);
-        (*aggs)[found].group_nulls[ci] = is_null;
-        /* If this group item is a bare node variable, remember its id so the
-         * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). */
-        if (!wc->items[ci].property && wc->items[ci].variable) {
-            cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
-            if (gn) {
-                (*aggs)[found].group_node_ids[ci] = gn->id;
-            }
+        int next_cap = *agg_cap * PAIR_LEN;
+        with_agg_t *grown = cypher_agg_realloc(*aggs, (size_t)next_cap * sizeof(*grown),
+                                               CYP_AGG_ALLOC_GROUP_ARRAY_GROWTH);
+        if (!grown) {
+            g_cypher_allocation_failed = true;
+            return CBM_NOT_FOUND;
         }
+        *aggs = grown;
+        memset(&(*aggs)[*agg_cap], 0, (size_t)(next_cap - *agg_cap) * sizeof(**aggs));
+        *agg_cap = next_cap;
     }
+    int found = *agg_cnt;
+    if (!with_agg_init_group(&(*aggs)[found], wc, b, key)) {
+        return CBM_NOT_FOUND;
+    }
+    (*agg_cnt)++;
     aggregate_group_index_insert(index, (*aggs)[found].group_key, found);
     return found;
 }
 
 /* Accumulate aggregation values for a binding */
-static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
+static bool with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
-        if (!wc->items[ci].func) {
+        if (!is_aggregate_func(wc->items[ci].func)) {
             continue;
         }
-        bool is_null = true;
-        const char *raw =
-            binding_get_virtual_ex(b, wc->items[ci].variable, wc->items[ci].property, &is_null);
-        if (is_null) {
+        cypher_value_t value;
+        binding_get_virtual_value(b, wc->items[ci].variable, wc->items[ci].property, &value);
+        if (value.is_null) {
+            cypher_value_free(&value);
+            continue;
+        }
+        bool is_collect = strcmp(wc->items[ci].func, "COLLECT") == 0;
+        bool inserted = true;
+        if (is_collect || wc->items[ci].distinct) {
+            if (!aggregate_value_list_add(&agg->value_lists[ci], b, &wc->items[ci], &value,
+                                          wc->items[ci].distinct, &inserted)) {
+                cypher_value_free(&value);
+                return false;
+            }
+        }
+        if (!inserted) {
+            cypher_value_free(&value);
             continue;
         }
         agg->counts[ci]++;
-        if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
-            distinct_list_add(&agg->distinct_lists[ci], &agg->distinct_n[ci], raw);
+        bool is_numeric = strcmp(wc->items[ci].func, "SUM") == 0 ||
+                          strcmp(wc->items[ci].func, "AVG") == 0 ||
+                          strcmp(wc->items[ci].func, "MIN") == 0 ||
+                          strcmp(wc->items[ci].func, "MAX") == 0;
+        if (is_numeric) {
+            if (!cypher_value_own(&value)) {
+                cypher_value_free(&value);
+                return false;
+            }
+            double numeric = strtod(value.data, NULL);
+            agg->sums[ci] += numeric;
+            if (numeric < agg->mins[ci]) {
+                agg->mins[ci] = numeric;
+            }
+            if (numeric > agg->maxs[ci]) {
+                agg->maxs[ci] = numeric;
+            }
         }
-        double dv = strtod(raw, NULL);
-        agg->sums[ci] += dv;
-        if (dv < agg->mins[ci]) {
-            agg->mins[ci] = dv;
-        }
-        if (dv > agg->maxs[ci]) {
-            agg->maxs[ci] = dv;
-        }
+        cypher_value_free(&value);
     }
-}
-
-/* Format a WITH aggregation value into buf */
-static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf, size_t buf_sz) {
-    if (strcmp(func, "SUM") == 0) {
-        snprintf(buf, buf_sz, "%.10g", agg->sums[ci]);
-    } else if (strcmp(func, "AVG") == 0) {
-        if (agg->counts[ci] == 0) {
-            buf[0] = '\0';
-        } else {
-            snprintf(buf, buf_sz, "%.10g", agg->sums[ci] / agg->counts[ci]);
-        }
-    } else if (strcmp(func, "MIN") == 0) {
-        if (agg->counts[ci] == 0) {
-            buf[0] = '\0';
-        } else {
-            snprintf(buf, buf_sz, "%.10g", agg->mins[ci]);
-        }
-    } else if (strcmp(func, "MAX") == 0) {
-        if (agg->counts[ci] == 0) {
-            buf[0] = '\0';
-        } else {
-            snprintf(buf, buf_sz, "%.10g", agg->maxs[ci]);
-        }
-    } else {
-        snprintf(buf, buf_sz, "%d", agg->counts[ci]);
-    }
+    return true;
 }
 
 /* Add a virtual variable binding for one WITH item */
-static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val, bool is_null) {
+static void with_add_vbinding_var_sized(binding_t *vb, const char *alias, size_t alias_length,
+                                        const char *val, size_t value_length, bool is_null,
+                                        cypher_value_kind_t kind) {
     int index = vb->var_count;
     if (!binding_reserve_node_index(vb, index)) {
         return;
     }
-    char *owned_alias = heap_strdup(alias);
-    char *owned_value = heap_strdup(val);
-    if ((alias && !owned_alias) || (val && !owned_value)) {
+    char *owned_alias =
+        alias_length > SIZE_MAX - SKIP_ONE ? NULL : malloc(alias_length + SKIP_ONE);
+    char *owned_value =
+        value_length > SIZE_MAX - SKIP_ONE ? NULL : malloc(value_length + SKIP_ONE);
+    if (owned_alias) {
+        memcpy(owned_alias, alias, alias_length);
+        owned_alias[alias_length] = '\0';
+    }
+    if (owned_value) {
+        memcpy(owned_value, val, value_length);
+        owned_value[value_length] = '\0';
+    }
+    if (!owned_alias || !owned_value) {
         free(owned_alias);
         free(owned_value);
         vb->allocation_failed = true;
         return;
     }
-    binding_set_node_metadata(vb, index, owned_alias, true, is_null);
+    binding_set_node_metadata(vb, index, owned_alias, true, is_null, kind);
     binding_node_at(vb, index)->name = owned_value;
     vb->var_count++;
 }
@@ -5354,23 +7506,17 @@ static void execute_unwind_literal(cbm_query_t *q, binding_t **bindings, int *bi
         size_t list_count;
         yyjson_val *value;
         yyjson_arr_foreach(list, index, list_count, value) {
-            char number[CBM_SZ_64];
-            const char *text = yyjson_is_str(value) ? yyjson_get_str(value) : NULL;
-            if (yyjson_is_num(value)) {
-                char *end = yyjson_write_number(value, number);
-                if (end) {
-                    *end = '\0';
-                    text = number;
-                }
-            }
-            if (!text) {
+            cypher_value_t item;
+            if (!cypher_value_set_yyjson(&item, value)) {
                 g_cypher_allocation_failed = true;
                 stop = true;
                 break;
             }
             binding_t row = {0};
             binding_copy(&row, &source[bi]);
-            with_add_vbinding_var(&row, q->unwind_alias, text, false);
+            with_add_vbinding_var_sized(&row, q->unwind_alias, strlen(q->unwind_alias),
+                                        item.data, item.length, item.is_null, item.kind);
+            cypher_value_free(&item);
             if (!binding_array_append(&expanded, &expanded_count, &expanded_cap, max_working_rows,
                                       &row)) {
                 stop = true;
@@ -5392,45 +7538,51 @@ static void execute_unwind_literal(cbm_query_t *q, binding_t **bindings, int *bi
 /* Free with_agg_t array */
 static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
     for (int a = 0; a < agg_cnt; a++) {
-        safe_str_free(&aggs[a].group_key);
-        for (int ci = 0; ci < item_count; ci++) {
-            safe_str_free(&aggs[a].group_vals[ci]);
-            if (aggs[a].distinct_lists && aggs[a].distinct_lists[ci]) {
-                for (int j = 0; j < aggs[a].distinct_n[ci]; j++) {
-                    free(aggs[a].distinct_lists[ci][j]);
-                }
-                free(aggs[a].distinct_lists[ci]);
-            }
-        }
-        free(aggs[a].group_vals);
-        free(aggs[a].group_nulls);
-        free(aggs[a].sums);
-        free(aggs[a].counts);
-        free(aggs[a].mins);
-        free(aggs[a].maxs);
-        free(aggs[a].distinct_lists);
-        free(aggs[a].distinct_n);
-        free(aggs[a].group_node_ids);
+        with_agg_entry_free(&aggs[a], item_count);
     }
     free(aggs);
 }
 
 /* Execute WITH aggregation path */
 static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings, int bind_count,
-                                   binding_t **vbindings, int *vcount) {
+                                   binding_t **vbindings, int *vcount, const char **aliases,
+                                   const size_t *alias_lengths) {
     int agg_cap = CBM_SZ_256;
-    with_agg_t *aggs = calloc(agg_cap, sizeof(with_agg_t));
+    with_agg_t *aggs =
+        cypher_agg_calloc((size_t)agg_cap, sizeof(with_agg_t), CYP_AGG_ALLOC_INITIAL);
     int agg_cnt = 0;
     aggregate_group_index_t group_index = aggregate_group_index_create();
-
-    for (int bi = 0; bi < bind_count; bi++) {
-        char key[CBM_SZ_1K] = "";
-        with_agg_build_key(wc, &bindings[bi], key, sizeof(key));
-        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, &group_index, wc,
-                                            &bindings[bi], key);
-        with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
+    cypher_string_builder_t key = {0};
+    if (!aggs || !cypher_string_builder_reset(&key)) {
+        g_cypher_allocation_failed = true;
+        aggregate_group_index_free(&group_index);
+        cypher_string_builder_free(&key);
+        free(aggs);
+        return;
     }
 
+    for (int bi = 0; bi < bind_count; bi++) {
+        if (!cypher_string_builder_reset(&key) ||
+            !with_agg_build_key(wc, &bindings[bi], &key)) {
+            break;
+        }
+        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, &group_index, wc,
+                                            &bindings[bi], key.data);
+        if (found < 0) {
+            break;
+        }
+        if (!with_agg_accumulate(&aggs[found], wc, &bindings[bi])) {
+            break;
+        }
+    }
+
+    if (g_cypher_allocation_failed) {
+        cypher_string_builder_free(&key);
+        aggregate_group_index_free(&group_index);
+        with_agg_free(aggs, agg_cnt, wc->count);
+        return;
+    }
+    cypher_string_builder_free(&key);
     *vbindings = safe_realloc(*vbindings, (size_t)(agg_cnt + SKIP_ONE) * sizeof(binding_t));
     if (!*vbindings) {
         g_cypher_allocation_failed = true;
@@ -5446,22 +7598,27 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         vb.project = (bind_count > 0) ? bindings[0].project : NULL;
         vb.use_active_overlay_edges =
             (bind_count > 0) ? bindings[0].use_active_overlay_edges : false;
-        for (int ci = 0; ci < wc->count; ci++) {
-            char name_buf[CBM_SZ_256];
-            const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-            if (wc->items[ci].func) {
-                char vbuf[CBM_SZ_64];
-                if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
-                    snprintf(vbuf, sizeof(vbuf), "%d", aggs[a].distinct_n[ci]); /* #239 */
-                } else {
-                    with_agg_format(wc->items[ci].func, &aggs[a], ci, vbuf, sizeof(vbuf));
+        for (int ci = 0;
+             ci < wc->count && !g_cypher_allocation_failed && !vb.allocation_failed; ci++) {
+            if (is_aggregate_func(wc->items[ci].func)) {
+                int aggregate_count =
+                    wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0
+                        ? aggs[a].value_lists[ci].count
+                        : aggs[a].counts[ci];
+                cypher_value_t formatted;
+                if (!format_aggregate_value_exact(
+                        wc->items[ci].func, aggregate_count, aggs[a].sums[ci], aggs[a].mins[ci],
+                        aggs[a].maxs[ci], aggs[a].value_lists, ci, &formatted)) {
+                    break;
                 }
-                bool is_null = aggs[a].counts[ci] == 0 && (strcmp(wc->items[ci].func, "AVG") == 0 ||
-                                                           strcmp(wc->items[ci].func, "MIN") == 0 ||
-                                                           strcmp(wc->items[ci].func, "MAX") == 0);
-                with_add_vbinding_var(&vb, alias, vbuf, is_null);
+                with_add_vbinding_var_sized(&vb, aliases[ci], alias_lengths[ci], formatted.data,
+                                            formatted.length, formatted.is_null, formatted.kind);
+                cypher_value_free(&formatted);
             } else {
-                with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci], aggs[a].group_nulls[ci]);
+                const char *value = aggs[a].group_vals[ci] ? aggs[a].group_vals[ci] : "";
+                with_add_vbinding_var_sized(&vb, aliases[ci], alias_lengths[ci], value,
+                                            strlen(value), aggs[a].group_nulls[ci],
+                                            aggs[a].group_kinds[ci]);
                 /* Tag the carried virtual var with the node id (when the group
                  * var is a node) so node_prop can re-fetch its full properties. */
                 if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
@@ -5469,7 +7626,7 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 }
             }
         }
-        if (vb.allocation_failed) {
+        if (g_cypher_allocation_failed || vb.allocation_failed) {
             g_cypher_allocation_failed = true;
             binding_free(&vb);
             break;
@@ -5482,24 +7639,27 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
 
 /* Execute WITH simple (non-aggregate) projection */
 static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, int bind_count,
-                                binding_t *vbindings, int *vcount) {
+                                binding_t *vbindings, int *vcount, const char **aliases,
+                                const size_t *alias_lengths) {
     for (int bi = 0; bi < bind_count; bi++) {
         binding_t vb = {0};
         vb.store = bindings[bi].store; /* so node_prop can re-fetch / compute on the projection */
         vb.project = bindings[bi].project;
         vb.use_active_overlay_edges = bindings[bi].use_active_overlay_edges;
         for (int ci = 0; ci < wc->count; ci++) {
-            char name_buf[CBM_SZ_256];
-            const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-            char func_buf[CBM_SZ_512];
-            const char *val =
-                project_item(&bindings[bi], &wc->items[ci], func_buf, sizeof(func_buf));
-            bool is_null = false;
-            if (!wc->items[ci].func && !wc->items[ci].kase && !wc->items[ci].args) {
-                (void)binding_get_virtual_ex(&bindings[bi], wc->items[ci].variable,
-                                             wc->items[ci].property, &is_null);
+            cbm_return_item_t *item = &wc->items[ci];
+            cypher_value_t value;
+            if (project_item_exact_value(&bindings[bi], item, &value)) {
+                with_add_vbinding_var_sized(&vb, aliases[ci], alias_lengths[ci], value.data,
+                                            value.length, value.is_null, value.kind);
+                cypher_value_free(&value);
+            } else {
+                char func_buf[CBM_SZ_512];
+                const char *val = project_item(&bindings[bi], item, func_buf, sizeof(func_buf));
+                const char *value = val ? val : "";
+                with_add_vbinding_var_sized(&vb, aliases[ci], alias_lengths[ci], value,
+                                            strlen(value), false, CYP_VALUE_STRING);
             }
-            with_add_vbinding_var(&vb, alias, val, is_null);
             /* A whole-node projection must remain a node binding across the
              * WITH boundary. Retain its canonical id so the next MATCH stage
              * can traverse from it and node_prop can re-fetch complete fields. */
@@ -5536,51 +7696,84 @@ static void filter_bindings_where(const cbm_where_clause_t *where, binding_t *vb
     *vcount = kept;
 }
 
-/* Build a key from a projected vbinding's value tuple (all WITH output items),
- * used to detect duplicate rows for WITH DISTINCT (#238). */
-static void with_proj_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
-    int kl = 0;
-    key[0] = '\0';
-    char name_buf[CBM_SZ_256];
+/* Build one exact, unambiguous projected-value tuple using the same null,
+ * length-prefix, and entity-identity encoding as aggregate grouping. */
+static bool with_proj_key(const cbm_return_clause_t *wc, const char **aliases, binding_t *binding,
+                          cypher_string_builder_t *key) {
     for (int ci = 0; ci < wc->count; ci++) {
-        const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-        const char *v = binding_get_virtual(b, alias, NULL);
-        int w = snprintf(key + kl, (kl < (int)key_sz) ? key_sz - (size_t)kl : 0, "%s|", v ? v : "");
-        if (w > 0) {
-            kl += w;
-        }
-        if (kl >= (int)key_sz) {
-            break; /* buffer full */
+        cypher_value_t value;
+        binding_get_virtual_value(binding, aliases[ci], NULL, &value);
+        bool appended =
+            group_key_append_value(key, binding, aliases[ci], true, &value);
+        cypher_value_free(&value);
+        if (!appended) {
+            return false;
         }
     }
+    return true;
 }
 
 /* Apply WITH DISTINCT: drop projected rows whose value tuple duplicates an
- * earlier one, keeping first occurrence (#238 — previously silently ignored). */
-static void with_apply_distinct(cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
-    int kept = 0;
-    for (int i = 0; i < *vcount; i++) {
-        char key[CBM_SZ_1K];
-        with_proj_key(wc, &vbindings[i], key, sizeof(key));
-        bool dup = false;
-        for (int j = 0; j < kept; j++) {
-            char pkey[CBM_SZ_1K];
-            with_proj_key(wc, &vbindings[j], pkey, sizeof(pkey));
-            if (strcmp(key, pkey) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) {
+ * earlier one, keeping first occurrence. For R rows containing T total tuple
+ * bytes, exact key construction plus hash lookup is expected O(T) time and
+ * O(T) memory; representational/OOM failures abort instead of publishing a
+ * partially deduplicated or quadratically rescanned result. */
+static void with_apply_distinct(cbm_return_clause_t *wc, const char **aliases,
+                                binding_t *vbindings, int *vcount) {
+    int original_count = *vcount;
+    const char **owned_keys = cypher_calloc_elements(original_count, sizeof(*owned_keys));
+    aggregate_group_index_t index = aggregate_group_index_create();
+    cypher_string_builder_t key = {0};
+    if (!owned_keys || !index.valid || !cypher_string_builder_reset(&key)) {
+        g_cypher_allocation_failed = true;
+        for (int i = 0; i < original_count; i++) {
             binding_free(&vbindings[i]);
-        } else {
-            if (kept != i) {
-                vbindings[kept] = vbindings[i];
-            }
-            kept++;
+        }
+        *vcount = 0;
+        free(owned_keys);
+        aggregate_group_index_free(&index);
+        cypher_string_builder_free(&key);
+        return;
+    }
+
+    int kept = 0;
+    int i = 0;
+    for (; i < original_count; i++) {
+        if (!cypher_string_builder_reset(&key) ||
+            !with_proj_key(wc, aliases, &vbindings[i], &key)) {
+            break;
+        }
+        if (aggregate_group_index_lookup(&index, key.data) != CYP_FOUND_NONE) {
+            binding_free(&vbindings[i]);
+            continue;
+        }
+        owned_keys[kept] = heap_strdup(key.data);
+        if (!owned_keys[kept]) {
+            g_cypher_allocation_failed = true;
+            break;
+        }
+        aggregate_group_index_insert(&index, owned_keys[kept], kept);
+        if (!index.valid) {
+            g_cypher_allocation_failed = true;
+            break;
+        }
+        if (kept != i) {
+            vbindings[kept] = vbindings[i];
+        }
+        kept++;
+    }
+    if (g_cypher_allocation_failed) {
+        for (; i < original_count; i++) {
+            binding_free(&vbindings[i]);
         }
     }
     *vcount = kept;
+    aggregate_group_index_free(&index);
+    cypher_string_builder_free(&key);
+    for (int key_index = 0; key_index < original_count; key_index++) {
+        safe_str_free(&owned_keys[key_index]);
+    }
+    free(owned_keys);
 }
 
 static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *bind_count_ptr) {
@@ -5603,6 +7796,18 @@ static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *b
         *bind_count_ptr = 0;
         return;
     }
+    const char **aliases = NULL;
+    size_t *alias_lengths = NULL;
+    if (!build_with_aliases(wc, &aliases, &alias_lengths)) {
+        free(vbindings);
+        for (int bi = 0; bi < bind_count; bi++) {
+            binding_free(&bindings[bi]);
+        }
+        free(bindings);
+        *bindings_ptr = NULL;
+        *bind_count_ptr = 0;
+        return;
+    }
 
     bool has_agg = false;
     for (int i = 0; i < wc->count; i++) {
@@ -5613,18 +7818,24 @@ static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *b
     }
 
     if (has_agg) {
-        execute_with_aggregate(wc, bindings, bind_count, &vbindings, &vcount);
+        execute_with_aggregate(wc, bindings, bind_count, &vbindings, &vcount, aliases,
+                               alias_lengths);
     } else {
-        execute_with_simple(wc, bindings, bind_count, vbindings, &vcount);
+        execute_with_simple(wc, bindings, bind_count, vbindings, &vcount, aliases, alias_lengths);
     }
 
     /* WITH DISTINCT: dedup projected rows (no-op for aggregation, which already
      * collapses to one row per group). */
-    if (wc->distinct) {
-        with_apply_distinct(wc, vbindings, &vcount);
+    if (!g_cypher_allocation_failed && wc->distinct) {
+        with_apply_distinct(wc, aliases, vbindings, &vcount);
     }
 
-    with_sort_skip_limit(wc, vbindings, &vcount);
+    if (!g_cypher_allocation_failed) {
+        with_sort_skip_limit(wc, vbindings, &vcount);
+    }
+
+    free(alias_lengths);
+    free_string_vector(aliases, wc->count);
 
     for (int bi = 0; bi < bind_count; bi++) {
         binding_free(&bindings[bi]);
@@ -5641,18 +7852,52 @@ static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *b
 
 /* ── Execute a single query (no UNION recursion) ──────────────── */
 
-/* Project RETURN * — all bound variable properties */
-/* Collect all variable names from query patterns */
-static int collect_pattern_vars(cbm_query_t *q, const char **vars, int max_vars) {
+/* Project RETURN * — all bound variable properties. Two linear passes give
+ * one exact O(V) allocation without an arbitrary variable ceiling or geometric
+ * reallocation; V is the number of explicitly bound pattern variables. */
+static int count_pattern_vars(const cbm_query_t *q) {
     int vc = 0;
     for (int pi = 0; pi < q->pattern_count; pi++) {
-        for (int ni = 0; ni < q->patterns[pi].node_count && vc < max_vars; ni++) {
+        for (int ni = 0; ni < q->patterns[pi].node_count; ni++) {
             if (q->patterns[pi].nodes[ni].variable) {
+                if (vc > INT_MAX - SKIP_ONE) {
+                    g_cypher_allocation_failed = true;
+                    return CBM_NOT_FOUND;
+                }
+                vc++;
+            }
+        }
+        for (int ri = 0; ri < q->patterns[pi].rel_count; ri++) {
+            if (q->patterns[pi].rels[ri].variable) {
+                if (vc > INT_MAX - SKIP_ONE) {
+                    g_cypher_allocation_failed = true;
+                    return CBM_NOT_FOUND;
+                }
+                vc++;
+            }
+        }
+    }
+    return vc;
+}
+
+static int collect_pattern_vars(const cbm_query_t *q, const char **vars, int capacity) {
+    int vc = 0;
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        for (int ni = 0; ni < q->patterns[pi].node_count; ni++) {
+            if (q->patterns[pi].nodes[ni].variable) {
+                if (vc >= capacity) {
+                    g_cypher_allocation_failed = true;
+                    return CBM_NOT_FOUND;
+                }
                 vars[vc++] = q->patterns[pi].nodes[ni].variable;
             }
         }
-        for (int ri = 0; ri < q->patterns[pi].rel_count && vc < max_vars; ri++) {
+        for (int ri = 0; ri < q->patterns[pi].rel_count; ri++) {
             if (q->patterns[pi].rels[ri].variable) {
+                if (vc >= capacity) {
+                    g_cypher_allocation_failed = true;
+                    return CBM_NOT_FOUND;
+                }
                 vars[vc++] = q->patterns[pi].rels[ri].variable;
             }
         }
@@ -5662,22 +7907,29 @@ static int collect_pattern_vars(cbm_query_t *q, const char **vars, int max_vars)
 
 /* Build star-projection columns: var.name, var.qualified_name, var.label, var.file_path */
 static void build_star_columns(result_builder_t *rb, const char **vars, int vc) {
-    int col_n = vc * CYP_NODE_COLS;
-    const char *col_names[CBM_SZ_128];
-    for (int v = 0; v < vc; v++) {
-        char buf[CBM_SZ_128];
-        snprintf(buf, sizeof(buf), "%s.name", vars[v]);
-        col_names[(size_t)v * CYP_NODE_COLS] = heap_strdup(buf);
-        snprintf(buf, sizeof(buf), "%s.qualified_name", vars[v]);
-        col_names[((size_t)v * CYP_NODE_COLS) + SKIP_ONE] = heap_strdup(buf);
-        snprintf(buf, sizeof(buf), "%s.label", vars[v]);
-        col_names[((size_t)v * CYP_NODE_COLS) + PAIR_LEN] = heap_strdup(buf);
-        snprintf(buf, sizeof(buf), "%s.file_path", vars[v]);
-        col_names[((size_t)v * CYP_NODE_COLS) + CYP_TRIPLE] = heap_strdup(buf);
+    if (vc < 0 || vc > INT_MAX / CYP_NODE_COLS) {
+        g_cypher_allocation_failed = true;
+        return;
     }
-    rb_set_columns(rb, col_names, col_n);
-    for (int i = 0; i < col_n; i++) {
-        safe_str_free(&col_names[i]);
+    int col_n = vc * CYP_NODE_COLS;
+    const char **col_names = cypher_calloc_elements(col_n, sizeof(*col_names));
+    if (!col_names) {
+        return;
+    }
+    static const char *const suffixes[CYP_NODE_COLS] = {
+        ".name", ".qualified_name", ".label", ".file_path"};
+    for (int v = 0; v < vc && !g_cypher_allocation_failed; v++) {
+        for (int ci = 0; ci < CYP_NODE_COLS; ci++) {
+            const char *parts[] = {vars[v], suffixes[ci]};
+            size_t index = ((size_t)v * CYP_NODE_COLS) + (size_t)ci;
+            col_names[index] = cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
+            if (!col_names[index]) {
+                g_cypher_allocation_failed = true;
+            }
+        }
+    }
+    if (g_cypher_allocation_failed || !rb_adopt_columns(rb, col_names, col_n)) {
+        free_string_vector(col_names, col_n);
     }
 }
 
@@ -5707,65 +7959,33 @@ static void project_star_row(binding_t *b, const char **vars, int vc, const char
 
 static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
                                 result_builder_t *rb) {
-    const char *vars[CBM_SZ_32];
-    int vc = collect_pattern_vars(q, vars, CBM_SZ_32);
+    int vc = count_pattern_vars(q);
+    if (vc < 0 || vc > INT_MAX / CYP_NODE_COLS) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    const char **vars = cypher_calloc_elements(vc, sizeof(*vars));
+    if (!vars || collect_pattern_vars(q, vars, vc) != vc) {
+        free(vars);
+        return;
+    }
     build_star_columns(rb, vars, vc);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
-        const char *vals[CBM_SZ_128];
+    int col_n = vc * CYP_NODE_COLS;
+    const char **vals = cypher_calloc_elements(col_n, sizeof(*vals));
+    if (!vals) {
+        free(vars);
+        return;
+    }
+    if (bind_count > max_rows) {
+        rb->truncated = true;
+    }
+    for (int bi = 0; bi < bind_count && rb->row_count < max_rows && !g_cypher_allocation_failed;
+         bi++) {
         project_star_row(&bindings[bi], vars, vc, vals);
         rb_add_row(rb, vals);
     }
-}
-
-/* Format an aggregate value into buf based on function name */
-/* Format a COLLECT list as JSON array string */
-static void format_collect_list(char **items, int item_count, char *buf, size_t buf_sz) {
-    char cbuf[CBM_SZ_2K] = "[";
-    int bl = SKIP_ONE;
-    for (int i = 0; i < item_count; i++) {
-        if (i > 0) {
-            cbuf[bl++] = ',';
-        }
-        bl += snprintf(cbuf + bl, sizeof(cbuf) - (size_t)bl, "\"%s\"", items[i]);
-        if (bl >= (int)sizeof(cbuf)) {
-            bl = (int)sizeof(cbuf) - SKIP_ONE;
-        }
-    }
-    if (bl < (int)sizeof(cbuf) - SKIP_ONE) {
-        cbuf[bl++] = ']';
-    }
-    cbuf[bl] = '\0';
-    snprintf(buf, buf_sz, "%s", cbuf);
-}
-
-static void format_agg_value(const char *func, int count, double sum, double min_val,
-                             double max_val, char ***collect_lists, int *collect_counts, int ci,
-                             char *buf, size_t buf_sz) {
-    if (strcmp(func, "SUM") == 0) {
-        snprintf(buf, buf_sz, "%.10g", sum);
-    } else if (strcmp(func, "AVG") == 0) {
-        if (count == 0) {
-            buf[0] = '\0';
-        } else {
-            snprintf(buf, buf_sz, "%.10g", sum / count);
-        }
-    } else if (strcmp(func, "MIN") == 0) {
-        if (count == 0) {
-            buf[0] = '\0';
-        } else {
-            snprintf(buf, buf_sz, "%.10g", min_val);
-        }
-    } else if (strcmp(func, "MAX") == 0) {
-        if (count == 0) {
-            buf[0] = '\0';
-        } else {
-            snprintf(buf, buf_sz, "%.10g", max_val);
-        }
-    } else if (strcmp(func, "COLLECT") == 0) {
-        format_collect_list(collect_lists[ci], collect_counts[ci], buf, buf_sz);
-    } else {
-        snprintf(buf, buf_sz, "%d", count);
-    }
+    free(vals);
+    free(vars);
 }
 
 /* RETURN aggregation entry */
@@ -5775,140 +7995,229 @@ typedef struct {
     double *sums;
     int *counts;
     double *mins, *maxs;
-    char ***collect_lists;
-    int *collect_counts;
+    aggregate_value_list_t *value_lists;
 } ret_agg_entry_t;
 
-/* Initialize a new RETURN aggregation group */
-static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item_count,
-                               const char **vals) {
-    entry->group_key = heap_strdup(key);
-    entry->group_vals = calloc(item_count, sizeof(const char *));
-    entry->sums = calloc(item_count, sizeof(double));
-    entry->counts = calloc(item_count, sizeof(int));
-    entry->mins = malloc(item_count * sizeof(double));
-    entry->maxs = malloc(item_count * sizeof(double));
-    entry->collect_lists = calloc(item_count, sizeof(char **));
-    entry->collect_counts = calloc(item_count, sizeof(int));
+static void ret_agg_entry_free(ret_agg_entry_t *entry, int item_count) {
+    if (!entry) {
+        return;
+    }
+    safe_str_free(&entry->group_key);
+    for (int ci = 0; ci < item_count; ci++) {
+        if (entry->group_vals) {
+            safe_str_free(&entry->group_vals[ci]);
+        }
+        if (entry->value_lists) {
+            aggregate_value_list_free(&entry->value_lists[ci]);
+        }
+    }
+    free(entry->group_vals);
+    free(entry->sums);
+    free(entry->counts);
+    free(entry->mins);
+    free(entry->maxs);
+    free(entry->value_lists);
+    memset(entry, 0, sizeof(*entry));
+}
+
+/* Construct a group atomically. Runtime and retained memory are O(item_count)
+ * plus copied projected bytes. A failed field or value allocation releases the
+ * exact initialized prefix and leaves `entry` zeroed for the shared unwind. */
+static bool ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item_count,
+                               const char **vals, const size_t *value_lengths) {
+    if (!entry || !key || item_count <= 0 || !vals || !value_lengths ||
+        (size_t)item_count > SIZE_MAX / sizeof(void *)) {
+        g_cypher_allocation_failed = true;
+        return false;
+    }
+    memset(entry, 0, sizeof(*entry));
+    entry->group_key = cypher_agg_strdup(key, CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->group_vals =
+        cypher_agg_calloc((size_t)item_count, sizeof(const char *), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->sums = cypher_agg_calloc((size_t)item_count, sizeof(double), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->counts = cypher_agg_calloc((size_t)item_count, sizeof(int), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->mins = cypher_agg_malloc((size_t)item_count * sizeof(double), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->maxs = cypher_agg_malloc((size_t)item_count * sizeof(double), CYP_AGG_ALLOC_GROUP_ENTRY);
+    entry->value_lists = cypher_agg_calloc((size_t)item_count, sizeof(*entry->value_lists),
+                                           CYP_AGG_ALLOC_GROUP_ENTRY);
+    if (!entry->group_key || !entry->group_vals || !entry->sums || !entry->counts || !entry->mins ||
+        !entry->maxs || !entry->value_lists) {
+        g_cypher_allocation_failed = true;
+        ret_agg_entry_free(entry, item_count);
+        return false;
+    }
     for (int ci = 0; ci < item_count; ci++) {
         entry->mins[ci] = CYP_DBL_MAX;
         entry->maxs[ci] = -CYP_DBL_MAX;
-        entry->group_vals[ci] = heap_strdup(vals[ci]);
+        entry->group_vals[ci] =
+            cypher_agg_strndup(vals[ci], value_lengths[ci], CYP_AGG_ALLOC_GROUP_ENTRY);
+        if (vals[ci] && !entry->group_vals[ci]) {
+            g_cypher_allocation_failed = true;
+            ret_agg_entry_free(entry, item_count);
+            return false;
+        }
     }
+    return true;
 }
 
 /* Accumulate a binding into RETURN aggregation */
-static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
+static bool ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!ret->items[ci].func) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
             continue;
         }
-        bool is_null = true;
-        const char *raw =
-            binding_get_virtual_ex(b, ret->items[ci].variable, ret->items[ci].property, &is_null);
-        if (is_null) {
+        cypher_value_t value;
+        binding_get_virtual_value(b, ret->items[ci].variable, ret->items[ci].property, &value);
+        if (value.is_null) {
+            cypher_value_free(&value);
+            continue;
+        }
+        bool is_collect = strcmp(ret->items[ci].func, "COLLECT") == 0;
+        bool inserted = true;
+        if ((is_collect || ret->items[ci].distinct) &&
+            !aggregate_value_list_add(&entry->value_lists[ci], b, &ret->items[ci], &value,
+                                      ret->items[ci].distinct, &inserted)) {
+            cypher_value_free(&value);
+            return false;
+        }
+        if (!inserted) {
+            cypher_value_free(&value);
             continue;
         }
         entry->counts[ci]++;
-        double dv = strtod(raw, NULL);
-        entry->sums[ci] += dv;
-        if (dv < entry->mins[ci]) {
-            entry->mins[ci] = dv;
+        bool is_numeric = strcmp(ret->items[ci].func, "SUM") == 0 ||
+                          strcmp(ret->items[ci].func, "AVG") == 0 ||
+                          strcmp(ret->items[ci].func, "MIN") == 0 ||
+                          strcmp(ret->items[ci].func, "MAX") == 0;
+        if (is_numeric) {
+            if (!cypher_value_own(&value)) {
+                cypher_value_free(&value);
+                return false;
+            }
+            double numeric = strtod(value.data, NULL);
+            entry->sums[ci] += numeric;
+            if (numeric < entry->mins[ci]) {
+                entry->mins[ci] = numeric;
+            }
+            if (numeric > entry->maxs[ci]) {
+                entry->maxs[ci] = numeric;
+            }
         }
-        if (dv > entry->maxs[ci]) {
-            entry->maxs[ci] = dv;
-        }
-        if (strcmp(ret->items[ci].func, "COLLECT") == 0) {
-            int idx = entry->collect_counts[ci]++;
-            entry->collect_lists[ci] =
-                safe_realloc(entry->collect_lists[ci], (idx + SKIP_ONE) * sizeof(char *));
-            entry->collect_lists[ci][idx] = heap_strdup(raw);
-        } else if (ret->items[ci].distinct && strcmp(ret->items[ci].func, "COUNT") == 0) {
-            /* COUNT(DISTINCT x): track unique values; emit the set size (#239). */
-            distinct_list_add(&entry->collect_lists[ci], &entry->collect_counts[ci], raw);
-        }
+        cypher_value_free(&value);
     }
+    return true;
 }
 
 /* Free RETURN aggregation entries */
 static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
     for (int a = 0; a < agg_count; a++) {
-        safe_str_free(&aggs[a].group_key);
-        for (int ci = 0; ci < item_count; ci++) {
-            safe_str_free(&aggs[a].group_vals[ci]);
-            for (int j = 0; j < aggs[a].collect_counts[ci]; j++) {
-                free(aggs[a].collect_lists[ci][j]);
-            }
-            free(aggs[a].collect_lists[ci]);
-        }
-        free(aggs[a].group_vals);
-        free(aggs[a].sums);
-        free(aggs[a].counts);
-        free(aggs[a].mins);
-        free(aggs[a].maxs);
-        free(aggs[a].collect_lists);
-        free(aggs[a].collect_counts);
+        ret_agg_entry_free(&aggs[a], item_count);
     }
     free(aggs);
 }
 
 /* Execute RETURN with aggregation */
 /* Build group key and projected values for one binding */
-static void ret_agg_build_key(cbm_return_clause_t *ret, binding_t *b, char *key, size_t key_sz,
-                              const char **vals, char valbufs[][CBM_SZ_512]) {
-    int klen = 0;
+static bool ret_agg_build_key(cbm_return_clause_t *ret, binding_t *b, cypher_string_builder_t *key,
+                              const char **vals, size_t *value_lengths,
+                              cypher_value_t *direct_values, char func_buffers[][CBM_SZ_512]) {
     for (int ci = 0; ci < ret->count; ci++) {
-        if (ret->items[ci].func) {
+        if (is_aggregate_func(ret->items[ci].func)) {
             vals[ci] = "0";
+            value_lengths[ci] = SKIP_ONE;
             continue;
         }
-        /* project_item may return its own scratch (stable static or a per-column
-         * buffer it copied into); persist the value in the caller-owned valbufs
-         * so vals[] survives until ret_agg_init_group strdup's it. */
-        bool is_null = false;
-        if (!ret->items[ci].func && !ret->items[ci].kase && !ret->items[ci].args) {
-            (void)binding_get_virtual_ex(b, ret->items[ci].variable, ret->items[ci].property,
-                                         &is_null);
+        cbm_return_item_t *item = &ret->items[ci];
+        bool direct = !item->func && !item->kase && !item->args;
+        cypher_value_t fallback_value;
+        cypher_value_t *value = NULL;
+        if (project_item_exact_value(b, item, &direct_values[ci])) {
+            value = &direct_values[ci];
+        } else {
+            const char *text = project_item(b, item, func_buffers[ci], CBM_SZ_512);
+            cypher_value_set_cstr(&fallback_value, text ? text : "", false);
+            value = &fallback_value;
         }
-        const char *v = project_item(b, &ret->items[ci], valbufs[ci], CBM_SZ_512);
-        if (v != valbufs[ci]) {
-            snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "");
+        vals[ci] = value->data;
+        value_lengths[ci] = value->length;
+        bool preserve_entity_identity = direct && !item->property;
+        if (!group_key_append_value(key, b, item->variable, preserve_entity_identity, value)) {
+            return false;
         }
-        vals[ci] = valbufs[ci];
-        klen = group_key_append(key, key_sz, klen, b, ret->items[ci].variable,
-                                ret->items[ci].property, vals[ci], is_null);
     }
+    return true;
 }
 
 /* Emit one aggregated row into the result builder */
-static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, result_builder_t *rb) {
-    const char *row[CBM_SZ_32];
-    char bufs[CBM_SZ_32][CBM_SZ_64];
+static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, result_builder_t *rb,
+                             const char **row, size_t *lengths, char **owned_values,
+                             cypher_value_t *formatted_values) {
+    bool complete = true;
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!ret->items[ci].func) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
             row[ci] = agg->group_vals[ci];
+            lengths[ci] = row[ci] ? strlen(row[ci]) : 0;
             continue;
         }
-        if (ret->items[ci].distinct && strcmp(ret->items[ci].func, "COUNT") == 0) {
-            /* COUNT(DISTINCT x) — number of unique values accumulated (#239). */
-            snprintf(bufs[ci], sizeof(bufs[ci]), "%d", agg->collect_counts[ci]);
-            row[ci] = bufs[ci];
-            continue;
+        int aggregate_count =
+            ret->items[ci].distinct && strcmp(ret->items[ci].func, "COUNT") == 0
+                ? agg->value_lists[ci].count
+                : agg->counts[ci];
+        if (!format_aggregate_value_exact(
+                ret->items[ci].func, aggregate_count, agg->sums[ci], agg->mins[ci],
+                agg->maxs[ci], agg->value_lists, ci, &formatted_values[ci])) {
+            complete = false;
+            break;
         }
-        format_agg_value(ret->items[ci].func, agg->counts[ci], agg->sums[ci], agg->mins[ci],
-                         agg->maxs[ci], agg->collect_lists, agg->collect_counts, ci, bufs[ci],
-                         sizeof(bufs[ci]));
-        row[ci] = bufs[ci];
+        row[ci] = formatted_values[ci].data;
+        lengths[ci] = formatted_values[ci].length;
+        owned_values[ci] = formatted_values[ci].owned;
+        formatted_values[ci].owned = NULL;
     }
-    rb_add_row(rb, row);
+    if (complete) {
+        rb_add_row_sized_owned(rb, row, lengths, owned_values);
+    }
+    for (int ci = 0; ci < ret->count; ci++) {
+        free(owned_values[ci]);
+        owned_values[ci] = NULL;
+        cypher_value_free(&formatted_values[ci]);
+    }
 }
 
 static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                result_builder_t *rb) {
+    const char **key_values = cypher_calloc_elements(ret->count, sizeof(*key_values));
+    size_t *key_value_lengths =
+        cypher_calloc_elements(ret->count, sizeof(*key_value_lengths));
+    cypher_value_t *direct_values =
+        cypher_calloc_elements(ret->count, sizeof(*direct_values));
+    char (*func_buffers)[CBM_SZ_512] =
+        cypher_calloc_elements(ret->count, sizeof(*func_buffers));
+    cypher_string_builder_t key = {0};
+    if (!key_values || !key_value_lengths || !direct_values || !func_buffers ||
+        !cypher_string_builder_reset(&key)) {
+        free(key_values);
+        free(key_value_lengths);
+        free(direct_values);
+        free(func_buffers);
+        cypher_string_builder_free(&key);
+        return;
+    }
     int agg_cap = CBM_SZ_256;
-    ret_agg_entry_t *aggs = calloc(agg_cap, sizeof(ret_agg_entry_t));
+    ret_agg_entry_t *aggs =
+        cypher_agg_calloc((size_t)agg_cap, sizeof(ret_agg_entry_t), CYP_AGG_ALLOC_INITIAL);
     int agg_count = 0;
     aggregate_group_index_t group_index = aggregate_group_index_create();
+    if (!aggs) {
+        g_cypher_allocation_failed = true;
+        aggregate_group_index_free(&group_index);
+        cypher_string_builder_free(&key);
+        free(func_buffers);
+        free(direct_values);
+        free(key_value_lengths);
+        free(key_values);
+        return;
+    }
 
     for (int bi = 0; bi < bind_count; bi++) {
         /* Keep the general execution deadline: group lookup is expected O(1),
@@ -5916,18 +8225,19 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
             break;
         }
-        char key[CBM_SZ_1K] = "";
-        const char *vals[CBM_SZ_32];
-        char valbufs[CBM_SZ_32][CBM_SZ_512];
-        ret_agg_build_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
+        if (!cypher_string_builder_reset(&key) ||
+            !ret_agg_build_key(ret, &bindings[bi], &key, key_values, key_value_lengths,
+                               direct_values, func_buffers)) {
+            break;
+        }
 
-        int found = aggregate_group_index_lookup(&group_index, key);
+        int found = aggregate_group_index_lookup(&group_index, key.data);
         if (!group_index.valid) {
             for (int a = 0; a < agg_count; a++) {
                 if (g_cypher_track_group_lookup_probes) {
                     g_cypher_group_lookup_probes++;
                 }
-                if (strcmp(aggs[a].group_key, key) == 0) {
+                if (strcmp(aggs[a].group_key, key.data) == 0) {
                     found = a;
                     break;
                 }
@@ -5935,18 +8245,68 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         }
         if (found < 0) {
             if (agg_count >= agg_cap) {
-                agg_cap *= PAIR_LEN;
-                aggs = safe_realloc(aggs, agg_cap * sizeof(ret_agg_entry_t));
+                if (agg_cap > INT_MAX / PAIR_LEN ||
+                    (size_t)(agg_cap * PAIR_LEN) > SIZE_MAX / sizeof(*aggs)) {
+                    g_cypher_allocation_failed = true;
+                    break;
+                }
+                int next_cap = agg_cap * PAIR_LEN;
+                ret_agg_entry_t *grown = cypher_agg_realloc(aggs, (size_t)next_cap * sizeof(*grown),
+                                                            CYP_AGG_ALLOC_GROUP_ARRAY_GROWTH);
+                if (!grown) {
+                    g_cypher_allocation_failed = true;
+                    break;
+                }
+                aggs = grown;
+                memset(&aggs[agg_cap], 0, (size_t)(next_cap - agg_cap) * sizeof(*aggs));
+                agg_cap = next_cap;
             }
-            found = agg_count++;
-            ret_agg_init_group(&aggs[found], key, ret->count, vals);
+            found = agg_count;
+            if (!ret_agg_init_group(&aggs[found], key.data, ret->count, key_values,
+                                    key_value_lengths)) {
+                break;
+            }
+            agg_count++;
             aggregate_group_index_insert(&group_index, aggs[found].group_key, found);
         }
-        ret_agg_accumulate(&aggs[found], ret, &bindings[bi]);
+        if (!ret_agg_accumulate(&aggs[found], ret, &bindings[bi])) {
+            break;
+        }
+        for (int ci = 0; ci < ret->count; ci++) {
+            cypher_value_free(&direct_values[ci]);
+        }
     }
 
-    for (int a = 0; a < agg_count; a++) {
-        ret_agg_emit_row(ret, &aggs[a], rb);
+    for (int ci = 0; ci < ret->count; ci++) {
+        cypher_value_free(&direct_values[ci]);
+    }
+    cypher_string_builder_free(&key);
+    free(func_buffers);
+    free(direct_values);
+    free(key_value_lengths);
+    free(key_values);
+    if (!g_cypher_allocation_failed) {
+        const char **emit_values = cypher_calloc_elements(ret->count, sizeof(*emit_values));
+        size_t *emit_lengths = cypher_calloc_elements(ret->count, sizeof(*emit_lengths));
+        char **emit_owned = cypher_calloc_elements(ret->count, sizeof(*emit_owned));
+        cypher_value_t *formatted_values =
+            cypher_calloc_elements(ret->count, sizeof(*formatted_values));
+        if (emit_values && emit_lengths && emit_owned && formatted_values) {
+            for (int a = 0; a < agg_count && !g_cypher_allocation_failed; a++) {
+                ret_agg_emit_row(ret, &aggs[a], rb, emit_values, emit_lengths, emit_owned,
+                                 formatted_values);
+            }
+        }
+        if (formatted_values) {
+            for (int ci = 0; ci < ret->count; ci++) {
+                free(emit_owned ? emit_owned[ci] : NULL);
+                cypher_value_free(&formatted_values[ci]);
+            }
+        }
+        free(formatted_values);
+        free(emit_owned);
+        free(emit_lengths);
+        free(emit_values);
     }
     aggregate_group_index_free(&group_index);
     ret_agg_free(aggs, agg_count, ret->count);
@@ -5954,31 +8314,23 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
 
 /* Build RETURN column names from items */
 static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret) {
-    const char *col_names[CBM_SZ_32];
-    for (int i = 0; i < ret->count && i < CBM_SZ_32; i++) {
-        cbm_return_item_t *item = &ret->items[i];
-        if (item->alias) {
-            col_names[i] = item->alias;
-        } else if (item->func) {
-            char buf[CBM_SZ_128];
-            snprintf(buf, sizeof(buf), "%s(%s)", item->func, item->variable);
-            col_names[i] = heap_strdup(buf);
-        } else if (item->kase) {
-            col_names[i] = "CASE";
-        } else if (item->property) {
-            char buf[CBM_SZ_128];
-            snprintf(buf, sizeof(buf), "%s.%s", item->variable, item->property);
-            col_names[i] = heap_strdup(buf);
-        } else {
-            col_names[i] = item->variable;
+    if (!ret) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    const char **col_names = cypher_calloc_elements(ret->count, sizeof(*col_names));
+    if (!col_names) {
+        return;
+    }
+    for (int i = 0; i < ret->count; i++) {
+        col_names[i] = cypher_item_name_owned(&ret->items[i]);
+        if (!col_names[i]) {
+            g_cypher_allocation_failed = true;
+            break;
         }
     }
-    rb_set_columns(rb, col_names, ret->count);
-    for (int i = 0; i < ret->count && i < CBM_SZ_32; i++) {
-        cbm_return_item_t *item = &ret->items[i];
-        if (!item->alias && (item->func || (!item->kase && item->property))) {
-            safe_str_free(&col_names[i]);
-        }
+    if (g_cypher_allocation_failed || !rb_adopt_columns(rb, col_names, ret->count)) {
+        free_string_vector(col_names, ret->count);
     }
 }
 
@@ -5998,50 +8350,70 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
             rb->truncated = true;
         }
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
-        const char *vals[CBM_SZ_32];
-        char func_bufs[CBM_SZ_32][CBM_SZ_512];
-        for (int ci = 0; ci < ret->count; ci++) {
-            vals[ci] =
-                project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
-        }
-        rb_add_row(rb, vals);
+    const char **vals = cypher_calloc_elements(ret->count, sizeof(*vals));
+    size_t *value_lengths = cypher_calloc_elements(ret->count, sizeof(*value_lengths));
+    cypher_value_t *direct_values =
+        cypher_calloc_elements(ret->count, sizeof(*direct_values));
+    char (*func_bufs)[CBM_SZ_512] = cypher_calloc_elements(ret->count, sizeof(*func_bufs));
+    if (!vals || !value_lengths || !direct_values || !func_bufs) {
+        free(vals);
+        free(value_lengths);
+        free(direct_values);
+        free(func_bufs);
+        return;
     }
+    for (int bi = 0; bi < bind_count && rb->row_count < proj_cap && !g_cypher_allocation_failed;
+        bi++) {
+        for (int ci = 0; ci < ret->count; ci++) {
+            cbm_return_item_t *item = &ret->items[ci];
+            if (project_item_exact_value(&bindings[bi], item, &direct_values[ci])) {
+                vals[ci] = direct_values[ci].data;
+                value_lengths[ci] = direct_values[ci].length;
+            } else {
+                vals[ci] = project_item(&bindings[bi], item, func_bufs[ci], sizeof(func_bufs[ci]));
+                value_lengths[ci] = vals[ci] ? strlen(vals[ci]) : 0;
+            }
+        }
+        rb_add_row_sized(rb, vals, value_lengths);
+        for (int ci = 0; ci < ret->count; ci++) {
+            cypher_value_free(&direct_values[ci]);
+        }
+    }
+    free(func_bufs);
+    free(direct_values);
+    free(value_lengths);
+    free(vals);
 }
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
 static void build_default_columns(result_builder_t *rb, const char **vars, int vc) {
-    if (vc > INT_MAX / CYP_EDGE_COLS) {
+    if (vc < 0 || vc > INT_MAX / CYP_EDGE_COLS) {
         g_cypher_allocation_failed = true;
         return;
     }
     int col_n = vc * CYP_EDGE_COLS;
-    const char **col_names = calloc(col_n > 0 ? (size_t)col_n : SKIP_ONE, sizeof(*col_names));
+    const char **col_names = cypher_calloc_elements(col_n, sizeof(*col_names));
     if (!col_names) {
         g_cypher_allocation_failed = true;
         return;
     }
     for (int v = 0; v < vc; v++) {
-        char buf[CBM_SZ_128];
-        snprintf(buf, sizeof(buf), "%s.name", vars[v]);
-        col_names[(size_t)v * CYP_EDGE_COLS] = heap_strdup(buf);
-        snprintf(buf, sizeof(buf), "%s.qualified_name", vars[v]);
-        col_names[((size_t)v * CYP_EDGE_COLS) + SKIP_ONE] = heap_strdup(buf);
-        snprintf(buf, sizeof(buf), "%s.label", vars[v]);
-        col_names[((size_t)v * CYP_EDGE_COLS) + PAIR_LEN] = heap_strdup(buf);
+        static const char *const suffixes[CYP_EDGE_COLS] = {
+            ".name", ".qualified_name", ".label"};
         size_t base = (size_t)v * CYP_EDGE_COLS;
-        if (!col_names[base] || !col_names[base + SKIP_ONE] || !col_names[base + PAIR_LEN]) {
-            g_cypher_allocation_failed = true;
-            break;
+        for (int ci = 0; ci < CYP_EDGE_COLS; ci++) {
+            const char *parts[] = {vars[v], suffixes[ci]};
+            col_names[base + (size_t)ci] =
+                cypher_join_parts(parts, sizeof(parts) / sizeof(parts[0]));
+            if (!col_names[base + (size_t)ci]) {
+                g_cypher_allocation_failed = true;
+                break;
+            }
         }
     }
-    if (!g_cypher_allocation_failed) {
-        rb_set_columns(rb, col_names, col_n);
+    if (g_cypher_allocation_failed || !rb_adopt_columns(rb, col_names, col_n)) {
+        free_string_vector(col_names, col_n);
     }
-    for (int i = 0; i < col_n; i++) {
-        safe_str_free(&col_names[i]);
-    }
-    free(col_names);
 }
 
 /* Default projection when no RETURN clause */
@@ -6050,6 +8422,10 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
     int vc = 0;
     for (int ni = 0; ni < pat0->node_count; ni++) {
         if (pat0->nodes[ni].variable) {
+            if (vc > INT_MAX - SKIP_ONE) {
+                g_cypher_allocation_failed = true;
+                return;
+            }
             vc++;
         }
     }
@@ -6404,9 +8780,11 @@ static void expand_patterns_from(cbm_store_t *store, cbm_query_t *q, int first_p
 
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
-        scan_pattern_nodes(store, project, max_working_rows + SKIP_ONE, max_working_rows,
-                           &patn->nodes[0], pattern_where, nvar, scan_mode, &extra_nodes,
-                           &extra_count);
+        if (!scan_pattern_nodes(store, project, max_working_rows + SKIP_ONE, max_working_rows,
+                                &patn->nodes[0], pattern_where, nvar, scan_mode, &extra_nodes,
+                                &extra_count)) {
+            return;
+        }
         if (patn->rel_count == 0) {
             cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt,
                              pattern_where, max_working_rows);
@@ -6495,7 +8873,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
     }
 
     if (ret->distinct) {
-        rb_apply_distinct(rb);
+        if (!rb_apply_distinct(rb)) {
+            return;
+        }
     }
     rb_apply_order_by(rb, ret);
     int output_limit = max_rows;
@@ -6574,8 +8954,11 @@ static void execute_single(cbm_store_t *store, cbm_query_t *q, const char *proje
     /* An explicit LIMIT 0 is a complete empty result for this prefix-safe
      * shape, so avoid touching the store at all. */
     if (!output_prefix_is_complete || exact_output_limit > 0) {
-        scan_pattern_nodes(store, project, candidate_limit, scan_working_budget, &pat0->nodes[0],
-                           q->where, var_name, scan_mode, &scanned, &scan_count);
+        if (!scan_pattern_nodes(store, project, candidate_limit, scan_working_budget,
+                                &pat0->nodes[0], q->where, var_name, scan_mode, &scanned,
+                                &scan_count)) {
+            return;
+        }
     }
 
     /* Build initial bindings with early WHERE */
@@ -6761,8 +9144,8 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
 
     cbm_query_t *q = NULL;
     char *err = NULL;
-    if (cbm_cypher_parse(query, &q, &err) < 0) {
-        out->error = err;
+    if (cbm_cypher_parse(query, &q, &err) < 0 || !q) {
+        out->error = err ? err : heap_strdup("query parser returned no executable query");
         return CBM_NOT_FOUND;
     }
 
@@ -6796,11 +9179,20 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
                    &rb);
 
     /* UNION chain */
+    char union_schema_error[CBM_SZ_512] = "";
+    int union_branch_number = PAIR_LEN;
     cbm_query_t *uq = q->union_next;
     while (uq) {
         result_builder_t rb2 = {0};
         execute_single(store, uq, project, max_working_rows, max_working_rows, scan_mode, false,
                        &rb2);
+        if (!g_cypher_allocation_failed && !g_cypher_store_failed && !g_cypher_timed_out &&
+            g_cypher_working_row_limit_hit == 0 &&
+            !rb_union_schema_matches(&rb, &rb2, union_branch_number, union_schema_error,
+                                     sizeof(union_schema_error))) {
+            rb_free(&rb2);
+            break;
+        }
         /* Concatenate rows from rb2 into rb */
         for (int i = 0; i < rb2.row_count; i++) {
             if (rb.row_count >= max_working_rows) {
@@ -6812,11 +9204,19 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         rb_free(&rb2);
 
         uq = uq->union_next;
+        union_branch_number++;
+    }
+
+    if (union_schema_error[0]) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error = heap_strdup(union_schema_error);
+        return CBM_NOT_FOUND;
     }
 
     /* UNION (not ALL) deduplication */
     if (q->union_next && !q->union_all) {
-        rb_apply_distinct(&rb);
+        (void)rb_apply_distinct(&rb);
     }
     /* max_rows is authoritative for the whole query, not independently for
      * each UNION branch. Apply it after UNION deduplication. */

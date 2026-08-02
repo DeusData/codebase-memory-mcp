@@ -147,4 +147,19 @@ enum {
 /* Common offset constants (used across many files). */
 enum { SKIP_ONE = 1, PAIR_LEN = 2 };
 
+/* ── Label allowlists for SQL ────────────────────────────────────
+ * SQL mirror of cbm_label_is_type_like() (internal/cbm/helpers.c). That
+ * function is documented as the single source of truth for type-like labels
+ * "instead of scattering `|| strcmp(label,\"Struct\")==0` across the tree" —
+ * but a SQL string literal cannot call it, so several queries hardcoded
+ * ('Function','Method','Class') and silently stopped matching the moment
+ * Struct/Interface/Enum/Type/Trait began being emitted.
+ *
+ * Use these instead of inlining a label list. tests/test_store_nodes.c pins
+ * them against cbm_label_is_type_like(), so adding a type-like label there
+ * without updating these fails CI rather than quietly shrinking query results. */
+#define CBM_SQL_TYPE_LIKE_LABELS "'Class','Struct','Interface','Enum','Type','Trait'"
+#define CBM_SQL_CALLABLE_LABELS "'Function','Method'"
+#define CBM_SQL_CALLABLE_OR_TYPE_LABELS CBM_SQL_CALLABLE_LABELS "," CBM_SQL_TYPE_LIKE_LABELS
+
 #endif /* CBM_CONSTANTS_H */

@@ -10,6 +10,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum {
+    REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT = 300,
+    REGISTRY_LONG_IDENTITY_FILL_BYTES = CBM_SZ_512 + CBM_SZ_64,
+    REGISTRY_DISTINCT_LABEL_FIXTURE_COUNT = CBM_SZ_64 + 1,
+};
+
+static char *registry_long_identity(const char *prefix, char fill, const char *suffix) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    if (prefix_len > SIZE_MAX - REGISTRY_LONG_IDENTITY_FILL_BYTES ||
+        prefix_len + REGISTRY_LONG_IDENTITY_FILL_BYTES > SIZE_MAX - suffix_len - SKIP_ONE) {
+        return NULL;
+    }
+    size_t size = prefix_len + REGISTRY_LONG_IDENTITY_FILL_BYTES + suffix_len + SKIP_ONE;
+    char *result = malloc(size);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, prefix, prefix_len);
+    memset(result + prefix_len, fill, REGISTRY_LONG_IDENTITY_FILL_BYTES);
+    memcpy(result + prefix_len + REGISTRY_LONG_IDENTITY_FILL_BYTES, suffix, suffix_len + SKIP_ONE);
+    return result;
+}
+
 /* ── FQN computation ──────────────────────────────────────────────── */
 
 TEST(fqn_simple) {
@@ -527,16 +551,13 @@ TEST(resolve_suffix_match_tie_is_insertion_order_independent) {
     PASS();
 }
 
-/* A name with more than REG_MAX_CANDIDATES (256) registered definitions is
- * unresolvable by name alone: the candidate penalty floors its confidence to
- * ~3/count (noise), while walking the candidate array per file dominated
- * usage-resolution CPU on the Linux kernel ("flags"/"dev"/"list_head" have
- * 4-7k definitions each). resolve must bail out with an empty result instead
- * of scanning and emitting a near-zero-confidence edge. */
+/* A high-cardinality bare name with no exact qualified/import signal remains
+ * unresolved: its confidence is noise, while scanning these names dominated
+ * usage-resolution CPU on the Linux kernel. */
 TEST(resolve_caps_unresolvably_ambiguous_names) {
     cbm_registry_t *r = cbm_registry_new();
-    for (int i = 0; i < 300; i++) {
-        char qn[64];
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
         snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
         cbm_registry_add(r, "flags", qn, "Variable");
     }
@@ -549,6 +570,154 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
     ASSERT_STR_EQ(res.strategy, "same_module");
 
     cbm_registry_free(r);
+    PASS();
+}
+
+/* Candidate cardinality is not a reason to discard an exact qualified-tail
+ * signal. The parent cap executes before Strategy 3.5 and loses this match. */
+TEST(resolve_high_cardinality_qualified_tail) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "proj.ns%d.run", i);
+        cbm_registry_add(r, "run", qn, "Function");
+    }
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "ns299.run", "proj.caller", NULL, NULL, 0);
+    bool exact = res.qualified_name && strcmp(res.qualified_name, "proj.ns299.run") == 0 &&
+                 res.strategy && strcmp(res.strategy, "qualified_suffix") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+/* An import-reachability signal can reduce an arbitrarily large by-name set to
+ * one exact candidate. The parent cap discards the signal before filtering. */
+TEST(resolve_high_cardinality_unique_import_reachable) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
+        cbm_registry_add(r, "flags", qn, "Variable");
+    }
+    const char *import_keys[] = {"target"};
+    const char *import_values[] = {"proj.mod299"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "flags", "proj.caller", import_keys, import_values, 1);
+    bool exact = res.qualified_name && strcmp(res.qualified_name, "proj.mod299.flags") == 0 &&
+                 res.strategy && strcmp(res.strategy, "suffix_match") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_fuzzy_high_cardinality_unique_import_reachable) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
+        cbm_registry_add(r, "flags", qn, "Variable");
+    }
+    const char *import_values[] = {"proj.mod299"};
+    cbm_fuzzy_result_t result =
+        cbm_registry_fuzzy_resolve(r, "unknown.flags", "proj.caller", NULL, import_values, 1);
+    bool exact = result.ok && result.result.qualified_name &&
+                 strcmp(result.result.qualified_name, "proj.mod299.flags") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(registry_retains_more_than_parent_label_pool) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_DISTINCT_LABEL_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        char label[CBM_SZ_32];
+        snprintf(qn, sizeof(qn), "proj.symbol%d", i);
+        snprintf(label, sizeof(label), "Label%d", i);
+        cbm_registry_add(r, "symbol", qn, label);
+    }
+    const char *last_label = cbm_registry_label_of(r, "proj.symbol64");
+    bool exact = cbm_registry_size(r) == REGISTRY_DISTINCT_LABEL_FIXTURE_COUNT && last_label &&
+                 strcmp(last_label, "Label64") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_import_map_preserves_long_key_and_target) {
+    char *alias = registry_long_identity("alias", 'a', "");
+    char *callee = registry_long_identity("alias", 'a', ".run");
+    char *resolved = registry_long_identity("proj.", 'r', "");
+    char *target = registry_long_identity("proj.", 'r', ".run");
+    if (!alias || !callee || !resolved || !target) {
+        free(target);
+        free(resolved);
+        free(callee);
+        free(alias);
+        FAIL("long import fixture allocation");
+    }
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "run", target, "Function");
+    const char *keys[] = {alias};
+    const char *values[] = {resolved};
+    cbm_resolution_t result = cbm_registry_resolve(r, callee, "proj.caller", keys, values, 1);
+    bool exact = result.qualified_name && strcmp(result.qualified_name, target) == 0 &&
+                 result.strategy && strcmp(result.strategy, "import_map") == 0;
+    cbm_registry_free(r);
+    free(target);
+    free(resolved);
+    free(callee);
+    free(alias);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_same_module_preserves_long_identity) {
+    char *module = registry_long_identity("proj.", 'm', "");
+    char *target = registry_long_identity("proj.", 'm', ".run");
+    if (!module || !target) {
+        free(target);
+        free(module);
+        FAIL("long same-module fixture allocation");
+    }
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "run", target, "Function");
+    cbm_resolution_t result = cbm_registry_resolve(r, "run", module, NULL, NULL, 0);
+    bool exact = result.qualified_name && strcmp(result.qualified_name, target) == 0 &&
+                 result.strategy && strcmp(result.strategy, "same_module") == 0;
+    cbm_registry_free(r);
+    free(target);
+    free(module);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_qualified_tail_preserves_long_identity) {
+    char *callee = registry_long_identity("ns.", 'q', ".run");
+    char *target = registry_long_identity("proj.ns.", 'q', ".run");
+    if (!callee || !target) {
+        free(target);
+        free(callee);
+        FAIL("long qualified-tail fixture allocation");
+    }
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "run", target, "Function");
+    cbm_registry_add(r, "run", "proj.other.run", "Function");
+    cbm_resolution_t result = cbm_registry_resolve(r, callee, "proj.caller", NULL, NULL, 0);
+    bool exact = result.qualified_name && strcmp(result.qualified_name, target) == 0 &&
+                 result.strategy && strcmp(result.strategy, "qualified_suffix") == 0;
+    cbm_registry_free(r);
+    free(target);
+    free(callee);
+    ASSERT_TRUE(exact);
     PASS();
 }
 
@@ -984,6 +1153,13 @@ SUITE(registry) {
     RUN_TEST(resolve_suffix_match);
     RUN_TEST(resolve_suffix_match_tie_is_insertion_order_independent);
     RUN_TEST(resolve_caps_unresolvably_ambiguous_names);
+    RUN_TEST(resolve_high_cardinality_qualified_tail);
+    RUN_TEST(resolve_high_cardinality_unique_import_reachable);
+    RUN_TEST(resolve_fuzzy_high_cardinality_unique_import_reachable);
+    RUN_TEST(registry_retains_more_than_parent_label_pool);
+    RUN_TEST(resolve_import_map_preserves_long_key_and_target);
+    RUN_TEST(resolve_same_module_preserves_long_identity);
+    RUN_TEST(resolve_qualified_tail_preserves_long_identity);
     RUN_TEST(resolve_import_map_suffix);
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);

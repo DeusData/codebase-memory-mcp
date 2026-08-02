@@ -244,7 +244,6 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
 }
 
 enum {
-    FQN_PATH_BUF = 1024,
     FQN_SEP_LEN = 1, /* one byte for the '/' separator */
     FQN_NUL_LEN = 1, /* one byte for the terminating NUL */
     FQN_DOTDOT_LEN = 2,
@@ -254,48 +253,85 @@ enum {
     FQN_REL_KIND_JS = 2,
 };
 
-/* Append a single path segment to a mutable buffer that already holds a
- * normalized slash-separated path.  Adds a '/' separator when needed,
- * returns false if the buffer would overflow. */
-static bool path_append_segment(char *buf, size_t buf_size, const char *seg, size_t seg_len) {
-    size_t cur = strlen(buf);
-    size_t need = cur + (cur > 0 ? FQN_SEP_LEN : 0) + seg_len + FQN_NUL_LEN;
-    if (need > buf_size) {
+/* Append one segment to an owned slash-separated path. `buf_size` includes
+ * the terminating NUL. Tracking `path_len` avoids rescanning the growing path;
+ * subtraction after validating it keeps the capacity check overflow-safe. */
+static bool path_append_segment(char *buf, size_t buf_size, size_t *path_len, const char *seg,
+                                size_t seg_len) {
+    size_t cur = *path_len;
+    if (cur >= buf_size) {
+        return false;
+    }
+    size_t separator = cur > 0 ? FQN_SEP_LEN : 0;
+    size_t available = buf_size - cur - FQN_NUL_LEN;
+    if (separator > available || seg_len > available - separator) {
         return false;
     }
     if (cur > 0) {
         buf[cur++] = '/';
     }
     memcpy(buf + cur, seg, seg_len);
-    buf[cur + seg_len] = '\0';
+    cur += seg_len;
+    buf[cur] = '\0';
+    *path_len = cur;
     return true;
 }
 
-/* Pop the last segment from a mutable slash-separated path. */
-static void path_pop_segment(char *buf) {
-    char *last = strrchr(buf, '/');
-    if (last) {
-        *last = '\0';
-    } else {
-        buf[0] = '\0';
+/* Pop the last segment without rescanning any retained prefix. Across one
+ * resolution, bytes removed from the source or appended module are visited at
+ * most once by pops, preserving O(S + M) total runtime. */
+static void path_pop_segment(char *buf, size_t *path_len) {
+    size_t length = *path_len;
+    while (length > 0 && buf[length - FQN_SEP_LEN] != '/') {
+        length--;
     }
+    if (length > 0) {
+        length--;
+    }
+    buf[length] = '\0';
+    *path_len = length;
 }
 
-/* Seed `buf` with the source file's directory (strip the basename) and
- * normalize backslashes. */
-static void seed_source_dir(char *buf, size_t buf_size, const char *source_rel) {
-    snprintf(buf, buf_size, "%s", source_rel ? source_rel : "");
-    for (char *p = buf; *p; p++) {
-        if (*p == '\\') {
-            *p = '/';
-        }
+/* Allocate one buffer large enough for the complete source path, every module
+ * byte, one possible joining slash, and NUL. Relative resolution never expands
+ * separators, so this single allocation is an exact upper bound: O(S + M)
+ * runtime and O(S + M) returned/working memory for S source and M module bytes. */
+static char *relative_path_buffer_new(const char *source_rel, const char *module_path,
+                                      size_t *buf_size, size_t *path_len) {
+    if (!module_path || !buf_size || !path_len) {
+        return NULL;
     }
+    const char *source = source_rel ? source_rel : "";
+    size_t source_len = strlen(source);
+    size_t module_len = strlen(module_path);
+    if (source_len > SIZE_MAX - module_len) {
+        return NULL;
+    }
+    size_t capacity = source_len + module_len;
+    if (capacity > SIZE_MAX - FQN_SEP_LEN) {
+        return NULL;
+    }
+    capacity += FQN_SEP_LEN;
+    if (capacity > SIZE_MAX - FQN_NUL_LEN) {
+        return NULL;
+    }
+    capacity += FQN_NUL_LEN;
+    char *buf = malloc(capacity);
+    if (!buf) {
+        return NULL;
+    }
+    memcpy(buf, source, source_len + FQN_NUL_LEN);
+    cbm_normalize_path_sep(buf);
     char *last = strrchr(buf, '/');
     if (last) {
         *last = '\0';
+        *path_len = (size_t)(last - buf);
     } else {
         buf[0] = '\0';
+        *path_len = 0;
     }
+    *buf_size = capacity;
+    return buf;
 }
 
 /* Detect the flavor of relative import based on the leading characters.
@@ -316,15 +352,16 @@ static int classify_relative_import(const char *module_path) {
 }
 
 /* Python relative import: ".foo", "..bar.baz" → resolve against source dir. */
-static char *resolve_python_relative(char *buf, size_t buf_size, const char *module_path) {
+static bool resolve_python_relative(char *buf, size_t buf_size, size_t *path_len,
+                                    const char *module_path) {
     const char *p = module_path;
-    int dot_count = 0;
+    size_t dot_count = 0;
     while (*p == '.') {
         dot_count++;
         p++;
     }
-    for (int i = FQN_MIN_PY_DOTS; i < dot_count; i++) {
-        path_pop_segment(buf);
+    for (size_t i = FQN_MIN_PY_DOTS; i < dot_count; i++) {
+        path_pop_segment(buf, path_len);
     }
     while (*p) {
         const char *seg_start = p;
@@ -332,14 +369,14 @@ static char *resolve_python_relative(char *buf, size_t buf_size, const char *mod
             p++;
         }
         size_t seg_len = (size_t)(p - seg_start);
-        if (seg_len > 0 && !path_append_segment(buf, buf_size, seg_start, seg_len)) {
-            return NULL;
+        if (seg_len > 0 && !path_append_segment(buf, buf_size, path_len, seg_start, seg_len)) {
+            return false;
         }
         if (*p == '.') {
             p++;
         }
     }
-    return strdup(buf);
+    return true;
 }
 
 /* Strip a trailing file extension from a segment (e.g. "helpers.ts" → "helpers").
@@ -347,7 +384,8 @@ static char *resolve_python_relative(char *buf, size_t buf_size, const char *mod
 static size_t strip_ext(const char *seg_start, size_t seg_len) {
     const char *seg_end = seg_start + seg_len;
     const char *dot = NULL;
-    for (const char *d = seg_end - FQN_SEP_LEN; d >= seg_start; d--) {
+    for (const char *d = seg_end; d > seg_start;) {
+        d--;
         if (*d == '.') {
             dot = d;
             break;
@@ -360,7 +398,8 @@ static size_t strip_ext(const char *seg_start, size_t seg_len) {
 }
 
 /* JS/TS relative import: "./foo", "../bar/baz" → resolve against source dir. */
-static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_path) {
+static bool resolve_js_relative(char *buf, size_t buf_size, size_t *path_len,
+                                const char *module_path) {
     const char *p = module_path;
     while (*p) {
         while (*p == '/') {
@@ -378,17 +417,17 @@ static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_
             continue;
         }
         if (seg_len == FQN_DOTDOT_LEN && seg_start[0] == '.' && seg_start[FQN_SEP_LEN] == '.') {
-            path_pop_segment(buf);
+            path_pop_segment(buf, path_len);
             continue;
         }
         if (*p == '\0') {
             seg_len = strip_ext(seg_start, seg_len);
         }
-        if (seg_len > 0 && !path_append_segment(buf, buf_size, seg_start, seg_len)) {
-            return NULL;
+        if (seg_len > 0 && !path_append_segment(buf, buf_size, path_len, seg_start, seg_len)) {
+            return false;
         }
     }
-    return strdup(buf);
+    return true;
 }
 
 char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *module_path) {
@@ -396,12 +435,20 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
     if (kind == FQN_REL_KIND_NONE) {
         return NULL;
     }
-    char buf[FQN_PATH_BUF];
-    seed_source_dir(buf, sizeof(buf), source_rel);
-    if (kind == FQN_REL_KIND_PYTHON) {
-        return resolve_python_relative(buf, sizeof(buf), module_path);
+    size_t buf_size = 0;
+    size_t path_len = 0;
+    char *buf = relative_path_buffer_new(source_rel, module_path, &buf_size, &path_len);
+    if (!buf) {
+        return NULL;
     }
-    return resolve_js_relative(buf, sizeof(buf), module_path);
+    bool complete = kind == FQN_REL_KIND_PYTHON
+                        ? resolve_python_relative(buf, buf_size, &path_len, module_path)
+                        : resolve_js_relative(buf, buf_size, &path_len, module_path);
+    if (!complete) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
 }
 
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {

@@ -36,32 +36,95 @@
  *     container nodes without indicating architectural importance.
  *   - WRITES/DECORATES explicit: small but non-zero contribution. */
 const cbm_edge_weights_t CBM_DEFAULT_EDGE_WEIGHTS = {
-    .calls = 1.0, .defines_method = 0.5, .defines = 0.1,
-    .imports = 0.3, .usage = 0.7, .configures = 0.1,
-    .http_calls = 0.5, .async_calls = 0.8,
-    .tests = 0.05, .writes = 0.15, .decorates = 0.2,
-    .default_weight = 0.1,
-    .member_rank_factor = 0.5
+#define CBM_PAGERANK_DEFAULT_INIT(edge_type, default_token, config_token, field) \
+    .field = CBM_PAGERANK_WEIGHT_##default_token##_DEFAULT,
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_DEFAULT_INIT)
+#undef CBM_PAGERANK_DEFAULT_INIT
 };
+
+enum {
+    PAGERANK_SCAN_NODES = 0,
+    PAGERANK_SCAN_EDGES = 1,
+};
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+_Static_assert((int)CBM_PAGERANK_TEST_SCAN_NODES == PAGERANK_SCAN_NODES,
+               "node scan seam must match the internal scan kind");
+_Static_assert((int)CBM_PAGERANK_TEST_SCAN_EDGES == PAGERANK_SCAN_EDGES,
+               "edge scan seam must match the internal scan kind");
+static _Thread_local cbm_pagerank_test_scan_t g_pagerank_test_failed_scan =
+    CBM_PAGERANK_TEST_SCAN_NODES;
+static _Thread_local int g_pagerank_test_scan_rows_before_failure = -1;
+
+void cbm_pagerank_test_fail_scan_after(cbm_pagerank_test_scan_t scan, int successful_rows) {
+    if ((scan != CBM_PAGERANK_TEST_SCAN_NODES && scan != CBM_PAGERANK_TEST_SCAN_EDGES) ||
+        successful_rows < 0) {
+        g_pagerank_test_scan_rows_before_failure = -1;
+        return;
+    }
+    g_pagerank_test_failed_scan = scan;
+    g_pagerank_test_scan_rows_before_failure = successful_rows;
+}
+#endif
+
+/* Preserve SQLite's ROW/DONE/error contract at both graph-input scans. Tests
+ * can replace one ROW with SQLITE_IOERR after a deterministic number of rows;
+ * production builds compile to one sqlite3_step call. */
+static inline int pagerank_scan_step(sqlite3_stmt *stmt, int scan) {
+    int rc = sqlite3_step(stmt);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_pagerank_test_scan_rows_before_failure >= 0 &&
+        scan == (int)g_pagerank_test_failed_scan) {
+        /* The failpoint belongs to one target scan, not the worker thread's
+         * lifetime. DONE or a real SQLite error therefore consumes it even
+         * when the requested row threshold was never reached. */
+        if (rc != SQLITE_ROW) {
+            g_pagerank_test_scan_rows_before_failure = -1;
+            return rc;
+        }
+        if (g_pagerank_test_scan_rows_before_failure == 0) {
+            g_pagerank_test_scan_rows_before_failure = -1;
+            return SQLITE_IOERR;
+        }
+        g_pagerank_test_scan_rows_before_failure--;
+    }
+#else
+    (void)scan;
+#endif
+    return rc;
+}
 
 /* ── Edge weight lookup (ordered by frequency) ─────────────── */
 
 static double edge_type_weight(const cbm_edge_weights_t *w, const char *type) {
     if (!type) return w->default_weight;
     /* Ordered by frequency (most common first for fast path) */
-    if (strcmp(type, "CALLS") == 0)          return w->calls;
-    if (strcmp(type, "DEFINES") == 0)        return w->defines;
-    if (strcmp(type, "TESTS") == 0)          return w->tests;
-    if (strcmp(type, "USAGE") == 0)          return w->usage;
-    if (strcmp(type, "DEFINES_METHOD") == 0) return w->defines_method;
-    if (strcmp(type, "WRITES") == 0)         return w->writes;
-    if (strcmp(type, "CONFIGURES") == 0)     return w->configures;
-    if (strcmp(type, "IMPORTS") == 0)        return w->imports;
-    if (strcmp(type, "DECORATES") == 0)      return w->decorates;
-    if (strcmp(type, "MEMBER_OF") == 0)      return w->member_rank_factor;
-    if (strcmp(type, "HTTP_CALLS") == 0)     return w->http_calls;
-    if (strcmp(type, "ASYNC_CALLS") == 0)    return w->async_calls;
+#define CBM_PAGERANK_EDGE_LOOKUP(edge_type, default_token, config_token, field) \
+    if (strcmp(type, edge_type) == 0) return w->field;
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_EDGE_LOOKUP)
+#undef CBM_PAGERANK_EDGE_LOOKUP
     return w->default_weight;
+}
+
+/* Config-backed callers are validated before this boundary, but the public C
+ * API also accepts an explicit weight structure. Normalize only invalid
+ * fields so one bad value cannot poison a weighted-degree sum and valid custom
+ * fields—including zero, which intentionally disables an edge kind—remain
+ * effective. The fixed field count makes this O(1) runtime and O(1) memory;
+ * the canonical mapping keeps it in lockstep with defaults and config loading. */
+static const cbm_edge_weights_t *
+pagerank_effective_edge_weights(const cbm_edge_weights_t *weights,
+                                cbm_edge_weights_t *normalized) {
+    if (!weights || weights == &CBM_DEFAULT_EDGE_WEIGHTS) return &CBM_DEFAULT_EDGE_WEIGHTS;
+    *normalized = *weights;
+#define CBM_PAGERANK_NORMALIZE_WEIGHT(edge_type, default_token, config_token, field)         \
+    if (!(normalized->field >= CBM_PAGERANK_EDGE_WEIGHT_MIN &&                              \
+          normalized->field <= CBM_PAGERANK_EDGE_WEIGHT_MAX)) {                             \
+        normalized->field = CBM_PAGERANK_WEIGHT_##default_token##_DEFAULT;                   \
+    }
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_NORMALIZE_WEIGHT)
+#undef CBM_PAGERANK_NORMALIZE_WEIGHT
+    return normalized;
 }
 
 /* ── Internal edge struct ────────────────────────────────────── */
@@ -101,8 +164,29 @@ typedef struct {
     int cap;
 } id_map_t;
 
+static bool pagerank_id_map_capacity(int node_count, int *capacity) {
+    if (!capacity || node_count <= 0 ||
+        node_count > (INT_MAX - SKIP_ONE) / CBM_HASHMAP_LOAD_FACTOR) {
+        return false;
+    }
+    *capacity = node_count * CBM_HASHMAP_LOAD_FACTOR + SKIP_ONE;
+    return true;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_pagerank_test_id_map_capacity(int node_count, int *capacity) {
+    return pagerank_id_map_capacity(node_count, capacity);
+}
+#endif
+
 static int id_map_init(id_map_t *m, int n) {
-    m->cap = n * CBM_HASHMAP_LOAD_FACTOR + 1;
+    if (!m || !pagerank_id_map_capacity(n, &m->cap)) {
+        return -1;
+    }
+    if ((size_t)m->cap > SIZE_MAX / sizeof(*m->keys) ||
+        (size_t)m->cap > SIZE_MAX / sizeof(*m->vals)) {
+        return -1;
+    }
     m->keys = calloc((size_t)m->cap, sizeof(int64_t));
     m->vals = calloc((size_t)m->cap, sizeof(int));
     if (!m->keys || !m->vals) {
@@ -138,16 +222,17 @@ static void id_map_free(id_map_t *m) {
     m->vals = NULL;
 }
 
-static int grow_node_arrays(int64_t **node_ids, char ***node_labels,
-                            char ***node_projects, int new_cap) {
-    /* These arrays own child strings. Use realloc rather than safe_realloc so
-     * OOM preserves the old arrays and cleanup can still free their children. */
-    int64_t *new_ids = realloc(*node_ids, (size_t)new_cap * sizeof(int64_t));
+static int grow_node_arrays(int64_t **node_ids, char ***node_projects, int new_cap) {
+    /* node_projects owns child strings. Use realloc rather than safe_realloc so
+     * OOM preserves the old arrays and cleanup can still free those children. */
+    if (!node_ids || !node_projects || new_cap <= 0 ||
+        (size_t)new_cap > SIZE_MAX / sizeof(**node_ids) ||
+        (size_t)new_cap > SIZE_MAX / sizeof(**node_projects)) {
+        return -1;
+    }
+    int64_t *new_ids = realloc(*node_ids, (size_t)new_cap * sizeof(**node_ids));
     if (!new_ids) return -1;
     *node_ids = new_ids;
-    char **new_labels = realloc(*node_labels, (size_t)new_cap * sizeof(char *));
-    if (!new_labels) return -1;
-    *node_labels = new_labels;
     char **new_projects = realloc(*node_projects, (size_t)new_cap * sizeof(char *));
     if (!new_projects) return -1;
     *node_projects = new_projects;
@@ -156,7 +241,10 @@ static int grow_node_arrays(int64_t **node_ids, char ***node_labels,
 
 static int grow_edge_array(pr_edge_t **edges, int new_cap) {
     /* pr_edge_t owns project strings, so preserve the old array on OOM. */
-    pr_edge_t *new_edges = realloc(*edges, (size_t)new_cap * sizeof(pr_edge_t));
+    if (!edges || new_cap <= 0 || (size_t)new_cap > SIZE_MAX / sizeof(**edges)) {
+        return -1;
+    }
+    pr_edge_t *new_edges = realloc(*edges, (size_t)new_cap * sizeof(**edges));
     if (!new_edges) return -1;
     *edges = new_edges;
     return 0;
@@ -321,16 +409,20 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
                          const cbm_edge_weights_t *weights,
                          cbm_rank_scope_t scope) {
     if (!store || !project || !project[0]) return -1;
-    if (!weights) weights = &CBM_DEFAULT_EDGE_WEIGHTS;
+    cbm_edge_weights_t normalized_weights;
+    weights = pagerank_effective_edge_weights(weights, &normalized_weights);
     /* Reject out-of-range AND NaN. IEEE-754 makes every NaN comparison false,
      * so the naive `damping < 0 || damping > 1` form lets NaN through (it then
      * poisons every rank and prevents convergence). The inverted-range form
      * `!(x >= lo && x <= hi)` rejects NaN because the inner >= is false.
      * NaN is reachable via config (strtod parses "nan") since damping/epsilon
      * became user-tunable. */
-    if (!(damping >= 0.0 && damping <= 1.0)) damping = CBM_PAGERANK_DAMPING;
-    if (max_iter <= 0) max_iter = CBM_PAGERANK_MAX_ITER;
-    if (!(epsilon > 0.0)) epsilon = CBM_PAGERANK_EPSILON;
+    if (!(damping >= CBM_PAGERANK_DAMPING_MIN && damping <= CBM_PAGERANK_DAMPING_MAX))
+        damping = CBM_PAGERANK_DAMPING;
+    if (max_iter < CBM_PAGERANK_MAX_ITER_MIN) max_iter = CBM_PAGERANK_MAX_ITER;
+    if (!(epsilon > CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE &&
+          epsilon <= CBM_PAGERANK_EPSILON_MAX))
+        epsilon = CBM_PAGERANK_EPSILON;
 
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) return -1;
@@ -347,12 +439,11 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     id_map_t map = {0};
     int N = 0, E = 0, result = -1;
 
-    char **node_labels = NULL;   /* label per node, parallel to node_ids */
     char **node_projects = NULL; /* owning project per node, parallel to node_ids */
 
-    /* ── Step 1: Load node IDs + labels ───────────────────── */
+    /* ── Step 1: Load node IDs + owning projects ──────────── */
     char sql_buf[512];
-    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, label, project FROM nodes WHERE %s",
+    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, project FROM nodes WHERE %s",
              scope_where(scope));
 
     sqlite3_stmt *stmt = NULL;
@@ -362,21 +453,20 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     int cap = CBM_PAGERANK_INITIAL_CAP;
     node_ids = malloc((size_t)cap * sizeof(int64_t));
-    node_labels = malloc((size_t)cap * sizeof(char *));
     node_projects = malloc((size_t)cap * sizeof(char *));
-    if (!node_ids || !node_labels || !node_projects) {
+    if (!node_ids || !node_projects) {
         sqlite3_finalize(stmt);
         free(node_ids);
-        free(node_labels);
         free(node_projects);
         return -1;
     }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int scan_rc = SQLITE_OK;
+    while ((scan_rc = pagerank_scan_step(stmt, PAGERANK_SCAN_NODES)) == SQLITE_ROW) {
         if (N >= cap) {
             int new_cap = 0;
             if (next_pagerank_capacity(cap, &new_cap) != 0 ||
-                grow_node_arrays(&node_ids, &node_labels, &node_projects, new_cap) != 0) {
+                grow_node_arrays(&node_ids, &node_projects, new_cap) != 0) {
                 sqlite3_finalize(stmt);
                 stmt = NULL;
                 goto cleanup;
@@ -384,27 +474,24 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
             cap = new_cap;
         }
         node_ids[N] = sqlite3_column_int64(stmt, 0);
-        const char *lbl = (const char *)sqlite3_column_text(stmt, 1);
-        const char *proj = (const char *)sqlite3_column_text(stmt, 2);
-        char *label_copy = lbl ? cbm_strdup(lbl) : NULL;
+        const char *proj = (const char *)sqlite3_column_text(stmt, 1);
         char *project_copy = cbm_strdup((proj && proj[0]) ? proj : project);
-        if ((lbl && !label_copy) || !project_copy) {
-            free(label_copy);
-            free(project_copy);
+        if (!project_copy) {
             sqlite3_finalize(stmt);
             stmt = NULL;
             goto cleanup;
         }
-        node_labels[N] = label_copy;
         node_projects[N] = project_copy;
         N++;
     }
     sqlite3_finalize(stmt);
     stmt = NULL;
+    if (scan_rc != SQLITE_DONE) {
+        goto cleanup;
+    }
 
     if (N == 0) {
         free(node_ids);
-        free(node_labels); /* no strdup'd elements since N==0 */
         free(node_projects);
         return clear_rank_rows_for_project(store, project);
     }
@@ -412,9 +499,6 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     /* Build id->index map */
     if (id_map_init(&map, N) != 0) {
         free(node_ids);
-        /* free all strdup'd labels accumulated before the failure */
-        for (int i = 0; i < N; i++) free(node_labels[i]);
-        free(node_labels);
         for (int i = 0; i < N; i++) free(node_projects[i]);
         free(node_projects);
         return -1;
@@ -431,9 +515,13 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
 
     int ecap = CBM_PAGERANK_INITIAL_CAP;
     edges = malloc((size_t)ecap * sizeof(pr_edge_t));
-    if (!edges) { sqlite3_finalize(stmt); goto cleanup; }
+    if (!edges) {
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+        goto cleanup;
+    }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while ((scan_rc = pagerank_scan_step(stmt, PAGERANK_SCAN_EDGES)) == SQLITE_ROW) {
         int64_t eid = sqlite3_column_int64(stmt, 0);
         int64_t src = sqlite3_column_int64(stmt, 1);
         int64_t dst = sqlite3_column_int64(stmt, 2);
@@ -470,6 +558,9 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     }
     sqlite3_finalize(stmt);
     stmt = NULL;
+    if (scan_rc != SQLITE_DONE) {
+        goto cleanup;
+    }
 
     /* ── Step 3: Allocate computation buffers ─────────────── */
     out_weight = calloc((size_t)N, sizeof(double));
@@ -694,10 +785,6 @@ publish_rollback:
 cleanup:
     if (stmt) sqlite3_finalize(stmt);  /* defensive: finalize any in-flight stmt */
     free(node_ids);
-    if (node_labels) {
-        for (int i = 0; i < N; i++) free(node_labels[i]);
-        free(node_labels);
-    }
     if (node_projects) {
         for (int i = 0; i < N; i++) free(node_projects[i]);
         free(node_projects);
@@ -735,19 +822,11 @@ int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
     if (!cfg) return cbm_pagerank_compute_default(store, project);
 
     cbm_edge_weights_t w;
-    w.calls          = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,          CBM_DEFAULT_EDGE_WEIGHTS.calls);
-    w.defines_method = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD, CBM_DEFAULT_EDGE_WEIGHTS.defines_method);
-    w.defines        = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFINES,        CBM_DEFAULT_EDGE_WEIGHTS.defines);
-    w.imports        = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_IMPORTS,        CBM_DEFAULT_EDGE_WEIGHTS.imports);
-    w.usage          = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_USAGE,          CBM_DEFAULT_EDGE_WEIGHTS.usage);
-    w.configures     = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CONFIGURES,     CBM_DEFAULT_EDGE_WEIGHTS.configures);
-    w.http_calls     = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS,     CBM_DEFAULT_EDGE_WEIGHTS.http_calls);
-    w.async_calls    = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS,    CBM_DEFAULT_EDGE_WEIGHTS.async_calls);
-    w.tests          = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_TESTS,          CBM_DEFAULT_EDGE_WEIGHTS.tests);
-    w.writes         = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_WRITES,         CBM_DEFAULT_EDGE_WEIGHTS.writes);
-    w.decorates      = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DECORATES,      CBM_DEFAULT_EDGE_WEIGHTS.decorates);
-    w.default_weight      = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_DEFAULT,        CBM_DEFAULT_EDGE_WEIGHTS.default_weight);
-    w.member_rank_factor  = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF,    CBM_DEFAULT_EDGE_WEIGHTS.member_rank_factor);
+#define CBM_PAGERANK_CONFIG_LOAD(edge_type, default_token, config_token, field)              \
+    w.field = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_##config_token,               \
+                                    CBM_DEFAULT_EDGE_WEIGHTS.field);
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_CONFIG_LOAD)
+#undef CBM_PAGERANK_CONFIG_LOAD
 
     int max_iter = cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER);
     double damping = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING);

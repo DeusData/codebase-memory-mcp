@@ -48,7 +48,13 @@
 extern char **environ;
 #endif
 
-enum { MCP_REQUEST_TEST_TIMEOUT_SECONDS = 5 };
+enum {
+    MCP_REQUEST_TEST_TIMEOUT_SECONDS = 5,
+    MCP_TEST_SQLITE_AUTO_LEN = -1,
+    MCP_TEST_PROJECT_BIND = 1,
+    MCP_TEST_TOKEN_BIND = 2,
+    MCP_TEST_VECTOR_BIND = 3,
+};
 
 static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
     yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
@@ -134,13 +140,14 @@ static void cleanup_project_db(const char *cache, const char *project) {
 }
 
 static bool test_file_exists_mcp(const char *path) {
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = cbm_fopen(path, "rb");
     if (!fp) {
         return false;
     }
     fclose(fp);
     return true;
 }
+
 
 TEST(tree_cell_sanitizes_control_and_invalid_utf8) {
     /* A raw control or invalid UTF-8 byte makes line-oriented consumers treat
@@ -677,7 +684,10 @@ TEST(mcp_tool_input_schemas_are_closed_in_classic_and_streamlined_modes) {
         yyjson_val *tool;
         while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
             yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
-            ASSERT_TRUE(yyjson_is_obj(schema));
+            if (!yyjson_is_obj(schema)) {
+                yyjson_val *name = yyjson_obj_get(tool, "name");
+                FAIL(yyjson_is_str(name) ? yyjson_get_str(name) : "tool missing name and schema");
+            }
             yyjson_val *closed = yyjson_obj_get(schema, "additionalProperties");
             ASSERT_TRUE(yyjson_is_bool(closed));
             ASSERT_FALSE(yyjson_get_bool(closed));
@@ -1881,8 +1891,8 @@ TEST(resolve_store_quarantines_structurally_corrupt_db) {
     ASSERT_NOT_NULL(srv);
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":"
-             "\"search_graph\",\"arguments\":{\"project\":\"corrupt-project\","
-             "\"pattern\":\"anything\"}}}");
+             "\"check_index_coverage\",\"arguments\":{\"project\":\"corrupt-project\","
+             "\"paths\":[\"src/main.c\"]}}}");
     ASSERT_NOT_NULL(resp);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -3219,6 +3229,46 @@ static int mcp_test_rebuild_nodes_fts(cbm_store_t *st) {
     return cbm_store_rebuild_nodes_fts(st);
 }
 
+static bool mcp_test_install_empty_vector_tables(cbm_store_t *st) {
+    sqlite3 *db = cbm_store_get_db(st);
+    return db &&
+           sqlite3_exec(db,
+                        "CREATE TABLE node_vectors ("
+                        "node_id INTEGER PRIMARY KEY, project TEXT NOT NULL, vector BLOB NOT NULL);"
+                        "CREATE TABLE token_vectors ("
+                        "id INTEGER PRIMARY KEY, project TEXT NOT NULL, token TEXT NOT NULL,"
+                        "vector BLOB NOT NULL, idf INTEGER NOT NULL);",
+                        NULL, NULL, NULL) == SQLITE_OK;
+}
+
+static bool mcp_test_install_malformed_token_vector(cbm_store_t *st, const char *project,
+                                                    const char *token) {
+    sqlite3 *db = cbm_store_get_db(st);
+    sqlite3_stmt *stmt = NULL;
+    if (!db || sqlite3_exec(db,
+                            "CREATE TABLE token_vectors ("
+                            "id INTEGER PRIMARY KEY, project TEXT NOT NULL, token TEXT NOT NULL,"
+                            "vector BLOB NOT NULL, idf INTEGER NOT NULL);",
+                            NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+                           "INSERT INTO token_vectors(project,token,vector,idf) "
+                           "VALUES(?1,?2,?3,1)",
+                           MCP_TEST_SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    const unsigned char malformed_vector[] = {0x7f};
+    bool ok = sqlite3_bind_text(stmt, MCP_TEST_PROJECT_BIND, project, MCP_TEST_SQLITE_AUTO_LEN,
+                                SQLITE_STATIC) == SQLITE_OK &&
+              sqlite3_bind_text(stmt, MCP_TEST_TOKEN_BIND, token, MCP_TEST_SQLITE_AUTO_LEN,
+                                SQLITE_STATIC) == SQLITE_OK &&
+              sqlite3_bind_blob(stmt, MCP_TEST_VECTOR_BIND, malformed_vector,
+                                (int)sizeof(malformed_vector), SQLITE_STATIC) == SQLITE_OK &&
+              sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3965,6 +4015,185 @@ TEST(tool_search_graph_query_rejects_bad_semantic_query) {
     PASS();
 }
 
+TEST(tool_search_graph_semantic_query_rejects_non_string_array_items) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, "semantic-item-type");
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"semantic-item-type\","
+             "\"semantic_query\":[\"publish\",7],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "array of keyword strings"));
+    ASSERT_NULL(strstr(inner, "semantic_results"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_semantic_query_keyword_allocation_failure_is_atomic) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, "semantic-keyword-allocation");
+    cbm_mcp_test_fail_next_semantic_keyword_allocation();
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":559,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"semantic-keyword-allocation\","
+             "\"semantic_query\":[\"publish\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "complete semantic_query without truncation"));
+    ASSERT_NULL(strstr(inner, "semantic_results"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_semantic_query_propagates_keyword_33_store_error) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "semantic-keyword-33";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/semantic-keyword-33"), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_install_malformed_token_vector(st, project, "keyword_32"));
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":556,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"semantic-keyword-33\",\"format\":\"json\","
+             "\"semantic_query\":["
+             "\"keyword_0\",\"keyword_1\",\"keyword_2\",\"keyword_3\","
+             "\"keyword_4\",\"keyword_5\",\"keyword_6\",\"keyword_7\","
+             "\"keyword_8\",\"keyword_9\",\"keyword_10\",\"keyword_11\","
+             "\"keyword_12\",\"keyword_13\",\"keyword_14\",\"keyword_15\","
+             "\"keyword_16\",\"keyword_17\",\"keyword_18\",\"keyword_19\","
+             "\"keyword_20\",\"keyword_21\",\"keyword_22\",\"keyword_23\","
+             "\"keyword_24\",\"keyword_25\",\"keyword_26\",\"keyword_27\","
+             "\"keyword_28\",\"keyword_29\",\"keyword_30\",\"keyword_31\","
+             "\"keyword_32\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "token vector has invalid dimension"));
+    ASSERT_NULL(strstr(inner, "semantic_results"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_semantic_query_propagates_store_error_in_toon) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "semantic-store-error-toon";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/semantic-store-error-toon"),
+              CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_install_malformed_token_vector(st, project, "broken"));
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":557,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"semantic-store-error-toon\","
+             "\"semantic_query\":[\"broken\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "token vector has invalid dimension"));
+    ASSERT_NULL(strstr(inner, "semantic["));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_semantic_query_does_not_mask_store_error_with_graph_json) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "semantic-store-error-graph-json";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/semantic-store-error-graph-json"),
+              CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, project, "Function", "graph_partial_marker",
+                                         "semantic.graph_partial_marker", "src/graph.c"));
+    ASSERT_TRUE(mcp_test_install_malformed_token_vector(st, project, "broken"));
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":560,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"semantic-store-error-graph-json\",\"format\":\"json\","
+             "\"name_pattern\":\"graph_partial_marker\","
+             "\"semantic_query\":[\"broken\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "token vector has invalid dimension"));
+    ASSERT_NULL(strstr(inner, "graph_partial_marker"));
+    ASSERT_NULL(strstr(inner, "semantic_results"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_semantic_query_does_not_mask_store_error_with_bm25) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "semantic-store-error-bm25";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/semantic-store-error-bm25"),
+              CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, project, "Function", "bm25_partial_marker",
+                                         "semantic.bm25_partial_marker", "src/bm25.c"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_install_malformed_token_vector(st, project, "broken"));
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":558,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"semantic-store-error-bm25\",\"query\":\"partial\","
+             "\"semantic_query\":[\"broken\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "token vector has invalid dimension"));
+    ASSERT_NULL(strstr(inner, "bm25_partial_marker"));
+    ASSERT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3973,6 +4202,7 @@ TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view) {
 
     const char *proj = "semantic-stale";
     ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/semantic-stale"), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_install_empty_vector_tables(st));
     cbm_mcp_server_set_project(srv, proj);
     ASSERT_EQ(cbm_store_set_derived_view_state(st, proj, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
                                                CBM_STORE_DERIVED_GENERATION_UNKNOWN,
@@ -4005,6 +4235,7 @@ TEST(tool_search_graph_semantic_only_json_does_not_return_unfiltered_nodes) {
 
     const char *proj = "semantic-only-json";
     ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/semantic-only-json"), CBM_STORE_OK);
+    ASSERT_TRUE(mcp_test_install_empty_vector_tables(st));
     cbm_mcp_server_set_project(srv, proj);
 
     /* A graph node without a semantic vector proves the handler does not
@@ -5341,14 +5572,16 @@ TEST(tool_check_index_coverage_surfaces_lookup_errors) {
  * dependency. Tests that exercise Git-backed MCP paths share this fixture so
  * spaces and platform command interpreters cannot change their semantics. */
 static bool mcp_test_init_committed_repo(const char *repo, const char *relative_path) {
-    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const init_args[] = {"-c", "init.defaultBranch=main", "init", "-q", NULL};
     const char *const email_args[] = {"config", "user.email", "test@example.com", NULL};
     const char *const name_args[] = {"config", "user.name", "Test", NULL};
+    const char *const signing_args[] = {"config", "commit.gpgsign", "false", NULL};
     const char *const add_args[] = {"add", relative_path, NULL};
     const char *const commit_args[] = {"commit", "-q", "-m", "initial", NULL};
     return repo && relative_path && cbm_git_drain_command(repo, init_args) == 0 &&
            cbm_git_drain_command(repo, email_args) == 0 &&
            cbm_git_drain_command(repo, name_args) == 0 &&
+           cbm_git_drain_command(repo, signing_args) == 0 &&
            cbm_git_drain_command(repo, add_args) == 0 &&
            cbm_git_drain_command(repo, commit_args) == 0;
 }
@@ -6042,6 +6275,212 @@ TEST(tool_trace_path_reports_dirty_metadata_as_canonical_only) {
 
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* CONTRACT PIN for the closed strategy vocabulary published by
+ * trace_path(include_evidence:true).
+ *
+ * The indexer records ~20 internal strategy names on CALLS edges and the set
+ * grows with every language added. We publish a CLASS, not the raw name, so a
+ * resolver rename cannot silently change a user-visible field. This test is
+ * what keeps that promise honest: every strategy production can emit must land
+ * in a known class. Adding lsp_foo_dispatch passes automatically; introducing a
+ * genuinely new KIND of resolution fails HERE and forces a deliberate decision
+ * about the public contract instead of leaking an internal name. */
+TEST(trace_evidence_strategy_class_vocabulary_is_closed) {
+    /* Every strategy string assigned anywhere in src/ + internal/ as of this
+     * commit, plus the two literals pass_calls.c writes directly. */
+    static const char *const lsp[] = {"lsp_direct",         "lsp_base_dispatch",
+                                      "lsp_embed_dispatch", "lsp_implicit_this",
+                                      "lsp_inherited_dispatch", "lsp_method_dispatch",
+                                      "lsp_proc_macro",     "lsp_smart_ptr_dispatch",
+                                      "lsp_strategy_cross_file", "lsp_trait_dispatch",
+                                      "lsp_type_dispatch",  "lsp_virtual_dispatch"};
+    for (size_t i = 0; i < sizeof(lsp) / sizeof(lsp[0]); i++) {
+        const char *cls = cbm_mcp_edge_strategy_class(lsp[i]);
+        ASSERT_NOT_NULL(cls);
+        ASSERT_STR_EQ(cls, "lsp");
+    }
+    static const char *const lang[] = {"php_self_static", "php_static_resolved",
+                                       "perl_method_static", "perl_method_typed"};
+    for (size_t i = 0; i < sizeof(lang) / sizeof(lang[0]); i++) {
+        const char *cls = cbm_mcp_edge_strategy_class(lang[i]);
+        ASSERT_NOT_NULL(cls);
+        ASSERT_STR_EQ(cls, "language_rule");
+    }
+    static const char *const heur[] = {"callee_suffix", "field_type_hint", "service_pattern",
+                                       "fastapi_depends"};
+    for (size_t i = 0; i < sizeof(heur) / sizeof(heur[0]); i++) {
+        const char *cls = cbm_mcp_edge_strategy_class(heur[i]);
+        ASSERT_NOT_NULL(cls);
+        ASSERT_STR_EQ(cls, "heuristic");
+    }
+    /* A failed LSP resolution is reported as unresolved, not as "lsp" — the
+     * caller's question is whether the edge is trustworthy, and "we tried LSP
+     * and it did not resolve" answers no. */
+    ASSERT_STR_EQ(cbm_mcp_edge_strategy_class("lsp_unresolved"), "unresolved");
+    ASSERT_STR_EQ(cbm_mcp_edge_strategy_class("unknown"), "unresolved");
+    /* Only a NULL/empty strategy is unclassified — an unmapped non-empty value
+     * must never silently disappear from the output. */
+    ASSERT_NULL(cbm_mcp_edge_strategy_class(NULL));
+    ASSERT_NULL(cbm_mcp_edge_strategy_class(""));
+    ASSERT_STR_EQ(cbm_mcp_edge_strategy_class("some_future_resolver"), "heuristic");
+    PASS();
+}
+
+/* Distilled from #559 (@vvenegasv). The indexer already records
+ * {strategy, confidence} on every CALLS edge (pass_calls.c:355) and the store
+ * reads it back, but no tool ever surfaced it — an agent could see THAT A->B
+ * exists, never HOW it was resolved.
+ *
+ * Binds two things at once: the evidence columns appear only when asked for
+ * (default stays lean), and the published value is the CLASS, not the raw
+ * internal strategy name. Fails without the production change in both
+ * directions — no columns at all before, and "lsp_trait_dispatch" would leak
+ * verbatim if the classifier were bypassed. */
+TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ev-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/ev");
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "ev-proj.src.caller",
+                         .file_path = "src/a.c",
+                         .start_line = 1,
+                         .end_line = 5};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "ev-proj.src.target",
+                         .file_path = "src/a.c",
+                         .start_line = 10,
+                         .end_line = 20};
+    int64_t id_caller = cbm_store_upsert_node(st, &caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    /* Exactly the shape pass_calls.c:355 writes in production. */
+    cbm_edge_t e = {.project = proj,
+                    .source_id = id_caller,
+                    .target_id = id_callee,
+                    .type = "CALLS",
+                    .properties_json = "{\"callee\":\"target\",\"confidence\":0.95,"
+                                       "\"strategy\":\"lsp_trait_dispatch\",\"candidates\":1}"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    /* Default: lean. No evidence columns, no strategy anywhere. */
+    char *plain = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-proj\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(plain);
+    char *plain_txt = extract_text_content(plain);
+    ASSERT_NOT_NULL(plain_txt);
+    ASSERT_NOT_NULL(strstr(plain_txt, "target")); /* positive control: the hop IS there */
+    ASSERT_NULL(strstr(plain_txt, "lsp"));
+    ASSERT_NULL(strstr(plain_txt, "0.95"));
+    free(plain_txt);
+    free(plain);
+
+    /* Opted in: the class and the confidence appear, the raw name does not. */
+    char *ev = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-proj\",\"direction\":\"outbound\",\"include_evidence\":true}}}");
+    ASSERT_NOT_NULL(ev);
+    char *ev_txt = extract_text_content(ev);
+    ASSERT_NOT_NULL(ev_txt);
+    ASSERT_NOT_NULL(strstr(ev_txt, "target"));
+    ASSERT_NOT_NULL(strstr(ev_txt, "lsp"));
+    ASSERT_NOT_NULL(strstr(ev_txt, "0.95"));
+    /* The internal resolver name must NOT reach the client. */
+    ASSERT_NULL(strstr(ev_txt, "lsp_trait_dispatch"));
+    free(ev_txt);
+    free(ev);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Evidence belongs to the shortest-path predecessor edge, not merely the
+ * first induced edge incident to a result node. Both target and via are one
+ * hop from root, while via->target is lateral. Ordering via before root makes
+ * the old incident-edge scan deterministically misattribute target as a
+ * heuristic even though root->target is the edge that reaches it at hop 1. */
+TEST(tool_trace_path_evidence_uses_shortest_path_predecessor) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ev-shortest";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/ev-shortest");
+    ASSERT_EQ(cbm_store_set_derived_view_state(st, proj, CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+
+    cbm_node_t root = {.project = proj,
+                       .label = "Function",
+                       .name = "zroot",
+                       .qualified_name = "ev-shortest.src.zroot"};
+    cbm_node_t via = {.project = proj,
+                      .label = "Function",
+                      .name = "avia",
+                      .qualified_name = "ev-shortest.src.avia"};
+    cbm_node_t target = {.project = proj,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "ev-shortest.src.target"};
+    int64_t root_id = cbm_store_upsert_node(st, &root);
+    int64_t via_id = cbm_store_upsert_node(st, &via);
+    int64_t target_id = cbm_store_upsert_node(st, &target);
+    ASSERT_GT(root_id, 0);
+    ASSERT_GT(via_id, 0);
+    ASSERT_GT(target_id, 0);
+
+    cbm_edge_t root_via = {.project = proj,
+                           .source_id = root_id,
+                           .target_id = via_id,
+                           .type = "CALLS",
+                           .properties_json = "{\"strategy\":\"lsp_direct\",\"confidence\":0.8}"};
+    cbm_edge_t root_target = {
+        .project = proj,
+        .source_id = root_id,
+        .target_id = target_id,
+        .type = "CALLS",
+        .properties_json =
+            "{\"strategy\":\"lsp_direct\",\"confidence\":0.9,\"args\":[\"correct\"]}"};
+    cbm_edge_t lateral = {
+        .project = proj,
+        .source_id = via_id,
+        .target_id = target_id,
+        .type = "CALLS",
+        .properties_json =
+            "{\"strategy\":\"callee_suffix\",\"confidence\":0.1,\"args\":[\"wrong\"]}"};
+    ASSERT_GT(cbm_store_insert_edge(st, &root_via), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &lateral), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &root_target), 0);
+
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{"
+             "\"function_name\":\"zroot\",\"project\":\"ev-shortest\","
+             "\"direction\":\"outbound\",\"mode\":\"data_flow\",\"format\":\"json\","
+             "\"include_evidence\":true}}}");
+    ASSERT_NOT_NULL(response);
+    char *text = extract_text_content(response);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"qualified_name\":\"ev-shortest.src.target\",\"hop\":1,"
+                                 "\"args\":[\"correct\"],\"strategy\":\"lsp\""));
+    ASSERT_NULL(strstr(text, "\"qualified_name\":\"ev-shortest.src.target\",\"hop\":1,"
+                             "\"args\":[\"correct\"],\"strategy\":\"heuristic\""));
+    ASSERT_NULL(strstr(text, "\"args\":[\"wrong\"]"));
+
+    free(text);
+    free(response);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -8924,6 +9363,7 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     PASS();
 }
 
+
 TEST(tool_index_repository_reports_store_backed_adr) {
     char tmp_dir[256];
     snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-index-adr-test-XXXXXX");
@@ -9384,6 +9824,7 @@ TEST(tool_detect_changes_not_found_rich_error) {
     cbm_rmdir(cache);
     PASS();
 }
+
 
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -14751,8 +15192,10 @@ enum {
 
 typedef struct {
     int deny_begin_call;      /* one-based; zero allows every acquisition */
+    int deny_try_begin_call;  /* one-based; zero allows every try acquisition */
     int cancel_on_begin_call; /* one-based; zero never requests cancellation */
     int begin_count;
+    int try_begin_count;
     int end_count;
     cbm_mcp_server_t *cancel_server;
     bool cancel_attempted;
@@ -14764,8 +15207,17 @@ typedef struct {
     bool db_exists_at_end;
     bool backup_exists_at_end;
     char begin_projects[MCP_MUTATION_GUARD_MAX_EVENTS][CBM_SZ_256];
+    char try_begin_projects[MCP_MUTATION_GUARD_MAX_EVENTS][CBM_SZ_256];
     char end_projects[MCP_MUTATION_GUARD_MAX_EVENTS][CBM_SZ_256];
 } mcp_mutation_guard_probe_t;
+
+typedef struct {
+    mcp_mutation_guard_probe_t guard;
+    const char *replacement_path;
+    const char *live_path;
+    bool replacement_attempted;
+    bool replacement_succeeded;
+} mcp_replacing_mutation_guard_t;
 
 typedef struct {
     const char *deny_step;
@@ -14833,6 +15285,25 @@ static bool mcp_mutation_guard_probe_begin(void *context, const char *project) {
         probe->backup_exists_at_begin = cbm_file_exists(probe->observed_backup_path);
     }
     return probe->deny_begin_call == 0 || probe->begin_count != probe->deny_begin_call;
+}
+
+static bool mcp_mutation_guard_probe_try_begin(void *context, const char *project) {
+    mcp_mutation_guard_probe_t *probe = context;
+    if (!probe) {
+        return false;
+    }
+    int event = probe->try_begin_count++;
+    if (event < MCP_MUTATION_GUARD_MAX_EVENTS) {
+        snprintf(probe->try_begin_projects[event], sizeof(probe->try_begin_projects[event]), "%s",
+                 project ? project : "");
+    }
+    if (probe->observed_db_path) {
+        probe->db_exists_at_begin = cbm_file_exists(probe->observed_db_path);
+    }
+    if (probe->observed_backup_path) {
+        probe->backup_exists_at_begin = cbm_file_exists(probe->observed_backup_path);
+    }
+    return probe->deny_try_begin_call == 0 || probe->try_begin_count != probe->deny_try_begin_call;
 }
 
 static void mcp_mutation_guard_probe_end(void *context, const char *project) {
@@ -14944,11 +15415,10 @@ static unsigned char *mcp_read_file_bytes(const char *path, long *out_len) {
     }
     *out_len = 0;
     FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
-        return NULL;
-    }
-    if (fseek(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
+    if (!fp || fseek(fp, 0, SEEK_END) != 0) {
+        if (fp) {
+            fclose(fp);
+        }
         return NULL;
     }
     long size = ftell(fp);
@@ -14956,14 +15426,15 @@ static unsigned char *mcp_read_file_bytes(const char *path, long *out_len) {
         fclose(fp);
         return NULL;
     }
-    unsigned char *bytes = malloc(size > 0 ? (size_t)size : 1);
+    unsigned char *bytes = malloc(size > 0 ? (size_t)size : SKIP_ONE);
     if (!bytes) {
         fclose(fp);
         return NULL;
     }
-    size_t read_count = fread(bytes, 1, (size_t)size, fp);
-    fclose(fp);
-    if (read_count != (size_t)size) {
+    size_t read_count = fread(bytes, SKIP_ONE, (size_t)size, fp);
+    bool read_ok = read_count == (size_t)size && ferror(fp) == 0;
+    bool close_ok = fclose(fp) == 0;
+    if (!read_ok || !close_ok) {
         free(bytes);
         return NULL;
     }
@@ -15085,25 +15556,19 @@ static void mcp_cleanup_corrupt_backups(const char *cache, const char *project) 
     cbm_closedir(dir);
 }
 
-typedef struct {
-    mcp_mutation_guard_probe_t guard;
-    const char *replacement_path;
-    const char *live_path;
-    bool replacement_attempted;
-    bool replacement_succeeded;
-} mcp_replacing_mutation_guard_t;
-
-static bool mcp_replacing_mutation_guard_begin(void *context, const char *project) {
-    mcp_replacing_mutation_guard_t *replacement = context;
-    if (!replacement || !mcp_mutation_guard_probe_begin(&replacement->guard, project)) {
-        return false;
-    }
+static bool mcp_replacing_mutation_guard_publish(mcp_replacing_mutation_guard_t *replacement) {
     replacement->replacement_attempted = true;
     bool sidecars_removed = cbm_remove_db_sidecars(replacement->live_path) == 0;
     replacement->replacement_succeeded =
         sidecars_removed &&
         cbm_rename_replace(replacement->replacement_path, replacement->live_path) == 0;
     return true;
+}
+
+static bool mcp_replacing_mutation_guard_begin(void *context, const char *project) {
+    mcp_replacing_mutation_guard_t *replacement = context;
+    return replacement && mcp_mutation_guard_probe_begin(&replacement->guard, project) &&
+           mcp_replacing_mutation_guard_publish(replacement);
 }
 
 static void mcp_replacing_mutation_guard_end(void *context, const char *project) {
@@ -15682,9 +16147,50 @@ TEST(tool_manage_adr_mutation_guard_balances_success) {
     PASS();
 }
 
-TEST(tool_manage_adr_mutation_guard_releases_on_missing_store) {
+/* ADR reads use the current SQLite snapshot and must not wait behind a
+ * potentially long-running index mutation.  This keeps read latency O(read)
+ * instead of adding unbounded mutation-queue latency, without changing the
+ * query's O(result bytes) output memory or the underlying store lookup cost. */
+TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard) {
+    const char *project = "guard-adr-read";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/guard-adr-read"), CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_store_adr_store(store, project, "## PURPOSE\nNonblocking read.\n\n## STACK\nC.\n"),
+        CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *get_response =
+        cbm_mcp_handle_tool(srv, "manage_adr", "{\"project\":\"guard-adr-read\",\"mode\":\"get\"}");
+    char *sections_response = cbm_mcp_handle_tool(
+        srv, "manage_adr", "{\"project\":\"guard-adr-read\",\"mode\":\"sections\"}");
+    bool get_returned_adr = get_response && strstr(get_response, "Nonblocking read.") &&
+                            !strstr(get_response, "\"isError\":true");
+    bool sections_returned_adr = sections_response && strstr(sections_response, "## PURPOSE") &&
+                                 strstr(sections_response, "## STACK") &&
+                                 !strstr(sections_response, "\"isError\":true");
+
+    free(get_response);
+    free(sections_response);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(get_returned_adr);
+    ASSERT_TRUE(sections_returned_adr);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.end_count, 0);
+    PASS();
+}
+
+TEST(tool_manage_adr_read_missing_store_skips_mutation_guard) {
     char cache[256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-adr-guard-XXXXXX");
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-adr-guard-XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(cache)) {
         PASS();
     }
@@ -15704,10 +16210,8 @@ TEST(tool_manage_adr_mutation_guard_releases_on_missing_store) {
                                      "{\"project\":\"guard-adr-missing\",\"mode\":\"get\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_TRUE(strstr(resp, "not found") || strstr(resp, "not indexed"));
-    ASSERT_EQ(probe.begin_count, 1);
-    ASSERT_EQ(probe.end_count, 1);
-    ASSERT_STR_EQ(probe.begin_projects[0], project);
-    ASSERT_STR_EQ(probe.end_projects[0], project);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.end_count, 0);
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -15715,6 +16219,81 @@ TEST(tool_manage_adr_mutation_guard_releases_on_missing_store) {
     cbm_rmdir(cache);
     restore_cache_dir(saved_cache_copy);
     free(saved_cache_copy);
+    PASS();
+}
+
+TEST(tool_manage_adr_legacy_migration_tries_without_blocking) {
+    const char *project = "guard-adr-legacy";
+    char root[256];
+    char cache[256];
+    snprintf(root, sizeof(root), "%s/cbm-adr-legacy-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-adr-legacy-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    char adr_dir[CBM_SZ_1K];
+    char adr_path[CBM_SZ_1K];
+    snprintf(adr_dir, sizeof(adr_dir), "%s/.codebase-memory", root);
+    snprintf(adr_path, sizeof(adr_path), "%s/adr.md", adr_dir);
+    ASSERT_EQ(cbm_mkdir(adr_dir), 0);
+    FILE *fp = cbm_fopen(adr_path, "w");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("## PURPOSE\nLegacy ADR.\n", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *writer = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, project, root), CBM_STORE_OK);
+    cbm_store_close(writer);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_try_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    cbm_mcp_server_set_project_mutation_try_guard(srv, mcp_mutation_guard_probe_try_begin);
+
+    char *busy_response = cbm_mcp_handle_tool(
+        srv, "manage_adr", "{\"project\":\"guard-adr-legacy\",\"mode\":\"get\"}");
+    char *migrated_response = cbm_mcp_handle_tool(
+        srv, "manage_adr", "{\"project\":\"guard-adr-legacy\",\"mode\":\"get\"}");
+    char *persisted_response = cbm_mcp_handle_tool(
+        srv, "manage_adr", "{\"project\":\"guard-adr-legacy\",\"mode\":\"get\"}");
+    bool busy_read_returned_legacy = busy_response && strstr(busy_response, "Legacy ADR.") &&
+                                     !strstr(busy_response, "\"isError\":true");
+    bool migrated_read_returned_legacy = migrated_response &&
+                                         strstr(migrated_response, "Legacy ADR.") &&
+                                         !strstr(migrated_response, "\"isError\":true");
+    bool migration_persisted = persisted_response && strstr(persisted_response, "Legacy ADR.") &&
+                               !strstr(persisted_response, "\"isError\":true");
+
+    free(busy_response);
+    free(migrated_response);
+    free(persisted_response);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(adr_path);
+    cbm_rmdir(adr_dir);
+    cbm_rmdir(root);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(busy_read_returned_legacy);
+    ASSERT_TRUE(migrated_read_returned_legacy);
+    ASSERT_TRUE(migration_persisted);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.try_begin_count, 2);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.try_begin_projects[0], project);
+    ASSERT_STR_EQ(probe.try_begin_projects[1], project);
+    ASSERT_STR_EQ(probe.end_projects[0], project);
     PASS();
 }
 
@@ -16492,9 +17071,9 @@ TEST(tool_cross_repo_honors_source_name_override) {
 }
 
 /* Corrupt-store quarantine renames/unlinks the project DB and sidecars, so it
- * is a mutation even when resolve_store() was reached by a query tool. The
- * query path needs one balanced lease; manage_adr already owns that project
- * lease and must not acquire a nested second lease during the same cleanup. */
+ * is a mutation even when reached by a query. Ordinary query resolution uses
+ * the established blocking lease; manage_adr reads use the nonblocking
+ * recovery variant so an ADR lookup never waits behind a long reindex. */
 TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-guard-XXXXXX", cbm_tmpdir());
@@ -16516,17 +17095,20 @@ TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
     };
     cbm_mcp_server_set_project_mutation_guard(query_srv, mcp_mutation_guard_probe_begin,
                                               mcp_mutation_guard_probe_end, &query_probe);
+    cbm_mcp_server_set_background_tasks(query_srv, false);
 
-    char *resp =
-        cbm_mcp_handle_tool(query_srv, "search_graph",
-                            "{\"project\":\"guard-corrupt-project\",\"name_pattern\":\".*\"}");
+    char *resp = cbm_mcp_handle_tool(
+        query_srv, "check_index_coverage",
+        "{\"project\":\"guard-corrupt-project\",\"paths\":[\"src/main.c\"]}");
     free(resp);
     cbm_mcp_server_free(query_srv);
     char query_backup_path[CBM_SZ_1K];
     int query_backup_count =
         mcp_find_corrupt_backups(cache, project, query_backup_path, sizeof(query_backup_path));
+    bool query_live_removed = !cbm_file_exists(db_path);
+    bool query_backup_named = query_backup_path[0] != '\0';
     bool query_quarantined =
-        !cbm_file_exists(db_path) && query_backup_count == 1 && query_backup_path[0] != '\0';
+        query_live_removed && query_backup_count == 1 && query_backup_named;
 
     /* Replant the same deterministic corruption to exercise manage_adr's
      * already-held lease independently from the query server above. */
@@ -16539,6 +17121,9 @@ TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
     };
     cbm_mcp_server_set_project_mutation_guard(adr_srv, mcp_mutation_guard_probe_begin,
                                               mcp_mutation_guard_probe_end, &adr_probe);
+    cbm_mcp_server_set_project_mutation_try_guard(adr_srv,
+                                                  mcp_mutation_guard_probe_try_begin);
+    cbm_mcp_server_set_background_tasks(adr_srv, false);
     resp = cbm_mcp_handle_tool(adr_srv, "manage_adr",
                                "{\"project\":\"guard-corrupt-project\",\"mode\":\"get\"}");
     free(resp);
@@ -16555,17 +17140,22 @@ TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
     free(saved_cache_copy);
     cbm_rmdir(cache);
 
+    ASSERT_TRUE(query_live_removed);
+    ASSERT_EQ(query_backup_count, 1);
+    ASSERT_TRUE(query_backup_named);
     ASSERT_TRUE(query_quarantined);
     ASSERT_EQ(query_probe.begin_count, 1);
+    ASSERT_EQ(query_probe.try_begin_count, 0);
     ASSERT_EQ(query_probe.end_count, 1);
     ASSERT_STR_EQ(query_probe.begin_projects[0], project);
     ASSERT_STR_EQ(query_probe.end_projects[0], project);
     ASSERT_TRUE(query_probe.db_exists_at_begin);
     ASSERT_FALSE(query_probe.db_exists_at_end);
     ASSERT_TRUE(adr_quarantined);
-    ASSERT_EQ(adr_probe.begin_count, 1);
+    ASSERT_EQ(adr_probe.begin_count, 0);
+    ASSERT_EQ(adr_probe.try_begin_count, 1);
     ASSERT_EQ(adr_probe.end_count, 1);
-    ASSERT_STR_EQ(adr_probe.begin_projects[0], project);
+    ASSERT_STR_EQ(adr_probe.try_begin_projects[0], project);
     ASSERT_STR_EQ(adr_probe.end_projects[0], project);
     ASSERT_TRUE(adr_probe.db_exists_at_begin);
     ASSERT_FALSE(adr_probe.db_exists_at_end);
@@ -16608,8 +17198,10 @@ TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal) {
     mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
     cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
                                               mcp_mutation_guard_probe_end, &probe);
+    cbm_mcp_server_set_background_tasks(srv, false);
     char *resp = cbm_mcp_handle_tool(
-        srv, "search_graph", "{\"project\":\"guard-corrupt-denied\",\"name_pattern\":\".*\"}");
+        srv, "check_index_coverage",
+        "{\"project\":\"guard-corrupt-denied\",\"paths\":[\"src/main.c\"]}");
 
     bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
     bool wal_unchanged = mcp_file_matches_snapshot(wal_path, wal_before, wal_len);
@@ -16714,6 +17306,102 @@ TEST(tool_cosmetic_root_path_store_is_retained_not_quarantined) {
     PASS();
 }
 
+/* Read-side recovery is nonblocking: a held mutation lease returns an explicit
+ * retryable error while preserving the live database and recovery artifacts. */
+TEST(tool_manage_adr_corrupt_store_busy_is_retryable) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-adr-corrupt-busy-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-adr-corrupt-busy";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    ASSERT_TRUE(mcp_make_corrupt_project_store(cache, project));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_try_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    cbm_mcp_server_set_project_mutation_try_guard(srv, mcp_mutation_guard_probe_try_begin);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "manage_adr", "{\"project\":\"guard-adr-corrupt-busy\",\"mode\":\"get\"}");
+    bool retryable_busy = resp && strstr(resp, "project is busy; retry after indexing") &&
+                          response_contains_json_fragment(resp, "\"isError\":true");
+    bool db_preserved = cbm_file_exists(db_path);
+    char unexpected_backup[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unexpected_backup, sizeof(unexpected_backup));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(retryable_busy);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.try_begin_count, 1);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_TRUE(db_preserved);
+    ASSERT_EQ(backup_count, 0);
+    PASS();
+}
+
+TEST(tool_manage_adr_corrupt_store_missing_try_guard_reports_configuration) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-adr-corrupt-config-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-adr-corrupt-config";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    ASSERT_TRUE(mcp_make_corrupt_project_store(cache, project));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "manage_adr", "{\"project\":\"guard-adr-corrupt-config\",\"mode\":\"get\"}");
+    bool missing_try_guard =
+        resp && strstr(resp, "project recovery requires a nonblocking mutation guard") &&
+        response_contains_json_fragment(resp, "\"isError\":true");
+    bool db_preserved = cbm_file_exists(db_path);
+    char unexpected_backup[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unexpected_backup, sizeof(unexpected_backup));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(missing_try_guard);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.try_begin_count, 0);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_TRUE(db_preserved);
+    ASSERT_EQ(backup_count, 0);
+    PASS();
+}
+
 /* Another session may publish a good generation while this query waits for
  * the mutation lease. Cleanup must re-open and re-check the path after lease
  * acquisition; quarantining based on the stale pre-wait handle loses the new
@@ -16744,8 +17432,10 @@ TEST(tool_corrupt_store_cleanup_rechecks_generation_after_guard_wait) {
     };
     cbm_mcp_server_set_project_mutation_guard(srv, mcp_replacing_mutation_guard_begin,
                                               mcp_replacing_mutation_guard_end, &replacement);
+    cbm_mcp_server_set_background_tasks(srv, false);
     char *resp = cbm_mcp_handle_tool(
-        srv, "search_graph", "{\"project\":\"guard-corrupt-recheck\",\"name_pattern\":\".*\"}");
+        srv, "check_index_coverage",
+        "{\"project\":\"guard-corrupt-recheck\",\"paths\":[\"src/main.c\"]}");
     bool response_used_replacement =
         resp && !response_contains_json_fragment(resp, "\"isError\":true");
     free(resp);
@@ -16820,8 +17510,10 @@ TEST(tool_corrupt_store_cleanup_preserves_existing_backup_and_uses_unique_name) 
     mcp_mutation_guard_probe_t probe = {0};
     cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
                                               mcp_mutation_guard_probe_end, &probe);
+    cbm_mcp_server_set_background_tasks(srv, false);
     char *resp = cbm_mcp_handle_tool(
-        srv, "search_graph", "{\"project\":\"guard-corrupt-unique\",\"name_pattern\":\".*\"}");
+        srv, "check_index_coverage",
+        "{\"project\":\"guard-corrupt-unique\",\"paths\":[\"src/main.c\"]}");
     free(resp);
     cbm_mcp_server_free(srv);
 
@@ -16892,11 +17584,12 @@ TEST(tool_corrupt_store_cleanup_publish_failure_preserves_db_and_wal) {
     mcp_mutation_guard_probe_t guard = {0};
     cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
                                               mcp_mutation_guard_probe_end, &guard);
+    cbm_mcp_server_set_background_tasks(srv, false);
     mcp_quarantine_hook_probe_t hook = {.deny_step = "before_snapshot_publish"};
     cbm_mcp_server_set_quarantine_test_hook(srv, mcp_quarantine_hook_probe, &hook);
-    char *resp =
-        cbm_mcp_handle_tool(srv, "search_graph",
-                            "{\"project\":\"guard-corrupt-publish-fail\",\"name_pattern\":\".*\"}");
+    char *resp = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"guard-corrupt-publish-fail\",\"paths\":[\"src/main.c\"]}");
 
     bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
     bool wal_unchanged = mcp_file_matches_snapshot(wal_path, wal_before, wal_len);
@@ -16966,11 +17659,12 @@ TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete) {
     mcp_mutation_guard_probe_t guard = {0};
     cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
                                               mcp_mutation_guard_probe_end, &guard);
+    cbm_mcp_server_set_background_tasks(srv, false);
     mcp_quarantine_hook_probe_t hook = {.deny_step = "after_snapshot_publish"};
     cbm_mcp_server_set_quarantine_test_hook(srv, mcp_quarantine_hook_probe, &hook);
     char *resp = cbm_mcp_handle_tool(
-        srv, "search_graph",
-        "{\"project\":\"guard-corrupt-after-publish\",\"name_pattern\":\".*\"}");
+        srv, "check_index_coverage",
+        "{\"project\":\"guard-corrupt-after-publish\",\"paths\":[\"src/main.c\"]}");
 
     bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
     bool wal_unchanged = mcp_file_matches_snapshot(wal_path, wal_before, wal_len);
@@ -17015,8 +17709,8 @@ TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete) {
     bool hook_order = hook.call_count == 2 &&
                       strcmp(hook.steps[0], "before_snapshot_publish") == 0 &&
                       strcmp(hook.steps[1], "after_snapshot_publish") == 0;
-    bool guard_balanced = guard.begin_count == 1 && guard.end_count == 1 &&
-                          strcmp(guard.begin_projects[0], project) == 0 &&
+    bool guard_balanced = guard.begin_count == 1 && guard.try_begin_count == 0 &&
+                          guard.end_count == 1 && strcmp(guard.begin_projects[0], project) == 0 &&
                           strcmp(guard.end_projects[0], project) == 0;
 
     free(resp);
@@ -17045,6 +17739,140 @@ TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete) {
  * success, validation error, and injected pre-spawn rejection must restore the
  * pre-call artifact count. The hook also proves every Git operation reaches the
  * contained argv helper; a raw popen regression bypasses it and fails here. */
+TEST(detect_changes_node_in_hunks_overlap_issue1363) {
+    cbm_changed_hunk_t hunks[] = {
+        {.path = "pkg/mod.py", .start_line = 10, .end_line = 12},
+        {.path = "pkg/other.py", .start_line = 1, .end_line = 1},
+    };
+    cbm_node_t inside = {.start_line = 8, .end_line = 15};
+    cbm_node_t exact = {.start_line = 10, .end_line = 12};
+    cbm_node_t touches_edge = {.start_line = 12, .end_line = 20};
+    cbm_node_t before = {.start_line = 1, .end_line = 9};
+    cbm_node_t after = {.start_line = 13, .end_line = 20};
+
+    ASSERT(cbm_detect_node_in_hunks(&inside, hunks, PAIR_LEN, "pkg/mod.py"));
+    ASSERT(cbm_detect_node_in_hunks(&exact, hunks, PAIR_LEN, "pkg/mod.py"));
+    ASSERT(cbm_detect_node_in_hunks(&touches_edge, hunks, PAIR_LEN, "pkg/mod.py"));
+    ASSERT(!cbm_detect_node_in_hunks(&before, hunks, PAIR_LEN, "pkg/mod.py"));
+    ASSERT(!cbm_detect_node_in_hunks(&after, hunks, PAIR_LEN, "pkg/mod.py"));
+    ASSERT(!cbm_detect_node_in_hunks(&exact, hunks, PAIR_LEN, "pkg/unrelated.py"));
+    PASS();
+}
+
+/* A same-line-count edit inside one top-level function must seed only that
+ * function.  Hunk parsing adds O(diff bytes + hunk count) time and memory up
+ * to the named safety ceiling; seed filtering remains linear in candidate
+ * definitions times relevant hunks and does not reduce result recall. */
+TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-seed-scope-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+
+    char src[600];
+    snprintf(src, sizeof(src), "%s/mod.py", repo);
+    ASSERT_EQ(th_write_file(src, "def foo():\n"
+                                 "    x = 1\n"
+                                 "    return x\n"
+                                 "\n"
+                                 "\n"
+                                 "def bar():\n"
+                                 "    y = 2\n"
+                                 "    return y\n"),
+              0);
+    ASSERT_TRUE(mcp_test_init_committed_repo(repo, "mod.py"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char idx_args[700];
+    snprintf(idx_args, sizeof(idx_args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", repo);
+    char *idx_resp = cbm_mcp_handle_tool(srv, "index_repository", idx_args);
+    ASSERT_NOT_NULL(idx_resp);
+    ASSERT_NULL(strstr(idx_resp, "\"isError\":true"));
+    free(idx_resp);
+
+    ASSERT_EQ(th_write_file(src, "def foo():\n"
+                                 "    x = 11\n"
+                                 "    return x\n"
+                                 "\n"
+                                 "\n"
+                                 "def bar():\n"
+                                 "    y = 2\n"
+                                 "    return y\n"),
+              0);
+
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    char dc_args[700];
+    snprintf(dc_args, sizeof(dc_args), "{\"project\":\"%s\",\"depth\":1}", project);
+    char *dc_resp = cbm_mcp_handle_tool(srv, "detect_changes", dc_args);
+    ASSERT_NOT_NULL(dc_resp);
+    ASSERT_NOT_NULL(strstr(dc_resp, "seed_symbols: 1\\n"));
+    ASSERT_NULL(strstr(dc_resp, "bar"));
+
+    free(dc_resp);
+    free(project);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* An import-only hunk overlaps no definition.  In that case the precision
+ * optimization must fall back to whole-file seeds, preserving completeness
+ * with the same asymptotic traversal bound as the pre-hunk implementation. */
+TEST(detect_changes_zero_overlap_falls_back_issue1363) {
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-zero-overlap-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+
+    char src[600];
+    snprintf(src, sizeof(src), "%s/mod.py", repo);
+    ASSERT_EQ(th_write_file(src, "import os\n"
+                                 "\n"
+                                 "\n"
+                                 "def foo():\n"
+                                 "    return 1\n"
+                                 "\n"
+                                 "\n"
+                                 "def bar():\n"
+                                 "    return 2\n"),
+              0);
+    ASSERT_TRUE(mcp_test_init_committed_repo(repo, "mod.py"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char idx_args[700];
+    snprintf(idx_args, sizeof(idx_args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", repo);
+    char *idx_resp = cbm_mcp_handle_tool(srv, "index_repository", idx_args);
+    ASSERT_NOT_NULL(idx_resp);
+    ASSERT_NULL(strstr(idx_resp, "\"isError\":true"));
+    free(idx_resp);
+
+    ASSERT_EQ(th_write_file(src, "import os, sys\n"
+                                 "\n"
+                                 "\n"
+                                 "def foo():\n"
+                                 "    return 1\n"
+                                 "\n"
+                                 "\n"
+                                 "def bar():\n"
+                                 "    return 2\n"),
+              0);
+
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    char dc_args[700];
+    snprintf(dc_args, sizeof(dc_args), "{\"project\":\"%s\",\"depth\":1}", project);
+    char *dc_resp = cbm_mcp_handle_tool(srv, "detect_changes", dc_args);
+    ASSERT_NOT_NULL(dc_resp);
+    ASSERT_NOT_NULL(strstr(dc_resp, "seed_symbols: 2\\n"));
+
+    free(dc_resp);
+    free(project);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
 TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     char cache[512];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-detect-contained-XXXXXX", cbm_tmpdir());
@@ -17063,6 +17891,10 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     root_ready = root_ready && source_length > 0 && (size_t)source_length < sizeof(source_path) &&
                  th_write_file(source_path, "int main(void) { return 0; }\n") == 0 &&
                  mcp_test_init_committed_repo(root, "main.c");
+    /* Leave a real unstaged hunk so the symbols request allocates its hunk
+     * array before the command hook rejects the later merge-base operation. */
+    root_ready = root_ready &&
+                 th_write_file(source_path, "int main(void) { return 1; }\n") == 0;
     const char *project = "detect-contained-project";
     cbm_mcp_server_t *srv = environment_ready && root_ready ? cbm_mcp_server_new(NULL) : NULL;
     bool server_ready = srv != NULL;
@@ -17091,7 +17923,7 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     char *rejected_response =
         project_ready ? cbm_mcp_handle_tool(srv, "detect_changes",
                                             "{\"project\":\"detect-contained-project\","
-                                            "\"base_branch\":\"HEAD\",\"scope\":\"files\"}")
+                                            "\"base_branch\":\"HEAD\",\"scope\":\"symbols\"}")
                       : NULL;
     bool containment_rejected =
         rejected_response && strstr(rejected_response, "contained command could not complete");
@@ -17132,11 +17964,11 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     ASSERT_EQ(artifacts_after_rejection, artifacts_before);
     ASSERT_TRUE(merge_base_reported);
     ASSERT_EQ(artifacts_after_success, artifacts_before);
-    /* Each request reaches two diff operations and one status operation.
-     * The rejected request stops at merge-base; the successful request
-     * completes it. Keeping the operation classes separate catches a missing
-     * or duplicated argv child instead of accepting only the aggregate. */
-    ASSERT_EQ(command_probe.diff_calls, 6);
+    /* The symbols request reaches two additional hunk-diff operations before
+     * merge-base; the file-only requests each reach two diff operations. Keep
+     * operation classes separate so an omitted/duplicated child cannot hide in
+     * an aggregate count. */
+    ASSERT_EQ(command_probe.diff_calls, 8);
     ASSERT_EQ(command_probe.status_calls, 3);
     ASSERT_EQ(command_probe.merge_base_calls, 2);
     ASSERT_TRUE(cleaned);
@@ -17567,6 +18399,12 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
+    RUN_TEST(tool_search_graph_semantic_query_rejects_non_string_array_items);
+    RUN_TEST(tool_search_graph_semantic_query_keyword_allocation_failure_is_atomic);
+    RUN_TEST(tool_search_graph_semantic_query_propagates_keyword_33_store_error);
+    RUN_TEST(tool_search_graph_semantic_query_propagates_store_error_in_toon);
+    RUN_TEST(tool_search_graph_semantic_query_does_not_mask_store_error_with_graph_json);
+    RUN_TEST(tool_search_graph_semantic_query_does_not_mask_store_error_with_bm25);
     RUN_TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view);
     RUN_TEST(tool_search_graph_semantic_only_json_does_not_return_unfiltered_nodes);
     RUN_TEST(tool_search_graph_blocks_internal_fields_and_compacts_json_properties);
@@ -17613,6 +18451,9 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_path_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
     RUN_TEST(tool_trace_pagination_exactly_once);
+    RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
+    RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+    RUN_TEST(tool_trace_path_evidence_uses_shortest_path_predecessor);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
@@ -17692,6 +18533,10 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_accepts_abs_path);
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
     RUN_TEST(tool_detect_changes_not_found_rich_error);
+    RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
+    RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
+    RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
+    RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
     RUN_TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins);
@@ -17777,7 +18622,6 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
-    RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
     RUN_TEST(query_store_reopens_after_database_replacement);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
@@ -17793,7 +18637,11 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
-    RUN_TEST(tool_manage_adr_mutation_guard_releases_on_missing_store);
+    RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);
+    RUN_TEST(tool_manage_adr_read_missing_store_skips_mutation_guard);
+    RUN_TEST(tool_manage_adr_legacy_migration_tries_without_blocking);
+    RUN_TEST(tool_manage_adr_corrupt_store_busy_is_retryable);
+    RUN_TEST(tool_manage_adr_corrupt_store_missing_try_guard_reports_configuration);
     RUN_TEST(tool_raw_dispatch_cancel_is_scoped_non_mutating_and_next_request_clean);
     RUN_TEST(tool_outer_request_scope_preserves_predispatch_cancel);
     RUN_TEST(tool_index_repository_early_raw_cancel_survives_index_entry);

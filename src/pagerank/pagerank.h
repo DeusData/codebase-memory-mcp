@@ -11,6 +11,9 @@
 #define CBM_PAGERANK_H
 
 #include <stdbool.h>
+#include <float.h>
+#include <foundation/constants.h>
+#include <limits.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
 
@@ -19,14 +22,44 @@ struct cbm_config;
 
 /* ── Algorithm defaults (config-overridable) ──────────────── */
 
-#define CBM_PAGERANK_DAMPING 0.85 /* Standard Google PageRank damping */
-#define CBM_PAGERANK_EPSILON 1e-6 /* L2 convergence threshold */
+/* NetworkX uses 0.85/100/1e-6. Keep those interoperable defaults while using
+ * this implementation's L2 convergence test and fail-without-publication
+ * contract. Damping is a probability, hence the exact closed [0,1] domain;
+ * 0.7-0.9 is an advisory neighborhood around the established default that
+ * trades propagation distance against convergence latency. */
+#define CBM_PAGERANK_DAMPING 0.85
+#define CBM_PAGERANK_DAMPING_STR CBM_STRINGIFY(CBM_PAGERANK_DAMPING)
+#define CBM_PAGERANK_DAMPING_MIN 0.0
+#define CBM_PAGERANK_DAMPING_MAX 1.0
+#define CBM_PAGERANK_DAMPING_RECOMMENDED_MIN 0.7
+#define CBM_PAGERANK_DAMPING_RECOMMENDED_MAX 0.9
+#define CBM_PAGERANK_DAMPING_RECOMMENDED_RANGE                                  \
+    CBM_STRINGIFY(CBM_PAGERANK_DAMPING_RECOMMENDED_MIN) "-"                    \
+        CBM_STRINGIFY(CBM_PAGERANK_DAMPING_RECOMMENDED_MAX)
+
+/* Epsilon must be positive and finite. DBL_MAX is the representation bound,
+ * not an algorithmic cap. The 1e-8..1e-4 advisory window spans higher-accuracy
+ * through lower-latency tuning around the 1e-6 default. */
+#define CBM_PAGERANK_EPSILON 1e-6
+#define CBM_PAGERANK_EPSILON_STR CBM_STRINGIFY(CBM_PAGERANK_EPSILON)
+#define CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE 0.0
+#define CBM_PAGERANK_EPSILON_MAX DBL_MAX
+#define CBM_PAGERANK_EPSILON_RECOMMENDED_MIN 1e-8
+#define CBM_PAGERANK_EPSILON_RECOMMENDED_MAX 1e-4
+#define CBM_PAGERANK_EPSILON_RECOMMENDED_RANGE                                  \
+    CBM_STRINGIFY(CBM_PAGERANK_EPSILON_RECOMMENDED_MIN) " to "                 \
+        CBM_STRINGIFY(CBM_PAGERANK_EPSILON_RECOMMENDED_MAX)
 /* NetworkX's established PageRank default. Unlike the historical 20-step
  * value, this converges the repository's 100-node linear regression fixture at
  * the default epsilon; exhaustion now fails instead of publishing partial
- * ranks. Keep the registry string sourced from the same named constant. */
+ * ranks. One iteration is the mathematical minimum and INT_MAX is the actual
+ * API representation maximum; start at 100, then select the smallest measured
+ * budget above the workload's logged convergence point. */
 #define CBM_PAGERANK_MAX_ITER 100
-#define CBM_PAGERANK_MAX_ITER_STR "100"
+#define CBM_PAGERANK_MAX_ITER_STR CBM_STRINGIFY(CBM_PAGERANK_MAX_ITER)
+#define CBM_PAGERANK_MAX_ITER_MIN 1
+#define CBM_PAGERANK_MAX_ITER_MAX INT_MAX
+#define CBM_PAGERANK_MAX_ITER_RECOMMENDED_START CBM_PAGERANK_MAX_ITER_STR
 
 /* Config keys for runtime tuning */
 #define CBM_CONFIG_PAGERANK_MAX_ITER "pagerank_max_iter"
@@ -66,6 +99,151 @@ cbm_rank_refresh_publish_t cbm_rank_refresh_publish_from_pipeline(
 #define CBM_CONFIG_EDGE_WEIGHT_DECORATES "edge_weight_decorates"
 #define CBM_CONFIG_EDGE_WEIGHT_DEFAULT "edge_weight_default"
 #define CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF "edge_weight_member_of"
+
+/* One owner for runtime defaults and generated registry/help strings. The
+ * accepted extent reaches the full finite double representation: PageRank
+ * weights must be finite and nonnegative, while the narrower ranges are
+ * advisory starting points rather than capability limits. Defaults were tuned
+ * on the repository's code-search ranking fixture (see pagerank.c and
+ * benchmarks/autotune.py); recommendations preserve each edge kind's intended
+ * scale relative to CALLS=1.0 and require workload measurement before changes. */
+#define CBM_PAGERANK_EDGE_WEIGHT_MIN 0.0
+#define CBM_PAGERANK_EDGE_WEIGHT_MAX DBL_MAX
+
+#define CBM_PAGERANK_WEIGHT_CALLS_DEFAULT 1.0
+#define CBM_PAGERANK_WEIGHT_CALLS_DEFAULT_STR CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_CALLS_DEFAULT)
+/* CALLS is the relative anchor; half-to-double keeps direct control flow dominant. */
+#define CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_MIN 0.5
+#define CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_MAX 2.0
+#define CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_RANGE                             \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_MIN) "-"               \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_USAGE_DEFAULT 0.7
+#define CBM_PAGERANK_WEIGHT_USAGE_DEFAULT_STR CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_USAGE_DEFAULT)
+/* USAGE is dense in typed/dynamic OO code; the window permits deliberate damping. */
+#define CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_MIN 0.2
+#define CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_MAX 1.0
+#define CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_RANGE                             \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_MIN) "-"               \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT 0.5
+#define CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT)
+/* Structural fan-out must remain below CALLS so large classes do not win by size alone. */
+#define CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_MIN 0.1
+#define CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_MAX 0.5
+#define CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_RANGE                    \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_MIN) "-"      \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT 0.3
+#define CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT)
+/* IMPORTS promotes shared modules but stays below direct calls to limit utility noise. */
+#define CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_MIN 0.3
+#define CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_MAX 0.8
+#define CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_RANGE                           \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_MIN) "-"             \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT 0.2
+#define CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT)
+/* DECORATES is sparse semantic signal; frameworks may justify raising it toward 0.5. */
+#define CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_MIN 0.2
+#define CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_MAX 0.5
+#define CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_RANGE                         \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_MIN) "-"           \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_WRITES_DEFAULT 0.15
+#define CBM_PAGERANK_WEIGHT_WRITES_DEFAULT_STR CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_WRITES_DEFAULT)
+/* WRITES is low by default; data pipelines may raise it when sinks define architecture. */
+#define CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_MIN 0.05
+#define CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_MAX 0.5
+#define CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_RANGE                            \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_MIN) "-"              \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT 0.1
+#define CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT)
+/* Every symbol has a DEFINES edge, so a narrow low range limits structural inflation. */
+#define CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_MIN 0.01
+#define CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_MAX 0.1
+#define CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_RANGE                           \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_MIN) "-"             \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT 0.1
+#define CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT)
+/* CONFIGURES is sparse; infrastructure repositories may raise it without exceeding imports. */
+#define CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_MIN 0.1
+#define CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_MAX 0.3
+#define CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_RANGE                        \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_MIN) "-"          \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_TESTS_DEFAULT 0.05
+#define CBM_PAGERANK_WEIGHT_TESTS_DEFAULT_STR CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_TESTS_DEFAULT)
+/* TESTS is deliberately damped so test multiplicity does not dominate production calls. */
+#define CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_MIN 0.01
+#define CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_MAX 0.1
+#define CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_RANGE                             \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_MIN) "-"               \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT 0.5
+#define CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT)
+/* HTTP_CALLS may be the primary cross-service coupling, so its window reaches 2x CALLS. */
+#define CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_MIN 0.5
+#define CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_MAX 2.0
+#define CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_RANGE                        \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_MIN) "-"          \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT 0.8
+#define CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT)
+/* ASYNC_CALLS remains near CALLS but can be damped in event-dense codebases. */
+#define CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_MIN 0.3
+#define CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_MAX 1.0
+#define CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_RANGE                       \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_MIN) "-"         \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT 0.1
+#define CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT)
+/* Unknown future edge kinds start low until their ranking semantics are measured. */
+#define CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_MIN 0.01
+#define CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_MAX 0.1
+#define CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_RANGE                          \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_MIN) "-"            \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_MAX)
+#define CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT 0.5
+#define CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT_STR \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT)
+/* MEMBER_OF propagates method importance to classes; zero disables that propagation. */
+#define CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_MIN 0.0
+#define CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_MAX 0.8
+#define CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_RANGE                         \
+    CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_MIN) "-"           \
+        CBM_STRINGIFY(CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_MAX)
+
+/* Canonical edge-type/default-token/config-token/struct-field mapping.
+ * Frequency order retains the lookup fast path. Consumers expand this list
+ * for lookup, initialization, config loading, validation, or contract tests so
+ * adding an edge kind cannot silently update only one surface. "DEFAULT" maps
+ * the fallback field and is harmless as an explicit edge type. Expansion is
+ * compile-time only and adds no runtime or memory cost. */
+#define CBM_PAGERANK_EDGE_WEIGHT_FIELDS(X)                         \
+    X("CALLS", CALLS, CALLS, calls)                               \
+    X("DEFINES", DEFINES, DEFINES, defines)                       \
+    X("TESTS", TESTS, TESTS, tests)                               \
+    X("USAGE", USAGE, USAGE, usage)                               \
+    X("DEFINES_METHOD", DEFINES_METHOD, DEFINES_METHOD, defines_method) \
+    X("WRITES", WRITES, WRITES, writes)                           \
+    X("CONFIGURES", CONFIGURES, CONFIGURES, configures)           \
+    X("IMPORTS", IMPORTS, IMPORTS, imports)                       \
+    X("DECORATES", DECORATES, DECORATES, decorates)               \
+    X("MEMBER_OF", MEMBER_OF, MEMBER_OF, member_rank_factor)      \
+    X("HTTP_CALLS", HTTP_CALLS, HTTP_CALLS, http_calls)           \
+    X("ASYNC_CALLS", ASYNC_CALLS, ASYNC_CALLS, async_calls)       \
+    X("DEFAULT", FALLBACK, DEFAULT, default_weight)
 
 /* ── Internal tuning constants ────────────────────────────── */
 
@@ -110,13 +288,16 @@ extern const cbm_edge_weights_t CBM_DEFAULT_EDGE_WEIGHTS;
  * Stores results in pagerank and linkrank tables.
  * Called after index_repository dump/flush.
  *
- * Runtime:  O(max_iter * (V + E)), typically 20 * (V + E).
+ * Runtime:  O(max_iter * (V + E)); the default budget is
+ * CBM_PAGERANK_MAX_ITER iterations and successful publication requires
+ * convergence before that budget is exhausted.
  * Memory:   O(V) for rank arrays + O(E) for edge list.
  * Returns:  number of nodes ranked, or -1 on error. */
 int cbm_pagerank_compute(cbm_store_t *store, const char *project, double damping, double epsilon,
                          int max_iter, const cbm_edge_weights_t *weights, cbm_rank_scope_t scope);
 
-/* Convenience: compute with defaults (FULL scope, d=0.85, eps=1e-6, 20 iter) */
+/* Convenience: compute with CBM_DEFAULT_RANK_SCOPE, CBM_PAGERANK_DAMPING,
+ * CBM_PAGERANK_EPSILON, and CBM_PAGERANK_MAX_ITER. */
 int cbm_pagerank_compute_default(cbm_store_t *store, const char *project);
 
 /* Convenience: compute with config-backed rank settings.
@@ -155,5 +336,18 @@ double cbm_pagerank_get(cbm_store_t *store, int64_t node_id);
 
 /* Get LinkRank score for a single edge. Returns 0.0 if not computed. */
 double cbm_linkrank_get(cbm_store_t *store, int64_t edge_id);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef enum {
+    CBM_PAGERANK_TEST_SCAN_NODES = 0,
+    CBM_PAGERANK_TEST_SCAN_EDGES = 1,
+} cbm_pagerank_test_scan_t;
+
+/* Inject one SQLite scan failure after successful_rows rows. The failpoint is
+ * thread-local and consumed when its target scan fails or reaches a terminal
+ * result, so parallel tests and later target scans do not inherit it. */
+void cbm_pagerank_test_fail_scan_after(cbm_pagerank_test_scan_t scan, int successful_rows);
+bool cbm_pagerank_test_id_map_capacity(int node_count, int *capacity);
+#endif
 
 #endif /* CBM_PAGERANK_H */

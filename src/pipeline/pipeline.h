@@ -20,7 +20,8 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-#include "discover/discover.h" /* cbm_ignored_file_t (#963) */
+#include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
+#include "foundation/constants.h" /* CBM_SZ_512 */
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -470,5 +471,21 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
                                               const char **import_map_vals, int import_map_count);
 
 const char *cbm_confidence_band(double score);
+
+/* ── Git diff hunks (pass_gitdiff.c) ──────────────────────────────
+ * Public (unlike the rest of pipeline_internal.h) because detect_changes
+ * (src/mcp/mcp.c) scopes seed detection to changed line ranges, not just
+ * changed files. */
+
+typedef struct {
+    char path[CBM_SZ_512];
+    int start_line;
+    int end_line;
+} cbm_changed_hunk_t;
+
+/* Parse `git diff --unified=0` output into per-hunk (path, start_line,
+ * end_line) entries — end_line is the last new-side line the hunk touches.
+ * Returns count written to out (capped at max_out). */
+int cbm_parse_hunks(const char *output, cbm_changed_hunk_t *out, int max_out);
 
 #endif /* CBM_PIPELINE_H */
