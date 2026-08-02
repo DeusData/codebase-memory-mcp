@@ -3753,6 +3753,68 @@ TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
     PASS();
 }
 
+/* Python attribute calls on unknown receivers are flagged so they cannot bind
+ * to unrelated project methods by name. Direct self/cls/super() calls retain
+ * class-local semantics, and imported receivers remain import-resolvable. */
+TEST(extract_python_member_call_flags_is_method) {
+    CBMFileResult *r = extract("from pkg import helper\n"
+                               "import tools as toolkit\n"
+                               "\n"
+                               "class C(Base):\n"
+                               "    def run(self, external):\n"
+                               "        external.commit()\n"
+                               "        self.client.send()\n"
+                               "        self.helper()\n"
+                               "        super ( ).render()\n"
+                               "        helper.compute()\n"
+                               "        toolkit.format()\n"
+                               "        helper()\n",
+                               CBM_LANG_PYTHON, "t", "x.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int external = 0;
+    int nested = 0;
+    int self_call = 0;
+    int super_call = 0;
+    int imported_module = 0;
+    int imported_alias = 0;
+    int bare = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (strcmp(cn, "external.commit") == 0) {
+            external++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "self.client.send") == 0) {
+            nested++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "self.helper") == 0) {
+            self_call++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strstr(cn, "render") != NULL) {
+            super_call++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "helper.compute") == 0) {
+            imported_module++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "toolkit.format") == 0) {
+            imported_alias++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "helper") == 0) {
+            bare++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
+    }
+    ASSERT_EQ(external, 1);
+    ASSERT_EQ(nested, 1);
+    ASSERT_EQ(self_call, 1);
+    ASSERT_EQ(super_call, 1);
+    ASSERT_EQ(imported_module, 1);
+    ASSERT_EQ(imported_alias, 1);
+    ASSERT_EQ(bare, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -5040,6 +5102,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
+    RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);

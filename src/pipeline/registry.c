@@ -428,19 +428,20 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
-/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
- * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
- * could not resolve the receiver type — type-resolved calls win via lsp_*
- * strategies before the registry runs. Binding such a call to a project symbol
- * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
- * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
- * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
- * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
- * default-drop) because the parallel resolver runs lsp_* strategies through the
- * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
- * + side-effect-free so the contract is unit-testable without a full pipeline. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
-    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+/* Dynamic-language analogue of the Perl guard above (#592/#606/#1276;
+ * precedent #477). A member call `x.foo()` reaches the weak textual cascade
+ * only when the language-specific resolver could not identify the receiver
+ * type — type-resolved calls win via lsp_* strategies before the registry runs.
+ * Binding such a call to a project symbol by a weak short-name strategy
+ * fabricates a CALLS edge (`re.test()` -> SalesforceRestClient.test,
+ * `accelerator.print()` -> MockAccelerator.print). Drop only the weak
+ * strategies; keep import/same-module/qualified-tail matches and every lsp_*
+ * strategy. Uses an explicit drop-list (not a keep-list plus default-drop)
+ * because the parallel resolver runs lsp_* strategies through the same guard
+ * variable — a default-drop would silently kill lsp_ts_method. Pure and
+ * side-effect-free so the contract is unit-testable without a full pipeline. */
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
+    if (!enabled || !is_method || !strategy || !strategy[0]) {
         return false;
     }
     /* Weak short-name strategies that actually reach the call-resolution guards:
