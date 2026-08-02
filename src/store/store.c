@@ -19211,8 +19211,8 @@ static void vs_token_reader_close(vs_token_reader_t *reader) {
 /* Look up one enriched vector through the reusable statement. A missing row
  * requests sparse-random fallback; malformed data or SQLite errors fail the
  * query rather than silently changing its meaning. */
-static int vs_token_reader_load(vs_token_reader_t *reader, const char *project,
-                                const char *token, float *out, bool *found) {
+static int vs_token_reader_load(vs_token_reader_t *reader, const char *project, const char *token,
+                                float *out, bool *found) {
     *found = false;
     if (reader->table_unavailable) {
         return CBM_STORE_OK;
@@ -19234,8 +19234,7 @@ static int vs_token_reader_load(vs_token_reader_t *reader, const char *project,
         store_set_error_sqlite(reader->store, "vector_search token vector step");
         return CBM_STORE_ERR;
     }
-    const int8_t *vec =
-        (const int8_t *)sqlite3_value_blob(sqlite3_column_value(reader->stmt, 0));
+    const int8_t *vec = (const int8_t *)sqlite3_value_blob(sqlite3_column_value(reader->stmt, 0));
     int vec_len = sqlite3_column_bytes(reader->stmt, 0);
     if (!vec || vec_len != VS_VEC_DIM) {
         store_set_error(reader->store, "vector_search token vector has invalid dimension");
@@ -19302,8 +19301,8 @@ static double vs_vector_magnitude(const int8_t vector[VS_VEC_DIM]) {
  * skipped. Query-sized storage is owned by the caller, so no keyword is
  * silently discarded by an implementation cap. */
 static int vs_build_keyword_vectors(vs_token_reader_t *reader, const char *project,
-                                    const char **keywords, int keyword_count,
-                                    vs_vector_t *kw_vecs, double *kw_norms, int *actual_out) {
+                                    const char **keywords, int keyword_count, vs_vector_t *kw_vecs,
+                                    double *kw_norms, int *actual_out) {
     int actual_kw = 0;
     for (int k = 0; k < keyword_count; k++) {
         if (!keywords[k] || !keywords[k][0]) {
@@ -19412,8 +19411,7 @@ static bool vs_results_reserve(cbm_vector_result_t **results, int *capacity, int
     if ((size_t)next > SIZE_MAX / sizeof(**results)) {
         return false;
     }
-    void *grown =
-        vs_realloc(VS_ALLOC_RESULT_RESERVE, *results, (size_t)next * sizeof(**results));
+    void *grown = vs_realloc(VS_ALLOC_RESULT_RESERVE, *results, (size_t)next * sizeof(**results));
     if (!grown) {
         return false;
     }
@@ -19423,14 +19421,12 @@ static bool vs_results_reserve(cbm_vector_result_t **results, int *capacity, int
 }
 
 /* A higher score is better; node id supplies deterministic tie ordering. */
-static bool vs_result_is_better(const cbm_vector_result_t *left,
-                                const cbm_vector_result_t *right) {
+static bool vs_result_is_better(const cbm_vector_result_t *left, const cbm_vector_result_t *right) {
     return left->score > right->score ||
            (left->score == right->score && left->node_id < right->node_id);
 }
 
-static bool vs_result_is_worse(const cbm_vector_result_t *left,
-                               const cbm_vector_result_t *right) {
+static bool vs_result_is_worse(const cbm_vector_result_t *left, const cbm_vector_result_t *right) {
     return vs_result_is_better(right, left);
 }
 
@@ -19494,24 +19490,58 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
+    /* Open the optional token lookup before classifying an absent node-vector
+     * table. This distinguishes the O(1) both-tables-absent path from a present
+     * token table whose requested rows must still be validated below. */
+    vs_token_reader_t token_reader;
+    if (vs_token_reader_open(s, &token_reader) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    /* FAST and legacy indexes intentionally may not materialize semantic
+     * vectors. Prepare the node scan before allocating/building Q keyword
+     * vectors so the common case where both tables are absent returns an exact
+     * empty result in O(1) time and memory. If token_vectors exists, requested
+     * rows are still validated in O(Q*D) time before accepting absent node
+     * vectors; malformed data and every other SQLite failure remain loud. */
+    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label, v.vector"
+                      " FROM node_vectors v"
+                      " INNER JOIN nodes n ON n.id = v.node_id"
+                      " WHERE v.project = ?1"
+                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+    sqlite3_stmt *stmt = NULL;
+    bool node_table_unavailable = false;
+    int prep_rc = sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL);
+    if (prep_rc != SQLITE_OK) {
+        node_table_unavailable = store_table_unavailable(s, "node_vectors");
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+        if (!node_table_unavailable) {
+            vs_token_reader_close(&token_reader);
+            store_set_error_sqlite(s, "vector_search prepare");
+            return CBM_STORE_ERR;
+        }
+        if (token_reader.table_unavailable) {
+            vs_token_reader_close(&token_reader);
+            return CBM_STORE_OK;
+        }
+    }
+
     if ((size_t)keyword_count > SIZE_MAX / sizeof(vs_vector_t) ||
         (size_t)keyword_count > SIZE_MAX / sizeof(double)) {
+        sqlite3_finalize(stmt);
+        vs_token_reader_close(&token_reader);
         store_set_error(s, "vector_search keyword allocation size overflow");
         return CBM_STORE_ERR;
     }
-    vs_vector_t *kw_vecs =
-        vs_calloc(VS_ALLOC_KEYWORDS, (size_t)keyword_count, sizeof(*kw_vecs));
+    vs_vector_t *kw_vecs = vs_calloc(VS_ALLOC_KEYWORDS, (size_t)keyword_count, sizeof(*kw_vecs));
     double *kw_norms = vs_calloc(VS_ALLOC_KEYWORDS, (size_t)keyword_count, sizeof(*kw_norms));
     if (!kw_vecs || !kw_norms) {
+        sqlite3_finalize(stmt);
+        vs_token_reader_close(&token_reader);
         free(kw_vecs);
         free(kw_norms);
         store_set_error(s, "vector_search keyword allocation failed");
-        return CBM_STORE_ERR;
-    }
-    vs_token_reader_t token_reader;
-    if (vs_token_reader_open(s, &token_reader) != CBM_STORE_OK) {
-        free(kw_vecs);
-        free(kw_norms);
         return CBM_STORE_ERR;
     }
     int actual_kw = 0;
@@ -19519,11 +19549,18 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
                                               kw_vecs, kw_norms, &actual_kw);
     vs_token_reader_close(&token_reader);
     if (keyword_rc != CBM_STORE_OK) {
+        sqlite3_finalize(stmt);
         free(kw_vecs);
         free(kw_norms);
         return CBM_STORE_ERR;
     }
+    if (node_table_unavailable) {
+        free(kw_vecs);
+        free(kw_norms);
+        return CBM_STORE_OK;
+    }
     if (actual_kw == 0) {
+        sqlite3_finalize(stmt);
         free(kw_vecs);
         free(kw_norms);
         return CBM_STORE_OK;
@@ -19533,21 +19570,6 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
      * true all-keyword winner. An exact bounded min-heap retains top K in
      * O(N * (D + Q*D + log K)) runtime and O(Q*D + K + copied result bytes)
      * memory for N nodes, Q keywords, vector dimension D, and output size K. */
-    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label, v.vector"
-                      " FROM node_vectors v"
-                      " INNER JOIN nodes n ON n.id = v.node_id"
-                      " WHERE v.project = ?1"
-                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
-
-    sqlite3_stmt *stmt = NULL;
-    int prep_rc = sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL);
-    if (prep_rc != SQLITE_OK) {
-        free(kw_vecs);
-        free(kw_norms);
-        store_set_error_sqlite(s, "vector_search prepare");
-        return CBM_STORE_ERR;
-    }
-
     int final_limit = limit > 0 ? limit : CBM_SZ_16;
     if (sqlite3_bind_text(stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC) != SQLITE_OK) {
         sqlite3_finalize(stmt);

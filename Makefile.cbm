@@ -1406,11 +1406,14 @@ lint-tidy:
 	@echo "=== clang-tidy ==="
 	@$(CLANG_TIDY) --quiet $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
-# cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck: complementary analysis (config in .cppcheck). Analyze the
+# failpoint-enabled superset so test-only allocation and cleanup paths remain
+# checked instead of collapsing to production constant-false stubs.
 lint-cppcheck:
 	@echo "=== cppcheck ==="
 	@$(CPPCHECK) --enable=warning,style,performance,portability \
 		--std=c11 --language=c \
+		-DCBM_ENABLE_TEST_SEAMS \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \
 		--inline-suppr \

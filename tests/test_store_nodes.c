@@ -178,6 +178,30 @@ TEST(store_vector_search_ranks_every_candidate_for_all_keywords) {
     PASS();
 }
 
+TEST(store_vector_search_without_vector_tables_is_empty_capability) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    const char *project = "vector-capability-absent";
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/vector-capability-absent"), CBM_STORE_OK);
+    /* Read-only legacy and FAST indexes may predate or intentionally omit
+     * semantic-vector materialization. That is an unavailable capability, not
+     * a corrupt partial result. Other prepare/step failures must remain loud. */
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE IF EXISTS node_vectors;"
+                                "DROP TABLE IF EXISTS token_vectors;"),
+              CBM_STORE_OK);
+
+    const char *keywords[] = {"publish"};
+    cbm_vector_result_t *results = (cbm_vector_result_t *)(uintptr_t)SKIP_ONE;
+    int count = CBM_SZ_16;
+    ASSERT_EQ(cbm_store_vector_search(s, project, keywords, SKIP_ONE, CBM_SZ_16, &results, &count),
+              CBM_STORE_OK);
+    ASSERT_NULL(results);
+    ASSERT_EQ(count, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_vector_search_uses_every_nonempty_keyword) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -7176,6 +7200,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
+    RUN_TEST(store_vector_search_without_vector_tables_is_empty_capability);
     RUN_TEST(store_vector_search_ranks_every_candidate_for_all_keywords);
     RUN_TEST(store_vector_search_uses_every_nonempty_keyword);
     RUN_TEST(store_vector_search_allocation_failures_are_atomic);

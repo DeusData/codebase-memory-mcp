@@ -4038,6 +4038,63 @@ TEST(tool_search_graph_semantic_query_rejects_non_string_array_items) {
     PASS();
 }
 
+TEST(tool_search_graph_semantic_query_without_vector_tables_is_empty_not_error) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "semantic-capability-absent";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/semantic-capability-absent"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(st, "DROP TABLE IF EXISTS node_vectors;"
+                                 "DROP TABLE IF EXISTS token_vectors;"),
+              CBM_STORE_OK);
+
+    /* Pin both explicit encodings without duplicating configurable-default
+     * precedence tests. The product default remains TOON; smoke B3 exercises
+     * that default through the CLI. Capability absence is store-level. */
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+                                   "\"project\":\"semantic-capability-absent\",\"format\":\"json\","
+                                   "\"semantic_query\":[\"send\",\"publish\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *semantic_results = yyjson_obj_get(yyjson_doc_get_root(doc), "semantic_results");
+    ASSERT_NOT_NULL(semantic_results);
+    ASSERT_TRUE(yyjson_is_arr(semantic_results));
+    ASSERT_EQ(yyjson_arr_size(semantic_results), 0);
+    ASSERT_NULL(strstr(inner, "Exact semantic search failed"));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+                                   "\"project\":\"semantic-capability-absent\",\"format\":\"toon\","
+                                   "\"semantic_query\":[\"send\",\"publish\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    /* Match scripts/smoke-test.sh B3: repeated CLI array flags become these
+     * two keywords, and a capability-absent semantic-only TOON response must
+     * retain its empty table header. */
+    ASSERT_NOT_NULL(strstr(inner, "semantic[0]"));
+    ASSERT_NULL(strstr(inner, "Exact semantic search failed"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_semantic_query_keyword_allocation_failure_is_atomic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -18400,6 +18457,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
     RUN_TEST(tool_search_graph_semantic_query_rejects_non_string_array_items);
+    RUN_TEST(tool_search_graph_semantic_query_without_vector_tables_is_empty_not_error);
     RUN_TEST(tool_search_graph_semantic_query_keyword_allocation_failure_is_atomic);
     RUN_TEST(tool_search_graph_semantic_query_propagates_keyword_33_store_error);
     RUN_TEST(tool_search_graph_semantic_query_propagates_store_error_in_toon);
