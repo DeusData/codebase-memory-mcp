@@ -543,6 +543,53 @@ TEST(activation_transaction_removal_can_rollback_or_finalize) {
     PASS();
 }
 
+#ifdef _WIN32
+/* A running Windows image can be renamed but never overwritten, so retiring it
+ * is a rename -- and that rename can lose to a handle that is about to go away
+ * (an antivirus scan of a fresh executable, a child the OS has not reaped).
+ * Both clear on their own, so the retry must absorb them rather than abandon a
+ * live installation. The failure seam substitutes for that timing instead of
+ * waiting on a real scanner, which no test could schedule. */
+TEST(activation_transaction_removal_survives_transient_rename_locks) {
+    char directory[ACTIVATION_TEST_PATH_CAP];
+    char target[ACTIVATION_TEST_PATH_CAP];
+    ASSERT_TRUE(activation_test_fixture(directory));
+    ASSERT_TRUE(activation_test_path(target, directory, "cbm"));
+    ASSERT_TRUE(activation_test_write(target, "old"));
+    activation_test_validation_t absent = {
+        .expect_absent = true,
+        .expected_contents = NULL,
+    };
+
+    cbm_activation_transaction_t *transaction = NULL;
+    ASSERT_EQ(cbm_activation_transaction_stage_removal(target, &transaction),
+              CBM_ACTIVATION_TRANSACTION_OK);
+    /* Strictly inside the budget: the retire must still succeed. */
+    cbm_activation_transaction_rename_failures_set_for_test(3U);
+    ASSERT_EQ(cbm_activation_transaction_commit(transaction, activation_test_validate, &absent),
+              CBM_ACTIVATION_TRANSACTION_OK);
+    cbm_activation_transaction_rename_failures_set_for_test(0U);
+    ASSERT_FALSE(activation_test_exists(target));
+    ASSERT_EQ(cbm_activation_transaction_finalize(transaction), CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(cbm_activation_transaction_close(&transaction), CBM_ACTIVATION_TRANSACTION_OK);
+
+    /* Past the budget it must still FAIL, and leave the target in place: a
+     * genuinely held file is not something to spin on or to report as removed. */
+    ASSERT_TRUE(activation_test_write(target, "old"));
+    ASSERT_EQ(cbm_activation_transaction_stage_removal(target, &transaction),
+              CBM_ACTIVATION_TRANSACTION_OK);
+    cbm_activation_transaction_rename_failures_set_for_test(64U);
+    ASSERT_EQ(cbm_activation_transaction_commit(transaction, activation_test_validate, &absent),
+              CBM_ACTIVATION_TRANSACTION_IO);
+    cbm_activation_transaction_rename_failures_set_for_test(0U);
+    ASSERT_TRUE(activation_test_exists(target));
+    (void)cbm_activation_transaction_rollback(transaction);
+    ASSERT_EQ(cbm_activation_transaction_close(&transaction), CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(th_rmtree(directory), 0);
+    PASS();
+}
+#endif
+
 TEST(activation_transaction_rejects_cross_account_writable_target_directory) {
 #ifndef _WIN32
     char directory[ACTIVATION_TEST_PATH_CAP];
@@ -972,6 +1019,9 @@ SUITE(activation_transaction) {
     RUN_TEST(activation_transaction_stage_file_installs_new_target);
     RUN_TEST(activation_transaction_stage_file_survives_long_target_path);
     RUN_TEST(activation_transaction_removal_can_rollback_or_finalize);
+#ifdef _WIN32
+    RUN_TEST(activation_transaction_removal_survives_transient_rename_locks);
+#endif
     RUN_TEST(activation_transaction_rejects_cross_account_writable_target_directory);
     RUN_TEST(activation_transaction_rejects_windows_callback_allow_directory_ace);
     RUN_TEST(activation_transaction_rejects_symlink_candidate_target_and_parent);

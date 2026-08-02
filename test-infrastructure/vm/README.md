@@ -18,7 +18,9 @@ seconds-fast local loop with full stderr/debugger visibility.
 |---|---|---|
 | `windows-bootstrap.ps1` | inside the VM, once | OpenSSH + host key + CI owner-policy mirror |
 | `provision-windows.sh`  | on the host | zero → fully-built, idempotent (disk-loss recovery) |
-| `win.sh`                | on the host | daily driver: build / test / guards / install-E2E / shell |
+| `win.sh`                | on the host | daily driver (`win.sh help`): routes every venue-grade command through the canonical leg scripts (`scripts/build.sh`, `scripts/test.sh`, `vm-smoke.sh`, `soak-legs.sh`) with clean-disk preflight |
+| `vm-run-tests.sh`       | inside the VM | provisioning wrapper (protected TEMP root + completion guard) around the canonical test/soak entries |
+| `vm-smoke.sh`           | inside the VM / CI msys2 | THE canonical Windows smoke (also run verbatim by PR CI and `_smoke.yml`) |
 
 Host-local config (never committed): `~/.claude/cbm-vm/config` with
 `CBM_VM_HOST=<ip>`, `CBM_VM_USER=<user>`, and the
@@ -67,6 +69,7 @@ vm/win.sh sync              # mirror the uncommitted worktree and rebuild before
 vm/win.sh test cli daemon_ipc         # run suites natively, seconds
 vm/win.sh guards                      # the Windows guard scripts
 vm/win.sh smoke-install               # managed-install E2E, stderr VISIBLE
+vm/win.sh soak 10                     # native daemon endurance gate
 vm/win.sh sh "cd /c/cbm && gdb ..."   # anything, interactively
 vm/win.sh push-file src/cli/cli.c /c/cbm/src/cli/cli.c   # WIP iteration
 ```
@@ -107,3 +110,25 @@ cleans stale build outputs, and rebuilds.
 - VM results complement, never replace, the CI matrix on the final SHA.
 - Everything runs over the local UTM/host network only — nothing about the
   VM loop touches the internet except the VM's own package/repo downloads.
+
+## Ephemerality & Defender posture (venue parity)
+
+A GitHub runner is ephemeral (fresh image, known-free disk, every job); this
+VM is long-lived. The gap is closed by construction where possible and
+documented honestly where not:
+
+- **Preflight, every venue-grade command:** `clean-test-residue.ps1` sweeps
+  temp roots/staged binaries and asserts a runner-like free-disk floor, then
+  `scripts/ci/ensure-defender.ps1` enables + verifies Defender real-time
+  protection ON THIS VM (fail-closed: a drifted-off Defender goes red).
+  Hosted GitHub runners CANNOT match this posture — RTP is policy-locked off
+  on their images (verified 2026-07-27: WinDefend starts, Set-MpPreference
+  accepts, RTP stays off) — so AV-interaction coverage is a deliberate LOCAL
+  superset, and runner release scans stay on-demand (MpCmdRun, fail-soft).
+- **Snapshot-revert is NOT scriptable via utmctl** (its verb set is
+  version/list/status/start/suspend/stop — no snapshot support), so per-run
+  revert-to-clean is not wired. The honest fallback is the sweep preflight
+  above. Opt-in alternative for a truly fresh start: shut the VM down and
+  manage qcow2 snapshots of the .utm disk offline (`qemu-img snapshot`) —
+  DESTRUCTIVE to VM state, so it is a deliberate manual step, never part of
+  the automated loop. `provision-windows.sh` remains the one-command rebuild.

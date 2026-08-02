@@ -65,6 +65,8 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+
+#include <stdatomic.h>
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -711,6 +713,24 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
 
     return s;
 }
+
+/* ── Shared page-cache slab ──────────────────────────────────────────
+ *
+ * Every request opens its own short-lived read-only store, and SQLite serves
+ * that connection's page cache from the general allocator. Measured on native
+ * Windows (#581): those blocks land in the allocator's MEDIUM size class, and a
+ * handful of survivors pin a 512 KiB page each — 140 pages held ~1.4 MiB of
+ * live data, roughly 2% occupancy, which no purge can reclaim because the pages
+ * are in use rather than free. The arena census confirmed the allocator was
+ * behaving correctly: zero free-committed slices, 58% already returned to the
+ * OS. The problem was allocation SHAPE, not retention.
+ *
+ * Giving SQLite one contiguous slab to serve page cache from makes that memory
+ * dense and bounded, and — because the slab is reused across connections —
+ * removes the per-request churn that did the pinning. Costs a fixed upfront
+ * commit, which is the point: bounded beats unbounded.
+ *
+ * Must run before SQLite initialises, so it is done once on the first open. */
 
 cbm_store_t *cbm_store_open_memory(void) {
     return store_open_internal(":memory:", true, true);
@@ -5256,7 +5276,7 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase =
         "SELECT id, qualified_name, file_path FROM nodes WHERE project=?1 AND label IN "
-        "('Function','Method','Class')";
+        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", nbase, arch_path_scope_sql());
     } else {
@@ -5399,7 +5419,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char qsqlbuf[ST_SQL_BUF];
     const char *qbase = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
-                        "('Function','Method','Class')";
+                        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     if (scoped) {
         snprintf(qsqlbuf, sizeof(qsqlbuf), "%s%s", qbase, arch_path_scope_sql());
     } else {
@@ -6666,7 +6686,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
     const char *nbase = "SELECT id, name, qualified_name, file_path FROM nodes "
-                        "WHERE project=?1 AND label IN ('Function','Method','Class')";
+                        "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
     if (scoped) {
         snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", nbase,
                  arch_path_scope_sql());
@@ -7117,12 +7137,33 @@ cbm_adr_sections_t cbm_adr_parse_sections(const char *content) {
     return result;
 }
 
-/* Append a section to the render buffer. */
+/* Append a section to the render buffer.
+ *
+ * snprintf returns the length it WOULD have written, so a section larger than
+ * the space left would otherwise push pos past buf_sz; the next call would then
+ * compute a wrapped (huge) remaining size from (buf_sz - pos) and write out of
+ * bounds. Clamp pos into [0, buf_sz-1] after every write so each snprintf gets
+ * a positive size and the returned cursor never escapes the buffer. */
 static int adr_render_section(char *buf, int buf_sz, int pos, const char *key, const char *value) {
-    if (pos > 0) {
-        pos += snprintf(buf + pos, buf_sz - pos, "\n\n");
+    if (buf_sz <= 0) {
+        return 0;
     }
-    pos += snprintf(buf + pos, buf_sz - pos, "## %s\n%s", key, value);
+    if (pos < 0) {
+        pos = 0;
+    }
+    if (pos >= buf_sz) {
+        return buf_sz - SKIP_ONE;
+    }
+    if (pos > 0) {
+        pos += snprintf(buf + pos, (size_t)(buf_sz - pos), "\n\n");
+        if (pos >= buf_sz) {
+            return buf_sz - SKIP_ONE;
+        }
+    }
+    pos += snprintf(buf + pos, (size_t)(buf_sz - pos), "## %s\n%s", key, value);
+    if (pos >= buf_sz) {
+        pos = buf_sz - SKIP_ONE;
+    }
     return pos;
 }
 
@@ -7719,7 +7760,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"
                       " WHERE v.project = ?2"
-                      " AND n.label IN ('Function','Method','Class')"
+                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")"
                       " ORDER BY score DESC"
                       " LIMIT ?3";
 

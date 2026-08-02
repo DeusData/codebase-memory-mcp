@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-43-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -155,11 +155,25 @@ Watcher registration is controlled separately by `auto_watch` (default `true`). 
 
 ### Keeping Up to Date
 
+**Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
+
 ```bash
-codebase-memory-mcp update
+# macOS / Linux
+bash "<install-dir>/install.sh"
 ```
 
-The MCP server also checks for updates on startup and notifies on the first tool call if a newer release is available.
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File "<install-dir>\install.ps1"
+```
+
+The install script is placed next to the binary at install time, so the printed path resolves beside the executable. It is idempotent, so re-running it *is* the update: it stops the daemon, retires the running binary, installs the new one, and cleans up.
+
+Why it works this way. On Windows it is a hard requirement — a running executable cannot replace its own image, so the swap has to happen from a process that is not the binary being replaced. On macOS and Linux it is a deliberate choice: an in-process updater is structurally a downloader (fetch an archive, verify it, unpack it, mark a file executable, run it), and shipping that composite in every binary to serve a command most people run a handful of times is a poor trade. The release archives now carry no download URLs at all, and **cbm makes no network request of its own accord** — it does not check for new versions in the background, and nothing phones home. You find out about releases from the install script, your package manager, or GitHub.
+
+If PowerShell refuses to run the script because the file came from the internet, `Unblock-File` it first.
+
+Installed through **npm or pip**? Update with your package manager on every platform (`npm install -g codebase-memory-mcp@latest` / `pip install -U codebase-memory-mcp`).
 
 ### Uninstall
 
@@ -168,6 +182,8 @@ codebase-memory-mcp uninstall
 ```
 
 Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and deleted only after confirmation.
+
+The install script placed beside the binary is **reported, not deleted** — uninstall prints its path and the `rm` command for it. It is left alone on purpose: it may be your own copy, a symlink into a checkout, or managed by a package manager, and an uninstaller should not delete a file it cannot prove it owns.
 
 ## Features
 
@@ -359,7 +375,23 @@ git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
-# Binary at: build/c/codebase-memory-mcp
+# Binary at: build/c/codebase-memory-mcp   (codebase-memory-mcp.exe on Windows)
+```
+
+Every platform builds **one self-contained binary** — no runtime dependencies, no companion executables to keep alongside it.
+
+Run the test suite (6,768 tests across 120 suites):
+
+```bash
+scripts/test.sh                     # full: clean sanitizer build + all suites + guards
+scripts/test.sh --suites <name>     # one suite, incremental, seconds
+build/c/test-runner --list-suites   # what is available
+```
+
+`scripts/test.sh` is the same entry the CI gates run, so a local pass means the same thing a CI pass does. Packaging a release archive locally uses the same canonical script the release pipeline calls:
+
+```bash
+scripts/package-release.sh <linux|darwin|windows> <amd64|arm64>
 ```
 
 ### Manual MCP Configuration
@@ -584,8 +616,10 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
-| `manage_adr` | CRUD for Architecture Decision Records. |
+| `manage_adr` | CRUD for Architecture Decision Records. Query modes do not wait behind a same-project reindex; writes remain serialized. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+
+`manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
 
 ## Graph Data Model
 

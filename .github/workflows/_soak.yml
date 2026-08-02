@@ -5,9 +5,13 @@ on:
   workflow_call:
     inputs:
       duration_minutes:
-        description: 'Soak duration in minutes'
+        description: 'Soak duration in minutes (per leg)'
         type: number
         default: 10
+      legs:
+        description: "Soak legs for the quick jobs, passed to scripts/soak-legs.sh --legs (e.g. 'quick,query-leak' or 'query-leak' for a long #581-only run)"
+        type: string
+        default: 'quick,query-leak'
       run_asan:
         description: 'Run ASan soak in addition to quick soak'
         type: boolean
@@ -47,12 +51,13 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
-    # BUG FIX: this was hard-coded to 30, but the caller (nightly-soak.yml)
-    # passes duration_minutes: 240. GitHub killed the job at 30 min, so the
-    # "4h nightly soak" was SILENTLY TRUNCATED to 30 min and never once ran
-    # multi-hour. Budget must always exceed the passed duration; 300 covers
-    # the 240-min nightly with headroom (build + analysis + idle phases).
-    timeout-minutes: 300
+    # Budget doctrine (this line has been silently violated TWICE): the job
+    # timeout must exceed the WORST-CASE run length, and duration_minutes is
+    # per LEG. Two 240-min legs (the nightly) need ~480 min + build + analysis;
+    # the previous 300 silently killed the second leg at the timeout — the same
+    # truncation class as the original hard-coded 30. Keep a literal (the
+    # inputs context is not reliably available at job-setup time): 560.
+    timeout-minutes: 560
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install deps (Linux)
@@ -60,15 +65,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
       - name: Build
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
-      - name: Soak (${{ inputs.duration_minutes }} min)
-        run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes }}
-      # #581 guard: read-only soak (never reindex/mutate) so any memory growth is
-      # a query-path leak, not WAL/indexing. Reuses the build above.
-      - name: Query-leak soak (#581, read-only)
-        env:
-          CBM_SOAK_MODE: query-leak
-          RESULTS_DIR: soak-results-query-leak
-        run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes }} --skip-crash-test
+      # The soak SEQUENCE and its guards live in the ONE canonical entry
+      # scripts/soak-legs.sh — never in workflow YAML. Leg selection is a
+      # workflow input so a long #581-only run needs no separate workflow.
+      - name: Soak legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
+        run: scripts/soak-legs.sh --legs "${{ inputs.legs }}" build/c/codebase-memory-mcp ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -86,12 +87,12 @@ jobs:
 
   soak-quick-windows:
     runs-on: windows-latest
-    # BUG FIX (same 30→240 mismatch as soak-quick above): the caller passes
-    # duration_minutes: 240, so a 30-min cap truncated the nightly soak here
-    # too. 300 covers the 240-min nightly with headroom.
-    timeout-minutes: 300
+    # Budget doctrine (see soak-quick): duration_minutes is per LEG, so two
+    # 240-min legs need ~480 min + build; 300 silently killed the second leg.
+    timeout-minutes: 560
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64
@@ -103,25 +104,28 @@ jobs:
             make
             git
             coreutils
+      # Same protected root the test legs and the VM soak use. Without it the
+      # soak ran under the runner's inherited LocalAppData\Temp ACLs while the
+      # local soak ran hardened — the two venues were soaking different shapes.
+      - name: Create protected per-user temp root
+        shell: pwsh
+        run: |
+          $root = & scripts/ci/new-protected-temp-root.ps1 `
+            -Prefix 'cbm-ci-tmp-' `
+            -ProtectDir (Join-Path $env:GITHUB_WORKSPACE "build\c")
+          "CBM_CI_TEMP_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build
         shell: msys2 {0}
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
-      - name: Soak (${{ inputs.duration_minutes }} min)
+      # Both release-gating legs via the ONE canonical soak entry; only the
+      # protected-TEMP provisioning is venue text. soak-legs.sh resolves .exe.
+      - name: Soak legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
         shell: msys2 {0}
         run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }}
-      # #581 guard on Windows — the platform the bug is reported on.
-      - name: Query-leak soak (#581, read-only)
-        shell: msys2 {0}
-        env:
-          CBM_SOAK_MODE: query-leak
-          RESULTS_DIR: soak-results-query-leak
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }} --skip-crash-test
+          export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
+          export TMP="$TEMP"
+          export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
+          scripts/soak-legs.sh --legs "${{ inputs.legs }}" build/c/codebase-memory-mcp ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -141,9 +145,11 @@ jobs:
     # Native ARM64 Windows soak (CLANGARM64, no sanitizer — ASan is unavailable
     # on native ARM64 Windows). Builds from source like soak-quick-windows.
     runs-on: windows-11-arm
-    timeout-minutes: 300
+    # Budget doctrine (see soak-quick): per-leg duration, two legs, 560.
+    timeout-minutes: 560
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANGARM64
@@ -155,25 +161,28 @@ jobs:
             make
             git
             coreutils
+      # Same protected root the test legs and the VM soak use. Without it the
+      # soak ran under the runner's inherited LocalAppData\Temp ACLs while the
+      # local soak ran hardened — the two venues were soaking different shapes.
+      - name: Create protected per-user temp root
+        shell: pwsh
+        run: |
+          $root = & scripts/ci/new-protected-temp-root.ps1 `
+            -Prefix 'cbm-ci-tmp-' `
+            -ProtectDir (Join-Path $env:GITHUB_WORKSPACE "build\c")
+          "CBM_CI_TEMP_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build
         shell: msys2 {0}
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
-      - name: Soak (${{ inputs.duration_minutes }} min)
+      # Both release-gating legs via the ONE canonical soak entry; only the
+      # protected-TEMP provisioning is venue text. soak-legs.sh resolves .exe.
+      - name: Soak legs (${{ inputs.legs }}, ${{ inputs.duration_minutes }} min each)
         shell: msys2 {0}
         run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }}
-      # #581 guard on Windows — the platform the bug is reported on.
-      - name: Query-leak soak (#581, read-only)
-        shell: msys2 {0}
-        env:
-          CBM_SOAK_MODE: query-leak
-          RESULTS_DIR: soak-results-query-leak
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }} --skip-crash-test
+          export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
+          export TMP="$TEMP"
+          export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
+          scripts/soak-legs.sh --legs "${{ inputs.legs }}" build/c/codebase-memory-mcp ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -234,7 +243,10 @@ jobs:
       - name: ASan soak (15 min)
         env:
           ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
-        run: scripts/soak-test.sh build/c/codebase-memory-mcp 15
+        # Single-leg variant of the canonical soak entry: the ASan build is too
+        # slow for the two-leg sequence; leg selection is a documented flag, not
+        # a divergent inline procedure.
+        run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -252,6 +264,7 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64
@@ -272,10 +285,8 @@ jobs:
         shell: msys2 {0}
         env:
           ASAN_OPTIONS: "detect_leaks=0:halt_on_error=0:log_path=soak-results/asan"
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          scripts/soak-test.sh "$BIN" 15
+        # Single-leg variant of the canonical soak entry (see the unix ASan job).
+        run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

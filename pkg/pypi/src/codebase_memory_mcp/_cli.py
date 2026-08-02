@@ -15,11 +15,9 @@ import urllib.request
 from pathlib import Path
 
 REPO = "DeusData/codebase-memory-mcp"
-_WINDOWS_LAUNCHER_NAME = "codebase-memory-mcp.exe"
-_WINDOWS_PAYLOAD_NAME = "codebase-memory-mcp.payload.exe"
+_WINDOWS_BINARY_NAME = "codebase-memory-mcp.exe"
 _WINDOWS_ARCHIVE_NAMES = (
-    _WINDOWS_LAUNCHER_NAME,
-    _WINDOWS_PAYLOAD_NAME,
+    _WINDOWS_BINARY_NAME,
     "LICENSE",
     "install.ps1",
     "THIRD_PARTY_NOTICES.md",
@@ -332,37 +330,26 @@ def _cache_dir() -> Path:
 
 
 def _bin_path(version: str) -> Path:
-    # The payload remains the immutable Windows cache pair's readiness signal.
-    # _execution_path selects the adjacent launcher for process execution.
+    # One binary per platform: the cached file is the executed file.
     name = (
-        _WINDOWS_PAYLOAD_NAME
+        _WINDOWS_BINARY_NAME
         if sys.platform == "win32"
         else "codebase-memory-mcp"
     )
     return _cache_dir() / version / name
 
 
-def _windows_pair_paths(version: str):
-    version_dir = _cache_dir() / version
-    return (
-        version_dir / _WINDOWS_LAUNCHER_NAME,
-        version_dir / _WINDOWS_PAYLOAD_NAME,
-    )
+def _execution_path(binary: Path, target_platform: str) -> Path:
+    """The cached binary is executed directly on every platform."""
+    return binary
 
 
-def _execution_path(payload: Path, target_platform: str) -> Path:
-    """Select the permanent Windows launcher without changing other platforms."""
-    if target_platform == "win32":
-        return payload.with_name(_WINDOWS_LAUNCHER_NAME)
-    return payload
-
-
-def _windows_pair_ready(version: str) -> bool:
-    launcher, payload = _windows_pair_paths(version)
-    if not launcher.is_file() or not payload.is_file():
+def _windows_binary_ready(version: str) -> bool:
+    binary = _cache_dir() / version / _WINDOWS_BINARY_NAME
+    if not binary.is_file():
         return False
     try:
-        _verify_candidate(launcher)
+        _verify_candidate(binary)
     except RuntimeError:
         return False
     return True
@@ -404,21 +391,12 @@ def _download(version: str) -> Path:
 
         _verify_checksum(tmp_archive, archive, version)
 
-        if os_name == "windows":
-            bin_name = _WINDOWS_PAYLOAD_NAME
-            extraction_names = (
-                _WINDOWS_LAUNCHER_NAME,
-                _WINDOWS_PAYLOAD_NAME,
-            )
-        else:
-            bin_name = "codebase-memory-mcp"
-            extraction_names = (bin_name,)
-        cache_names = extraction_names
-        publish_names = (
-            (_WINDOWS_LAUNCHER_NAME, _WINDOWS_PAYLOAD_NAME)
-            if os_name == "windows"
-            else cache_names
+        bin_name = (
+            _WINDOWS_BINARY_NAME if os_name == "windows" else "codebase-memory-mcp"
         )
+        extraction_names = (bin_name,)
+        cache_names = extraction_names
+        publish_names = cache_names
         if ext == "tar.gz":
             import tarfile
             with tarfile.open(tmp_archive) as tf:
@@ -447,11 +425,7 @@ def _download(version: str) -> Path:
             )
             extracted_paths[name] = extracted_path
         try:
-            if os_name == "windows":
-                # The portable launcher must resolve this adjacent payload.
-                _verify_candidate(extracted_paths[_WINDOWS_LAUNCHER_NAME])
-            else:
-                _verify_candidate(extracted_paths[bin_name])
+            _verify_candidate(extracted_paths[bin_name])
         except RuntimeError as exc:
             sys.exit(f"codebase-memory-mcp: {exc}")
 
@@ -488,7 +462,7 @@ def _download(version: str) -> Path:
                     if not _files_equal_sha256(staged_paths[name], target):
                         raise publish_error
             if os_name == "windows":
-                _verify_candidate(dest.parent / _WINDOWS_LAUNCHER_NAME)
+                _verify_candidate(dest.parent / _WINDOWS_BINARY_NAME)
             else:
                 _verify_candidate(dest)
         except RuntimeError as exc:
@@ -508,7 +482,7 @@ def main() -> None:
     bin_path = _bin_path(version)
 
     cache_ready = (
-        _windows_pair_ready(version)
+        _windows_binary_ready(version)
         if sys.platform == "win32"
         else bin_path.is_file()
     )

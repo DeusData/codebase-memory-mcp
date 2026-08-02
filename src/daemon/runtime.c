@@ -9,6 +9,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include "foundation/mem.h"
 #include "foundation/platform.h"
 
 #include <limits.h>

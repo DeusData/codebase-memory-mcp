@@ -8,10 +8,9 @@ const test = require('node:test');
 
 const {
   UNIX_ARCHIVE_NAMES,
-  WINDOWS_LAUNCHER_NAME,
-  WINDOWS_PAYLOAD_NAME,
+  WINDOWS_BINARY_NAME,
   extractExactTarArchive,
-  installWindowsPairAtomically,
+  installWindowsBinaryAtomically,
   validateExactTarMemberListing,
 } = require('../install.js');
 
@@ -53,25 +52,20 @@ test('Unix extraction requests only the validated root executable', () => {
   );
 });
 
-function writePair(directory, tag) {
+function writeBinary(directory, tag) {
   fs.mkdirSync(directory, { recursive: true });
-  fs.writeFileSync(path.join(directory, WINDOWS_LAUNCHER_NAME), `launcher:${tag}`);
-  fs.writeFileSync(path.join(directory, WINDOWS_PAYLOAD_NAME), `payload:${tag}`);
+  fs.writeFileSync(path.join(directory, WINDOWS_BINARY_NAME), `binary:${tag}`);
 }
 
-function fakePairVerifier(launcherPath) {
-  const launcher = fs.readFileSync(launcherPath, 'utf8');
-  const payload = fs.readFileSync(
-    path.join(path.dirname(launcherPath), WINDOWS_PAYLOAD_NAME), 'utf8',
-  );
-  const match = /^launcher:(.+)$/.exec(launcher);
-  if (!match || payload !== `payload:${match[1]}`) {
-    throw new Error('launcher/payload test pair mismatch');
+function fakeBinaryVerifier(binaryPath) {
+  const binary = fs.readFileSync(binaryPath, 'utf8');
+  if (!/^binary:(.+)$/.test(binary)) {
+    throw new Error('cached Windows binary failed verification');
   }
 }
 
-function withPairDirectories(callback) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-npm-pair-test-'));
+function withBinaryDirectories(callback) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-npm-binary-test-'));
   const source = path.join(root, 'source');
   const destination = path.join(root, 'destination');
   fs.mkdirSync(destination);
@@ -82,56 +76,42 @@ function withPairDirectories(callback) {
   }
 }
 
-function assertPair(directory, tag) {
+function assertBinary(directory, tag) {
   assert.equal(
-    fs.readFileSync(path.join(directory, WINDOWS_LAUNCHER_NAME), 'utf8'),
-    `launcher:${tag}`,
-  );
-  assert.equal(
-    fs.readFileSync(path.join(directory, WINDOWS_PAYLOAD_NAME), 'utf8'),
-    `payload:${tag}`,
+    fs.readFileSync(path.join(directory, WINDOWS_BINARY_NAME), 'utf8'),
+    `binary:${tag}`,
   );
 }
 
-test('Windows publication repairs a corrupt launcher', () => {
-  withPairDirectories(({ source, destination }) => {
-    writePair(source, 'candidate');
-    writePair(destination, 'old');
-    fs.writeFileSync(path.join(destination, WINDOWS_LAUNCHER_NAME), 'corrupt');
+test('Windows publication repairs a corrupt cached binary', () => {
+  withBinaryDirectories(({ source, destination }) => {
+    writeBinary(source, 'candidate');
+    writeBinary(destination, 'old');
+    fs.writeFileSync(path.join(destination, WINDOWS_BINARY_NAME), 'corrupt');
 
-    installWindowsPairAtomically(source, destination, fakePairVerifier);
+    installWindowsBinaryAtomically(source, destination, fakeBinaryVerifier);
 
-    assertPair(destination, 'candidate');
+    assertBinary(destination, 'candidate');
   });
 });
 
-test('Windows publication repairs corrupt or missing payload state', () => {
-  for (const payload of ['corrupt', null]) {
-    withPairDirectories(({ source, destination }) => {
-      writePair(source, 'candidate');
-      fs.writeFileSync(
-        path.join(destination, WINDOWS_LAUNCHER_NAME), 'launcher:partial',
-      );
-      if (payload !== null) {
-        fs.writeFileSync(
-          path.join(destination, WINDOWS_PAYLOAD_NAME), payload,
-        );
-      }
+test('Windows publication installs into an empty cache', () => {
+  withBinaryDirectories(({ source, destination }) => {
+    writeBinary(source, 'candidate');
 
-      installWindowsPairAtomically(source, destination, fakePairVerifier);
+    installWindowsBinaryAtomically(source, destination, fakeBinaryVerifier);
 
-      assertPair(destination, 'candidate');
-    });
-  }
+    assertBinary(destination, 'candidate');
+  });
 });
 
 test('Windows publication preserves a valid concurrent winner', () => {
-  withPairDirectories(({ source, destination }) => {
-    writePair(source, 'loser');
-    writePair(destination, 'winner');
+  withBinaryDirectories(({ source, destination }) => {
+    writeBinary(source, 'loser');
+    writeBinary(destination, 'winner');
 
-    installWindowsPairAtomically(source, destination, fakePairVerifier);
+    installWindowsBinaryAtomically(source, destination, fakeBinaryVerifier);
 
-    assertPair(destination, 'winner');
+    assertBinary(destination, 'winner');
   });
 });

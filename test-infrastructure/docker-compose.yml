@@ -52,6 +52,9 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/arm64
+    # make is PID 1 for this service. Give orphaned subprocess-test descendants
+    # a real reaper so killed zombies do not keep process groups appearing live.
+    init: true
     volumes:
       - ..:/src
       - cbm-build:/src/build
@@ -67,7 +70,9 @@ services:
     # seccomp profile — unconfined is safe here (the container runs only our own
     # test code). The no-randomize personality inherits to the make child.
     security_opt: ["seccomp=unconfined"]
-    entrypoint: ["setarch", "-R", "make", "-f", "Makefile.cbm", "test-tsan"]
+    # The TSan leg lives in the canonical test entry (scripts/test.sh --tsan),
+    # same as CI's tsan jobs; the no-randomize personality inherits through it.
+    entrypoint: ["setarch", "-R", "bash", "scripts/test.sh", "--tsan"]
     command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64-tsan"]
 
   test-tsan-amd64:
@@ -75,6 +80,7 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/amd64
+    init: true
     volumes:
       - ..:/src
       - cbm-build:/src/build
@@ -84,7 +90,8 @@ services:
       CCACHE_DIR: /root/.ccache
       CCACHE_MAXSIZE: 1500M
     security_opt: ["seccomp=unconfined"]
-    entrypoint: ["setarch", "-R", "make", "-f", "Makefile.cbm", "test-tsan"]
+    # Canonical test entry, TSan mode — same file as CI's tsan jobs.
+    entrypoint: ["setarch", "-R", "bash", "scripts/test.sh", "--tsan"]
     command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64-tsan"]
 
   # ── Linux production build (-O2 -Werror) ───────────────────
@@ -146,7 +153,7 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
-        scripts/smoke-test.sh ./build/linux-arm64/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/linux-arm64/codebase-memory-mcp
 
   smoke-amd64:
     build:
@@ -159,7 +166,25 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-amd64 &&
-        scripts/smoke-test.sh ./build/linux-amd64/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/linux-amd64/codebase-memory-mcp
+
+  # ── Soak (both CI legs) ────────────────────────────────────
+  # The sequence (quick + #581 query-leak) lives in the canonical entry
+  # scripts/soak-legs.sh — the same file _soak.yml and the Windows VM run.
+  # The local ladder previously had NO unix soak at all. Duration follows
+  # CBM_SOAK_MINUTES (default 10, matching the dry run).
+  soak:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
+        scripts/soak-legs.sh ./build/linux-arm64/codebase-memory-mcp ${CBM_SOAK_MINUTES:-10}
 
   # ── Windows smoke (cross-compile + Wine) ──────────────────
   smoke-windows:
@@ -173,28 +198,9 @@ services:
     command:
       - |
         scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ BUILD_DIR=build/win-cross &&
-        mv build/win-cross/codebase-memory-mcp build/win-cross/codebase-memory-mcp.exe 2>/dev/null || true &&
-        WINEDEBUG=-all scripts/smoke-test.sh ./build/win-cross/codebase-memory-mcp.exe
-
-  # ── Windows soak (cross-compile + Wine) ───────────────────
-  # Soak is the one place a CPU cap is meaningful: sustained runs under
-  # deliberate resource starvation surface scheduling/backpressure behaviour the
-  # full-parallel correctness suite does not target. Opt in with
-  # CBM_LOCAL_CI_CPUS=<n>; default 0 = unlimited, so normal soak runs stay fast.
-  soak-windows:
-    build:
-      context: ..
-      dockerfile: test-infrastructure/Dockerfile.mingw
-    platform: linux/amd64
-    cpus: ${CBM_LOCAL_CI_CPUS:-0}
-    volumes:
-      - ..:/src
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ BUILD_DIR=build/win-cross &&
-        mv build/win-cross/codebase-memory-mcp build/win-cross/codebase-memory-mcp.exe 2>/dev/null || true &&
-        CBM_DIAGNOSTICS=1 WINEDEBUG=-all scripts/soak-test.sh ./build/win-cross/codebase-memory-mcp.exe 10
+        test ! -e build/win-cross/codebase-memory-mcp.payload.exe &&
+        WINEDEBUG=-all wine64 ./build/win-cross/codebase-memory-mcp.exe --version &&
+        WINEDEBUG=-all wine64 cmd /c build/win-cross/codebase-memory-mcp.exe --version
 
   # ── Linux portable (Alpine musl static) ────────────────────
   test-portable:
@@ -230,7 +236,50 @@ services:
         scripts/build.sh CC=gcc CXX=g++ STATIC=1 BUILD_DIR=build/alpine &&
         file build/alpine/codebase-memory-mcp | grep -q "statically linked" &&
         echo "=== Verified: statically linked ===" &&
-        scripts/smoke-test.sh ./build/alpine/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
+
+  # ── Artifact-flow smoke (package → extract → wrapper) ──────
+  # The release venue smokes the shipped archive; this lane reproduces that
+  # flow with local bytes via the canonical package-release.sh +
+  # smoke-local.sh artifact mode, so archive-layout bugs surface locally.
+  smoke-artifact:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        BUILD_DIR=build/linux-arm64 \
+          scripts/ci/smoke-artifact.sh linux arm64 CC=gcc CXX=g++
+
+  # ── glibc floor (ubuntu-22.04, glibc 2.35) ─────────────────
+  # Mirrors CI's broad-matrix 22.04 legs: the portable (musl-static) binary
+  # must pass the canonical smoke on the oldest supported userland, and the
+  # dynamic binary must REFUSE to start (glibc 2.38+ floor is by design).
+  smoke-glibc-floor:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.glibc22
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        file build/alpine/codebase-memory-mcp | grep -q "statically linked"
+        echo "=== glibc-floor: portable binary smoke on glibc 2.35 ==="
+        scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
+        echo "=== glibc-floor: dynamic binary must refuse (glibc 2.38+ floor) ==="
+        if build/linux-arm64/codebase-memory-mcp --version 2>/tmp/dynamic-floor.err; then
+          echo "ERROR: dynamic binary ran on glibc 2.35 — floor contract broken"
+          exit 1
+        fi
+        grep -qi 'GLIBC' /tmp/dynamic-floor.err
+        echo "=== Verified: dynamic binary refuses with a GLIBC floor error ==="
 
   # ── Lint ────────────────────────────────────────────────────
   lint:

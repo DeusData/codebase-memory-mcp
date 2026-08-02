@@ -1,4 +1,4 @@
-# install.ps1 — One-line installer for codebase-memory-mcp (Windows).
+# install.ps1 - One-line installer for codebase-memory-mcp (Windows).
 #
 # Usage: see README.md for install instructions.
 #
@@ -14,10 +14,8 @@ Add-Type -AssemblyName System.Net.Http
 $Repo = "DeusData/codebase-memory-mcp"
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
-$PayloadName = "codebase-memory-mcp.payload.exe"
 $WindowsArchiveNames = @(
     $BinName,
-    $PayloadName,
     "LICENSE",
     "install.ps1",
     "THIRD_PARTY_NOTICES.md"
@@ -105,7 +103,7 @@ foreach ($arg in $args) {
 # PROCESSOR_ARCHITEW6432, which is unset for 64-bit emulated processes. Fall back
 # to the env vars only if the .NET API is somehow unavailable.
 if ($env:CBM_ARCH) {
-    # Explicit override wins — used by CI/tests, and an escape hatch under x64
+    # Explicit override wins - used by CI/tests, and an escape hatch under x64
     # emulation on ARM64 where no in-process detection is reliable.
     $Arch = $env:CBM_ARCH
 } else {
@@ -237,32 +235,28 @@ try {
     exit 1
 }
 
-# Extract the complete, validated bundle. The portable launcher owns the
-# managed install transaction and contains its adjacent payload.
+# Extract the validated bundle. Windows ships ONE binary, exactly like Linux
+# and macOS; this script is what replaces it, because a running executable
+# cannot replace itself on Windows. Re-running this script IS the update.
 Write-Host "Extracting..."
 Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
 
-$DownloadedLauncher = Join-Path $TmpDir $BinName
-$DownloadedPayload = Join-Path $TmpDir $PayloadName
-if (-not (Test-Path -LiteralPath $DownloadedLauncher -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $DownloadedPayload -PathType Leaf)) {
-    Write-Host "error: launcher or payload not found after extraction" -ForegroundColor Red
+$DownloadedBinary = Join-Path $TmpDir $BinName
+if (-not (Test-Path -LiteralPath $DownloadedBinary -PathType Leaf)) {
+    Write-Host "error: $BinName not found after extraction" -ForegroundColor Red
     Remove-Item -Recurse -Force $TmpDir
     exit 1
 }
-$launcherItem = Get-Item -LiteralPath $DownloadedLauncher
-$payloadItem = Get-Item -LiteralPath $DownloadedPayload
-if (($launcherItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
-    ($payloadItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+$binaryItem = Get-Item -LiteralPath $DownloadedBinary
+if ($binaryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
     Write-Host "error: refusing reparse-point executable in release archive" -ForegroundColor Red
     Remove-Item -Recurse -Force $TmpDir
     exit 1
 }
 
-# Verify the complete launcher/payload path before it asks all coordinated CBM
-# processes to stop.
+# Prove the downloaded binary runs before touching an existing installation.
 try {
-    $candidateVersion = & $DownloadedLauncher --version 2>&1
+    $candidateVersion = & $DownloadedBinary --version 2>&1
     if ($LASTEXITCODE -ne 0) { throw "candidate exited with $LASTEXITCODE" }
     Write-Host "Verified candidate: $candidateVersion"
 } catch {
@@ -272,15 +266,60 @@ try {
 }
 
 $Dest = Join-Path $InstallDir $BinName
+
+# Retire the running installation before replacing it. Windows keeps an image
+# lock on a running .exe: the file cannot be overwritten, but it CAN be renamed
+# out of the way, which is what makes an in-place update possible from here.
+if (Test-Path -LiteralPath $Dest -PathType Leaf) {
+    try { & $Dest daemon stop 2>&1 | Out-Null } catch { }
+    $retired = "$Dest.retired-$(Get-Date -Format yyyyMMddHHmmss)"
+    $renamed = $false
+    foreach ($attempt in 1..10) {
+        try { Move-Item -LiteralPath $Dest -Destination $retired -Force -ErrorAction Stop; $renamed = $true; break }
+        catch { Start-Sleep -Milliseconds 500 }
+    }
+    if (-not $renamed) {
+        Write-Host "error: could not retire the existing $BinName - close all running" -ForegroundColor Red
+        Write-Host "       codebase-memory-mcp sessions and coding agents, then re-run." -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 1
+    }
+    # A retired image stays locked until its last process exits; delete it when
+    # we can, and leave it for the next run when we cannot. Never fail here.
+    Remove-Item -LiteralPath $retired -Force -ErrorAction SilentlyContinue
+}
+Get-ChildItem -LiteralPath $InstallDir -Filter "$BinName.retired-*" -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+
 $InstallArgs = @("install", "-y", "--force", "--dir=$InstallDir")
 if ($SkipConfig) { $InstallArgs += "--skip-config" }
-# PowerShell's call operator waits for the launcher, which in turn contains the
-# install payload in its native job and relays the exact exit status.
-& $DownloadedLauncher @InstallArgs
+& $DownloadedBinary @InstallArgs
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "error: coordinated activation failed (exit code $LASTEXITCODE)" -ForegroundColor Red
+    Write-Host "error: installation failed (exit code $LASTEXITCODE)" -ForegroundColor Red
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     exit 1
+}
+
+# Place the installer beside the binary so `update` points at a local file
+# rather than a URL, and so the next update runs THIS release's installer.
+#
+# Sourced from the archive we just checksum-verified, and published by rename
+# rather than written over the live path. PowerShell parses a script fully
+# before executing it, so self-overwrite is less hazardous here than it is for
+# bash -- but rename costs nothing and keeps both platforms on one rule.
+# Best effort: a failure here still leaves a working install.
+$DownloadedInstaller = Join-Path $TmpDir "install.ps1"
+if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
+    $InstallerDest = Join-Path $InstallDir "install.ps1"
+    $InstallerTmp = "$InstallerDest.new"
+    try {
+        Copy-Item -LiteralPath $DownloadedInstaller -Destination $InstallerTmp -Force -ErrorAction Stop
+        Move-Item -LiteralPath $InstallerTmp -Destination $InstallerDest -Force -ErrorAction Stop
+        Write-Host "Installed updater -> $InstallerDest"
+    } catch {
+        Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        Write-Host "note: could not place install.ps1 in $InstallDir (update will explain where to find it)"
+    }
 }
 
 # Verify

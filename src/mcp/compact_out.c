@@ -97,15 +97,60 @@ static bool looks_numeric(const char *s) {
     return digit;
 }
 
+/* UTF-8 sequence length starting at p, validating continuation bytes and the
+ * lead-byte ranges (RFC 3629: no overlongs, no surrogates, max U+10FFFF);
+ * 0 = not a valid sequence start. Reads stop at the first invalid byte, so a
+ * terminating NUL is never overrun. */
+static size_t utf8_sequence_length(const unsigned char *p) {
+    unsigned char c = p[0];
+    if (c < 0x80) {
+        return 1;
+    }
+    if (c < 0xC2) {
+        return 0; /* bare continuation byte or overlong lead */
+    }
+    if (c < 0xE0) {
+        return (p[1] & 0xC0) == 0x80 ? 2 : 0;
+    }
+    if (c < 0xF0) {
+        unsigned char lo = c == 0xE0 ? 0xA0 : 0x80;
+        unsigned char hi = c == 0xED ? 0x9F : 0xBF;
+        if (p[1] < lo || p[1] > hi || (p[2] & 0xC0) != 0x80) {
+            return 0;
+        }
+        return 3;
+    }
+    if (c < 0xF5) {
+        unsigned char lo = c == 0xF0 ? 0x90 : 0x80;
+        unsigned char hi = c == 0xF4 ? 0x8F : 0xBF;
+        if (p[1] < lo || p[1] > hi || (p[2] & 0xC0) != 0x80 || (p[3] & 0xC0) != 0x80) {
+            return 0;
+        }
+        return 4;
+    }
+    return 0;
+}
+
 static bool needs_quotes(const char *s) {
     if (!s || !*s) {
         return false; /* empty cells emit as the "-" placeholder, not quotes */
     }
     for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
         /* Space-delimited rows: any internal whitespace or quote forces
-         * quoting so column positions stay parseable. */
-        if (isspace((unsigned char)*p) || *p == '"' || *p == '\r') {
+         * quoting so column positions stay parseable. Control bytes and
+         * invalid UTF-8 force the quoted path too, which sanitizes them —
+         * one raw byte otherwise makes line-oriented consumers (BSD grep)
+         * treat the ENTIRE tool output as unmatchable binary. */
+        if (isspace(c) || *p == '"' || *p == '\r' || c < 0x20 || c == 0x7f) {
             return true;
+        }
+        if (c >= 0x80) {
+            size_t len = utf8_sequence_length((const unsigned char *)p);
+            if (!len) {
+                return true;
+            }
+            p += len - 1;
         }
     }
     if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0 || strcmp(s, "null") == 0 ||
@@ -131,9 +176,28 @@ static void append_quoted(cbm_sb_t *sb, const char *s) {
         case '\r':
             cbm_sb_append_n(sb, "\\r", 2);
             break;
-        default:
-            cbm_sb_append_n(sb, p, 1);
+        default: {
+            unsigned char c = (unsigned char)*p;
+            if (c >= 0x20 && c != 0x7f && c < 0x80) {
+                cbm_sb_append_n(sb, p, 1);
+            } else if (c < 0x20 || c == 0x7f) {
+                /* JSON-style escape: the value stays one printable line. */
+                char esc[8];
+                snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                cbm_sb_append(sb, esc);
+            } else {
+                size_t len = utf8_sequence_length((const unsigned char *)p);
+                if (len) {
+                    cbm_sb_append_n(sb, p, len);
+                    p += len - 1;
+                } else {
+                    /* Invalid byte → U+FFFD: output is valid UTF-8 by
+                     * construction, and the corruption stays visible. */
+                    cbm_sb_append_n(sb, "\xEF\xBF\xBD", 3);
+                }
+            }
             break;
+        }
         }
     }
     cbm_sb_append_n(sb, "\"", 1);

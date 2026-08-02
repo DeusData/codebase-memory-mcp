@@ -1606,6 +1606,9 @@ static bool is_queue_topic_field(const char *key) {
 // Extract string value from a node (literal or constant reference).
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
     const char *vk = ts_node_type(val_node);
+    if (strcmp(vk, "template_string") == 0) {
+        return cbm_template_string_text(ctx->arena, val_node, ctx->source);
+    }
     if (is_string_like(vk)) {
         char *text = cbm_node_text(ctx->arena, val_node, ctx->source);
         if (text && text[0]) {
@@ -1706,6 +1709,14 @@ static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
 
 // Try to extract URL/topic from a positional argument (string or constant).
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
+    /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
+     * client URL joins the server route's canonical placeholder (issue #1006). */
+    if (strcmp(ak, "template_string") == 0) {
+        const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
+        if (flat) {
+            return strip_and_validate_string_arg(ctx->arena, (char *)flat);
+        }
+    }
     if (is_string_like(ak)) {
         char *text = cbm_node_text(ctx->arena, arg, ctx->source);
         const char *validated = strip_and_validate_string_arg(ctx->arena, text);

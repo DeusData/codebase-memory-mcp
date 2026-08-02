@@ -221,7 +221,16 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
   const int vermajor = MI_MALLOC_VERSION/10000;
   const int verminor = (MI_MALLOC_VERSION%10000)/100;
   const int verpatch = (MI_MALLOC_VERSION%100);
-  _mi_fprintf(out, arg, "v%i.%i.%i%s%s (built on %s, %s)\n", vermajor, verminor, verpatch,
+  /* CBM LOCAL PATCH (keep across mimalloc refreshes): upstream appends
+   * "(built on __DATE__, __TIME__)" here. mimalloc is linked into every cbm
+   * binary, so those two macros made every build byte-unique — two compilations
+   * of identical source seconds apart could never produce the same hash. That
+   * defeats reproducible builds, and it also means a released artifact can never
+   * inherit an antivirus false-positive determination made about its
+   * predecessor, because every rebuild is a brand-new file to a reputation
+   * system. The banner keeps the version; the wall clock is not diagnostics.
+   * -Wdate-time in CFLAGS_COMMON makes any new use a build failure. */
+  _mi_fprintf(out, arg, "v%i.%i.%i%s%s\n", vermajor, verminor, verpatch,
       #if defined(MI_CMAKE_BUILD_TYPE)
       ", " mi_stringify(MI_CMAKE_BUILD_TYPE)
       #else
@@ -233,7 +242,7 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
       #else
       ""
       #endif
-      , __DATE__, __TIME__);
+      );
 
   // show options
   for (int i = 0; i < _mi_option_last; i++) {

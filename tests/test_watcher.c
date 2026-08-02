@@ -675,6 +675,12 @@ TEST(watcher_stop_flag) {
  * blocked forever in pclose(). The test owns a verified forced-termination
  * backstop so the pre-fix RED cannot wedge the rest of the suite. */
 #define WATCHER_TEST_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
+/* Budget for the blocked-git child to spawn and write its PID marker (watcher
+ * poll + process spawn + first write). 5s was missed twice on starved 4-vCPU
+ * windows-11-arm runners (release run 30300256783, both attempts) with no
+ * failure on any faster leg — spawn latency under CPU starvation, not a
+ * watcher defect. 20s keeps the wait bounded without re-arming that miss. */
+#define WATCHER_TEST_SPAWN_MARKER_BUDGET_MS 20000
 
 #ifdef _WIN32
 typedef struct {
@@ -957,7 +963,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
               0);
 
     uint64_t child_id = 0;
-    bool marker_ready = watcher_windows_wait_pid(marker, cbm_now_ms() + 5000, &child_id);
+    bool marker_ready = watcher_windows_wait_pid(
+        marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &child_id);
     HANDLE child_process =
         marker_ready ? watcher_windows_open_exact_process(child_id, &expected_git) : NULL;
     bool exact_stop_image = child_process != NULL;
@@ -994,8 +1001,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
                                 &unwatch_run),
               0);
     uint64_t unwatch_child_id = 0;
-    bool unwatch_marker_ready =
-        watcher_windows_wait_pid(unwatch_marker, cbm_now_ms() + 5000, &unwatch_child_id);
+    bool unwatch_marker_ready = watcher_windows_wait_pid(
+        unwatch_marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &unwatch_child_id);
     HANDLE unwatch_process =
         unwatch_marker_ready ? watcher_windows_open_exact_process(unwatch_child_id, &expected_git)
                              : NULL;
@@ -1090,7 +1097,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_EQ(cbm_thread_create(&thread, 128U * 1024U, watcher_blocked_run_thread, &run), 0);
 
     pid_t child = 0;
-    bool marker_ready = watcher_test_wait_pid(marker, cbm_now_ms() + 5000, &child);
+    bool marker_ready =
+        watcher_test_wait_pid(marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &child);
     cbm_watcher_stop(watcher);
     bool stopped_without_backstop =
         marker_ready && watcher_test_wait_complete(&run.completed, cbm_now_ms() + 2500);
@@ -1115,8 +1123,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
         cbm_thread_create(&unwatch_thread, 128U * 1024U, watcher_blocked_run_thread, &unwatch_run),
         0);
     pid_t unwatch_child = 0;
-    bool unwatch_marker_ready =
-        watcher_test_wait_pid(unwatch_marker, cbm_now_ms() + 5000, &unwatch_child);
+    bool unwatch_marker_ready = watcher_test_wait_pid(
+        unwatch_marker, cbm_now_ms() + WATCHER_TEST_SPAWN_MARKER_BUDGET_MS, &unwatch_child);
     cbm_watcher_unwatch(unwatch_watcher, "blocked-unwatch");
     bool unwatch_cancelled_without_backstop =
         unwatch_marker_ready && watcher_test_wait_process_gone(unwatch_child, cbm_now_ms() + 2500);

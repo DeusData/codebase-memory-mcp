@@ -22,6 +22,8 @@ set -uo pipefail
 
 RUNNER="${1:?usage: run-tests-parallel.sh <path-to-test-runner> [jobs]}"
 JOBS="${2:-${CBM_TEST_PAR_JOBS:-}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCHEDULER="$SCRIPT_DIR/run-test-wave.py"
 
 if [ -z "$JOBS" ]; then
     if command -v nproc >/dev/null 2>&1; then
@@ -86,6 +88,7 @@ stamp_windows_build_dir pre-wave
 
 SUITES_FILE="$LOGDIR/suites.txt"
 RESULTS_FILE="$LOGDIR/results.txt"
+: > "$RESULTS_FILE"
 
 # tr strips the CR that the Windows CRT appends to every stdout line — a
 # suites file with CRLF endings made the runner reject every name
@@ -192,55 +195,48 @@ shard_filter < "$SER_FILE" > "$SER_FILE.shard" && mv "$SER_FILE.shard" "$SER_FIL
 SHARD_EXPECT="$LOGDIR/suites-shard.txt"
 cat "$PAR_FILE" "$SER_FILE" > "$SHARD_EXPECT"
 NSHARD=$(wc -l < "$SHARD_EXPECT" | tr -d ' ')
+
+# Machine-checkable manifest for CI's cross-shard completeness job: it
+# proves at runtime that the shards of one leg agree on N and on the full
+# suite list, and that the union of their slices IS that list — the guard
+# against a mis-plumbed CBM_TEST_SHARD (two jobs running the same slice
+# passes every per-shard check but silently drops a slice; only a
+# cross-shard view catches it). Written BEFORE any suite runs: the slice is
+# fully determined here, and a red run's manifest is exactly as load-bearing
+# as a green one's — CI uploads it if: always().
+{
+    echo "leg=${CBM_TEST_LEG:-local}"
+    echo "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
+    echo "list_sha256=$(sort "$SUITES_FILE" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
+    echo "--- slice ---"
+    cat "$SHARD_EXPECT"
+} > "$LOGDIR/shard-manifest.txt"
 echo "=== parallel test run: $NSHARD of $NSUITES suites (shard ${SHARD_INDEX}/${SHARD_TOTAL}, $(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
 
-export RUNNER LOGDIR RESULTS_FILE
-run_one() {
-    s="$1"
-    t0=$SECONDS
-    # Per-suite wall-clock ceiling so a wedged suite fails LOUDLY instead of
-    # blocking the run (and the single local build slot) indefinitely. The
-    # `incremental` suite legitimately re-indexes large fixtures (minutes) so
-    # it gets a wider ceiling until the template-DB fixture refactor lands;
-    # `daemon_runtime` measures ~610s SOLO on arm64 under ASan (10-round
-    # loop), so on an overloaded 4-job CI runner the 900s default is a
-    # slowness kill, not a hang detector — it joins the slow tier.
-    # Uses `timeout` where available (always in the Linux container / CI); on a
-    # host without it the suite runs uncapped (no regression vs before).
-    case "$s" in
-        incremental | store_arch | daemon_runtime) st="${CBM_SUITE_TIMEOUT_SLOW:-3600}" ;;
-        *) st="${CBM_SUITE_TIMEOUT:-900}" ;;
-    esac
-    if command -v timeout >/dev/null 2>&1; then
-        timeout --kill-after=15 "$st" "$RUNNER" "$s" > "$LOGDIR/$s.log" 2>&1
-        rc=$?
-        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "  FAIL: suite '$s' exceeded ${st}s wall clock (killed as hung)" \
-                >> "$LOGDIR/$s.log"
-        fi
-    else
-        "$RUNNER" "$s" > "$LOGDIR/$s.log" 2>&1
-        rc=$?
+# Per-suite wall-clock ceilings make a wedged child fail loudly. The
+# `incremental` suite legitimately re-indexes large fixtures (minutes), while
+# `daemon_runtime` measures ~610s solo on arm64 under ASan; those and
+# `store_arch` receive the wider ceiling. Process ownership and result
+# accounting live in one Python parent — no exported MSYS bash worker remains
+# between a completed native child and its durable result line.
+run_wave() {
+    local suite_file="$1"
+    local jobs="$2"
+    if ! python3 "$SCHEDULER" \
+        --suite-file "$suite_file" \
+        --log-dir "$LOGDIR" \
+        --results-file "$RESULTS_FILE" \
+        --jobs "$jobs" \
+        --timeout "${CBM_SUITE_TIMEOUT:-900}" \
+        --slow-timeout "${CBM_SUITE_TIMEOUT_SLOW:-3600}" \
+        --kill-grace 15 \
+        "$RUNNER"; then
+        echo "FAIL: parallel suite scheduler infrastructure failed" >&2
+        exit 1
     fi
-    secs=$((SECONDS - t0))
-    summary=$(grep -E '^  [0-9]+ passed' "$LOGDIR/$s.log" | tail -1)
-    # A suite that exits 0 WITHOUT printing its completion summary ran zero
-    # tests as far as anyone can prove (mis-parsed argv, drifted registration
-    # macro, early return) — that is a failure, not a green with pass=0.
-    if [ "$rc" -eq 0 ] && [ -z "$summary" ]; then
-        rc=97
-        echo "  FAIL: suite '$s' exited 0 without a completion summary (ran nothing?)" \
-            >> "$LOGDIR/$s.log"
-    fi
-    pass=$(printf '%s' "$summary" | sed -n 's/^  \([0-9]*\) passed.*/\1/p')
-    failn=$(printf '%s' "$summary" | sed -n 's/.* \([0-9]*\) failed.*/\1/p')
-    skip=$(printf '%s' "$summary" | sed -n 's/.* \([0-9]*\) skipped.*/\1/p')
-    # A single short echo line is an atomic append (< PIPE_BUF).
-    echo "$s rc=$rc pass=${pass:-0} fail=${failn:-0} skip=${skip:-0} secs=$secs" >> "$RESULTS_FILE"
 }
-export -f run_one
 
-xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$PAR_FILE"
+run_wave "$PAR_FILE" "$JOBS"
 
 # Tail scheduling in two phases. The FLEX suites are timing-shaped but do
 # not rendezvous through the shared per-account daemon runtime namespace,
@@ -272,24 +268,8 @@ done < "$SER_FILE"
 # Re-stamp at the tail boundary so the deadline-sensitive tail — which
 # hosts those suites — always starts from the verified-clean shape.
 stamp_windows_build_dir pre-tail
-xargs -P "${CBM_TAIL_JOBS:-2}" -I{} bash -c 'run_one "$@"' _ {} < "$FLEX_FILE"
-while IFS= read -r sname; do
-    run_one "$sname"
-done < "$EXCL_FILE"
-
-# Machine-checkable manifest for CI's cross-shard completeness job: it
-# proves at runtime that the shards of one leg agree on N and on the full
-# suite list, and that the union of their slices IS that list — the guard
-# against a mis-plumbed CBM_TEST_SHARD (two jobs running the same slice
-# passes every per-shard check but silently drops a slice; only a
-# cross-shard view catches it).
-{
-    echo "leg=${CBM_TEST_LEG:-local}"
-    echo "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
-    echo "list_sha256=$(sort "$SUITES_FILE" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
-    echo "--- slice ---"
-    cat "$SHARD_EXPECT"
-} > "$LOGDIR/shard-manifest.txt"
+run_wave "$FLEX_FILE" "${CBM_TAIL_JOBS:-2}"
+run_wave "$EXCL_FILE" 1
 
 # ── Union guard: every suite in this shard's slice produced exactly one
 # result. The slice is deterministic, so N green shard jobs = full coverage;

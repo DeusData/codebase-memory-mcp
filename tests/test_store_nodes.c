@@ -6,10 +6,51 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include <foundation/constants.h>
+#include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+/* ── Label allowlist / SQL drift guard ──────────────────────────── */
+
+/* CONTRACT PIN. `cbm_label_is_type_like()` is documented in cbm.h as the single
+ * source of truth for type-like labels, "instead of scattering
+ * `|| strcmp(label,\"Struct\")==0` across the tree". A SQL string literal cannot
+ * call it, so four queries in store.c and the BM25 ranking in mcp.c hardcoded
+ * their own label lists — and silently stopped matching once Struct (Rust, Go,
+ * Swift, D) began being emitted. get_architecture and vector search dropped
+ * every struct in the project; search_code under-ranked them.
+ *
+ * This pins the SQL mirrors to the C predicate in BOTH directions, so the next
+ * type-like label fails here instead of quietly shrinking query results. */
+TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
+    /* Every label the C predicate accepts must appear in the SQL fragment. */
+    static const char *const type_like[] = {"Class", "Struct", "Interface",
+                                            "Enum",  "Type",   "Trait"};
+    for (size_t i = 0; i < sizeof(type_like) / sizeof(type_like[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_type_like(type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", type_like[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+        ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* And nothing the predicate rejects may be smuggled into the type-like
+     * fragment — otherwise the SQL would widen past the C contract. */
+    static const char *const not_type_like[] = {"Function", "Method", "Module",
+                                                "File",     "Folder", "Variable"};
+    for (size_t i = 0; i < sizeof(not_type_like) / sizeof(not_type_like[0]); i++) {
+        ASSERT_FALSE(cbm_label_is_type_like(not_type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", not_type_like[i]);
+        ASSERT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+    }
+    /* The callable fragment carries exactly Function and Method on top. */
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Function'"));
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Method'"));
+    PASS();
+}
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
@@ -1930,6 +1971,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);

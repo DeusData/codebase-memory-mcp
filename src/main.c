@@ -14,7 +14,8 @@
  * per-account daemon. One-shot CLI tool calls run in an isolated local server
  * and never create or retain a daemon generation.
  */
-#include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
+#include "cbm.h"
+#include "store/store.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "daemon/application.h"
 #include "daemon/bootstrap.h"
 #include "daemon/frontend.h"
@@ -200,11 +201,22 @@ static void main_project_lock_release_fully(cbm_project_lock_lease_t **lease) {
     }
 }
 
-/* Test-only ownership proof for the real-binary POSIX smoke. The environment
- * variable is otherwise inert, and only a supervised physical worker may
- * publish it. Publication occurs after the native project lease is acquired,
- * so a marker from the worker also proves that its polling supervisor did not
- * retain the same exclusive lease. */
+/* Test-only ownership proof consumed by the POSIX worker-lease contract tests.
+ * The environment variable is otherwise inert, and only a supervised physical
+ * worker may publish it. Publication occurs after the native project lease is
+ * acquired, so a marker from the worker also proves that its polling supervisor
+ * did not retain the same exclusive lease.
+ *
+ * COMPILED OUT of ordinary builds alongside the watchdog probe above. This one
+ * is benign in isolation (an O_EXCL|O_NOFOLLOW PID file), but it is still
+ * test-only code reachable through a caller-supplied path in a shipped binary,
+ * and its consumers all build with TEST_SEAMS=1. The two seams smoke genuinely
+ * needs against real release artifacts (CBM_TEST_CRASH_ON / CBM_TEST_HANG_ON
+ * fault injection, and CBM_TEST_WINDOWS_USER_PATH_RUN_ID, which is what keeps
+ * the PATH smoke from touching the real user PATH) deliberately REMAIN: smoke's
+ * whole value is exercising the artifact we ship, and removing them would trade
+ * release-artifact coverage for a cosmetic win. */
+#ifdef CBM_ENABLE_TEST_SEAMS
 static bool main_test_worker_project_lock_marker(const main_local_cli_mutation_t *mutation) {
 #ifdef _WIN32
     (void)mutation;
@@ -237,18 +249,23 @@ static bool main_test_worker_project_lock_marker(const main_local_cli_mutation_t
     return close(marker) == 0 && written;
 #endif
 }
+#endif
 
-static bool main_local_cli_mutation_begin(void *context, const char *project) {
+static bool main_local_cli_mutation_begin_internal(void *context, const char *project, bool wait) {
     main_local_cli_mutation_t *mutation = context;
     if (!mutation || !mutation->manager || !project || !project[0]) {
         return false;
     }
     for (;;) {
-        uint64_t now = cbm_now_ms();
-        uint64_t deadline = now > UINT64_MAX - 100U ? UINT64_MAX : now + 100U;
         cbm_project_lock_lease_t *lease = NULL;
-        cbm_private_file_lock_status_t status =
-            cbm_project_lock_acquire(mutation->manager, project, deadline, NULL, &lease);
+        cbm_private_file_lock_status_t status;
+        if (wait) {
+            uint64_t now = cbm_now_ms();
+            uint64_t deadline = now > UINT64_MAX - 100U ? UINT64_MAX : now + 100U;
+            status = cbm_project_lock_acquire(mutation->manager, project, deadline, NULL, &lease);
+        } else {
+            status = cbm_project_lock_try_acquire(mutation->manager, project, &lease);
+        }
         if (status == CBM_PRIVATE_FILE_LOCK_OK && lease) {
             main_local_cli_lease_t *held = calloc(1, sizeof(*held));
             if (held) {
@@ -262,6 +279,7 @@ static bool main_local_cli_mutation_begin(void *context, const char *project) {
             held->lease = lease;
             held->next = mutation->leases;
             mutation->leases = held;
+#ifdef CBM_ENABLE_TEST_SEAMS
             if (!main_test_worker_project_lock_marker(mutation)) {
                 mutation->leases = held->next;
                 main_project_lock_release_fully(&held->lease);
@@ -269,12 +287,16 @@ static bool main_local_cli_mutation_begin(void *context, const char *project) {
                 free(held);
                 return false;
             }
+#endif
             return true;
         }
         main_project_lock_release_fully(&lease);
         if (status != CBM_PRIVATE_FILE_LOCK_BUSY) {
             cbm_log_error("cli.project_lock_failed", "project", project, "action",
                           "refuse_mutation");
+            return false;
+        }
+        if (!wait) {
             return false;
         }
         if (mutation->feedback && !mutation->waiting_reported) {
@@ -284,6 +306,14 @@ static bool main_local_cli_mutation_begin(void *context, const char *project) {
             mutation->waiting_reported = true;
         }
     }
+}
+
+static bool main_local_cli_mutation_begin(void *context, const char *project) {
+    return main_local_cli_mutation_begin_internal(context, project, true);
+}
+
+static bool main_local_cli_mutation_try_begin(void *context, const char *project) {
+    return main_local_cli_mutation_begin_internal(context, project, false);
 }
 
 static void main_local_cli_mutation_end(void *context, const char *project) {
@@ -387,9 +417,34 @@ static bool worker_prepare_process_group(void) {
     return (setpgid(0, 0) == 0 || getpgrp() == process_id) && getpgrp() == process_id;
 }
 
+/* A worker that cannot contain its own process tree must not index: on failure
+ * it would keep running as an orphan with no supervisor able to reap it. Shared
+ * by the ordered containment steps in the worker path so all of them fail
+ * identically — write() and _exit() rather than fprintf/exit, because this runs
+ * after fork-sensitive setup and must not touch stdio locks or atexit handlers.
+ */
+static void worker_containment_unavailable(void) {
+    static const char message[] =
+        "CBM index worker could not start: process-tree containment unavailable\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    (void)kill(-getpid(), SIGKILL);
+    _exit(EXIT_FAILURE);
+}
+
 /* Test-only crash-orphan probe used by tests/test_worker_watchdog.sh. It is
  * created before the watchdog thread so fork never occurs in a multithreaded
- * worker, and inherits the worker's isolated process group. */
+ * worker, and inherits the worker's isolated process group.
+ *
+ * COMPILED OUT of ordinary builds (see TEST_SEAMS in Makefile.cbm). "Fork a
+ * child that ignores SIGTERM and loops forever, then write its PID to a path
+ * the caller chose" is a fine test probe and an appalling thing to find in a
+ * shipped executable — it is precisely the shape a generic malware classifier
+ * is built to notice, and it has no production caller. Seams are OPT-IN so the
+ * failure mode of forgetting the flag is a clean binary, not a leaky one; the
+ * suites that need it build with TEST_SEAMS=1, and
+ * scripts/ci/check-binary-composition.sh fails the release if the marker
+ * string ever reappears in an artifact. */
+#ifdef CBM_ENABLE_TEST_SEAMS
 static bool worker_start_watchdog_test_descendant(void) {
     char pid_path[CBM_SZ_4K] = {0};
     if (!cbm_safe_getenv("CBM_TEST_WORKER_DESCENDANT_PID_FILE", pid_path, sizeof(pid_path), NULL) ||
@@ -428,6 +483,7 @@ static bool worker_start_watchdog_test_descendant(void) {
     }
     return written;
 }
+#endif
 
 static bool worker_start_parent_watchdog(pid_t initial_ppid) {
     static parent_watchdog_config_t worker_config;
@@ -734,6 +790,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             if (project_locks) {
                 cbm_mcp_server_set_project_mutation_guard(srv, main_local_cli_mutation_begin,
                                                           main_local_cli_mutation_end, &mutation);
+                cbm_mcp_server_set_project_mutation_try_guard(srv,
+                                                              main_local_cli_mutation_try_begin);
             }
         }
         maintenance_binding_failed = srv && !maintenance_context;
@@ -847,10 +905,13 @@ static void print_help(void) {
     printf("  Manual/UI MCP boundaries: Qodo, Warp, JetBrains AI/ACP, Replit,\n");
     printf("  Plandex, SWE-agent, BLACKBOX, GitHub cloud agents, Jules,\n");
     printf("  CodeRabbit.\n");
-    printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
-    printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
-    printf("  list_projects, delete_project, index_status, detect_changes,\n");
-    printf("  manage_adr, ingest_traces\n");
+    /* Rendered from the MCP tool registry: a hand-maintained copy here
+     * omitted check_index_coverage (#1361) and could silently drift again. */
+    char *tools_help = cbm_mcp_tools_help_list();
+    if (tools_help) {
+        printf("\n%s", tools_help);
+        free(tools_help);
+    }
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
@@ -1718,13 +1779,6 @@ int main(int argc, char **argv) {
         }
     }
 #endif
-    int windows_descriptor_role = cbm_cli_windows_payload_descriptor_role(argc, argv);
-    if (windows_descriptor_role >= 0) {
-        return windows_descriptor_role;
-    }
-    if (cbm_cli_windows_launcher_startup_authenticate(argc, argv) != 0) {
-        return EXIT_FAILURE;
-    }
     cbm_daemon_process_role_t role = cbm_daemon_process_role(argc, argv);
     if (role == CBM_DAEMON_PROCESS_INVALID) {
         (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
@@ -2018,14 +2072,28 @@ int main(int argc, char **argv) {
                                           invocation.marker_file, invocation.quarantine_file,
                                           invocation.memory_budget_bytes);
 #ifndef _WIN32
+        /* Split into three ordered steps rather than one condition, because the
+         * ORDER is load-bearing and the middle step only exists in test builds:
+         *   1. establish the isolated process group,
+         *   2. (test builds) start the crash-orphan probe, which must inherit
+         *      that group and must fork BEFORE the watchdog thread exists —
+         *      forking a multithreaded process is the bug this ordering avoids,
+         *   3. start the parent-death watchdog thread.
+         * Keeping the probe inside a single `||` chain made its call
+         * unconditional in the source, so with the seam compiled out cppcheck
+         * correctly reported `!probe()` as always false. Guarding the STEP, not
+         * stubbing the function, means release builds simply do not have it. */
         if (!worker_prepare_process_group() || process_initial_ppid <= 1 ||
-            getppid() != process_initial_ppid || !worker_start_watchdog_test_descendant() ||
-            !worker_start_parent_watchdog(process_initial_ppid)) {
-            static const char message[] =
-                "CBM index worker could not start: process-tree containment unavailable\n";
-            (void)write(STDERR_FILENO, message, sizeof(message) - 1);
-            (void)kill(-getpid(), SIGKILL);
-            _exit(EXIT_FAILURE);
+            getppid() != process_initial_ppid) {
+            worker_containment_unavailable();
+        }
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (!worker_start_watchdog_test_descendant()) {
+            worker_containment_unavailable();
+        }
+#endif
+        if (!worker_start_parent_watchdog(process_initial_ppid)) {
+            worker_containment_unavailable();
         }
 #endif
         cbm_index_supervisor_mark_host();

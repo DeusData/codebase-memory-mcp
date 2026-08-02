@@ -623,7 +623,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
-    char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
     if (!name || !name[0]) {
         return NULL;
     }
@@ -644,12 +644,24 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    /* Nix: a binding's own attrpath contributes scope (`a.b.fn = …`), and the def
+     * extractor bakes it into the def QN. Compose it identically here — otherwise
+     * an in-body call sources to a QN one or more segments short of the def, and
+     * the edge is dropped at write. */
+    const char *qn_name = name;
+    if (ctx->language == CBM_LANG_NIX) {
+        qn_name = cbm_nix_qn_name(ctx->arena, node, ctx->source, name);
+        if (!qn_name || !qn_name[0]) {
+            return NULL;
+        }
+    }
+
     if (state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
                                        ctx->language);
 }
 
@@ -657,6 +669,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         return objectscript_get_class_name(ctx, node);
+    }
+    /* Nix: an attrset-valued `binding` is a named scope. Same shared helper the def
+     * extractor's compute_class_qn uses — these are two separate functions, and a
+     * one-segment disagreement between them drops every CALLS edge sourced from a
+     * nested binding. */
+    if (ctx->language == CBM_LANG_NIX) {
+        return cbm_nix_binding_scope_qn(ctx, node, state ? state->enclosing_class_qn : NULL);
     }
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
@@ -746,20 +765,28 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
         return;
     }
 
-    /* Value must be a string literal */
-    if (!is_string_node(ts_node_type(value_node))) {
+    /* Value must be a string literal (template literals flatten to "{}" form) */
+    const char *value_kind = ts_node_type(value_node);
+    const char *flat_value = NULL;
+    if (strcmp(value_kind, "template_string") == 0) {
+        flat_value = cbm_template_string_text(ctx->arena, value_node, ctx->source);
+        if (!flat_value) {
+            return;
+        }
+    } else if (!is_string_node(value_kind)) {
         return;
     }
 
     char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-    char *value = cbm_node_text(ctx->arena, value_node, ctx->source);
+    char *value =
+        flat_value ? (char *)flat_value : cbm_node_text(ctx->arena, value_node, ctx->source);
     if (!name || !name[0] || !value || !value[0]) {
         return;
     }
 
-    /* Strip quotes from value */
+    /* Strip quotes from value (template values are already unquoted) */
     int vlen = (int)strlen(value);
-    if (vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
+    if (!flat_value && vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
         value = cbm_arena_strndup(ctx->arena, value + SKIP_ONE, (size_t)(vlen - PAIR_LEN));
         if (!value) {
             return;
@@ -789,6 +816,27 @@ static bool is_string_node(const char *kind) {
 
 static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     const char *kind = ts_node_type(node);
+    /* JS/TS template literals: flatten ${...} substitutions to "{}" so URL-ish
+     * template strings become string_refs with the canonical placeholder shape
+     * shared with server route paths (issue #1006). */
+    if (strcmp(kind, "template_string") == 0) {
+        const char *flat = cbm_template_string_text(ctx->arena, node, ctx->source);
+        if (!flat) {
+            return;
+        }
+        int kind_val = cbm_classify_string(flat, (int)strlen(flat));
+        if (kind_val < 0) {
+            return;
+        }
+        CBMStringRef ref = {
+            .value = flat,
+            .enclosing_func_qn =
+                state->enclosing_func_qn ? state->enclosing_func_qn : ctx->module_qn,
+            .kind = (CBMStringRefKind)kind_val,
+        };
+        cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
+        return;
+    }
     if (!is_string_node(kind)) {
         return;
     }
@@ -1417,6 +1465,16 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 state->os_type_map.count = 0;
                 state->os_type_map.class_base_count = 0;
             }
+        }
+    } else if (ctx->language == CBM_LANG_NIX && strcmp(ts_node_type(node), "binding") == 0 &&
+               cbm_nix_binding_is_attrset_scope(node)) {
+        /* Nix: a binding whose value is an attribute set is a named scope, exactly
+         * as is_namespace_scope_kind treats it on the def side. Pushing it here is
+         * what makes an in-body call source to `proj.file.setA.fn` rather than the
+         * bare `proj.file.fn` that no node carries once defs are attrpath-qualified. */
+        const char *cqn = compute_class_qn(ctx, node, state);
+        if (cqn) {
+            push_scope(state, SCOPE_CLASS, depth, cqn);
         }
     } else if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
         TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));

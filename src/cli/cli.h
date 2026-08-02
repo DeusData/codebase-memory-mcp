@@ -220,6 +220,14 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
+void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
+int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
+                                                     const char *previous_binary_path,
+                                                     const char *config_path);
+int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
+                                                   const char *previous_binary_path,
+                                                   const char *config_path);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
@@ -328,7 +336,11 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
 /* Get the Codex CLI instructions content. */
 const char *cbm_get_codex_instructions(void);
 
-/* ── Tar.gz extraction ────────────────────────────────────────── */
+/* ── Tar.gz / zip extraction (TEST-ONLY) ──────────────────────────
+ * Reachable only from the excluded in-process updater and tests/test_cli.c.
+ * Declared and defined under the test guard so the capability is absent from
+ * release artifacts rather than present-but-unreachable. */
+#ifdef CBM_CLI_ENABLE_TEST_API
 
 /* Extract a binary named "codebase-memory-mcp*" from a tar.gz buffer.
  * Returns malloc'd binary content and sets *out_len.
@@ -340,18 +352,7 @@ unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data
  * Returns NULL on error. Caller must free. */
 unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len);
 
-/* Strict two-file Windows release bundle extraction. The archive must contain
- * exactly one root launcher and one root payload; ambiguous aliases,
- * traversal, duplicates, and malformed central/local metadata fail closed. */
-typedef struct {
-    unsigned char *launcher;
-    int launcher_len;
-    unsigned char *payload;
-    int payload_len;
-} cbm_windows_release_pair_t;
-bool cbm_extract_windows_release_pair_from_zip(const unsigned char *data, int data_len,
-                                               cbm_windows_release_pair_t *pair_out);
-void cbm_windows_release_pair_free(cbm_windows_release_pair_t *pair);
+#endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Index management ─────────────────────────────────────────── */
 
@@ -438,14 +439,6 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * private runtime parent. NULL restores the platform default. This is not a
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
-
-/* Consume and authenticate any inherited permanent-launcher context before
- * process-role classification. An absent context is the normal portable
- * payload case; an advertised but invalid context fails closed. */
-int cbm_cli_windows_launcher_startup_authenticate(int argc, char *const argv[]);
-/* Internal release-pair probe. Returns -1 when argv does not select the role,
- * otherwise a process exit code. It runs before cache/daemon initialization. */
-int cbm_cli_windows_payload_descriptor_role(int argc, char *const argv[]);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 

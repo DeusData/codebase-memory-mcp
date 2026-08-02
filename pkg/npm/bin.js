@@ -8,23 +8,19 @@ const fs = require('fs');
 const { spawnSync } = require('child_process');
 
 const isWindows = process.platform === 'win32';
-const windowsLauncherName = 'codebase-memory-mcp.exe';
-// npm is a portable one-shot wrapper. On Windows the public .exe in the
-// release archive is the permanent launcher, so privately validate the
-// release pair, cache both files, and enter the native process through that
-// launcher. The adjacent payload remains the immutable cache readiness signal.
-const binName = isWindows ? 'codebase-memory-mcp.payload.exe' : 'codebase-memory-mcp';
+// npm is a portable one-shot wrapper. Every platform ships exactly ONE binary,
+// so the cached file is the executed file — there is no launcher pair to keep
+// in sync and no adjacent payload to validate.
+const binName = isWindows ? 'codebase-memory-mcp.exe' : 'codebase-memory-mcp';
 const binPath = path.join(__dirname, 'bin', binName);
-const launcherPath = path.join(__dirname, 'bin', windowsLauncherName);
-const executionPath = isWindows ? launcherPath : binPath;
+const executionPath = binPath;
 const cacheReady = () => {
-  if (!fs.existsSync(binPath) || (isWindows && !fs.existsSync(launcherPath))) {
+  if (!fs.existsSync(binPath)) {
     return false;
   }
   if (!isWindows) return true;
-  // The launcher resolving --version through its adjacent payload validates
-  // both halves of the immutable Windows cache pair.
-  const probe = spawnSync(launcherPath, ['--version'], {
+  // A cached Windows binary that cannot report its own version is not usable.
+  const probe = spawnSync(binPath, ['--version'], {
     stdio: 'ignore',
     timeout: 15_000,
     windowsHide: true,
@@ -77,8 +73,8 @@ if (mutation) {
   process.stderr.write(
     `This npm Windows copy is portable. Use "${packageCommand}" for package ` +
     'maintenance (add -g for a global install), or run ' +
-    '"codebase-memory-mcp install --yes" once to create ' +
-    'a managed launcher with coordinated self-update/uninstall.\n',
+    '"codebase-memory-mcp install --yes" once for a managed install with its ' +
+    'own install.ps1 for updates.\n',
   );
 }
 

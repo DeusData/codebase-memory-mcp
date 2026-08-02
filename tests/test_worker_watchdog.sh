@@ -22,7 +22,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="${ROOT}/build/c/codebase-memory-mcp"
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
@@ -33,6 +33,20 @@ esac
 
 if [[ ! -x "${BINARY}" ]]; then
   echo "missing binary: ${BINARY}" >&2
+  exit 2
+fi
+
+# PRECONDITION, not a skip: this test drives the crash-orphan probe, which is
+# compiled out of ordinary builds (it forks a SIGTERM-ignoring child, which must
+# never ship — see src/main.c and TEST_SEAMS in Makefile.cbm). Against a
+# seam-less binary the probe silently no-ops and the test dies with an opaque
+# "Killed: 9" many lines later. Assert the capability up front and say exactly
+# how to get it. Failing (not skipping) is deliberate: a skip here would hide
+# the loss of watchdog coverage entirely.
+if ! LC_ALL=C grep -a -q -F 'CBM_TEST_WORKER_DESCENDANT_PID_FILE' "${BINARY}"; then
+  echo "binary lacks the crash-orphan test seam: ${BINARY}" >&2
+  echo "  rebuild it with:  make -f Makefile.cbm cbm TEST_SEAMS=1" >&2
+  echo "  or run this test through scripts/test.sh, which does that for you." >&2
   exit 2
 fi
 
