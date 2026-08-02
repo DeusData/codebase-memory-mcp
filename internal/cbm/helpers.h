@@ -119,8 +119,18 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 // def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
 char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
 
+// Rust cfg-gated definitions retain distinct graph identities by appending a
+// normalized predicate suffix. Shared by definition extraction and call-scope
+// tracking so CALLS source QNs exactly match their Function node QNs.
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode node, const char *source,
+                                        const char *base_qn);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
+
+// Resolve the terminal name node from a C-family function declarator chain.
+// Used by both definition extraction and call-scope attribution.
+TSNode cbm_c_family_declarator_name(TSNode node);
 
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
@@ -146,7 +156,8 @@ typedef struct {
 
 // Compute the metrics above in one traversal of `node`'s subtree.
 // `branching_types` is the language's branching node-type set.
-void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
+// Returns false only when traversal scratch storage cannot grow.
+bool cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
 
 // Is `kind` a loop construct node type? Language-agnostic curated set (for/while/
 // do/foreach/repeat/loop variants). Exposed so the unified walk can track loop

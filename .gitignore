@@ -10,7 +10,10 @@ bin/
 # Test artifacts
 *.test
 *.out
+*.log
 coverage.txt
+# Clang static analyzer (make -f Makefile.cbm test-analyze) per-file reports
+*.plist
 
 # Test fixture temp dirs (created by C test suite in CWD instead of /tmp/)
 cbm_*/
@@ -26,6 +29,16 @@ cli-*/
 .DS_Store
 Thumbs.db
 
+# Git worktrees (created by Claude Code subagents)
+.worktrees/
+
+# Runtime/session artifacts
+session_project
+project
+project|params.project
+conductor/
+with
+
 # Database files (local cache)
 *.db
 *.db-wal
@@ -40,9 +53,11 @@ Thumbs.db
 # Local project memory (Claude Code auto-memory)
 memory/
 reference/
+.claude/
 
 # Local-only scratch / session notes (never pushed)
 private/
+notes/
 
 # Build artifacts
 build/
@@ -51,11 +66,23 @@ graph-ui/dist/
 
 # Generated reports
 BENCHMARK_REPORT.md
+benchmark-results/
+*.facts/
 TEST_PLAN.md
+scripts/autotune_results.json
 CHANGELOG.md
 
-# Soak test output
+# Local memory/soak outputs (uploaded as CI artifacts, never committed)
+memlab-*.jsonl
 soak-results/
+soak-results-query-leak/
+# ...and ANY ad-hoc run directory at the repo root. The two exact names above did
+# not match hand-named runs, so 13 soak directories and 4 memlab files (78 files
+# of logs and CSVs) were committed to main by accident in 7808eee. Root-anchored
+# so nothing under scripts/ or tests/ is affected — scripts/soak-legs.sh and
+# scripts/soak-test.sh stay tracked.
+/soak*/
+/memlab-*
 
 # LSP originality-check reference cache (scripts/check-lsp-originality.sh)
 .lsp-refs/
@@ -66,14 +93,3 @@ graph-ui/.npm-cache-local/
 # Python bytecode from tests/windows/ harness
 __pycache__/
 *.pyc
-
-# Local soak-leg outputs (uploaded as CI artifacts, never committed)
-soak-results/
-soak-results-query-leak/
-# ...and ANY ad-hoc run directory at the repo root. The two exact names above did
-# not match hand-named runs, so 13 soak directories and 4 memlab files (78 files
-# of logs and CSVs) were committed to main by accident in 7808eee. Root-anchored
-# so nothing under scripts/ or tests/ is affected — scripts/soak-legs.sh and
-# scripts/soak-test.sh stay tracked.
-/soak*/
-/memlab-*

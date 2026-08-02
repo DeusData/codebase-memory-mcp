@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 static CBMLogLevel g_log_level = CBM_LOG_INFO;
 static CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
 static cbm_log_sink_fn g_log_sink = NULL;
+static atomic_bool g_profile_stderr_mirror = false;
 static CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
@@ -78,6 +80,10 @@ void cbm_log_set_sink(cbm_log_sink_fn fn) {
 void cbm_log_set_sink_ex(cbm_log_sink_fn fn, CBMLogSinkMode mode) {
     g_log_sink = fn;
     g_log_sink_mode = mode;
+}
+
+void cbm_log_set_profile_stderr_mirror(bool enabled) {
+    atomic_store_explicit(&g_profile_stderr_mirror, enabled, memory_order_relaxed);
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
@@ -253,6 +259,10 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     finish_line(line_buf, sizeof(line_buf), pos);
     emit_line(line_buf);
+    if (g_log_sink && g_log_sink_mode == CBM_LOG_SINK_REPLACE && msg && strcmp(msg, "prof") == 0 &&
+        atomic_load_explicit(&g_profile_stderr_mirror, memory_order_relaxed)) {
+        (void)fprintf(stderr, "%s\n", line_buf);
+    }
 }
 
 void cbm_log_control_record(const char *msg, ...) {

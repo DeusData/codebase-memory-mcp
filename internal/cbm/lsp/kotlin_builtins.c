@@ -38,6 +38,7 @@ typedef struct {
  * Universal kotlin.Any members the LSP falls back to (kt_any_methods in
  * kotlin_lsp.c). The Any class node anchors the three methods.
  */
+enum { KT_BUILTIN_SYNTHETIC_LINE = 1 };
 static const KtBuiltinNode kKtBuiltinNodes[] = {
     {"kotlin.Any", "Any", "Class"},
     {"kotlin.Any.toString", "toString", "Method"},
@@ -55,8 +56,8 @@ static void kt_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
     if (!result || !arena) {
         return;
     }
-    const int n = (int)(sizeof(kKtBuiltinNodes) / sizeof(kKtBuiltinNodes[0]));
-    for (int i = 0; i < n; i++) {
+    const size_t node_count = sizeof(kKtBuiltinNodes) / sizeof(kKtBuiltinNodes[0]);
+    for (size_t i = 0; i < node_count; i++) {
         const KtBuiltinNode *b = &kKtBuiltinNodes[i];
         CBMDefinition def;
         memset(&def, 0, sizeof(def));
@@ -64,8 +65,8 @@ static void kt_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
         def.qualified_name = b->qn;
         def.label = b->label;
         def.file_path = "<kotlin-builtins>";
-        def.start_line = 1;
-        def.end_line = 1;
+        def.start_line = KT_BUILTIN_SYNTHETIC_LINE;
+        def.end_line = KT_BUILTIN_SYNTHETIC_LINE;
         cbm_defs_push(&result->defs, arena, def);
     }
 }

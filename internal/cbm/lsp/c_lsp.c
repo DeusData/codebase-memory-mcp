@@ -1,4 +1,5 @@
 #include "c_lsp.h"
+#include "foundation/platform.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <string.h>
@@ -69,8 +70,7 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
-    const char *debug_env = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (debug_env && debug_env[0]);
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void c_lsp_add_include(CLSPContext *ctx, const char *header_path, const char *ns_qn) {
@@ -4464,7 +4464,7 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         }
     }
     // Set min_params on the registered function (for default-arg overload matching)
-    if (total_params > 0 && defaulted_params > 0) {
+    if (total_params > 0 && defaulted_params > 0 && !ctx->registry_shared) {
         for (int ri = 0; ri < ((CBMTypeRegistry *)ctx->registry)->func_count; ri++) {
             CBMRegisteredFunc *rf = &((CBMTypeRegistry *)ctx->registry)->funcs[ri];
             if (strcmp(rf->qualified_name, func_qn) == 0 && rf->min_params < 0) {
@@ -4695,7 +4695,8 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
             ctx->enclosing_class_qn = class_qn;
 
             // Store template param names on the registered type (for substitution)
-            if (ctx->in_template && ctx->template_param_names && ctx->template_param_count > 0) {
+            if (ctx->in_template && ctx->template_param_names && ctx->template_param_count > 0 &&
+                !ctx->registry_shared) {
                 CBMRegisteredType *rt = NULL;
                 for (int ri = 0; ri < ((CBMTypeRegistry *)ctx->registry)->type_count; ri++) {
                     if (strcmp(((CBMTypeRegistry *)ctx->registry)->types[ri].qualified_name,
@@ -4802,7 +4803,7 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
     if (!ts_node_is_null(body)) {
         // Pre-pass: register method declarations (no body) as methods in registry.
         // This allows template return type substitution for methods like T& value();
-        if (ctx->enclosing_class_qn) {
+        if (ctx->enclosing_class_qn && !ctx->registry_shared) {
             uint32_t bkn = 0;
             TSNode *bkids = cbm_lsp_collect_children(ctx->arena, body, &bkn);
             for (uint32_t i = 0; i < bkn; i++) {

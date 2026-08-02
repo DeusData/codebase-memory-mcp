@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "foundation/constants.h"
 
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
@@ -22,6 +23,9 @@ void cbm_cli_set_version(const char *ver);
 
 /* Get the version string. */
 const char *cbm_cli_get_version(void);
+
+/* True only for the shared non-semver local-build sentinel. */
+bool cbm_version_is_development(const char *version);
 
 /* ── CLI tool arguments (flags / --args-file / --help) ────────── */
 
@@ -38,6 +42,12 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
 int cbm_cli_print_tool_help(const char *tool_name);
+
+/* Print the top-level `--help` text (usage lines including every config
+ * subcommand, UI options, agent list, tool lists) to stdout. Lives here
+ * instead of main.c so the test runner, which does not link main.c, can
+ * assert the help content in-process. */
+void cbm_cli_print_main_help(void);
 
 /* Inspect a raw MCP tool-result envelope. Returns true only when the root
  * object carries the exact boolean field `isError: true`; malformed JSON,
@@ -160,31 +170,33 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Detected coding agents on the system. */
 typedef struct {
-    bool claude_code;   /* ~/.claude/ exists */
-    bool codex;         /* $CODEX_HOME or ~/.codex exists */
-    bool gemini;        /* Gemini settings or executable exists */
-    bool zed;           /* platform-specific Zed config dir exists */
-    bool opencode;      /* opencode on PATH or config exists */
-    bool antigravity;   /* Antigravity CLI config or executable exists */
-    bool aider;         /* aider on PATH */
-    bool kilocode;      /* KiloCode globalStorage dir exists */
-    bool vscode;        /* VS Code User config dir exists */
-    bool cursor;        /* ~/.cursor/ exists */
-    bool windsurf;      /* ~/.codeium/windsurf/ exists */
-    bool augment;       /* ~/.augment/ or Auggie CLI exists */
-    bool openclaw;      /* ~/.openclaw/ exists */
-    bool kiro;          /* ~/.kiro/ exists */
-    bool junie;         /* ~/.junie/ exists */
-    bool hermes;        /* ~/.hermes/ or hermes CLI exists */
-    bool openhands;     /* ~/.openhands/ or openhands CLI exists */
-    bool cline;         /* ~/.cline/ or cline CLI exists */
-    bool warp;          /* Warp footprint or oz/oz-preview/warp-cli exists */
-    bool qwen;          /* ~/.qwen/ or qwen CLI exists */
-    bool copilot_cli;   /* $COPILOT_HOME, ~/.copilot/, or copilot CLI exists */
-    bool factory_droid; /* ~/.factory/ or droid CLI exists */
-    bool crush;         /* Crush config or CLI exists */
-    bool goose;         /* Goose config or CLI exists */
-    bool mistral_vibe;  /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
+    bool claude_code;    /* ~/.claude/ exists */
+    bool claude_desktop; /* platform Claude Desktop config dir exists */
+    bool codex;          /* $CODEX_HOME or ~/.codex exists */
+    bool gemini;         /* Gemini settings or executable exists */
+    bool zed;            /* platform-specific Zed config dir exists */
+    bool opencode;       /* opencode on PATH or config exists */
+    bool antigravity;    /* Antigravity CLI config or executable exists */
+    bool aider;          /* aider on PATH */
+    bool kilo_cli;       /* standalone Kilo ~/.config/kilo exists */
+    bool kilocode;       /* KiloCode globalStorage dir exists */
+    bool vscode;         /* VS Code User config dir exists */
+    bool cursor;         /* ~/.cursor/ exists */
+    bool windsurf;       /* ~/.codeium/windsurf/ exists */
+    bool augment;        /* ~/.augment/ or Auggie CLI exists */
+    bool openclaw;       /* ~/.openclaw/ exists */
+    bool kiro;           /* ~/.kiro/ exists */
+    bool junie;          /* ~/.junie/ exists */
+    bool hermes;         /* ~/.hermes/ or hermes CLI exists */
+    bool openhands;      /* ~/.openhands/ or openhands CLI exists */
+    bool cline;          /* ~/.cline/ or cline CLI exists */
+    bool warp;           /* Warp footprint or oz/oz-preview/warp-cli exists */
+    bool qwen;           /* ~/.qwen/ or qwen CLI exists */
+    bool copilot_cli;    /* $COPILOT_HOME, ~/.copilot/, or copilot CLI exists */
+    bool factory_droid;  /* ~/.factory/ or droid CLI exists */
+    bool crush;          /* Crush config or CLI exists */
+    bool goose;          /* Goose config or CLI exists */
+    bool mistral_vibe;   /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
@@ -209,6 +221,8 @@ int cbm_upsert_qwen_lifecycle_hooks_for_testing(const char *settings_path, const
                                                 bool windows);
 int cbm_upsert_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
 int cbm_remove_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
+void cbm_config_set_error_for_testing(const char *key, const char *value, char *out,
+                                      size_t out_size);
 /* Explicit lifecycle adapter seam for hook protocols whose output envelope is
  * not Claude/Gemini-compatible. Returns allocated JSON or NULL to fail open. */
 char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char *forced_event,
@@ -228,6 +242,10 @@ int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
 int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
                                                    const char *previous_binary_path,
                                                    const char *config_path);
+void cbm_agent_installed_binary_path_for_testing(const char *home, char *binary_path,
+                                                 size_t binary_path_size);
+int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
+                                             const char *os, const char *arch);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
@@ -289,6 +307,8 @@ int cbm_upsert_claude_hooks(const char *settings_path);
 /* Remove our PreToolUse hook from Claude Code settings.json.
  * Returns 0 on success. */
 int cbm_remove_claude_hooks(const char *settings_path);
+int cbm_upsert_claude_session_hooks(const char *settings_path);
+int cbm_remove_claude_session_hooks(const char *settings_path);
 
 /* Write the PreToolUse gate shim to <home>/.claude/hooks/. The shim is a thin
  * wrapper that invokes the compiled `hook-augment` and writes to stdout only —
@@ -309,8 +329,8 @@ int cbm_remove_gemini_hooks(const char *settings_path);
  * SessionStart hook (non-blocking; stdout injected as session context). */
 int cbm_upsert_codex_hooks(const char *config_path);
 int cbm_remove_codex_hooks(const char *config_path);
-int cbm_upsert_gemini_session_hooks(const char *settings_path);
-int cbm_remove_gemini_session_hooks(const char *settings_path);
+int cbm_upsert_gemini_session_hooks(const char *settings_path, const char *binary_path);
+int cbm_remove_gemini_session_hooks(const char *settings_path, const char *binary_path);
 
 #ifdef CBM_JSON_LIKE_ENABLE_TEST_API
 typedef void (*cbm_hook_json_prewrite_test_hook_t)(const char *settings_path, void *context);
@@ -327,9 +347,12 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path);
 
 /* ── PATH management ──────────────────────────────────────────── */
 
-/* Append an export PATH line to the given rc file.
- * Checks if already present. Returns 0 on success, 1 if already present. */
+/* Append the requested shell PATH entry. On macOS, remove only obsolete
+ * Homebrew entries previously marked as owned by this installer; explicit
+ * install directories and user-authored entries remain authoritative.
+ * Returns 0 on success, 1 if the requested entry was already present. */
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
+int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run);
 
 /* ── Codex instructions (legacy, wraps cbm_get_agent_instructions) ── */
 
@@ -371,6 +394,9 @@ typedef struct cbm_config cbm_config_t;
  * Creates _config.db if it doesn't exist. Returns NULL on error. */
 cbm_config_t *cbm_config_open(const char *cache_dir);
 
+/* Open an existing config store without creating files or schema. */
+cbm_config_t *cbm_config_open_readonly(const char *cache_dir);
+
 /* Close the config store. */
 void cbm_config_close(cbm_config_t *cfg);
 
@@ -384,15 +410,104 @@ bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val);
 /* Get a config value as int. Returns default_val if not found or invalid. */
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val);
 
+/* Get a config value as double. Returns default_val if not found or invalid. */
+double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val);
+
 /* Set a config value. Returns 0 on success. */
 int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
+/* Atomically apply a named, exact capability preset. */
+int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
+
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
+/* Production auto-index file cap. A zero configured value means unlimited. */
+#define CBM_DEFAULT_AUTO_INDEX_LIMIT 50000
+#define CBM_DEFAULT_AUTO_INDEX_LIMIT_STR "50000"
+#define CBM_CONFIG_SEARCH_LIMIT "search_limit"
+#define CBM_CONFIG_TRACE_MAX_RESULTS "trace_max_results"
+#define CBM_DEFAULT_TRACE_MAX_RESULTS 25
+#define CBM_DEFAULT_TRACE_MAX_RESULTS_STR "25"
+#define CBM_CONFIG_SNIPPET_MAX_LINES "snippet_max_lines"
+#define CBM_DEFAULT_SNIPPET_MAX_LINES 200
+#define CBM_DEFAULT_SNIPPET_MAX_LINES_STR "200"
+#define CBM_CONFIG_KEY_FUNCTIONS_COUNT "key_functions_count"
+#define CBM_DEFAULT_KEY_FUNCTIONS_COUNT 25
+#define CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR "25"
+#define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
+/* Bound the key_functions preview pushed in the automatic first-response
+ * context. Non-positive values fall back to this smaller orientation default;
+ * get_architecture retains its independently configurable full preview. */
+#define CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT "context_key_functions_limit"
+#define CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT 10
+#define CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR "10"
+#define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
+#define CBM_CONFIG_QUERY_MAX_WORKING_ROWS "query_max_working_rows"
+#define CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES "query_max_output_bytes"
+#define CBM_CONFIG_ARCH_HOTSPOT_LIMIT "arch_hotspot_limit"
+#define CBM_CONFIG_ARCH_RESOLUTION "architecture_resolution"
+#define CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET "arch_cluster_node_budget"
+#define CBM_CONFIG_TOOL_MODE "tool_mode"
+#define CBM_CONFIG_TOOL_MODE_STREAMLINED "streamlined"
+#define CBM_CONFIG_TOOL_MODE_CLASSIC "classic"
+#define CBM_CONFIG_DEFAULT_RESPONSE_FORMAT "default_response_format"
+#define CBM_CONFIG_CONTEXT_INJECTION "context_injection"
+#define CBM_CONFIG_BUILD_FINGERPRINT_MODE "build_fingerprint_mode"
+#define CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT "cached_exact"
+#define CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH "always_rehash"
+#define CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT
+#define CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES 32768
+#define CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR "32768"
+
+typedef struct {
+    const char *key;
+    const char *default_val;
+    const char *env_var;
+    const char *category;
+    const char *description;
+    const char *range;
+    const char *guidance;
+} cbm_config_entry_t;
+
+typedef enum {
+    CBM_CONFIG_NUMERIC_INTEGER = 0,
+    CBM_CONFIG_NUMERIC_REAL,
+} cbm_config_numeric_kind_t;
+
+/* Typed numeric metadata is the executable contract for migrated config
+ * entries. Textual ranges remain available for enums and legacy entries, but
+ * numeric consumers must not recover bounds by reparsing presentation text. */
+typedef struct {
+    const char *key;
+    cbm_config_numeric_kind_t kind;
+    double accepted_minimum;
+    double accepted_maximum;
+    bool accepted_minimum_inclusive;
+    bool accepted_maximum_inclusive;
+    bool has_recommended_minimum;
+    bool has_recommended_maximum;
+    double recommended_minimum;
+    double recommended_maximum;
+} cbm_config_numeric_domain_t;
+
+/* User-facing tuning levels live in registry guidance so every existing
+ * consumer emits them without a parallel key-to-tier map. Leading knobs change
+ * major capability/cost/freshness policy; user-tunable knobs express ordinary
+ * intent; advanced knobs require workload measurement or algorithm knowledge. */
+#define CBM_CONFIG_GUIDANCE_LEADING "Tuning level: leading (high priority). "
+#define CBM_CONFIG_GUIDANCE_USER_TUNABLE "Tuning level: user-tunable. "
+#define CBM_CONFIG_GUIDANCE_ADVANCED "Tuning level: advanced. "
+
+extern const cbm_config_entry_t CBM_CONFIG_REGISTRY[];
+const cbm_config_numeric_domain_t *cbm_config_numeric_domain(const char *key);
+
+const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val);
+bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool default_val);
+int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default_val);
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 

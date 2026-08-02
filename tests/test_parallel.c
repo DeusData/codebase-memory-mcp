@@ -11,6 +11,7 @@
 #include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/worker_pool.h"
@@ -19,7 +20,10 @@
 #include "foundation/platform.h"
 #include "foundation/log.h"
 #include "cbm.h"
+#include <store/store.h>
+#include <sqlite3.h>
 
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -110,6 +114,25 @@ static void teardown_parallel_repo(void) {
     if (g_par_tmpdir[0])
         rm_rf(g_par_tmpdir);
     g_par_tmpdir[0] = '\0';
+}
+
+static void cbm_init_parallel_worker(int idx, void *ctx_ptr) {
+    int *rcs = (int *)ctx_ptr;
+    rcs[idx] = cbm_init();
+}
+
+TEST(parallel_cbm_init_concurrent_idempotent) {
+    enum { INIT_CALLS = 32, INIT_WORKERS = 4 };
+    int rcs[INIT_CALLS];
+    memset(rcs, 0x7f, sizeof(rcs));
+
+    cbm_parallel_for_opts_t opts = {.max_workers = INIT_WORKERS, .force_pthreads = false};
+    cbm_parallel_for(INIT_CALLS, cbm_init_parallel_worker, rcs, opts);
+
+    for (int i = 0; i < INIT_CALLS; i++) {
+        ASSERT_EQ(rcs[i], 0);
+    }
+    PASS();
 }
 
 /* ── Run sequential pipeline on files, returning gbuf ─────────────── */
@@ -416,6 +439,70 @@ TEST(parallel_empty_files) {
     PASS();
 }
 
+TEST(extraction_errors_are_nonfatal_in_parallel_and_sequential_paths) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_extract_error_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/input.txt", dir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fclose(f);
+
+    cbm_file_info_t file = {
+        .path = path,
+        .rel_path = (char *)"input.txt",
+        .language = CBM_LANG_PYTHON,
+    };
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("extract-error", dir);
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(registry);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "extract-error",
+        .repo_path = dir,
+        .gbuf = gbuf,
+        .registry = registry,
+        .cancelled = &cancelled,
+        .pkgmap_preseeded = true,
+    };
+
+    CBMFileResult *cache[1] = {NULL};
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, 1);
+    ASSERT_EQ(cbm_parallel_extract(&ctx, &file, 1, cache, &shared_ids, 1), 0);
+    ASSERT_NOT_NULL(cache[0]);
+    ASSERT_FALSE(cache[0]->has_error);
+    int nodes_after_empty = cbm_gbuf_node_count(gbuf);
+    cbm_free_result(cache[0]);
+    cache[0] = NULL;
+
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("content\n", f);
+    fclose(f);
+    file.language = (CBMLanguage)-1;
+    /* Unsupported-language extraction is a per-file skip, not a run-level
+     * failure. Both paths must leave the graph unchanged and allow the caller
+     * to publish the successfully indexed subset. The production pipeline
+     * supplies ctx.pipeline and records this file in skipped[]. */
+    ASSERT_EQ(cbm_parallel_extract(&ctx, &file, 1, cache, &shared_ids, 1), 0);
+    ASSERT_NULL(cache[0]);
+    ASSERT_EQ(cbm_gbuf_node_count(gbuf), nodes_after_empty);
+
+    ASSERT_EQ(cbm_pipeline_pass_definitions(&ctx, &file, 1), 0);
+    ASSERT_EQ(cbm_gbuf_node_count(gbuf), nodes_after_empty);
+
+    cbm_registry_free(registry);
+    cbm_gbuf_free(gbuf);
+    unlink(path);
+    rmdir(dir);
+    PASS();
+}
+
 /* ── Regression: args JSON must not overflow the props buffer ──────── */
 
 /* A call with many long string arguments makes append_args_json()'s running
@@ -461,6 +548,472 @@ TEST(parallel_args_json_no_overflow) {
     cbm_gbuf_free(gbuf);
     cbm_discover_free(files, file_count);
     th_rmtree(dir);
+    PASS();
+}
+
+typedef struct {
+    int self_get_calls;
+} self_get_call_ctx_t;
+
+static void count_self_get_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
+    self_get_call_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    if (edge->source_id != edge->target_id) {
+        return;
+    }
+    if (edge->properties_json && strstr(edge->properties_json, "\"callee\":\"ec.get\"")) {
+        c->self_get_calls++;
+    }
+}
+
+static int count_extracted_calls_named(const CBMFileResult *result, const char *callee_name) {
+    int count = 0;
+    if (!result || !callee_name) {
+        return 0;
+    }
+    for (int i = 0; i < result->calls.count; i++) {
+        const char *got = result->calls.items[i].callee_name;
+        if (got && strcmp(got, callee_name) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+TEST(parallel_unresolved_route_suffix_does_not_emit_self_call) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_route_suffix_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    const char *source = "def FilterPanel(ec, e):\n"
+                         "    return ec.get(e.type)\n";
+    CBMFileResult *extracted =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "cbm_route_suffix",
+                         "app.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(extracted);
+    ASSERT_GT(count_extracted_calls_named(extracted, "ec.get"), 0);
+    cbm_free_result(extracted);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.py", dir);
+    ASSERT_EQ(th_write_file(path, source), 0);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_route_suffix", dir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    self_get_call_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_self_get_call_edges, &c);
+    ASSERT_EQ(c.self_get_calls, 0);
+
+    cbm_gbuf_free(gbuf);
+    th_rmtree(dir);
+    PASS();
+}
+
+typedef struct {
+    const char *url_path;
+    int route_registration_calls;
+} route_registration_count_ctx_t;
+
+static void count_route_registration_edges(const cbm_gbuf_edge_t *edge, void *ud) {
+    route_registration_count_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "CALLS") != 0 || !edge->properties_json) {
+        return;
+    }
+    if (strstr(edge->properties_json, "\"via\":\"route_registration\"") &&
+        strstr(edge->properties_json, c->url_path)) {
+        c->route_registration_calls++;
+    }
+}
+
+static int count_route_registration_for_path(cbm_gbuf_t *gbuf, const char *url_path) {
+    route_registration_count_ctx_t c = {.url_path = url_path, .route_registration_calls = 0};
+    cbm_gbuf_foreach_edge(gbuf, count_route_registration_edges, &c);
+    return c.route_registration_calls;
+}
+
+static void count_exception_edges(const cbm_gbuf_edge_t *edge, void *ud) {
+    int *count = (int *)ud;
+    if (!edge || !edge->type || !count) {
+        return;
+    }
+    if (strcmp(edge->type, "THROWS") == 0 || strcmp(edge->type, "RAISES") == 0) {
+        (*count)++;
+    }
+}
+
+static int exception_edge_count(cbm_gbuf_t *gbuf) {
+    int count = 0;
+    cbm_gbuf_foreach_edge(gbuf, count_exception_edges, &count);
+    return count;
+}
+
+TEST(parallel_top_level_raise_matches_sequential_no_file_fallback) {
+    char dir[CBM_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s/cbm_top_raise_XXXXXX", cbm_tmpdir());
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(dir));
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    const char *source =
+        "class HTTPException(Exception):\n"
+        "    pass\n\n"
+        "raise HTTPException()\n";
+
+    char path[CBM_PATH_MAX];
+    n = snprintf(path, sizeof(path), "%s/app.py", dir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(path));
+    ASSERT_EQ(th_write_file(path, source), 0);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *seq = run_sequential("cbm_top_raise", dir, files, 1);
+    cbm_gbuf_t *par = run_parallel("cbm_top_raise", dir, files, 1, 1);
+    ASSERT_NOT_NULL(seq);
+    ASSERT_NOT_NULL(par);
+
+    ASSERT_EQ(exception_edge_count(seq), 0);
+    ASSERT_EQ(exception_edge_count(par), 0);
+
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(dir);
+    PASS();
+}
+
+TEST(parallel_fastapi_websocket_route_registration_matches_sequential) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_ws_routes_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    const char *source =
+        "from fastapi import APIRouter, WebSocket\n\n"
+        "router = APIRouter()\n\n"
+        "@router.websocket('/custom_error/')\n"
+        "async def router_ws_custom_error(websocket: WebSocket):\n"
+        "    raise RuntimeError('boom')\n\n"
+        "@router.websocket_route('/router')\n"
+        "async def routerindex(websocket: WebSocket):\n"
+        "    await websocket.accept()\n";
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.py", dir);
+    ASSERT_EQ(th_write_file(path, source), 0);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *seq = run_sequential("cbm_ws_routes", dir, files, 1);
+    cbm_gbuf_t *par = run_parallel("cbm_ws_routes", dir, files, 1, 1);
+    ASSERT_NOT_NULL(seq);
+    ASSERT_NOT_NULL(par);
+
+    ASSERT_EQ(count_route_registration_for_path(seq, "/custom_error/"), 1);
+    ASSERT_EQ(count_route_registration_for_path(seq, "/router"), 1);
+    ASSERT_EQ(count_route_registration_for_path(par, "/custom_error/"), 1);
+    ASSERT_EQ(count_route_registration_for_path(par, "/router"), 1);
+
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(dir);
+    PASS();
+}
+
+/* ── Production pipeline worker-count parity ─────────────────────── */
+
+enum {
+    PARITY_REPO_FILE_COUNT = 64,
+    PARITY_EXPECTED_FILE_HASHES = PARITY_REPO_FILE_COUNT + 2,
+    PARITY_DB_PATH_COUNT = 4,
+    PARITY_PATH_BUF = CBM_SZ_512,
+    PARITY_SOURCE_BUF = CBM_SZ_4K,
+    PARITY_REP_QN_COUNT = 4,
+};
+
+typedef struct {
+    int nodes;
+    int edges;
+    int file_hashes;
+    int calls;
+    int imports;
+    int usage;
+    int semantic;
+    int representative_qns;
+} pipeline_db_counts_t;
+
+static int parity_format(char *dst, size_t dst_sz, const char *fmt, ...) {
+    if (!dst || dst_sz == 0 || !fmt) {
+        return CBM_NOT_FOUND;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(dst, dst_sz, fmt, ap);
+    va_end(ap);
+    return n >= 0 && (size_t)n < dst_sz ? 0 : CBM_NOT_FOUND;
+}
+
+static void remove_sqlite_family(const char *db_path) {
+    if (!db_path || !db_path[0]) {
+        return;
+    }
+    cbm_unlink(db_path);
+    char sidecar[PARITY_PATH_BUF];
+    if (parity_format(sidecar, sizeof(sidecar), "%s-wal", db_path) == 0) {
+        cbm_unlink(sidecar);
+    }
+    if (parity_format(sidecar, sizeof(sidecar), "%s-shm", db_path) == 0) {
+        cbm_unlink(sidecar);
+    }
+}
+
+static int sqlite_integrity_ok(const char *db_path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int ok = 0;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK && db &&
+        sqlite3_prepare_v2(db, "PRAGMA integrity_check;", CBM_NOT_FOUND, &stmt, NULL) ==
+            SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *msg = (const char *)sqlite3_column_text(stmt, 0);
+        ok = msg && strcmp(msg, "ok") == 0;
+    }
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    return ok;
+}
+
+static int write_worker_parity_repo(char *repo_dir, size_t repo_dir_sz) {
+    if (!repo_dir || repo_dir_sz == 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (parity_format(repo_dir, repo_dir_sz, "%s/cbm_pipe_parity_XXXXXX", cbm_tmpdir()) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (!cbm_mkdtemp(repo_dir)) {
+        return CBM_NOT_FOUND;
+    }
+
+    char path[PARITY_PATH_BUF];
+    char src[PARITY_SOURCE_BUF];
+
+    if (parity_format(path, sizeof(path), "%s/common.py", repo_dir) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (th_write_file(path,
+                      "def shared(value):\n"
+                      "    return value + 1\n"
+                      "\n"
+                      "class Shared:\n"
+                      "    def touch(self, value):\n"
+                      "        return shared(value)\n") != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    for (int i = 0; i < PARITY_REPO_FILE_COUNT; i++) {
+        if (parity_format(path, sizeof(path), "%s/mod_%02d.py", repo_dir, i) != 0) {
+            return CBM_NOT_FOUND;
+        }
+        int prev = (i + PARITY_REPO_FILE_COUNT - 1) % PARITY_REPO_FILE_COUNT;
+        if (parity_format(src, sizeof(src),
+                          "from common import Shared, shared\n"
+                          "from mod_%02d import func_%02d\n"
+                          "\n"
+                          "class Worker%02d:\n"
+                          "    def method_%02d(self, value):\n"
+                          "        helper = Shared()\n"
+                          "        return helper.touch(shared(value))\n"
+                          "\n"
+                          "def func_%02d(value):\n"
+                          "    item = Worker%02d()\n"
+                          "    return item.method_%02d(value)\n"
+                          "\n"
+                          "def chain_%02d(value):\n"
+                          "    return func_%02d(value) + func_%02d(value) + shared(value)\n",
+                          prev, prev, i, i, i, i, i, i, i, prev) != 0) {
+            return CBM_NOT_FOUND;
+        }
+        if (th_write_file(path, src) != 0) {
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (parity_format(path, sizeof(path), "%s/app.py", repo_dir) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return CBM_NOT_FOUND;
+    }
+    int write_ok = 1;
+    for (int i = 0; i < PARITY_REPO_FILE_COUNT; i++) {
+        write_ok = write_ok && fprintf(f, "from mod_%02d import chain_%02d\n", i, i) >= 0;
+    }
+    write_ok = write_ok && fputs("\ndef main():\n    total = 0\n", f) >= 0;
+    for (int i = 0; i < PARITY_REPO_FILE_COUNT; i++) {
+        write_ok = write_ok && fprintf(f, "    total += chain_%02d(%d)\n", i, i) >= 0;
+    }
+    write_ok = write_ok && fputs("    return total\n", f) >= 0;
+    if (fclose(f) != 0) {
+        write_ok = 0;
+    }
+    return write_ok ? 0 : CBM_NOT_FOUND;
+}
+
+static int count_representative_qns(cbm_store_t *store) {
+    static const char *qns[PARITY_REP_QN_COUNT] = {
+        "pipe-parity.common.shared",
+        "pipe-parity.common.Shared.touch",
+        "pipe-parity.mod_00.func_00",
+        "pipe-parity.app.main",
+    };
+    int found = 0;
+    for (int i = 0; i < PARITY_REP_QN_COUNT; i++) {
+        cbm_node_t node = {0};
+        if (cbm_store_find_node_by_qn(store, "pipe-parity", qns[i], &node) == CBM_STORE_OK) {
+            found++;
+            cbm_node_free_fields(&node);
+        }
+    }
+    return found;
+}
+
+static int run_pipeline_worker_case(const char *repo_dir, const char *db_path, int workers,
+                                    pipeline_db_counts_t *out) {
+    if (!repo_dir || !db_path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    char worker_buf[CBM_SZ_32];
+    if (parity_format(worker_buf, sizeof(worker_buf), "%d", workers) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (workers > 0) {
+        cbm_setenv("CBM_WORKERS", worker_buf, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+
+    remove_sqlite_family(db_path);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_set_project_name(p, "pipe-parity");
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (rc != 0 || !sqlite_integrity_ok(db_path)) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    int hash_rc = cbm_store_get_file_hashes(store, "pipe-parity", &hashes, &hash_count);
+    out->nodes = cbm_store_count_nodes(store, "pipe-parity");
+    out->edges = cbm_store_count_edges(store, "pipe-parity");
+    out->calls = cbm_store_count_edges_by_type(store, "pipe-parity", "CALLS");
+    out->imports = cbm_store_count_edges_by_type(store, "pipe-parity", "IMPORTS");
+    out->usage = cbm_store_count_edges_by_type(store, "pipe-parity", "USAGE");
+    out->semantic = cbm_store_count_edges_by_type(store, "pipe-parity", "SEMANTICALLY_RELATED");
+    out->file_hashes = hash_rc == CBM_STORE_OK ? hash_count : CBM_STORE_ERR;
+    out->representative_qns = count_representative_qns(store);
+    cbm_store_free_file_hashes(hashes, hash_count);
+
+    cbm_project_t project = {0};
+    int project_rc = cbm_store_get_project(store, "pipe-parity", &project);
+    int project_root_ok =
+        project_rc == CBM_STORE_OK && project.root_path && strcmp(project.root_path, repo_dir) == 0;
+    cbm_project_free_fields(&project);
+
+    cbm_store_close(store);
+
+    return (project_root_ok && out->nodes > 0 && out->edges > 0 &&
+            out->file_hashes == PARITY_EXPECTED_FILE_HASHES && out->calls > 0 &&
+            out->imports > 0 && out->representative_qns == PARITY_REP_QN_COUNT)
+               ? 0
+               : CBM_NOT_FOUND;
+}
+
+static int assert_pipeline_counts_equal(const pipeline_db_counts_t *want,
+                                        const pipeline_db_counts_t *got) {
+    if (!want || !got) {
+        return CBM_NOT_FOUND;
+    }
+    return want->nodes == got->nodes && want->edges == got->edges &&
+           want->file_hashes == got->file_hashes && want->calls == got->calls &&
+           want->imports == got->imports && want->usage == got->usage &&
+           want->semantic == got->semantic && want->representative_qns == got->representative_qns
+               ? 0
+               : CBM_NOT_FOUND;
+}
+
+TEST(parallel_full_pipeline_worker_count_parity_64_files) {
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers =
+        cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers), NULL) != NULL;
+
+    char repo_dir[PARITY_PATH_BUF] = {0};
+    int rc = write_worker_parity_repo(repo_dir, sizeof(repo_dir));
+
+    const int workers[PARITY_DB_PATH_COUNT] = {1, 2, 4, 0};
+    char db_paths[PARITY_DB_PATH_COUNT][PARITY_PATH_BUF] = {{0}};
+    pipeline_db_counts_t counts[PARITY_DB_PATH_COUNT] = {{0}};
+    if (rc == 0) {
+        for (int i = 0; i < PARITY_DB_PATH_COUNT; i++) {
+            if (parity_format(db_paths[i], sizeof(db_paths[i]), "%s/pipe-parity-%d.db", repo_dir,
+                              i) != 0) {
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+            if (run_pipeline_worker_case(repo_dir, db_paths[i], workers[i], &counts[i]) != 0) {
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+        }
+    }
+
+    if (rc == 0) {
+        for (int i = 1; i < PARITY_DB_PATH_COUNT; i++) {
+            if (assert_pipeline_counts_equal(&counts[0], &counts[i]) != 0) {
+                rc = CBM_NOT_FOUND;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < PARITY_DB_PATH_COUNT; i++) {
+        remove_sqlite_family(db_paths[i]);
+    }
+    if (repo_dir[0]) {
+        th_rmtree(repo_dir);
+    }
+    if (had_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+
+    ASSERT_EQ(rc, 0);
     PASS();
 }
 
@@ -576,6 +1129,91 @@ TEST(gbuf_next_id_accessors) {
     PASS();
 }
 
+TEST(lsp_resolution_matches_cpp_segments_and_reason_joins) {
+    CBMResolvedCall items[] = {
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.C.doWork",
+         .strategy = "lsp_type_dispatch",
+         .confidence = 0.90f,
+         .reason = NULL},
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.target",
+         .strategy = "lsp_func_ptr",
+         .confidence = 0.85f,
+         .reason = "fp"},
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.C.~C",
+         .strategy = "lsp_destructor",
+         .confidence = 0.90f,
+         .reason = "ptr"},
+    };
+    CBMResolvedCallArray arr = {.items = items, .count = 3, .cap = 3};
+
+    CBMCall member_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "obj->doWork"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &member_call, false) == &items[0]);
+
+    CBMCall scoped_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "ns::doWork"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &scoped_call, false) == &items[0]);
+
+    CBMCall fp_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "fp"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &fp_call, false) == &items[1]);
+
+    CBMCall dtor_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "ptr"};
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &dtor_call, false) == &items[2]);
+
+    PASS();
+}
+
+TEST(lsp_resolution_index_matches_linear_cpp_semantics) {
+    CBMResolvedCall items[] = {
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.C.doWork",
+         .strategy = "lsp_type_dispatch",
+         .confidence = 0.90f,
+         .reason = NULL},
+        {.caller_qn = "proj.C.run",
+         .callee_qn = "proj.target",
+         .strategy = "lsp_func_ptr",
+         .confidence = 0.85f,
+         .reason = "fp"},
+    };
+    CBMResolvedCallArray arr = {.items = items, .count = 2, .cap = 2};
+    cbm_lsp_resolution_index_t idx = {0};
+    cbm_lsp_resolution_index_build(&idx, &arr, 2, 0.0);
+    ASSERT_TRUE(idx.complete);
+
+    CBMCall member_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "obj->doWork"};
+    ASSERT(cbm_lsp_resolution_index_find(&idx, &arr, &member_call, 0.0, false) == &items[0]);
+
+    CBMCall fp_call = {.enclosing_func_qn = "proj.C.run", .callee_name = "fp"};
+    ASSERT(cbm_lsp_resolution_index_find(&idx, &arr, &fp_call, 0.0, false) == &items[1]);
+
+    cbm_lsp_resolution_index_free(&idx);
+    PASS();
+}
+
+TEST(lsp_resolution_index_overlong_key_falls_back_to_linear) {
+    char caller[CBM_SZ_1K + CBM_SZ_128];
+    memset(caller, 'a', sizeof(caller) - 1);
+    caller[sizeof(caller) - 1] = '\0';
+
+    CBMResolvedCall item = {.caller_qn = caller,
+                            .callee_qn = "proj.target",
+                            .strategy = "lsp_direct",
+                            .confidence = 0.95f,
+                            .reason = NULL};
+    CBMResolvedCallArray arr = {.items = &item, .count = 1, .cap = 1};
+    cbm_lsp_resolution_index_t idx = {0};
+    cbm_lsp_resolution_index_build(&idx, &arr, 1, 0.0);
+    ASSERT_FALSE(idx.complete);
+
+    CBMCall call = {.enclosing_func_qn = caller, .callee_name = "target"};
+    ASSERT(cbm_lsp_resolution_index_find(&idx, &arr, &call, 0.0, false) == &item);
+
+    cbm_lsp_resolution_index_free(&idx);
+    PASS();
+}
+
 /* ── Parallel-pipeline LSP-override regression ────────────────────── */
 /* Pin the wiring fix that unified pass_calls.c (sequential) and
  * pass_parallel.c (parallel) on cbm_pipeline_find_lsp_resolution +
@@ -602,6 +1240,62 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
     if (edge->properties_json && strstr(edge->properties_json, "\"strategy\":\"lsp")) {
         c->lsp_strategy_count++;
     }
+}
+
+static bool resolved_call_contains(const CBMResolvedCallArray *arr, const char *caller_sub,
+                                   const char *callee_sub) {
+    if (!arr || !caller_sub || !callee_sub) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, caller_sub) && rc->callee_qn &&
+            strstr(rc->callee_qn, callee_sub)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *source_sub;
+    const char *target_sub;
+    const char *props_sub;
+    bool found;
+} call_edge_contains_ctx_t;
+
+static void call_edge_contains_visit(const cbm_gbuf_edge_t *edge, void *ud) {
+    call_edge_contains_ctx_t *ctx = ud;
+    if (!ctx || ctx->found || !edge || !edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(ctx->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, edge->target_id);
+    if (!source || !target || !source->qualified_name || !target->qualified_name) {
+        return;
+    }
+    if (strstr(source->qualified_name, ctx->source_sub) &&
+        strstr(target->qualified_name, ctx->target_sub) &&
+        (!ctx->props_sub ||
+         (edge->properties_json && strstr(edge->properties_json, ctx->props_sub)))) {
+        ctx->found = true;
+    }
+}
+
+static bool call_edge_contains(const cbm_gbuf_t *gbuf, const char *source_sub,
+                               const char *target_sub, const char *props_sub) {
+    if (!gbuf || !source_sub || !target_sub) {
+        return false;
+    }
+    call_edge_contains_ctx_t ctx = {
+        .gbuf = gbuf,
+        .source_sub = source_sub,
+        .target_sub = target_sub,
+        .props_sub = props_sub,
+    };
+    cbm_gbuf_foreach_edge(gbuf, call_edge_contains_visit, &ctx);
+    return ctx.found;
 }
 
 static const char *class_method_tail(const char *qn) {
@@ -957,6 +1651,103 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+TEST(parallel_cross_lsp_pruning_requires_matching_call_resolution) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_prune_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char rpath[512];
+    snprintf(rpath, sizeof(rpath), "%s/routing.py", tmpdir);
+    FILE *rf = fopen(rpath, "w");
+    if (!rf) {
+        rmdir(tmpdir);
+        FAIL("fopen routing.py failed");
+    }
+    fprintf(rf, "class APIRouter:\n"
+                "    def add_api_route(self):\n"
+                "        return None\n"
+                "    def include_router(self):\n"
+                "        self.add_api_route()\n");
+    fclose(rf);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = rpath;
+    files[0].rel_path = (char *)"routing.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("cbm_par_pylsp_prune", tmpdir);
+    cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **result_cache = calloc(1, sizeof(*result_cache));
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NOT_NULL(result_cache);
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "cbm_par_pylsp_prune",
+                              .repo_path = tmpdir,
+                              .gbuf = gbuf,
+                              .registry = reg,
+                              .cancelled = &cancelled};
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(gbuf));
+
+    cbm_init();
+    ASSERT_EQ(cbm_parallel_extract(&ctx, files, 1, result_cache, &shared_ids, 1), 0);
+    cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+    ASSERT_NOT_NULL(result_cache[0]);
+    ASSERT_GT(result_cache[0]->calls.count, 0);
+
+    result_cache[0]->resolved_calls.count = 0;
+    CBMResolvedCall unrelated = {.caller_qn = "cbm_par_pylsp_prune.routing.unrelated",
+                                 .callee_qn = "cbm_par_pylsp_prune.routing.APIRouter.unrelated",
+                                 .strategy = "lsp_method",
+                                 .confidence = 0.95f};
+    cbm_resolvedcall_push(&result_cache[0]->resolved_calls, &result_cache[0]->arena, unrelated);
+    ASSERT_EQ(result_cache[0]->resolved_calls.count, result_cache[0]->calls.count);
+
+    ASSERT_EQ(cbm_build_registry_from_cache(&ctx, files, 1, result_cache), 0);
+
+    char **def_modules = calloc(1, sizeof(*def_modules));
+    int def_count = 0;
+    CBMLSPDef *all_defs =
+        cbm_pxc_collect_all_defs(result_cache, files, 1, ctx.project_name, def_modules, &def_count);
+    CBMModuleDefIndex *module_def_index =
+        all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    ASSERT_NOT_NULL(all_defs);
+
+    ASSERT_EQ(cbm_parallel_resolve(&ctx, files, 1, result_cache, &shared_ids, 1, all_defs,
+                                   def_count, def_modules, module_def_index,
+                                   NULL /* cross_registries */),
+              0);
+    cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+
+    ASSERT_TRUE(resolved_call_contains(&result_cache[0]->resolved_calls, "include_router",
+                                       "add_api_route"));
+    lsp_edge_count_ctx_t lsp_edges = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_lsp_call_edges, &lsp_edges);
+    ASSERT_GT(lsp_edges.total_calls, 0);
+    ASSERT_GT(lsp_edges.lsp_strategy_count, 0);
+    ASSERT_TRUE(call_edge_contains(gbuf, "APIRouter.include_router", "APIRouter.add_api_route",
+                                   "\"strategy\":\"lsp_method\""));
+
+    cbm_pxc_free_module_def_index(module_def_index);
+    free(all_defs);
+    if (def_modules) {
+        free(def_modules[0]);
+        free(def_modules);
+    }
+    cbm_free_result(result_cache[0]);
+    free(result_cache);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    unlink(rpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* RED/GREEN A — the graph-quality guarantee behind the low-RAM retention cap.
  *
  * The fused cross-file LSP step re-parses each file's source to resolve calls
@@ -1208,6 +1999,7 @@ TEST(lsp_resolve_misattribution_is_bounded) {
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
+    RUN_TEST(parallel_cbm_init_concurrent_idempotent);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
     RUN_TEST(lsp_resolve_misattribution_is_bounded);
     RUN_TEST(grpc_service_name_preserves_service_suffix_issue294);
@@ -1219,11 +2011,15 @@ SUITE(parallel) {
     RUN_TEST(gbuf_merge_empty_src);
     RUN_TEST(gbuf_merge_src_free_safe);
     RUN_TEST(gbuf_next_id_accessors);
+    RUN_TEST(lsp_resolution_matches_cpp_segments_and_reason_joins);
+    RUN_TEST(lsp_resolution_index_matches_linear_cpp_semantics);
+    RUN_TEST(lsp_resolution_index_overlong_key_falls_back_to_linear);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_cross_lsp_pruning_requires_matching_call_resolution);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
@@ -1236,8 +2032,13 @@ SUITE(parallel) {
     RUN_TEST(parallel_implements_parity);
     RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
+    RUN_TEST(parallel_full_pipeline_worker_count_parity_64_files);
     RUN_TEST(parallel_empty_files);
+    RUN_TEST(extraction_errors_are_nonfatal_in_parallel_and_sequential_paths);
     RUN_TEST(parallel_args_json_no_overflow);
+    RUN_TEST(parallel_unresolved_route_suffix_does_not_emit_self_call);
+    RUN_TEST(parallel_top_level_raise_matches_sequential_no_file_fallback);
+    RUN_TEST(parallel_fastapi_websocket_route_registration_matches_sequential);
 
     /* Cleanup shared state */
     parity_teardown();

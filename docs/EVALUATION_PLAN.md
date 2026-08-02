@@ -846,7 +846,7 @@ Deep-Dive section.
 > the question — that's exactly the gap symmetric authoring is designed to expose.
 >
 > **Pinning.** During authoring, the repo's resolved commit SHA is recorded and baked into
-> `clone-bench-repos.sh`, so the run indexes the *same* HEAD the questions were written against.
+> `scripts/clone-bench-repos.sh`, so the run indexes the *same* HEAD the questions were written against.
 >
 > §14 contains two fully-worked exemplars now; the remaining 157 are generated against their cloned
 > repos (§15) following this authoring split.
@@ -1061,7 +1061,7 @@ The plan proposes "3–5 known near-duplicate / copy-pasted function pairs found
 | C cross-repo pair (redis/hiredis, RESP protocol) produces 0 CROSS edges | High | Medium | Already flagged — treat as documented gap; consider using a WASM/Wasm-C host if a genuine C HTTP service pair can be found |
 | 159-language sweep is not completable in one session without checkpointing | High | Medium | Add explicit checkpoint/resume logic to the script; describe failure-recovery in §13 |
 | ~30 flagged ⚠️ repos unavailable, too small, or wrong language on run day | Medium | Medium | Validate all ⚠️ rows before authoring questions; fallback fixture corpus per §8.1 |
-| Shallow clone at run time produces a different HEAD than during question authoring | Medium | Medium | Pin repos by commit SHA during authoring; bake SHA into `clone-bench-repos.sh` |
+| Shallow clone at run time produces a different HEAD than during question authoring | Medium | Medium | Pin repos by commit SHA during authoring; bake SHA into `scripts/clone-bench-repos.sh` |
 | 3-pass median of same judge hides variance; passes are correlated not independent | Medium | Medium | Cross-family panel or acknowledge limitation explicitly in §9 |
 | Explorer spawn overhead excluded but material; Token Ratio misleads | Medium | Medium | Include full-session token cost as a second metric; label the narrow metric clearly |
 
@@ -1099,7 +1099,7 @@ If the Graph agent returns zero results on D2 (zero-result rate flagged in §5),
 1. **Question authoring source of truth (§12 authoring note):** When you write "questions must cite real symbols, so they are filled in during Phase 0/1" — do you mean you will use the graph to discover those symbols, or will you independently verify them with Grep? If graph-first, you have the bias I described. What is your plan to ensure D1/D3 questions target symbols that Grep can also find?
 2. **Judge model identity (§9.4):** What model will be the judge? If it is any Claude model, the same-family self-preference effect applies to every Claude-written Graph and Explorer answer. Have you considered a cross-family judge rotation, or at minimum disclosing the judge model in the report so readers can calibrate?
 3. **CROSS edge formation in OTel sub-dirs (§11.1, §15):** Before writing 157 more language chapters, have you actually run `index_repository(mode="cross-repo-intelligence")` on two OTel service sub-dirs and confirmed that CROSS_HTTP_CALLS edges form? This is the load-bearing question for the entire deep-dive block. What is the fallback plan if they don't?
-4. **Session continuity (§13):** What happens when the main session context window fills up or hits the usage limit at language 94? Is there a described checkpoint format — e.g., a manifest of completed languages that `clone-bench-repos.sh` can consult to skip already-done languages — or does the whole run restart from zero?
+4. **Session continuity (§13):** What happens when the main session context window fills up or hits the usage limit at language 94? Is there a described checkpoint format — e.g., a manifest of completed languages that `scripts/clone-bench-repos.sh` can consult to skip already-done languages — or does the whole run restart from zero?
 5. **D5 cross-group comparability (§3, §8):** You aggregate D5 scores across all 159 languages. But D5 for Go means `semantic_query=["dispatch","route"]` surfacing functions from a vector index. D5 for gitignore means "naming-pattern / config↔code links." These are different operations using different graph tools. Do you actually intend the cross-language D5 rollup in §10.1 to be meaningful, or is it cosmetic?
 6. **S2 ground truth (§11.2):** "3–5 known near-duplicate function pairs" — how will you construct this set for each of the 9 LSP languages? Will you use the simhash output the indexer already produces, or is this a manual read? A 3-pair sample with no inter-rater agreement cannot support a recall claim. What is the minimum ground-truth size you consider credible?
 7. **Token exclusion policy (§5):** If a developer is deciding whether to adopt codebase-memory-mcp, they pay the full session cost, including agent spawn, orientation, and formatting. Why should the reported "Token Ratio" exclude the Explorer's orientation cost? Would you consider reporting both the narrow metric and the full-session metric?

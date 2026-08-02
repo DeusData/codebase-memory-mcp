@@ -5,7 +5,8 @@
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "foundation/compat.h" // CBM_TLS
-#include <stdlib.h>            // calloc/free for the symbol-set cache
+#include <limits.h>
+#include <stdlib.h> // calloc/free for the symbol-set cache
 
 enum {
     MIN_ROUTE_LEN = 3,
@@ -166,6 +167,11 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
+bool cbm_label_uses_source_span_selection(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     cbm_label_is_type_like(label) || strcmp(label, "Module") == 0);
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;
@@ -210,22 +216,25 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     return false;
 }
 
-// Builtins that appear in the keyword set above (so they are suppressed as bare
-// usages) but for which we mint a real graph node and an LSP resolution, so a
-// CALL to them must still be extracted. MUST stay in sync with kPyBuiltinNodes
-// in internal/cbm/lsp/py_builtins.c — every entry here has a "builtins.<name>"
-// node, so the resulting CALLS edge always has a target (never Module-sourced).
-static const char *python_resolvable_builtins[] = {"len",  "print", "str",   "int",
-                                                   "list", "dict",  "range", NULL};
+/* Keyword-like calls that should still be emitted as call records. Keep Python
+ * entries in sync with lsp/py_builtins.c builtins.<name> nodes. */
+static const char *const python_resolvable_builtins[] = {"len",  "print", "str",   "int",
+                                                         "list", "dict",  "range", NULL};
+static const char *const puppet_resolvable_builtins[] = {"include", NULL};
 
 bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return false;
     }
-    if (lang != CBM_LANG_PYTHON) {
+    const char *const *builtins = NULL;
+    if (lang == CBM_LANG_PYTHON) {
+        builtins = python_resolvable_builtins;
+    } else if (lang == CBM_LANG_PUPPET) {
+        builtins = puppet_resolvable_builtins;
+    } else {
         return false;
     }
-    for (const char **b = python_resolvable_builtins; *b; b++) {
+    for (const char *const *b = builtins; *b; b++) {
         if (strcmp(name, *b) == 0) {
             return true;
         }
@@ -554,6 +563,13 @@ bool cbm_is_loop_node_type(const char *kind) {
     return false;
 }
 
+TSNode cbm_c_family_declarator_name(TSNode node) {
+    /* Compatibility entry point retained for branch callers. Route both APIs
+     * through the canonical #438 implementation so depth limits and terminal
+     * name kinds cannot drift across extraction pathways. */
+    return cbm_resolve_c_declarator_name_node(node);
+}
+
 // Is `kind` a chained member/subscript access node? Language-agnostic generic
 // set covering the common grammars; used only for the structural "access depth"
 // smell, so unmatched grammars simply report 0 (never wrong, just silent).
@@ -579,34 +595,90 @@ static bool is_member_access_node(const char *kind) {
     return false;
 }
 
+typedef struct {
+    TSNode node;
+    int bdepth;
+    int ldepth;
+    int adepth;
+} complexity_frame_t;
+
+typedef struct {
+    complexity_frame_t inline_items[CBM_SZ_64];
+    complexity_frame_t *items;
+    int count;
+    int capacity;
+} complexity_stack_t;
+
+static void complexity_stack_init(complexity_stack_t *stack) {
+    stack->items = stack->inline_items;
+    stack->count = 0;
+    stack->capacity = CBM_SZ_64;
+}
+
+static void complexity_stack_destroy(complexity_stack_t *stack) {
+    if (stack->items != stack->inline_items) {
+        free(stack->items);
+    }
+}
+
+/*
+ * The inline working set keeps ordinary functions allocation-free. Wider
+ * sibling sets grow geometrically, so a function with F AST nodes takes O(F)
+ * traversal time, amortized O(1) pushes, and O(W) peak scratch memory for the
+ * maximum pending frontier W. Spill storage is freed before this function
+ * returns rather than extending the extracted result's lifetime.
+ */
+static bool complexity_stack_push(complexity_stack_t *stack, complexity_frame_t frame) {
+    if (stack->count >= stack->capacity) {
+        if (stack->capacity > INT_MAX / PAIR_LEN) {
+            return false;
+        }
+        int next_capacity = stack->capacity * PAIR_LEN;
+        if ((size_t)next_capacity > SIZE_MAX / sizeof(*stack->items)) {
+            return false;
+        }
+        size_t bytes = (size_t)next_capacity * sizeof(*stack->items);
+        complexity_frame_t *grown = NULL;
+        if (stack->items == stack->inline_items) {
+            grown = (complexity_frame_t *)malloc(bytes);
+            if (grown) {
+                memcpy(grown, stack->inline_items, (size_t)stack->count * sizeof(*stack->items));
+            }
+        } else {
+            grown = (complexity_frame_t *)realloc(stack->items, bytes);
+        }
+        if (!grown) {
+            return false;
+        }
+        stack->items = grown;
+        stack->capacity = next_capacity;
+    }
+    stack->items[stack->count++] = frame;
+    return true;
+}
+
 // One traversal computing cyclomatic + cognitive + loop-nesting + access-depth
 // metrics. Each frame carries its branch-, loop- and access-nesting depth so
 // every metric (cognitive Campbell penalty, loop_depth polynomial-degree proxy,
 // max chained access depth) is produced in a single walk.
-void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out) {
+bool cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out) {
     out->cyclomatic = 0;
     out->cognitive = 0;
     out->loop_count = 0;
     out->loop_depth = 0;
     out->max_access_depth = 0;
     if (!branching_types) {
-        return;
+        return true;
     }
-    struct cx_frame {
-        TSNode node;
-        int bdepth;
-        int ldepth;
-        int adepth;
-    };
-    struct cx_frame stack[BRANCHING_STACK_CAP];
-    int top = 0;
-    stack[top].node = node;
-    stack[top].bdepth = 0;
-    stack[top].ldepth = 0;
-    stack[top].adepth = 0;
-    top++;
-    while (top > 0) {
-        struct cx_frame f = stack[--top];
+    complexity_stack_t stack;
+    complexity_stack_init(&stack);
+    if (!complexity_stack_push(
+            &stack, (complexity_frame_t){.node = node, .bdepth = 0, .ldepth = 0, .adepth = 0})) {
+        complexity_stack_destroy(&stack);
+        return false;
+    }
+    while (stack.count > 0) {
+        complexity_frame_t f = stack.items[--stack.count];
         const char *kind = ts_node_type(f.node);
         bool is_branch = false;
         for (const char **t = branching_types; *t; t++) {
@@ -645,14 +717,21 @@ void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
             child_l = d;
         }
         uint32_t n = ts_node_child_count(f.node);
-        for (int i = (int)n - SKIP_ONE; i >= 0 && top < BRANCHING_STACK_CAP; i--) {
-            stack[top].node = ts_node_child(f.node, (uint32_t)i);
-            stack[top].bdepth = child_b;
-            stack[top].ldepth = child_l;
-            stack[top].adepth = child_a;
-            top++;
+        for (int i = (int)n - SKIP_ONE; i >= 0; i--) {
+            complexity_frame_t child = {
+                .node = ts_node_child(f.node, (uint32_t)i),
+                .bdepth = child_b,
+                .ldepth = child_l,
+                .adepth = child_a,
+            };
+            if (!complexity_stack_push(&stack, child)) {
+                complexity_stack_destroy(&stack);
+                return false;
+            }
         }
     }
+    complexity_stack_destroy(&stack);
+    return true;
 }
 
 // --- Enclosing function detection ---
@@ -864,10 +943,6 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
  * edge names a source node that does not exist and is dropped at write, which is
  * precisely how the function-header bug manifested. */
 
-/* Bound on the interpolation scan below. An attrpath segment is an identifier or a
- * string, so its subtree is shallow; this only has to stop a pathological input. */
-enum { NIX_ATTR_SCAN_MAX = 32 };
-
 /* Strip one matching pair of surrounding double quotes, in place. */
 void cbm_nix_strip_attr_quotes(char *text) {
     if (!text) {
@@ -881,26 +956,33 @@ void cbm_nix_strip_attr_quotes(char *text) {
 }
 
 /* True when a segment contains a `${...}` interpolation, and therefore has no
- * statically knowable name. Iterative and bounded — the lint forbids unlisted
- * recursion, and an attrpath segment is shallow by construction. */
+ * statically knowable name. The tree cursor visits the complete finite subtree
+ * in O(N) runtime and O(1) auxiliary memory for N syntax nodes; unlike a fixed
+ * stack, it cannot silently classify a later interpolation as static. */
 bool cbm_nix_attr_is_interpolated(TSNode attr) {
     if (ts_node_is_null(attr)) {
         return false;
     }
-    TSNode stack[NIX_ATTR_SCAN_MAX];
-    int top = 0;
-    stack[top++] = attr;
-    while (top > 0) {
-        TSNode cur = stack[--top];
-        if (strcmp(ts_node_type(cur), "interpolation") == 0) {
-            return true;
+    bool found = false;
+    bool complete = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(attr);
+    while (!complete) {
+        if (strcmp(ts_node_type(ts_tree_cursor_current_node(&cursor)), "interpolation") == 0) {
+            found = true;
+            break;
         }
-        uint32_t n = ts_node_named_child_count(cur);
-        for (uint32_t i = 0; i < n && top < NIX_ATTR_SCAN_MAX; i++) {
-            stack[top++] = ts_node_named_child(cur, i);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                complete = true;
+                break;
+            }
         }
     }
-    return false;
+    ts_tree_cursor_delete(&cursor);
+    return found;
 }
 
 /* The leaf segment of an attrpath — the name. `attr` is a FIELD in this grammar,
@@ -918,31 +1000,84 @@ TSNode cbm_nix_attrpath_last_attr(TSNode attrpath) {
     return ts_node_named_child(attrpath, n - SKIP_ONE);
 }
 
+/* Source span of one statically rendered attr segment without surrounding
+ * double quotes. The source belongs to the parsed tree, so node byte offsets
+ * are the single authority used by both sizing and copying passes. */
+static bool nix_attr_unquoted_span(TSNode segment, const char *source, uint32_t *start_out,
+                                   uint32_t *end_out) {
+    if (!source || !start_out || !end_out || ts_node_is_null(segment)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(segment);
+    uint32_t end = ts_node_end_byte(segment);
+    if (end <= start) {
+        return false;
+    }
+    if (end - start >= CBM_QUOTE_PAIR && source[start] == '"' && source[end - SKIP_ONE] == '"') {
+        start += SKIP_ONE;
+        end -= SKIP_ONE;
+    }
+    *start_out = start;
+    *end_out = end;
+    return true;
+}
+
 /* The scope prefix of an attrpath: every segment except the leaf, quote-stripped
  * and dot-joined. `a.b.fn = …` yields "a.b" so it qualifies identically to the
  * nested spelling `a = { b = { fn = …; }; }`. Returns NULL for a single-segment
  * path (no scope) or when a leading segment is interpolated (not nameable). */
 const char *cbm_nix_attrpath_scope(CBMArena *a, TSNode attrpath, const char *source) {
-    if (ts_node_is_null(attrpath)) {
+    if (!a || !source || ts_node_is_null(attrpath)) {
         return NULL;
     }
     uint32_t n = ts_node_named_child_count(attrpath);
     if (n <= SKIP_ONE) {
         return NULL;
     }
-    const char *scope = NULL;
+
+    /* Validate and size once, then allocate/copy once. Repeatedly formatting
+     * each growing prefix retained every abandoned prefix in the file arena,
+     * taking O(L^2) runtime and memory for total scope length L. */
+    size_t scope_len = 0;
     for (uint32_t i = 0; i + SKIP_ONE < n; i++) {
         TSNode seg = ts_node_named_child(attrpath, i);
         if (cbm_nix_attr_is_interpolated(seg)) {
             return NULL;
         }
-        char *seg_text = cbm_node_text(a, seg, source);
-        if (!seg_text || !seg_text[0]) {
+        uint32_t start = 0;
+        uint32_t end = 0;
+        if (!nix_attr_unquoted_span(seg, source, &start, &end)) {
             return NULL;
         }
-        cbm_nix_strip_attr_quotes(seg_text);
-        scope = scope ? cbm_arena_sprintf(a, "%s.%s", scope, seg_text) : seg_text;
+        size_t segment_len = (size_t)(end - start);
+        size_t separator_len = i > 0 ? SKIP_ONE : 0;
+        if (scope_len > SIZE_MAX - separator_len ||
+            segment_len > SIZE_MAX - (scope_len + separator_len)) {
+            return NULL;
+        }
+        scope_len += separator_len + segment_len;
     }
+    if (scope_len == SIZE_MAX) {
+        return NULL;
+    }
+    char *scope = cbm_arena_alloc(a, scope_len + SKIP_ONE);
+    if (!scope) {
+        return NULL;
+    }
+    size_t offset = 0;
+    for (uint32_t i = 0; i + SKIP_ONE < n; i++) {
+        TSNode seg = ts_node_named_child(attrpath, i);
+        uint32_t start = 0;
+        uint32_t end = 0;
+        (void)nix_attr_unquoted_span(seg, source, &start, &end);
+        if (i > 0) {
+            scope[offset++] = '.';
+        }
+        size_t segment_len = (size_t)(end - start);
+        memcpy(scope + offset, source + start, segment_len);
+        offset += segment_len;
+    }
+    scope[offset] = '\0';
     return scope;
 }
 
@@ -1016,6 +1151,16 @@ const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, c
 
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+         lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+         lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC) &&
+        strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        TSNode c_name = cbm_c_family_declarator_name(func_node);
+        if (!ts_node_is_null(c_name)) {
+            return cbm_node_text(a, c_name, source);
+        }
+    }
+
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
     if (lang == CBM_LANG_WOLFRAM) {
         const char *nk = ts_node_type(func_node);

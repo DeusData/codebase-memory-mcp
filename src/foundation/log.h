@@ -8,7 +8,7 @@
  *   - Levels: DEBUG, INFO, WARN, ERROR
  *   - Level filtering at runtime via cbm_log_set_level() or the
  *     CBM_LOG_LEVEL env var (see cbm_log_init_from_env)
- *   - Thread-safe (each fprintf is atomic on POSIX for lines < PIPE_BUF)
+ *   - Configure level/sink at startup; concurrent log calls use stdio's stream lock.
  */
 #ifndef CBM_LOG_H
 #define CBM_LOG_H
@@ -96,5 +96,10 @@ void cbm_log_http_request(const char *component, const char *method, const char 
 typedef void (*cbm_log_sink_fn)(const char *line);
 void cbm_log_set_sink(cbm_log_sink_fn fn);
 void cbm_log_set_sink_ex(cbm_log_sink_fn fn, CBMLogSinkMode mode);
+
+/* When enabled, msg=prof lines are also mirrored to stderr even when a custom
+ * sink is active. This is opt-in so MCP stdio stdout stays protocol-only and
+ * normal server logs remain sink-routed by default. */
+void cbm_log_set_profile_stderr_mirror(bool enabled);
 
 #endif /* CBM_LOG_H */

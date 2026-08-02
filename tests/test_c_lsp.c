@@ -27,8 +27,11 @@
 #include "lsp/go_lsp.h"
 #include "lsp/type_registry.h"
 #include "arena.h"
+#include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ── Helpers (same as test_go_lsp.c) ───────────────────────────── */
 
@@ -38,6 +41,18 @@ static int find_resolved(const CBMFileResult *r, const char *callerSub, const ch
         if (rc->caller_qn && strstr(rc->caller_qn, callerSub) && rc->callee_qn &&
             strstr(rc->callee_qn, calleeSub))
             return i;
+    }
+    return -1;
+}
+
+static int find_resolved_exact_caller(const CBMFileResult *r, const char *caller,
+                                      const char *calleeSub) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller) == 0 &&
+            strstr(rc->callee_qn, calleeSub)) {
+            return i;
+        }
     }
     return -1;
 }
@@ -60,6 +75,73 @@ static CBMFileResult *extract_c(const char *src) {
 
 static CBMFileResult *extract_cpp(const char *src) {
     return cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "test", "main.cpp", 0, NULL, NULL);
+}
+
+TEST(clsp_shared_cross_registry_read_only) {
+    const char *source = "class Widget {\n"
+                         "public:\n"
+                         "    Widget& value();\n"
+                         "    void mutate() {}\n"
+                         "};\n"
+                         "int existing(int a, int b = 1) { return a; }\n"
+                         "Widget factory();\n"
+                         "void test() {\n"
+                         "    Widget w;\n"
+                         "    w.mutate();\n"
+                         "    existing(1);\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.Widget",
+         .short_name = "Widget",
+         .label = "Class",
+         .def_module_qn = "test.main",
+         .lang = CBM_LANG_CPP},
+        {.qualified_name = "test.main.existing",
+         .short_name = "existing",
+         .label = "Function",
+         .def_module_qn = "test.main",
+         .return_types = "int",
+         .lang = CBM_LANG_CPP},
+    };
+
+    CBMArena registry_arena;
+    CBMArena run_arena;
+    cbm_arena_init(&registry_arena);
+    cbm_arena_init(&run_arena);
+
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&registry_arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    int func_count = reg->func_count;
+    int type_count = reg->type_count;
+    const CBMRegisteredFunc *existing = cbm_registry_lookup_func(reg, "test.main.existing");
+    ASSERT_NOT_NULL(existing);
+    int min_params = existing->min_params;
+
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&run_arena, source, (int)strlen(source), "test.main", true,
+                                      reg, NULL, NULL, 0, NULL, &out);
+
+    ASSERT_EQ(reg->func_count, func_count);
+    ASSERT_EQ(reg->type_count, type_count);
+    existing = cbm_registry_lookup_func(reg, "test.main.existing");
+    ASSERT_NOT_NULL(existing);
+    ASSERT_EQ(existing->min_params, min_params);
+    ASSERT_NULL(cbm_registry_lookup_func(reg, "test.main.factory"));
+    ASSERT_NULL(cbm_registry_lookup_method(reg, "test.main.Widget", "value"));
+
+    cbm_arena_destroy(&run_arena);
+    cbm_arena_destroy(&registry_arena);
+    PASS();
+}
+
+TEST(clsp_cpp_out_of_line_method_lsp_caller_qn) {
+    CBMFileResult *r = extract_cpp("class Helper { public: void work(); };\n"
+                                   "class Processor { public: int run(); Helper helper; };\n"
+                                   "int Processor::run() { helper.work(); return 0; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved_exact_caller(r, "test.main.Processor.run", "helper.work"), 0);
+    cbm_free_result(r);
+    PASS();
 }
 
 TEST(clsp_simple_var_decl) {
@@ -611,9 +693,19 @@ TEST(clsp_calls_attributed_to_function_issue220) {
  * this drives the vendored xxhash.h (~7.5k lines, same macro-dense family)
  * through C extraction as a proxy/regression guard. Runs under ASan. */
 TEST(clsp_nocrash_issue355_xxhash_header) {
-    FILE *fp = fopen("vendored/xxhash/xxhash.h", "rb");
+    const char *repository_root = tf_repository_root();
+    if (!repository_root) {
+        FAIL("test runner is not inside a source checkout");
+    }
+    char fixture_path[CBM_PATH_MAX];
+    int fixture_written = snprintf(fixture_path, sizeof(fixture_path),
+                                   "%s/vendored/xxhash/xxhash.h", repository_root);
+    if (fixture_written <= 0 || (size_t)fixture_written >= sizeof(fixture_path)) {
+        FAIL("vendored xxhash fixture path is too long");
+    }
+    FILE *fp = cbm_fopen(fixture_path, "rb");
     if (!fp) {
-        FAIL("vendored/xxhash/xxhash.h not found (run from repo root)");
+        FAIL("vendored/xxhash/xxhash.h not found under test repository root");
     }
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
@@ -15503,6 +15595,8 @@ TEST(seal_go_shared_registry_readonly) {
 }
 
 SUITE(c_lsp) {
+    RUN_TEST(clsp_shared_cross_registry_read_only);
+    RUN_TEST(clsp_cpp_out_of_line_method_lsp_caller_qn);
     RUN_TEST(clsp_tier2_shared_registry_readonly_c);
     RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
     RUN_TEST(seal_py_shared_registry_readonly);

@@ -22,10 +22,14 @@
 #define CBM_PIPELINE_LSP_RESOLVE_H
 
 #include "cbm.h"
+#include "foundation/compat.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
+#include "foundation/hash_table.h"
 
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Confidence floor below which LSP-resolved calls are ignored and the
@@ -34,6 +38,7 @@
  * Applies to every language whose LSP populates result->resolved_calls
  * (Go, C/C++, Python, PHP). */
 #define CBM_LSP_CONFIDENCE_FLOOR 0.6f
+#define CBM_LSP_RESOLUTION_KEY_SEP '|'
 
 /* Bare last segment of a (possibly qualified) name, splitting on the LAST
  * member/scope separator. C++ textual callees carry `::` (Class::method,
@@ -62,6 +67,26 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
         }
     }
     return seg;
+}
+
+static inline bool cbm_lsp_reason_join_strategy(const char *strategy) {
+    return strategy &&
+           (strcmp(strategy, "lsp_func_ptr") == 0 || strcmp(strategy, "lsp_dll_resolve") == 0 ||
+            strcmp(strategy, "lsp_method_ref_ctor") == 0 ||
+            strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
+            strcmp(strategy, "lsp_dict_dispatch") == 0 ||
+            strcmp(strategy, "lsp_import_alias") == 0 || strcmp(strategy, "lsp_destructor") == 0 ||
+            strcmp(strategy, "php_method_dynamic") == 0);
+}
+
+static inline bool cbm_lsp_resolution_matches_call(const CBMResolvedCall *rc, const CBMCall *call) {
+    const char *call_short = cbm_lsp_bare_segment(call->callee_name);
+    const char *resolved_short = cbm_lsp_bare_segment(rc->callee_qn);
+    if (strcmp(resolved_short, call_short) == 0) {
+        return true;
+    }
+    return rc->reason && cbm_lsp_reason_join_strategy(rc->strategy) &&
+           strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0;
 }
 
 /* Tail helper: return the start of the final two dot-separated segments
@@ -115,71 +140,35 @@ static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const cha
  * short-name matches the textual callee. Returns a pointer into `arr`
  * or NULL if no qualifying entry exists.
  *
- * Match rule:
- *   1. exact caller_qn + callee short-name match wins first;
- *   2. if no exact caller match exists AND allow_tail_match is set
- *      (JVM callers only, see cbm_pipeline_lsp_allow_tail_match), a
- *      unique Class.method tail match between rc->caller_qn and
- *      call->enclosing_func_qn may win;
- *   3. ambiguous tails return NULL so the registry fallback stays in
- *      control.
- *
- * Qualified static callees (e.g. Perl `Pkg::sub`) are reduced to their
- * bare last segment by cbm_lsp_bare_segment before matching.
- *
- * The pointer returned aliases into `arr` and stays valid as long as the
- * underlying CBMFileResult is alive. */
-static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
-    const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match) {
+ * Exact matches compare the shared bare member segment, including C++ `::`
+ * and `->` forms and selected indirect strategies whose original textual
+ * callee is carried in `reason`. When explicitly enabled for JVM languages,
+ * a unique Class.method caller tail may match; ambiguous tails fail closed.
+ * The returned pointer aliases into `arr`. */
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor(
+    const CBMResolvedCallArray *arr, const CBMCall *call, double confidence_floor,
+    bool allow_tail_match) {
     if (!arr || arr->count == 0 || !call) {
         return NULL;
     }
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
-
+    double floor = confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
     const CBMResolvedCall *best_exact = NULL;
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
         if (!rc->caller_qn || !rc->callee_qn) {
             continue;
         }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if ((double)rc->confidence < floor) {
             continue;
         }
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
             continue;
         }
-        const char *short_name = cbm_lsp_bare_segment(rc->callee_qn);
-        /* The call's callee_name is receiver-qualified for method/qualified
-         * calls ("c.inc", "A.Helper", "Math::square", "p->run"); the LSP
-         * records the resolved class-qualified callee_qn ("Class.inc"). Compare
-         * the bare last segment on BOTH sides so method-dispatch resolutions
-         * join — the LSP already did the receiver->type resolution, and matching
-         * the full "c.inc" against "inc" would always miss, silently dropping the
-         * type-aware LSP strategy to the weaker textual registry. Free-function
-         * calls (bare callee_name) are unaffected. */
-        const char *call_short = cbm_lsp_bare_segment(call->callee_name);
-        if (strcmp(short_name, call_short) != 0) {
-            /* Indirect/implicit resolution: the textual callee differs from the
-             * resolved callee_qn's short name. A function-pointer / DLL call's
-             * callee is the pointer name (`fp`); a C++ destructor's only textual
-             * anchor is the deleted operand (`p`, vs. the `T.~T` callee QN). In
-             * both the LSP stashed the original textual name in `reason`. Match
-             * the call site on that name, gated to those strategies so `reason`
-             * is never misread as an unresolved-call diagnostic. */
-            if (!(rc->reason && rc->strategy &&
-                  (strcmp(rc->strategy, "lsp_func_ptr") == 0 ||
-                   strcmp(rc->strategy, "lsp_dll_resolve") == 0 ||
-                   strcmp(rc->strategy, "lsp_method_ref_ctor") == 0 ||
-                   strcmp(rc->strategy, "lsp_method_ref_ctor_synth") == 0 ||
-                   strcmp(rc->strategy, "lsp_dict_dispatch") == 0 ||
-                   strcmp(rc->strategy, "lsp_import_alias") == 0 ||
-                   strcmp(rc->strategy, "lsp_destructor") == 0 ||
-                   strcmp(rc->strategy, "php_method_dynamic") == 0) &&
-                  strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0)) {
-                continue;
-            }
+        if (!cbm_lsp_resolution_matches_call(rc, call)) {
+            continue;
         }
         if (!best_exact || rc->confidence > best_exact->confidence) {
             best_exact = rc;
@@ -203,7 +192,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         if (!rc->caller_qn || !rc->callee_qn) {
             continue;
         }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if ((double)rc->confidence < floor) {
             continue;
         }
         const char *short_name = strrchr(rc->callee_qn, '.');
@@ -221,6 +210,132 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
         best_tail = rc;
     }
     return best_tail;
+}
+
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
+    const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match) {
+    return cbm_pipeline_find_lsp_resolution_with_floor(arr, call, 0.0, allow_tail_match);
+}
+
+typedef struct cbm_lsp_resolution_index {
+    CBMHashTable *entries;
+    bool complete;
+} cbm_lsp_resolution_index_t;
+
+static inline void cbm_lsp_resolution_index_free_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    free((char *)key);
+}
+
+static inline void cbm_lsp_resolution_index_store(cbm_lsp_resolution_index_t *idx,
+                                                  const char *caller_qn, const char *callee_short,
+                                                  CBMResolvedCall *rc) {
+    if (!idx || !idx->entries || !caller_qn || !callee_short || !rc) {
+        if (idx) {
+            idx->complete = false;
+        }
+        return;
+    }
+    char key[CBM_SZ_1K];
+    int written =
+        snprintf(key, sizeof(key), "%s%c%s", caller_qn, CBM_LSP_RESOLUTION_KEY_SEP, callee_short);
+    if (written <= 0 || (size_t)written >= sizeof(key)) {
+        idx->complete = false;
+        return;
+    }
+
+    CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+    if (!existing) {
+        char *owned_key = cbm_strdup(key);
+        if (!owned_key) {
+            idx->complete = false;
+            return;
+        }
+        cbm_ht_set(idx->entries, owned_key, rc);
+    } else if (rc->confidence > existing->confidence) {
+        const char *stored_key = cbm_ht_get_key(idx->entries, key);
+        if (stored_key) {
+            cbm_ht_set(idx->entries, stored_key, rc);
+        } else {
+            idx->complete = false;
+        }
+    }
+}
+
+/* Build a per-file lookup table keyed by "caller_qn|callee_short".
+ *
+ * This preserves cbm_pipeline_find_lsp_resolution_with_floor() semantics:
+ * it applies the function's confidence_floor argument, requires exact caller_qn
+ * equality, compares shared callee segments with C++ `::`/`->` awareness,
+ * indexes allowed original-text reason joins, and keeps the highest-confidence
+ * entry for duplicate keys. The index changes lookup cost from O(call_count * resolved_count) to
+ * O(resolved_count + call_count) for files where every eligible key is indexed.
+ *
+ * If memory allocation or key formatting fails for any eligible entry,
+ * `complete` is cleared. A later miss then falls back to the linear helper so
+ * correctness is preserved even when the optimization cannot cover every row. */
+static inline void cbm_lsp_resolution_index_build(cbm_lsp_resolution_index_t *idx,
+                                                  const CBMResolvedCallArray *arr, int call_count,
+                                                  double confidence_floor) {
+    if (!idx) {
+        return;
+    }
+    idx->entries = NULL;
+    idx->complete = false;
+    if (!arr || arr->count == 0 || call_count <= 0) {
+        return;
+    }
+
+    idx->entries = cbm_ht_create((uint32_t)arr->count * 2u + (uint32_t)CBM_SZ_16);
+    if (!idx->entries) {
+        return;
+    }
+    idx->complete = true;
+
+    double floor = confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
+    for (int i = 0; i < arr->count; i++) {
+        CBMResolvedCall *rc = &arr->items[i];
+        if (!rc->caller_qn || !rc->callee_qn || (double)rc->confidence < floor) {
+            continue;
+        }
+        cbm_lsp_resolution_index_store(idx, rc->caller_qn, cbm_lsp_bare_segment(rc->callee_qn), rc);
+        if (rc->reason && cbm_lsp_reason_join_strategy(rc->strategy)) {
+            cbm_lsp_resolution_index_store(idx, rc->caller_qn, cbm_lsp_bare_segment(rc->reason),
+                                           rc);
+        }
+    }
+}
+
+static inline const CBMResolvedCall *cbm_lsp_resolution_index_find(
+    const cbm_lsp_resolution_index_t *idx, const CBMResolvedCallArray *arr, const CBMCall *call,
+    double confidence_floor, bool allow_tail_match) {
+    if (!call || !call->enclosing_func_qn || !call->callee_name) {
+        return NULL;
+    }
+    if (idx && idx->entries) {
+        char key[CBM_SZ_1K];
+        int written = snprintf(key, sizeof(key), "%s%c%s", call->enclosing_func_qn,
+                               CBM_LSP_RESOLUTION_KEY_SEP, cbm_lsp_bare_segment(call->callee_name));
+        if (written > 0 && (size_t)written < sizeof(key)) {
+            const CBMResolvedCall *hit = (const CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+            if (hit || (idx->complete && !allow_tail_match)) {
+                return hit;
+            }
+        }
+    }
+    return cbm_pipeline_find_lsp_resolution_with_floor(arr, call, confidence_floor,
+                                                       allow_tail_match);
+}
+
+static inline void cbm_lsp_resolution_index_free(cbm_lsp_resolution_index_t *idx) {
+    if (!idx || !idx->entries) {
+        return;
+    }
+    cbm_ht_foreach(idx->entries, cbm_lsp_resolution_index_free_key, NULL);
+    cbm_ht_free(idx->entries);
+    idx->entries = NULL;
+    idx->complete = false;
 }
 
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.
@@ -295,6 +410,29 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
         match = cand;
     }
     return match;
+}
+
+/* Whether an unresolved LSP target is explicitly inside the indexed project.
+ *
+ * Cross-file registries can resolve a declaration to a project-qualified QN
+ * that is not itself a graph node. C/C++ forward declarations are the common
+ * case: the declaration QN belongs to the caller translation unit while the
+ * canonical definition node belongs to another file. In that case the textual
+ * registry resolver remains a valid canonical-definition fallback.
+ *
+ * Unqualified targets are deliberately not assumed to be internal. Python and
+ * other language resolvers use those QNs for third-party libraries (for example
+ * starlette.routing.Route), where a weak short-name fallback would manufacture
+ * a project edge. Explicit `external.*` targets are also excluded naturally.
+ */
+static inline bool cbm_lsp_resolution_targets_project(const CBMResolvedCall *resolution,
+                                                      const char *project_name) {
+    if (!resolution || !resolution->callee_qn || !project_name || !project_name[0]) {
+        return false;
+    }
+    size_t project_len = strlen(project_name);
+    return strncmp(resolution->callee_qn, project_name, project_len) == 0 &&
+           resolution->callee_qn[project_len] == '.';
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

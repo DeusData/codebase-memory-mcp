@@ -30,6 +30,35 @@ if ! grep -Fq 'run-test-wave.py' "$driver"; then
     exit 1
 fi
 
+assignment_body() {
+    local name="$1"
+    awk -v name="$name" '
+        $0 ~ "^" name "=\"" { capture = 1 }
+        capture {
+            print
+            if ($0 !~ /\\$/) {
+                exit
+            }
+        }
+    ' "$driver"
+}
+
+# These suites assert absolute wall-clock ceilings. They must stay out of both
+# concurrent waves: running one alone is part of the measurement contract, not
+# a tolerance increase for a loaded scheduler.
+serial_body="$(assignment_body SERIAL_SUITES)"
+exclusive_body="$(assignment_body TAIL_EXCL)"
+for suite in cs_lsp_bench py_lsp_bench py_lsp_scale; do
+    if ! grep -Eq "(^|[[:space:]])${suite}([[:space:]\"\\\\]|$)" <<<"$serial_body"; then
+        echo "FAIL: $suite can enter the main concurrent suite wave" >&2
+        exit 1
+    fi
+    if ! grep -Eq "(^|[[:space:]])${suite}([[:space:]\"\\\\]|$)" <<<"$exclusive_body"; then
+        echo "FAIL: $suite can enter the concurrent serial-tail wave" >&2
+        exit 1
+    fi
+done
+
 cat >"$fixture/fake_runner.py" <<'PY'
 from __future__ import annotations
 

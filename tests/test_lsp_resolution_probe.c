@@ -127,7 +127,9 @@ static cbm_store_t *lrp_open_indexed(LRP_Proj *lp) {
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    /* Honor CBM_CACHE_DIR so this matches the pipeline write path (test isolation). */
+    snprintf(cache_dir, sizeof(cache_dir), "%s",
+             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp");
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
@@ -216,9 +218,9 @@ static int lrp_assert_calls(const LRP_File *files, int nfiles, int min_calls,
                 scenario, got, min_calls, expect_green ? "(GREEN regression)" : "(RED reproduction)");
         lrp_diag(store, lp.project, scenario);
     } else if (!expect_green) {
-        /* Unexpectedly passing — the lsp_cross wiring may have been added. */
-        fprintf(stderr, "  [LRP] %s UNEXPECTED PASS calls=%d "
-                "(lsp_cross may now be wired — promote to GREEN)\n", scenario, got);
+        fprintf(stderr,
+                "  [LRP] %s CAPABILITY PRESENT (baseline expected absent) calls=%d\n",
+                scenario, got);
     }
     lrp_cleanup(&lp, store);
     return got >= min_calls;

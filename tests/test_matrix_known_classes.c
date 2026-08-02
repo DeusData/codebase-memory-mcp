@@ -73,7 +73,9 @@ static cbm_store_t *mkc_open_indexed(MKC_Proj *lp) {
     if (!home)
         home = "/tmp";
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    /* Honor CBM_CACHE_DIR so this matches the pipeline write path (test isolation). */
+    snprintf(cache_dir, sizeof(cache_dir), "%s",
+             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp");
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
@@ -166,8 +168,7 @@ static int mkc_edge(const MKC_File *files, int nfiles, const char *edge_type, in
         mkc_diag(store, lp.project, label);
     } else if (!is_green) {
         fprintf(stderr,
-                "  [MKC] %s UNEXPECTED PASS %s=%d "
-                "(bug may be fixed — promote to GREEN)\n",
+                "  [MKC] %s CAPABILITY PRESENT (baseline expected absent) %s=%d\n",
                 label, edge_type, got);
     }
     mkc_cleanup(&lp, store);
@@ -368,7 +369,7 @@ TEST(mkc_c2_cpp_operator_plus) {
 /* C2-B: C++ — operator[] subscript overload.
  * red=bug: `arr[0]` on a custom array type is a subscript_expression;
  * same root cause as C2-A — no desugaring to CALLS for subscript operators. */
-TEST(mkc_c2_cpp_operator_subscript) {
+TEST(mkc_c2_cpp_operator_subscript_does_not_count_data_target) {
     static const MKC_File f[] = {{"arr.cpp", "struct IntArr {\n    int data[8];\n"
                                              "    int& operator[](int i) { return data[i]; }\n"
                                              "};\n\n"
@@ -377,10 +378,16 @@ TEST(mkc_c2_cpp_operator_subscript) {
                                              "}\n"}};
     /* REAL BUG: a[2] should CALLS run->IntArr::operator[].  The subscript
      * operator desugaring is not modeled — C++ call extraction does not emit a
-     * call for subscript_expression on an overloaded-operator type → 0 CALLS.
-     * (Note: C++ binary operator+ desugaring now works — c2/cpp/operator_plus
-     * passes — but subscript [] is still missing.) [KNOWN class 12] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/cpp/operator_subscript", 0));
+     * call for subscript_expression on an overloaded-operator type. Before
+     * weak non-callable targets were filtered, this fixture passed by counting
+     * a false CALLS edge to the data field. Keep the known operator-resolution
+     * gap explicit without accepting that semantically invalid edge. */
+    MKC_Proj lp;
+    cbm_store_t *store = mkc_index(&lp, f, 1);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, lp.project, "CALLS"), 0);
+    ASSERT_GTE(cbm_store_count_edges_by_type(store, lp.project, "USAGE"), 1);
+    mkc_cleanup(&lp, store);
     PASS();
 }
 
@@ -1241,9 +1248,9 @@ SUITE(matrix_known_classes) {
     RUN_TEST(mkc_c1_rust_new_samefile);
 
     /* ── CLASS C2: OPERATOR OVERLOADING ────────────────────────────────── */
-    /* C2-A/B: C++ operator+/[] — red=bug */
+    /* C2-A: operator+ capability; C2-B: operator[] false-target guard. */
     RUN_TEST(mkc_c2_cpp_operator_plus);
-    RUN_TEST(mkc_c2_cpp_operator_subscript);
+    RUN_TEST(mkc_c2_cpp_operator_subscript_does_not_count_data_target);
     /* C2-C/D: Python __add__/__getitem__ — red=bug */
     RUN_TEST(mkc_c2_python_dunder_add);
     RUN_TEST(mkc_c2_python_dunder_getitem);

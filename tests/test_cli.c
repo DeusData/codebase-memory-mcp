@@ -20,6 +20,7 @@
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/platform.h>
+#include <foundation/sha256.h>
 #include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
@@ -38,8 +39,20 @@
 #include <mach-o/dyld.h>
 #endif
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <zlib.h>
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
+#include <depindex/depindex.h>
+#include <pagerank/pagerank.h>
+#include <pipeline/pipeline.h>
+#include <sqlite3.h>
+
+/* Binary path for the Gemini session-hook tests. cbm_upsert/remove_gemini_session_hooks
+ * both take it, and removal matches owned entries by this exact path, so the paired
+ * upsert and remove in a test must use the same value. */
+#define CLI_TEST_GEMINI_BINARY "/usr/local/bin/codebase-memory-mcp"
 
 /* Internal prompt seam used to restore process-global state after command
  * tests that exercise --yes. */
@@ -176,7 +189,9 @@ static int write_test_file(const char *path, const char *content) {
 /* Helper: read a file into static buffer */
 static const char *read_test_file(const char *path) {
     static char buf[8192];
-    FILE *f = fopen(path, "r");
+    /* Exercise the production UTF-8 path seam: O(path bytes) runtime work,
+     * latency, and transient memory on Windows; direct fopen on POSIX. */
+    FILE *f = cbm_fopen(path, "r");
     if (!f)
         return NULL;
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
@@ -186,7 +201,7 @@ static const char *read_test_file(const char *path) {
 }
 
 static char *read_test_file_alloc(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f)
         return NULL;
     if (fseek(f, 0, SEEK_END) != 0) {
@@ -463,21 +478,18 @@ static cbm_cli_activation_ops_t cli_activation_fake_ops(cli_activation_fake_t *f
     return ops;
 }
 
-/* Every install/update/uninstall in this suite dispatches through here. On
- * Windows a test that has not installed its own activation ops gets a default
- * fake for the duration of the command: without the seam, `update` (correctly)
- * hands off to install.ps1 before the shared agent-config logic these tests
- * verify ever runs. POSIX behavior is untouched — tests without ops keep
- * exercising the real activation machinery. */
+/* Ordinary install/update/uninstall tests dispatch through here. A test that
+ * has not installed activation ops gets a successful default fake for the
+ * duration of the command, keeping agent-config assertions independent of a
+ * real dogfood daemon using the developer's cache. Tests of production cohort
+ * behavior call cbm_cmd_* directly or install explicit ops. On Windows the
+ * seam also reaches shared agent-config logic before the production
+ * install.ps1 handoff; direct release gates retain that handoff coverage. */
 static cli_activation_fake_t g_cli_test_seam_fake;
 static cbm_cli_activation_ops_t g_cli_test_seam_ops;
 
 static int cli_test_cmd_dispatch(int (*command)(int, char **), int argc, char **argv) {
-#ifdef _WIN32
     bool engage = !cbm_cli_activation_test_ops_installed();
-#else
-    bool engage = false;
-#endif
     if (engage) {
         memset(&g_cli_test_seam_fake, 0, sizeof(g_cli_test_seam_fake));
         g_cli_test_seam_fake.mutation_reserve_result = 1;
@@ -641,7 +653,10 @@ TEST(cli_activation_refuses_when_cohort_does_not_drain) {
     ASSERT_EQ(fake.mutation_count, 0);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_FALSE(fake.mutation_lease_held);
-    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "automatic stop request timed out"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "Close or restart"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "retry the same command"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "no executable, configuration, or index mutation"));
     PASS();
 }
 
@@ -661,7 +676,10 @@ TEST(cli_activation_refuses_unsafe_cohort_reservation) {
     ASSERT_EQ(fake.mutation_count, 0);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_FALSE(fake.mutation_lease_held);
-    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "could not prove exclusive activation safety"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "owner-only and writable"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "retry the same command"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "no executable, configuration, or index mutation"));
     PASS();
 }
 
@@ -873,7 +891,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = child_ready ? cbm_cmd_install(4, install_argv) : -1;
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1768,6 +1786,10 @@ TEST(cli_compare_versions) {
     ASSERT_EQ(cbm_compare_versions("0.2.1-dev", "0.2.1-dev"), 0);
     ASSERT(cbm_compare_versions("0.3.0", "0.2.1-dev") > 0);
     ASSERT(cbm_compare_versions("0.2.0", "0.2.1-dev") < 0);
+    ASSERT_TRUE(cbm_version_is_development(CBM_VERSION_DEVELOPMENT));
+    ASSERT_FALSE(cbm_version_is_development("0.2.1-dev"));
+    ASSERT_FALSE(cbm_version_is_development("0.2.1"));
+    ASSERT_FALSE(cbm_version_is_development(NULL));
     PASS();
 }
 
@@ -2286,7 +2308,16 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "15 MCP Tools") != NULL);
+    /* Heading asserted WITHOUT a tool count. Upstream's skill said "## 15 MCP
+     * Tools" and this assertion matched that literal; the branch had already
+     * dropped the count to "## MCP Tools", and the merge kept the branch's
+     * generator (src/cli/cli.c:1469). Keeping the countless form is the right
+     * resolution rather than a concession: a count hard-coded in a string
+     * constant drifts silently from TOOLS[] the moment a tool is added, and it
+     * already had: README.md:40 carries the same stale "15" while TOOLS[]
+     * defines more. Do not re-add a literal count here; if the count is ever
+     * worth publishing it has to be derived from TOOLS[], not restated. */
+    ASSERT(strstr(sk[0].content, "MCP Tools") != NULL);
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -3008,6 +3039,7 @@ TEST(cli_openclaw_compaction_preserves_user_owned_section) {
         installed && strstr(installed, "Codebase Memory") && strstr(installed, "User Notes");
     free(installed);
 
+    char *cache_before_uninstall = save_test_env("CBM_CACHE_DIR");
     char *argv[] = {"uninstall", "--yes"};
     int rc = cli_test_cmd_uninstall(2, argv);
     char *uninstalled = read_test_file_alloc(config_path);
@@ -3017,21 +3049,27 @@ TEST(cli_openclaw_compaction_preserves_user_owned_section) {
         uninstalled && !strstr(uninstalled, "Codebase Knowledge Graph (codebase-memory-mcp)");
     free(uninstalled);
 
-    const size_t cache_env_index = sizeof(env_names) / sizeof(env_names[0]) - 1;
     const char *cache_after_uninstall = getenv("CBM_CACHE_DIR");
     bool cache_environment_restored =
-        saved_env[cache_env_index]
+        cache_before_uninstall
             ? cache_after_uninstall &&
-                  strcmp(cache_after_uninstall, saved_env[cache_env_index]) == 0
+                  strcmp(cache_after_uninstall, cache_before_uninstall) == 0
             : cache_after_uninstall == NULL;
+    free(cache_before_uninstall);
 
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         restore_test_env(env_names[i], saved_env[i]);
     }
     test_rmdir_r(tmpdir);
     if (!installed_owned || !retained_existing || rc != 0 || !preserved_user || !removed_owned ||
-        !cache_environment_restored)
+        !cache_environment_restored) {
+        fprintf(stderr,
+                "OpenClaw compaction diag installed_owned=%d retained_existing=%d uninstall=%d "
+                "preserved_user=%d removed_owned=%d cache_restored=%d\n",
+                installed_owned, retained_existing, rc, preserved_user, removed_owned,
+                cache_environment_restored);
         FAIL("OpenClaw uninstall must remove only its namespaced compaction section");
+    }
     PASS();
 }
 
@@ -3362,11 +3400,11 @@ TEST(cli_ensure_path_append) {
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
     write_test_file(rcfile, "# existing content\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc, 0);
 
     const char *data = read_test_file(rcfile);
-    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -3380,9 +3418,9 @@ TEST(cli_ensure_path_already_present) {
 
     char rcfile[512];
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
-    write_test_file(rcfile, "export PATH=\"/usr/local/bin:$PATH\"\n");
+    write_test_file(rcfile, "export PATH=\"/Users/test/.local/bin:$PATH\"\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc, 1); /* 1 = already present */
 
     test_rmdir_r(tmpdir);
@@ -3399,7 +3437,7 @@ TEST(cli_ensure_path_dry_run) {
     snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
     write_test_file(rcfile, "# clean\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, true);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, true);
     ASSERT_EQ(rc, 0);
 
     /* File should NOT be modified */
@@ -3422,18 +3460,138 @@ TEST(cli_ensure_path_fish_syntax_issue319) {
     snprintf(rcfile, sizeof(rcfile), "%s/config.fish", tmpdir);
     write_test_file(rcfile, "# existing fish config\n");
 
-    int rc = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc, 0);
 
     const char *data = read_test_file(rcfile);
     ASSERT_NOT_NULL(data);
     /* fish-native form, and NO sh-style export. */
-    ASSERT(strstr(data, "fish_add_path /usr/local/bin") != NULL);
+    ASSERT(strstr(data, "fish_add_path /Users/test/.local/bin") != NULL);
     ASSERT(strstr(data, "export PATH") == NULL);
 
     /* Idempotent: a second call detects the existing fish line. */
-    int rc2 = cbm_ensure_path("/usr/local/bin", rcfile, false);
+    int rc2 = cbm_ensure_path("/Users/test/.local/bin", rcfile, false);
     ASSERT_EQ(rc2, 1);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_migrates_owned_intel_homebrew_block_on_apple_silicon) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user content\n"
+                            "export KEEP_ME=1\n"
+                            "export PATH=\"/usr/local/bin:$PATH\"\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/usr/local/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/Users/test/.local/bin", rcfile, false,
+                                                       "darwin", "arm64"),
+              0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "export KEEP_ME=1") != NULL);
+    ASSERT_EQ(test_count_substring(data, "export PATH=\"/usr/local/bin:$PATH\""), 1U);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_migrates_owned_arm_homebrew_block_on_intel_macos) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user content\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/Users/test/.local/bin", rcfile, false,
+                                                       "darwin", "amd64"),
+              0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "# user content") != NULL);
+    ASSERT_EQ(test_count_substring(data, "export PATH=\"/opt/homebrew/bin:$PATH\""), 1U);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_honors_explicit_macos_homebrew_overrides) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char arm_rc[512];
+    snprintf(arm_rc, sizeof(arm_rc), "%s/arm.zshrc", tmpdir);
+    write_test_file(arm_rc, "# arm user content\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/usr/local/bin", arm_rc, false, "darwin",
+                                                       "arm64"),
+              0);
+    const char *data = read_test_file(arm_rc);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "# arm user content") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/opt/homebrew/bin:$PATH\"") == NULL);
+
+    char intel_rc[512];
+    snprintf(intel_rc, sizeof(intel_rc), "%s/intel.zshrc", tmpdir);
+    write_test_file(intel_rc, "# intel user content\n"
+                              "\n# Added by codebase-memory-mcp install\n"
+                              "export PATH=\"/usr/local/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/opt/homebrew/bin", intel_rc, false,
+                                                       "darwin", "amd64"),
+              0);
+    data = read_test_file(intel_rc);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "# intel user content") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/opt/homebrew/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_ensure_path_does_not_migrate_homebrew_blocks_off_macos) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-platform-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user content\n"
+                            "\n# Added by codebase-memory-mcp install\n"
+                            "export PATH=\"/opt/homebrew/bin:$PATH\"\n");
+
+    ASSERT_EQ(cbm_ensure_path_for_platform_for_testing("/Users/test/.local/bin", rcfile, false,
+                                                       "linux", "arm64"),
+              0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "export PATH=\"/opt/homebrew/bin:$PATH\"") != NULL);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -4321,9 +4479,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     }
     free(data);
 
-    data = read_test_file_alloc("src/main.c");
+    data = read_test_file_alloc("src/cli/cli.c");
     if (!data)
-        FAIL("could not read src/main.c for supported-agent help contract");
+        FAIL("could not read src/cli/cli.c for supported-agent help contract");
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
             free(data);
@@ -5372,12 +5530,14 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
     write_test_file(verify_path, legacy_verify);
     write_test_file(scout_path, foreign_scout);
 
-    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    char binary_path[640];
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary_path, sizeof(binary_path));
+    char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     bool plan_ok =
         plan && strstr(plan, scout_path) && strstr(plan, verify_path) && strstr(plan, auditor_path);
     free(plan);
 
-    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int install_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
     char *scout = read_test_file_alloc(scout_path);
     char *verify = read_test_file_alloc(verify_path);
     char *auditor = read_test_file_alloc(auditor_path);
@@ -6129,7 +6289,7 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
     char *rovo_mcp_data = read_test_file_alloc(rovo_mcp);
     char *amp_mcp_data = read_test_file_alloc(amp_mcp);
     const char *const instruction_terms[] = {"search_graph", "trace_path", "subagent"};
-    const char *const skill_terms[] = {"search_graph", "trace_path", "Sessions and Subagents"};
+    const char *const skill_terms[] = {"search_graph", "trace_path", "Freshness and Delegation"};
     const char *const kimi_hook_terms[] = {"theme = \"dark\"", "[[hooks]]",
                                            "event = \"UserPromptSubmit\"", "--dialect kimi",
                                            "timeout = 5"};
@@ -6378,7 +6538,7 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
         strstr(devin_agents_data, "search_graph") &&
         test_file_contains_all(
             devin_skill,
-            (const char *const[]){"search_graph", "trace_path", "Sessions and Subagents"}, 3U) &&
+            (const char *const[]){"search_graph", "trace_path", "Freshness and Delegation"}, 3U) &&
         test_file_contains_all(
             gitlab_mcp,
             (const char *const[]){"codebase-memory-mcp", binary_path, "\"type\": \"stdio\""}, 3U);
@@ -6723,7 +6883,8 @@ TEST(cli_registry_installs_codebuddy_bob_and_pochi_durable_context) {
         test_file_contains_all(codebuddy_memory,
                                (const char *const[]){codebuddy_personal, "search_graph"}, 2U) &&
         test_file_contains_all(
-            codebuddy_skill, (const char *const[]){"search_graph", "Sessions and Subagents"}, 2U) &&
+            codebuddy_skill,
+            (const char *const[]){"search_graph", "Freshness and Delegation"}, 2U) &&
         test_file_contains_all(
             codebuddy_agent,
             (const char *const[]){"permissionMode: plan",
@@ -6742,7 +6903,7 @@ TEST(cli_registry_installs_codebuddy_bob_and_pochi_durable_context) {
     bool bob_rule_installed =
         test_file_contains_all(bob_rule, (const char *const[]){bob_personal, "search_graph"}, 2U);
     bool bob_skill_installed = test_file_contains_all(
-        bob_skill, (const char *const[]){"search_graph", "Sessions and Subagents"}, 2U);
+        bob_skill, (const char *const[]){"search_graph", "Freshness and Delegation"}, 2U);
     bool bob_agent_absent = stat(bob_agent, &state) != 0;
     bool bob_installed = bob_ide_mcp_installed && bob_shell_mcp_installed && bob_rule_installed &&
                          bob_skill_installed && bob_agent_absent;
@@ -6752,7 +6913,7 @@ TEST(cli_registry_installs_codebuddy_bob_and_pochi_durable_context) {
         test_file_contains_all(pochi_rules, (const char *const[]){pochi_personal, "search_graph"},
                                2U) &&
         test_file_contains_all(
-            pochi_skill, (const char *const[]){"search_graph", "Sessions and Subagents"}, 2U) &&
+            pochi_skill, (const char *const[]){"search_graph", "Freshness and Delegation"}, 2U) &&
         test_file_contains_all(pochi_agent,
                                (const char *const[]){"tools:", "readFile", "parent agent"}, 3U);
     bool installed =
@@ -6892,14 +7053,15 @@ TEST(cli_gemini_session_hook_uses_json_for_all_sources) {
     char path[512];
     snprintf(path, sizeof(path), "%s/settings.json", tmpdir);
 
-    ASSERT_EQ(cbm_upsert_gemini_session_hooks(path), 0);
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(path, CLI_TEST_GEMINI_BINARY), 0);
     char *data = read_test_file_alloc(path);
     bool all_sources = data && strstr(data, "\"matcher\": \"startup\"") != NULL &&
                        strstr(data, "\"matcher\": \"resume\"") != NULL &&
                        strstr(data, "\"matcher\": \"clear\"") != NULL &&
                        strstr(data, "startup|resume|clear") == NULL;
-    bool json_context = data && strstr(data, "hookSpecificOutput") != NULL &&
-                        strstr(data, "additionalContext") != NULL;
+    bool json_context =
+        data && test_count_substring(data, "hook-augment") == 3U &&
+        test_count_substring(data, CLI_TEST_GEMINI_BINARY) == 3U;
 
     free(data);
     test_rmdir_r(tmpdir);
@@ -7443,6 +7605,9 @@ TEST(cli_augment_session_uses_workspace_roots) {
     snprintf(input, sizeof(input), "{\"workspace_roots\":[\"%s\"]}", repo);
     char *output = cbm_hook_augment_lifecycle_json_for(input, "SessionStart", false);
     bool matched = output && strstr(output, "augment-project") && strstr(output, "is indexed");
+    if (!matched) {
+        fprintf(stderr, "Augment workspace lifecycle output: %s\n", output ? output : "<null>");
+    }
     free(output);
     restore_test_env("CBM_CACHE_DIR", saved_cache);
     test_rmdir_r(tmpdir);
@@ -7477,6 +7642,18 @@ TEST(cli_hook_session_resolves_custom_named_index_by_root_path) {
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", nested);
     char *output = cbm_hook_augment_lifecycle_json(input);
     bool matched = output && strstr(output, "custom-hook-project") && strstr(output, "is indexed");
+    if (!matched) {
+        fprintf(stderr, "Custom project lifecycle output: %s\n", output ? output : "<null>");
+        cbm_mcp_server_t *diagnostic_server = cbm_mcp_server_new(NULL);
+        char *inventory = diagnostic_server
+                              ? cbm_mcp_handle_tool(diagnostic_server, "list_projects",
+                                                    "{\"all\":true}")
+                              : NULL;
+        fprintf(stderr, "Custom project inventory output: %s\n",
+                inventory ? inventory : "<null>");
+        free(inventory);
+        cbm_mcp_server_free(diagnostic_server);
+    }
 
     free(output);
     restore_test_env("CBM_CACHE_DIR", saved_cache);
@@ -7517,6 +7694,9 @@ TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
         specific ? yyjson_get_str(yyjson_obj_get(specific, "additionalContext")) : NULL;
     bool safe = context && strstr(context, "untrusted repository metadata") &&
                 strchr(context, '\n') == NULL;
+    if (!safe) {
+        fprintf(stderr, "Untrusted project lifecycle output: %s\n", output ? output : "<null>");
+    }
 
     yyjson_doc_free(doc);
     free(output);
@@ -7597,7 +7777,8 @@ TEST(cli_hook_ownership_requires_exact_command_identity) {
         after_install && strstr(after_install, "user-owned-claude") &&
         strstr(after_install, "user-owned-gemini") &&
         test_count_substring(after_install, "cbm-code-discovery-gate") == 3U &&
-        test_count_substring(after_install, "codebase-memory-mcp search_graph") == 2U;
+        test_count_substring(after_install, "codebase-memory-mcp search_graph") == 1U &&
+        test_count_substring(after_install, "codebase-memory-mcp graph tools over grep") == 1U;
     free(after_install);
 
     int remove_claude = cbm_remove_claude_hooks(settings);
@@ -7607,7 +7788,8 @@ TEST(cli_hook_ownership_requires_exact_command_identity) {
         after_remove && strstr(after_remove, "user-owned-claude") &&
         strstr(after_remove, "user-owned-gemini") &&
         test_count_substring(after_remove, "cbm-code-discovery-gate") == 1U &&
-        test_count_substring(after_remove, "codebase-memory-mcp search_graph") == 1U;
+        test_count_substring(after_remove, "codebase-memory-mcp search_graph") == 1U &&
+        test_count_substring(after_remove, "codebase-memory-mcp graph tools over grep") == 0U;
     free(after_remove);
 
     restore_test_env("HOME", saved_home);
@@ -7654,17 +7836,17 @@ TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands) {
         write_test_file(settings, legacy_json);
 
         int before_upsert = cbm_upsert_gemini_hooks(settings);
-        int session_upsert = cbm_upsert_gemini_session_hooks(settings);
+        int session_upsert = cbm_upsert_gemini_session_hooks(settings, CLI_TEST_GEMINI_BINARY);
         char *upgraded = read_test_file_alloc(settings);
         bool migrated = upgraded && !strstr(upgraded, legacy_before_commands[i]) &&
                         !strstr(upgraded, "grep/file-read; run index_repository first") &&
                         test_count_substring(upgraded, "hookEventName:'BeforeTool'") == 1U &&
-                        test_count_substring(upgraded, "hookEventName:'SessionStart'") == 3U;
+                        test_count_substring(upgraded, "hook-augment") == 3U;
         free(upgraded);
 
         write_test_file(settings, legacy_json);
         int before_remove = cbm_remove_gemini_hooks(settings);
-        int session_remove = cbm_remove_gemini_session_hooks(settings);
+        int session_remove = cbm_remove_gemini_session_hooks(settings, CLI_TEST_GEMINI_BINARY);
         char *removed = read_test_file_alloc(settings);
         bool legacy_removed = removed && !strstr(removed, legacy_before_commands[i]) &&
                               !strstr(removed, "grep/file-read; run index_repository first");
@@ -7821,17 +8003,18 @@ TEST(cli_gemini_session_hook_parity) {
     char cfg[512];
     snprintf(cfg, sizeof(cfg), "%s/settings.json", tmpdir);
 
-    ASSERT_EQ(cbm_upsert_gemini_session_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(cfg, CLI_TEST_GEMINI_BINARY), 0);
     const char *d = read_test_file(cfg);
     ASSERT_NOT_NULL(d);
     ASSERT(strstr(d, "SessionStart") != NULL);
-    ASSERT(strstr(d, "search_graph") != NULL);
+    ASSERT_EQ(test_count_substring(d, "hook-augment"), 3U);
+    ASSERT_EQ(test_count_substring(d, CLI_TEST_GEMINI_BINARY), 3U);
     ASSERT(strstr(d, "\"matcher\": \"startup\"") != NULL);
     ASSERT(strstr(d, "\"matcher\": \"resume\"") != NULL);
     ASSERT(strstr(d, "\"matcher\": \"clear\"") != NULL);
     ASSERT(strstr(d, "startup|resume|clear") == NULL);
 
-    ASSERT_EQ(cbm_remove_gemini_session_hooks(cfg), 0);
+    ASSERT_EQ(cbm_remove_gemini_session_hooks(cfg, CLI_TEST_GEMINI_BINARY), 0);
     d = read_test_file(cfg);
     ASSERT_NULL(strstr(d, "SessionStart"));
 
@@ -8889,10 +9072,11 @@ TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only) {
     const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart");
     ASSERT_NOT_NULL(session);
     ASSERT_NOT_NULL(subagent);
-    ASSERT(strstr(session, "Run index_repository") != NULL);
-    ASSERT(strstr(subagent, "Ask the parent agent to run index_repository") != NULL);
-    ASSERT(strstr(subagent, "do not attempt graph mutation") != NULL);
-    ASSERT(strstr(subagent, "Run index_repository") == NULL);
+    ASSERT(strstr(session, "index_repository") != NULL);
+    ASSERT(strstr(subagent, "Ask the parent") != NULL);
+    ASSERT(strstr(subagent, "index_repository") != NULL);
+    ASSERT(strstr(subagent, "Do not mutate the graph") != NULL);
+    ASSERT(strstr(subagent, "Call search_graph") == NULL);
     PASS();
 }
 
@@ -10349,8 +10533,29 @@ TEST(cli_installed_skill_limits_match_server_contract) {
     const cbm_skill_t *installed = cbm_get_skills();
     ASSERT_NOT_NULL(installed);
     ASSERT_NOT_NULL(installed[0].content);
-    ASSERT(strstr(installed[0].content, "100k row ceiling") != NULL);
-    ASSERT(strstr(installed[0].content, "default to 50") != NULL);
+    /* Derived from the same constants.h macros the skill text and config
+     * registry use, so this test cannot pass while either published budget
+     * disagrees with the enforced one. Upstream asserted the literal "100k row
+     * ceiling", which would keep passing after the cap changed — the exact
+     * drift a test named "limits match server contract" exists to prevent. */
+    ASSERT(strstr(installed[0].content,
+                  "query_max_rows defaults to " CBM_DEFAULT_QUERY_MAX_ROWS_STR
+                  " final rows and marks a complete prefix as truncated") != NULL);
+    ASSERT(strstr(installed[0].content,
+                  "query_max_working_rows defaults to " CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
+                  " intermediate rows and returns an MCP tool execution error instead of partial "
+                  "results when exhausted") != NULL);
+    /* Locks the string twin to the value it describes, so the two cannot drift
+     * apart silently. Without this, CBM_DEFAULT_SEARCH_LIMIT could move while
+     * the published "50" stayed and every assertion below would still pass. */
+    ASSERT_EQ(atoi(CBM_DEFAULT_SEARCH_LIMIT_STR), CBM_DEFAULT_SEARCH_LIMIT);
+    /* Upstream asserted "default to 50". The merged skill says "default to
+     * search_limit (50 unless configured)", which is the stronger wording: it
+     * names the config key the reader must set, not just the number. Asserted
+     * via the macro so the published default cannot drift from the enforced
+     * one. */
+    ASSERT(strstr(installed[0].content, "search_limit (" CBM_DEFAULT_SEARCH_LIMIT_STR
+                                        " unless configured)") != NULL);
     ASSERT(strstr(installed[0].content, "200-row cap") == NULL);
     ASSERT(strstr(installed[0].content, "default to 10") == NULL);
     PASS();
@@ -10931,7 +11136,7 @@ TEST(cli_tool_hooks_preserve_foreign_same_matcher) {
                      strstr(claude, "user-claude-sibling") &&
                      strstr(claude, "cbm-code-discovery-gate") && gemini &&
                      strstr(gemini, "user-gemini-tool-hook") &&
-                     strstr(gemini, "codebase-memory-mcp search_graph");
+                     strstr(gemini, "codebase-memory-mcp graph tools over grep");
     free(claude);
     free(gemini);
 
@@ -10943,7 +11148,7 @@ TEST(cli_tool_hooks_preserve_foreign_same_matcher) {
                               strstr(claude, "user-claude-sibling") &&
                               !strstr(claude, "cbm-code-discovery-gate") && gemini &&
                               strstr(gemini, "user-gemini-tool-hook") &&
-                              !strstr(gemini, "codebase-memory-mcp search_graph");
+                              !strstr(gemini, "codebase-memory-mcp graph tools over grep");
     free(claude);
     free(gemini);
     test_rmdir_r(tmpdir);
@@ -11172,6 +11377,144 @@ TEST(cli_config_open_close) {
     PASS();
 }
 
+static bool cli_seed_raw_config(const char *directory, const char *rows_sql) {
+    char dbpath[512];
+    int path_len = snprintf(dbpath, sizeof(dbpath), "%s/_config.db", directory);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(dbpath)) {
+        return false;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open(dbpath, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    bool ok = sqlite3_exec(db, "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)", NULL, NULL,
+                           NULL) == SQLITE_OK &&
+              sqlite3_exec(db, rows_sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+TEST(cli_config_open_migrates_development_spellings) {
+    static const struct {
+        const char *old_key;
+        const char *old_value;
+        const char *new_key;
+        const char *new_value;
+    } cases[] = {
+        {CBM_CONFIG_INCREMENTAL_REINDEX, "off", CBM_CONFIG_INCREMENTAL_REINDEX, "full_rebuild"},
+        {CBM_CONFIG_INCREMENTAL_REINDEX, "fast", CBM_CONFIG_INCREMENTAL_REINDEX,
+         "fast_mode_indexes_only"},
+        {"incremental_derived_refresh", "eager", CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+         "at_publish"},
+        {"incremental_derived_refresh", "stale_on_exact",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_exact_delta_reindexes"},
+        {"incremental_derived_refresh", "stale_on_incremental",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_all_incremental_reindexes"},
+        {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "eager",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "at_publish"},
+        {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_exact",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_exact_delta_reindexes"},
+        {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_incremental",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_all_incremental_reindexes"},
+        {CBM_CONFIG_RANK_REFRESH, "eager", CBM_CONFIG_RANK_REFRESH, "at_publish"},
+        {CBM_CONFIG_RANK_REFRESH, "stale_on_exact", CBM_CONFIG_RANK_REFRESH,
+         "defer_exact_delta_reindexes"},
+        {CBM_CONFIG_RANK_REFRESH, "stale_on_incremental", CBM_CONFIG_RANK_REFRESH,
+         "defer_all_incremental_reindexes"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char tmpdir[256];
+        snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-migrate-XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+        char rows[1024];
+        int rows_len =
+            snprintf(rows, sizeof(rows),
+                     "INSERT INTO config(key,value) VALUES('%s','%s');"
+                     "INSERT INTO config(key,value) VALUES('private_extension','retained');",
+                     cases[i].old_key, cases[i].old_value);
+        ASSERT_TRUE(rows_len > 0 && (size_t)rows_len < sizeof(rows));
+        ASSERT_TRUE(cli_seed_raw_config(tmpdir, rows));
+
+        cbm_config_t *cfg = cbm_config_open(tmpdir);
+        ASSERT_NOT_NULL(cfg);
+        ASSERT_STR_EQ(cbm_config_get(cfg, cases[i].new_key, "missing"), cases[i].new_value);
+        ASSERT_STR_EQ(cbm_config_get(cfg, "private_extension", "missing"), "retained");
+        if (strcmp(cases[i].old_key, cases[i].new_key) != 0) {
+            ASSERT_STR_EQ(cbm_config_get(cfg, cases[i].old_key, "removed"), "removed");
+        }
+        cbm_config_close(cfg);
+        test_rmdir_r(tmpdir);
+    }
+    PASS();
+}
+
+TEST(cli_config_open_preserves_canonical_value_on_key_conflict) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-migrate-conflict-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    ASSERT_TRUE(cli_seed_raw_config(tmpdir,
+                                    "INSERT INTO config(key,value) VALUES"
+                                    "('incremental_derived_refresh','stale_on_incremental'),"
+                                    "('incremental_derived_results_refresh','at_publish');"));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "missing"),
+                  "at_publish");
+    ASSERT_STR_EQ(cbm_config_get(cfg, "incremental_derived_refresh", "removed"), "removed");
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_open_preserves_unrecognized_development_value) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-migrate-unknown-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    ASSERT_TRUE(cli_seed_raw_config(
+        tmpdir,
+        "INSERT INTO config(key,value) VALUES('incremental_derived_refresh','extension_owned');"));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_STR_EQ(cbm_config_get(cfg, "incremental_derived_refresh", "missing"), "extension_owned");
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "absent"),
+                  "absent");
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_rejects_development_spellings_with_replacements) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-rename-error-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_NEQ(cbm_config_set(cfg, "incremental_derived_refresh", "eager"), 0);
+    char error[1024];
+    cbm_config_set_error_for_testing("incremental_derived_refresh", "eager", error, sizeof(error));
+    ASSERT_NOT_NULL(strstr(error, "incremental_derived_results_refresh"));
+    ASSERT_NOT_NULL(strstr(error, "at_publish"));
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "off"), 0);
+    cbm_config_set_error_for_testing(CBM_CONFIG_INCREMENTAL_REINDEX, "off", error, sizeof(error));
+    ASSERT_NOT_NULL(strstr(error, "always|full_rebuild|fast_mode_indexes_only"));
+    ASSERT_NOT_NULL(strstr(error, "'off' was renamed to 'full_rebuild'"));
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, "stale_on_exact"), 0);
+    cbm_config_set_error_for_testing(CBM_CONFIG_RANK_REFRESH, "stale_on_exact", error,
+                                     sizeof(error));
+    ASSERT_NOT_NULL(strstr(error, "defer_exact_delta_reindexes"));
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_get_set) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -11331,6 +11674,185 @@ TEST(cli_config_get_int) {
     /* Non-numeric → default */
     cbm_config_set(cfg, "limit", "abc");
     ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* The registry is the public contract for algorithm knobs. Config writes must
+ * enforce that contract once, before PageRank or any other consumer observes
+ * the value; otherwise NaN/Inf weights can poison an O(I * (V + E)) run and an
+ * invalid non-positive iteration budget cannot converge. Positive iteration
+ * budgets and finite nonnegative weights remain uncapped. Validation itself is
+ * O(K + |value|) for K registry entries and uses O(1) memory. */
+TEST(cli_config_pagerank_numeric_ranges_are_enforced) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-pagerank-ranges-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    /* Compiler limit macros are C expressions, not necessarily decimal text:
+     * GCC spells INT_MAX as 0x7fffffff and DBL_MAX as a cast expression. Format
+     * their values through the same locale-independent decimal grammar exposed
+     * by config rather than stringifying implementation-specific source. */
+    char maximum[CBM_SZ_32];
+    int written = snprintf(maximum, sizeof(maximum), "%d", CBM_PAGERANK_MAX_ITER_MAX);
+    ASSERT_TRUE(written > 0 && (size_t)written < sizeof(maximum));
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER,
+                             CBM_STRINGIFY(CBM_PAGERANK_MAX_ITER_MIN)),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "10000"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "10001"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, maximum), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "0"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "1.5"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "2147483648"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING,
+                             CBM_STRINGIFY(CBM_PAGERANK_DAMPING_MIN)),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING,
+                             CBM_STRINGIFY(CBM_PAGERANK_DAMPING_MAX)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "-0.1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "1.1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "nan"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_DAMPING, "inf"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON_STR), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "1.0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "2.0"), 0);
+    written = snprintf(maximum, sizeof(maximum), "%.*g", DBL_DECIMAL_DIG,
+                       CBM_PAGERANK_EPSILON_MAX);
+    ASSERT_TRUE(written > 0 && (size_t)written < sizeof(maximum));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, maximum), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "0"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "nan"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,
+                             CBM_STRINGIFY(CBM_PAGERANK_EDGE_WEIGHT_MIN)),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "100.0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "100.1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, maximum), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "-0.1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "nan"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "inf"), 0);
+
+    cbm_config_close(cfg);
+
+    /* Typed readers use the same registry validation so hand-edited legacy
+     * rows cannot bypass setter validation and poison algorithm state. */
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_PAGERANK_MAX_ITER, "0"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_PAGERANK_DAMPING, "nan"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_PAGERANK_EPSILON, "0"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_EDGE_WEIGHT_CALLS, "inf"), 0);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER),
+              CBM_PAGERANK_MAX_ITER);
+    ASSERT_TRUE(cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING) ==
+                CBM_PAGERANK_DAMPING);
+    ASSERT_TRUE(cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON) ==
+                CBM_PAGERANK_EPSILON);
+    ASSERT_TRUE(cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,
+                                      CBM_DEFAULT_EDGE_WEIGHTS.calls) ==
+                CBM_DEFAULT_EDGE_WEIGHTS.calls);
+    cbm_config_close(cfg);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_query_row_limits_enforce_advertised_ranges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-query-limits-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, CBM_STRINGIFY(CBM_MAX_QUERY_ROWS)), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "-1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "1000001"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS,
+                             CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "0"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "1000001"), 0);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_githistory_max_couplings_enforces_advertised_range) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-githistory-couplings-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS,
+                             CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, "0"), 0);
+    char over_max[CBM_SZ_32];
+    ASSERT_GT(snprintf(over_max, sizeof(over_max), "%d", CBM_GITHISTORY_MAX_COUPLINGS_LIMIT + 1),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, over_max), 0);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_cluster_node_budget_uses_shared_broad_range) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-cluster-budget-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET,
+                             CBM_MIN_ARCH_CLUSTER_NODE_BUDGET_STR),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET,
+                             CBM_STRINGIFY(CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, "1"), 0);
+    char over_max[32];
+    ASSERT_GT(snprintf(over_max, sizeof(over_max), "%d", CBM_MAX_ARCH_CLUSTER_NODE_BUDGET + 1), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, over_max), 0);
+
+    const cbm_config_entry_t *entry = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0) {
+            entry = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET_STR);
+    ASSERT_NOT_NULL(strstr(entry->range, CBM_STRINGIFY(CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)));
 
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
@@ -11557,9 +12079,39 @@ TEST(cli_build_args_json_bad_positional_errors_issue680) {
     PASS();
 }
 
-/* Per-tool --help returns 0 for a known tool, -1 for an unknown one. */
+/* Per-tool --help returns 0 for a known tool, -1 for an unknown one, and
+ * teaches only the preferred argument forms. Inline JSON remains accepted for
+ * compatibility, but advertising a deprecated form makes the CLI easy to use
+ * incorrectly. */
 TEST(cli_print_tool_help_issue680) {
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    ASSERT_TRUE(saved_stdout >= 0);
+    int fds[2];
+    ASSERT_EQ(cbm_pipe(fds), 0);
+    dup2(fds[1], STDOUT_FILENO);
+    close(fds[1]);
+
     ASSERT_EQ(cbm_cli_print_tool_help("index_repository"), 0);
+
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    static char help_buf[8192];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(help_buf) - 1 &&
+           (n = read(fds[0], help_buf + used, sizeof(help_buf) - 1 - used)) > 0) {
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    help_buf[used] = '\0';
+
+    ASSERT_NOT_NULL(strstr(help_buf, "--flag value"));
+    ASSERT_NOT_NULL(strstr(help_buf, "--args-file"));
+    ASSERT_NOT_NULL(strstr(help_buf, "echo '<json>'"));
+    ASSERT_NULL(strstr(help_buf, "raw-json-args"));
     ASSERT_EQ(cbm_cli_print_tool_help("nope_not_a_tool"), -1);
     PASS();
 }
@@ -11706,6 +12258,42 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+TEST(cli_sha256_fragmented_updates_match_one_shot_digest) {
+    uint8_t input[CBM_SHA256_BLOCK_LEN * 4 + 17];
+    for (size_t i = 0; i < sizeof(input); i++) {
+        input[i] = (uint8_t)(i * 37U + 11U);
+    }
+
+    uint8_t expected[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_ctx one_shot;
+    cbm_sha256_init(&one_shot);
+    cbm_sha256_update(&one_shot, input, sizeof(input));
+    cbm_sha256_final(&one_shot, expected);
+
+    static const size_t chunk_sizes[] = {
+        1U, CBM_SHA256_BLOCK_LEN - 1U, CBM_SHA256_BLOCK_LEN, CBM_SHA256_BLOCK_LEN + 1U, 7U,
+    };
+    uint8_t observed[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_ctx fragmented;
+    cbm_sha256_init(&fragmented);
+    size_t offset = 0;
+    size_t chunk = 0;
+    while (offset < sizeof(input)) {
+        size_t available = sizeof(input) - offset;
+        size_t length = chunk_sizes[chunk % (sizeof(chunk_sizes) / sizeof(chunk_sizes[0]))];
+        if (length > available) {
+            length = available;
+        }
+        cbm_sha256_update(&fragmented, input + offset, length);
+        offset += length;
+        chunk++;
+    }
+    cbm_sha256_final(&fragmented, observed);
+
+    ASSERT_EQ(memcmp(expected, observed, sizeof(expected)), 0);
+    PASS();
+}
+
 #ifdef _WIN32
 /* The Windows update contract, asserted with the activation seam OFF so this
  * takes the exact dispatch a release binary ships: `update` never replaces the
@@ -11751,6 +12339,1761 @@ TEST(cli_windows_update_hands_off_to_install_script) {
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
+
+/* Environment snapshot/restore used by the api-consolidation tests below.
+ * Upstream's test_cli.c has no equivalent, so the helpers move with them. */
+typedef struct {
+    const char *name;
+    char *value;
+} cli_env_snapshot_t;
+
+static bool cli_env_snapshot(cli_env_snapshot_t *snap, const char *name) {
+    const char *value = getenv(name);
+    snap->name = name;
+    snap->value = value ? cbm_strndup(value, strlen(value)) : NULL;
+    return !value || snap->value;
+}
+
+static void cli_env_restore(cli_env_snapshot_t *snap) {
+    if (!snap->name) {
+        return;
+    }
+    if (snap->value) {
+        cbm_setenv(snap->name, snap->value, 1);
+        free(snap->value);
+        snap->value = NULL;
+    } else {
+        cbm_unsetenv(snap->name);
+    }
+}
+
+static int test_path_exists(const char *path) {
+    return cbm_file_exists(path);
+}
+
+static char *make_overlong_nested_path(const char *base, const char *leaf) {
+    size_t cap = (size_t)CBM_PATH_MAX * 2;
+    char *path = malloc(cap);
+    if (!path) {
+        return NULL;
+    }
+    int n = snprintf(path, cap, "%s", base);
+    if (n < 0 || (size_t)n >= cap) {
+        free(path);
+        return NULL;
+    }
+    size_t used = (size_t)n;
+    const char *segment = "/a";
+    size_t segment_len = strlen(segment);
+    while (used <= (size_t)CBM_PATH_MAX) {
+        if (used + segment_len >= cap) {
+            free(path);
+            return NULL;
+        }
+        memcpy(path + used, segment, segment_len + 1);
+        used += segment_len;
+    }
+    size_t leaf_len = strlen(leaf);
+    const char *separator = "/";
+    size_t separator_len = strlen(separator);
+    if (used + separator_len + leaf_len >= cap) {
+        free(path);
+        return NULL;
+    }
+    memcpy(path + used, separator, separator_len + 1);
+    used += separator_len;
+    if (leaf_len > 0) {
+        memcpy(path + used, leaf, leaf_len + 1);
+    } else {
+        path[used] = '\0';
+    }
+    return path;
+}
+
+/* Deep long-path fixtures must not use the generic recursive tree remover:
+ * one call frame per short component can overflow an ASan thread stack. Walk
+ * leaf-to-root iteratively in O(path length) time, O(path length) heap, and
+ * O(1) stack while tolerating a writer that stopped at an earlier component. */
+static void remove_long_nested_path_fixture(const char *path, const char *root) {
+    if (!path || !root) {
+        return;
+    }
+    (void)cbm_unlink(path);
+    char *cursor = cbm_strdup(path);
+    if (!cursor) {
+        return;
+    }
+    size_t root_length = strlen(root);
+    size_t cursor_length = strlen(cursor);
+    char *separator = cursor + cursor_length;
+    while (separator > cursor && separator[-1] != '/'
+#ifdef _WIN32
+           && separator[-1] != '\\'
+#endif
+    ) {
+        --separator;
+    }
+    if (separator == cursor) {
+        free(cursor);
+        return;
+    }
+    --separator;
+    *separator = '\0';
+    cursor_length = (size_t)(separator - cursor);
+    while (cursor_length > root_length) {
+        (void)cbm_rmdir(cursor);
+        while (separator > cursor && separator[-1] != '/'
+#ifdef _WIN32
+               && separator[-1] != '\\'
+#endif
+        ) {
+            --separator;
+        }
+        if (separator == cursor) {
+            break;
+        }
+        --separator;
+        *separator = '\0';
+        cursor_length = (size_t)(separator - cursor);
+    }
+    free(cursor);
+    (void)cbm_rmdir(root);
+}
+
+static int cli_run_help_without_home(int (*cmd)(int, char **)) {
+    cli_env_snapshot_t home = {0};
+    cli_env_snapshot_t userprofile = {0};
+    if (!cli_env_snapshot(&home, "HOME") || !cli_env_snapshot(&userprofile, "USERPROFILE")) {
+        cli_env_restore(&userprofile);
+        cli_env_restore(&home);
+        return -1;
+    }
+
+    cbm_unsetenv("HOME");
+    cbm_unsetenv("USERPROFILE");
+    char *args[] = {"--help"};
+    int rc = cmd(1, args);
+
+    cli_env_restore(&userprofile);
+    cli_env_restore(&home);
+    return rc;
+}
+
+/* ── Tests unique to api-consolidation ─────────────────────────────
+ * Retained alongside upstream's per-agent tests: the branch consolidated
+ * several of those into table-driven forms, but the functionality they
+ * cover is still shipped, so both sets are kept. */
+
+TEST(cli_find_cli_fallback_scans_cargo_bin) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-find-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+#ifdef _WIN32
+    cbm_rmdir(tmpdir);
+    SKIP_PLATFORM("Windows: fallback path lookup uses POSIX semantics");
+#endif
+    char cargobin[512];
+    snprintf(cargobin, sizeof(cargobin), "%s/.cargo/bin", tmpdir);
+    test_mkdirp(cargobin);
+
+    char fakecli[512];
+    snprintf(fakecli, sizeof(fakecli), "%s/testcargo", cargobin);
+    write_test_file(fakecli, "#!/bin/sh\n");
+    th_make_executable(fakecli);
+
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    cbm_setenv("PATH", "/nonexistent", 1);
+
+    const char *result = cbm_find_cli("testcargo", tmpdir);
+    ASSERT_STR_EQ(result, fakecli);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_remove_owned_path_block_preserves_user_content) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-remove-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user prefix\nexport KEEP_ME=1\n");
+    ASSERT_EQ(cbm_ensure_path("/Users/test/.local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_remove_owned_path("/Users/test/.local/bin", rcfile, false), 0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "export KEEP_ME=1") != NULL);
+    ASSERT(strstr(data, "Added by codebase-memory-mcp install") == NULL);
+    ASSERT(strstr(data, "export PATH=\"/Users/test/.local/bin:$PATH\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_remove_owned_path_dry_run_preserves_block) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-remove-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/config.fish", tmpdir);
+    write_test_file(rcfile, "# user prefix\n");
+    ASSERT_EQ(cbm_ensure_path("/Users/test/.local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_remove_owned_path("/Users/test/.local/bin", rcfile, true), 0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "Added by codebase-memory-mcp install") != NULL);
+    ASSERT(strstr(data, "fish_add_path /Users/test/.local/bin") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+/* A dry-run is a read-only preview even when -y is supplied.  In particular,
+ * it must not route the automatic answer through the destructive index-removal
+ * branch. */
+TEST(cli_uninstall_dry_run_preserves_indexes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-preview-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cache_dir[512];
+    char project_db[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(project_db, sizeof(project_db), "%s/project.db", cache_dir);
+    ASSERT_EQ(test_mkdirp(cache_dir), 0);
+    ASSERT_EQ(write_test_file(project_db, "indexed graph"), 0);
+
+    cli_env_snapshot_t home = {0};
+    cli_env_snapshot_t cache = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char *args[] = {"--dry-run", "-y"};
+    ASSERT_EQ(cli_test_cmd_uninstall(2, args), 0);
+
+    struct stat st;
+    ASSERT_EQ(stat(project_db, &st), 0);
+
+    /* parse_auto_answer() is process-global; do not leak this test's -y into
+     * later lifecycle tests. */
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&cache);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_uninstall_removes_codex_json_hook_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char hooks_path[768];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
+    ASSERT_EQ(test_mkdirp(codex_dir), 0);
+    ASSERT_EQ(write_test_file(hooks_path, "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"startup\","
+                                          "\"hooks\":[{\"type\":\"command\","
+                                          "\"command\":\"echo user-hook\"}]}]}}"),
+              0);
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(hooks_path, "/usr/local/bin/codebase-memory-mcp"),
+              0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
+
+    const char *contents = read_test_file(hooks_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "echo user-hook") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp reminder") == NULL);
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_uninstall_removes_owned_claude_hook_scripts) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-claude-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    ASSERT_EQ(test_mkdirp(hooks_dir), 0);
+#ifdef _WIN32
+    const char *names[] = {"cbm-code-discovery-gate.cmd", "cbm-session-reminder.cmd",
+                           "cbm-subagent-reminder.cmd"};
+#else
+    const char *names[] = {"cbm-code-discovery-gate", "cbm-session-reminder",
+                           "cbm-subagent-reminder"};
+#endif
+    char paths[3][768];
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", hooks_dir, names[i]);
+    }
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char binary[768];
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    ASSERT_EQ(cbm_install_agent_configs(tmpdir, binary, false, false), 0);
+    struct stat st;
+    for (size_t i = 0; i < 3; i++)
+        ASSERT_EQ(stat(paths[i], &st), 0);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
+
+    for (size_t i = 0; i < 3; i++)
+        ASSERT_NEQ(stat(paths[i], &st), 0);
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_uninstall_removes_vscode_profile_mcp_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-vscode-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+#ifdef _WIN32
+    cli_env_snapshot_t app_config = {0};
+    ASSERT_TRUE(cli_env_snapshot(&app_config, "APPDATA"));
+    char app_config_path[512];
+    snprintf(app_config_path, sizeof(app_config_path), "%s/AppData/Roaming", tmpdir);
+#elif !defined(__APPLE__)
+    cli_env_snapshot_t app_config = {0};
+    ASSERT_TRUE(cli_env_snapshot(&app_config, "XDG_CONFIG_HOME"));
+    char app_config_path[512];
+    snprintf(app_config_path, sizeof(app_config_path), "%s/.config", tmpdir);
+#endif
+
+    /* Snapshot every inherited value before mutating any of them, so a failed
+     * setup assertion cannot leave a half-isolated environment for later
+     * tests. The platform resolver is evaluated only after both overrides. */
+    cbm_setenv("HOME", tmpdir, 1);
+#ifdef _WIN32
+    cbm_setenv("APPDATA", app_config_path, 1);
+#elif !defined(__APPLE__)
+    cbm_setenv("XDG_CONFIG_HOME", app_config_path, 1);
+#endif
+
+    char profile_dir[768];
+    char profile_mcp[1024];
+#ifdef __APPLE__
+    snprintf(profile_dir, sizeof(profile_dir),
+             "%s/Library/Application Support/Code/User/profiles/profile-a", tmpdir);
+#else
+    snprintf(profile_dir, sizeof(profile_dir), "%s/Code/User/profiles/profile-a",
+             cbm_app_config_dir());
+#endif
+    snprintf(profile_mcp, sizeof(profile_mcp), "%s/mcp.json", profile_dir);
+    ASSERT_EQ(test_mkdirp(profile_dir), 0);
+    ASSERT_EQ(
+        write_test_file(profile_mcp, "{\"servers\":{\"user-server\":{\"command\":\"user\"}}}"), 0);
+    char binary[768];
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
+    ASSERT_EQ(cbm_install_vscode_mcp(binary, profile_mcp), 0);
+
+    char *args[] = {"-n"};
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
+
+    const char *contents = read_test_file(profile_mcp);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "user-server") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+#if defined(_WIN32) || !defined(__APPLE__)
+    cli_env_restore(&app_config);
+#endif
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_install_help_does_not_require_home) {
+    ASSERT_EQ(cli_run_help_without_home(cbm_cmd_install), 0);
+    PASS();
+}
+TEST(cli_uninstall_help_does_not_require_home) {
+    ASSERT_EQ(cli_run_help_without_home(cbm_cmd_uninstall), 0);
+    PASS();
+}
+TEST(cli_update_help_does_not_require_home) {
+    ASSERT_EQ(cli_run_help_without_home(cbm_cmd_update), 0);
+    PASS();
+}
+TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-kilo-standalone-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char config_path[768];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/kilo", tmpdir);
+    ASSERT_EQ(test_mkdirp(config_dir), 0);
+    snprintf(config_path, sizeof(config_path), "%s/kilo.jsonc", config_dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.kilo_cli);
+
+    char *plan = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(plan);
+    ASSERT(strstr(plan, "\"kilo-cli\"") != NULL);
+    ASSERT(strstr(plan, ".config/kilo/kilo.jsonc") != NULL);
+    free(plan);
+
+    ASSERT_EQ(write_test_file(
+                  config_path,
+                  "{\n  // user-owned server\n  \"mcp\": {\n    \"foreign\": {\"type\": \"local\", "
+                  "\"command\": [\"keep-me\"]},\n  },\n}\n"),
+              0);
+    char binary[768];
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
+    ASSERT_EQ(cbm_upsert_opencode_mcp(binary, config_path), 0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
+    cli_env_restore(&home);
+
+    const char *contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "keep-me") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+/* A pre-consolidation installer release wrote local-array MCP entries with an
+ * extra "enabled": true member: {"enabled":true,"type":"local","command":[bin]}.
+ * Upsert must recognize that exact released shape as installer-owned and
+ * rewrite it canonically, and owned removal must delete it; an entry with
+ * "enabled": false is user-modified and must still be refused. */
+TEST(cli_json_mcp_migrates_legacy_enabled_true_entry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-legacy-enabled-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_path[768];
+    snprintf(config_path, sizeof(config_path), "%s/kilo.jsonc", tmpdir);
+    char binary[768];
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
+
+    char legacy[1600];
+    snprintf(legacy, sizeof(legacy),
+             "{\n  \"mcp\": {\n    \"codebase-memory-mcp\": {\n      \"enabled\": true,\n"
+             "      \"type\": \"local\",\n      \"command\": [\"%s\"]\n    }\n  }\n}\n",
+             binary);
+    ASSERT_EQ(write_test_file(config_path, legacy), 0);
+    ASSERT_EQ(cbm_upsert_opencode_mcp(binary, config_path), 0);
+
+    const char *contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "\"enabled\"") == NULL);
+    ASSERT(strstr(contents, binary) != NULL);
+
+    /* Owned removal must also recognize the legacy released shape. */
+    ASSERT_EQ(write_test_file(config_path, legacy), 0);
+    ASSERT_EQ(cbm_remove_opencode_mcp_owned(binary, config_path), 0);
+    contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "codebase-memory-mcp\"") == NULL || strstr(contents, binary) == NULL);
+
+    /* "enabled": false was never a released shape: refuse to overwrite it. */
+    char modified[1600];
+    snprintf(modified, sizeof(modified),
+             "{\n  \"mcp\": {\n    \"codebase-memory-mcp\": {\n      \"enabled\": false,\n"
+             "      \"type\": \"local\",\n      \"command\": [\"%s\"]\n    }\n  }\n}\n",
+             binary);
+    ASSERT_EQ(write_test_file(config_path, modified), 0);
+    ASSERT(cbm_upsert_opencode_mcp(binary, config_path) != 0);
+    contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "\"enabled\": false") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_reference_harnesses_are_planned_without_mutation) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-reference-harnesses-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *dirs[] = {".qwen", ".codeium/windsurf"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
+        ASSERT_EQ(test_mkdirp(path), 0);
+    }
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, ".qwen/settings.json") != NULL);
+    ASSERT(strstr(json, ".qwen/QWEN.md") != NULL);
+    ASSERT(strstr(json, ".codeium/windsurf/mcp_config.json") != NULL);
+    const char *detected = strstr(json, "\"agents_detected\"");
+    const char *configs = strstr(json, "\"config_files_planned\"");
+    ASSERT_NOT_NULL(detected);
+    ASSERT_NOT_NULL(configs);
+    const char *qwen_detected = strstr(detected, "\"qwen\"");
+    const char *windsurf_detected = strstr(detected, "\"windsurf\"");
+    ASSERT(qwen_detected != NULL && qwen_detected < configs);
+    ASSERT(windsurf_detected != NULL && windsurf_detected < configs);
+
+    /* Plan mode must not publish any of the planned files. */
+    char path[768];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/.qwen/settings.json", tmpdir);
+    ASSERT_NEQ(stat(path, &st), 0);
+    snprintf(path, sizeof(path), "%s/.codeium/windsurf/mcp_config.json", tmpdir);
+    ASSERT_NEQ(stat(path, &st), 0);
+
+    free(json);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_claude_desktop_plan_and_uninstall_preserve_foreign_entries) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-claude-desktop-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char config_path[768];
+#ifdef __APPLE__
+    snprintf(config_dir, sizeof(config_dir), "%s/Library/Application Support/Claude", tmpdir);
+#elif defined(_WIN32)
+    snprintf(config_dir, sizeof(config_dir), "%s/AppData/Roaming/Claude", tmpdir);
+#else
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/Claude", tmpdir);
+#endif
+    ASSERT_EQ(test_mkdirp(config_dir), 0);
+    snprintf(config_path, sizeof(config_path), "%s/claude_desktop_config.json", config_dir);
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"claude-desktop\"") != NULL);
+    ASSERT(strstr(json, "claude_desktop_config.json") != NULL);
+    struct stat st;
+    ASSERT_NEQ(stat(config_path, &st), 0);
+    free(json);
+
+    ASSERT_EQ(
+        write_test_file(config_path, "{\"mcpServers\":{\"foreign\":{\"command\":\"keep-me\"}}}"),
+        0);
+    char binary[768];
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
+    ASSERT_EQ(cbm_install_editor_mcp(binary, config_path), 0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
+    cli_env_restore(&home);
+
+    const char *contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "keep-me") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_reference_harnesses_uninstall_owned_entries_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-reference-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *dirs[] = {".qwen", ".codeium/windsurf"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
+        ASSERT_EQ(test_mkdirp(path), 0);
+    }
+
+    const char *config_rel[] = {".qwen/settings.json", ".codeium/windsurf/mcp_config.json"};
+    char binary[768];
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
+    char config_paths[2][768];
+    for (size_t i = 0; i < 2; i++) {
+        snprintf(config_paths[i], sizeof(config_paths[i]), "%s/%s", tmpdir, config_rel[i]);
+        ASSERT_EQ(write_test_file(
+                      config_paths[i],
+                      "{\"mcpServers\":{\"foreign\":{\"command\":\"keep-me\"}}}"),
+                  0);
+        ASSERT_EQ(cbm_install_editor_mcp(binary, config_paths[i]), 0);
+    }
+
+    const char *instruction_rel[] = {".qwen/QWEN.md"};
+    char instruction_paths[1][768];
+    for (size_t i = 0; i < 1; i++) {
+        snprintf(instruction_paths[i], sizeof(instruction_paths[i]), "%s/%s", tmpdir,
+                 instruction_rel[i]);
+        ASSERT_EQ(write_test_file(instruction_paths[i], "user-authored guidance\n"), 0);
+        ASSERT_EQ(cbm_upsert_instructions(instruction_paths[i], cbm_get_agent_instructions()), 0);
+    }
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cli_test_cmd_uninstall(1, args), 0);
+
+    for (size_t i = 0; i < 2; i++) {
+        const char *contents = read_test_file(config_paths[i]);
+        ASSERT_NOT_NULL(contents);
+        ASSERT(strstr(contents, "keep-me") != NULL);
+        ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+    }
+    for (size_t i = 0; i < 1; i++) {
+        const char *contents = read_test_file(instruction_paths[i]);
+        ASSERT_NOT_NULL(contents);
+        ASSERT(strstr(contents, "user-authored guidance") != NULL);
+        ASSERT(strstr(contents, "codebase-memory-mcp:start") == NULL);
+    }
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_codex_mcp_and_hook_upserts_are_idempotent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+    write_test_file(cfg, "model = \"gpt-5\"\n");
+
+    ASSERT_EQ(cbm_upsert_codex_mcp("/usr/local/bin/codebase-memory-mcp", cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_mcp("/usr/local/bin/codebase-memory-mcp", cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(test_count_substring(d, "[mcp_servers.codebase-memory-mcp]"), 1);
+    ASSERT_EQ(test_count_substring(d, "# >>> codebase-memory-mcp SessionStart >>>"), 1);
+    ASSERT_EQ(test_count_substring(d, "# <<< codebase-memory-mcp SessionStart <<<"), 1);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart.hooks]]"), 1);
+    ASSERT(strstr(d, "model = \"gpt-5\"") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_codex_hook_upsert_rejects_orphan_end_sentinel) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+    write_test_file(cfg, "model = \"gpt-5\"\n"
+                         "\n"
+                         "[[hooks.SessionStart]]\n"
+                         "[[hooks.SessionStart.hooks]]\n"
+                         "type = \"command\"\n"
+                         "command = 'echo old'\n"
+                         "# <<< codebase-memory-mcp SessionStart <<<\n"
+                         "\n"
+                         "# >>> codebase-memory-mcp SessionStart >>>\n"
+                         "[[hooks.SessionStart]]\n"
+                         "[[hooks.SessionStart.hooks]]\n"
+                         "type = \"command\"\n"
+                         "command = 'echo duplicate'\n"
+                         "# <<< codebase-memory-mcp SessionStart <<<\n");
+
+    const char *before = read_test_file(cfg);
+    ASSERT_NOT_NULL(before);
+    char *snapshot = strdup(before);
+    ASSERT_NOT_NULL(snapshot);
+
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), -1);
+
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d, snapshot);
+    free(snapshot);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_hook_augment_guidance_uses_dependency_default) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-default-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t auto_index_deps = {0};
+    cli_env_snapshot_t auto_dep_limit = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_deps, "CBM_AUTO_INDEX_DEPS"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_dep_limit, "CBM_AUTO_DEP_LIMIT"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_AUTO_INDEX_DEPS");
+    cbm_unsetenv("CBM_AUTO_DEP_LIMIT");
+
+    const char *input =
+        "{\"hook_event_name\":\"SessionStart\","
+        "\"cwd\":\"/definitely-not-indexed/default-dependency-guidance\"}";
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT_NOT_NULL(strstr(output, "auto_index_deps=false"));
+    ASSERT_NOT_NULL(strstr(output, "index_dependencies"));
+    ASSERT_NULL(strstr(output, "Dependencies: automatic"));
+    free(output);
+
+    cli_env_restore(&auto_dep_limit);
+    cli_env_restore(&auto_index_deps);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-config-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t tool_mode = {0};
+    cli_env_snapshot_t auto_index = {0};
+    cli_env_snapshot_t context_injection = {0};
+    cli_env_snapshot_t auto_watch = {0};
+    cli_env_snapshot_t auto_index_limit = {0};
+    cli_env_snapshot_t auto_index_deps = {0};
+    cli_env_snapshot_t auto_dep_limit = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&tool_mode, "CBM_TOOL_MODE"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index, "CBM_AUTO_INDEX"));
+    ASSERT_TRUE(cli_env_snapshot(&context_injection, "CBM_CONTEXT_INJECTION"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_watch, "CBM_AUTO_WATCH"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_limit, "CBM_AUTO_INDEX_LIMIT"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_deps, "CBM_AUTO_INDEX_DEPS"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_dep_limit, "CBM_AUTO_DEP_LIMIT"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_AUTO_INDEX");
+    cbm_unsetenv("CBM_CONTEXT_INJECTION");
+    cbm_unsetenv("CBM_AUTO_WATCH");
+    cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+    cbm_unsetenv("CBM_AUTO_INDEX_DEPS");
+    cbm_unsetenv("CBM_AUTO_DEP_LIMIT");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_CONTEXT_INJECTION, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "17"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
+    cbm_config_close(cfg);
+
+    const char *input =
+        "{\"hook_event_name\":\"SessionStart\","
+        "\"cwd\":\"/definitely-not-indexed/config-guidance\"}";
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=streamlined") != NULL);
+    ASSERT(strstr(output, "_hidden_tools") == NULL);
+    ASSERT(strstr(output, "get_code") != NULL);
+    ASSERT(strstr(output, "get_architecture") == NULL);
+    ASSERT(strstr(output, "then trace_path") == NULL);
+    ASSERT(strstr(output, "First-use indexing") != NULL);
+    ASSERT(strstr(output, "first-response codebase context") != NULL);
+    ASSERT(strstr(output, "auto_watch=true") != NULL);
+    ASSERT(strstr(output, "Git-change refresh is automatic") != NULL);
+    ASSERT(strstr(output, "auto_index_limit=17") != NULL);
+    ASSERT(strstr(output, "auto_index_deps=false") != NULL);
+    free(output);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_CONTEXT_INJECTION, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false"), 0);
+    cbm_config_close(cfg);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=streamlined") != NULL);
+    ASSERT(strstr(output, "First-use indexing") == NULL);
+    ASSERT(strstr(output, "first-response codebase context") == NULL);
+    ASSERT(strstr(output, "auto_watch=false") != NULL);
+    ASSERT(strstr(output, "refresh explicitly after Git changes") != NULL);
+    free(output);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "3"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_DEP_MAX_FILES, "7"), 0);
+    cbm_config_close(cfg);
+
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=classic") != NULL);
+    ASSERT(strstr(output, "get_code_snippet") != NULL);
+    ASSERT(strstr(output, "get_architecture") != NULL);
+    ASSERT(strstr(output, "search_graph, then trace_path, then get_code_snippet") != NULL);
+    ASSERT(strstr(output, "directly visible") != NULL);
+    ASSERT(strstr(output, "_hidden_tools") == NULL);
+    ASSERT(strstr(output, "auto_index=false") != NULL);
+    ASSERT(strstr(output, "auto_dep_limit=3") != NULL);
+    ASSERT(strstr(output, "dep_max_files=7") != NULL);
+    free(output);
+
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_AUTO_DEP_LIMIT, "-1"), 0);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    char expected_dep_limit[64];
+    snprintf(expected_dep_limit, sizeof(expected_dep_limit), "auto_dep_limit=%d",
+             CBM_DEFAULT_AUTO_DEP_LIMIT);
+    ASSERT(strstr(output, expected_dep_limit) != NULL);
+    ASSERT(strstr(output, "auto_dep_limit=0 (unlimited)") == NULL);
+    free(output);
+
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_DEP_MAX_FILES, "-1"), 0);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    char expected_file_limit[64];
+    snprintf(expected_file_limit, sizeof(expected_file_limit), "dep_max_files=%d",
+             CBM_DEFAULT_DEP_MAX_FILES);
+    ASSERT(strstr(output, expected_file_limit) != NULL);
+    ASSERT(strstr(output, "dep_max_files=-1") == NULL);
+    free(output);
+
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_AUTO_DEP_LIMIT, "0"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_DEP_MAX_FILES, "0"), 0);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "auto_dep_limit=0 and dep_max_files=0 (unlimited)") != NULL);
+    ASSERT(strstr(output, "index_dependencies for a package omitted") == NULL);
+    free(output);
+
+    /* Environment-only configuration must still shape guidance when no config
+     * database exists, and the hook must not create one while reading it. */
+    char missing_cache[512];
+    snprintf(missing_cache, sizeof(missing_cache), "%s/missing", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", missing_cache, 1);
+    cbm_setenv("CBM_TOOL_MODE", CBM_CONFIG_TOOL_MODE_STREAMLINED, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+    cbm_setenv("CBM_AUTO_INDEX_LIMIT", "9", 1);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=streamlined") != NULL);
+    ASSERT(strstr(output, "auto_index_limit=9") != NULL);
+    struct stat missing_cache_stat;
+    ASSERT_EQ(stat(missing_cache, &missing_cache_stat), -1);
+    free(output);
+
+    cli_env_restore(&auto_dep_limit);
+    cli_env_restore(&auto_index_deps);
+    cli_env_restore(&auto_index_limit);
+    cli_env_restore(&auto_index);
+    cli_env_restore(&context_injection);
+    cli_env_restore(&auto_watch);
+    cli_env_restore(&tool_mode);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_detect_agents_finds_claude_desktop) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+#ifdef __APPLE__
+    snprintf(dir, sizeof(dir), "%s/Library/Application Support/Claude", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir), "%s/AppData/Roaming/Claude", tmpdir);
+#else
+    snprintf(dir, sizeof(dir), "%s/.config/Claude", tmpdir);
+#endif
+    test_mkdirp(dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.claude_desktop);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_upsert_codex_mcp_preserves_owned_descendant_tool_policy) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-descendant-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+    const char *initial = "[mcp_servers.codebase-memory-mcp]\n"
+                          "command = \"/old/path/codebase-memory-mcp\"\n"
+                          "args = []\n\n"
+                          "[mcp_servers.codebase-memory-mcp.tools.query_graph]\n"
+                          "approval_mode = \"approve\"\n\n"
+                          "[other]\nkeep = true\n";
+    ASSERT_EQ(write_test_file(configpath, initial), 0);
+
+    ASSERT_EQ(cbm_upsert_codex_mcp("/new/path/codebase-memory-mcp", configpath), 0);
+    ASSERT_EQ(cbm_upsert_codex_mcp("/new/path/codebase-memory-mcp", configpath), 0);
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT_NOT_NULL(strstr(data, "/new/path/codebase-memory-mcp"));
+    ASSERT_NULL(strstr(data, "/old/path/codebase-memory-mcp"));
+    ASSERT_NOT_NULL(strstr(data, "[mcp_servers.codebase-memory-mcp.tools.query_graph]\n"
+                                 "approval_mode = \"approve\""));
+    ASSERT_NOT_NULL(strstr(data, "[other]\nkeep = true"));
+    ASSERT_EQ(test_count_substring(data, "# >>> codebase-memory-mcp MCP >>>"), 1);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_upsert_json_preserves_platform_valid_long_path_without_truncation) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-json-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    char *configpath = make_overlong_nested_path(tmpdir, "mcp_config.json");
+    ASSERT_NOT_NULL(configpath);
+
+    int rc = cbm_upsert_antigravity_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    bool exact_file_created = test_path_exists(configpath);
+    const char *data = exact_file_created ? read_test_file(configpath) : NULL;
+    bool exact_content =
+        data && strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL;
+    bool no_partial_parent = rc == 0 || !test_path_exists(unexpected);
+
+    remove_long_nested_path_fixture(configpath, tmpdir);
+    free(configpath);
+#ifdef __linux__
+    /* Linux permits a total path longer than the historical CBM_PATH_MAX
+     * scratch buffer when each component is valid. The JSON-like writer uses
+     * path-sized allocation, so an arbitrary application cap would be a
+     * correctness regression rather than a portability safeguard. */
+    ASSERT_EQ(rc, 0);
+#endif
+    ASSERT_TRUE((rc == 0 && exact_file_created && exact_content) ||
+                (rc != 0 && no_partial_parent));
+    PASS();
+}
+TEST(cli_upsert_instructions_rejects_overlong_path_without_truncated_parent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-instr-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    char *filepath = make_overlong_nested_path(tmpdir, "AGENTS.md");
+    ASSERT_NOT_NULL(filepath);
+
+    int rc = cbm_upsert_instructions(filepath, "# Test content\n");
+    ASSERT_NEQ(rc, 0);
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(filepath);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_mode_guidance_artifacts_preserve_both_contracts) {
+    const cbm_skill_t *installed_skills = cbm_get_skills();
+    const char *artifacts[] = {
+        installed_skills[0].content,
+        cbm_get_codex_instructions(),
+        read_test_file("README.md"),
+        read_test_file("docs/CONFIGURATION.md"),
+    };
+    for (size_t i = 0U; i < sizeof(artifacts) / sizeof(artifacts[0]); i++) {
+        ASSERT_NOT_NULL(artifacts[i]);
+        ASSERT_NOT_NULL(strstr(artifacts[i], "streamlined"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "classic"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "search_graph`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "trace_path`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "get_code_snippet`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "query_graph`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "get_architecture`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "advertises"));
+    }
+
+    const char *agent = cbm_get_agent_instructions();
+    ASSERT_NOT_NULL(agent);
+    ASSERT_NOT_NULL(strstr(agent, "Classic uses steps 1-3 in order"));
+    ASSERT_NOT_NULL(strstr(agent, "get_code_snippet` (classic)"));
+    ASSERT_NOT_NULL(strstr(agent, "get_architecture`"));
+    ASSERT_NOT_NULL(strstr(agent, "advanced when streamlined"));
+    PASS();
+}
+TEST(cli_hook_gate_script_rejects_overlong_home_without_truncated_parent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-gate-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    char *home = make_overlong_nested_path(tmpdir, "home");
+    ASSERT_NOT_NULL(home);
+
+    cbm_install_hook_gate_script(home, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(home);
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    } else {
+        cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_claude_hooks_reject_overlong_config_dir_command) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-env-long-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
+    char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
+    char *config_dir = make_overlong_nested_path(tmpdir, "claude-config");
+    ASSERT_NOT_NULL(config_dir);
+    cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
+
+    char settingspath[512];
+    snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
+    ASSERT_NEQ(cbm_upsert_claude_hooks(settingspath), 0);
+    ASSERT_NEQ(cbm_upsert_claude_session_hooks(settingspath), 0);
+    ASSERT_FALSE(test_path_exists(settingspath));
+
+    char unexpected[512];
+    snprintf(unexpected, sizeof(unexpected), "%s/a", tmpdir);
+    ASSERT_FALSE(test_path_exists(unexpected));
+
+    free(config_dir);
+    if (saved_ccd_copy) {
+        cbm_setenv("CLAUDE_CONFIG_DIR", saved_ccd_copy, 1);
+        free(saved_ccd_copy);
+    } else {
+        cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_claude_session_hooks_all_lifecycle_matchers) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-session-hook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char settingspath[512];
+    snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
+
+    ASSERT_EQ(cbm_upsert_claude_session_hooks(settingspath), 0);
+    const char *data = read_test_file(settingspath);
+    ASSERT_NOT_NULL(data);
+    ASSERT_EQ(test_count_substring(data, "\"SessionStart\""), 1);
+    ASSERT(strstr(data, "\"startup\"") != NULL);
+    ASSERT(strstr(data, "\"resume\"") != NULL);
+    ASSERT(strstr(data, "\"clear\"") != NULL);
+    ASSERT(strstr(data, "\"compact\"") != NULL);
+    ASSERT_EQ(test_count_substring(data, "cbm-session-reminder"), 4);
+
+    ASSERT_EQ(cbm_remove_claude_session_hooks(settingspath), 0);
+    data = read_test_file(settingspath);
+    ASSERT_NOT_NULL(data);
+    ASSERT_NULL(strstr(data, "SessionStart"));
+    ASSERT_NULL(strstr(data, "cbm-session-reminder"));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_upsert_gemini_hook_replaces_previous_json_guidance) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ghook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char settingspath[512];
+    snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
+    write_test_file(
+        settingspath,
+        "{\"hooks\":{\"BeforeTool\":[{\"matcher\":\"google_web_search|grep_search\","
+        "\"hooks\":[{\"type\":\"command\",\"command\":\"node -e \\\"process.stdout.write("
+        "JSON.stringify({hookSpecificOutput:{hookEventName:'BeforeTool',additionalContext:"
+        "'Code discovery: prefer codebase-memory-mcp search_graph, trace_path, and "
+        "get_code_snippet over grep or file search.'}}))\\\"\"}]}]}}");
+
+    ASSERT_EQ(cbm_upsert_gemini_hooks(settingspath), 0);
+    const char *data = read_test_file(settingspath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "graph tools over grep or file search") != NULL);
+    ASSERT(strstr(data, "get_code_snippet") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_config_get_effective_env_overrides_db) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, "auto_index_limit", "111"), 0);
+
+    const char *old_limit = getenv("CBM_AUTO_INDEX_LIMIT");
+    char *old_limit_copy = old_limit ? strdup(old_limit) : NULL;
+    if (old_limit) {
+        ASSERT_NOT_NULL(old_limit_copy);
+    }
+    cbm_setenv("CBM_AUTO_INDEX_LIMIT", "222", 1);
+
+    ASSERT_STR_EQ(cbm_config_get_effective(cfg, "auto_index_limit", "50000"), "222");
+    ASSERT_EQ(cbm_config_get_effective_int(cfg, "auto_index_limit", 50000), 222);
+
+    if (old_limit_copy) {
+        cbm_setenv("CBM_AUTO_INDEX_LIMIT", old_limit_copy, 1);
+        free(old_limit_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+    }
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_config_build_fingerprint_mode_is_exact_and_configurable) {
+    const cbm_config_entry_t *entry = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_BUILD_FINGERPRINT_MODE) == 0) {
+            entry = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT);
+    ASSERT_STR_EQ(entry->env_var, "CBM_BUILD_FINGERPRINT_MODE");
+    ASSERT_STR_EQ(entry->range, "cached_exact|always_rehash");
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-fingerprint-config-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_MODE,
+                             CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH),
+              0);
+    ASSERT_STR_EQ(cbm_config_get_effective(cfg, CBM_CONFIG_BUILD_FINGERPRINT_MODE,
+                                           CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT),
+                  CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH);
+    ASSERT(cbm_config_set(cfg, CBM_CONFIG_BUILD_FINGERPRINT_MODE, "metadata_only") != 0);
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_config_registry_includes_dep_ranking_toggle) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, "search_disable_dep_ranking") == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_STR_EQ(found->default_val, "false");
+    ASSERT_STR_EQ(found->range, "true|false");
+    ASSERT_NOT_NULL(strstr(found->description, "search_graph"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "dependency"));
+    PASS();
+}
+TEST(cli_config_registry_includes_query_max_rows) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_ROWS) == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_STR_EQ(found->default_val, CBM_DEFAULT_QUERY_MAX_ROWS_STR);
+    ASSERT_STR_EQ(found->range, "0-" CBM_STRINGIFY(CBM_MAX_QUERY_ROWS));
+    ASSERT_NOT_NULL(strstr(found->description, "result-row cap"));
+    ASSERT_NOT_NULL(strstr(found->description, "query_graph"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "after exact selection"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "may lower but not bypass this cap"));
+    PASS();
+}
+TEST(cli_config_registry_query_limits_use_shared_definitions) {
+    const cbm_config_entry_t *output = NULL;
+    const cbm_config_entry_t *rows = NULL;
+    const cbm_config_entry_t *working_rows = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES) == 0) {
+            output = &CBM_CONFIG_REGISTRY[i];
+        } else if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_ROWS) == 0) {
+            rows = &CBM_CONFIG_REGISTRY[i];
+        } else if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_WORKING_ROWS) == 0) {
+            working_rows = &CBM_CONFIG_REGISTRY[i];
+        }
+    }
+
+    ASSERT_NOT_NULL(output);
+    ASSERT_STR_EQ(output->default_val, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR);
+    ASSERT_EQ(atoi(output->default_val), CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_STR_EQ(rows->default_val, CBM_DEFAULT_QUERY_MAX_ROWS_STR);
+    ASSERT_NOT_NULL(strstr(rows->guidance, "after exact selection"));
+    ASSERT_NOT_NULL(working_rows);
+    ASSERT_STR_EQ(working_rows->default_val, CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR);
+    ASSERT_NOT_NULL(strstr(working_rows->guidance, "MCP tool execution error"));
+    ASSERT_NOT_NULL(strstr(working_rows->guidance, "instead of partial results"));
+    PASS();
+}
+TEST(cli_config_registry_search_previews_use_shared_definitions) {
+    const cbm_config_entry_t *search = NULL;
+    const cbm_config_entry_t *trace = NULL;
+    const cbm_config_entry_t *snippet = NULL;
+    const cbm_config_entry_t *key_functions = NULL;
+    const cbm_config_entry_t *context_key_functions = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        const cbm_config_entry_t *entry = &CBM_CONFIG_REGISTRY[i];
+        if (strcmp(entry->key, CBM_CONFIG_SEARCH_LIMIT) == 0) {
+            search = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_TRACE_MAX_RESULTS) == 0) {
+            trace = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_SNIPPET_MAX_LINES) == 0) {
+            snippet = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_KEY_FUNCTIONS_COUNT) == 0) {
+            key_functions = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT) == 0) {
+            context_key_functions = entry;
+        }
+    }
+
+    ASSERT_NOT_NULL(search);
+    ASSERT_STR_EQ(search->default_val, CBM_DEFAULT_SEARCH_LIMIT_STR);
+    ASSERT_EQ(atoi(search->default_val), CBM_DEFAULT_SEARCH_LIMIT);
+    ASSERT_NOT_NULL(trace);
+    ASSERT_STR_EQ(trace->default_val, CBM_DEFAULT_TRACE_MAX_RESULTS_STR);
+    ASSERT_EQ(atoi(trace->default_val), CBM_DEFAULT_TRACE_MAX_RESULTS);
+    ASSERT_NOT_NULL(snippet);
+    ASSERT_STR_EQ(snippet->default_val, CBM_DEFAULT_SNIPPET_MAX_LINES_STR);
+    ASSERT_EQ(atoi(snippet->default_val), CBM_DEFAULT_SNIPPET_MAX_LINES);
+    ASSERT_NOT_NULL(key_functions);
+    ASSERT_STR_EQ(key_functions->default_val, CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR);
+    ASSERT_EQ(atoi(key_functions->default_val), CBM_DEFAULT_KEY_FUNCTIONS_COUNT);
+    ASSERT_NOT_NULL(context_key_functions);
+    ASSERT_STR_EQ(context_key_functions->default_val,
+                  CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR);
+    ASSERT_EQ(atoi(context_key_functions->default_val),
+              CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT);
+    PASS();
+}
+TEST(cli_config_registry_architecture_defaults_use_shared_definitions) {
+    const cbm_config_entry_t *hotspots = NULL;
+    const cbm_config_entry_t *resolution = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        const cbm_config_entry_t *entry = &CBM_CONFIG_REGISTRY[i];
+        if (strcmp(entry->key, CBM_CONFIG_ARCH_HOTSPOT_LIMIT) == 0) {
+            hotspots = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_ARCH_RESOLUTION) == 0) {
+            resolution = entry;
+        }
+    }
+
+    ASSERT_NOT_NULL(hotspots);
+    ASSERT_STR_EQ(hotspots->default_val, CBM_DEFAULT_ARCH_HOTSPOT_LIMIT_STR);
+    ASSERT_EQ(atoi(hotspots->default_val), CBM_DEFAULT_ARCH_HOTSPOT_LIMIT);
+    ASSERT_NOT_NULL(resolution);
+    ASSERT_STR_EQ(resolution->default_val, CBM_DEFAULT_ARCH_RESOLUTION_STR);
+    ASSERT_TRUE(atof(resolution->default_val) == CBM_DEFAULT_ARCH_RESOLUTION);
+    PASS();
+}
+TEST(cli_config_registry_pagerank_guidance_names_actual_defaults) {
+    const struct {
+        const char *key;
+        double actual_default;
+        cbm_config_numeric_kind_t kind;
+        double accepted_minimum;
+        double accepted_maximum;
+        bool accepted_minimum_inclusive;
+        bool accepted_maximum_inclusive;
+        bool has_recommended_maximum;
+        double recommended_minimum;
+        double recommended_maximum;
+    } cases[] = {
+        {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER, CBM_CONFIG_NUMERIC_INTEGER,
+         CBM_PAGERANK_MAX_ITER_MIN, CBM_PAGERANK_MAX_ITER_MAX, true, true, false,
+         CBM_PAGERANK_MAX_ITER, 0.0},
+        {CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING, CBM_CONFIG_NUMERIC_REAL,
+         CBM_PAGERANK_DAMPING_MIN, CBM_PAGERANK_DAMPING_MAX, true, true, true,
+         CBM_PAGERANK_DAMPING_RECOMMENDED_MIN, CBM_PAGERANK_DAMPING_RECOMMENDED_MAX},
+        {CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON, CBM_CONFIG_NUMERIC_REAL,
+         CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE, CBM_PAGERANK_EPSILON_MAX, false, true, true,
+         CBM_PAGERANK_EPSILON_RECOMMENDED_MIN, CBM_PAGERANK_EPSILON_RECOMMENDED_MAX},
+#define CBM_PAGERANK_REGISTRY_CASE(edge_type, default_token, config_token, field)            \
+    {CBM_CONFIG_EDGE_WEIGHT_##config_token, CBM_DEFAULT_EDGE_WEIGHTS.field,                  \
+     CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_EDGE_WEIGHT_MIN,                                 \
+     CBM_PAGERANK_EDGE_WEIGHT_MAX, true, true, true,                                         \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MIN,                                  \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MAX},
+        CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_REGISTRY_CASE)
+#undef CBM_PAGERANK_REGISTRY_CASE
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const cbm_config_entry_t *entry = NULL;
+        for (int j = 0; CBM_CONFIG_REGISTRY[j].key; j++) {
+            if (strcmp(CBM_CONFIG_REGISTRY[j].key, cases[i].key) == 0) {
+                entry = &CBM_CONFIG_REGISTRY[j];
+                break;
+            }
+        }
+        ASSERT_NOT_NULL(entry);
+        char *end = NULL;
+        double documented_default = strtod(entry->default_val, &end);
+        ASSERT_NOT_NULL(end);
+        ASSERT_TRUE(*end == '\0');
+        ASSERT_TRUE(documented_default == cases[i].actual_default);
+        ASSERT_NULL(entry->range);
+
+        const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(cases[i].key);
+        ASSERT_NOT_NULL(domain);
+        ASSERT_EQ(domain->kind, cases[i].kind);
+        ASSERT_TRUE(domain->accepted_minimum == cases[i].accepted_minimum);
+        ASSERT_TRUE(domain->accepted_maximum == cases[i].accepted_maximum);
+        ASSERT_EQ(domain->accepted_minimum_inclusive, cases[i].accepted_minimum_inclusive);
+        ASSERT_EQ(domain->accepted_maximum_inclusive, cases[i].accepted_maximum_inclusive);
+        ASSERT_TRUE(domain->has_recommended_minimum);
+        ASSERT_EQ(domain->has_recommended_maximum, cases[i].has_recommended_maximum);
+        ASSERT_TRUE(domain->recommended_minimum == cases[i].recommended_minimum);
+        if (domain->has_recommended_maximum) {
+            ASSERT_TRUE(domain->recommended_maximum == cases[i].recommended_maximum);
+        }
+        ASSERT_TRUE(documented_default >= domain->accepted_minimum);
+        ASSERT_TRUE(documented_default <= domain->accepted_maximum);
+        ASSERT_TRUE(documented_default >= domain->recommended_minimum);
+        ASSERT_TRUE(!domain->has_recommended_maximum ||
+                    documented_default <= domain->recommended_maximum);
+
+        char expected_guidance[CBM_SZ_64];
+        int n = snprintf(expected_guidance, sizeof(expected_guidance), "default %s",
+                         entry->default_val);
+        ASSERT_TRUE(n > 0 && (size_t)n < sizeof(expected_guidance));
+        ASSERT_NOT_NULL(strstr(entry->guidance, expected_guidance));
+        ASSERT_NOT_NULL(strstr(entry->guidance, "Recommended"));
+        ASSERT_TRUE(strncmp(entry->guidance, CBM_CONFIG_GUIDANCE_ADVANCED,
+                            strlen(CBM_CONFIG_GUIDANCE_ADVANCED)) == 0);
+    }
+    PASS();
+}
+TEST(cli_config_registry_pagerank_policy_tuning_levels_are_explicit) {
+    static const struct {
+        const char *key;
+        const char *level;
+    } cases[] = {
+        {CBM_CONFIG_RANK_ENABLED, CBM_CONFIG_GUIDANCE_LEADING},
+        {CBM_CONFIG_RANK_REFRESH, CBM_CONFIG_GUIDANCE_LEADING},
+        {CBM_CONFIG_RANK_SCOPE, CBM_CONFIG_GUIDANCE_USER_TUNABLE},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const cbm_config_entry_t *entry = NULL;
+        for (int j = 0; CBM_CONFIG_REGISTRY[j].key; j++) {
+            if (strcmp(CBM_CONFIG_REGISTRY[j].key, cases[i].key) == 0) {
+                entry = &CBM_CONFIG_REGISTRY[j];
+                break;
+            }
+        }
+        ASSERT_NOT_NULL(entry);
+        ASSERT_TRUE(strncmp(entry->guidance, cases[i].level, strlen(cases[i].level)) == 0);
+    }
+    PASS();
+}
+TEST(cli_config_describe_emits_registry_contract) {
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    ASSERT_TRUE(saved_stdout >= 0);
+    int fds[2];
+    ASSERT_EQ(cbm_pipe(fds), 0);
+    ASSERT_TRUE(dup2(fds[1], STDOUT_FILENO) >= 0);
+    close(fds[1]);
+
+    char *args[] = {"describe", CBM_CONFIG_PAGERANK_DAMPING};
+    int rc = cbm_cmd_config(2, args);
+
+    fflush(stdout);
+    ASSERT_TRUE(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    close(saved_stdout);
+
+    static char output[CBM_SZ_4K];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(output) - 1 &&
+           (n = read(fds[0], output + used, sizeof(output) - 1 - used)) > 0) {
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    output[used] = '\0';
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(output, CBM_CONFIG_PAGERANK_DAMPING));
+    ASSERT_NOT_NULL(strstr(output, "default: " CBM_PAGERANK_DAMPING_STR));
+    ASSERT_NOT_NULL(strstr(output, "accepted_minimum: 0"));
+    ASSERT_NOT_NULL(strstr(output, "accepted_maximum: 1"));
+    ASSERT_NOT_NULL(strstr(output, "recommended_minimum: 0.7"));
+    ASSERT_NOT_NULL(strstr(output, "recommended_maximum: 0.9"));
+    ASSERT_NOT_NULL(strstr(output, CBM_CONFIG_GUIDANCE_ADVANCED));
+    PASS();
+}
+TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_EQ(atoi(found->default_val), CBM_DEFAULT_AUTO_DEP_LIMIT);
+    char expected_range[CBM_SZ_32];
+    snprintf(expected_range, sizeof(expected_range), "0-%d", CBM_MAX_AUTO_DEP_LIMIT);
+    ASSERT_STR_EQ(found->range, expected_range);
+    PASS();
+}
+TEST(cli_config_registry_auto_index_deps_defaults_disabled) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_AUTO_INDEX_DEPS) == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_STR_EQ(found->default_val, "false");
+    ASSERT_STR_EQ(found->range, "true|false");
+    ASSERT_NOT_NULL(strstr(found->description, "installed dependency source"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "index_dependencies"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "does not delete"));
+    PASS();
+}
+TEST(cli_config_registry_reindex_startup_guidance_is_precise) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, "reindex_on_startup") == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_NOT_NULL(strstr(found->guidance, "startup"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "stale"));
+    ASSERT_NULL(strstr(found->guidance, "always-fresh"));
+    PASS();
+}
+TEST(cli_configuration_doc_auto_index_default_matches_registry) {
+    const cbm_config_entry_t *entry = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, "auto_index") == 0) {
+            entry = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+
+    const char *doc = read_test_file("docs/CONFIGURATION.md");
+    ASSERT_NOT_NULL(doc);
+    char expected[128];
+    snprintf(expected, sizeof(expected), "| `auto_index` | `%s` |", entry->default_val);
+    ASSERT_NOT_NULL(strstr(doc, expected));
+    PASS();
+}
+TEST(cli_config_presets_apply_exact_capability_sets) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    static const struct {
+        const char *name;
+        const char *tool_mode;
+        bool auto_index_deps;
+    } cases[] = {
+        {"streamlined-automatic-dependency-source-indexing-disabled", "streamlined", false},
+        {"streamlined-automatic-dependency-source-indexing-enabled", "streamlined", true},
+        {"classic-automatic-dependency-source-indexing-disabled", "classic", false},
+        {"classic-automatic-dependency-source-indexing-enabled", "classic", true},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS,
+                                 cases[i].auto_index_deps ? "false" : "true"),
+                  0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, "false"), 0);
+
+        ASSERT_EQ(cbm_config_apply_preset(cfg, cases[i].name), 0);
+        ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_TOOL_MODE, ""), cases[i].tool_mode);
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, false));
+        ASSERT_EQ(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS,
+                                      !cases[i].auto_index_deps),
+                  cases[i].auto_index_deps);
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, false));
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, false));
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, false));
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, false));
+    }
+
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "streamlined-quality"), 0);
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "classic-quality"), 0);
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "dependency-disabled"), 0);
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "rank-disabled"), 0);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, false));
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "optional-graph-disabled"), -1);
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "minimal-indexing"), 0);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, true));
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "unknown"), 0);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+/* Named presets are a user-facing config capability, not only an internal
+ * benchmark helper. Exercise the real dispatcher so it cannot drift away from
+ * the existing atomic preset implementation again. */
+TEST(cli_config_command_dispatches_presets) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-command-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t tool_mode = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&tool_mode, "CBM_TOOL_MODE"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_TOOL_MODE");
+
+    char *preset_list_args[] = {"preset", "list"};
+    char *preset_apply_args[] = {"preset", "apply", "minimal-indexing"};
+    ASSERT_EQ(cbm_cmd_config(2, preset_list_args), 0);
+    ASSERT_EQ(cbm_cmd_config(3, preset_apply_args), 0);
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
+    cbm_config_close(cfg);
+
+    /* Stored preset values remain deterministic, but an active environment
+     * override must be reported through a nonzero command status. */
+    cbm_setenv("CBM_TOOL_MODE", CBM_CONFIG_TOOL_MODE_CLASSIC, 1);
+    char *overridden_args[] = {
+        "preset", "apply", "streamlined-automatic-dependency-source-indexing-disabled"};
+    ASSERT_NEQ(cbm_cmd_config(3, overridden_args), 0);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_TOOL_MODE, ""),
+                  CBM_CONFIG_TOOL_MODE_STREAMLINED);
+    ASSERT_STR_EQ(cbm_config_get_effective(cfg, CBM_CONFIG_TOOL_MODE, ""),
+                  CBM_CONFIG_TOOL_MODE_CLASSIC);
+    cbm_config_close(cfg);
+
+    char *unknown_args[] = {"preset", "apply", "not-a-preset"};
+    ASSERT_NEQ(cbm_cmd_config(3, unknown_args), 0);
+
+    cli_env_restore(&tool_mode);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+TEST(cli_remove_indexes_preserves_config_db) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-index-clean-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *old_cache_copy = old_cache ? strdup(old_cache) : NULL;
+    if (old_cache) {
+        ASSERT_NOT_NULL(old_cache_copy);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    char project_db[512];
+    char project_tmp[512];
+    char config_db[512];
+    snprintf(project_db, sizeof(project_db), "%s/project.db", tmpdir);
+    snprintf(project_tmp, sizeof(project_tmp), "%s/project.db.tmp", tmpdir);
+    snprintf(config_db, sizeof(config_db), "%s/_config.db", tmpdir);
+    ASSERT_EQ(write_test_file(project_db, "project"), 0);
+    ASSERT_EQ(write_test_file(project_tmp, "tmp"), 0);
+    ASSERT_EQ(write_test_file(config_db, "config"), 0);
+
+    ASSERT_EQ(cbm_remove_indexes(NULL), 1);
+
+    struct stat st;
+    ASSERT_NEQ(stat(project_db, &st), 0);
+    ASSERT_NEQ(stat(project_tmp, &st), 0);
+    ASSERT_EQ(stat(config_db, &st), 0);
+
+    if (old_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache_copy, 1);
+        free(old_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(config_db);
+    cbm_rmdir(tmpdir);
+    PASS();
+}
+/* An array-typed flag whose value is itself JSON array text must be parsed
+ * into its string elements, not wrapped as one literal element. Previously
+ * `--target-projects '["*"]'` produced ["[\"*\"]"]; the cross-repo matcher
+ * then treated that as a literal project name, silently created an empty
+ * database named ["*"].db, and reported success with zero matches. */
+TEST(cli_build_args_json_json_array_value) {
+    char *err = NULL;
+    char *argv[] = {"--target-projects", "[\"*\"]"};
+    char *json = cbm_cli_build_args_json("index_repository", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"target_projects\":[\"*\"]") != NULL);
+    ASSERT(strstr(json, "[\\\"*\\\"]") == NULL);
+    free(json);
+
+    /* JSON-array values and plain values accumulate into one array. */
+    char *argv2[] = {"--target-projects", "[\"a\",\"b\"]", "--target-projects", "c"};
+    json = cbm_cli_build_args_json("index_repository", 4, argv2, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"target_projects\":[\"a\",\"b\",\"c\"]") != NULL);
+    free(json);
+    PASS();
+}
+/* Top-level --help must advertise every working config subcommand. `config
+ * preset <list|apply>` dispatches in cbm_cmd_config and is listed by the
+ * config-specific usage, but the main help's config line omitted it, so
+ * `--help` readers never learn presets exist. Capture stdout via pipe+dup2
+ * (same technique as test_log.c's stderr capture) and assert the preset
+ * line is present next to the other config usage line. */
+TEST(cli_main_help_lists_config_preset_subcommand) {
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    ASSERT_TRUE(saved_stdout >= 0);
+    int fds[2];
+    ASSERT_EQ(cbm_pipe(fds), 0);
+    dup2(fds[1], STDOUT_FILENO);
+    close(fds[1]);
+
+    cbm_cli_print_main_help();
+
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    static char help_buf[8192];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(help_buf) - 1 &&
+           (n = read(fds[0], help_buf + used, sizeof(help_buf) - 1 - used)) > 0) {
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    help_buf[used] = '\0';
+
+    /* Existing config line still present ... */
+    ASSERT_NOT_NULL(strstr(help_buf, "config <list|get|describe|set|reset>"));
+    /* ... and the preset subcommand is advertised beside it. */
+    ASSERT_NOT_NULL(strstr(help_buf, "config preset <list|apply>"));
+    /* Daemon lifecycle control is implemented (main_run_daemon_ctl) and named
+     * by runtime guidance, so top-level help must advertise it too. */
+    ASSERT_NOT_NULL(strstr(help_buf, "daemon <start|stop|status>"));
+    /* Installed evidence guidance names this advanced tool, so help must too. */
+    ASSERT_NOT_NULL(strstr(help_buf, "check_index_coverage"));
+    /* Prefer the schema-derived flag form; deprecated inline JSON must not be
+     * the generic top-level contract. */
+    ASSERT_NOT_NULL(strstr(help_buf, "cli <tool> [--flag value ...]"));
+    ASSERT_NULL(strstr(help_buf, "cli <tool> [json]"));
+    PASS();
+}
+
 SUITE(cli) {
     RUN_TEST(cli_progress_visibility_policy);
     RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);
@@ -11758,6 +14101,7 @@ SUITE(cli) {
     RUN_TEST(cli_progress_sink_accepts_worker_json_logs);
     RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_sha256_fragmented_updates_match_one_shot_digest);
     RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
     RUN_TEST(cli_checksum_manifest_rejects_invalid_missing_and_conflicting_digest);
     RUN_TEST(cli_checksum_manifest_rejects_oversized_input);
@@ -11863,6 +14207,10 @@ SUITE(cli) {
     RUN_TEST(cli_ensure_path_already_present);
     RUN_TEST(cli_ensure_path_dry_run);
     RUN_TEST(cli_ensure_path_fish_syntax_issue319);
+    RUN_TEST(cli_ensure_path_migrates_owned_intel_homebrew_block_on_apple_silicon);
+    RUN_TEST(cli_ensure_path_migrates_owned_arm_homebrew_block_on_intel_macos);
+    RUN_TEST(cli_ensure_path_honors_explicit_macos_homebrew_overrides);
+    RUN_TEST(cli_ensure_path_does_not_migrate_homebrew_blocks_off_macos);
 
     /* File copy (2 tests — update_test.go) */
     RUN_TEST(cli_copy_file);
@@ -12074,10 +14422,18 @@ SUITE(cli) {
 
     /* Config store (7 tests — group F) */
     RUN_TEST(cli_config_open_close);
+    RUN_TEST(cli_config_open_migrates_development_spellings);
+    RUN_TEST(cli_config_open_preserves_canonical_value_on_key_conflict);
+    RUN_TEST(cli_config_open_preserves_unrecognized_development_value);
+    RUN_TEST(cli_config_rejects_development_spellings_with_replacements);
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_pagerank_numeric_ranges_are_enforced);
+    RUN_TEST(cli_config_query_row_limits_enforce_advertised_ranges);
+    RUN_TEST(cli_config_githistory_max_couplings_enforces_advertised_range);
+    RUN_TEST(cli_config_cluster_node_budget_uses_shared_broad_range);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 
@@ -12097,4 +14453,52 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+    /* api-consolidation-only tests */
+    RUN_TEST(cli_find_cli_fallback_scans_cargo_bin);
+    RUN_TEST(cli_remove_owned_path_block_preserves_user_content);
+    RUN_TEST(cli_remove_owned_path_dry_run_preserves_block);
+    RUN_TEST(cli_uninstall_dry_run_preserves_indexes);
+    RUN_TEST(cli_uninstall_removes_codex_json_hook_only);
+    RUN_TEST(cli_uninstall_removes_owned_claude_hook_scripts);
+    RUN_TEST(cli_uninstall_removes_vscode_profile_mcp_only);
+    RUN_TEST(cli_install_help_does_not_require_home);
+    RUN_TEST(cli_uninstall_help_does_not_require_home);
+    RUN_TEST(cli_update_help_does_not_require_home);
+    RUN_TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries);
+    RUN_TEST(cli_json_mcp_migrates_legacy_enabled_true_entry);
+    RUN_TEST(cli_reference_harnesses_are_planned_without_mutation);
+    RUN_TEST(cli_claude_desktop_plan_and_uninstall_preserve_foreign_entries);
+    RUN_TEST(cli_reference_harnesses_uninstall_owned_entries_only);
+    RUN_TEST(cli_codex_mcp_and_hook_upserts_are_idempotent);
+    RUN_TEST(cli_codex_hook_upsert_rejects_orphan_end_sentinel);
+    RUN_TEST(cli_hook_augment_guidance_uses_dependency_default);
+    RUN_TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config);
+    RUN_TEST(cli_detect_agents_finds_claude_desktop);
+    RUN_TEST(cli_upsert_codex_mcp_preserves_owned_descendant_tool_policy);
+    RUN_TEST(cli_upsert_json_preserves_platform_valid_long_path_without_truncation);
+    RUN_TEST(cli_upsert_instructions_rejects_overlong_path_without_truncated_parent);
+    RUN_TEST(cli_mode_guidance_artifacts_preserve_both_contracts);
+    RUN_TEST(cli_hook_gate_script_rejects_overlong_home_without_truncated_parent);
+    RUN_TEST(cli_claude_hooks_reject_overlong_config_dir_command);
+    RUN_TEST(cli_claude_session_hooks_all_lifecycle_matchers);
+    RUN_TEST(cli_upsert_gemini_hook_replaces_previous_json_guidance);
+    RUN_TEST(cli_config_get_effective_env_overrides_db);
+    RUN_TEST(cli_config_build_fingerprint_mode_is_exact_and_configurable);
+    RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
+    RUN_TEST(cli_config_registry_includes_query_max_rows);
+    RUN_TEST(cli_config_registry_query_limits_use_shared_definitions);
+    RUN_TEST(cli_config_registry_search_previews_use_shared_definitions);
+    RUN_TEST(cli_config_registry_architecture_defaults_use_shared_definitions);
+    RUN_TEST(cli_config_registry_pagerank_guidance_names_actual_defaults);
+    RUN_TEST(cli_config_registry_pagerank_policy_tuning_levels_are_explicit);
+    RUN_TEST(cli_config_describe_emits_registry_contract);
+    RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
+    RUN_TEST(cli_config_registry_auto_index_deps_defaults_disabled);
+    RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
+    RUN_TEST(cli_configuration_doc_auto_index_default_matches_registry);
+    RUN_TEST(cli_config_presets_apply_exact_capability_sets);
+    RUN_TEST(cli_config_command_dispatches_presets);
+    RUN_TEST(cli_remove_indexes_preserves_config_db);
+    RUN_TEST(cli_build_args_json_json_array_value);
+    RUN_TEST(cli_main_help_lists_config_preset_subcommand);
 }

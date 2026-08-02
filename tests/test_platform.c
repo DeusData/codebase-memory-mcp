@@ -9,6 +9,7 @@
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -93,10 +94,48 @@ TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
 #else
         close(descriptor);
 #endif
+    }
+
+    static const char probe[] = "probe";
+    FILE *probe_file = created ? cbm_fopen(file_template, "wb") : NULL;
+    bool probe_written = false;
+    if (probe_file) {
+        bool write_ok =
+            fwrite(probe, sizeof(probe) - SKIP_ONE, SKIP_ONE, probe_file) == SKIP_ONE;
+        bool close_ok = fclose(probe_file) == 0;
+        probe_written = write_ok && close_ok;
+    }
+    struct stat directory_state = {0};
+    struct stat file_state = {0};
+    int directory_stat = cbm_stat(base, &directory_state);
+    int file_stat = cbm_stat(file_template, &file_state);
+    cbm_file_identity_t directory_identity = {0};
+    cbm_file_identity_t file_identity = {0};
+    cbm_file_identity_t repeated_file_identity = {0};
+    bool directory_identity_read = cbm_file_identity_read(base, &directory_identity);
+    bool file_identity_read = cbm_file_identity_read(file_template, &file_identity);
+    bool repeated_file_identity_read =
+        cbm_file_identity_read(file_template, &repeated_file_identity);
+    if (created) {
         (void)cbm_unlink(file_template);
     }
+    errno = 0;
+    int missing_stat = cbm_stat(file_template, &file_state);
+    int missing_error = errno;
     (void)cbm_rmdir(base);
     ASSERT_TRUE(created);
+    ASSERT_TRUE(probe_written);
+    ASSERT_EQ(directory_stat, 0);
+    ASSERT_TRUE(S_ISDIR(directory_state.st_mode));
+    ASSERT_EQ(file_stat, 0);
+    ASSERT_TRUE(S_ISREG(file_state.st_mode));
+    ASSERT_EQ(file_state.st_size, (off_t)(sizeof(probe) - SKIP_ONE));
+    ASSERT_TRUE(directory_identity_read);
+    ASSERT_TRUE(file_identity_read);
+    ASSERT_TRUE(repeated_file_identity_read);
+    ASSERT_TRUE(cbm_file_identity_equal(&file_identity, &repeated_file_identity));
+    ASSERT_EQ(missing_stat, -1);
+    ASSERT_EQ(missing_error, ENOENT);
     /* The returned path must keep the caller's UTF-8 directory intact. */
     ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
     PASS();
@@ -122,6 +161,42 @@ TEST(platform_counter_scaling_preserves_monotonic_deadlines) {
     ASSERT(next_ns >= now_ns);
     ASSERT(deadline_ns > now_ns);
     ASSERT(deadline_ns - now_ns == UINT64_C(5000000000));
+    PASS();
+}
+
+TEST(platform_proc_stat_group_parser_handles_parentheses_and_states) {
+    int64_t process_group = 0;
+    bool execution_quiescent = false;
+    ASSERT_TRUE(cbm_platform_parse_proc_stat_group(
+        "123 (ordinary worker) R 7 41 41 0 -1 0", &process_group, &execution_quiescent));
+    ASSERT_EQ(process_group, 41);
+    ASSERT_FALSE(execution_quiescent);
+
+    ASSERT_TRUE(cbm_platform_parse_proc_stat_group(
+        "456 (worker ) name with spaces) Z 8 99 99 0 -1 0", &process_group,
+        &execution_quiescent));
+    ASSERT_EQ(process_group, 99);
+    ASSERT_TRUE(execution_quiescent);
+
+    ASSERT_TRUE(cbm_platform_parse_proc_stat_group(
+        "789 (dead worker) X 9 101 101 0 -1 0", &process_group, &execution_quiescent));
+    ASSERT_EQ(process_group, 101);
+    ASSERT_TRUE(execution_quiescent);
+
+    ASSERT_FALSE(cbm_platform_parse_proc_stat_group(
+        "123 missing-close R 7 41", &process_group, &execution_quiescent));
+    ASSERT_FALSE(cbm_platform_parse_proc_stat_group(
+        "123 (missing fields) R 7", &process_group, &execution_quiescent));
+    ASSERT_FALSE(cbm_platform_parse_proc_stat_group(NULL, &process_group, &execution_quiescent));
+    PASS();
+}
+
+TEST(platform_proc_entry_disappearance_is_narrow) {
+    ASSERT_TRUE(cbm_platform_proc_entry_vanished(ENOENT));
+    ASSERT_TRUE(cbm_platform_proc_entry_vanished(ESRCH));
+    ASSERT_FALSE(cbm_platform_proc_entry_vanished(0));
+    ASSERT_FALSE(cbm_platform_proc_entry_vanished(EACCES));
+    ASSERT_FALSE(cbm_platform_proc_entry_vanished(EIO));
     PASS();
 }
 
@@ -188,6 +263,37 @@ TEST(platform_now_ns) {
 TEST(platform_now_ms) {
     uint64_t t1 = cbm_now_ms();
     ASSERT_GT(t1, 0);
+    PASS();
+}
+
+TEST(platform_thread_condition_uses_monotonic_deadline) {
+    enum {
+        CONDITION_TEST_TIMEOUT_MS = 20,
+        /* A deadline can be observed late under load, but an incorrect clock
+         * domain must not park the suite indefinitely. */
+        CONDITION_TEST_HANG_BOUND_MS = 5000,
+    };
+    cbm_mutex_t mutex;
+    cbm_thread_condition_t condition;
+    cbm_mutex_init(&mutex);
+    int init_status = cbm_thread_condition_init(&condition);
+    cbm_mutex_lock(&mutex);
+    uint64_t started_ms = cbm_now_ms();
+    cbm_thread_condition_wait_status_t wait_status =
+        init_status == 0 ? cbm_thread_condition_wait_until(&condition, &mutex,
+                                                           started_ms + CONDITION_TEST_TIMEOUT_MS)
+                         : CBM_THREAD_CONDITION_WAIT_ERROR;
+    uint64_t elapsed_ms = cbm_now_ms() - started_ms;
+    cbm_mutex_unlock(&mutex);
+    if (init_status == 0) {
+        cbm_thread_condition_destroy(&condition);
+    }
+    cbm_mutex_destroy(&mutex);
+
+    ASSERT_EQ(init_status, 0);
+    ASSERT_EQ(wait_status, CBM_THREAD_CONDITION_WAIT_TIMEOUT);
+    ASSERT_TRUE(elapsed_ms >= CONDITION_TEST_TIMEOUT_MS);
+    ASSERT_TRUE(elapsed_ms <= CONDITION_TEST_HANG_BOUND_MS);
     PASS();
 }
 
@@ -364,6 +470,37 @@ TEST(platform_setenv_preserves_utf8_in_wide_environment) {
     PASS();
 }
 
+/* cbm_getenv_fits must share cbm_safe_getenv's UTF-16 environment reader.
+ * SetEnvironmentVariableW deliberately bypasses the CRT's narrow _environ
+ * snapshot so this test fails if the two public APIs drift apart again. */
+TEST(platform_getenv_fits_reads_windows_wide_environment) {
+    static const wchar_t name[] = L"CBM_TEST_GETENV_FITS_WIDE";
+    static const wchar_t wide[] = L"C:/cbm-config-\u0394-\u65e5\u672c";
+    static const char utf8[] = "C:/cbm-config-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac";
+    ASSERT_TRUE(SetEnvironmentVariableW(name, wide) != 0);
+
+    char observed[128];
+    bool present = false;
+    bool fits =
+        cbm_getenv_fits("CBM_TEST_GETENV_FITS_WIDE", observed, sizeof(observed), &present);
+    bool full_value_present = present;
+
+    char too_small[8] = "stale";
+    present = false;
+    bool too_long =
+        !cbm_getenv_fits("CBM_TEST_GETENV_FITS_WIDE", too_small, sizeof(too_small), &present);
+    bool long_value_present = present;
+
+    ASSERT_TRUE(SetEnvironmentVariableW(name, NULL) != 0);
+    ASSERT_TRUE(fits);
+    ASSERT_TRUE(full_value_present);
+    ASSERT_STR_EQ(observed, utf8);
+    ASSERT_TRUE(too_long);
+    ASSERT_TRUE(long_value_present);
+    ASSERT_STR_EQ(too_small, "");
+    PASS();
+}
+
 /* Empty and absent variables have different fallback semantics. In
  * particular, an explicitly empty CBM_CACHE_DIR means "use the default"; it
  * must not be misreported as a failed wide-environment read. Unset is also
@@ -431,10 +568,83 @@ TEST(platform_default_workers_env_unset) {
     PASS();
 }
 
-TEST(platform_system_info) {
-    cbm_system_info_t info = cbm_system_info();
-    ASSERT_GT(info.total_cores, 0);
-    ASSERT_GT(info.total_ram, 0);
+TEST(platform_getenv_fits) {
+    const char *name = "CBM_TEST_GETENV_FITS";
+    char buf[8];
+    bool present = true;
+
+    cbm_unsetenv(name);
+    ASSERT_FALSE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_FALSE(present);
+    ASSERT_STR_EQ(buf, "");
+
+    cbm_setenv(name, "", 1);
+    present = true;
+    ASSERT_FALSE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_FALSE(present);
+    ASSERT_STR_EQ(buf, "");
+
+    cbm_setenv(name, "fits", 1);
+    ASSERT_TRUE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_TRUE(present);
+    ASSERT_STR_EQ(buf, "fits");
+
+    cbm_setenv(name, "too-long-for-buffer", 1);
+    present = false;
+    ASSERT_FALSE(cbm_getenv_fits(name, buf, sizeof(buf), &present));
+    ASSERT_TRUE(present);
+    ASSERT_STR_EQ(buf, "");
+
+    cbm_unsetenv(name);
+    PASS();
+}
+
+TEST(platform_env_flag_enabled) {
+    const char *name = "CBM_TEST_ENV_FLAG";
+
+    cbm_unsetenv(name);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "0", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "false", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "OFF", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "No", 1);
+    ASSERT_FALSE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "1", 1);
+    ASSERT_TRUE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "true", 1);
+    ASSERT_TRUE(cbm_env_flag_enabled(name));
+
+    cbm_setenv(name, "debug", 1);
+    ASSERT_TRUE(cbm_env_flag_enabled(name));
+
+    cbm_unsetenv(name);
+    PASS();
+}
+
+TEST(platform_dirent_name_fits_boundary) {
+    char fits[CBM_DIRENT_NAME_MAX];
+    char too_long[CBM_DIRENT_NAME_MAX + SKIP_ONE];
+
+    memset(fits, 'a', sizeof(fits) - SKIP_ONE);
+    fits[sizeof(fits) - SKIP_ONE] = '\0';
+    ASSERT_TRUE(cbm_dirent_name_fits(fits));
+
+    memset(too_long, 'b', sizeof(too_long) - SKIP_ONE);
+    too_long[sizeof(too_long) - SKIP_ONE] = '\0';
+    ASSERT_FALSE(cbm_dirent_name_fits(too_long));
+    ASSERT_FALSE(cbm_dirent_name_fits(NULL));
     PASS();
 }
 
@@ -610,15 +820,35 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+/* Restored from the merge base: cbm_system_info() is still live
+ * (src/foundation/platform.h:107) and load-bearing -- src/daemon/host.c:998 sizes
+ * the memory pool from total_ram, and src/foundation/mem.c:221 reads it too. It
+ * lost its only direct test when this file auto-merged, with no conflict raised.
+ * Strengthened past the base form, which checked only total_cores and total_ram:
+ * perf_cores is also consumed by callers and must be sane and bounded by
+ * total_cores. */
+TEST(platform_system_info) {
+    cbm_system_info_t info = cbm_system_info();
+    ASSERT_GT(info.total_cores, 0);
+    ASSERT_GT(info.total_ram, 0);
+    ASSERT_GT(info.perf_cores, 0);
+    ASSERT_TRUE(info.perf_cores <= info.total_cores);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
+    RUN_TEST(platform_proc_stat_group_parser_handles_parentheses_and_states);
+    RUN_TEST(platform_proc_entry_disappearance_is_narrow);
     RUN_TEST(platform_now_ns_concurrent_first_call);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
+    RUN_TEST(platform_thread_condition_uses_monotonic_deadline);
     RUN_TEST(platform_nprocs);
+    RUN_TEST(platform_system_info); /* restored from merge base */
     RUN_TEST(platform_file_exists);
     RUN_TEST(platform_is_dir);
     RUN_TEST(platform_file_size);
@@ -628,12 +858,15 @@ SUITE(platform) {
     RUN_TEST(platform_cache_dir_rejects_truncated_override);
 #ifdef _WIN32
     RUN_TEST(platform_setenv_preserves_utf8_in_wide_environment);
+    RUN_TEST(platform_getenv_fits_reads_windows_wide_environment);
     RUN_TEST(platform_windows_empty_environment_is_read_and_unset_idempotently);
 #endif
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
-    RUN_TEST(platform_system_info);
+    RUN_TEST(platform_getenv_fits);
+    RUN_TEST(platform_env_flag_enabled);
+    RUN_TEST(platform_dirent_name_fits_boundary);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);

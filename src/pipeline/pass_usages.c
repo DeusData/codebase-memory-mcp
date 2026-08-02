@@ -87,110 +87,6 @@ static bool is_checked_exception(const char *name) {
     return true; /* Default: treat as checked */
 }
 
-/* Build import map from cached extraction result (fast path). */
-static int build_import_map_from_cache(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                       const char ***out_keys, const char ***out_vals,
-                                       int *out_count) {
-    const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-    const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
-    int count = 0;
-
-    for (int i = 0; i < result->imports.count; i++) {
-        const CBMImport *imp = &result->imports.items[i];
-        if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
-            continue;
-        }
-        char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-        free(target_qn);
-        if (!target) {
-            continue;
-        }
-        keys[count] = strdup(imp->local_name);
-        vals[count] = target->qualified_name;
-        count++;
-    }
-
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-/* Build import map from graph buffer IMPORTS edges (slow path). */
-static int build_import_map_from_edges(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                                       const char ***out_keys, const char ***out_vals,
-                                       int *out_count) {
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    free(file_qn);
-    if (!file_node) {
-        return 0;
-    }
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc = cbm_gbuf_find_edges_by_source_type(ctx->gbuf, file_node->id, "IMPORTS", &edges,
-                                                &edge_count);
-    if (rc != 0 || edge_count == 0) {
-        return 0;
-    }
-
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
-    int count = 0;
-
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, e->target_id);
-        if (!target || !e->properties_json) {
-            continue;
-        }
-
-        const char *start = strstr(e->properties_json, "\"local_name\":\"");
-        if (start) {
-            start += strlen("\"local_name\":\"");
-            const char *end = strchr(start, '"');
-            if (end && end > start) {
-                keys[count] = cbm_strndup(start, end - start);
-                vals[count] = target->qualified_name;
-                count++;
-            }
-        }
-    }
-
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-/* Build per-file import map from cached extraction result or graph buffer edges. */
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
-    *out_keys = NULL;
-    *out_vals = NULL;
-    *out_count = 0;
-
-    if (result && result->imports.count > 0) {
-        return build_import_map_from_cache(ctx, result, out_keys, out_vals, out_count);
-    }
-    return build_import_map_from_edges(ctx, rel_path, out_keys, out_vals, out_count);
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-        }
-        free((void *)keys);
-    }
-    if (vals) {
-        free((void *)vals);
-    }
-}
-
 /* Find the graph buffer node for an enclosing function QN, falling back to file node. */
 static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const char *func_qn,
                                                   const char *rel_path) {
@@ -234,7 +130,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -255,6 +151,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count) {
+    (void)rel; /* Throws intentionally match the parallel pass: no file-node fallback. */
     int resolved = 0;
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
@@ -262,8 +159,8 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        const cbm_gbuf_node_t *src = find_enclosing_node(ctx, thr->enclosing_func_qn, rel);
-        if (!src) {
+        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(ctx->gbuf, thr->enclosing_func_qn);
+        if (!cbm_pipeline_node_is_callable_scope(src)) {
             continue;
         }
 
@@ -273,7 +170,7 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 
         const cbm_gbuf_node_t *tgt = NULL;
         if (res.qualified_name && res.qualified_name[0]) {
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         }
         if (!tgt || src->id == tgt->id) {
             continue;
@@ -307,7 +204,7 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -348,8 +245,10 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+            result = cbm_extract_file_with_options(
+                source, source_len, files[i].language, ctx->project_name, rel,
+                cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
             free(source);
             if (!result) {
                 errors++;
@@ -368,7 +267,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
+                                                 &imp_vals, &imp_count);
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pu_module_is_dir(files[i].language));
@@ -380,7 +280,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }

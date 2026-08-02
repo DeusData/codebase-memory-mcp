@@ -365,7 +365,7 @@ static bool application_regular_db_exists(const char *project) {
         return false;
     }
     struct stat status;
-    return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+    return cbm_stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
 static cbm_daemon_application_watch_t *application_find_watch_locked(
@@ -1744,15 +1744,20 @@ static bool application_update_version_valid(const char *version) {
 static void application_update_publish_terminal_locked(cbm_daemon_application_t *application,
                                                        const char *latest_version,
                                                        bool completed_generation) {
-    if (!application->update_cancel_requested && application_update_version_valid(latest_version) &&
-        cbm_compare_versions(latest_version, cbm_cli_get_version()) > 0) {
+    const char *current_version = cbm_cli_get_version();
+    /* A local development build has no ordered release version. Treating its
+     * sentinel as semver zero would prepend an arbitrary release as a claimed
+     * upgrade to an unrelated tool response. This bounded string check adds
+     * no allocation, I/O, or lifecycle state to the background generation. */
+    if (!application->update_cancel_requested && !cbm_version_is_development(current_version) &&
+        application_update_version_valid(latest_version) &&
+        cbm_compare_versions(latest_version, current_version) > 0) {
         (void)snprintf(application->update_notice, sizeof(application->update_notice),
                        "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
                        "Enjoying codebase-memory-mcp? Please leave a star: "
                        "https://github.com/DeusData/codebase-memory-mcp",
-                       cbm_cli_get_version(), latest_version);
-        cbm_log_info("update.available", "current", cbm_cli_get_version(), "latest",
-                     latest_version);
+                       current_version, latest_version);
+        cbm_log_info("update.available", "current", current_version, "latest", latest_version);
     }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
@@ -1927,17 +1932,25 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
      * terminal state. */
     (void)application_update_reap(application, false, 0);
     bool db_exists = application_regular_db_exists(project);
-    bool auto_index = application->config &&
-                      cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_INDEX, false);
-    int auto_index_limit =
-        application->config ? cbm_config_get_int(application->config, CBM_CONFIG_AUTO_INDEX_LIMIT,
-                                                 CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT)
-                            : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
+    /* Resolve the same stored/environment/default layers as synchronous MCP
+     * first use and hook augmentation. This is O(1) time and memory; keeping
+     * admission here lets the existing daemon worker overlap indexing with
+     * later requests instead of putting O(repository) work on the first graph
+     * call's latency path. */
+    bool default_auto_index = application->config != NULL;
+    bool auto_index = cbm_config_get_effective_bool(application->config, CBM_CONFIG_AUTO_INDEX,
+                                                    default_auto_index);
+    int auto_index_limit = cbm_config_get_effective_int(
+        application->config, CBM_CONFIG_AUTO_INDEX_LIMIT, CBM_DEFAULT_AUTO_INDEX_LIMIT);
     int tracked_files = -1;
     bool auto_index_candidate = auto_index && !db_exists;
+    /* Configured value, so the registry's "0 = no limit, index everything"
+     * convention applies; calling the raw mechanism here made an explicit 0 mean
+     * "admit nothing", the opposite of what the key documents and of what the MCP
+     * resolve path does with the same setting. */
     bool within_auto_index_limit =
         !auto_index_candidate ||
-        cbm_mcp_auto_index_within_file_limit(root_path, auto_index_limit, &tracked_files);
+        cbm_mcp_auto_index_within_configured_limit(root_path, auto_index_limit, &tracked_files);
     if (auto_index_candidate && !within_auto_index_limit) {
         char files[32];
         (void)snprintf(files, sizeof(files), "%d", tracked_files);
@@ -2321,7 +2334,7 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     }
     struct stat root_status;
     canonical =
-        canonical && stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
+        canonical && cbm_stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
     bool set =
         canonical && cbm_mcp_server_set_session_context(session->mcp, canonical_root,
                                                         allowed_present ? canonical_allowed : NULL);
@@ -2377,8 +2390,10 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
         *response_out = (uint8_t *)response;
         *response_length_out = (uint32_t)response_length;
     }
+    bool tools_list_changed = response && cbm_mcp_server_tools_list_changed_pending(session->mcp);
     application_refresh_watch(session);
-    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    return tools_list_changed ? CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED
+                              : CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
 static cbm_daemon_runtime_application_status_t application_tool_request(
@@ -2561,12 +2576,12 @@ static cbm_daemon_runtime_application_status_t application_request(
         session->request_cancel_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     }
     bool activate_background =
-        !cancelled && status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+        !cancelled && cbm_daemon_runtime_application_status_is_success(status) &&
         (session->pending_background_initialize ||
          (session->background_eligible &&
           (session->auto_index_retry_pending ||
            (!application->update_generation_started && !session->update_owner))));
-    if (!cancelled && status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+    if (!cancelled && cbm_daemon_runtime_application_status_is_success(status) &&
         session->pending_update_notice) {
         session->update_notice_delivered = true;
     }
@@ -2578,6 +2593,13 @@ static cbm_daemon_runtime_application_status_t application_request(
         *response_out = NULL;
         *response_length_out = 0;
         return CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
+    }
+    if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+        !cbm_mcp_server_take_tools_list_changed(session->mcp)) {
+        /* Only this session's request thread consumes the flag. Treat a
+         * defensive mismatch as ordinary success rather than emitting a
+         * notification that no publication/reveal requested. */
+        status = CBM_DAEMON_RUNTIME_APPLICATION_OK;
     }
     if (activate_background) {
         application_background_initialize(session);
@@ -2973,7 +2995,7 @@ static cbm_daemon_runtime_application_status_t application_client_exchange_tagge
                                                                    request_length, &response,
                                                                    &response_length, timeout_ms);
     free(request);
-    if (status != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+    if (!cbm_daemon_runtime_application_status_is_success(status)) {
         free(response);
         return status;
     }
@@ -3182,7 +3204,7 @@ static int application_background_index(cbm_daemon_application_t *application,
     char canonical_root[APPLICATION_PATH_CAP];
     struct stat root_status;
     if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
-        stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        cbm_stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
         return -1;
     }
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);

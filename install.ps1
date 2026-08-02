@@ -136,6 +136,7 @@ $Url = "$BaseUrl/$Archive"
 # Download
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+try {
 
 Write-Host "Downloading $Archive..."
 try {
@@ -322,14 +323,16 @@ if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
     }
 }
 
-# Verify
+# Verify. The launcher's activation transaction already staged, swapped, and
+# rolled back the binary under its own ownership and DACL checks, so this step
+# only confirms the activated executable runs; there is no script-level
+# rename-aside copy left to restore.
 try {
     $ver = & $Dest --version 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "installed binary exited with code $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {
-    Write-Host "error: installed binary failed to run" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir
+    Write-Host "error: installed binary failed to run: $_" -ForegroundColor Red
     exit 1
 }
 
@@ -343,8 +346,8 @@ if ($SkipConfig) {
 # coordinated activation lease. Do not perform a second registry mutation here
 # after running sessions have been allowed to restart.
 
-# Cleanup
-Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-
 Write-Host ""
 Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp."
+} finally {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+}

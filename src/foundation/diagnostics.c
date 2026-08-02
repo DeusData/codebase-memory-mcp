@@ -543,7 +543,8 @@ static void write_diagnostics(void) {
 
     /* Memory map: live allocator bytes on this thread's heap, a size-class
      * histogram, and the residual the walk does NOT account for. The residual
-     * is what keeps this honest — see mem.h. */
+     * is what keeps this honest — see mem.h. This diagnostics-only scan is not
+     * on the normal request path. */
     diag_write_allocator_stats();
 
     cbm_mem_map_t map;
@@ -577,6 +578,8 @@ static void write_diagnostics(void) {
         snprintf(snapshot, sizeof(snapshot),
                  "{\n"
                  "  \"uptime_s\": %ld,\n"
+                 "  \"process_user_cpu_ms\": %zu,\n"
+                 "  \"process_system_cpu_ms\": %zu,\n"
                  "  \"rss_bytes\": %zu,\n"
                  "  \"peak_rss_bytes\": %zu,\n"
                  "  \"heap_committed_bytes\": %zu,\n"
@@ -597,8 +600,8 @@ static void write_diagnostics(void) {
                  "  \"mem_phases\": [%s],\n"
                  "  \"pid\": %d\n"
                  "}\n",
-                 uptime, current_rss, peak_rss, current_commit, peak_commit, page_faults, fds,
-                 qcount, qerrors, qtime, qavg, qmax,
+                 uptime, user_ms, sys_ms, current_rss, peak_rss, current_commit, peak_commit,
+                 page_faults, fds, qcount, qerrors, qtime, qavg, qmax,
                  map.malloc_is_allocator_owned ? "true" : "false", map.live_bytes, map.live_blocks,
                  map.area_committed_bytes, residual, buckets, phases, (int)getpid());
     if (length <= 0 || (size_t)length >= sizeof(snapshot) ||
@@ -641,6 +644,9 @@ bool cbm_diag_start(void) {
     }
 
     g_start_time = time(NULL);
+    /* Both output paths are derived from the private diagnostics directory by
+     * diag_directory_prepare()/diag_set_output_paths() below, so the snapshot
+     * and trajectory names are no longer built from the shared temp dir. */
     g_diag_ndjson_size = 0;
     atomic_store_explicit(&g_diag_stop, false, memory_order_release);
     atomic_store_explicit(&g_diag_done, false, memory_order_release);
@@ -681,6 +687,13 @@ void cbm_diag_stop(void) {
          * state. Detaching avoids turning an already-complete best-effort
          * writer into an unbounded native join during daemon teardown. */
         (void)cbm_thread_detach(&g_diag_thread);
+        /* diag_cleanup_live_files() removes the live snapshot and its .tmp but
+         * KEEPS the trajectory NDJSON, so announce where that retained file is;
+         * the control channel is the same one the start record uses and it
+         * survives CBM_LOG_LEVEL suppression. */
+        if (g_diag_ndjson_path[0] != '\0') {
+            cbm_log_control("diagnostics.trajectory_kept", "trajectory", g_diag_ndjson_path);
+        }
         diag_cleanup_live_files();
         diag_directory_close(false);
     } else {

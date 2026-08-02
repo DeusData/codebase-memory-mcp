@@ -5,7 +5,8 @@
  * from WAL journal mode.  Switching to MEMORY journal mode during bulk writes
  * makes the database unrecoverable on a crash because the in-memory rollback
  * journal is lost.  WAL mode is inherently crash-safe: uncommitted WAL entries
- * are discarded on the next open.
+ * are simply discarded on the next open.  Performance is preserved via
+ * synchronous=OFF and a larger cache, which are safe with WAL.
  *
  * Tests:
  *   bulk_pragma_wal_invariant     — journal_mode stays "wal" after begin_bulk
@@ -21,6 +22,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <signal.h>
 #include <sys/wait.h>
 #endif
 
@@ -77,7 +79,7 @@ TEST(bulk_pragma_wal_invariant) {
 
     char *after = get_journal_mode(db_path);
     ASSERT_NOT_NULL(after);
-    ASSERT_STR_EQ(after, "wal"); /* FAILS with bug, PASSES with fix */
+    ASSERT_STR_EQ(after, "wal"); /* FAILS if bulk mode switches away from WAL */
     free(after);
 
     cbm_store_end_bulk(s);
@@ -141,7 +143,18 @@ TEST(bulk_crash_recovery) {
     }
     ASSERT_GT(pid, 0);
     int status;
-    waitpid(pid, &status, 0);
+    /* Robust wait: leaks --atExit on macOS temporarily SIGSTOPs forked children
+     * during heap inspection. WUNTRACED lets us detect the stop and send SIGCONT
+     * so the child can proceed to _exit(). */
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WUNTRACED);
+        ASSERT_GT((int)r, 0);
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
     /* Confirm child exited normally so the write actually occurred. */
     ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 

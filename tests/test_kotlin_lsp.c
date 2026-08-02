@@ -44,6 +44,17 @@ static CBMFileResult *extract_kotlin_path(const char *source, const char *rel_pa
                             NULL, NULL);
 }
 
+static bool has_def_qn_label(const CBMFileResult *r, const char *qn, const char *label) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->qualified_name && d->label && strcmp(d->qualified_name, qn) == 0 &&
+            strcmp(d->label, label) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Search resolved_calls for a match where caller contains callerSub
  * and callee contains calleeSub. Returns index or -1. */
 static int find_resolved(const CBMFileResult *r, const char *callerSub, const char *calleeSub) {
@@ -444,6 +455,19 @@ TEST(ktlsp_typealias) {
                                       "fun show(id: UserId): String = id.toString()\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "show", "toString"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ktlsp_any_builtin_targets) {
+    CBMFileResult *r = extract_kotlin("fun show(value: Any): String = value.toString()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_GTE(require_resolved(r, "show", "kotlin.Any.toString"), 0);
+    ASSERT(has_def_qn_label(r, "kotlin.Any", "Class"));
+    ASSERT(has_def_qn_label(r, "kotlin.Any.toString", "Method"));
+    ASSERT(has_def_qn_label(r, "kotlin.Any.equals", "Method"));
+    ASSERT(has_def_qn_label(r, "kotlin.Any.hashCode", "Method"));
     cbm_free_result(r);
     PASS();
 }
@@ -1134,6 +1158,7 @@ SUITE(kotlin_lsp) {
     RUN_TEST(ktlsp_scope_let);
     RUN_TEST(ktlsp_scope_apply);
     RUN_TEST(ktlsp_typealias);
+    RUN_TEST(ktlsp_any_builtin_targets);
     RUN_TEST(ktlsp_enum_class);
     RUN_TEST(ktlsp_sealed_when);
     RUN_TEST(ktlsp_generic_call);

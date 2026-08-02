@@ -1312,7 +1312,7 @@ static int posix_startup_lock_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
     return unlock_result == 0 && still_private && close_result == 0 ? 0 : -1;
 }
 
-int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+static int posix_transport_presence_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
     if (!endpoint_runtime_still_valid(endpoint)) {
         return -1;
     }
@@ -1322,6 +1322,14 @@ int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endp
     }
     if (errno != ENOENT) {
         return -1;
+    }
+    return 0;
+}
+
+int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    int transport = posix_transport_presence_probe(endpoint);
+    if (transport != 0) {
+        return transport;
     }
     return posix_startup_lock_probe(endpoint);
 }
@@ -2903,6 +2911,15 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
         return 1;
     }
     return -1;
+}
+
+int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    /* Presence is observed without connecting: a bootstrap caller immediately
+     * follows a positive result with the authenticated runtime connection.
+     * For P endpoint-path bytes this remains O(P) runtime and O(1) auxiliary
+     * memory while avoiding one accepted peer and worker lifecycle per
+     * bootstrap polling attempt. */
+    return posix_transport_presence_probe(endpoint);
 }
 
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
@@ -4816,12 +4833,11 @@ int cbm_daemon_ipc_lifetime_reservation_probe(const cbm_daemon_ipc_endpoint_t *e
     return result;
 }
 
-static int win_legacy_pipe_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
-    if (!endpoint || !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name) {
+static int win_named_pipe_presence_probe(const wchar_t *pipe_name) {
+    if (!pipe_name) {
         return -1;
     }
-
-    if (WaitNamedPipeW(endpoint->legacy_pipe_name, 0)) {
+    if (WaitNamedPipeW(pipe_name, 0)) {
         return 1;
     }
     DWORD pipe_error = GetLastError();
@@ -4832,6 +4848,13 @@ static int win_legacy_pipe_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
         return -1;
     }
     return 0;
+}
+
+static int win_legacy_pipe_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    if (!endpoint || !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name) {
+        return -1;
+    }
+    return win_named_pipe_presence_probe(endpoint->legacy_pipe_name);
 }
 
 int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
@@ -5445,6 +5468,35 @@ static int win_current_generation_transport_probe(const cbm_daemon_ipc_endpoint_
         return 1;
     }
     return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 0 : -1;
+}
+
+static int win_current_generation_transport_presence_probe(
+    const cbm_daemon_ipc_endpoint_t *endpoint) {
+    win_rendezvous_status_t rendezvous = win_endpoint_refresh_rendezvous(endpoint);
+    if (rendezvous == WIN_RENDEZVOUS_ABSENT) {
+        return 0;
+    }
+    if (rendezvous != WIN_RENDEZVOUS_VALID) {
+        return -1;
+    }
+    win_generation_address_t *generation = win_endpoint_generation_snapshot(endpoint);
+    if (!generation || !generation->pipe_name) {
+        return -1;
+    }
+
+    /* WaitNamedPipeW with a zero timeout observes publication without opening
+     * a server instance. The subsequent runtime connection authenticates the
+     * server. For N rendezvous/pipe-name bytes this is O(N) runtime and O(1)
+     * auxiliary memory, and bootstrap polling creates no probe-only connection
+     * or daemon worker lifecycle. */
+    return win_named_pipe_presence_probe(generation->pipe_name);
+}
+
+int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    if (!endpoint) {
+        return -1;
+    }
+    return win_current_generation_transport_presence_probe(endpoint);
 }
 
 int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uint32_t timeout_ms) {

@@ -1771,6 +1771,67 @@ TEST(daemon_ipc_no_spawn_probe_distinguishes_absent_active_and_busy) {
     PASS();
 }
 
+TEST(daemon_ipc_transport_probe_distinguishes_reservation_from_listener) {
+    static const char key[] = "3141592653589793";
+    /* A queued probe peer is immediately accept-ready; this small bound only
+     * distinguishes an empty queue without adding material suite latency. */
+    enum { EMPTY_QUEUE_ACCEPT_TIMEOUT_MS = 10 };
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+    cbm_daemon_ipc_participant_guard_t *participant = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+    cbm_daemon_ipc_connection_t *probe_connection = NULL;
+    int acquired = -1;
+    int reserved_transport = -1;
+    int listening_transport = -1;
+    int queued_after_probe = -1;
+
+    if (ipc_test_parent_new(parent, "transport-reservation")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        int startup_result = cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup);
+        bool prepared = startup_result == 1 && cbm_daemon_ipc_startup_lock_prepare_handoff(startup);
+        int participant_result =
+            prepared ? cbm_daemon_ipc_participant_guard_try_join(endpoint, &participant) : -1;
+        acquired = participant_result == 1
+                       ? cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &reservation)
+                       : -1;
+        cbm_daemon_ipc_startup_lock_release(&startup);
+        startup = NULL;
+    }
+    if (reservation) {
+        reserved_transport = cbm_daemon_ipc_transport_probe(endpoint);
+        listener = cbm_daemon_ipc_listen_reserved(endpoint, &reservation);
+    }
+    if (listener) {
+        listening_transport = cbm_daemon_ipc_transport_probe(endpoint);
+        queued_after_probe =
+            cbm_daemon_ipc_accept(listener, EMPTY_QUEUE_ACCEPT_TIMEOUT_MS, &probe_connection);
+    }
+
+    cbm_daemon_ipc_connection_close(probe_connection);
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_lifetime_reservation_release(reservation);
+    bool participant_released = cbm_daemon_ipc_participant_guard_release(&participant);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_EQ(acquired, 1);
+    ASSERT_EQ(reserved_transport, 0);
+    ASSERT_NOT_NULL(listener);
+    ASSERT_EQ(listening_transport, 1);
+    ASSERT_EQ(queued_after_probe, 0);
+    ASSERT_NULL(probe_connection);
+    ASSERT_TRUE(participant_released);
+    ASSERT_NULL(participant);
+    PASS();
+}
+
 TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen) {
     static const char key[] = "13579bdf13579bdf";
     enum { PROBE_CLIENT_CAP = 64 };
@@ -4633,6 +4694,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_relative_runtime_parent_is_canonical_and_stable);
     RUN_TEST(daemon_ipc_rejects_uppercase_instance_key);
     RUN_TEST(daemon_ipc_no_spawn_probe_distinguishes_absent_active_and_busy);
+    RUN_TEST(daemon_ipc_transport_probe_distinguishes_reservation_from_listener);
     RUN_TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen);
     RUN_TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window);
     RUN_TEST(daemon_ipc_local_frame_roundtrip);

@@ -21,8 +21,22 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
+#include "depindex/depindex.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 #include "mcp/index_supervisor.h"
+#include "pagerank/pagerank.h"
+#include "pipeline/pipeline.h"
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
+static bool cli_args_have_help(int argc, char **argv);
+static void print_install_help(void);
+static void print_uninstall_help(void);
+static void print_update_help(void);
+static const char *detect_os(void);
+static const char *detect_arch(void);
 
 /* CLI buffer size constants. */
 enum {
@@ -58,6 +72,8 @@ enum {
     SQL_NUL_TERM = -1, /* sqlite3 length = -1 means NUL-terminated */
     SQL_PARAM_1 = 1,   /* sqlite3_bind parameter index 1 */
     SQL_PARAM_2 = 2,
+    SQL_PARAM_3 = 3,
+    SQL_PARAM_4 = 4,
     SEMVER_PARTS = 3, /* major.minor.patch */
     DB_EXT_LEN = 3,   /* strlen(".db") */
     MIN_ARGC_CMD = 3,
@@ -97,9 +113,10 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #include "foundation/compat_fs.h"
 
 #ifndef CBM_VERSION
-#define CBM_VERSION "dev"
+#define CBM_VERSION CBM_VERSION_DEVELOPMENT
 #endif
-#include <errno.h>  // EEXIST
+#include <errno.h> // EEXIST
+#include <math.h>
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
 #include <limits.h> // UINT_MAX
 #include <stdint.h> // uintptr_t
@@ -153,9 +170,15 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
     return maintenance_cancelled && exit_status == EXIT_SUCCESS ? EXIT_FAILURE : exit_status;
 }
 
-static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
-    "error: active CBM sessions and operations could not be stopped safely; "
-    "no activation was committed.";
+static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
+    "error: the automatic stop request timed out while CBM sessions or operations remained "
+    "active. Close or restart every coding-agent session and CBM command using this cache, "
+    "then retry the same command; no executable, configuration, or index mutation was started.";
+static const char CLI_ACTIVATION_SAFETY_MESSAGE[] =
+    "error: CBM could not prove exclusive activation safety. Verify that the configured cache "
+    "directory (CBM_CACHE_DIR when set) is owner-only and writable, close or restart every "
+    "coding-agent session and CBM command using it, then retry the same command; no executable, "
+    "configuration, or index mutation was started.";
 static const char CLI_ACTIVATION_PARTIAL_MESSAGE[] =
     "error: activation stopped after one or more agent configuration or "
     "cleanup operations failed; the published/current executable was kept, "
@@ -195,7 +218,7 @@ static bool g_cli_activation_test_ops_set = false;
 static const char *g_cli_activation_runtime_parent_for_test = NULL;
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
-    const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
+    const char *diagnostic = message ? message : CLI_ACTIVATION_SAFETY_MESSAGE;
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);
         return;
@@ -207,7 +230,7 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
                                       cbm_cli_activation_mutation_fn mutation,
                                       void *mutation_context) {
     if (!ops || !ops->reserve_for_mutation || !ops->mutation_lease_release) {
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        cli_activation_diagnostic(ops, CLI_ACTIVATION_SAFETY_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -220,7 +243,8 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
         if (mutation_lease) {
             ops->mutation_lease_release(ops->context, mutation_lease);
         }
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        cli_activation_diagnostic(ops, reserve_status == 0 ? CLI_ACTIVATION_BUSY_MESSAGE
+                                                           : CLI_ACTIVATION_SAFETY_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -546,7 +570,7 @@ static void cli_activation_production_diagnostic(void *opaque, const char *messa
         (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_MUTATION_FAILED_MESSAGE);
         return;
     }
-    (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_REFUSED_MESSAGE);
+    (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_SAFETY_MESSAGE);
 }
 
 static bool cli_activation_production_context_init(cli_activation_production_context_t *context,
@@ -672,7 +696,7 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
     cli_activation_production_context_t context;
     if (!cli_activation_production_context_init(&context, action, target_version, target_build)) {
         cli_activation_production_context_close(&context);
-        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_REFUSED_MESSAGE);
+        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_SAFETY_MESSAGE);
         return CLI_TRUE;
     }
     printf("Stopping active CBM sessions and operations for %s...\n",
@@ -731,7 +755,7 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
 
 /* ── Version ──────────────────────────────────────────────────── */
 
-static const char *cli_version = "dev";
+static const char *cli_version = CBM_VERSION_DEVELOPMENT;
 
 void cbm_cli_set_version(const char *ver) {
     if (ver) {
@@ -741,6 +765,10 @@ void cbm_cli_set_version(const char *ver) {
 
 const char *cbm_cli_get_version(void) {
     return cli_version;
+}
+
+bool cbm_version_is_development(const char *version) {
+    return version && strcmp(version, CBM_VERSION_DEVELOPMENT) == 0;
 }
 
 /* ── Version comparison ───────────────────────────────────────── */
@@ -823,7 +851,7 @@ const char *cbm_detect_shell_rc(const char *home_dir) {
         /* Prefer .bashrc, fall back to .bash_profile */
         snprintf(buf, sizeof(buf), "%s/.bashrc", home_dir);
         struct stat st;
-        if (stat(buf, &st) == 0) {
+        if (cbm_stat(buf, &st) == 0) {
             return buf;
         }
         snprintf(buf, sizeof(buf), "%s/.bash_profile", home_dir);
@@ -848,14 +876,14 @@ const char *cbm_detect_shell_rc(const char *home_dir) {
 #define PATH_DELIM ":"
 #endif
 
-/* Check if a path exists and is executable.
- * On Windows, stat() doesn't set S_IXUSR — just check existence. */
+/* Check if a path exists and is executable. On Windows the metadata API does
+ * not set S_IXUSR, so existence is the portable executable predicate. */
 static bool is_executable(const char *path) {
     struct stat st;
 #ifdef _WIN32
-    return stat(path, &st) == 0;
+    return cbm_stat(path, &st) == 0;
 #else
-    return stat(path, &st) == 0 && (st.st_mode & S_IXUSR);
+    return cbm_stat(path, &st) == 0 && (st.st_mode & S_IXUSR);
 #endif
 }
 
@@ -954,12 +982,12 @@ static bool cbm_agent_cli_exists(const char *name, const char *home_dir) {
 /* ── File utilities ───────────────────────────────────────────── */
 
 int cbm_copy_file(const char *src, const char *dst) {
-    FILE *in = fopen(src, "rb");
+    FILE *in = cbm_fopen(src, "rb");
     if (!in) {
         return CLI_ERR;
     }
 
-    FILE *out = fopen(dst, "wb");
+    FILE *out = cbm_fopen(dst, "wb");
     if (!out) {
         (void)fclose(in);
         return CLI_ERR;
@@ -995,7 +1023,7 @@ int cbm_copy_file(const char *src, const char *dst) {
 static bool cbm_same_file(const char *a, const char *b) {
     struct stat sa;
     struct stat sb;
-    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+    if (cbm_stat(a, &sa) != 0 || cbm_stat(b, &sb) != 0) {
         return false;
     }
 #ifdef _WIN32
@@ -1217,7 +1245,7 @@ static const char skill_content[] =
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
     "\n"
-    "Graph tools return precise structural results in ~500 tokens vs ~80K for grep.\n"
+    "Graph tools return structured code results with lower token cost than broad grep.\n"
     "\n"
     "## Quick Decision Matrix\n"
     "\n"
@@ -1234,10 +1262,16 @@ static const char skill_content[] =
     "| Text search | `search_code` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `list_projects` — check if project is indexed\n"
-    "2. `get_graph_schema` — understand node/edge types\n"
-    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
-    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
+    "- **Streamlined:** `search_graph(name_pattern=\"...\")` finds symbols and can auto-index the "
+    "server CWD or explicit repo path; use `trace_path`, `get_code(qualified_name=...)`, and "
+    "`query_graph` as needed. First-use indexing and first-response context are automatic when "
+    "configured.\n"
+    "- **Classic:** use `search_graph(name_pattern=\"...\")`, then `trace_path`, then "
+    "`get_code_snippet(qualified_name=...)`; use `query_graph` or `get_architecture` for broader "
+    "structure.\n"
+    "- `_hidden_tools` is only for explicit streamlined diagnostics or maintenance such as "
+    "list_projects, index_status, get_graph_schema, check_index_coverage, index_repository, or "
+    "index_dependencies; classic advertises those tools directly.\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
@@ -1254,40 +1288,43 @@ static const char skill_content[] =
     "complete relevant pagination, both call directions and broader relationships when material, "
     "plus explicit unresolved limitations.\n"
     "- **Every tier:** after candidate paths are known, call `check_index_coverage` once with "
-    "every "
-    "evidence path. For negative or exhaustive claims also include the relevant scopes. A clean "
+    "every evidence path (reveal it first when streamlined). "
+    "For negative or exhaustive claims also include the relevant scopes. A clean "
     "result means no recorded gap, not proof of completeness. For partial, skipped, excluded, "
     "stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying on "
     "the graph.\n"
     "\n"
-    "## Sessions and Subagents\n"
-    "- At session start or after compaction, call `list_projects`/`index_status` before "
-    "structural exploration, then choose Scout, Verify, or Auditor for the task.\n"
-    "- Before delegating, query the graph and coverage in the parent. Pass the tier, exact "
-    "project, "
-    "generation/freshness, bounded scope, queries and pagination state, qualified symbols, paths, "
-    "call-chain findings, coverage ranges/reasons, source fallback already performed, and "
-    "unresolved "
-    "questions to the child.\n"
-    "- Runtimes such as Hermes isolate child context: put those graph findings in the "
-    "`context` argument to `delegate_task`; do not assume the child inherits MCP access or "
-    "the parent's conversation.\n"
-    "- A child without MCP tools must not call or claim MCP access. It should work from the "
-    "supplied "
-    "evidence and use read/grep on exact source, especially every reported missed-coverage range.\n"
+    "## Freshness and Delegation\n"
+    "- auto_watch=true registers indexed projects for automatic background Git-change refresh; "
+    "when false, refresh explicitly after changes.\n"
+    "- When auto_index=true, default graph calls can index the server CWD or an explicit path "
+    "under auto_index_limit. When disabled or skipped, reveal/use index_repository explicitly. "
+    "Reveal list_projects/index_status only for explicit inventory or freshness diagnostics.\n"
+    "- auto_index_deps=true indexes dependency APIs up to auto_dep_limit; when disabled or capped, "
+    "reveal/use index_dependencies for required packages instead of assuming dependency coverage.\n"
+    "- When handing work to another agent, pass the evidence tier, project, generation/freshness, "
+    "bounded scope, queries and pagination state, qualified symbols, paths, coverage findings, "
+    "source fallback, and unresolved questions. Do not assume it inherits tool access or context.\n"
+    "- Hermes isolates delegated context: pass those graph findings in the `context` argument to "
+    "`delegate_task`; do not assume the child inherits MCP access or the parent conversation.\n"
     "\n"
     "## Quality Analysis\n"
     "- Dead code: `search_graph(max_degree=0, exclude_entry_points=true)`\n"
-    "- High fan-out: `search_graph(min_degree=10, relationship=\"CALLS\", "
-    "direction=\"outbound\")`\n"
-    "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
-    "direction=\"inbound\")`\n"
+    "- High fan-out: `query_graph(query=\"MATCH (f)-[:CALLS]->(g) RETURN f.name, count(g) AS "
+    "out_degree ORDER BY out_degree DESC LIMIT 20\")`\n"
+    "- High fan-in: `query_graph(query=\"MATCH (f)<-[:CALLS]-(g) RETURN f.name, count(g) AS "
+    "in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
     "\n"
-    "## 15 MCP Tools\n"
+    "## MCP Tools\n"
+    "Normal streamlined exploration uses `search_graph`, `query_graph`, `search_code`, "
+    "`trace_path`, and `get_code`; graph-backed calls auto-index and deliver first-response "
+    "context when configured. `_hidden_tools` discovers explicit advanced operations. Classic "
+    "mode advertises them directly and uses "
+    "`get_code_snippet` for source retrieval:\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
     "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
-    "`check_index_coverage`, `manage_adr`, `ingest_traces`\n"
+    "`check_index_coverage`, `manage_adr`, `ingest_traces`, `index_dependencies`\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
@@ -1302,16 +1339,29 @@ static const char skill_content[] =
     "MATCH (f:Function) WHERE f.name =~ '.*Handler.*' RETURN f.name, f.file_path\n"
     "MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'main' RETURN b.name\n"
     "```\n"
+    "Examples are non-exhaustive guidance. Write problem-specific Cypher for effective, "
+    "computationally efficient results; explicit labels/properties and exploratory LIMIT are "
+    "optional optimizations.\n"
     "\n"
     "## Gotchas\n"
     "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
     "use `query_graph` with Cypher to see actual edges.\n"
-    "2. `query_graph` has a 100k row ceiling — add a Cypher `LIMIT` for broad queries "
-    "or use `search_graph` pagination.\n"
-    "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
-    "4. `direction=\"outbound\"` misses cross-service callers — use "
-    "`direction=\"both\"`.\n"
-    "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
+    /* Defaults are concatenated from constants.h rather than restated, so
+     * changing either configured budget cannot leave this text stale. */
+    "2. `query_graph` is bounded three ways: query_max_rows defaults "
+    "to " CBM_DEFAULT_QUERY_MAX_ROWS_STR " final rows and marks a complete prefix as truncated; "
+    "query_max_working_rows defaults to " CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
+    " intermediate rows and returns an MCP tool execution error instead of partial results when "
+    "exhausted; query_max_output_bytes bounds the serialized response. A Cypher LIMIT may lower "
+    "but not bypass the output cap. Use LIMIT when it helps exploration efficiency; omit it when "
+    "full results are necessary, and set max_output_bytes=0 only when uncapped output is "
+    "appropriate.\n"
+    "3. `trace_path` works best with exact names — use `search_graph(name_pattern=...)` first.\n"
+    "4. `direction=\"outbound\"` returns callees only; use `direction=\"both\"` for callers too.\n"
+    /* Default concatenated from CBM_DEFAULT_SEARCH_LIMIT_STR (constants.h) so
+     * raising the default cannot leave this text stale. */
+    "5. Results default to search_limit (" CBM_DEFAULT_SEARCH_LIMIT_STR " unless configured); "
+    "check `has_more` and use `offset`.\n";
 
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
@@ -1319,13 +1369,33 @@ static const char codex_instructions_content[] =
     "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
     "Use the MCP tools to explore and understand the code:\n"
     "\n"
-    "- `search_graph` — find functions, classes, routes by pattern\n"
+    "- `search_graph` — find functions, classes, routes by pattern; graph-backed tools can "
+    "auto-index the server CWD or explicit repo path when auto_index=true and under "
+    "auto_index_limit\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
-    "- `get_code_snippet` — read function source code\n"
-    "- `query_graph` — run Cypher queries for complex patterns\n"
-    "- `get_architecture` — high-level project summary\n"
+    "- Use the advertised source tool: `get_code` in streamlined mode or `get_code_snippet` in "
+    "classic mode\n"
+    "- `query_graph` — write problem-specific Cypher for effective, computationally efficient "
+    "structural answers; examples and LIMIT are optional guidance\n"
+    "- `get_architecture` — high-level summary after `_hidden_tools` reveal or in classic mode\n"
     "\n"
-    "Always prefer graph tools over grep for code discovery.\n";
+    "Normal streamlined exploration uses the default tools above as needed without a reveal. "
+    "Classic structural discovery uses `search_graph`, then `trace_path`, then "
+    "`get_code_snippet`; use `query_graph` or `get_architecture` for broader structure. When "
+    "configured, streamlined first-use indexing and first-response context are automatic. "
+    "Classic mode advertises explicit checks such as "
+    "`check_index_coverage`, `index_status`, `index_repository`, and `index_dependencies` "
+    "directly; streamlined discovers them through `_hidden_tools`. "
+    "With auto_index=true, graph-backed tools can index "
+    "paths under auto_index_limit; otherwise use index_repository. auto_index_deps and "
+    "auto_dep_limit control automatic dependency coverage, so use index_dependencies for "
+    "disabled, capped, or missing packages. auto_watch controls automatic background Git-change "
+    "refresh.\n"
+    "\n"
+    "Prefer graph tools over grep for structural code discovery.\n"
+    "If a sandbox blocks an MCP or CLI operation because it crosses a shell or filesystem "
+    "boundary, retry that operation with escalation instead of treating the block as a project "
+    "failure. MCP approval and shell sandbox authorization are separate.\n";
 
 /* Old skill names — cleaned up during install to remove stale directories. */
 static const char *old_skill_names[] = {
@@ -1363,7 +1433,7 @@ static bool cbm_remove_empty_directory(const char *path, bool dry_run) {
 #ifndef _WIN32
     if (lstat(path, &state) != 0 || !S_ISDIR(state.st_mode)) {
 #else
-    if (stat(path, &state) != 0 || !S_ISDIR(state.st_mode)) {
+    if (cbm_stat(path, &state) != 0 || !S_ISDIR(state.st_mode)) {
 #endif
         return false;
     }
@@ -1411,7 +1481,7 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
             continue;
         }
 #else
-        if (stat(skill_path, &skill_state) == 0 && !S_ISDIR(skill_state.st_mode)) {
+        if (cbm_stat(skill_path, &skill_state) == 0 && !S_ISDIR(skill_state.st_mode)) {
             continue;
         }
 #endif
@@ -1419,7 +1489,7 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
         /* Check if already exists */
         if (!force) {
             struct stat st;
-            if (stat(file_path, &st) == 0) {
+            if (cbm_stat(file_path, &st) == 0) {
                 continue;
             }
         }
@@ -1455,13 +1525,13 @@ int cbm_remove_skills(const char *skills_dir, bool dry_run) {
 #ifndef _WIN32
         if (lstat(skill_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
 #else
-        if (stat(skill_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (cbm_stat(skill_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
 #endif
             continue;
         }
 
         struct stat file_state;
-        if (stat(file_path, &file_state) != 0) {
+        if (cbm_stat(file_path, &file_state) != 0) {
             continue;
         }
 
@@ -1563,7 +1633,7 @@ static char *cbm_build_json_mcp_entry(const char *binary_path, cbm_json_mcp_sche
 }
 
 static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const char *argument,
-                                            cbm_json_like_object_field_t fields[3]) {
+                                            cbm_json_like_object_field_t fields[4]) {
     fields[0] = (cbm_json_like_object_field_t){
         .key = "command",
         .shape = cbm_json_mcp_command_is_array(schema) ? CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY
@@ -1578,17 +1648,26 @@ static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const 
         .expected_string = argument,
         .flags = argument ? CBM_JSON_LIKE_FIELD_REQUIRED : 0U,
     };
+    /* Pre-consolidation installer releases wrote an extra "enabled": true
+     * member; accept that exact released shape so upgrades and uninstalls
+     * recognize their own prior entries (command ownership still required). */
+    size_t count = 2U;
     const char *type = cbm_json_mcp_required_type(schema);
-    if (!type) {
-        return 2U;
+    if (type) {
+        fields[count++] = (cbm_json_like_object_field_t){
+            .key = "type",
+            .shape = CBM_JSON_LIKE_VALUE_STRING,
+            .expected_string = type,
+            .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+        };
     }
-    fields[2] = (cbm_json_like_object_field_t){
-        .key = "type",
-        .shape = CBM_JSON_LIKE_VALUE_STRING,
-        .expected_string = type,
-        .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+    fields[count++] = (cbm_json_like_object_field_t){
+        .key = "enabled",
+        .shape = CBM_JSON_LIKE_VALUE_TRUE,
+        .expected_string = NULL,
+        .flags = 0U,
     };
-    return 3U;
+    return count;
 }
 
 /* The running executable is trustworthy identity evidence: install/update can
@@ -1899,7 +1978,7 @@ static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document
                                            cbm_json_mcp_schema_t schema, const char *entry_name,
                                            const char *argument, const char *expected_binary,
                                            const char *previous_managed_binary) {
-    cbm_json_like_object_field_t fields[3];
+    cbm_json_like_object_field_t fields[4];
     size_t field_count = cbm_json_mcp_ownership_fields(schema, argument, fields);
     char *command = NULL;
     int result = cbm_json_like_match_object_entry(document, document_length, object_path, path_len,
@@ -2113,7 +2192,7 @@ static bool dir_exists(const char *path) {
 #ifndef _WIN32
     return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
 #else
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return cbm_stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
 }
 
@@ -2465,7 +2544,12 @@ static int cbm_build_claude_hook_command(const char *script_name, const char *co
 
 static int cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    if (env_present && !env_fits) {
+        return CLI_ERR;
+    }
+    const char *env = env_fits ? env_buf : NULL;
 #ifdef _WIN32
     return cbm_build_claude_hook_command(script_name, env, true, out, out_sz);
 #else
@@ -2477,7 +2561,12 @@ static int cbm_resolve_hook_command(const char *script_name, char *out, size_t o
 int cbm_resolve_claude_hook_command_for_testing(const char *script_name, bool windows,
                                                 char *command, size_t command_size) {
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    if (env_present && !env_fits) {
+        return CLI_ERR;
+    }
+    const char *env = env_fits ? env_buf : NULL;
     return cbm_build_claude_hook_command(script_name, env, windows, command, command_size);
 }
 #endif
@@ -2489,7 +2578,12 @@ static int cbm_resolve_previous_hook_command(const char *script_name, char *out,
         return CLI_ERR;
     }
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    if (env_present && !env_fits) {
+        return CLI_ERR;
+    }
+    const char *env = env_fits ? env_buf : NULL;
     if (env && env[0]) {
         char path[CLI_BUF_1K];
         int written = snprintf(path, sizeof(path), "%s/hooks/%s", env, script_name);
@@ -2509,7 +2603,12 @@ static int cbm_resolve_released_hook_command(const char *script_name, char *out,
         return CLI_ERR;
     }
     char env_buf[CLI_BUF_1K];
-    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    bool env_present = false;
+    bool env_fits = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present);
+    if (env_present && !env_fits) {
+        return CLI_ERR;
+    }
+    const char *env = env_fits ? env_buf : NULL;
     int written = env && env[0] ? snprintf(out, out_sz, "%s/hooks/%s", env, script_name)
                                 : snprintf(out, out_sz, "~/.claude/hooks/%s", script_name);
     return written > 0 && (size_t)written < out_sz ? CLI_OK : CLI_ERR;
@@ -2526,6 +2625,15 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     cbm_claude_config_dir(home_dir, path, sizeof(path));
     agents.claude_code = path[0] != '\0' && dir_exists(path);
+
+#ifdef __APPLE__
+    snprintf(path, sizeof(path), "%s/Library/Application Support/Claude", home_dir);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/AppData/Roaming/Claude", home_dir);
+#else
+    snprintf(path, sizeof(path), "%s/.config/Claude", home_dir);
+#endif
+    agents.claude_desktop = dir_exists(path);
 
     cbm_codex_config_dir(home_dir, path, sizeof(path));
     agents.codex = path[0] != '\0' && dir_exists(path);
@@ -2565,7 +2673,8 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 #endif
     agents.kilocode = dir_exists(path);
     snprintf(path, sizeof(path), "%s/.config/kilo", home_dir);
-    agents.kilocode = agents.kilocode || dir_exists(path) || cbm_agent_cli_exists("kilo", home_dir);
+    agents.kilo_cli = dir_exists(path) || cbm_agent_cli_exists("kilo", home_dir);
+    agents.kilocode = agents.kilocode || agents.kilo_cli;
 
 #ifdef __APPLE__
     snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", home_dir);
@@ -2672,12 +2781,16 @@ static const char agent_instructions_content[] =
     "ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.\n"
     "\n"
     "### Priority Order\n"
+    "Classic uses steps 1-3 in order; streamlined uses them as needed without a reveal. Later "
+    "tools cover verification or broader structure.\n"
     "1. `search_graph` — find functions, classes, routes, variables by pattern\n"
     "2. `trace_path` — trace who calls a function or what it calls\n"
-    "3. `get_code_snippet` — read specific function/class source code\n"
-    "4. `check_index_coverage` — validate candidate paths and missed ranges before claims\n"
+    "3. Use advertised `get_code` (streamlined) or `get_code_snippet` (classic) — read exact "
+    "source\n"
+    "4. `check_index_coverage` — validate candidate paths and missed ranges before claims "
+    "(reveal it first with `_hidden_tools` in streamlined mode)\n"
     "5. `query_graph` — run Cypher queries for complex patterns\n"
-    "6. `get_architecture` — high-level project summary\n"
+    "6. `get_architecture` — high-level project summary (advanced when streamlined)\n"
     "\n"
     "### Evidence tiers\n"
     "- **Scout (Tier 1):** quick positive lookup with few calls and targeted source checks. Mark "
@@ -2689,7 +2802,8 @@ static const char agent_instructions_content[] =
     "- **Auditor (Tier 3):** bounded-scope full verification with current generation, complete "
     "relevant pagination, both call directions and broader relationships when material, and every "
     "limitation disclosed.\n"
-    "- After candidate paths are known in any tier, call `check_index_coverage` once with every "
+    "- After candidate paths are known in any tier, reveal advanced tools when streamlined, then "
+    "call `check_index_coverage` once with every "
     "evidence path. Add relevant scopes for negative or exhaustive claims. A clean result means no "
     "recorded gap, not proof of completeness. For partial, skipped, excluded, stale, pending, or "
     "unknown coverage, read/grep the reported ranges or scope before relying on graph results.\n"
@@ -2702,11 +2816,18 @@ static const char agent_instructions_content[] =
     "### Examples\n"
     "- Find a handler: `search_graph(name_pattern=\".*OrderHandler.*\")`\n"
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
-    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n"
+    "- Read source: use advertised `get_code(qualified_name=...)` or "
+    "`get_code_snippet(qualified_name=...)`\n"
     "\n"
     "### Session resets and subagents\n"
-    "- At session start or after compaction, confirm the nearest graph project and generation with "
-    "`list_projects` or `index_status`, then choose Scout, Verify, or Auditor.\n"
+    "- At session start or after compaction, use automatic session/first-response context when "
+    "available. For explicit inventory or freshness diagnostics, use `list_projects` or "
+    "`index_status` (after `_hidden_tools` reveal when streamlined), then choose Scout, Verify, "
+    "or Auditor.\n"
+    "- With auto_index=true, graph-backed tools can index a CWD/path under auto_index_limit; "
+    "otherwise reveal/use index_repository. auto_index_deps and auto_dep_limit bound automatic "
+    "dependency coverage; reveal/use index_dependencies for missing packages. auto_watch controls "
+    "automatic background Git-change refresh.\n"
     "- Before spawning a subagent, query the graph and coverage in the parent. Pass the tier, "
     "project, generation/freshness, bounded scope, queries and pagination state, qualified "
     "symbols, "
@@ -3118,7 +3239,7 @@ const char *cbm_get_agent_instructions(void) {
 
 /* Read entire file into malloc'd buffer. Returns NULL on error. */
 static char *read_file_str(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         if (out_len) {
             *out_len = 0;
@@ -3231,7 +3352,10 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
         cbm_remove_codex_legacy_mcp(config_path) != 0) {
         return CLI_ERR;
     }
-    return cbm_toml_upsert_managed_block(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END, block) == 0
+    /* Per-tool approval tables are user policy below the installer-owned MCP
+     * root. Preserve them across upgrades; TOML permits child-before-parent. */
+    return cbm_toml_upsert_managed_block_preserve_descendants(config_path, CODEX_MCP_BEGIN,
+                                                              CODEX_MCP_END, block) == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -3264,13 +3388,17 @@ static int cbm_build_augment_command(const char *binary_path, char *out, size_t 
     return written > 0 && (size_t)written < out_size ? CLI_OK : CLI_ERR;
 }
 
+static bool cbm_hook_dialect_supported(const char *dialect) {
+    return dialect && (strcmp(dialect, "hermes") == 0 || strcmp(dialect, "qoder") == 0 ||
+                       strcmp(dialect, "kimi") == 0 || strcmp(dialect, "devin") == 0 ||
+                       strcmp(dialect, "cline") == 0 || strcmp(dialect, "gemini") == 0 ||
+                       strcmp(dialect, "qwen") == 0 || strcmp(dialect, "factory") == 0 ||
+                       strcmp(dialect, "augment") == 0);
+}
+
 static int cbm_build_augment_dialect_command(const char *binary_path, const char *dialect,
                                              char *out, size_t out_size) {
-    if (!dialect || (strcmp(dialect, "hermes") != 0 && strcmp(dialect, "qoder") != 0 &&
-                     strcmp(dialect, "kimi") != 0 && strcmp(dialect, "devin") != 0 &&
-                     strcmp(dialect, "cline") != 0 && strcmp(dialect, "gemini") != 0 &&
-                     strcmp(dialect, "qwen") != 0 && strcmp(dialect, "factory") != 0 &&
-                     strcmp(dialect, "augment") != 0)) {
+    if (!cbm_hook_dialect_supported(dialect)) {
         return CLI_ERR;
     }
     char base[CLI_BUF_8K];
@@ -3290,20 +3418,30 @@ static int cbm_build_augment_command_windows(const char *binary_path, char *out,
     return written > 0 && (size_t)written < out_size ? CLI_OK : CLI_ERR;
 }
 
-static int cbm_build_dialect_hook_command(const char *binary_path, const char *dialect,
-                                          bool windows, char *command, size_t command_size,
-                                          char *shell, size_t shell_size) {
+static int cbm_build_hook_command(const char *binary_path, bool windows, char *command,
+                                  size_t command_size, char *shell, size_t shell_size) {
     if (!shell || shell_size == 0U) {
         return CLI_ERR;
     }
     if (!windows) {
         shell[0] = '\0';
-        return cbm_build_augment_dialect_command(binary_path, dialect, command, command_size);
+        return cbm_build_augment_command(binary_path, command, command_size);
     }
     int shell_written = snprintf(shell, shell_size, "%s", "powershell");
+    return shell_written > 0 && (size_t)shell_written < shell_size
+               ? cbm_build_augment_command_windows(binary_path, command, command_size)
+               : CLI_ERR;
+}
+
+static int cbm_build_dialect_hook_command(const char *binary_path, const char *dialect,
+                                          bool windows, char *command, size_t command_size,
+                                          char *shell, size_t shell_size) {
+    if (!cbm_hook_dialect_supported(dialect)) {
+        return CLI_ERR;
+    }
     char base[CLI_BUF_8K];
-    if (shell_written < 0 || (size_t)shell_written >= shell_size ||
-        cbm_build_augment_command_windows(binary_path, base, sizeof(base)) != CLI_OK) {
+    if (cbm_build_hook_command(binary_path, windows, base, sizeof(base), shell, shell_size) !=
+        CLI_OK) {
         return CLI_ERR;
     }
     int written = snprintf(command, command_size, "%s --dialect %s", base, dialect);
@@ -4920,6 +5058,29 @@ static const char cmm_released_session_script[] =
     "3. If a project is not indexed yet, run index_repository FIRST.\n"
     "REMINDER\n";
 
+/* Exact SessionStart document emitted by the streamlined auto-index release.
+ * Keep released installer bytes explicit so upgrades migrate only known-owned
+ * files; a user-edited near-match continues to fail closed. */
+static const char cmm_released_streamlined_session_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
+    "cat << 'REMINDER'\n"
+    "Code Discovery Protocol:\n"
+    "1. Prefer codebase-memory-mcp tools first for structural code exploration:\n"
+    "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
+    "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
+    "   - get_code(qualified_name) for exact symbol source in streamlined mode\n"
+    "   - query_graph(query) for complex Cypher patterns\n"
+    "   - search_code(pattern) for text/regex source search in an indexed project\n"
+    "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
+    "   always Read a file before editing it.\n"
+    "3. Graph-backed tools auto-index the server CWD or explicit repo paths when\n"
+    "   auto_index=true and under auto_index_limit. search_code needs an\n"
+    "   indexed project. Use _hidden_tools\n"
+    "   to reveal index_repository or get_architecture when explicit control is needed.\n"
+    "REMINDER\n";
+
 static const char cmm_released_subagent_script[] =
     "#!/usr/bin/env bash\n"
     "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
@@ -5071,14 +5232,16 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
                                       sizeof(script)) != CLI_OK) {
         return false;
     }
-    const char *const legacy[] = {cmm_released_session_script};
+    const char *const legacy[] = {cmm_released_session_script,
+                                  cmm_released_streamlined_session_script};
 #ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_SESSION_REMINDER_SCRIPT_LEGACY, script,
-                                            legacy, 1U) != CLI_OK) {
+                                            legacy, sizeof(legacy) / sizeof(legacy[0])) != CLI_OK) {
         return false;
     }
 #endif
-    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
+    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy,
+                                                   sizeof(legacy) / sizeof(legacy[0]));
 }
 
 static int cbm_upsert_session_hooks(const char *settings_path) {
@@ -5151,6 +5314,14 @@ static int cbm_remove_session_hooks(const char *settings_path) {
         }
     }
     return rc;
+}
+
+int cbm_upsert_claude_session_hooks(const char *settings_path) {
+    return cbm_upsert_session_hooks(settings_path);
+}
+
+int cbm_remove_claude_session_hooks(const char *settings_path) {
+    return cbm_remove_session_hooks(settings_path);
 }
 
 static bool cbm_has_complete_claude_session_hooks(const char *home) {
@@ -5341,18 +5512,24 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path) {
 /* Matcher excludes read_file for consistency with the Claude fix: the hook
  * is an advisory reminder, not a gate over the agent's file reads. */
 #define GEMINI_HOOK_MATCHER "google_web_search|grep_search"
-#define GEMINI_HOOK_COMMAND                                                            \
+#define GEMINI_HOOK_COMMAND                                                     \
+    "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"       \
+    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer the " \
+    "codebase-memory-mcp graph tools over grep or file search.'}}))\""
+#define GEMINI_PREVIOUS_HOOK_COMMAND                                                   \
     "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"              \
     "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer "            \
     "codebase-memory-mcp search_graph, trace_path, and get_code_snippet over grep or " \
     "file search.'}}))\""
 static const char *const cmm_gemini_released_hook_commands[] = {
+    GEMINI_PREVIOUS_HOOK_COMMAND,
     "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_path/get_code_snippet over "
     "grep/file search for code discovery.' >&2",
     "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_call_path/get_code_snippet "
     "over grep/file search for code discovery.' >&2",
     NULL,
 };
+#undef GEMINI_PREVIOUS_HOOK_COMMAND
 
 int cbm_upsert_gemini_hooks(const char *settings_path) {
     return upsert_hooks_json((hooks_upsert_args_t){
@@ -5411,22 +5588,29 @@ static int cbm_remove_gemini_coverage_hook(const char *settings_path, const char
 }
 #endif
 
-/* Gemini CLI SessionStart reminder. settings.json uses the same
- * hooks.<Event>[].hooks[] JSON shape as Claude, so it reuses upsert_hooks_json. */
-#define GEMINI_SESSION_COMMAND                                                          \
+/* Exact released command retained only so upgrades and uninstalls can remove
+ * entries owned by versions that embedded static SessionStart guidance. */
+#define GEMINI_RELEASED_SESSION_COMMAND                                                 \
     "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"               \
     "hookEventName:'SessionStart',additionalContext:'Code discovery: prefer "           \
     "codebase-memory-mcp search_graph, trace_path, get_code_snippet, query_graph, and " \
     "search_code; run index_repository first when needed.'}}))\""
 static const char *const cmm_gemini_released_session_commands[] = {
+    GEMINI_RELEASED_SESSION_COMMAND,
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, "
     "get_code_snippet, query_graph, search_code) over grep/file-read; run index_repository "
     "first if the project is not indexed.\"",
     NULL,
 };
 
-int cbm_upsert_gemini_session_hooks(const char *settings_path) {
+int cbm_upsert_gemini_session_hooks(const char *settings_path, const char *binary_path) {
     static const char *const matchers[] = {"startup", "resume", "clear"};
+    char command[CLI_BUF_8K];
+    char shell[CLI_BUF_32];
+    if (cbm_build_hook_command(binary_path, cbm_current_platform_is_windows(), command,
+                               sizeof(command), shell, sizeof(shell)) != CLI_OK) {
+        return CLI_ERR;
+    }
     int rc = CLI_OK;
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         const char *const *old_matchers = i == 0U ? cmm_gemini_session_old_matchers : NULL;
@@ -5434,11 +5618,12 @@ int cbm_upsert_gemini_session_hooks(const char *settings_path) {
                 .settings_path = settings_path,
                 .hook_event = "SessionStart",
                 .matcher_str = matchers[i],
-                .command_str = GEMINI_SESSION_COMMAND,
+                .command_str = command,
+                .shell = shell[0] ? shell : NULL,
                 .old_matchers = old_matchers,
                 .old_commands = cmm_gemini_released_session_commands,
                 .timeout_value = GEMINI_HOOK_TIMEOUT_MS,
-                .match_command_exact = GEMINI_SESSION_COMMAND,
+                .match_command_exact = command,
             }) != CLI_OK) {
             rc = CLI_ERR;
         }
@@ -5446,8 +5631,14 @@ int cbm_upsert_gemini_session_hooks(const char *settings_path) {
     return rc;
 }
 
-int cbm_remove_gemini_session_hooks(const char *settings_path) {
+int cbm_remove_gemini_session_hooks(const char *settings_path, const char *binary_path) {
     static const char *const matchers[] = {"startup", "resume", "clear"};
+    char command[CLI_BUF_8K];
+    char shell[CLI_BUF_32];
+    if (cbm_build_hook_command(binary_path, cbm_current_platform_is_windows(), command,
+                               sizeof(command), shell, sizeof(shell)) != CLI_OK) {
+        return CLI_ERR;
+    }
     int rc = CLI_OK;
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         const char *const *old_matchers = i == 0U ? cmm_gemini_session_old_matchers : NULL;
@@ -5457,7 +5648,7 @@ int cbm_remove_gemini_session_hooks(const char *settings_path) {
                 .matcher_str = matchers[i],
                 .old_matchers = old_matchers,
                 .old_commands = cmm_gemini_released_session_commands,
-                .match_command_exact = GEMINI_SESSION_COMMAND,
+                .match_command_exact = command,
             }) != CLI_OK) {
             rc = CLI_ERR;
         }
@@ -5675,8 +5866,50 @@ static int cbm_remove_augment_coverage_hook(const char *settings_path, const cha
 
 /* ── PATH management ──────────────────────────────────────────── */
 
-int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
-    if (!bin_dir || !rc_file) {
+static bool cli_path_is_directory(const char *path, const char *directory) {
+    if (!path || !directory) {
+        return false;
+    }
+    size_t path_len = strlen(path);
+    while (path_len > 1U && path[path_len - 1U] == '/') {
+        path_len--;
+    }
+    size_t directory_len = strlen(directory);
+    return path_len == directory_len && strncmp(path, directory, directory_len) == 0;
+}
+
+static const char *cli_stale_owned_homebrew_path(const char *bin_dir, const char *os,
+                                                 const char *arch) {
+    if (strcmp(os, "darwin") != 0) {
+        return NULL;
+    }
+    if (cli_path_is_directory(bin_dir, "/usr/local/bin")) {
+        return "/opt/homebrew/bin";
+    }
+    if (cli_path_is_directory(bin_dir, "/opt/homebrew/bin")) {
+        return "/usr/local/bin";
+    }
+    if (strcmp(arch, "arm64") == 0) {
+        return "/usr/local/bin";
+    }
+    if (strcmp(arch, "amd64") == 0 || strcmp(arch, "x86_64") == 0) {
+        return "/opt/homebrew/bin";
+    }
+    return NULL;
+}
+
+static int cli_remove_opposite_owned_path(const char *bin_dir, const char *rc_file, bool dry_run,
+                                          const char *os, const char *arch) {
+    const char *stale_path = cli_stale_owned_homebrew_path(bin_dir, os, arch);
+    if (!stale_path) {
+        return CLI_OK;
+    }
+    return cbm_remove_owned_path(stale_path, rc_file, dry_run);
+}
+
+static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file, bool dry_run,
+                                        const char *os, const char *arch) {
+    if (!bin_dir || !rc_file || !os || !arch) {
         return CLI_ERR;
     }
 
@@ -5695,13 +5928,15 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
     }
 
     /* Check if already present in rc file */
-    FILE *f = fopen(rc_file, "r");
+    FILE *f = cbm_fopen(rc_file, "r");
     if (f) {
         char buf[CLI_BUF_2K];
         while (fgets(buf, sizeof(buf), f)) {
             if (strstr(buf, line)) {
                 (void)fclose(f);
-                return CLI_TRUE; /* already present */
+                int cleanup_rc =
+                    cli_remove_opposite_owned_path(bin_dir, rc_file, dry_run, os, arch);
+                return cleanup_rc == CLI_OK ? CLI_TRUE : CLI_ERR; /* already present */
             }
         }
         (void)fclose(f);
@@ -5711,15 +5946,81 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
         return 0;
     }
 
-    f = fopen(rc_file, "a");
+    f = cbm_fopen(rc_file, "a");
     if (!f) {
         return CLI_ERR;
     }
 
     (void)fprintf(f, "\n# Added by codebase-memory-mcp install\n%s\n", line);
-    (void)fclose(f);
-    return 0;
+    if (fclose(f) != 0) {
+        return CLI_ERR;
+    }
+
+    /* A legacy automatic install may have added the opposite Homebrew prefix.
+     * Remove only our exact managed block after the replacement line is
+     * durable, but never remove bin_dir itself: an explicit --dir remains
+     * authoritative even when it names the other architecture's prefix. */
+    if (cli_remove_opposite_owned_path(bin_dir, rc_file, dry_run, os, arch) != CLI_OK) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
 }
+
+int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
+    return cbm_ensure_path_for_platform(bin_dir, rc_file, dry_run, detect_os(), detect_arch());
+}
+
+int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run) {
+    if (!bin_dir || !rc_file) {
+        return CLI_ERR;
+    }
+    size_t rc_len = strlen(rc_file);
+    bool is_fish = rc_len >= CBM_SZ_5 && strcmp(rc_file + rc_len - CBM_SZ_5, ".fish") == 0;
+    char line[CLI_BUF_1K];
+    int line_len = is_fish ? snprintf(line, sizeof(line), "fish_add_path %s", bin_dir)
+                           : snprintf(line, sizeof(line), "export PATH=\"%s:$PATH\"", bin_dir);
+    char block[CLI_BUF_2K];
+    int block_len =
+        snprintf(block, sizeof(block), "\n# Added by codebase-memory-mcp install\n%s\n", line);
+    if (line_len <= 0 || (size_t)line_len >= sizeof(line) || block_len <= 0 ||
+        (size_t)block_len >= sizeof(block)) {
+        return CLI_ERR;
+    }
+    size_t content_len = 0U;
+    char *content = read_file_str(rc_file, &content_len);
+    if (!content || !strstr(content, block) || dry_run) {
+        free(content);
+        return CLI_OK;
+    }
+    char *updated = malloc(content_len + 1U);
+    if (!updated) {
+        free(content);
+        return CLI_ERR;
+    }
+    const char *cursor = content;
+    char *out = updated;
+    const char *match = NULL;
+    size_t owned_len = strlen(block);
+    while ((match = strstr(cursor, block)) != NULL) {
+        size_t prefix_len = (size_t)(match - cursor);
+        memcpy(out, cursor, prefix_len);
+        out += prefix_len;
+        cursor = match + owned_len;
+    }
+    size_t suffix_len = strlen(cursor);
+    memcpy(out, cursor, suffix_len + 1U);
+    int rc = cbm_write_file_atomic(rc_file, updated, strlen(updated), NULL);
+    free(updated);
+    free(content);
+    return rc;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_ensure_path_for_platform_for_testing(const char *bin_dir, const char *rc_file, bool dry_run,
+                                             const char *os, const char *arch) {
+    return cbm_ensure_path_for_platform(bin_dir, rc_file, dry_run, os, arch);
+}
+#endif
 
 #ifdef _WIN32
 static wchar_t *cli_windows_utf8_to_wide(const char *value) {
@@ -6245,6 +6546,15 @@ static const char *get_cache_dir(const char *home_dir) {
     return cbm_resolve_cache_dir();
 }
 
+static bool is_project_index_db_name(const char *name) {
+    if (!name) {
+        return false;
+    }
+    size_t len = strlen(name);
+    return len > DB_EXT_LEN && strcmp(name + len - DB_EXT_LEN, ".db") == 0 &&
+           strcmp(name, "_config.db") != 0;
+}
+
 int cbm_list_indexes(const char *home_dir) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
@@ -6259,8 +6569,7 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (is_project_index_db_name(ent->name)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
         }
@@ -6283,8 +6592,7 @@ int cbm_remove_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (is_project_index_db_name(ent->name)) {
             char path[CLI_BUF_1K];
             snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
             /* Also remove .db.tmp if present */
@@ -6307,6 +6615,185 @@ int cbm_remove_indexes(const char *home_dir) {
 struct cbm_config {
     sqlite3 *db;
 };
+
+typedef struct {
+    const char *old_key;
+    const char *old_value;
+    const char *new_key;
+    const char *new_value;
+} cbm_config_rename_t;
+
+/* Development builds used these spellings before the configuration vocabulary
+ * stabilized. They never shipped upstream, so migrate persisted rows once
+ * without retaining a permanent read-time alias surface. Exact old-key/value
+ * pairs keep unknown or user-owned extension rows untouched. */
+static const cbm_config_rename_t CBM_CONFIG_RENAMES[] = {
+    {CBM_CONFIG_INCREMENTAL_REINDEX, "off", CBM_CONFIG_INCREMENTAL_REINDEX,
+     CBM_CONFIG_INCREMENTAL_REINDEX_FULL_REBUILD},
+    {CBM_CONFIG_INCREMENTAL_REINDEX, "fast", CBM_CONFIG_INCREMENTAL_REINDEX,
+     CBM_CONFIG_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY},
+    {"incremental_derived_refresh", "eager", CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH},
+    {"incremental_derived_refresh", "stale_on_exact",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES},
+    {"incremental_derived_refresh", "stale_on_incremental",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "eager",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_exact",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_incremental",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES},
+    {CBM_CONFIG_RANK_REFRESH, "eager", CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_AT_PUBLISH},
+    {CBM_CONFIG_RANK_REFRESH, "stale_on_exact", CBM_CONFIG_RANK_REFRESH,
+     CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES},
+    {CBM_CONFIG_RANK_REFRESH, "stale_on_incremental", CBM_CONFIG_RANK_REFRESH,
+     CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES},
+};
+
+static const char *cbm_config_renamed_key(const char *key) {
+    return key && strcmp(key, "incremental_derived_refresh") == 0
+               ? CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH
+               : NULL;
+}
+
+static const cbm_config_rename_t *cbm_config_find_rename(const char *key, const char *value) {
+    if (!key || !value) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(CBM_CONFIG_RENAMES) / sizeof(CBM_CONFIG_RENAMES[0]); i++) {
+        if (strcmp(CBM_CONFIG_RENAMES[i].old_key, key) == 0 &&
+            strcmp(CBM_CONFIG_RENAMES[i].old_value, value) == 0) {
+            return &CBM_CONFIG_RENAMES[i];
+        }
+    }
+    return NULL;
+}
+
+static bool cbm_config_has_rename_rows(sqlite3 *db, bool *found) {
+    if (!found) {
+        return false;
+    }
+    *found = false;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM config WHERE key = ? AND value = ? LIMIT 1",
+                           SQL_NUL_TERM, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(CBM_CONFIG_RENAMES) / sizeof(CBM_CONFIG_RENAMES[0]); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        if (sqlite3_bind_text(stmt, SQL_PARAM_1, CBM_CONFIG_RENAMES[i].old_key, SQL_NUL_TERM,
+                              cbm_sqlite_transient) != SQLITE_OK ||
+            sqlite3_bind_text(stmt, SQL_PARAM_2, CBM_CONFIG_RENAMES[i].old_value, SQL_NUL_TERM,
+                              cbm_sqlite_transient) != SQLITE_OK) {
+            ok = false;
+            break;
+        }
+        int step_rc = sqlite3_step(stmt);
+        if (step_rc == SQLITE_ROW) {
+            *found = true;
+            break;
+        }
+        if (step_rc != SQLITE_DONE) {
+            ok = false;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+static bool cbm_config_migrate_development_spellings(sqlite3 *db) {
+    bool has_rename_rows = false;
+    if (!cbm_config_has_rename_rows(db, &has_rename_rows)) {
+        return false;
+    }
+    if (!has_rename_rows) {
+        return true;
+    }
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_stmt *insert = NULL;
+    sqlite3_stmt *update = NULL;
+    sqlite3_stmt *delete_old = NULL;
+    bool ok = sqlite3_prepare_v2(db,
+                                 "INSERT OR IGNORE INTO config(key,value) "
+                                 "SELECT ?,? FROM config WHERE key = ? AND value = ?",
+                                 SQL_NUL_TERM, &insert, NULL) == SQLITE_OK &&
+              sqlite3_prepare_v2(db, "UPDATE config SET value = ? WHERE key = ? AND value = ?",
+                                 SQL_NUL_TERM, &update, NULL) == SQLITE_OK &&
+              sqlite3_prepare_v2(db, "DELETE FROM config WHERE key = ? AND value = ?", SQL_NUL_TERM,
+                                 &delete_old, NULL) == SQLITE_OK;
+
+    for (size_t i = 0; ok && i < sizeof(CBM_CONFIG_RENAMES) / sizeof(CBM_CONFIG_RENAMES[0]); i++) {
+        const cbm_config_rename_t *rename = &CBM_CONFIG_RENAMES[i];
+        if (strcmp(rename->old_key, rename->new_key) == 0) {
+            sqlite3_reset(update);
+            sqlite3_clear_bindings(update);
+            ok = sqlite3_bind_text(update, SQL_PARAM_1, rename->new_value, SQL_NUL_TERM,
+                                   cbm_sqlite_transient) == SQLITE_OK &&
+                 sqlite3_bind_text(update, SQL_PARAM_2, rename->old_key, SQL_NUL_TERM,
+                                   cbm_sqlite_transient) == SQLITE_OK &&
+                 sqlite3_bind_text(update, SQL_PARAM_3, rename->old_value, SQL_NUL_TERM,
+                                   cbm_sqlite_transient) == SQLITE_OK &&
+                 sqlite3_step(update) == SQLITE_DONE;
+            continue;
+        }
+
+        sqlite3_reset(insert);
+        sqlite3_clear_bindings(insert);
+        ok = sqlite3_bind_text(insert, SQL_PARAM_1, rename->new_key, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(insert, SQL_PARAM_2, rename->new_value, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(insert, SQL_PARAM_3, rename->old_key, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(insert, SQL_PARAM_4, rename->old_value, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_step(insert) == SQLITE_DONE;
+        if (!ok) {
+            break;
+        }
+
+        sqlite3_reset(delete_old);
+        sqlite3_clear_bindings(delete_old);
+        ok = sqlite3_bind_text(delete_old, SQL_PARAM_1, rename->old_key, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(delete_old, SQL_PARAM_2, rename->old_value, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_step(delete_old) == SQLITE_DONE;
+    }
+
+    sqlite3_finalize(delete_old);
+    sqlite3_finalize(update);
+    sqlite3_finalize(insert);
+    if (ok) {
+        ok = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    }
+    if (!ok) {
+        (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    }
+    return ok;
+}
+
+static cbm_config_t *cbm_config_wrap_db(sqlite3 *db) {
+    cbm_config_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(*cfg));
+    if (!cfg) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    cfg->db = db;
+    return cfg;
+}
 
 cbm_config_t *cbm_config_open(const char *cache_dir) {
     if (!cache_dir) {
@@ -6335,14 +6822,29 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         sqlite3_close(db);
         return NULL;
     }
-
-    cbm_config_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(*cfg));
-    if (!cfg) {
+    if (!cbm_config_migrate_development_spellings(db)) {
         sqlite3_close(db);
         return NULL;
     }
-    cfg->db = db;
-    return cfg;
+
+    return cbm_config_wrap_db(db);
+}
+
+cbm_config_t *cbm_config_open_readonly(const char *cache_dir) {
+    if (!cache_dir) {
+        return NULL;
+    }
+
+    char dbpath[CLI_BUF_1K];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cache_dir);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(dbpath, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return NULL;
+    }
+    return cbm_config_wrap_db(db);
 }
 
 void cbm_config_close(cbm_config_t *cfg) {
@@ -6394,21 +6896,341 @@ bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
     return default_val;
 }
 
-int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
-    const char *val = cbm_config_get(cfg, key, NULL);
-    if (!val) {
-        return default_val;
+static bool cbm_config_parse_decimal_int(const char *value, int *out) {
+    if (!value || !out) {
+        return false;
     }
     char *endptr;
-    long v = strtol(val, &endptr, CLI_STRTOL_BASE);
-    if (endptr == val || *endptr != '\0') {
-        return default_val;
+    errno = 0;
+    long parsed = strtol(value, &endptr, CLI_STRTOL_BASE);
+    if (errno == ERANGE || endptr == value || *endptr != '\0' || parsed < INT_MIN ||
+        parsed > INT_MAX) {
+        return false;
     }
-    return (int)v;
+    *out = (int)parsed;
+    return true;
 }
 
+static bool cbm_config_value_is_valid(const char *key, const char *value);
+
+int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
+    const char *val = cbm_config_get(cfg, key, NULL);
+    int parsed = 0;
+    if (!val || !cbm_config_value_is_valid(key, val) ||
+        !cbm_config_parse_decimal_int(val, &parsed)) {
+        return default_val;
+    }
+    return parsed;
+}
+
+static bool cbm_config_value_matches_enum(const char *range, const char *value) {
+    if (!range || !value || !strchr(range, '|')) {
+        return true;
+    }
+    const char *token = range;
+    while (*token) {
+        const char *end = strchr(token, '|');
+        size_t length = end ? (size_t)(end - token) : strlen(token);
+        if (strlen(value) == length && strncmp(token, value, length) == 0) {
+            return true;
+        }
+        if (!end) {
+            break;
+        }
+        token = end + 1;
+    }
+    return false;
+}
+
+typedef enum {
+    CBM_CONFIG_RANGE_NOT_NUMERIC = 0,
+    CBM_CONFIG_RANGE_MATCHES,
+    CBM_CONFIG_RANGE_MISMATCHES,
+} cbm_config_range_result_t;
+
+static bool cbm_config_parse_finite_double(const char *value, const char **end_out, double *out) {
+    if (!value || !end_out || !out) {
+        return false;
+    }
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    if (end == value || !isfinite(parsed)) {
+        return false;
+    }
+    *end_out = end;
+    *out = parsed;
+    return true;
+}
+
+static const cbm_config_numeric_domain_t CBM_CONFIG_NUMERIC_DOMAINS[] = {
+    {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_CONFIG_NUMERIC_INTEGER, CBM_PAGERANK_MAX_ITER_MIN,
+     CBM_PAGERANK_MAX_ITER_MAX, true, true, true, false, CBM_PAGERANK_MAX_ITER, 0.0},
+    {CBM_CONFIG_PAGERANK_DAMPING, CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_DAMPING_MIN,
+     CBM_PAGERANK_DAMPING_MAX, true, true, true, true, CBM_PAGERANK_DAMPING_RECOMMENDED_MIN,
+     CBM_PAGERANK_DAMPING_RECOMMENDED_MAX},
+    {CBM_CONFIG_PAGERANK_EPSILON, CBM_CONFIG_NUMERIC_REAL, CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE,
+     CBM_PAGERANK_EPSILON_MAX, false, true, true, true, CBM_PAGERANK_EPSILON_RECOMMENDED_MIN,
+     CBM_PAGERANK_EPSILON_RECOMMENDED_MAX},
+#define CBM_PAGERANK_CONFIG_DOMAIN(edge_type, default_token, config_token, field) \
+    {CBM_CONFIG_EDGE_WEIGHT_##config_token,                                       \
+     CBM_CONFIG_NUMERIC_REAL,                                                     \
+     CBM_PAGERANK_EDGE_WEIGHT_MIN,                                                \
+     CBM_PAGERANK_EDGE_WEIGHT_MAX,                                                \
+     true,                                                                        \
+     true,                                                                        \
+     true,                                                                        \
+     true,                                                                        \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MIN,                       \
+     CBM_PAGERANK_WEIGHT_##default_token##_RECOMMENDED_MAX},
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_CONFIG_DOMAIN)
+#undef CBM_PAGERANK_CONFIG_DOMAIN
+        {NULL, CBM_CONFIG_NUMERIC_REAL, 0.0, 0.0, false, false, false, false, 0.0, 0.0},
+};
+
+const cbm_config_numeric_domain_t *cbm_config_numeric_domain(const char *key) {
+    if (!key) {
+        return NULL;
+    }
+    for (size_t i = 0; CBM_CONFIG_NUMERIC_DOMAINS[i].key; i++) {
+        if (strcmp(CBM_CONFIG_NUMERIC_DOMAINS[i].key, key) == 0) {
+            return &CBM_CONFIG_NUMERIC_DOMAINS[i];
+        }
+    }
+    return NULL;
+}
+
+/* Typed comparisons are the executable contract for migrated numeric keys.
+ * Validation is O(D + |value|) time for D numeric domains, O(1) memory, and
+ * rejects NaN/Inf before an algorithm can observe them. */
+static bool cbm_config_numeric_domain_matches(const cbm_config_numeric_domain_t *domain,
+                                              const char *value) {
+    if (!domain || !value) {
+        return false;
+    }
+    double parsed = 0.0;
+    if (domain->kind == CBM_CONFIG_NUMERIC_INTEGER) {
+        int integer = 0;
+        if (!cbm_config_parse_decimal_int(value, &integer)) {
+            return false;
+        }
+        parsed = (double)integer;
+    } else {
+        const char *end = NULL;
+        if (!cbm_config_parse_finite_double(value, &end, &parsed) || *end != '\0') {
+            return false;
+        }
+    }
+    bool above_minimum = domain->accepted_minimum_inclusive ? parsed >= domain->accepted_minimum
+                                                            : parsed > domain->accepted_minimum;
+    bool below_maximum = domain->accepted_maximum_inclusive ? parsed <= domain->accepted_maximum
+                                                            : parsed < domain->accepted_maximum;
+    return above_minimum && below_maximum;
+}
+
+static void cbm_config_format_numeric_value(const cbm_config_numeric_domain_t *domain, double value,
+                                            char *out, size_t out_size) {
+    if (!domain || !out || out_size == 0) {
+        return;
+    }
+    if (domain->kind == CBM_CONFIG_NUMERIC_INTEGER) {
+        (void)snprintf(out, out_size, "%d", (int)value);
+        return;
+    }
+
+    /* libc has no portable shortest-double formatter. Try the bounded set of
+     * standard %g precisions and retain the first representation that strtod
+     * maps back to the exact value. This avoids binary artifacts for ordinary
+     * values (0.7 stays 0.7) without rounding DBL_MAX into infinity. Runtime is
+     * O(DBL_DECIMAL_DIG), therefore O(1), with O(1) stack storage. */
+    for (int precision = 1; precision <= DBL_DECIMAL_DIG; precision++) {
+        int written = snprintf(out, out_size, "%.*g", precision, value);
+        if (written < 0 || (size_t)written >= out_size) {
+            break;
+        }
+        char *end = NULL;
+        errno = 0;
+        double parsed = strtod(out, &end);
+        if (errno != ERANGE && end && *end == '\0' && parsed == value) {
+            return;
+        }
+    }
+    (void)snprintf(out, out_size, "%.*g", DBL_DECIMAL_DIG, value);
+}
+
+/* Interpret the registry's complete numeric range declarations. Historical
+ * "minimum-maximum" declarations are closed intervals; conventional bracket
+ * notation additionally expresses open bounds without key-specific validators
+ * or magic epsilon values. Non-numeric guidance remains descriptive only.
+ * Runtime is O(|range| + |value|), memory is O(1). */
+static cbm_config_range_result_t cbm_config_numeric_range_matches(const char *range,
+                                                                  const char *value) {
+    if (!range || !value || !range[0]) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+
+    const char *cursor = range;
+    bool minimum_inclusive = true;
+    bool maximum_inclusive = true;
+    bool bracketed = cursor[0] == '[' || cursor[0] == '(';
+    if (bracketed) {
+        minimum_inclusive = cursor[0] == '[';
+        cursor++;
+    }
+
+    double minimum = 0.0;
+    const char *minimum_end = NULL;
+    if (!cbm_config_parse_finite_double(cursor, &minimum_end, &minimum)) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+    char separator = bracketed ? ',' : '-';
+    if (*minimum_end != separator) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+
+    double maximum = 0.0;
+    const char *maximum_end = NULL;
+    bool maximum_unbounded = bracketed && strcmp(minimum_end + 1, "+inf)") == 0;
+    if (!maximum_unbounded &&
+        !cbm_config_parse_finite_double(minimum_end + 1, &maximum_end, &maximum)) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+    if (bracketed) {
+        if (!maximum_unbounded &&
+            ((*maximum_end != ']' && *maximum_end != ')') || maximum_end[1] != '\0')) {
+            return CBM_CONFIG_RANGE_NOT_NUMERIC;
+        }
+        maximum_inclusive = !maximum_unbounded && *maximum_end == ']';
+    } else if (*maximum_end != '\0') {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+    if (!maximum_unbounded && minimum > maximum) {
+        return CBM_CONFIG_RANGE_NOT_NUMERIC;
+    }
+
+    double parsed = 0.0;
+    if (!strchr(range, '.')) {
+        int integer = 0;
+        if (!cbm_config_parse_decimal_int(value, &integer)) {
+            return CBM_CONFIG_RANGE_MISMATCHES;
+        }
+        parsed = (double)integer;
+    } else {
+        const char *value_end = NULL;
+        if (!cbm_config_parse_finite_double(value, &value_end, &parsed) || *value_end != '\0') {
+            return CBM_CONFIG_RANGE_MISMATCHES;
+        }
+    }
+
+    bool above_minimum = minimum_inclusive ? parsed >= minimum : parsed > minimum;
+    bool below_maximum =
+        maximum_unbounded || (maximum_inclusive ? parsed <= maximum : parsed < maximum);
+    return above_minimum && below_maximum ? CBM_CONFIG_RANGE_MATCHES : CBM_CONFIG_RANGE_MISMATCHES;
+}
+
+/* Numeric registry ranges historically mixed hard correctness/resource
+ * contracts with tuning guidance. Keep the established hard contracts and
+ * make every PageRank numeric domain executable, without turning unrelated
+ * advisory maxima into new capability limits. */
+static bool cbm_config_numeric_range_is_contract(const cbm_config_entry_t *entry) {
+    return strcmp(entry->category, "PageRank") == 0 ||
+           strcmp(entry->key, CBM_CONFIG_EXTRACT_TIMEOUT_MS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_QUERY_MAX_ROWS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_QUERY_MAX_WORKING_ROWS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_DEP_MAX_FILES) == 0;
+}
+
+static bool cbm_config_value_matches_declared_range(const cbm_config_entry_t *entry,
+                                                    const char *value) {
+    const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(entry->key);
+    if (domain) {
+        return cbm_config_numeric_domain_matches(domain, value);
+    }
+    if (entry->range && strchr(entry->range, '|')) {
+        return cbm_config_value_matches_enum(entry->range, value);
+    }
+    if (!cbm_config_numeric_range_is_contract(entry)) {
+        return true;
+    }
+    return cbm_config_numeric_range_matches(entry->range, value) != CBM_CONFIG_RANGE_MISMATCHES;
+}
+
+static bool cbm_config_value_is_valid(const char *key, const char *value) {
+    if (!key || !value) {
+        return false;
+    }
+    if (cbm_config_renamed_key(key)) {
+        return false;
+    }
+    for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
+            return cbm_config_value_matches_declared_range(&CBM_CONFIG_REGISTRY[i], value);
+        }
+    }
+    return true; /* preserve extension/private keys not owned by this registry */
+}
+
+static const cbm_config_entry_t *cbm_config_registry_entry(const char *key) {
+    if (!key) {
+        return NULL;
+    }
+    for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
+            return &CBM_CONFIG_REGISTRY[i];
+        }
+    }
+    return NULL;
+}
+
+static void cbm_config_set_error(const char *key, const char *value, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    const cbm_config_rename_t *rename = cbm_config_find_rename(key, value);
+    const char *renamed_key = cbm_config_renamed_key(key);
+    const char *effective_key = renamed_key ? renamed_key : key;
+    const cbm_config_entry_t *entry = cbm_config_registry_entry(effective_key);
+    const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(effective_key);
+
+    if (renamed_key && rename) {
+        (void)snprintf(out, out_size,
+                       "config key '%s' was renamed to '%s', and value '%s' was renamed to '%s'; "
+                       "use %s=%s",
+                       key, renamed_key, value, rename->new_value, renamed_key, rename->new_value);
+    } else if (renamed_key) {
+        (void)snprintf(out, out_size, "config key '%s' was renamed to '%s'; use %s=%s", key,
+                       renamed_key, renamed_key, value ? value : "");
+    } else if (domain) {
+        char minimum[CBM_SZ_32];
+        char maximum[CBM_SZ_32];
+        cbm_config_format_numeric_value(domain, domain->accepted_minimum, minimum, sizeof(minimum));
+        cbm_config_format_numeric_value(domain, domain->accepted_maximum, maximum, sizeof(maximum));
+        (void)snprintf(out, out_size, "%s must be %s %s and %s %s, got '%s'", key,
+                       domain->accepted_minimum_inclusive ? ">=" : ">", minimum,
+                       domain->accepted_maximum_inclusive ? "<=" : "<", maximum,
+                       value ? value : "");
+    } else if (rename && entry && entry->range) {
+        (void)snprintf(out, out_size, "%s must be %s, got '%s'; '%s' was renamed to '%s'", key,
+                       entry->range, value, value, rename->new_value);
+    } else if (entry && entry->range) {
+        (void)snprintf(out, out_size, "%s must be %s, got '%s'", key, entry->range,
+                       value ? value : "");
+    } else {
+        (void)snprintf(out, out_size, "failed to set %s", key ? key : "config value");
+    }
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_config_set_error_for_testing(const char *key, const char *value, char *out,
+                                      size_t out_size) {
+    cbm_config_set_error(key, value, out, out_size);
+}
+#endif
+
 int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value) {
-    if (!cfg || !key || !value) {
+    if (!cfg || !key || !value || !cbm_config_value_is_valid(key, value)) {
         return CLI_ERR;
     }
 
@@ -6444,24 +7266,74 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name);
+static void cbm_config_print_presets(void);
+
+static int cbm_config_describe(const char *key) {
+    const cbm_config_entry_t *entry = cbm_config_registry_entry(key);
+    if (!entry) {
+        (void)fprintf(stderr, "Unknown config key: %s\n", key ? key : "");
+        return CLI_TRUE;
+    }
+    printf("%s\n", entry->key);
+    printf("  category: %s\n", entry->category ? entry->category : "");
+    printf("  default: %s\n", entry->default_val ? entry->default_val : "");
+    const cbm_config_numeric_domain_t *domain = cbm_config_numeric_domain(entry->key);
+    if (domain) {
+        char value[CBM_SZ_32];
+        cbm_config_format_numeric_value(domain, domain->accepted_minimum, value, sizeof(value));
+        printf("  accepted_minimum: %s (%s)\n", value,
+               domain->accepted_minimum_inclusive ? "inclusive" : "exclusive");
+        cbm_config_format_numeric_value(domain, domain->accepted_maximum, value, sizeof(value));
+        printf("  accepted_maximum: %s (%s)\n", value,
+               domain->accepted_maximum_inclusive ? "inclusive" : "exclusive");
+        if (domain->has_recommended_minimum) {
+            cbm_config_format_numeric_value(domain, domain->recommended_minimum, value,
+                                            sizeof(value));
+            printf("  recommended_minimum: %s\n", value);
+        }
+        if (domain->has_recommended_maximum) {
+            cbm_config_format_numeric_value(domain, domain->recommended_maximum, value,
+                                            sizeof(value));
+            printf("  recommended_maximum: %s\n", value);
+        }
+    } else {
+        printf("  accepted: %s\n", entry->range ? entry->range : "any value");
+    }
+    printf("  description: %s\n", entry->description ? entry->description : "");
+    printf("  guidance: %s\n", entry->guidance ? entry->guidance : "");
+    return 0;
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     if (argc == 0 || (argv && (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0))) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
         printf("Commands:\n");
-        printf("  list             Show all config values\n");
+        printf("  list             Show common effective config values\n");
         printf("  get <key>        Get a config value\n");
+        printf("  describe <key>   Show its default, accepted extent, and tuning guidance\n");
         printf("  set <key> <val>  Set a config value\n");
-        printf("  reset <key>      Reset a key to default\n\n");
-        printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
+        printf("  reset <key>      Reset a key to default\n");
+        printf("  preset list      List exact named capability/API configurations\n");
+        printf("  preset apply <name>  Atomically apply a named preset\n\n");
+        printf("Common config keys:\n");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "true",
                "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
+               CBM_DEFAULT_AUTO_INDEX_LIMIT_STR, "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
                "Register background git watcher on session connect");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
+    }
+
+    if (strcmp(argv[0], "describe") == 0) {
+        if (argc < MIN_ARGC_GET) {
+            (void)fprintf(stderr, "Usage: config describe <key>\n");
+            return CLI_TRUE;
+        }
+        return cbm_config_describe(argv[CLI_SKIP_ONE]);
     }
 
     const char *home = cbm_get_home_dir();
@@ -6483,13 +7355,23 @@ int cbm_cmd_config(int argc, char **argv) {
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
         printf("Configuration:\n");
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                        CBM_DEFAULT_AUTO_INDEX_LIMIT_STR));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_UI_LANG, "auto"));
+    } else if (strcmp(argv[0], "preset") == 0) {
+        if (argc == MIN_ARGC_GET && strcmp(argv[CLI_SKIP_ONE], "list") == 0) {
+            cbm_config_print_presets();
+        } else if (argc == MIN_ARGC_CMD && strcmp(argv[CLI_SKIP_ONE], "apply") == 0) {
+            rc = cbm_config_apply_preset_cli(cfg, argv[CLI_PAIR_LEN]);
+        } else {
+            (void)fprintf(stderr, "Usage: config preset list | config preset apply <name>\n");
+            rc = CLI_TRUE;
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
@@ -6505,7 +7387,10 @@ int cbm_cmd_config(int argc, char **argv) {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
                 printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
             } else {
-                (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
+                char reason[CLI_BUF_1K];
+                cbm_config_set_error(argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN], reason,
+                                     sizeof(reason));
+                (void)fprintf(stderr, "error: %s\n", reason);
                 rc = CLI_TRUE;
             }
         }
@@ -6925,9 +7810,11 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
 
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
-/* ── Detect OS/arch for download URL ──────────────────────────── */
-
-#ifdef CBM_CLI_ENABLE_TEST_API
+/* ── Detect OS/arch for PATH ownership and test-only updater ─────
+ *
+ * cbm_ensure_path uses these in every build to distinguish macOS Homebrew
+ * prefixes safely. The in-process updater is test-only, but these two
+ * side-effect-free platform probes are therefore part of the production path. */
 static const char *detect_os(void) {
 #ifdef _WIN32
     return "windows";
@@ -6939,14 +7826,20 @@ static const char *detect_os(void) {
 }
 
 static const char *detect_arch(void) {
+#ifdef __APPLE__
+    int arm64_capable = 0;
+    size_t arm64_capable_size = sizeof(arm64_capable);
+    if (sysctlbyname("hw.optional.arm64", &arm64_capable, &arm64_capable_size, NULL, 0) == 0 &&
+        arm64_capable == 1) {
+        return "arm64";
+    }
+#endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     return "arm64";
 #else
     return "amd64";
 #endif
 }
-
-#endif /* CBM_CLI_ENABLE_TEST_API */
 
 /* ── Agent config install/refresh (shared by install + update) ── */
 
@@ -7390,10 +8283,16 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
             access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
         char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
                                                    profiles.binary_path);
-        const char *released[2];
+        char *legacy_codex = profiles.dialect == CBM_GRAPH_DIALECT_CODEX
+                                 ? cbm_render_legacy_codex_graph_profile(tier)
+                                 : NULL;
+        const char *released[3];
         size_t released_count = 0U;
         if (alternate) {
             released[released_count++] = alternate;
+        }
+        if (legacy_codex) {
+            released[released_count++] = legacy_codex;
         }
         if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
             released[released_count++] = profiles.legacy_verify_content;
@@ -7401,6 +8300,7 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
         int result = prepare_config_parent(path)
                          ? cbm_text_migrate_owned_document(path, current, released, released_count)
                          : CLI_ERR;
+        free(legacy_codex);
         free(alternate);
         free(current);
         if (result != CLI_OK) {
@@ -7437,15 +8337,22 @@ static void uninstall_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, b
             access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
         char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
                                                    profiles.binary_path);
-        const char *released[2];
+        char *legacy_codex = profiles.dialect == CBM_GRAPH_DIALECT_CODEX
+                                 ? cbm_render_legacy_codex_graph_profile(tier)
+                                 : NULL;
+        const char *released[3];
         size_t released_count = 0U;
         if (alternate) {
             released[released_count++] = alternate;
+        }
+        if (legacy_codex) {
+            released[released_count++] = legacy_codex;
         }
         if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
             released[released_count++] = profiles.legacy_verify_content;
         }
         int result = cbm_text_remove_owned_document_any(path, current, released, released_count);
+        free(legacy_codex);
         free(alternate);
         free(current);
         if (result < CLI_OK) {
@@ -7599,7 +8506,7 @@ static bool cbm_agent_registry_path_exists(const char *path, const void *context
 #ifndef _WIN32
     return path && path[0] && lstat(path, &state) == 0 && !S_ISLNK(state.st_mode);
 #else
-    return path && path[0] && stat(path, &state) == 0;
+    return path && path[0] && cbm_stat(path, &state) == 0;
 #endif
 }
 
@@ -7661,6 +8568,13 @@ static void cbm_agent_installed_binary_path(const char *home, char *binary_path,
     snprintf(binary_path, binary_path_size, "%s/.local/bin/codebase-memory-mcp", home);
 #endif
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_agent_installed_binary_path_for_testing(const char *home, char *binary_path,
+                                                 size_t binary_path_size) {
+    cbm_agent_installed_binary_path(home, binary_path, binary_path_size);
+}
+#endif
 
 static void install_managed_agent_instructions(const char *label, const char *instructions_path,
                                                bool dry_run) {
@@ -8045,7 +8959,7 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
             record_agent_config_error(false, "Gemini CLI", "after_tool_hook_install", cp);
         }
 #endif
-        if (cbm_upsert_gemini_session_hooks(cp) != CLI_OK) {
+        if (cbm_upsert_gemini_session_hooks(cp, binary_path) != CLI_OK) {
             record_agent_config_error(false, "Gemini CLI", "session_hook_install", cp);
         }
     }
@@ -8182,7 +9096,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             snprintf(legacy_settings, sizeof(legacy_settings),
                      "%s/.gemini/antigravity-cli/settings.json", home);
             if (cbm_file_exists(legacy_settings) &&
-                cbm_remove_gemini_session_hooks(legacy_settings) != CLI_OK) {
+                cbm_remove_gemini_session_hooks(legacy_settings, binary_path) != CLI_OK) {
                 record_agent_config_error(false, "Antigravity", "legacy_hook_cleanup",
                                           legacy_settings);
             }
@@ -8232,7 +9146,7 @@ static void install_vscode_profile_configs(const char *code_user, const char *bi
         char profile_path[CLI_BUF_1K];
         snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
         struct stat st;
-        if (stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (cbm_stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
             continue;
         }
         char cp[CLI_BUF_1K];
@@ -8259,7 +9173,7 @@ static void uninstall_vscode_profile_configs(const char *code_user, const char *
         char profile_dir[CLI_BUF_1K];
         snprintf(profile_dir, sizeof(profile_dir), "%s/%s", profiles_dir, entry->name);
         struct stat state;
-        if (stat(profile_dir, &state) != 0 || !S_ISDIR(state.st_mode)) {
+        if (cbm_stat(profile_dir, &state) != 0 || !S_ISDIR(state.st_mode)) {
             continue;
         }
         char config_path[CLI_BUF_1K];
@@ -8274,6 +9188,19 @@ static void uninstall_vscode_profile_configs(const char *code_user, const char *
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
 static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
                                          const char *binary_path, bool force, bool dry_run) {
+    if (agents->claude_desktop) {
+        char cp[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Claude/claude_desktop_config.json",
+                 home);
+#elif defined(_WIN32)
+        snprintf(cp, sizeof(cp), "%s/AppData/Roaming/Claude/claude_desktop_config.json", home);
+#else
+        snprintf(cp, sizeof(cp), "%s/.config/Claude/claude_desktop_config.json", home);
+#endif
+        install_generic_agent_config("Claude Desktop", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
+    }
     if (agents->zed) {
         char config_dir[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
@@ -8813,8 +9740,7 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (is_project_index_db_name(ent->name)) {
             count++;
         }
     }
@@ -8957,12 +9883,14 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
         const char *name;
     } names[] = {
         {det.claude_code, "claude-code"},
+        {det.claude_desktop, "claude-desktop"},
         {det.codex, "codex"},
         {det.gemini, "gemini"},
         {det.zed, "zed"},
         {det.opencode, "opencode"},
         {det.antigravity, "antigravity"},
         {det.aider, "aider"},
+        {det.kilo_cli, "kilo-cli"},
         {det.kilocode, "kilocode"},
         {det.vscode, "vscode"},
         {det.cursor, "cursor"},
@@ -9007,6 +9935,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_val *configs = yyjson_mut_arr(doc);
     yyjson_mut_val *instrs = yyjson_mut_arr(doc);
     yyjson_mut_val *skill_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *skill_dirs = yyjson_mut_arr(doc);
     yyjson_mut_val *agent_files = yyjson_mut_arr(doc);
     yyjson_mut_val *prompt_files = yyjson_mut_arr(doc);
     yyjson_mut_val *hooks = yyjson_mut_arr(doc);
@@ -9021,7 +9950,20 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
             yyjson_mut_arr_add_val(hooks, h);
         } else if (strcmp(e->kind, "skill") == 0 || strcmp(e->kind, "skills") == 0) {
             yyjson_mut_arr_add_strcpy(doc, skill_files, e->path);
-            yyjson_mut_arr_add_strcpy(doc, instrs, e->path);
+            char directory[CLI_BUF_1K];
+            snprintf(directory, sizeof(directory), "%s", e->path);
+            char *last = strrchr(directory, '/');
+            if (last) {
+                *last = '\0';
+                char *parent = last;
+                while (parent > directory && parent[-SKIP_ONE] != '/') {
+                    parent--;
+                }
+                if (parent > directory) {
+                    parent[-SKIP_ONE] = '\0';
+                }
+            }
+            yyjson_mut_arr_add_strcpy(doc, skill_dirs, directory);
         } else if (strcmp(e->kind, "agent") == 0) {
             yyjson_mut_arr_add_strcpy(doc, agent_files, e->path);
             yyjson_mut_arr_add_strcpy(doc, instrs, e->path);
@@ -9034,6 +9976,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     }
     yyjson_mut_obj_add_val(doc, root, "config_files_planned", configs);
     yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
+    yyjson_mut_obj_add_val(doc, root, "skill_dirs_planned", skill_dirs);
     yyjson_mut_obj_add_val(doc, root, "skill_files_planned", skill_files);
     yyjson_mut_obj_add_val(doc, root, "agent_files_planned", agent_files);
     yyjson_mut_obj_add_val(doc, root, "prompt_files_planned", prompt_files);
@@ -9179,6 +10122,10 @@ static int cli_install_activate(void *opaque) {
 }
 
 int cbm_cmd_install(int argc, char **argv) {
+    if (cli_args_have_help(argc, argv)) {
+        print_install_help();
+        return CLI_OK;
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
@@ -9263,7 +10210,7 @@ int cbm_cmd_install(int argc, char **argv) {
     (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
 
     struct stat target_status;
-    bool target_exists = (stat(bin_target, &target_status) == 0);
+    bool target_exists = (cbm_stat(bin_target, &target_status) == 0);
     bool same_binary = cbm_same_file(self_path, bin_target);
     bool do_copy = !same_binary && (!target_exists || force);
 
@@ -9698,7 +10645,7 @@ static int cbm_remove_managed_instructions(const char *instructions_path) {
     if (lstat(instructions_path, &state) == 0 && S_ISREG(state.st_mode) && state.st_size == 0 &&
         cbm_unlink(instructions_path) != 0) {
 #else
-    if (stat(instructions_path, &state) == 0 && S_ISREG(state.st_mode) && state.st_size == 0 &&
+    if (cbm_stat(instructions_path, &state) == 0 && S_ISREG(state.st_mode) && state.st_size == 0 &&
         cbm_unlink(instructions_path) != 0) {
 #endif
         return CLI_ERR;
@@ -10023,7 +10970,7 @@ static void uninstall_gemini_config(const char *home, bool dry_run) {
             record_agent_config_error(true, "Gemini CLI", "after_tool_hook_uninstall", cp);
         }
 #endif
-        if (cbm_remove_gemini_session_hooks(cp) != CLI_OK) {
+        if (cbm_remove_gemini_session_hooks(cp, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Gemini CLI", "session_hook_uninstall", cp);
         }
         if (cbm_remove_instructions(ip) != CLI_OK) {
@@ -10050,11 +10997,13 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         char ip[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
         char ap[CLI_BUF_1K];
+        char installed_binary[CLI_BUF_1K];
         cbm_codex_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
                                   cbm_remove_codex_mcp_owned);
         uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
@@ -10062,6 +11011,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             (cbm_tiered_profile_set_t){
                 .label = "Codex CLI",
                 .verify_path = ap,
+                .binary_path = installed_binary,
                 .legacy_verify_content = legacy_codex_verify_agent_content,
                 .dialect = CBM_GRAPH_DIALECT_CODEX,
             },
@@ -10071,10 +11021,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                 record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
             }
             char hooks_json[CLI_BUF_1K];
-            char installed_binary[CLI_BUF_1K];
             char hook_command[CLI_BUF_8K];
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
-            cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
             if (cbm_file_exists(hooks_json) &&
                 (cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) !=
                      CLI_OK ||
@@ -10117,7 +11065,9 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         if (!dry_run) {
             char sp[CLI_BUF_1K];
             snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
-            if (cbm_remove_gemini_session_hooks(sp) != CLI_OK) {
+            char installed_binary[CLI_BUF_1K];
+            cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+            if (cbm_remove_gemini_session_hooks(sp, installed_binary) != CLI_OK) {
                 record_agent_config_error(true, "Antigravity", "session_hook_uninstall", sp);
             }
         }
@@ -10134,6 +11084,9 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             if (cbm_remove_instructions(ip) != CLI_OK) {
                 record_agent_config_error(true, "Aider", "instructions_uninstall", ip);
             }
+            /* Management of this config ends here; drop the persistent lock
+             * sidecar the YAML editor reuses across edits. */
+            (void)cbm_yaml_remove_lock_sidecar(cp);
         }
         printf("Aider: removed instructions + loader reference\n");
     }
@@ -10144,6 +11097,19 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
                                     bool dry_run) {
     char installed_binary[CLI_BUF_1K];
     cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+    if (agents->claude_desktop) {
+        char cp[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Claude/claude_desktop_config.json",
+                 home);
+#elif defined(_WIN32)
+        snprintf(cp, sizeof(cp), "%s/AppData/Roaming/Claude/claude_desktop_config.json", home);
+#else
+        snprintf(cp, sizeof(cp), "%s/.config/Claude/claude_desktop_config.json", home);
+#endif
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Claude Desktop", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp_owned);
+    }
     if (agents->zed) {
         char config_dir[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
@@ -10359,6 +11325,11 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Hermes", cp, NULL}, dry_run,
                                   cbm_remove_hermes_mcp_owned);
         uninstall_agent_skill("Hermes", skills_dir, dry_run);
+        if (!dry_run) {
+            /* Management of this config ends here; drop the persistent lock
+             * sidecar the YAML editor reuses across edits. */
+            (void)cbm_yaml_remove_lock_sidecar(cp);
+        }
     }
     if (agents->openhands) {
         char cp[CLI_BUF_1K];
@@ -10631,7 +11602,7 @@ static void cli_uninstall_report_leftover_installer(const char *bin_path, bool d
             continue;
         }
         struct stat installer_status;
-        if (stat(installer_path, &installer_status) != 0) {
+        if (cbm_stat(installer_path, &installer_status) != 0) {
             continue;
         }
         if (dry_run) {
@@ -10705,6 +11676,10 @@ static int cli_uninstall_activate(void *opaque) {
 }
 
 int cbm_cmd_uninstall(int argc, char **argv) {
+    if (cli_args_have_help(argc, argv)) {
+        print_uninstall_help();
+        return CLI_OK;
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     for (int i = 0; i < argc; i++) {
@@ -10740,12 +11715,16 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     if (index_count > 0) {
         printf("\nFound %d index(es):\n", index_count);
         cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
-            if (dry_run) {
-                printf("(dry-run — indexes would be deleted)\n");
-            } else {
-                delete_indexes = true;
-            }
+        if (dry_run) {
+            /* Dry-run reports the outcome without prompting; the auto-answer
+             * decides what a real run would have done. */
+            printf("Dry-run: would %s %d index(es).\n",
+                   g_auto_answer == AUTO_YES ? "remove" : "keep", index_count);
+        } else if (prompt_yn("Delete these indexes?")) {
+            /* Deferred: the removal runs inside the final guarded activation
+             * rather than here, so a failed activation cannot leave the
+             * indexes deleted under a still-installed binary. */
+            delete_indexes = true;
         } else {
             printf("Indexes kept.\n");
         }
@@ -10760,7 +11739,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp", home);
 #endif
     struct stat binary_status;
-    bool binary_exists = stat(bin_path, &binary_status) == 0;
+    bool binary_exists = cbm_stat(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
     if (!dry_run && binary_exists) {
         cbm_activation_transaction_status_t stage_status =
@@ -10877,7 +11856,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
     const char *tmp_archive = args.tmp_archive;
     const char *ext = args.ext;
     const char *bin_dest = args.bin_dest;
-    FILE *f = fopen(tmp_archive, "rb");
+    FILE *f = cbm_fopen(tmp_archive, "rb");
     if (!f) {
         (void)fprintf(stderr, "error: cannot open %s\n", tmp_archive);
         return CLI_TRUE;
@@ -11197,7 +12176,7 @@ static char *fetch_latest_tag(void) {
             slash[--len] = '\0';
         }
         if (len > 0) {
-            tag = strdup(slash);
+            tag = cbm_strdup(slash);
         }
         break;
     }
@@ -11236,6 +12215,10 @@ static bool check_already_latest(void) {
 #endif /* CBM_CLI_ENABLE_TEST_API */
 
 int cbm_cmd_update(int argc, char **argv) {
+    if (cli_args_have_help(argc, argv)) {
+        print_update_help();
+        return CLI_OK;
+    }
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
@@ -11551,7 +12534,11 @@ static const char *cli_schema_type(yyjson_val *props, const char *key) {
 }
 
 /* Append a typed value to the output object under `key`. For array-typed
- * properties, repeated flags accumulate into a single JSON array. */
+ * properties, repeated flags accumulate into a single JSON array, and a value
+ * that is itself JSON array text ('["*"]', '["a","b"]') contributes its
+ * string elements instead of one literal element — otherwise the raw text
+ * would flow downstream as a bogus single value (e.g. a project literally
+ * named ["*"]). */
 static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *key,
                           const char *type, const char *value, bool have_value) {
     if (type && strcmp(type, "array") == 0) {
@@ -11559,6 +12546,30 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
         if (!arr || !yyjson_mut_is_arr(arr)) {
             arr = yyjson_mut_arr(out);
             yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
+        }
+        if (have_value && value[0] == '[') {
+            yyjson_doc *vdoc = yyjson_read(value, strlen(value), 0);
+            yyjson_val *vroot = vdoc ? yyjson_doc_get_root(vdoc) : NULL;
+            bool all_strings = vroot && yyjson_is_arr(vroot);
+            size_t idx;
+            size_t max;
+            yyjson_val *el;
+            if (all_strings) {
+                yyjson_arr_foreach(vroot, idx, max, el) {
+                    if (!yyjson_is_str(el)) {
+                        all_strings = false;
+                        break;
+                    }
+                }
+            }
+            if (all_strings) {
+                yyjson_arr_foreach(vroot, idx, max, el) {
+                    yyjson_mut_arr_add_strcpy(out, arr, yyjson_get_str(el));
+                }
+                yyjson_doc_free(vdoc);
+                return;
+            }
+            yyjson_doc_free(vdoc);
         }
         yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
         return;
@@ -11727,7 +12738,6 @@ int cbm_cli_print_tool_help(const char *tool_name) {
     printf("  codebase-memory-mcp cli %s --flag value [--flag2 value2 ...]\n", tool_name);
     printf("  codebase-memory-mcp cli %s --args-file <path-to-json>\n", tool_name);
     printf("  echo '<json>' | codebase-memory-mcp cli %s\n", tool_name);
-    printf("  codebase-memory-mcp cli %s '<raw-json-args>'\n", tool_name);
 
     printf("\nFlags:\n");
     if (props && yyjson_is_obj(props)) {
@@ -11768,4 +12778,803 @@ int cbm_cli_print_tool_help(const char *tool_name) {
         yyjson_doc_free(doc);
     }
     return CLI_OK;
+}
+
+/* Top-level --help text. Moved here from main.c's static print_help so the
+ * test runner (which does not link main.c) can assert the help content.
+ * Version comes from cbm_cli_set_version, bound in main() before dispatch. */
+void cbm_cli_print_main_help(void) {
+    printf("codebase-memory-mcp %s\n\n", cbm_cli_get_version());
+    printf("Usage:\n");
+    printf("  codebase-memory-mcp              Run MCP server on stdio\n");
+    printf("  codebase-memory-mcp cli <tool> [--flag value ...]  Run a single tool\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
+    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
+    printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");
+    printf("  codebase-memory-mcp config <list|get|describe|set|reset>\n");
+    printf("  codebase-memory-mcp config preset <list|apply>\n");
+    printf("  codebase-memory-mcp daemon <start|stop|status>\n");
+    printf("  codebase-memory-mcp --version    Print version\n");
+    printf("  codebase-memory-mcp --help       Print this help\n");
+    printf("\nUI options:\n");
+    printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
+    printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
+    printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
+    printf("\nSupported automatic/conditional client surfaces (43):\n");
+    printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
+    printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
+    printf("  Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands,\n");
+    printf("  Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush,\n");
+    printf("  Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI,\n");
+    printf("  Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn,\n");
+    printf("  Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE,\n");
+    printf("  CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi,\n");
+    printf("  Sourcegraph Cody\n");
+    printf("  Conditional/explicit targets are changed only when their documented\n");
+    printf("  platform, marker, or explicit existing config path is present.\n");
+    printf("  Claude Desktop is an additional detected MCP-only desktop surface.\n");
+    /* Render from the same registry as MCP tools/list. This keeps the testable
+     * cli.c help surface synchronized as tools are added or renamed. */
+    char *tools_help = cbm_mcp_tools_help_list();
+    if (tools_help) {
+        printf("\n%s", tools_help);
+        free(tools_help);
+    }
+}
+
+double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val) {
+    const char *val = cbm_config_get(cfg, key, NULL);
+    if (!val || !cbm_config_value_is_valid(key, val)) {
+        return default_val;
+    }
+    const char *end = NULL;
+    double parsed = 0.0;
+    if (!cbm_config_parse_finite_double(val, &end, &parsed) || *end != '\0') {
+        return default_val;
+    }
+    return parsed;
+}
+
+typedef struct {
+    const char *key;
+    const char *value;
+} cbm_config_preset_value_t;
+
+typedef struct {
+    const char *name;
+    const char *description;
+    const cbm_config_preset_value_t *values;
+    size_t value_count;
+    bool benchmark_ablation;
+} cbm_config_preset_t;
+
+#define PRESET_VALUE(key_, value_) {key_, value_}
+#define PRESET_COUNT(values_) (sizeof(values_) / sizeof((values_)[0]))
+#define PRESET_QUALITY_VALUES(auto_index_deps_, rank_, similarity_, semantic_, git_, http_) \
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, rank_),                                           \
+        PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, auto_index_deps_),                         \
+        PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, similarity_),                           \
+        PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, semantic_),                         \
+        PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, git_),                                  \
+        PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, http_)
+
+static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_DISABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true", "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_ENABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED),
+    PRESET_QUALITY_VALUES("true", "true", "true", "true", "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_DISABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true", "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_ENABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC),
+    PRESET_QUALITY_VALUES("true", "true", "true", "true", "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_RANK_DISABLED[] = {
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "true", "true", "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_MINIMAL_INDEXING[] = {
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "false", "false", "false",
+                          "false"),
+};
+
+static const cbm_config_preset_t CBM_CONFIG_PRESETS[] = {
+    {"streamlined-automatic-dependency-source-indexing-disabled",
+     "streamlined API; automatic installed dependency-source indexing disabled",
+     PRESET_STREAMLINED_DEPS_DISABLED, PRESET_COUNT(PRESET_STREAMLINED_DEPS_DISABLED), false},
+    {"streamlined-automatic-dependency-source-indexing-enabled",
+     "streamlined API; automatic installed dependency-source indexing enabled",
+     PRESET_STREAMLINED_DEPS_ENABLED, PRESET_COUNT(PRESET_STREAMLINED_DEPS_ENABLED), false},
+    {"classic-automatic-dependency-source-indexing-disabled",
+     "classic API; automatic installed dependency-source indexing disabled",
+     PRESET_CLASSIC_DEPS_DISABLED, PRESET_COUNT(PRESET_CLASSIC_DEPS_DISABLED), false},
+    {"classic-automatic-dependency-source-indexing-enabled",
+     "classic API; automatic installed dependency-source indexing enabled",
+     PRESET_CLASSIC_DEPS_ENABLED, PRESET_COUNT(PRESET_CLASSIC_DEPS_ENABLED), false},
+    {"rank-disabled", "exact PageRank/LinkRank ablation; lowers measured ranking quality",
+     PRESET_RANK_DISABLED, PRESET_COUNT(PRESET_RANK_DISABLED), true},
+    {"minimal-indexing",
+     "disable optional graph passes and dependency-source automation; the post-edit reindex "
+     "strategy is unchanged",
+     PRESET_MINIMAL_INDEXING, PRESET_COUNT(PRESET_MINIMAL_INDEXING), true},
+    {NULL, NULL, NULL, 0, false},
+};
+
+static const cbm_config_preset_t *cbm_config_find_preset(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    for (size_t i = 0; CBM_CONFIG_PRESETS[i].name; i++) {
+        if (strcmp(CBM_CONFIG_PRESETS[i].name, name) == 0) {
+            return &CBM_CONFIG_PRESETS[i];
+        }
+    }
+    return NULL;
+}
+
+int cbm_config_apply_preset(cbm_config_t *cfg, const char *name) {
+    const cbm_config_preset_t *preset = cbm_config_find_preset(name);
+    if (!cfg || !preset ||
+        sqlite3_exec(cfg->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        return CLI_ERR;
+    }
+    for (size_t i = 0; i < preset->value_count; i++) {
+        if (cbm_config_set(cfg, preset->values[i].key, preset->values[i].value) != 0) {
+            (void)sqlite3_exec(cfg->db, "ROLLBACK", NULL, NULL, NULL);
+            return CLI_ERR;
+        }
+    }
+    if (sqlite3_exec(cfg->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(cfg->db, "ROLLBACK", NULL, NULL, NULL);
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+static void cbm_config_print_presets(void) {
+    printf("Named presets (applied atomically):\n");
+    for (size_t i = 0; CBM_CONFIG_PRESETS[i].name; i++) {
+        printf("  %-24s %s%s\n", CBM_CONFIG_PRESETS[i].name, CBM_CONFIG_PRESETS[i].description,
+               CBM_CONFIG_PRESETS[i].benchmark_ablation ? " [benchmark ablation]" : "");
+    }
+}
+
+/* A preset always records its exact values in one transaction.  Environment
+ * variables intentionally retain higher runtime priority, so the CLI verifies
+ * the effective result and reports any mismatch instead of claiming that the
+ * requested configuration is active. */
+static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name) {
+    const cbm_config_preset_t *preset = cbm_config_find_preset(name);
+    if (!preset) {
+        (void)fprintf(stderr, "error: unknown config preset: %s\n", name ? name : "");
+        cbm_config_print_presets();
+        return CLI_TRUE;
+    }
+    if (cbm_config_apply_preset(cfg, name) != CLI_OK) {
+        (void)fprintf(stderr, "error: failed to apply config preset: %s\n", name);
+        return CLI_TRUE;
+    }
+
+    bool overridden = false;
+    for (size_t i = 0; i < preset->value_count; i++) {
+        const cbm_config_preset_value_t *value = &preset->values[i];
+        const char *effective = cbm_config_get_effective(cfg, value->key, value->value);
+        if (strcmp(effective, value->value) != 0) {
+            (void)fprintf(stderr,
+                          "warning: %s is effectively %s because a higher-priority environment "
+                          "override is active; preset requested %s\n",
+                          value->key, effective, value->value);
+            overridden = true;
+        }
+    }
+
+    if (overridden) {
+        (void)fprintf(stderr,
+                      "preset %s was stored but is not fully effective; remove the listed override "
+                      "and retry\n",
+                      name);
+        return CLI_TRUE;
+    }
+    printf("Applied preset: %s\n", name);
+    return CLI_OK;
+}
+
+/* ── Config registry ──────────────────────────────────────────── */
+
+/* Hand-wrapped for readable help text; automatic formatting makes this table
+ * substantially narrower and churns unrelated entries. */
+// clang-format off
+const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
+    /* ── Runtime security ── */
+    {CBM_CONFIG_BUILD_FINGERPRINT_MODE, CBM_CONFIG_BUILD_FINGERPRINT_MODE_DEFAULT,
+     "CBM_BUILD_FINGERPRINT_MODE", "Runtime",
+     "Exact executable fingerprint verification cost policy",
+     CBM_CONFIG_BUILD_FINGERPRINT_MODE_CACHED_EXACT "|"
+     CBM_CONFIG_BUILD_FINGERPRINT_MODE_ALWAYS_REHASH,
+     "'cached_exact' (default) reuses a checksummed SHA-256 only while the kernel-bound native "
+     "file identity and strong change metadata remain unchanged; any ambiguity falls back to an "
+     "exact full-image hash. 'always_rehash' hashes the full process image at every process "
+     "startup. Installer/update candidates and Windows launcher payloads always use full exact "
+     "hashes regardless of this setting."},
+    /* ── Indexing ── */
+    {"auto_index", "true", "CBM_AUTO_INDEX", "Indexing",
+     "Auto-index the MCP server CWD or explicit repo paths on startup/first use",
+     "true|false",
+     "Enable for automatic indexing; disable for manual control, CI, or embedded read-only contexts."},
+    {"auto_index_limit", CBM_DEFAULT_AUTO_INDEX_LIMIT_STR, "CBM_AUTO_INDEX_LIMIT", "Indexing",
+     "Max indexable files before auto-index is skipped (0=no limit, index everything)",
+     "0-10000000",
+     "Protects against accidentally indexing huge monorepos. Raise for large codebases. "
+     "Set 0 to disable the limit and always index regardless of repo size."},
+    {CBM_CONFIG_EXTRACT_TIMEOUT_MS, CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT, NULL, "Indexing",
+     "Per-file tree-sitter parse deadline in milliseconds",
+     "100-120000",
+     "Bounds pathological parses. A timeout fails the indexing transaction and preserves the prior database; raise only for measured large-file workloads or instrumented tests."},
+    {"reindex_on_startup", "false", "CBM_REINDEX_ON_STARTUP", "Indexing",
+     "Re-index stale projects when server starts",
+     "true|false",
+     "Enable to refresh stale indexes at startup (adds startup latency). Prefer reindex_stale_seconds for scheduled refresh."},
+    {"reindex_stale_seconds", "0", NULL, "Indexing",
+     "Re-index if DB is older than N seconds (0=disabled)",
+     "0-2592000",
+     "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
+    {CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT, NULL, "Indexing",
+     "Strategy used by the reindex that runs after every edit",
+     "always|full_rebuild|fast_mode_indexes_only",
+     "Every edit triggers a reindex; this key selects the strategy. 'always' (default) uses the "
+     "disk incremental path and falls back to containment or a full rebuild when the exact-delta "
+     "caps are exceeded, preserving correctness. 'full_rebuild' rebuilds atomically from scratch "
+     "on every reindex. 'fast_mode_indexes_only' uses the incremental path only when the index was "
+     "built in fast mode."},
+    {CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_OFF, NULL, "Indexing",
+     "Foreground overlay publish policy for bounded incremental deltas",
+     "off|small_deltas",
+     "'off' preserves canonical publish behavior. 'small_deltas' is opt-in: eligible exact-delta "
+     "batches publish ready overlay rows without mutating canonical graph rows; a canonical full "
+     "reindex remains the repair/oracle path."},
+    {CBM_CONFIG_OVERLAY_COMPACTION_POLICY,
+     CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL,
+     NULL,
+     "Indexing",
+     "Background overlay compaction trigger policy",
+     "manual|after_publish",
+     "'manual' never starts compaction automatically. 'after_publish' starts one bounded worker "
+     "only after index_repository successfully publishes an incremental_overlay result."},
+    {CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS,
+     CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS,
+     NULL,
+     "Indexing",
+     "Max overlay generations compacted by one automatic worker pass",
+     "1-256",
+     "Bounds after_publish maintenance. Keep low for foreground responsiveness; raise only after "
+     "benchmarks show compaction backlog is the limiting factor."},
+    {CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
+     CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS,
+     NULL,
+     "Indexing",
+     "Max changed files eligible for exact disk incremental publish",
+     "1-100000",
+     "Default is conservative. Raise only with canonical-graph benchmarks for your workload; larger "
+     "batches can approach full-rebuild cost."},
+    {CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+     CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS,
+     NULL,
+     "Indexing",
+     "Max changed plus inbound-dependent source files exact delta may reparse",
+     "1-100000",
+     "Default 32 keeps measured small cross-file edit frontiers on the canonical exact path and "
+     "selects bounded fallback before the observed latency crossover. The cap "
+     "limits exact-delta work before a correctness fallback; it does not bound total indexing cost "
+     "because fallback may perform containment or a full rebuild. Change only with canonical-graph "
+     "and latency/memory benchmarks for your workload."},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT,
+     NULL,
+     "Indexing",
+     "When incremental reindexes may defer recomputing the derived results (semantic edges, "
+     "similarity edges, architecture, routes)",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH "|"
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES "|"
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
+     "'defer_all_incremental_reindexes' (default): incremental reindexes mark the derived results "
+     "stale and defer their recomputation; query surfaces warn until a full reindex or an "
+     "at_publish run rebuilds them. 'at_publish' recomputes them as part of each reindex. "
+     "'defer_exact_delta_reindexes' defers only for small exact-delta reindexes; other reindexes "
+     "recompute at publish."},
+    /* ── Search ── */
+    {CBM_CONFIG_SEARCH_LIMIT, CBM_DEFAULT_SEARCH_LIMIT_STR, NULL, "Search",
+     "Default max results for search_graph/search_code",
+     "1-100000",
+     "Higher = more results but more tokens. Overridden by limit param per-query. "
+     CBM_DEFAULT_SEARCH_LIMIT_STR
+     " is good for exploration; 200+ for exhaustive analysis."},
+    {CBM_CONFIG_TRACE_MAX_RESULTS, CBM_DEFAULT_TRACE_MAX_RESULTS_STR, NULL, "Search",
+     "Default max nodes per direction in trace_path",
+     "1-10000",
+     "Controls how far call chains are traced. " CBM_DEFAULT_TRACE_MAX_RESULTS_STR
+     " covers typical call depth; raise to 100+ for deep dependency tracing."},
+    {CBM_CONFIG_QUERY_MAX_ROWS, CBM_DEFAULT_QUERY_MAX_ROWS_STR, NULL, "Search",
+     "Default result-row cap for query_graph when max_rows is omitted",
+     "0-" CBM_STRINGIFY(CBM_MAX_QUERY_ROWS),
+     "Bounds only rows returned after exact selection. Cypher LIMIT may lower but not bypass this "
+     "cap; 0 selects the default."},
+    {CBM_CONFIG_QUERY_MAX_WORKING_ROWS, CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR, NULL, "Search",
+     "Maximum intermediate rows/candidates materialized by query_graph",
+     "1-" CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS),
+     "A correctness-preserving resource budget, separate from output shaping. Exhaustion returns "
+     "an MCP tool execution error instead of partial results. An explicit max_rows raises the "
+     "effective working budget when needed."},
+    {CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR, NULL, "Search",
+     "Max response bytes for query_graph (0=unlimited)",
+     "0-104857600",
+     "32KB default prevents huge responses. Set 0 for unlimited Cypher results. Raise for bulk analysis queries."},
+    {CBM_CONFIG_SNIPPET_MAX_LINES, CBM_DEFAULT_SNIPPET_MAX_LINES_STR, NULL, "Search",
+     "Max source lines returned by get_code/get_code_snippet (0=unlimited)",
+     "0-1000000",
+     CBM_DEFAULT_SNIPPET_MAX_LINES_STR
+     " lines covers most functions. Set 0 for unlimited to get full file contents."},
+    {CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
+     "Comma-separated glob patterns to exclude from architecture key functions",
+     "glob patterns, e.g. graph-ui/**,tests/**",
+     "Use to remove UI, generated code, or test helpers from the architecture view. "
+     "Example: 'graph-ui/**,tools/**,scripts/**,tests/**'."},
+    {CBM_CONFIG_KEY_FUNCTIONS_COUNT, CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR, NULL, "Search",
+     "Max key functions returned in codebase://architecture and search context",
+     "1-10000",
+     "The architecture resource ranks every symbol by PageRank importance and returns the top N. "
+     "Use " CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR
+     " for most projects. Raise to 50-100 for large multi-language codebases where "
+     "important functions may not appear in the first " CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR
+     ". Lower to 10 when tokens are limited."},
+    {CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT, CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR, NULL,
+     "Search",
+     "Max key functions PUSHED in the first-response _context header (0 = use built-in "
+     CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR ")",
+     "0-100",
+     "Separate from key_functions_count (the architecture query bound) — this governs only the "
+     "auto-pushed summary that closes the codebase://architecture pull-only gap. Kept small ("
+     CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR ") "
+     "to keep first-response token cost modest; raise to 20-25 if you want richer upfront context."},
+    /* ── Tools ── */
+    {CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED, "CBM_TOOL_MODE", "Tools",
+     "Which tool surface the MCP server lists by default",
+     "streamlined|classic",
+     "'streamlined' (default): lists core tools plus _hidden_tools discovery: "
+     "search_graph, query_graph, search_code, trace_path, get_code. "
+     "'classic': exposes all individual tools including index_repository, get_code_snippet, get_architecture, "
+     "list_projects, detect_changes, manage_adr, etc. "
+     "You can also enable individual classic tools without switching modes: "
+     "config set tool_index_repository true"},
+    {CBM_CONFIG_DEFAULT_RESPONSE_FORMAT, CBM_MCP_OUTPUT_FORMAT_TOON,
+     "CBM_DEFAULT_RESPONSE_FORMAT", "Tools",
+     "Default response encoding when a tool call omits format",
+     CBM_MCP_OUTPUT_FORMAT_TOON "|" CBM_MCP_OUTPUT_FORMAT_JSON,
+     "toon (default) returns compact tables across supported read tools. json preserves complete "
+     "object/array responses for programmatic and compatibility workflows. An explicit per-call "
+     "format always overrides this default."},
+    {CBM_CONFIG_CONTEXT_INJECTION, "true", "CBM_CONTEXT_INJECTION", "Tools",
+     "Inject codebase schema and stats into the first tool response so the AI starts informed",
+     "true|false",
+     "When true (default), the first tool response includes a "
+     "_context object with project/index status, actionable recovery when results are unavailable, "
+     "canonical node/edge counts, dirty/overlay freshness, coverage state, schema, PageRank status, "
+     "and detected language ecosystem. Delivered once per MCP server process; later calls include "
+     "only session_project. "
+     "Why enable: the MCP client gets codebase structure upfront without needing to call "
+     "get_architecture or get_graph_schema separately. Useful for code exploration, "
+     "refactoring, debugging, and codebase-understanding tasks. "
+     "Why disable: context window space consumed by _context is wasted when the MCP client task "
+     "involves non-code tasks, scripted/programmatic tool use, CI pipelines, token-metered "
+     "environments, or when the model already has codebase context from another source. "
+     "To disable for one MCP server process: export CBM_CONTEXT_INJECTION=false "
+     "To disable by default: codebase-memory-mcp config set context_injection false"},
+    {"compact", "true", "CBM_COMPACT", "Tools",
+     "Default compact output for search_graph, trace_path, and get_code",
+     "true|false",
+     "true (default): omits name when equal to last qn segment, empty label/file, degree=0. "
+     "Per-call compact= param overrides. false for programmatic output parsing."},
+    {"default_sort_by", "relevance", NULL, "Tools",
+     "Default sort for search_graph when sort_by not specified",
+     "relevance|name|degree|calls|linkrank",
+     "relevance = PageRank structural importance. calls = most direct calls. "
+     "Set 'calls' for call-density analysis workflows."},
+    {"default_include_dependencies", "true", NULL, "Tools",
+     "Default include_dependencies for search_graph",
+     "true|false",
+     "false = restrict to project code only (exclude dep sub-projects). "
+     "Set false for single-project focus workflows."},
+    {"search_disable_dep_ranking", "false", NULL, "Tools",
+     "Disable project-before-dependency ranking in search_graph",
+     "true|false",
+     "false (default) ranks project symbols before dependency symbols when include_dependencies=true. "
+     "true uses pure relevance order across project and dependency symbols."},
+    /* ── PageRank ── */
+    {CBM_CONFIG_RANK_ENABLED, "true", NULL, "PageRank",
+     "Compute PageRank, LinkRank, and precomputed node-degree views after indexing",
+     "true|false",
+     CBM_CONFIG_GUIDANCE_LEADING
+     "true preserves existing ranking behavior. false skips all three coupled rank views and removes "
+     "their stored rows so queries cannot consume stale scores; structural degree remains available. "
+     "Disable for a lower-cost baseline: codebase-memory-mcp config set rank_enabled false"},
+    {CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER_STR, NULL, "PageRank",
+     "Maximum PageRank iterations allowed while seeking convergence",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "The default " CBM_PAGERANK_MAX_ITER_STR " matches the algorithm's tested convergence budget. Each iteration is O(V + E); "
+     "reaching the budget without convergence returns an error and preserves previously published "
+     "rank rows. Recommended: start at " CBM_PAGERANK_MAX_ITER_RECOMMENDED_START " and use the smallest measured budget safely above the "
+     "logged convergence iteration. Any positive int is accepted; lowering too far may reject valid "
+     "large graphs, while runtime is linear in the budget."},
+    {CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING_STR, NULL, "PageRank",
+     "Damping factor — fraction of importance that follows edges vs. teleports randomly (the 'bored surfer')",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_DAMPING_RECOMMENDED_RANGE "; default " CBM_PAGERANK_DAMPING_STR " is the standard Google PageRank value. Higher values spread "
+     "importance further along long call chains; lower values keep importance local. Config writes reject "
+     "out-of-range and non-finite values; invalid legacy/raw values use the " CBM_PAGERANK_DAMPING_STR " default."},
+    {CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON_STR, NULL, "PageRank",
+     "Convergence threshold — PageRank stops early when the L2 change between iterations drops below this",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_EPSILON_RECOMMENDED_RANGE "; default " CBM_PAGERANK_EPSILON_STR ". Lower values iterate longer for marginally "
+     "finer convergence; higher values stop sooner with less precise rankings. Must be > 0 — non-positive and "
+     "non-finite values are rejected. Values above 1 are allowed but normally stop immediately; pair "
+     "with pagerank_max_iter as the work budget."},
+    {CBM_CONFIG_RANK_SCOPE, "full", NULL, "PageRank",
+     "Project/dependency scope used when computing PageRank and LinkRank",
+     "full|project|deps",
+     CBM_CONFIG_GUIDANCE_USER_TUNABLE
+     "'full' (default): score the project plus its dependency sub-projects. "
+     "'project': score only the requested project's own symbols. "
+     "'deps': score only dependency sub-project symbols."},
+    {CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFAULT, NULL, "PageRank",
+     "When to recompute PageRank/LinkRank after indexing",
+     CBM_RANK_REFRESH_AT_PUBLISH "|" CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES "|"
+     CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
+     CBM_CONFIG_GUIDANCE_LEADING
+     "'defer_all_incremental_reindexes' (default): incremental reindexes, including containment "
+     "publishes and full rebuilds reached through incremental fallback, may defer rank recompute "
+     "after marking rank views stale; search/trace omit stale rank until a later refresh. "
+     "'at_publish': recompute after graph changes, dependency reindexes, or missing rank views. "
+     "'defer_exact_delta_reindexes': only small exact-delta reindexes may skip synchronous rank "
+     "recompute, after marking rank views stale."},
+    {CBM_CONFIG_EDGE_WEIGHT_CALLS, CBM_PAGERANK_WEIGHT_CALLS_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows along direct function/method call edges (CALLS)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "PageRank works like Google PageRank: importance flows along edges. Higher weight = more "
+     "importance flows when one function calls another. Recommended range " CBM_PAGERANK_WEIGHT_CALLS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_CALLS_DEFAULT_STR " is the "
+     "anchor and all other weights are relative to it. Increase to 2.0 for call-heavy C/Rust codebases. "
+     "Decrease to 0.5 for event-driven systems where direct calls aren't the primary coupling."},
+    {CBM_CONFIG_EDGE_WEIGHT_USAGE, CBM_PAGERANK_WEIGHT_USAGE_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows along type-reference edges: type annotations, attribute access, isinstance (USAGE)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "USAGE edges are created when code references a type (e.g. 'x: MyClass', 'isinstance(x, Foo)'). "
+     "Recommended range " CBM_PAGERANK_WEIGHT_USAGE_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_USAGE_DEFAULT_STR ". These are dense in TypeScript/Python and can inflate UI utilities over core functions. "
+     "Reduce to 0.2-0.3 if type annotations are dominating your architecture results."},
+    {CBM_CONFIG_EDGE_WEIGHT_DEFINES_METHOD, CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows from a class to each method it defines (DEFINES_METHOD)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_DEFINES_METHOD_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_DEFINES_METHOD_DEFAULT_STR ". Every class has one DEFINES_METHOD edge per method. Higher = classes with many methods rank "
+     "higher relative to standalone functions. Lower to 0.1 to treat functions and class methods equally."},
+    {CBM_CONFIG_EDGE_WEIGHT_IMPORTS, CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows along module import edges (IMPORTS)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_IMPORTS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_IMPORTS_DEFAULT_STR ". Created when file A imports file/module B. Higher promotes widely-imported utility modules "
+     "(e.g. a shared 'utils.py' imported by 50 files). Raise to 0.6-0.8 to emphasize shared infrastructure; "
+     "keep low if star-imports create many spurious edges."},
+    {CBM_CONFIG_EDGE_WEIGHT_DECORATES, CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows from a decorator to the function it decorates (DECORATES)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_DECORATES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_DECORATES_DEFAULT_STR ". Created when @decorator is applied to a function. Raise above 0.5 in Python web frameworks "
+     "where @route, @cached, @requires_auth are semantically important architectural markers."},
+    {CBM_CONFIG_EDGE_WEIGHT_WRITES, CBM_PAGERANK_WEIGHT_WRITES_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows when a function writes to a variable or file (WRITES)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_WRITES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_WRITES_DEFAULT_STR ". Tracks side effects: function writes to a shared variable or file. Raise for ETL or "
+     "data-pipeline codebases where write targets (databases, output files) are the primary output."},
+    {CBM_CONFIG_EDGE_WEIGHT_DEFINES, CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows from a file/module to each symbol it defines (DEFINES — structural)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_DEFINES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_DEFINES_DEFAULT_STR ". Every function has exactly one DEFINES edge from its containing file. "
+     "This is purely structural bookkeeping; raising it inflates ALL symbols in a file equally, "
+     "which is rarely what you want."},
+    {CBM_CONFIG_EDGE_WEIGHT_CONFIGURES, CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows from config files to the code they configure (CONFIGURES)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_CONFIGURES_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_CONFIGURES_DEFAULT_STR ". Created when a config file references a code symbol (e.g. a YAML file referencing a handler "
+     "class). Raise to 0.3+ for infrastructure projects where config -> code coupling is important."},
+    {CBM_CONFIG_EDGE_WEIGHT_TESTS, CBM_PAGERANK_WEIGHT_TESTS_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows from test code to the production function it tests (TESTS)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_TESTS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_TESTS_DEFAULT_STR ". Keep this low so test files don't inflate production function rankings. A function "
+     "with 100 tests would otherwise rank at the top of every project. Raise only if you want "
+     "heavily-tested functions to rank higher (useful for spotting critical code paths)."},
+    {CBM_CONFIG_EDGE_WEIGHT_HTTP_CALLS, CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows along cross-service HTTP call edges (HTTP_CALLS)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_HTTP_CALLS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_HTTP_CALLS_DEFAULT_STR ". Created when code makes an HTTP call to another service endpoint. Raise to 1.0-2.0 for "
+     "microservice architectures where HTTP calls ARE the primary coupling between components "
+     "and you want service entry points to appear prominently in architecture results."},
+    {CBM_CONFIG_EDGE_WEIGHT_ASYNC_CALLS, CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows along async function call edges (ASYNC_CALLS)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_ASYNC_CALLS_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_ASYNC_CALLS_DEFAULT_STR ". Like edge_weight_calls but for async/await call patterns. Slightly lower than sync calls "
+     "by default. Reduce to 0.3 for heavily async Node.js or Python asyncio codebases where "
+     "awaited spans are dense and create noise in the rankings."},
+    {CBM_CONFIG_EDGE_WEIGHT_DEFAULT, CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT_STR, NULL, "PageRank",
+     "Fallback importance weight for edge types not listed above",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_FALLBACK_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_FALLBACK_DEFAULT_STR ". This is the safety net for edge types added without explicit "
+     "weights; it rarely affects results."},
+    {CBM_CONFIG_EDGE_WEIGHT_MEMBER_OF, CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT_STR, NULL, "PageRank",
+     "How much importance flows from a method back up to its parent class (MEMBER_OF — reverse structural)",
+     NULL,
+     CBM_CONFIG_GUIDANCE_ADVANCED
+     "Recommended range " CBM_PAGERANK_WEIGHT_MEMBER_OF_RECOMMENDED_RANGE "; default " CBM_PAGERANK_WEIGHT_MEMBER_OF_DEFAULT_STR ". Set to 0 to disable (method importance stays in the method, not the class). "
+     "Higher values propagate method-level importance up to the parent class — "
+     "raise to 0.8 to make heavily-called classes rank higher than individual methods."},
+    /* ── Watcher ── */
+    {CBM_CONFIG_AUTO_WATCH, "true", NULL, "Watcher",
+     "Register the background Git watcher when an MCP session connects",
+     "true|false",
+     "Disable for hermetic or externally orchestrated indexing; enable for automatic incremental refresh."},
+    {"watcher_poll_base_ms", "5000", NULL, "Watcher",
+     "Base file-watcher poll interval in milliseconds",
+     "100-3600000",
+     "5 seconds by default. Lower for faster change detection (100ms for dev loops); "
+     "raise for large repos to reduce CPU overhead. Actual interval scales with file count."},
+    {"watcher_poll_max_ms", "60000", NULL, "Watcher",
+     "Maximum file-watcher poll interval in milliseconds (cap for large repos)",
+     "100-3600000",
+     "60 seconds for repos with 50K+ files. Lower to 10000 for faster detection in large repos "
+     "if CPU allows. Formula: min(base + file_count/500 * 1000, max)."},
+    {CBM_CONFIG_UI_LANG, "auto", NULL, "UI",
+     "Graph UI language selection",
+     "auto|en|zh",
+     "Use auto to follow the client locale, or pin a supported language for consistent shared sessions."},
+    {"store_idle_timeout_s", "60", NULL, "MCP",
+     "Seconds an MCP server keeps an idle SQLite project store open",
+     "1-65536",
+     "60 seconds balances latency for repeated tool calls with memory release while idle. Lower for "
+     "memory-constrained hosts; raise for long MCP server runs that repeatedly query one project."},
+    {"db_validate_busy_timeout_ms", "1000", NULL, "MCP",
+     "SQLite busy timeout for read-only cache database validation in MCP startup/discovery paths",
+     "0-65536",
+     "1 second avoids hanging JSON-RPC startup on locked databases. Raise on slow network filesystems; "
+     "set 0 to fail immediately."},
+    {"update_check_timeout_s", "5", NULL, "MCP",
+     "Curl timeout for the optional MCP background latest-release check (0=disabled)",
+     "0-256",
+     "Default preserves the historical 5-second bound. Set 0 for offline, hermetic, or privacy-sensitive "
+     "MCP deployments where the server must not make background network requests."},
+    /* ── Architecture ── */
+    {CBM_CONFIG_ARCH_HOTSPOT_LIMIT, CBM_DEFAULT_ARCH_HOTSPOT_LIMIT_STR, NULL, "Architecture",
+     "Max hotspot functions shown in the classic get_architecture tool's hotspots section",
+     "1-10000",
+     "Hotspots are functions ranked by how many times they are directly called (calls_in count). "
+     "They identify the most-invoked code — good candidates for optimization and risk assessment. "
+     "25 is enough for orientation; raise to 100 for exhaustive call-density analysis. "
+     "Only applies to the classic 'get_architecture' tool (tool_mode=classic)."},
+    {CBM_CONFIG_ARCH_RESOLUTION, CBM_DEFAULT_ARCH_RESOLUTION_STR, NULL, "Architecture",
+     "Leiden community-detection resolution for architecture clusters",
+     "0.0001-10.0",
+     "1.0 is the standard Leiden default. Higher (2.0-5.0) splits code into more, finer-grained "
+     "clusters; lower (0.3-0.5) merges related clusters into coarse subsystems. Non-positive and "
+     "NaN values are clamped to 1.0. Drives the 'clusters' section of get_architecture."},
+    {CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET_STR, NULL,
+     "Architecture",
+     "Maximum Function, Method, and Class nodes processed by Leiden architecture clustering",
+     CBM_MIN_ARCH_CLUSTER_NODE_BUDGET_STR "-" CBM_STRINGIFY(CBM_MAX_ARCH_CLUSTER_NODE_BUDGET),
+     "Bounds graph-sized clustering runtime and memory without silently changing results. When a "
+     "project exceeds this budget, get_architecture omits clusters, reports the exact eligible "
+     "node count and budget, and advises narrowing path or raising this setting."},
+    /* ── Similarity ── */
+    {CBM_CONFIG_SIMILARITY_ENABLED, "true", NULL, "Similarity",
+     "Create MinHash SIMILAR edges during full and moderate indexing",
+     "true|false",
+     "false skips the global MinHash comparison pass while leaving semantic edges independent. "
+     "Use for an ablation or lower indexing cost: codebase-memory-mcp config set similarity_enabled false"},
+    {CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true", NULL, "Similarity",
+     "Create SEMANTICALLY_RELATED edges during full and moderate indexing",
+     "true|false",
+     "false skips the global semantic-edge pass while leaving MinHash similarity independent. "
+     "Use for an ablation or lower indexing cost: codebase-memory-mcp config set semantic_edges_enabled false"},
+    {CBM_CONFIG_GITHISTORY_ENABLED, "true", NULL, "Similarity",
+     "Scan Git history and create FILE_CHANGES_WITH coupling edges",
+     "true|false",
+     "false avoids Git-history scanning and its worker without changing source extraction. "
+     "Disable for repositories without useful history: codebase-memory-mcp config set githistory_enabled false"},
+    {CBM_CONFIG_HTTPLINKS_ENABLED, "true", NULL, "Similarity",
+     "Create route-to-client HTTP_CALLS edges with the HTTP linker",
+     "true|false",
+     "false skips fork-specific HTTP linking while retaining route discovery and other call edges. "
+     "Use for upstream-compatible comparisons: codebase-memory-mcp config set httplinks_enabled false"},
+    {"similarity_threshold", "0.0", NULL, "Similarity",
+     "MinHash Jaccard threshold for semantic SIMILAR edges (0.0 = use the built-in 0.95 default)",
+     "0.0-1.0",
+     "Two symbols get a SIMILAR edge when their estimated Jaccard similarity is at least this. "
+     "0.0 (default) uses the built-in 0.95, so only near-duplicates are linked. Lower to 0.7-0.8 to "
+     "surface more semantic duplicates (refactoring candidates); too low adds noisy edges that inflate "
+     "PageRank rankings. Effective only when indexing creates similarity edges (full/moderate modes)."},
+    {"semantic_threshold", "0.0", NULL, "Similarity",
+     "Combined semantic score threshold for SEMANTICALLY_RELATED edges (0.0 = built-in 0.75)",
+     "0.0-1.0",
+     "Controls the algorithmic semantic-edge pass. Higher values improve precision and reduce edge count; "
+     "lower values increase recall and runtime output volume. 0.0 preserves the upstream-compatible default."},
+    {"httplink_min_confidence", "0.0", NULL, "Similarity",
+     "Minimum confidence for HTTP route-to-call linking (0.0 = built-in 0.25)",
+     "0.0-1.0",
+     "Raises or lowers the fork-only HTTP linker's match threshold. Higher values reduce speculative "
+     "cross-service HTTP_CALLS edges; 0.0 keeps existing behavior."},
+    {CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.0", NULL, "Similarity",
+     "Minimum file co-change coupling score for FILE_CHANGES_WITH edges (0.0 = built-in 0.3)",
+     "0.0-1.0",
+     "Controls how strongly two files must co-change before git-history coupling emits an edge. "
+     "Higher values reduce noisy historical edges; 0.0 keeps existing behavior."},
+    {CBM_CONFIG_GITHISTORY_MAX_COUPLINGS,
+     CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS_STR,
+     NULL,
+     "Similarity",
+     "Maximum strongest FILE_CHANGES_WITH edges retained from git history",
+     "1-" CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR,
+     "The default preserves the established graph-size and indexing-cost budget. When more valid "
+     "pairs exist, the server returns the strongest complete subset and logs a couplings_partial "
+     "warning with written, eligible, and omitted counts. Raise toward the exhaustive "
+     CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR
+     " upper bound only when the additional graph size, runtime, and path-string memory are "
+     "acceptable; that bound covers every possible pair observation in the current "
+     CBM_STRINGIFY(CBM_GITHISTORY_HISTORY_COMMIT_LIMIT)
+     "-commit, " CBM_STRINGIFY(CBM_GITHISTORY_MAX_FILES_PER_COMMIT)
+     "-files-per-commit history window."},
+    {"lsp_confidence_floor", "0.0", NULL, "Similarity",
+     "Minimum LSP-resolved call confidence accepted by call resolution (0.0 = built-in 0.6)",
+     "0.0-1.0",
+     "Applies consistently to sequential and parallel call resolution. Raise to prefer registry matches "
+     "over uncertain LSP hints; lower only when language-specific LSP coverage is known to be precise."},
+    /* ── Degree / Sort ── */
+    {"degree_mode", "weighted", NULL, "Degree",
+     "What 'degree' means for min_degree/max_degree filters and sort_by=degree ranking",
+     "weighted|unweighted|calls_only",
+     "Degree = how connected a symbol is. 'weighted' multiplies each connection by its edge type weight "
+     "(e.g. a direct call counts 1.0x, a test call counts 0.05x) — best overall signal. "
+     "'unweighted' = raw connection count regardless of type. "
+     "'calls_only' = only count direct function call connections — best for finding the most-called functions."},
+    /* ── Dependencies ── */
+    {CBM_CONFIG_AUTO_INDEX_DEPS, CBM_DEFAULT_AUTO_INDEX_DEPS_STR, NULL, "Dependencies",
+     "Automatically index installed dependency source for cross-package search and tracing",
+     "true|false",
+     "Disabled by default to bound indexing latency, CPU, memory, and stored graph size. Enable when "
+     "automatic dependency-source coverage is worth that cost; auto_dep_limit bounds each discovery "
+     "pass. index_dependencies remains available for explicit packages. Disabling this setting stops "
+     "future automatic dependency indexing; it does not delete dependency projects already indexed."},
+    {CBM_CONFIG_AUTO_DEP_LIMIT, CBM_STRINGIFY(CBM_DEFAULT_AUTO_DEP_LIMIT), NULL, "Dependencies",
+     "Max number of packages to auto-index",
+     "0-" CBM_STRINGIFY(CBM_MAX_AUTO_DEP_LIMIT),
+     "When more packages are installed than this limit, the most-imported packages are selected "
+     "(ranked by project import references, ties broken by name). Raise to 100+ for comprehensive "
+     "dependency analysis. 0 = unlimited (may be very slow for large dependency trees)."},
+    {CBM_CONFIG_DEP_MAX_FILES, CBM_STRINGIFY(CBM_DEFAULT_DEP_MAX_FILES), NULL, "Dependencies",
+     "Max indexable source files allowed per automatically indexed dependency package",
+     "0-" CBM_STRINGIFY(CBM_MAX_DEP_MAX_FILES),
+     "Packages above the bound are skipped atomically rather than published with partial API "
+     "coverage; index_repository reports the skip count and server logs identify each package. "
+     "Raise for measured large-package workloads. Set 0 for unlimited files per dependency."},
+    {NULL, NULL, NULL, NULL, NULL, NULL, NULL} /* sentinel */
+};
+// clang-format on
+
+/* Get config value with env var override priority: env > db > default.
+ * Looks up the registry entry for the key to find the env var name. */
+const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val) {
+    static CBM_TLS char env_value[CBM_SZ_2K];
+    /* Check env var override first */
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0 && CBM_CONFIG_REGISTRY[i].env_var) {
+            const char *env =
+                cbm_safe_getenv(CBM_CONFIG_REGISTRY[i].env_var, env_value, sizeof(env_value), NULL);
+            if (env && env[0])
+                return env;
+            break;
+        }
+    }
+    /* Fall back to DB value or default */
+    return cbm_config_get(cfg, key, default_val);
+}
+
+bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+    const char *val = cbm_config_get_effective(cfg, key, default_val ? "true" : "false");
+    if (!val) {
+        return default_val;
+    }
+    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
+        return true;
+    }
+    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
+        return false;
+    }
+    return default_val;
+}
+
+int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default_val) {
+    char default_buf[CBM_SZ_32];
+    snprintf(default_buf, sizeof(default_buf), "%d", default_val);
+    const char *val = cbm_config_get_effective(cfg, key, default_buf);
+    if (!val || !val[0] || !cbm_config_value_is_valid(key, val)) {
+        return default_val;
+    }
+    int parsed = 0;
+    if (!cbm_config_parse_decimal_int(val, &parsed)) {
+        return default_val;
+    }
+    return parsed;
+}
+
+/* ── Config CLI subcommand ────────────────────────────────────── */
+static bool cli_args_have_help(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void print_install_help(void) {
+    puts("Usage: codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]");
+    puts("");
+    puts("Install the current binary, MCP agent configs, skills, hooks, and PATH entries.");
+    puts("");
+    puts("Options:");
+    puts("  -y, --yes   Answer yes to prompts");
+    puts("  -n, --no    Answer no to prompts");
+    puts("  --force     Overwrite existing installed files where supported");
+    puts("  --dry-run   Show actions without modifying files");
+    puts("  --plan      Print JSON install plan and do not modify files");
+}
+
+static void print_uninstall_help(void) {
+    puts("Usage: codebase-memory-mcp uninstall [-y|-n] [--dry-run]");
+    puts("");
+    puts("Remove MCP agent configs, skills, hooks, indexes, and installed binary.");
+    puts("");
+    puts("Options:");
+    puts("  -y, --yes   Answer yes to prompts");
+    puts("  -n, --no    Answer no to prompts");
+    puts("  --dry-run   Show actions without modifying files");
+}
+
+static void print_update_help(void) {
+    puts("Usage: codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]");
+    puts("");
+    puts("Download a release binary, replace the installed binary, and refresh agent configs.");
+    puts("");
+    puts("Options:");
+    puts("  -y, --yes   Answer yes to prompts");
+    puts("  -n, --no    Answer no to prompts");
+    puts("  --force     Skip latest-version check");
+    puts("  --dry-run   Show actions without downloading or modifying files");
+    puts("  --standard  Select MCP-server-only binary without prompting");
+    puts("  --ui        Select binary with embedded graph visualization without prompting");
 }

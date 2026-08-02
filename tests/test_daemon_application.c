@@ -33,6 +33,7 @@
  * loaded 3-core CI runner — at 2000 ms the cancel-delivery wait lost the
  * tail of that distribution once in seven otherwise-green TSan rounds. */
 enum { APP_TEST_TIMEOUT_MS = 10000, APP_TEST_PATH_CAP = 1024 };
+#define APP_TEST_RELEASE_VERSION "1.0.0"
 
 typedef struct {
     char runtime_parent[APP_TEST_PATH_CAP];
@@ -615,6 +616,101 @@ TEST(daemon_application_mcp_notification_has_no_response) {
     ASSERT_EQ(notification_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_TRUE(response == NULL);
     ASSERT_EQ(response_length, 0);
+    PASS();
+}
+
+/* The daemon application has no stdio stream of its own. Preserve the
+ * response-before-notification contract as an explicit success disposition so
+ * the thin frontend can frame the notification for the client's transport.
+ * Repeated reveal and Codex's static catalog must remain ordinary successes. */
+TEST(daemon_application_reports_hidden_tool_catalog_change_once) {
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *generic = app_test_open(&callbacks, 20);
+    cbm_daemon_runtime_application_session_t *codex = app_test_open(&callbacks, 21);
+    char root[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-hidden-tools-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+
+    static const char *const generic_messages[] = {
+        ("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+         "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+         "\"clientInfo\":{\"name\":\"generic-client\",\"version\":\"1.0\"}}}"),
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+        ("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+         "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"),
+        ("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+         "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"),
+    };
+    static const char *const codex_messages[] = {
+        ("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"initialize\","
+         "\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
+         "\"clientInfo\":{\"name\":\"codex-mcp-client\",\"version\":\"1.0\"}}}"),
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/list\",\"params\":{}}",
+        ("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\","
+         "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}"),
+    };
+    cbm_daemon_runtime_application_status_t generic_statuses[4] = {0};
+    cbm_daemon_runtime_application_status_t codex_statuses[3] = {0};
+    bool responses_ok = application && generic && codex && root_ok;
+
+    for (int session_index = 0; responses_ok && session_index < 2; session_index++) {
+        cbm_daemon_runtime_application_session_t *session = session_index == 0 ? generic : codex;
+        uint8_t *context = NULL;
+        uint32_t context_length = 0;
+        responses_ok = app_test_context_request(root, root, &context, &context_length);
+        uint8_t *response = NULL;
+        uint32_t response_length = 0;
+        if (responses_ok) {
+            responses_ok =
+                app_test_request(&callbacks, session, context, context_length, &response,
+                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                response == NULL && response_length == 0;
+        }
+        free(context);
+        free(response);
+
+        const char *const *messages = session_index == 0 ? generic_messages : codex_messages;
+        int message_count = session_index == 0 ? 4 : 3;
+        cbm_daemon_runtime_application_status_t *statuses =
+            session_index == 0 ? generic_statuses : codex_statuses;
+        for (int index = 0; responses_ok && index < message_count; index++) {
+            uint8_t *request = NULL;
+            uint32_t request_length = 0;
+            response = NULL;
+            response_length = 0;
+            responses_ok = app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                                                 messages[index], &request, &request_length);
+            if (responses_ok) {
+                statuses[index] = app_test_request(&callbacks, session, request, request_length,
+                                                   &response, &response_length);
+                responses_ok = response && response_length > 0;
+            }
+            free(request);
+            free(response);
+        }
+    }
+
+    if (generic) {
+        callbacks.session_close(callbacks.context, generic);
+    }
+    if (codex) {
+        callbacks.session_close(callbacks.context, codex);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    (void)cbm_rmdir(root);
+
+    ASSERT_TRUE(responses_ok);
+    ASSERT_EQ(generic_statuses[0], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(generic_statuses[1], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(generic_statuses[2], CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED);
+    ASSERT_EQ(generic_statuses[3], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(codex_statuses[0], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(codex_statuses[1], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(codex_statuses[2], CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(stopped);
     PASS();
 }
 
@@ -1816,7 +1912,10 @@ static bool app_wait_for_update_notice(const cbm_daemon_runtime_application_call
  * one physical worker but retain one subscription per live session. */
 TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     app_env_backup_t cache_environment;
+    app_env_backup_t auto_index_environment;
     bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    bool auto_index_saved = app_env_backup_capture(&auto_index_environment, "CBM_AUTO_INDEX");
+    bool auto_index_unset = auto_index_saved && cbm_unsetenv("CBM_AUTO_INDEX") == 0;
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, false);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -1825,11 +1924,14 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     (void)snprintf(root, sizeof(root), "%s/cbm-app-auto-index-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-index-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
-    bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool cache_set =
+        dirs_ok && cache_saved && auto_index_unset && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
-    bool config_ready = stored_config &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    /* Leave auto_index unset in both the stored and environment layers:
+     * daemon session-start admission must use the registry's true default,
+     * exactly like synchronous first-use indexing. */
+    bool config_ready =
+        stored_config && cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -1924,8 +2026,11 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     (void)th_rmtree(root);
     (void)th_rmtree(cache);
     bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool auto_index_restored = app_env_backup_restore(&auto_index_environment);
 
     ASSERT_TRUE(cache_saved);
+    ASSERT_TRUE(auto_index_saved);
+    ASSERT_TRUE(auto_index_unset);
     ASSERT_TRUE(dirs_ok);
     ASSERT_TRUE(cache_set);
     ASSERT_TRUE(config_ready);
@@ -1946,6 +2051,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_EQ(atomic_load(&update.destroys), 1);
     ASSERT_TRUE(stopped);
     ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(auto_index_restored);
     PASS();
 }
 
@@ -1955,18 +2061,32 @@ TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     char root[APP_TEST_PATH_CAP];
     char cache[APP_TEST_PATH_CAP];
     char tracked[APP_TEST_PATH_CAP];
+    char second[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-auto-limit-root-XXXXXX", cbm_tmpdir());
     (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-limit-cache-XXXXXX", cbm_tmpdir());
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
     bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
     (void)snprintf(tracked, sizeof(tracked), "%s/tracked.c", root);
+    (void)snprintf(second, sizeof(second), "%s/tracked_second.c", root);
     bool git_ready = dirs_ok && app_test_create_empty_file(tracked) &&
+                     app_test_create_empty_file(second) &&
                      app_test_git(root, "init", "-q", NULL) == 0 &&
-                     app_test_git(root, "add", "--", "tracked.c") == 0;
+                     app_test_git(root, "add", "--", "tracked.c") == 0 &&
+                     app_test_git(root, "add", "--", "tracked_second.c") == 0;
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
+    /* Two indexable files against a limit of 1, so the limit genuinely bounds the
+     * repository. This fixture previously used auto_index_limit=0, which every
+     * limit key in the configuration registry documents as UNLIMITED, not as
+     * "admit nothing": auto_index_limit itself says "0=no limit, index
+     * everything" (src/cli/cli.c), and auto_dep_limit, query_max_output_bytes,
+     * and snippet_max_lines all say "0 = unlimited". Asserting that 0 blocks
+     * admission pinned the exact opposite of the documented behavior, and
+     * contradicted cbm_mcp_auto_index_within_limit, which returns early for
+     * file_limit <= 0. A limit of 1 tests the same intent without depending on a
+     * value whose documented meaning is "no limit at all". */
     bool config_ready = stored_config &&
                         cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX_LIMIT, "0") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX_LIMIT, "1") == 0 &&
                         cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
 
     app_fake_worker_context_t fake;
@@ -2187,6 +2307,9 @@ TEST(daemon_application_auto_index_retries_transient_busy_admission) {
  * per MCP server. Its completed result is replayed exactly once to every
  * eligible full session, including a session initialized after completion. */
 TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_once) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(APP_TEST_RELEASE_VERSION);
+
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, true);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -2245,6 +2368,7 @@ TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_onc
     }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
     free(initial_notice);
     free(initial_second);
     free(late_notice);
@@ -2266,7 +2390,62 @@ TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_onc
     PASS();
 }
 
+/* Development builds do not have an ordered release version. Comparing the
+ * sentinel as semver zero would advertise an arbitrary published release as
+ * an upgrade and prepend that misleading notice to an unrelated tool result. */
+TEST(daemon_application_development_version_suppresses_release_notice) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(CBM_VERSION_DEVELOPMENT);
+
+    app_fake_update_context_t update;
+    app_fake_update_context_init(&update, true);
+    cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
+    cbm_daemon_application_config_t config = {.update_ops = &update_ops};
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-update-dev-root-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_daemon_application_t *application = root_ok ? cbm_daemon_application_new(&config) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 4251) : NULL;
+    bool initialized = app_test_initialize_profile(&callbacks, session, root,
+                                                   CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool generation_completed = initialized && app_wait_for_atomic_int(&update.destroys, 1);
+
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t response_status =
+        generation_completed
+            ? app_test_list_projects(&callbacks, session, 42510, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool notice_absent = response_status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response &&
+                         !strstr((char *)response, "Update available:");
+
+    if (session) {
+        callbacks.session_cancel(callbacks.context, session);
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
+    free(response);
+    (void)th_rmtree(root);
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_TRUE(initialized);
+    ASSERT_TRUE(generation_completed);
+    ASSERT_TRUE(notice_absent);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(atomic_load(&update.cancels), 0);
+    ASSERT_EQ(atomic_load(&update.destroys), 1);
+    PASS();
+}
+
 TEST(daemon_application_update_generation_retries_worker_start_failure) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(APP_TEST_RELEASE_VERSION);
+
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, true);
     atomic_store(&update.start_failures_remaining, 1);
@@ -2294,6 +2473,7 @@ TEST(daemon_application_update_generation_retries_worker_start_failure) {
     }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
     free(notice);
     (void)th_rmtree(root);
 
@@ -2309,6 +2489,9 @@ TEST(daemon_application_update_generation_retries_worker_start_failure) {
 }
 
 TEST(daemon_application_update_generation_retries_cancelled_check) {
+    const char *previous_version = cbm_cli_get_version();
+    cbm_cli_set_version(APP_TEST_RELEASE_VERSION);
+
     app_fake_update_context_t update;
     app_fake_update_context_init(&update, false);
     cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
@@ -2358,6 +2541,7 @@ TEST(daemon_application_update_generation_retries_cancelled_check) {
     }
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    cbm_cli_set_version(previous_version);
     free(notice);
     (void)th_rmtree(root);
 
@@ -4879,6 +5063,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
+    RUN_TEST(daemon_application_reports_hidden_tool_catalog_change_once);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
@@ -4888,6 +5073,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);
     RUN_TEST(daemon_application_auto_index_retries_transient_busy_admission);
     RUN_TEST(daemon_application_update_generation_notifies_initial_and_late_sessions_once);
+    RUN_TEST(daemon_application_development_version_suppresses_release_notice);
     RUN_TEST(daemon_application_update_generation_retries_worker_start_failure);
     RUN_TEST(daemon_application_update_generation_retries_cancelled_check);
     RUN_TEST(daemon_application_final_disconnect_cancels_and_joins_update_generation);

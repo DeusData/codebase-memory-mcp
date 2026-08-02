@@ -13,9 +13,11 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h"
 #include "foundation/compat.h"
 
 #include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,14 +35,32 @@
 #define CONF_FILE_FULLPATH 0.90
 #define CONF_FILE_BASENAME 0.70
 
+static const char configlink_edge_configures[] = "CONFIGURES";
+static const char configlink_strategy_key_symbol[] = "key_symbol";
+static const char configlink_strategy_dep_import[] = "dependency_import";
+static const char configlink_prop_key_symbol[] = "\"strategy\":\"key_symbol\"";
+static const char configlink_prop_dep_import[] = "\"strategy\":\"dependency_import\"";
+
+static void clear_configlink_edges(cbm_gbuf_t *gb) {
+    if (!gb) {
+        return;
+    }
+    cbm_gbuf_delete_edges_by_type_matching_props(gb, configlink_edge_configures,
+                                                 configlink_prop_key_symbol);
+    cbm_gbuf_delete_edges_by_type_matching_props(gb, configlink_edge_configures,
+                                                 configlink_prop_dep_import);
+}
+
 /* ── Manifest / dep section tables ──────────────────────────────── */
 
+/* Use the shared manifest file list from depindex.h for DRY.
+ * Adding new manifest files to CBM_MANIFEST_FILES covers both
+ * dep discovery and config linking automatically. */
+#include "depindex/depindex.h"
+
 static bool is_manifest_file(const char *basename) {
-    static const char *names[] = {"Cargo.toml",       "package.json",  "go.mod",
-                                  "requirements.txt", "Gemfile",       "build.gradle",
-                                  "pom.xml",          "composer.json", NULL};
-    for (int i = 0; names[i]; i++) {
-        if (strcmp(basename, names[i]) == 0) {
+    for (int i = 0; CBM_MANIFEST_FILES[i]; i++) {
+        if (strcmp(basename, CBM_MANIFEST_FILES[i]) == 0) {
             return true;
         }
     }
@@ -144,6 +164,24 @@ static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) 
     return n;
 }
 
+static int count_code_entry_capacity(cbm_gbuf_t *gb) {
+    int total = 0;
+    static const char *labels[] = {"Function", "Variable", "Class", NULL};
+
+    for (int li = 0; labels[li]; li++) {
+        const cbm_gbuf_node_t **nodes = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_label(gb, labels[li], &nodes, &count) != 0) {
+            continue;
+        }
+        if (count > INT_MAX - total) {
+            return 0;
+        }
+        total += count;
+    }
+    return total;
+}
+
 static int strategy_key_symbols(cbm_gbuf_t *gb) {
     /* Get all Variable nodes */
     const cbm_gbuf_node_t **vars = NULL;
@@ -151,16 +189,34 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
     if (cbm_gbuf_find_by_label(gb, "Variable", &vars, &var_count) != 0) {
         return 0;
     }
-
-    config_entry_t config_entries[CBM_SZ_4K];
-    int config_count = collect_config_entries(vars, var_count, config_entries, CBM_SZ_4K);
-
-    if (config_count == 0) {
+    if (var_count <= 0) {
         return 0;
     }
 
-    code_entry_t code_entries[CBM_SZ_8K];
-    int code_count = collect_code_entries(gb, code_entries, CBM_SZ_8K);
+    /* Heap-allocate from discovered counts. Fixed caps made full and
+     * containment runs pick different candidates when graph iteration order
+     * differed, breaking incremental/fresh parity on large repositories. */
+    config_entry_t *config_entries = calloc((size_t)var_count, sizeof(config_entry_t));
+    if (!config_entries)
+        return 0;
+    int config_count = collect_config_entries(vars, var_count, config_entries, var_count);
+
+    if (config_count == 0) {
+        free(config_entries);
+        return 0;
+    }
+
+    int code_cap = count_code_entry_capacity(gb);
+    if (code_cap <= 0) {
+        free(config_entries);
+        return 0;
+    }
+    code_entry_t *code_entries = calloc((size_t)code_cap, sizeof(code_entry_t));
+    if (!code_entries) {
+        free(config_entries);
+        return 0;
+    }
+    int code_count = collect_code_entries(gb, code_entries, code_cap);
 
     int edge_count = 0;
 
@@ -179,16 +235,18 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
             if (confidence > 0.0) {
                 char props[CBM_SZ_512];
                 snprintf(props, sizeof(props),
-                         "{\"strategy\":\"key_symbol\",\"confidence\":%.2f,\"config_key\":\"%s\"}",
-                         confidence, config_entries[ci].name);
+                         "{\"strategy\":\"%s\",\"confidence\":%.2f,\"config_key\":\"%s\"}",
+                         configlink_strategy_key_symbol, confidence, config_entries[ci].name);
 
                 cbm_gbuf_insert_edge(gb, code_entries[co].node_id, config_entries[ci].node_id,
-                                     "CONFIGURES", props);
+                                     configlink_edge_configures, props);
                 edge_count++;
             }
         }
     }
 
+    free(config_entries);
+    free(code_entries);
     return edge_count;
 }
 
@@ -198,15 +256,6 @@ typedef struct {
     int64_t node_id;
     char name[CBM_SZ_256];
 } dep_entry_t;
-
-/* Extract basename from a file path. */
-static const char *path_basename(const char *path) {
-    if (!path) {
-        return "";
-    }
-    const char *slash = strrchr(path, '/');
-    return slash ? slash + SKIP_ONE : path;
-}
 
 /* Check if a Cargo.toml QN contains a dependency section in any dotted part. */
 static bool is_cargo_dep_section(const char *qn) {
@@ -242,7 +291,7 @@ static int collect_manifest_deps(const cbm_gbuf_node_t *const *vars, int var_cou
                                  dep_entry_t *out, int max_out) {
     int n = 0;
     for (int i = 0; i < var_count && n < max_out; i++) {
-        const char *base = path_basename(vars[i]->file_path);
+        const char *base = cbm_path_base(vars[i]->file_path);
         if (!is_manifest_file(base)) {
             continue;
         }
@@ -297,10 +346,19 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
         return 0;
     }
 
-    dep_entry_t deps[CBM_SZ_2K];
-    int dep_count = collect_manifest_deps(vars, var_count, deps, CBM_SZ_2K);
+    if (var_count <= 0) {
+        return 0;
+    }
+
+    /* Heap-allocate from discovered variable count; large manifests should not
+     * silently truncate dependency candidates. */
+    dep_entry_t *deps = calloc((size_t)var_count, sizeof(dep_entry_t));
+    if (!deps)
+        return 0;
+    int dep_count = collect_manifest_deps(vars, var_count, deps, var_count);
 
     if (dep_count == 0) {
+        free(deps);
         return 0;
     }
 
@@ -308,6 +366,7 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
     const cbm_gbuf_edge_t **imports = NULL;
     int import_count = 0;
     if (cbm_gbuf_find_edges_by_type(gb, "IMPORTS", &imports, &import_count) != 0) {
+        free(deps);
         return 0;
     }
 
@@ -331,18 +390,18 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
             double confidence = match_dep_to_import(target, dep_lower);
             if (confidence > 0.0) {
                 char props[CBM_SZ_512];
-                snprintf(
-                    props, sizeof(props),
-                    "{\"strategy\":\"dependency_import\",\"confidence\":%.2f,\"dep_name\":\"%s\"}",
-                    confidence, deps[di].name);
+                snprintf(props, sizeof(props),
+                         "{\"strategy\":\"%s\",\"confidence\":%.2f,\"dep_name\":\"%s\"}",
+                         configlink_strategy_dep_import, confidence, deps[di].name);
 
-                cbm_gbuf_insert_edge(gb, source->id, deps[di].node_id, "CONFIGURES", props);
+                cbm_gbuf_insert_edge(gb, source->id, deps[di].node_id, configlink_edge_configures,
+                                     props);
                 edge_count++;
             }
         }
     }
 
-    /* gbuf data is borrowed — no free */
+    free(deps);
     return edge_count;
 }
 
@@ -357,6 +416,8 @@ typedef struct {
 
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx) {
     cbm_gbuf_t *gb = ctx->gbuf;
+    clear_configlink_edges(gb);
+
     /* Early exit: check if any config files exist in the project. */
     bool has_config = false;
 

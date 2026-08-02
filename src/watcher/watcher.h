@@ -66,6 +66,11 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
  * A stopped watcher rejects new registrations. */
 bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path);
 
+/* Mark a project as explicitly indexed at its current git state.
+ * This updates the watch baseline without making duplicate watch() calls reset
+ * state during ordinary project access. */
+void cbm_watcher_mark_indexed(cbm_watcher_t *w, const char *project_name, const char *root_path);
+
 /* Remove a project from the watch list. Any not-yet-admitted callback in the
  * current poll snapshot is invalidated before this function returns. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
@@ -79,9 +84,10 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
  * Returns the number of projects that were reindexed. */
 int cbm_watcher_poll_once(cbm_watcher_t *w);
 
-/* Run the blocking poll loop. Polls every base_interval_ms until
- * cbm_watcher_stop() is called. Returns 0 on clean shutdown. */
-int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
+/* Run the blocking poll loop. Polls every base_ms until cbm_watcher_stop() is called.
+ * max_ms caps the adaptive interval for large repos. 0 = use defaults (5000/60000).
+ * Returns 0 on clean shutdown. */
+int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms);
 
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);
@@ -91,8 +97,9 @@ void cbm_watcher_stop(cbm_watcher_t *w);
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
 
-/* Return the adaptive poll interval (ms) for a given file count. */
-int cbm_watcher_poll_interval_ms(int file_count);
+/* Return the adaptive poll interval (ms) for a given file count.
+ * base_ms/max_ms: 0 = use defaults (POLL_BASE_MS=5000, POLL_MAX_MS=60000). */
+int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms);
 
 /* Classify a stat() errno observed on a watched project root: returns true
  * only for values that mean the root itself is gone (ENOENT, ENOTDIR) and
@@ -101,5 +108,10 @@ int cbm_watcher_poll_interval_ms(int file_count);
  * DB holds user-authored data and is unrecoverable once pruned. Exposed
  * for direct unit testing with injected errno values. */
 bool cbm_watcher_root_missing_errno(int err);
+
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+/* Number of run-loop threads currently parked between poll cycles. */
+int cbm_watcher_waiter_count_for_test(const cbm_watcher_t *w);
+#endif
 
 #endif /* CBM_WATCHER_H */

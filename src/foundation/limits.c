@@ -43,12 +43,6 @@ static int env_positive_int(const char *name, int fallback) {
     return fallback;
 }
 
-int cbm_cypher_max_depth(void) {
-    /* 10 — generous for a code call/def graph; an explicit `*1..N` above this is
-     * WARN-capped, never an unbounded (cyclic-graph DoS) traversal. */
-    return env_positive_int("CBM_CYPHER_MAX_DEPTH", 10);
-}
-
 int cbm_mcp_max_depth(void) {
     /* 15 — ceiling for client-driven MCP graph traversals (trace_call_path,
      * detect_changes); the caller's `depth` is WARN-clamped to this. */

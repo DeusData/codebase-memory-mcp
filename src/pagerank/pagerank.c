@@ -1,0 +1,940 @@
+/*
+ * pagerank.c — PageRank (node) + LinkRank (edge) ranking for codebase graphs.
+ *
+ * References:
+ *   - aider repomap.py (github.com/Aider-AI/aider/blob/main/aider/repomap.py)
+ *   - NetworkX pagerank (networkx/algorithms/link_analysis/pagerank_alg.py)
+ *   - Kim et al. (2010) LinkRank, arXiv:0902.3728
+ *   - nazgob/PageRank (github.com/nazgob/PageRank/blob/master/algorithm.c)
+ */
+
+#include "pagerank.h"
+#include <cli/cli.h>
+#include <foundation/compat.h>
+#include <foundation/log.h>
+#include <limits.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sqlite3.h>
+
+/* ── Default edge weights (aider/RepoMapper-inspired) ──────── */
+
+/* Tuned for Python/JS/TS codebases where USAGE edges capture type references,
+ * attribute access, and isinstance — the primary way classes are referenced.
+ *
+ * Key design choices:
+ *   - USAGE raised to 0.7: classes like EventContext have 400 USAGE refs but
+ *     were ranked #9 at 0.2 weight. USAGE is the dominant reference type in
+ *     Python/JS (type hints, attribute access, isinstance).
+ *   - TESTS lowered to 0.05: 3900 test edges were inflating production function
+ *     scores. A function called by 50 tests shouldn't outrank one called by
+ *     20 production functions.
+ *   - DEFINES lowered to 0.1: "Module DEFINES Function" edges leak rank to
+ *     container nodes without indicating architectural importance.
+ *   - WRITES/DECORATES explicit: small but non-zero contribution. */
+const cbm_edge_weights_t CBM_DEFAULT_EDGE_WEIGHTS = {
+#define CBM_PAGERANK_DEFAULT_INIT(edge_type, default_token, config_token, field) \
+    .field = CBM_PAGERANK_WEIGHT_##default_token##_DEFAULT,
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_DEFAULT_INIT)
+#undef CBM_PAGERANK_DEFAULT_INIT
+};
+
+enum {
+    PAGERANK_SCAN_NODES = 0,
+    PAGERANK_SCAN_EDGES = 1,
+};
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+_Static_assert((int)CBM_PAGERANK_TEST_SCAN_NODES == PAGERANK_SCAN_NODES,
+               "node scan seam must match the internal scan kind");
+_Static_assert((int)CBM_PAGERANK_TEST_SCAN_EDGES == PAGERANK_SCAN_EDGES,
+               "edge scan seam must match the internal scan kind");
+static _Thread_local cbm_pagerank_test_scan_t g_pagerank_test_failed_scan =
+    CBM_PAGERANK_TEST_SCAN_NODES;
+static _Thread_local int g_pagerank_test_scan_rows_before_failure = -1;
+
+void cbm_pagerank_test_fail_scan_after(cbm_pagerank_test_scan_t scan, int successful_rows) {
+    if ((scan != CBM_PAGERANK_TEST_SCAN_NODES && scan != CBM_PAGERANK_TEST_SCAN_EDGES) ||
+        successful_rows < 0) {
+        g_pagerank_test_scan_rows_before_failure = -1;
+        return;
+    }
+    g_pagerank_test_failed_scan = scan;
+    g_pagerank_test_scan_rows_before_failure = successful_rows;
+}
+#endif
+
+/* Preserve SQLite's ROW/DONE/error contract at both graph-input scans. Tests
+ * can replace one ROW with SQLITE_IOERR after a deterministic number of rows;
+ * production builds compile to one sqlite3_step call. */
+static inline int pagerank_scan_step(sqlite3_stmt *stmt, int scan) {
+    int rc = sqlite3_step(stmt);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_pagerank_test_scan_rows_before_failure >= 0 &&
+        scan == (int)g_pagerank_test_failed_scan) {
+        /* The failpoint belongs to one target scan, not the worker thread's
+         * lifetime. DONE or a real SQLite error therefore consumes it even
+         * when the requested row threshold was never reached. */
+        if (rc != SQLITE_ROW) {
+            g_pagerank_test_scan_rows_before_failure = -1;
+            return rc;
+        }
+        if (g_pagerank_test_scan_rows_before_failure == 0) {
+            g_pagerank_test_scan_rows_before_failure = -1;
+            return SQLITE_IOERR;
+        }
+        g_pagerank_test_scan_rows_before_failure--;
+    }
+#else
+    (void)scan;
+#endif
+    return rc;
+}
+
+/* ── Edge weight lookup (ordered by frequency) ─────────────── */
+
+static double edge_type_weight(const cbm_edge_weights_t *w, const char *type) {
+    if (!type) return w->default_weight;
+    /* Ordered by frequency (most common first for fast path) */
+#define CBM_PAGERANK_EDGE_LOOKUP(edge_type, default_token, config_token, field) \
+    if (strcmp(type, edge_type) == 0) return w->field;
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_EDGE_LOOKUP)
+#undef CBM_PAGERANK_EDGE_LOOKUP
+    return w->default_weight;
+}
+
+/* Config-backed callers are validated before this boundary, but the public C
+ * API also accepts an explicit weight structure. Normalize only invalid
+ * fields so one bad value cannot poison a weighted-degree sum and valid custom
+ * fields—including zero, which intentionally disables an edge kind—remain
+ * effective. The fixed field count makes this O(1) runtime and O(1) memory;
+ * the canonical mapping keeps it in lockstep with defaults and config loading. */
+static const cbm_edge_weights_t *
+pagerank_effective_edge_weights(const cbm_edge_weights_t *weights,
+                                cbm_edge_weights_t *normalized) {
+    if (!weights || weights == &CBM_DEFAULT_EDGE_WEIGHTS) return &CBM_DEFAULT_EDGE_WEIGHTS;
+    *normalized = *weights;
+#define CBM_PAGERANK_NORMALIZE_WEIGHT(edge_type, default_token, config_token, field)         \
+    if (!(normalized->field >= CBM_PAGERANK_EDGE_WEIGHT_MIN &&                              \
+          normalized->field <= CBM_PAGERANK_EDGE_WEIGHT_MAX)) {                             \
+        normalized->field = CBM_PAGERANK_WEIGHT_##default_token##_DEFAULT;                   \
+    }
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_NORMALIZE_WEIGHT)
+#undef CBM_PAGERANK_NORMALIZE_WEIGHT
+    return normalized;
+}
+
+/* ── Internal edge struct ────────────────────────────────────── */
+
+typedef struct {
+    int src_idx;
+    int dst_idx;
+    int64_t edge_id;
+    char *project;
+    double weight;
+    bool is_calls;  /* DF-1: true if edge type == "CALLS" */
+} pr_edge_t;
+
+enum {
+    CBM_PAGERANK_GROWTH_FACTOR = 2,
+    CBM_RANK_SQL_BUF = 256,
+};
+
+/* ── ISO timestamp helper ────────────────────────────────────── */
+
+static void iso_now(char *buf, size_t sz) {
+    time_t t = time(NULL);
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    strftime(buf, sz, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+/* ── Hash map: node_id -> array index (linear probing) ──────── */
+
+typedef struct {
+    int64_t *keys;
+    int *vals;
+    int cap;
+} id_map_t;
+
+static bool pagerank_id_map_capacity(int node_count, int *capacity) {
+    if (!capacity || node_count <= 0 ||
+        node_count > (INT_MAX - SKIP_ONE) / CBM_HASHMAP_LOAD_FACTOR) {
+        return false;
+    }
+    *capacity = node_count * CBM_HASHMAP_LOAD_FACTOR + SKIP_ONE;
+    return true;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_pagerank_test_id_map_capacity(int node_count, int *capacity) {
+    return pagerank_id_map_capacity(node_count, capacity);
+}
+#endif
+
+static int id_map_init(id_map_t *m, int n) {
+    if (!m || !pagerank_id_map_capacity(n, &m->cap)) {
+        return -1;
+    }
+    if ((size_t)m->cap > SIZE_MAX / sizeof(*m->keys) ||
+        (size_t)m->cap > SIZE_MAX / sizeof(*m->vals)) {
+        return -1;
+    }
+    m->keys = calloc((size_t)m->cap, sizeof(int64_t));
+    m->vals = calloc((size_t)m->cap, sizeof(int));
+    if (!m->keys || !m->vals) {
+        free(m->keys); free(m->vals);
+        m->keys = NULL; m->vals = NULL;
+        return -1;
+    }
+    memset(m->vals, -1, (size_t)m->cap * sizeof(int));
+    return 0;
+}
+
+static void id_map_put(id_map_t *m, int64_t key, int val) {
+    int h = (int)((uint64_t)key % (uint64_t)m->cap);
+    while (m->keys[h] != 0 && m->keys[h] != key)
+        h = (h + 1) % m->cap;
+    m->keys[h] = key;
+    m->vals[h] = val;
+}
+
+static int id_map_get(const id_map_t *m, int64_t key) {
+    int h = (int)((uint64_t)key % (uint64_t)m->cap);
+    while (m->keys[h] != 0) {
+        if (m->keys[h] == key) return m->vals[h];
+        h = (h + 1) % m->cap;
+    }
+    return -1;
+}
+
+static void id_map_free(id_map_t *m) {
+    free(m->keys);
+    free(m->vals);
+    m->keys = NULL;
+    m->vals = NULL;
+}
+
+static int grow_node_arrays(int64_t **node_ids, char ***node_projects, int new_cap) {
+    /* node_projects owns child strings. Use realloc rather than safe_realloc so
+     * OOM preserves the old arrays and cleanup can still free those children. */
+    if (!node_ids || !node_projects || new_cap <= 0 ||
+        (size_t)new_cap > SIZE_MAX / sizeof(**node_ids) ||
+        (size_t)new_cap > SIZE_MAX / sizeof(**node_projects)) {
+        return -1;
+    }
+    int64_t *new_ids = realloc(*node_ids, (size_t)new_cap * sizeof(**node_ids));
+    if (!new_ids) return -1;
+    *node_ids = new_ids;
+    char **new_projects = realloc(*node_projects, (size_t)new_cap * sizeof(char *));
+    if (!new_projects) return -1;
+    *node_projects = new_projects;
+    return 0;
+}
+
+static int grow_edge_array(pr_edge_t **edges, int new_cap) {
+    /* pr_edge_t owns project strings, so preserve the old array on OOM. */
+    if (!edges || new_cap <= 0 || (size_t)new_cap > SIZE_MAX / sizeof(**edges)) {
+        return -1;
+    }
+    pr_edge_t *new_edges = realloc(*edges, (size_t)new_cap * sizeof(**edges));
+    if (!new_edges) return -1;
+    *edges = new_edges;
+    return 0;
+}
+
+static int next_pagerank_capacity(int cap, int *out) {
+    if (!out || cap <= 0 || cap > INT_MAX / CBM_PAGERANK_GROWTH_FACTOR) {
+        return -1;
+    }
+    *out = cap * CBM_PAGERANK_GROWTH_FACTOR;
+    return 0;
+}
+
+/* ── Scope -> SQL WHERE clause (DRY: one function) ──────────── */
+
+static const char *scope_where(cbm_rank_scope_t scope) {
+    switch (scope) {
+    case CBM_RANK_SCOPE_PROJECT: return "project = ?1";
+    case CBM_RANK_SCOPE_DEPS:   return "project LIKE ?1 || '.dep.%'";
+    case CBM_RANK_SCOPE_FULL:
+    default:                     return "(project = ?1 OR project LIKE ?1 || '.dep.%')";
+    }
+}
+
+static cbm_rank_scope_t rank_scope_from_config(cbm_config_t *cfg) {
+    const char *scope = cbm_config_get(cfg, CBM_CONFIG_RANK_SCOPE, NULL);
+    if (!scope || !scope[0] || strcmp(scope, "full") == 0) {
+        return CBM_DEFAULT_RANK_SCOPE;
+    }
+    if (strcmp(scope, "project") == 0) {
+        return CBM_RANK_SCOPE_PROJECT;
+    }
+    if (strcmp(scope, "deps") == 0) {
+        return CBM_RANK_SCOPE_DEPS;
+    }
+    return CBM_DEFAULT_RANK_SCOPE;
+}
+
+static bool rank_enabled_from_config(cbm_config_t *cfg) {
+    return cfg ? cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true) : true;
+}
+
+static void refresh_graph_stats_best_effort(cbm_store_t *store, const char *project) {
+    /* Graph/rank publication remains authoritative if this derived accelerator
+     * cannot be built: invalidation makes every reader fall back to the exact
+     * O(N + E + R) scans. A successful refresh pays that scan once per
+     * publication and makes subsequent status reads O(log P), with O(1)
+     * returned memory, for P projects. */
+    if (cbm_store_refresh_project_graph_stats(store) != CBM_STORE_OK) {
+        cbm_log_warn("pagerank.graph_stats_refresh_failed", "project", project ? project : "",
+                     "fallback", "exact_scan", "detail", cbm_store_error(store));
+    }
+}
+
+static int clear_rank_rows_for_project(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) return -1;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db || cbm_store_invalidate_project_graph_stats(store) != CBM_STORE_OK ||
+        cbm_store_exec(store, "SAVEPOINT cbm_disable_rank") != CBM_STORE_OK) {
+        return -1;
+    }
+
+    static const char *tables[] = {"pagerank", "linkrank", "node_degree"};
+    sqlite3_stmt *stmt = NULL;
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        char sql[CBM_RANK_SQL_BUF];
+        int n = snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s", tables[i],
+                         scope_where(CBM_RANK_SCOPE_FULL));
+        if (n < 0 || (size_t)n >= sizeof(sql) ||
+            sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            goto rollback;
+        }
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) goto rollback;
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
+
+    if (sqlite3_prepare_v2(
+            db,
+            "DELETE FROM derived_view_state WHERE project = ?1 AND view_name IN "
+            "('pagerank', 'linkrank', 'node_degree')",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        goto rollback;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto rollback;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (cbm_store_exec(store, "RELEASE cbm_disable_rank") != CBM_STORE_OK) goto rollback;
+    refresh_graph_stats_best_effort(store, project);
+    return 0;
+
+rollback:
+    sqlite3_finalize(stmt);
+    (void)cbm_store_exec(store, "ROLLBACK TO cbm_disable_rank");
+    (void)cbm_store_exec(store, "RELEASE cbm_disable_rank");
+    return -1;
+}
+
+typedef enum {
+    CBM_RANK_REFRESH_POLICY_AT_PUBLISH = 0,
+    CBM_RANK_REFRESH_POLICY_DEFER_EXACT_DELTA_REINDEXES,
+    CBM_RANK_REFRESH_POLICY_DEFER_ALL_INCREMENTAL_REINDEXES,
+} cbm_rank_refresh_policy_t;
+
+static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *cfg) {
+    const char *policy = cfg ? cbm_config_get(cfg, CBM_CONFIG_RANK_REFRESH,
+                                             CBM_RANK_REFRESH_DEFAULT)
+                             : CBM_RANK_REFRESH_DEFAULT;
+    if (!policy || !policy[0]) {
+        policy = CBM_RANK_REFRESH_DEFAULT;
+    }
+    if (strcmp(policy, CBM_RANK_REFRESH_AT_PUBLISH) == 0) {
+        return CBM_RANK_REFRESH_POLICY_AT_PUBLISH;
+    }
+    if (strcmp(policy, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES) == 0) {
+        return CBM_RANK_REFRESH_POLICY_DEFER_EXACT_DELTA_REINDEXES;
+    }
+    if (strcmp(policy, CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES) == 0) {
+        return CBM_RANK_REFRESH_POLICY_DEFER_ALL_INCREMENTAL_REINDEXES;
+    }
+    return CBM_RANK_REFRESH_POLICY_AT_PUBLISH;
+}
+
+static bool rank_refresh_policy_allows_defer(cbm_rank_refresh_policy_t policy,
+                                             cbm_rank_refresh_publish_t publish_kind) {
+    if (policy == CBM_RANK_REFRESH_POLICY_DEFER_EXACT_DELTA_REINDEXES) {
+        return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT;
+    }
+    if (policy == CBM_RANK_REFRESH_POLICY_DEFER_ALL_INCREMENTAL_REINDEXES) {
+        return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT ||
+               publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT ||
+               publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK;
+    }
+    return false;
+}
+
+cbm_rank_refresh_publish_t
+cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind,
+                                       bool incremental_fallback) {
+    switch (publish_kind) {
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT:
+        return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT;
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT:
+        return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT;
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP:
+        return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_NOOP;
+    case CBM_PIPELINE_PUBLISH_FULL:
+        return incremental_fallback ? CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK
+                                    : CBM_RANK_REFRESH_PUBLISH_FULL;
+    case CBM_PIPELINE_PUBLISH_NONE:
+    default:
+        return CBM_RANK_REFRESH_PUBLISH_FULL;
+    }
+}
+
+/* ── Core PageRank + LinkRank ────────────────────────────────── */
+
+int cbm_pagerank_compute(cbm_store_t *store, const char *project,
+                         double damping, double epsilon, int max_iter,
+                         const cbm_edge_weights_t *weights,
+                         cbm_rank_scope_t scope) {
+    if (!store || !project || !project[0]) return -1;
+    cbm_edge_weights_t normalized_weights;
+    weights = pagerank_effective_edge_weights(weights, &normalized_weights);
+    /* Reject out-of-range AND NaN. IEEE-754 makes every NaN comparison false,
+     * so the naive `damping < 0 || damping > 1` form lets NaN through (it then
+     * poisons every rank and prevents convergence). The inverted-range form
+     * `!(x >= lo && x <= hi)` rejects NaN because the inner >= is false.
+     * NaN is reachable via config (strtod parses "nan") since damping/epsilon
+     * became user-tunable. */
+    if (!(damping >= CBM_PAGERANK_DAMPING_MIN && damping <= CBM_PAGERANK_DAMPING_MAX))
+        damping = CBM_PAGERANK_DAMPING;
+    if (max_iter < CBM_PAGERANK_MAX_ITER_MIN) max_iter = CBM_PAGERANK_MAX_ITER;
+    if (!(epsilon > CBM_PAGERANK_EPSILON_MIN_EXCLUSIVE &&
+          epsilon <= CBM_PAGERANK_EPSILON_MAX))
+        epsilon = CBM_PAGERANK_EPSILON;
+
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) return -1;
+
+    /* All heap pointers initialized to NULL for safe cleanup via goto */
+    int64_t *node_ids = NULL;
+    pr_edge_t *edges = NULL;
+    double *out_weight = NULL, *rank = NULL, *new_rank = NULL;
+    /* DF-1: degree accumulators (freed at cleanup) */
+    int *total_in = NULL, *total_out = NULL;
+    int *calls_in = NULL, *calls_out = NULL;
+    double *w_in = NULL;
+    double *lr_in = NULL;
+    id_map_t map = {0};
+    int N = 0, E = 0, result = -1;
+
+    char **node_projects = NULL; /* owning project per node, parallel to node_ids */
+
+    /* ── Step 1: Load node IDs + owning projects ──────────── */
+    char sql_buf[512];
+    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, project FROM nodes WHERE %s",
+             scope_where(scope));
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+
+    int cap = CBM_PAGERANK_INITIAL_CAP;
+    node_ids = malloc((size_t)cap * sizeof(int64_t));
+    node_projects = malloc((size_t)cap * sizeof(char *));
+    if (!node_ids || !node_projects) {
+        sqlite3_finalize(stmt);
+        free(node_ids);
+        free(node_projects);
+        return -1;
+    }
+
+    int scan_rc = SQLITE_OK;
+    while ((scan_rc = pagerank_scan_step(stmt, PAGERANK_SCAN_NODES)) == SQLITE_ROW) {
+        if (N >= cap) {
+            int new_cap = 0;
+            if (next_pagerank_capacity(cap, &new_cap) != 0 ||
+                grow_node_arrays(&node_ids, &node_projects, new_cap) != 0) {
+                sqlite3_finalize(stmt);
+                stmt = NULL;
+                goto cleanup;
+            }
+            cap = new_cap;
+        }
+        node_ids[N] = sqlite3_column_int64(stmt, 0);
+        const char *proj = (const char *)sqlite3_column_text(stmt, 1);
+        char *project_copy = cbm_strdup((proj && proj[0]) ? proj : project);
+        if (!project_copy) {
+            sqlite3_finalize(stmt);
+            stmt = NULL;
+            goto cleanup;
+        }
+        node_projects[N] = project_copy;
+        N++;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (scan_rc != SQLITE_DONE) {
+        goto cleanup;
+    }
+
+    if (N == 0) {
+        free(node_ids);
+        free(node_projects);
+        return clear_rank_rows_for_project(store, project);
+    }
+
+    /* Build id->index map */
+    if (id_map_init(&map, N) != 0) {
+        free(node_ids);
+        for (int i = 0; i < N; i++) free(node_projects[i]);
+        free(node_projects);
+        return -1;
+    }
+    for (int i = 0; i < N; i++) id_map_put(&map, node_ids[i], i);
+
+    /* ── Step 2: Load weighted edges ──────────────────────── */
+    snprintf(sql_buf, sizeof(sql_buf),
+             "SELECT id, source_id, target_id, type, project FROM edges WHERE %s",
+             scope_where(scope));
+    if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) != SQLITE_OK)
+        goto cleanup;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+
+    int ecap = CBM_PAGERANK_INITIAL_CAP;
+    edges = malloc((size_t)ecap * sizeof(pr_edge_t));
+    if (!edges) {
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+        goto cleanup;
+    }
+
+    while ((scan_rc = pagerank_scan_step(stmt, PAGERANK_SCAN_EDGES)) == SQLITE_ROW) {
+        int64_t eid = sqlite3_column_int64(stmt, 0);
+        int64_t src = sqlite3_column_int64(stmt, 1);
+        int64_t dst = sqlite3_column_int64(stmt, 2);
+        const char *type = (const char *)sqlite3_column_text(stmt, 3);
+        const char *edge_project = (const char *)sqlite3_column_text(stmt, 4);
+
+        int si = id_map_get(&map, src);
+        int di = id_map_get(&map, dst);
+        if (si < 0 || di < 0) continue;
+
+        if (E >= ecap) {
+            int new_ecap = 0;
+            if (next_pagerank_capacity(ecap, &new_ecap) != 0 ||
+                grow_edge_array(&edges, new_ecap) != 0) {
+                sqlite3_finalize(stmt);
+                stmt = NULL;
+                goto cleanup;
+            }
+            ecap = new_ecap;
+        }
+        char *edge_project_copy = cbm_strdup((edge_project && edge_project[0]) ? edge_project : project);
+        if (!edge_project_copy) {
+            sqlite3_finalize(stmt);
+            stmt = NULL;
+            goto cleanup;
+        }
+        edges[E].src_idx = si;
+        edges[E].dst_idx = di;
+        edges[E].edge_id = eid;
+        edges[E].project = edge_project_copy;
+        edges[E].weight = edge_type_weight(weights, type);
+        edges[E].is_calls = (type && strcmp(type, "CALLS") == 0);
+        E++;
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (scan_rc != SQLITE_DONE) {
+        goto cleanup;
+    }
+
+    /* ── Step 3: Allocate computation buffers ─────────────── */
+    out_weight = calloc((size_t)N, sizeof(double));
+    rank = malloc((size_t)N * sizeof(double));
+    new_rank = malloc((size_t)N * sizeof(double));
+    if (!out_weight || !rank || !new_rank) goto cleanup;
+
+    /* The three rank views are one published generation, so their O(N)
+     * computation buffers are one allocation unit. Partial allocation must
+     * fail before touching the prior published tables; checking only total_in
+     * while dereferencing total_out was an asymmetric-allocation crash. */
+    total_in = calloc((size_t)N, sizeof(int));
+    total_out = calloc((size_t)N, sizeof(int));
+    calls_in = calloc((size_t)N, sizeof(int));
+    calls_out = calloc((size_t)N, sizeof(int));
+    w_in = calloc((size_t)N, sizeof(double));
+    lr_in = calloc((size_t)N, sizeof(double));
+    if (!total_in || !total_out || !calls_in || !calls_out || !w_in || !lr_in)
+        goto cleanup;
+
+    for (int e = 0; e < E; e++) {
+        int s = edges[e].src_idx;
+        int d = edges[e].dst_idx;
+        out_weight[s] += edges[e].weight;
+        total_out[s]++;
+        total_in[d]++;
+        w_in[d] += edges[e].weight;
+        if (edges[e].is_calls) {
+            calls_out[s]++;
+            calls_in[d]++;
+        }
+    }
+
+    /* ── Step 4: Power iteration ──────────────────────────── */
+    double init_rank = 1.0 / N;
+    for (int i = 0; i < N; i++) rank[i] = init_rank;
+
+    double base = (1.0 - damping) / N;
+    int iter;
+    bool converged = false;
+    for (iter = 0; iter < max_iter; iter++) {
+        for (int i = 0; i < N; i++) new_rank[i] = base;
+
+        /* Distribute rank along weighted edges */
+        for (int e = 0; e < E; e++) {
+            int s = edges[e].src_idx;
+            if (out_weight[s] > 0.0) {
+                new_rank[edges[e].dst_idx] +=
+                    damping * rank[s] * edges[e].weight / out_weight[s];
+            }
+        }
+
+        /* Dangling node handling (NetworkX convention) */
+        double dangling_sum = 0.0;
+        for (int i = 0; i < N; i++) {
+            if (out_weight[i] == 0.0) dangling_sum += rank[i];
+        }
+        if (dangling_sum > 0.0) {
+            double add = damping * dangling_sum / N;
+            for (int i = 0; i < N; i++) new_rank[i] += add;
+        }
+
+        /* Convergence: L2 norm of rank delta */
+        double delta = 0.0;
+        for (int i = 0; i < N; i++) {
+            double d = new_rank[i] - rank[i];
+            delta += d * d;
+        }
+        delta = sqrt(delta);
+
+        /* Swap buffers */
+        double *tmp = rank; rank = new_rank; new_rank = tmp;
+
+        if (delta < epsilon) {
+            iter++;
+            converged = true;
+            break;
+        }
+    }
+    /* max_iter is a numerical work budget, not permission to publish an
+     * unconverged approximation as a fresh derived view. Failure preserves the
+     * prior generation and lets callers raise the budget or relax epsilon.
+     * Runtime remains O(max_iter * (N + E)). */
+    if (!converged)
+        goto cleanup;
+
+    /* Member-rank propagation is handled naturally by MEMBER_OF edges
+     * (Method→Class) inserted during the pipeline. No post-hoc aggregation
+     * needed — the power iteration above already propagated rank via
+     * MEMBER_OF edges at the configured member_rank_factor weight. */
+
+    /* Compute LinkRank and incoming sums before publication so allocation or
+     * arithmetic setup cannot fail after the transaction begins. */
+    for (int e = 0; e < E; e++) {
+        int s_idx = edges[e].src_idx;
+        double lr = 0.0;
+        if (out_weight[s_idx] > 0.0) {
+            lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
+        }
+        lr_in[edges[e].dst_idx] += lr;
+    }
+
+    /* ── Step 5: Atomically publish all rank views ────────── */
+    char ts[CBM_ISO_TIMESTAMP_LEN];
+    iso_now(ts, sizeof(ts));
+
+    /* Rank tables do not include a scope column. Clear project and dependency
+     * ranks before writing any scope so narrower recomputes cannot leave stale
+     * rows from a previous full-scope compute. A savepoint composes with an
+     * outer store transaction while making PageRank, LinkRank, node degree,
+     * and completeness metadata one generation. Publication performs O(N + E)
+     * writes and retains O(1) additional memory. */
+    if (cbm_store_invalidate_project_graph_stats(store) != CBM_STORE_OK ||
+        cbm_store_exec(store, "SAVEPOINT cbm_rank_publish") != CBM_STORE_OK) {
+        goto cleanup;
+    }
+    static const char *rank_tables[] = {"pagerank", "linkrank", "node_degree"};
+    for (size_t ti = 0; ti < sizeof(rank_tables) / sizeof(rank_tables[0]); ti++) {
+        int written = snprintf(sql_buf, sizeof(sql_buf), "DELETE FROM %s WHERE %s", rank_tables[ti],
+                               scope_where(CBM_RANK_SCOPE_FULL));
+        if (written < 0 || (size_t)written >= sizeof(sql_buf) ||
+            sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) != SQLITE_OK) {
+            goto publish_rollback;
+        }
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
+
+    /* Node projects were loaded with node_ids, preserving dependency attribution
+     * without doing an indexed SELECT per stored row. */
+    const char *ins_sql = "INSERT OR REPLACE INTO pagerank "
+                          "(node_id, project, rank, computed_at) "
+                          "VALUES (?1, ?2, ?3, ?4)";
+    if (sqlite3_prepare_v2(db, ins_sql, -1, &stmt, NULL) != SQLITE_OK)
+        goto publish_rollback;
+    for (int i = 0; i < N; i++) {
+        sqlite3_bind_int64(stmt, 1, node_ids[i]);
+        sqlite3_bind_text(stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 3, rank[i]);
+        sqlite3_bind_text(stmt, 4, ts, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    const char *lr_sql = "INSERT OR REPLACE INTO linkrank "
+                         "(edge_id, project, rank, computed_at) "
+                         "VALUES (?1, ?2, ?3, ?4)";
+    if (sqlite3_prepare_v2(db, lr_sql, -1, &stmt, NULL) != SQLITE_OK)
+        goto publish_rollback;
+    for (int e = 0; e < E; e++) {
+        int s_idx = edges[e].src_idx;
+        double lr = 0.0;
+        if (out_weight[s_idx] > 0.0) {
+            lr = rank[s_idx] * edges[e].weight / out_weight[s_idx];
+        }
+        sqlite3_bind_int64(stmt, 1, edges[e].edge_id);
+        sqlite3_bind_text(stmt, 2, edges[e].project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 3, lr);
+        sqlite3_bind_text(stmt, 4, ts, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    const char *deg_sql = "INSERT OR REPLACE INTO node_degree "
+                          "(node_id, project, total_in, total_out, calls_in, calls_out, "
+                          " weighted_in, weighted_out, linkrank_in, computed_at) "
+                          "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+    if (sqlite3_prepare_v2(db, deg_sql, -1, &stmt, NULL) != SQLITE_OK)
+        goto publish_rollback;
+    for (int i = 0; i < N; i++) {
+        sqlite3_bind_int64(stmt, 1, node_ids[i]);
+        sqlite3_bind_text(stmt, 2, node_projects[i], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, total_in[i]);
+        sqlite3_bind_int(stmt, 4, total_out[i]);
+        sqlite3_bind_int(stmt, 5, calls_in[i]);
+        sqlite3_bind_int(stmt, 6, calls_out[i]);
+        sqlite3_bind_double(stmt, 7, w_in[i]);
+        sqlite3_bind_double(stmt, 8, out_weight[i]);
+        sqlite3_bind_double(stmt, 9, lr_in[i]);
+        sqlite3_bind_text(stmt, 10, ts, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            goto publish_rollback;
+        sqlite3_reset(stmt);
+    }
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    if (cbm_store_mark_rank_derived_views_complete_in_transaction(
+            store, project, CBM_STORE_DERIVED_GENERATION_UNKNOWN) != CBM_STORE_OK) {
+        goto publish_rollback;
+    }
+    if (cbm_store_exec(store, "RELEASE cbm_rank_publish") != CBM_STORE_OK)
+        goto publish_rollback;
+    refresh_graph_stats_best_effort(store, project);
+
+    /* ── Logging ──────────────────────────────────────────── */
+    char iter_s[CBM_LOG_INT_BUF], n_s[CBM_LOG_INT_BUF], e_s[CBM_LOG_INT_BUF];
+    snprintf(iter_s, sizeof(iter_s), "%d", iter);
+    snprintf(n_s, sizeof(n_s), "%d", N);
+    snprintf(e_s, sizeof(e_s), "%d", E);
+    cbm_log_info("pagerank.done", "project", project,
+                 "nodes", n_s, "edges", e_s, "iterations", iter_s);
+
+    result = N;
+    goto cleanup;
+
+publish_rollback:
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    (void)cbm_store_exec(store, "ROLLBACK TO cbm_rank_publish");
+    (void)cbm_store_exec(store, "RELEASE cbm_rank_publish");
+
+cleanup:
+    if (stmt) sqlite3_finalize(stmt);  /* defensive: finalize any in-flight stmt */
+    free(node_ids);
+    if (node_projects) {
+        for (int i = 0; i < N; i++) free(node_projects[i]);
+        free(node_projects);
+    }
+    id_map_free(&map);
+    if (edges) {
+        for (int e = 0; e < E; e++) free(edges[e].project);
+    }
+    free(edges);
+    free(out_weight);
+    free(rank);
+    free(new_rank);
+    free(total_in);
+    free(total_out);
+    free(calls_in);
+    free(calls_out);
+    free(w_in);
+    free(lr_in);
+    return result;
+}
+
+int cbm_pagerank_compute_default(cbm_store_t *store, const char *project) {
+    return cbm_pagerank_compute(store, project,
+        CBM_PAGERANK_DAMPING, CBM_PAGERANK_EPSILON,
+        CBM_PAGERANK_MAX_ITER, &CBM_DEFAULT_EDGE_WEIGHTS,
+        CBM_DEFAULT_RANK_SCOPE);
+}
+
+int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
+                                     cbm_config_t *cfg) {
+    if (!rank_enabled_from_config(cfg)) {
+        cbm_log_info("pagerank.skip", "project", project ? project : "", "reason", "disabled");
+        return clear_rank_rows_for_project(store, project);
+    }
+    if (!cfg) return cbm_pagerank_compute_default(store, project);
+
+    cbm_edge_weights_t w;
+#define CBM_PAGERANK_CONFIG_LOAD(edge_type, default_token, config_token, field)              \
+    w.field = cbm_config_get_double(cfg, CBM_CONFIG_EDGE_WEIGHT_##config_token,               \
+                                    CBM_DEFAULT_EDGE_WEIGHTS.field);
+    CBM_PAGERANK_EDGE_WEIGHT_FIELDS(CBM_PAGERANK_CONFIG_LOAD)
+#undef CBM_PAGERANK_CONFIG_LOAD
+
+    int max_iter = cbm_config_get_int(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, CBM_PAGERANK_MAX_ITER);
+    double damping = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_DAMPING, CBM_PAGERANK_DAMPING);
+    double epsilon = cbm_config_get_double(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON);
+
+    cbm_rank_scope_t scope = rank_scope_from_config(cfg);
+
+    return cbm_pagerank_compute(store, project,
+        damping, epsilon,
+        max_iter, &w, scope);
+}
+
+static bool pagerank_view_has_status(cbm_store_t *store, const char *project, const char *view,
+                                     const char *status) {
+    cbm_derived_view_state_t state = {0};
+    bool matches = false;
+    if (cbm_store_get_derived_view_state(store, project, view, &state) == CBM_STORE_OK) {
+        matches = state.status && strcmp(state.status, status) == 0;
+    }
+    cbm_store_derived_view_state_free_fields(&state);
+    return matches;
+}
+
+static bool pagerank_view_complete(cbm_store_t *store, const char *project, const char *view) {
+    return pagerank_view_has_status(store, project, view, CBM_STORE_DERIVED_STATUS_COMPLETE);
+}
+
+bool cbm_pagerank_views_complete(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) {
+        return false;
+    }
+    return pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK) &&
+           pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK) &&
+           pagerank_view_complete(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE);
+}
+
+static bool pagerank_views_stale(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) {
+        return false;
+    }
+    return pagerank_view_has_status(store, project, CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                    CBM_STORE_DERIVED_STATUS_STALE) &&
+           pagerank_view_has_status(store, project, CBM_STORE_DERIVED_VIEW_LINKRANK,
+                                    CBM_STORE_DERIVED_STATUS_STALE) &&
+           pagerank_view_has_status(store, project, CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
+                                    CBM_STORE_DERIVED_STATUS_STALE);
+}
+
+int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
+                                       cbm_config_t *cfg, bool graph_changed,
+                                       int deps_reindexed,
+                                       cbm_rank_refresh_publish_t publish_kind) {
+    if (!store || !project || !project[0]) {
+        return -1;
+    }
+    if (!rank_enabled_from_config(cfg)) {
+        cbm_log_info("pagerank.skip", "project", project, "reason", "disabled");
+        return clear_rank_rows_for_project(store, project);
+    }
+    if (!graph_changed && deps_reindexed <= 0 && cbm_pagerank_views_complete(store, project)) {
+        cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");
+        refresh_graph_stats_best_effort(store, project);
+        return 0;
+    }
+    cbm_rank_refresh_policy_t policy = rank_refresh_policy_from_config(cfg);
+    if (graph_changed && deps_reindexed <= 0 &&
+        rank_refresh_policy_allows_defer(policy, publish_kind) &&
+        pagerank_views_stale(store, project)) {
+        cbm_log_info("pagerank.defer", "project", project, "reason", "incremental_stale_views");
+        refresh_graph_stats_best_effort(store, project);
+        return 0;
+    }
+    return cbm_pagerank_compute_with_config(store, project, cfg);
+}
+
+int cbm_pagerank_refresh_if_needed(cbm_store_t *store, const char *project,
+                                   cbm_config_t *cfg, bool graph_changed,
+                                   int deps_reindexed, bool exact_incremental_publish) {
+    return cbm_pagerank_refresh_after_publish(
+        store, project, cfg, graph_changed, deps_reindexed,
+        exact_incremental_publish ? CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT
+                                  : CBM_RANK_REFRESH_PUBLISH_FULL);
+}
+
+double cbm_pagerank_get(cbm_store_t *store, int64_t node_id) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) return 0.0;
+    sqlite3_stmt *stmt = NULL;
+    double r = 0.0;
+    if (sqlite3_prepare_v2(db, "SELECT rank FROM pagerank WHERE node_id = ?1",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, node_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) r = sqlite3_column_double(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    return r;
+}
+
+double cbm_linkrank_get(cbm_store_t *store, int64_t edge_id) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) return 0.0;
+    sqlite3_stmt *stmt = NULL;
+    double r = 0.0;
+    if (sqlite3_prepare_v2(db, "SELECT rank FROM linkrank WHERE edge_id = ?1",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, edge_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) r = sqlite3_column_double(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    return r;
+}

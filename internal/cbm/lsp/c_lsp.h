@@ -51,7 +51,7 @@ typedef struct {
     // ONLY when the Tier-2 registry is shared+read-only (registry_shared), where
     // the module-prefix/base-class/short-name cascades are pure, stable functions
     // of (type_qn, registry) — so a recorded miss can never turn into a hit. Lets
-    // the hot resolve path skip the sprintf("%s.%s") strlen storm + the O(type_count)
+    // the hot resolve path skip repeated formatted QN construction + the O(type_count)
     // short-name scan on repeated misses of the same (type_qn, member). malloc-owned;
     // freed at end of c_lsp_process_file.
     uint64_t *neg_memo;

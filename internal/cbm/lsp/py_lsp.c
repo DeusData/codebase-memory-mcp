@@ -11,6 +11,8 @@
  *                                          resolved_calls entries
  */
 #include "py_lsp.h"
+#include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "../cbm.h"
 #include "../helpers.h"
 #include "tree_sitter/api.h"
@@ -103,8 +105,7 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = dbg && dbg[0] && dbg[0] != '0';
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *module_qn) {
@@ -2070,12 +2071,13 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
                     if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
-                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
-                                                                                strlen(mod) + 1);
+                        size_t mod_len = strlen(mod);
+                        char *qual_mod = (char *)cbm_arena_alloc(
+                            ctx->arena, root_len + SKIP_ONE + mod_len + SKIP_ONE);
                         if (qual_mod) {
                             memcpy(qual_mod, ctx->module_qn, root_len);
                             qual_mod[root_len] = '.';
-                            strcpy(qual_mod + root_len + 1, mod);
+                            memcpy(qual_mod + root_len + SKIP_ONE, mod, mod_len + SKIP_ONE);
                             const CBMRegisteredFunc *qf =
                                 cbm_registry_lookup_symbol(ctx->registry, qual_mod, attr_name);
                             if (qf) {

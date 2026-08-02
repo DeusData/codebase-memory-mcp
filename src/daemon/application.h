@@ -117,7 +117,9 @@ cbm_daemon_runtime_application_callbacks_t cbm_daemon_application_runtime_callba
     cbm_daemon_application_t *application);
 
 /* Thin-client request helpers. Every helper performs one bounded runtime
- * exchange. MCP notifications succeed with a NULL/zero response. Returned
+ * exchange. MCP notifications succeed with a NULL/zero response; an MCP
+ * request may return OK_TOOLS_LIST_CHANGED with normal response bytes so its
+ * frontend can write the response before the coalesced notification. Returned
  * response bytes are malloc-owned and include one trailing NUL for text use;
  * response_length excludes that terminator. */
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_context(

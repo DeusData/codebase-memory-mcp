@@ -16,6 +16,20 @@
 #include <sys/stat.h>
 #endif
 
+int64_t cbm_stat_mtime_ns(const struct stat *st) {
+    if (!st) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
 /* ── strndup (Windows lacks it) ───────────────────────────────── */
 
 #ifdef _WIN32
@@ -113,20 +127,57 @@ static bool win_mkdtemp_private_create(const char *path) {
     return created;
 }
 
-char *cbm_mkdtemp(char *tmpl) {
-    /* Build path in static buffer, then copy back to caller.
-     * Callers must provide buffers >= CBM_SZ_256 bytes (all test code does). */
-    static char buf[CBM_SZ_512];
-    if (strncmp(tmpl, "/tmp/", 5) == 0) {
+/* Single owner of the "/tmp/" -> %TEMP% template rewrite, shared by
+ * cbm_mkdtemp and cbm_mkstemp_s so the rule is stated once. */
+static int rewrite_tmp_template(char *tmpl, size_t tmpl_sz) {
+    if (!tmpl || tmpl_sz == 0) {
+        errno = EINVAL;
+        return CBM_NOT_FOUND;
+    }
+
+    size_t len = 0;
+    while (len < tmpl_sz && tmpl[len]) {
+        len++;
+    }
+    if (len == tmpl_sz || len >= CBM_PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return CBM_NOT_FOUND;
+    }
+
+    char original[CBM_PATH_MAX];
+    memcpy(original, tmpl, len + SKIP_ONE);
+
+    enum { TMP_PREFIX_LEN = sizeof("/tmp/") - SKIP_ONE };
+    int n;
+    if (strncmp(original, "/tmp/", TMP_PREFIX_LEN) == 0) {
         const char *tmp = getenv("TEMP");
         if (!tmp)
             tmp = getenv("TMP");
         if (!tmp)
             tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
+        n = snprintf(tmpl, tmpl_sz, "%s\\%s", tmp, original + TMP_PREFIX_LEN);
     } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
+        n = snprintf(tmpl, tmpl_sz, "%s", original);
     }
+    if (n < 0 || (size_t)n >= tmpl_sz) {
+        errno = ENAMETOOLONG;
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+char *cbm_mkdtemp(char *tmpl) {
+    /* Per-call storage: daemon project workers create staging directories
+     * concurrently, so a shared scratch buffer would be a data race. The
+     * expanded path is copied back into the caller's template before return. */
+    char buf[CBM_PATH_MAX];
+    int n = snprintf(buf, sizeof(buf), "%s", tmpl ? tmpl : "");
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    if (rewrite_tmp_template(buf, sizeof(buf)) != 0)
+        return NULL;
     /* Wide-API template expansion: the ANSI CRT interprets the UTF-8 bytes of
      * non-ASCII cache/temp components in the local codepage and fails. */
     wchar_t *wide_template = cbm_utf8_to_wide(buf);
@@ -136,11 +187,15 @@ char *cbm_mkdtemp(char *tmpl) {
     }
     char *expanded = cbm_wide_to_utf8(wide_template);
     free(wide_template);
-    if (!expanded || strlen(expanded) >= sizeof(buf)) {
+    if (!expanded) {
+        return NULL;
+    }
+    size_t expanded_len = strlen(expanded);
+    if (expanded_len >= sizeof(buf)) {
         free(expanded);
         return NULL;
     }
-    strcpy(buf, expanded);
+    memcpy(buf, expanded, expanded_len + SKIP_ONE);
     free(expanded);
     if (!win_mkdtemp_private_create(buf)) {
         /* One-time note: every private-namespace validation downstream
@@ -207,55 +262,80 @@ bool cbm_path_for_file_api(const char *path, char *out, size_t out_size) {
 
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl) {
-    /* Rewrite /tmp/ to %TEMP%\ like cbm_mkdtemp */
-    /* Per-call storage: daemon project workers can create staging files
-     * concurrently, so a process-global scratch buffer is a data race. */
-    char buf[CBM_SZ_4K];
-    int written;
-    if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
-        written = snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
-    } else {
-        written = snprintf(buf, sizeof(buf), "%s", tmpl);
-    }
-    if (written < 0 || (size_t)written >= sizeof(buf)) {
+    /* Legacy ABI: caller owns an unsized template buffer. New shared code should
+     * use cbm_mkstemp_s() so long paths fail instead of copying back blindly.
+     * Per-call storage: daemon project workers create staging files
+     * concurrently, so a shared scratch buffer would be a data race. */
+    char buf[CBM_PATH_MAX];
+    int n = snprintf(buf, sizeof(buf), "%s", tmpl ? tmpl : "");
+    if (n < 0 || (size_t)n >= sizeof(buf)) {
         errno = ENAMETOOLONG;
         return CBM_NOT_FOUND;
     }
-    /* Wide-API expansion and open: worker staging files land inside
-     * CBM_CACHE_DIR, which users may place at non-ASCII paths; the ANSI CRT
-     * (_mktemp/_open) mangles those bytes in the local codepage. */
-    wchar_t *wide_template = cbm_utf8_to_wide(buf);
-    if (!wide_template || !_wmktemp(wide_template)) {
-        free(wide_template);
+    int fd = cbm_mkstemp_s(buf, sizeof(buf));
+    if (fd >= 0)
+        strcpy(tmpl, buf);
+    return fd;
+}
+
+int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz) {
+    if (rewrite_tmp_template(tmpl, tmpl_sz) != 0)
+        return CBM_NOT_FOUND;
+
+    char *pattern = cbm_strdup(tmpl);
+    if (!pattern) {
+        errno = ENOMEM;
         return CBM_NOT_FOUND;
     }
-    char *expanded_for_open = cbm_wide_to_utf8(wide_template);
-    wchar_t *wide_open = expanded_for_open ? cbm_path_to_wide(expanded_for_open) : NULL;
-    free(expanded_for_open);
-    if (!wide_open) {
-        free(wide_template);
-        return CBM_NOT_FOUND;
-    }
-    int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
-    free(wide_open);
-    if (fd >= 0) {
-        char *expanded = cbm_wide_to_utf8(wide_template);
-        if (!expanded || strlen(expanded) >= sizeof(buf)) {
-            free(expanded);
-            free(wide_template);
-            (void)_close(fd);
+
+    enum { MKSTEMP_COLLISION_RETRIES = CBM_SZ_32 };
+    for (int attempt = 0; attempt < MKSTEMP_COLLISION_RETRIES; attempt++) {
+        int n = snprintf(tmpl, tmpl_sz, "%s", pattern);
+        if (n < 0 || (size_t)n >= tmpl_sz) {
+            free(pattern);
+            errno = ENAMETOOLONG;
             return CBM_NOT_FOUND;
         }
-        strcpy(tmpl, expanded);
+        /* Wide-API expansion and open: worker staging files land inside
+         * CBM_CACHE_DIR, which users may place at non-ASCII paths; the ANSI CRT
+         * (_mktemp/_open) mangles those bytes in the local codepage. */
+        wchar_t *wide_template = cbm_utf8_to_wide(tmpl);
+        if (!wide_template || !_wmktemp(wide_template)) {
+            free(wide_template);
+            break;
+        }
+        char *expanded = cbm_wide_to_utf8(wide_template);
+        free(wide_template);
+        if (!expanded) {
+            break;
+        }
+        size_t expanded_len = strlen(expanded);
+        if (expanded_len >= tmpl_sz) {
+            free(expanded);
+            errno = ENAMETOOLONG;
+            break;
+        }
+        wchar_t *wide_open = cbm_path_to_wide(expanded);
+        if (!wide_open) {
+            free(expanded);
+            break;
+        }
+        int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+        free(wide_open);
+        if (fd >= 0) {
+            memcpy(tmpl, expanded, expanded_len + SKIP_ONE);
+            free(expanded);
+            free(pattern);
+            return fd;
+        }
         free(expanded);
+        if (errno != EEXIST) {
+            break;
+        }
     }
-    free(wide_template);
-    return fd;
+
+    free(pattern);
+    return CBM_NOT_FOUND;
 }
 #endif
 

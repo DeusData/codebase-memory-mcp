@@ -260,12 +260,8 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
             strcmp(fk, "value_identifier") == 0 || strcmp(fk, "value_identifier_path") == 0) {
             return cbm_node_text(a, func_node, source);
         }
-        // C++ explicit template call f<T>(args): the `function` field is a
-        // template_function whose `name` child is the bare callee (identifier
-        // "identity" or qualified_identifier "ns::f"). Without this the whole
-        // "identity<int>" text would never be produced as a textual callee, so
-        // no CALLS edge — and the LSP's lsp_template resolution has nothing to
-        // attach to. Return the name child so the join recovers the bare method.
+        // C++ f<T>(args): use template_function's bare `name` child so the
+        // textual call joins the LSP's template resolution.
         if (strcmp(fk, "template_function") == 0) {
             TSNode tname = ts_node_child_by_field_name(func_node, TS_FIELD("name"));
             if (!ts_node_is_null(tname)) {
@@ -319,10 +315,23 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
         return method;
     }
 
+    TSNode callee_node = ts_node_child_by_field_name(node, TS_FIELD("callee"));
+    if (!ts_node_is_null(callee_node)) {
+        while (ts_node_named_child_count(callee_node) == 1) {
+            const char *ck = ts_node_type(callee_node);
+            if (strcmp(ck, "value") != 0 && strcmp(ck, "var") != 0 &&
+                strcmp(ck, "expression") != 0) {
+                break;
+            }
+            callee_node = ts_node_named_child(callee_node, 0);
+        }
+        return cbm_node_text(a, callee_node, source);
+    }
+
     return NULL;
 }
 
-// Haskell/OCaml: extract callee from apply/infix nodes.
+// Haskell/OCaml/PureScript: extract callee from apply/infix nodes.
 static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "apply") == 0 || strcmp(nk, "application_expression") == 0 ||
         strcmp(nk, "exp_apply") == 0) {
@@ -651,17 +660,43 @@ static char *extract_dart_callee(CBMArena *a, TSNode node, const char *source, c
     return NULL;
 }
 
-// SCSS: an `@include foo;` is an include_statement whose callee is its
-// `identifier` child (the mixin name).
+static bool agda_expr_belongs_to_signature(TSNode node) {
+    TSNode cur = node;
+    while (!ts_node_is_null(cur)) {
+        if (strcmp(ts_node_type(cur), "function") == 0) {
+            TSNode lhs = cbm_find_child_by_kind(cur, "lhs");
+            return !ts_node_is_null(lhs) &&
+                   !ts_node_is_null(cbm_find_child_by_kind(lhs, "function_name"));
+        }
+        cur = ts_node_parent(cur);
+    }
+    return false;
+}
+
+// Agda function application parses as an expr with the callee in child 0.
+static char *extract_agda_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "module_application") == 0) {
+        return extract_callee_from_fields(a, node, source);
+    }
+    if (strcmp(nk, "expr") != 0 || ts_node_named_child_count(node) < 2 ||
+        agda_expr_belongs_to_signature(node)) {
+        return NULL;
+    }
+    TSNode head = ts_node_named_child(node, 0);
+    if (strcmp(ts_node_type(head), "atom") == 0 && ts_node_named_child_count(head) > 0) {
+        head = ts_node_named_child(head, 0);
+    }
+    return cbm_node_text(a, head, source);
+}
+
+// SCSS includes and @function calls store callees as named children rather
+// than the generic function/name fields.
 static char *extract_scss_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "include_statement") == 0) {
         TSNode id = cbm_find_child_by_kind(node, "identifier");
         return ts_node_is_null(id) ? NULL : cbm_node_text(a, id, source);
     }
-    /* SCSS @function call `double($x)` is a call_expression whose callee is a
-     * `function_name` child (there is no `function` field), so the generic
-     * field-based resolver returns NULL and the call is dropped — no CALLS edge
-     * to the in-file @function. */
+    /* `double($x)` has no generic `function` field. */
     if (strcmp(nk, "call_expression") == 0) {
         TSNode fn = cbm_find_child_by_kind(node, "function_name");
         if (!ts_node_is_null(fn)) {
@@ -765,9 +800,13 @@ static char *extract_nickel_callee(CBMArena *a, TSNode node, const char *source,
     if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "applicative") == 0) {
         return NULL;
     }
-    enum { NICKEL_APPLY_DEPTH = 8 };
+    /*
+     * Only the outermost applicative reaches this walk, so following the full
+     * function-side chain is O(D) for curried depth D rather than repeated
+     * quadratic work. Stop on a null/self edge, not an arbitrary semantic cap.
+     */
     TSNode cur = node;
-    for (int depth = 0; depth < NICKEL_APPLY_DEPTH && !ts_node_is_null(cur); depth++) {
+    while (!ts_node_is_null(cur)) {
         const char *ck = ts_node_type(cur);
         if (strcmp(ck, "ident") == 0) {
             return cbm_node_text(a, cur, source);
@@ -872,8 +911,9 @@ static char *extract_nasm_callee(CBMArena *a, TSNode node, const char *source, c
         return NULL;
     }
     char *m = cbm_node_text(a, mnem, source);
-    if (!m || (strcmp(m, "call") != 0 && strcmp(m, "jmp") != 0 && strcmp(m, "je") != 0 &&
-               strcmp(m, "jne") != 0 && strcmp(m, "jz") != 0 && strcmp(m, "jnz") != 0)) {
+    if (!m ||
+        (strcasecmp(m, "call") != 0 && strcasecmp(m, "jmp") != 0 && strcasecmp(m, "je") != 0 &&
+         strcasecmp(m, "jne") != 0 && strcasecmp(m, "jz") != 0 && strcasecmp(m, "jnz") != 0)) {
         return NULL;
     }
     TSNode ops = ts_node_child_by_field_name(node, TS_FIELD("operands"));
@@ -939,20 +979,6 @@ static char *extract_nix_callee(CBMArena *a, TSNode node, const char *source, co
         return NULL;
     }
     return NULL;
-}
-
-// Agda: function application `f x y` parses as an `expr` whose named children are
-// `atom`s (no dedicated application node). Treat an `expr` with >= 2 atom children
-// as a call whose callee is the head atom's identifier.
-static char *extract_agda_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
-    if (strcmp(nk, "expr") != 0 || ts_node_named_child_count(node) < 2) {
-        return NULL;
-    }
-    TSNode head = ts_node_named_child(node, 0);
-    if (strcmp(ts_node_type(head), "atom") != 0) {
-        return NULL;
-    }
-    return first_leaf_identifier(a, head, source);
 }
 
 // Make: `$(shell ...)` is a `shell_function` node; the callee is the literal
@@ -1041,6 +1067,14 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
         char *c = extract_meson_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
+    if (lang == CBM_LANG_MAKEFILE) {
+        char *c = extract_make_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_PUPPET) {
+        char *c = extract_puppet_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
 
     if (lang == CBM_LANG_SCSS) {
         char *c = extract_scss_callee(a, node, source, nk);
@@ -1054,12 +1088,24 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
         char *c = extract_sql_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
+    if (lang == CBM_LANG_ELM) {
+        char *c = extract_elm_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_NIX) {
+        char *c = extract_nix_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
     if (lang == CBM_LANG_COBOL) {
         char *c = extract_cobol_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
-    if (lang == CBM_LANG_ELM) {
-        char *c = extract_elm_callee(a, node, source, nk);
+    if (lang == CBM_LANG_VHDL) {
+        char *c = extract_vhdl_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_VERILOG || lang == CBM_LANG_SYSTEMVERILOG) {
+        char *c = extract_hdl_callee(a, node, source, nk);
         return c ? c : extract_scripting_callee(a, node, source, lang, nk);
     }
 
@@ -1088,6 +1134,14 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     if (lang == CBM_LANG_DART) {
         return extract_dart_callee(a, node, source, nk);
     }
+    if (lang == CBM_LANG_AGDA) {
+        char *c = extract_agda_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
+    if (lang == CBM_LANG_NASM) {
+        char *c = extract_nasm_callee(a, node, source, nk);
+        return c ? c : extract_scripting_callee(a, node, source, lang, nk);
+    }
     if (lang == CBM_LANG_OBJC) {
         return extract_objc_callee(a, node, source, nk);
     }
@@ -1103,24 +1157,6 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     if (lang == CBM_LANG_SWIFT) {
         return extract_swift_callee(a, node, source, nk);
     }
-    if (lang == CBM_LANG_VERILOG || lang == CBM_LANG_SYSTEMVERILOG) {
-        char *c = extract_hdl_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
-    if (lang == CBM_LANG_VHDL) {
-        char *c = extract_vhdl_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
-    if (lang == CBM_LANG_NASM) {
-        char *c = extract_nasm_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
     if (lang == CBM_LANG_LLVM_IR) {
         char *c = extract_llvm_callee(a, node, source, nk);
         if (c) {
@@ -1133,87 +1169,50 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
             return c;
         }
     }
-    if (lang == CBM_LANG_AGDA) {
-        char *c = extract_agda_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
-    if (lang == CBM_LANG_NIX) {
-        char *c = extract_nix_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
-    if (lang == CBM_LANG_MAKEFILE) {
-        char *c = extract_make_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
     if (lang == CBM_LANG_JUST) {
         char *c = extract_just_callee(a, node, source, nk);
         if (c) {
             return c;
         }
     }
-    if (lang == CBM_LANG_PUPPET) {
-        char *c = extract_puppet_callee(a, node, source, nk);
-        if (c) {
-            return c;
-        }
-    }
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
-        // ##class(Pkg.Class).Method() -> "Pkg.Class.Method"
         if (strcmp(nk, "class_method_call") == 0) {
             TSNode class_ref = cbm_find_child_by_kind(node, "class_ref");
             TSNode method_name = cbm_find_child_by_kind(node, "method_name");
-            if (!ts_node_is_null(class_ref) && !ts_node_is_null(method_name)) {
-                TSNode cname = cbm_find_child_by_kind(class_ref, "class_name");
-                if (ts_node_is_null(cname)) {
-                    return NULL;
-                }
-                char *cls = cbm_node_text(a, cname, source);
-                if (!cls || !cls[0]) {
-                    return NULL;
-                }
-                TSNode mname_ident = ts_node_named_child_count(method_name) > 0
-                                         ? ts_node_named_child(method_name, 0)
-                                         : (TSNode){0};
-                if (ts_node_is_null(mname_ident)) {
-                    return cls;
-                }
-                char *meth = cbm_node_text(a, mname_ident, source);
-                if (!meth || !meth[0]) {
-                    return cls;
-                }
-                return cbm_arena_sprintf(a, "%s.%s", cls, meth);
-            }
-            return NULL;
-        }
-        // $$label^routine extrinsic / routine tag call -> the line_ref text
-        if (strcmp(nk, "routine_tag_call") == 0) {
-            TSNode line_ref = cbm_find_child_by_kind(node, "line_ref");
-            if (!ts_node_is_null(line_ref)) {
-                return cbm_node_text(a, line_ref, source);
-            }
-            return NULL;
-        }
-        // $$$Macro(...) -> raw "$$$Name" callee (expanded later in handle_calls)
-        if (strcmp(nk, "macro") == 0) {
-            char *raw = cbm_node_text(a, node, source);
-            if (!raw || raw[0] != '$' || raw[1] != '$' || raw[2] != '$') {
+            if (ts_node_is_null(class_ref) || ts_node_is_null(method_name)) {
                 return NULL;
             }
-            char *name_start = raw + 3;
-            char *paren = strchr(name_start, '(');
+            TSNode class_name = cbm_find_child_by_kind(class_ref, "class_name");
+            if (ts_node_is_null(class_name)) {
+                return NULL;
+            }
+            char *class_text = cbm_node_text(a, class_name, source);
+            TSNode method_ident = ts_node_named_child_count(method_name) > 0
+                                      ? ts_node_named_child(method_name, 0)
+                                      : (TSNode){0};
+            if (!class_text || !class_text[0] || ts_node_is_null(method_ident)) {
+                return class_text;
+            }
+            char *method_text = cbm_node_text(a, method_ident, source);
+            return method_text && method_text[0]
+                       ? cbm_arena_sprintf(a, "%s.%s", class_text, method_text)
+                       : class_text;
+        }
+        if (strcmp(nk, "routine_tag_call") == 0) {
+            TSNode line_ref = cbm_find_child_by_kind(node, "line_ref");
+            return ts_node_is_null(line_ref) ? NULL : cbm_node_text(a, line_ref, source);
+        }
+        if (strcmp(nk, "macro") == 0) {
+            char *raw = cbm_node_text(a, node, source);
+            if (!raw || strncmp(raw, "$$$", 3) != 0) {
+                return NULL;
+            }
+            char *name = raw + 3;
+            char *paren = strchr(name, '(');
             if (paren) {
                 *paren = '\0';
             }
-            if (!name_start[0]) {
-                return NULL;
-            }
-            return cbm_arena_sprintf(a, "$$$%s", name_start);
+            return name[0] ? cbm_arena_sprintf(a, "$$$%s", name) : NULL;
         }
         return NULL;
     }
@@ -1465,6 +1464,14 @@ static char *gotemplate_string_child(CBMArena *a, TSNode parent, const char *sou
     return (char *)v;
 }
 
+static TSNode find_call_arguments_node(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        args = cbm_find_child_by_kind(node, "argument_list");
+    }
+    return args;
+}
+
 // Resolve a Go-template / Helm call to the referenced named template:
 //   {{ template "x" . }}            -> template_action, name is a string child
 //   {{ include "x" . }}             -> function_call(include), name is first string arg
@@ -1484,10 +1491,7 @@ static char *gotemplate_callee(CBMArena *a, TSNode node, const char *source) {
                        strcmp(fname, "tpl") != 0)) {
             return NULL;
         }
-        TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
-        if (ts_node_is_null(args)) {
-            args = cbm_find_child_by_kind(node, "argument_list");
-        }
+        TSNode args = find_call_arguments_node(node);
         if (ts_node_is_null(args)) {
             return NULL;
         }
@@ -1836,14 +1840,20 @@ static void extract_jsx_component_ref(CBMExtractCtx *ctx, TSNode node, const cha
     }
 }
 
-// Kotlin: `a OP b` desugars to an operator-method call `a.<method>(b)`. The
-// generic call walk keys on call_expression nodes and so never sees these
-// precedence-specific binary-expression nodes, leaving the type-aware LSP
-// operator resolution (lsp_kt_operator -> the user `operator fun`) with no call
-// site to attach to. Record a textual call to the operator method's bare name;
-// the operator-token -> method mapping mirrors kotlin_lsp.c's binary handler so
-// the names join. Builtin operands (Int+Int) resolve to a stdlib type with no
-// graph node and drop, exactly as before — only user `operator fun`s gain edges.
+/* Kotlin operator/convention syntax and Java/C++ implicit syntax can represent
+ * real calls without a call_expression node. These helpers add the textual
+ * CBMCall records required for existing type-aware LSP resolutions to join. */
+static void push_synthetic_call(CBMExtractCtx *ctx, TSNode node, const char *callee,
+                                const char *enclosing_func_qn) {
+    if (!callee || !callee[0]) {
+        return;
+    }
+    CBMCall call = {0};
+    call.callee_name = callee;
+    call.enclosing_func_qn = enclosing_func_qn;
+    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
+    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+}
 static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                          const char *enclosing_func_qn) {
     if (strcmp(kind, "binary_expression") != 0 && strcmp(kind, "additive_expression") != 0 &&
@@ -1873,15 +1883,16 @@ static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const 
     size_t blen = (size_t)(rhs_start - lhs_end);
     const char *op_method = NULL;
     if (cbm_memmem(between, blen, "===", 3) || cbm_memmem(between, blen, "!==", 3)) {
-        return; // identity comparison: no operator method
-    } else if (cbm_memmem(between, blen, "==", 2) || cbm_memmem(between, blen, "!=", 2)) {
+        return;
+    }
+    if (cbm_memmem(between, blen, "==", 2) || cbm_memmem(between, blen, "!=", 2)) {
         op_method = "equals";
     } else if (cbm_memmem(between, blen, "..<", 3)) {
         op_method = "rangeUntil";
     } else if (cbm_memmem(between, blen, "..", 2)) {
         op_method = "rangeTo";
     } else if (cbm_memmem(between, blen, "<", 1) || cbm_memmem(between, blen, ">", 1)) {
-        op_method = "compareTo"; // covers <, >, <=, >=
+        op_method = "compareTo";
     } else if (cbm_memmem(between, blen, "+", 1)) {
         op_method = "plus";
     } else if (cbm_memmem(between, blen, "-", 1)) {
@@ -1893,38 +1904,38 @@ static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const 
     } else if (cbm_memmem(between, blen, "%", 1)) {
         op_method = "rem";
     }
-    if (!op_method) {
-        return;
+    push_synthetic_call(ctx, node, op_method, enclosing_func_qn);
+}
+
+static void extract_kotlin_desugared_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
+                                           const char *enclosing_func_qn) {
+    if (strcmp(kind, "property_declaration") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(c), "multi_variable_declaration") != 0) {
+                continue;
+            }
+            uint32_t vc = ts_node_named_child_count(c);
+            uint32_t comp = 0;
+            for (uint32_t j = 0; j < vc; j++) {
+                TSNode v = ts_node_named_child(c, j);
+                if (strcmp(ts_node_type(v), "variable_declaration") != 0) {
+                    continue;
+                }
+                comp++;
+                push_synthetic_call(ctx, node, cbm_arena_sprintf(ctx->arena, "component%u", comp),
+                                    enclosing_func_qn);
+            }
+            break;
+        }
+    } else if (strcmp(kind, "for_statement") == 0) {
+        push_synthetic_call(ctx, node, "iterator", enclosing_func_qn);
+        push_synthetic_call(ctx, node, "hasNext", enclosing_func_qn);
+        push_synthetic_call(ctx, node, "next", enclosing_func_qn);
     }
-    CBMCall call = {0};
-    call.callee_name = op_method;
-    call.enclosing_func_qn = enclosing_func_qn;
-    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
 }
 
-// Kotlin convention-desugared calls that the call walk never sees as
-// call_expressions: `val (a,b) = e` -> e.component1()/e.component2(); and
-// `for (x in e)` -> e.iterator()/hasNext()/next(). Record textual calls to those
-// operator-convention method names so the LSP's lsp_kt_destructure /
-// lsp_kt_iterator resolutions have a call site to join (names match the LSP's).
-static void kt_push_implicit_call(CBMExtractCtx *ctx, TSNode node, const char *callee,
-                                  const char *enclosing_func_qn) {
-    CBMCall call = {0};
-    call.callee_name = callee;
-    call.enclosing_func_qn = enclosing_func_qn;
-    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
-}
-
-// C++ overloaded binary operator `a + b`: the operator method (`operator+`) is
-// invoked implicitly, so the call walk never sees a call node. Synthesize a
-// textual call to the bare operator name so the c-LSP's lsp_operator resolution
-// (which keys the same `operator<tok>` member on the lhs type) has a call site to
-// join. The operator token is the first unnamed child, mirroring c_lsp.c's binary
-// handling. Builtin-operand expressions (int + int) synthesize an `operator+`
-// callee too, but no such member exists so the call resolves to nothing and is
-// dropped — no spurious edge.
 static void extract_cpp_operator_call(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                       const char *enclosing_func_qn) {
     if (strcmp(kind, "binary_expression") != 0) {
@@ -1942,32 +1953,15 @@ static void extract_cpp_operator_call(CBMExtractCtx *ctx, TSNode node, const cha
         }
         char *op = cbm_node_text(ctx->arena, child, ctx->source);
         if (op && op[0]) {
-            CBMCall call = {0};
-            call.callee_name = cbm_arena_sprintf(ctx->arena, "operator%s", op);
-            call.enclosing_func_qn = enclosing_func_qn;
-            call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-            cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+            push_synthetic_call(ctx, node, cbm_arena_sprintf(ctx->arena, "operator%s", op),
+                                enclosing_func_qn);
         }
         break;
     }
 }
 
-// C++ implicit calls that produce no textual call node: the destructor
-// (`delete p`), the copy/move constructor (`T a = b;` copy-init), and the
-// conversion operator (`if (obj)` where obj has `operator bool`). The c-LSP
-// resolves each to the corresponding member but there is no call site to join
-// to (callable=0). Synthesize a textual call sourced to the enclosing function
-// so the lsp_{destructor,copy_constructor,conversion} resolution binds.
-//
-//   - destructor: the callee QN embeds the type (`T.~T`), which is not textually
-//     available from `delete p`, so it joins via the reason gate — c_lsp stashes
-//     the operand text in `reason` and the synthesized callee is that same text.
-//   - copy constructor: the callee short-name is the constructed type (`T`),
-//     which IS textually present as the declaration's type — join by short-name.
-//   - conversion: the callee short-name is the type-independent `operator bool`.
-//
-// Spurious synthesis (a condition/operand that has no such member) resolves to
-// nothing and is dropped, so no extra edge is produced.
+/* These implicit C++ calls have no call node; unresolved synthetic names are
+ * dropped later, while valid names join the corresponding LSP resolution. */
 static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                        const char *enclosing_func_qn) {
     const char *callee = NULL;
@@ -1981,8 +1975,6 @@ static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const ch
         }
     } else if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "while_statement") == 0 ||
                strcmp(kind, "do_statement") == 0) {
-        // `if (obj)` invokes obj's `operator bool`. Only a lone-identifier
-        // condition triggers it; comparisons/logical exprs evaluate to bool.
         TSNode cond = ts_node_child_by_field_name(node, TS_FIELD("condition"));
         if (!ts_node_is_null(cond)) {
             TSNode inner = cond;
@@ -1995,7 +1987,6 @@ static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const ch
             }
         }
     } else if (strcmp(kind, "declaration") == 0) {
-        // `T a = b;` — copy-init from an identifier invokes T's copy constructor.
         TSNode type = ts_node_child_by_field_name(node, TS_FIELD("type"));
         TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
         if (!ts_node_is_null(type) && !ts_node_is_null(decl) &&
@@ -2010,52 +2001,9 @@ static void extract_cpp_implicit_calls(CBMExtractCtx *ctx, TSNode node, const ch
             }
         }
     }
-    if (callee && callee[0]) {
-        CBMCall call = {0};
-        call.callee_name = callee;
-        call.enclosing_func_qn = enclosing_func_qn;
-        call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-        cbm_calls_push(&ctx->result->calls, ctx->arena, call);
-    }
+    push_synthetic_call(ctx, node, callee, enclosing_func_qn);
 }
 
-static void extract_kotlin_desugared_calls(CBMExtractCtx *ctx, TSNode node, const char *kind,
-                                           const char *enclosing_func_qn) {
-    if (strcmp(kind, "property_declaration") == 0) {
-        uint32_t nc = ts_node_named_child_count(node);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode c = ts_node_named_child(node, i);
-            if (strcmp(ts_node_type(c), "multi_variable_declaration") != 0) {
-                continue;
-            }
-            // One componentN() call per destructured variable.
-            uint32_t vc = ts_node_named_child_count(c);
-            uint32_t comp = 0;
-            for (uint32_t j = 0; j < vc; j++) {
-                TSNode v = ts_node_named_child(c, j);
-                if (strcmp(ts_node_type(v), "variable_declaration") != 0) {
-                    continue;
-                }
-                comp++;
-                kt_push_implicit_call(ctx, node, cbm_arena_sprintf(ctx->arena, "component%u", comp),
-                                      enclosing_func_qn);
-            }
-            break;
-        }
-    } else if (strcmp(kind, "for_statement") == 0) {
-        kt_push_implicit_call(ctx, node, "iterator", enclosing_func_qn);
-        kt_push_implicit_call(ctx, node, "hasNext", enclosing_func_qn);
-        kt_push_implicit_call(ctx, node, "next", enclosing_func_qn);
-    }
-}
-
-// Java method reference `Lhs::name` (e.g. `String::length`, `Foo::new`). The
-// call walk only visits call_expression-like nodes, so a method_reference never
-// becomes a call and the LSP's lsp_method_ref resolution has no call site to
-// attach to. Record a textual call to the referenced method's bare name (the
-// constructor ref `Lhs::new` uses the unnamed `new` token); the LSP join then
-// matches on the bare name. The referenced method IS invoked indirectly, so
-// this is an accurate call edge (mirrors java_lsp.c resolve_method_reference).
 static void extract_java_method_reference(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                           const char *enclosing_func_qn) {
     if (strcmp(kind, "method_reference") != 0) {
@@ -2070,13 +2018,9 @@ static void extract_java_method_reference(CBMExtractCtx *ctx, TSNode node, const
         mname = cbm_node_text(ctx->arena, ts_node_named_child(node, nc - 1), ctx->source);
     }
     if (!mname || !mname[0]) {
-        mname = "new"; // constructor reference `Lhs::new` — `new` is unnamed
+        mname = "new";
     }
-    CBMCall call = {0};
-    call.callee_name = mname;
-    call.enclosing_func_qn = enclosing_func_qn;
-    call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
-    cbm_calls_push(&ctx->result->calls, ctx->arena, call);
+    push_synthetic_call(ctx, node, mname, enclosing_func_qn);
 }
 
 // ObjectScript: resolve `var.Method(...)` / `..Property.Method(...)` instance
@@ -2213,6 +2157,7 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
             call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
+            call.is_macro_invocation = strcmp(ts_node_type(node), "macro_invocation") == 0;
             // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
             // generic short-name resolver cannot place a method without a known
             // receiver type, so the call-resolution pass suppresses those edges.
@@ -2245,9 +2190,9 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                 }
             }
 
-            TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
-            // ObjectScript stores args under oref_method/method_args, not the
-            // generic "arguments" field.
+            TSNode args = find_call_arguments_node(node);
+            /* ObjectScript stores arguments under oref_method/method_args,
+             * not the generic arguments field used by most grammars. */
             if (ts_node_is_null(args) && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
                                           ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
                 TSNode oref = cbm_find_child_by_kind(node, "oref_method");

@@ -74,99 +74,6 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from cached extraction result or graph buffer edges. */
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
-    *out_keys = NULL;
-    *out_vals = NULL;
-    *out_count = 0;
-
-    /* Fast path: build from cached extraction result (no JSON parsing) */
-    if (result && result->imports.count > 0) {
-        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
-        int count = 0;
-
-        for (int i = 0; i < result->imports.count; i++) {
-            const CBMImport *imp = &result->imports.items[i];
-            if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
-                continue;
-            }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
-            free(target_qn);
-            if (!target) {
-                continue;
-            }
-            keys[count] = strdup(imp->local_name);
-            vals[count] = target->qualified_name;
-            count++;
-        }
-
-        *out_keys = keys;
-        *out_vals = vals;
-        *out_count = count;
-        return 0;
-    }
-
-    /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    free(file_qn);
-    if (!file_node) {
-        return 0;
-    }
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc = cbm_gbuf_find_edges_by_source_type(ctx->gbuf, file_node->id, "IMPORTS", &edges,
-                                                &edge_count);
-    if (rc != 0 || edge_count == 0) {
-        return 0;
-    }
-
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
-    int count = 0;
-
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, e->target_id);
-        if (!target || !e->properties_json) {
-            continue;
-        }
-
-        const char *start = strstr(e->properties_json, "\"local_name\":\"");
-        if (start) {
-            start += strlen("\"local_name\":\"");
-            const char *end = strchr(start, '"');
-            if (end && end > start) {
-                keys[count] = cbm_strndup(start, end - start);
-                vals[count] = target->qualified_name;
-                count++;
-            }
-        }
-    }
-
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-        }
-        free((void *)keys);
-    }
-    if (vals) {
-        free((void *)vals);
-    }
-}
-
 /* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
@@ -242,14 +149,14 @@ typedef struct {
     int64_t id;
 } go_imethod_t;
 
-/* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE edges. */
-static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *cls,
-                                     const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
-                                     int im_count) {
-    if (!cls->file_path || !cls->qualified_name) {
+/* Check if a Go type has all interface methods and create graph edges. */
+static int check_go_type_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *typ,
+                                    const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
+                                    int im_count) {
+    if (!typ->file_path || !typ->qualified_name) {
         return 0;
     }
-    if (!fp_ends_with(cls->file_path, ".go")) {
+    if (!fp_ends_with(typ->file_path, ".go")) {
         return 0;
     }
     /* Resolve the struct's methods two ways and use whichever finds them:
@@ -257,16 +164,16 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
      *       pipeline path, where Go receiver methods carry a flat QN (e.g.
      *       "pkg.Area" rather than "pkg.Circle.Area"), so QN-string
      *       reconstruction would miss; and
-     *   (b) the reconstructed QN "<ClassQN>.<methodName>" — used by tests and any
-     *       extractor that does emit class-qualified method QNs without
-     *       DEFINES_METHOD edges from the class. */
+     *   (b) the reconstructed QN "<TypeQN>.<methodName>" — used by tests and any
+     *       extractor that emits type-qualified method QNs without
+     *       DEFINES_METHOD edges from the type. */
     const cbm_gbuf_edge_t **cls_dm = NULL;
     int cls_dm_count = 0;
-    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cls->id, "DEFINES_METHOD", &cls_dm,
+    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, typ->id, "DEFINES_METHOD", &cls_dm,
                                        &cls_dm_count);
 
     char prefix[CBM_SZ_512];
-    snprintf(prefix, sizeof(prefix), "%s.", cls->qualified_name);
+    snprintf(prefix, sizeof(prefix), "%s.", typ->qualified_name);
 
     /* For each interface method, find the matching struct method node. */
     const cbm_gbuf_node_t *matched[CBM_SZ_128];
@@ -280,7 +187,7 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
                 break;
             }
         }
-        /* (b) reconstructed "<ClassQN>.<methodName>" */
+        /* (b) reconstructed "<TypeQN>.<methodName>" */
         if (!found) {
             char method_qn[CBM_SZ_512];
             snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
@@ -291,7 +198,7 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
         }
         matched[m] = found;
     }
-    cbm_gbuf_insert_edge(ctx->gbuf, cls->id, iface->id, "IMPLEMENTS", "{}");
+    cbm_gbuf_insert_edge(ctx->gbuf, typ->id, iface->id, "IMPLEMENTS", "{}");
     int edges = SKIP_ONE;
     for (int m = 0; m < im_count; m++) {
         cbm_gbuf_insert_edge(ctx->gbuf, matched[m]->id, imethods[m].id, "OVERRIDE", "{}");
@@ -351,13 +258,14 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        /* Check each concrete-type node (Struct + Class) for method-set
-         * satisfaction. */
+        /* Check each Go struct node for method-set satisfaction. */
         for (int c = 0; c < struct_count; c++) {
-            edge_count += check_go_class_implements(ctx, structs[c], iface, imethods, im_count);
+            edge_count += check_go_type_implements(ctx, structs[c], iface, imethods, im_count);
         }
+
+        /* Preserve compatibility with legacy graph-buffer fixtures. */
         for (int c = 0; c < class_count; c++) {
-            edge_count += check_go_class_implements(ctx, classes[c], iface, imethods, im_count);
+            edge_count += check_go_type_implements(ctx, classes[c], iface, imethods, im_count);
         }
     }
     return edge_count;
@@ -398,7 +306,7 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
     const cbm_gbuf_node_t *dec = NULL;
     if (res.qualified_name && res.qualified_name[0] != '\0') {
-        dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        dec = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
     }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
@@ -450,7 +358,7 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             if (!base_qn) {
                 continue;
             }
-            const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
+            const cbm_gbuf_node_t *base_node = cbm_pipeline_find_node_by_qn(ctx, base_qn);
             if (base_node && node->id != base_node->id) {
                 /* A base that resolves to an Interface is an IMPLEMENTS relation
                  * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
@@ -485,8 +393,10 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
     if (!source) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file(source, source_len, fi->language, ctx->project_name,
-                                        fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+    CBMFileResult *r =
+        cbm_extract_file_with_options(source, source_len, fi->language, ctx->project_name,
+                                      fi->rel_path, cbm_pipeline_ctx_extract_timeout(ctx), NULL,
+                                      NULL, cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
     free(source);
     if (r) {
         *owned = true;
@@ -514,8 +424,8 @@ static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (!struct_qn) {
             continue;
         }
-        const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, trait_qn);
-        const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, struct_qn);
+        const cbm_gbuf_node_t *tn = cbm_pipeline_find_node_by_qn(ctx, trait_qn);
+        const cbm_gbuf_node_t *sn = cbm_pipeline_find_node_by_qn(ctx, struct_qn);
         if (tn && sn && tn->id != sn->id) {
             cbm_gbuf_insert_edge(ctx->gbuf, sn->id, tn->id, "IMPLEMENTS", "{}");
             count++;
@@ -551,7 +461,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
+                                                 &imp_vals, &imp_count);
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       ps_module_is_dir(files[i].language));
@@ -567,7 +478,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }

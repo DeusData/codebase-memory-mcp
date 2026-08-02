@@ -7,6 +7,7 @@
 #include "daemon/service.h"
 #include "foundation/compat.h"
 #include "foundation/platform.h"
+#include "foundation/subprocess.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -18,7 +19,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "foundation/subprocess.h"
 #include "foundation/win_utf8.h"
 #include <windows.h>
 #else
@@ -171,7 +171,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
             if (bootstrap_has_help_after(argc, argv, arg + 1)) {
                 return CBM_DAEMON_PROCESS_STATELESS;
             }
-            return CBM_DAEMON_PROCESS_LOCAL_CLI;
+            return CBM_DAEMON_PROCESS_DAEMON_CLI;
         }
         if (bootstrap_arg_is(argv[arg], "hook-augment")) {
             return CBM_DAEMON_PROCESS_HOOK_CLIENT;
@@ -181,7 +181,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
                                                                  : CBM_DAEMON_PROCESS_LOCAL_CLI;
         }
         /* Placed after the `cli` check on purpose: `cbm cli search "daemon
-         * start"` is opaque tool input and must stay LOCAL_CLI. */
+         * start"` is opaque tool input and must stay DAEMON_CLI. */
         if (bootstrap_arg_is(argv[arg], "daemon")) {
             return bootstrap_has_help_after(argc, argv, arg + 1) ? CBM_DAEMON_PROCESS_STATELESS
                                                                  : CBM_DAEMON_PROCESS_DAEMON_CTL;
@@ -593,6 +593,19 @@ static cbm_daemon_bootstrap_probe_status_t bootstrap_production_probe(
         return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
     }
 
+    int transport = cbm_daemon_ipc_transport_probe(endpoint);
+    if (transport == 0) {
+        /* A claim/lifetime reservation without a published transport is a
+         * real generation transition, not a reason to enter the full client
+         * connect timeout. The outer bootstrap loop rechecks ownership after
+         * its shared retry interval, so handoff latency is O(transition time)
+         * rather than O(connect timeout), with O(1) memory. */
+        return CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
+    }
+    if (transport != 1) {
+        return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
+    }
+
     *client_out = cbm_daemon_runtime_client_connect(endpoint, identity, timeout_ms, result_out);
     if (*client_out) {
         return CBM_DAEMON_BOOTSTRAP_PROBE_CONNECTED;
@@ -891,17 +904,8 @@ static bool bootstrap_production_spawn(void *context,
     return true;
 }
 #else
-static void bootstrap_child_close_fds(void) {
-    long open_max = sysconf(_SC_OPEN_MAX);
-    if (open_max < 0 || open_max > 1048576L) {
-        open_max = 65536L;
-    }
-    for (int fd = 3; fd < open_max; fd++) {
-        (void)close(fd);
-    }
-}
-
-static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec) {
+static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec,
+                                        long max_fd) {
     (void)umask(077);
     sigset_t empty;
     (void)sigemptyset(&empty);
@@ -914,7 +918,7 @@ static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t
     if (null_fd > STDERR_FILENO) {
         (void)close(null_fd);
     }
-    bootstrap_child_close_fds();
+    cbm_subprocess_posix_close_nonstdio(max_fd);
     execv(spec->executable_path, (char *const *)spec->argv);
     _exit(127);
 }
@@ -925,6 +929,11 @@ static bool bootstrap_production_spawn(void *context,
     if (!spec || !spec->detached || spec->inherit_standard_handles || spec->use_shell) {
         return false;
     }
+    /* Resolve the portable fallback bound before fork. The grandchild then
+     * reuses subprocess.c's allocation-free close_range/F_CLOSEM/close loop,
+     * preserving descriptor hygiene without O(OPEN_MAX) failed syscalls on
+     * kernels that provide a range primitive. */
+    long max_fd = cbm_subprocess_posix_fd_close_limit();
     pid_t first = fork();
     if (first < 0) {
         return false;
@@ -940,7 +949,7 @@ static bool bootstrap_production_spawn(void *context,
         if (daemon > 0) {
             _exit(0);
         }
-        bootstrap_daemon_grandchild(spec);
+        bootstrap_daemon_grandchild(spec, max_fd);
     }
 
     int status = 0;

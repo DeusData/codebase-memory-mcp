@@ -56,7 +56,7 @@
       "featureList": [
         "Indexes 158 programming languages via vendored tree-sitter grammars",
         "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
-        "15 MCP tools for structural search, call-path tracing, targeted coverage checks, and Cypher graph queries",
+        "Streamlined MCP tools plus 15 classic tools for structural search, call-path tracing, and Cypher graph queries",
         "Semantic vector code search via bundled nomic-embed-code embeddings (no API key, fully local)",
         "Semantic graph edges (SEMANTICALLY_RELATED) and near-clone detection (SIMILAR_TO, MinHash + LSH)",
         "Cross-service linking for HTTP, gRPC, GraphQL, tRPC, and pub/sub channels with confidence scoring",
@@ -67,7 +67,7 @@
         "Dead-code detection with entry-point filtering",
         "Infrastructure-as-code indexing for Dockerfiles, Kubernetes, and Kustomize",
         "Built-in 3D graph visualization UI",
-        "Auto-sync background watcher for incremental re-indexing",
+        "Auto-sync background watcher with configurable reindex policy",
         "One command configures 43 automatic/conditional client surfaces"
       ],
       "author": {
@@ -157,7 +157,7 @@
           "name": "Which AI coding agents work with codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "A single install command configures 43 automatic/conditional client surfaces. The 37 detected surfaces are Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi. Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody are conditional or explicit integrations. Qodo, Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI, Plandex, and SWE-agent require manual, UI, cloud, or repository-managed setup and are not counted among the 43."
+            "text": "A single install command configures 43 automatic/conditional client surfaces. The 37 detected surfaces are Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi. Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody are conditional or explicit integrations."
           }
         },
         {
@@ -526,49 +526,11 @@
             <span class="cmd">"Index this project"</span>
         </div>
         <p class="muted">
-            One command configures 43 automatic/conditional client surfaces. <strong>Detected automatically (37):</strong>
-            Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor,
-            Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code,
-            GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI,
-            GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE,
-            CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi.
-        </p>
-        <p class="muted">
-            <strong>Conditional or explicit (6):</strong> Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE,
-            and Sourcegraph Cody. <strong>Manual, UI, cloud, or repository-managed (not counted):</strong> Qodo,
-            Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI,
-            Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection
-            remains manual. Windows users run <code>install.ps1</code>. Also available via <code>npm</code>,
-            <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
-        </p>
-        <p class="muted">
-            Lifecycle installation follows documented context contracts: Qoder uses <code>SessionStart</code>,
-            <code>SubagentStart</code>, and post-<code>Read</code> coverage, including its documented Windows
-            PowerShell executor. Kimi uses <code>UserPromptSubmit</code>;
-            on macOS/Linux, GitLab Duo gets a fail-open user <code>SessionStart</code>, while Devin gets
-            <code>UserPromptSubmit</code>, <code>PostCompaction</code>, and a deduplicated <code>SessionStart</code>
-            when Claude does not already provide it. GitLab Duo, Devin, and Factory hooks are withheld on
-            Windows where no deterministic shell/executor contract is documented. Cline's auto-activating file hooks
-            are withheld because their context output is not reliably consumed; CodeBuddy's beta hooks are not
-            auto-installed; Junie's EAP
-            <code>SessionStart</code> output is documented as ignored; and Cursor context hooks are withheld because
-            the documented events cannot safely provide race-free MCP context to read-only subagents.
-        </p>
-        <p class="muted">
-            Documented custom-agent formats receive three exact-owned evidence tiers: Scout for narrow provisional
-            discovery, Verify as the task-directed default, and Auditor for bounded, paginated, current-generation
-            verification. Every direct tier calls <code>check_index_coverage</code> for cited paths and relevant scopes,
-            then reads flagged ranges or skipped files directly. Kiro and Junie use positive-allowlist
-            <code>--tool-profile scout</code> and <code>--tool-profile analysis</code> server surfaces;
-            Junie selects dedicated named aliases because its subagent schema filters by server.
-            Qoder combines named-server selection with exact tier-specific MCP tool IDs. Factory uses
-            exact registered tool IDs without its additive whole-server <code>mcpServers</code> field.
-            A foreign Junie alias is preserved and causes the installed profiles to fail closed to parent handoff.
-            Cursor, Rovo, Augment, Pochi, and Cline use explicit
-            parent handoff where direct child MCP is unavailable or unsafe; Pochi is limited to <code>readFile</code>.
-            Neither IBM Bob surface receives an invented hook or custom agent. Amazon Q Developer
-            IDE defaults to <code>~/.aws/amazonq/default.json</code> while preserving either existing documented
-            alternative.
+            One command configures 43 automatic/conditional client surfaces. Detected clients receive only
+            their documented MCP, instruction, skill, agent, and fail-open context-hook surfaces; conditional
+            clients are written only when their platform, marker, or explicit existing config proves activation.
+            Windows users run <code>install.ps1</code>. Also available via
+            <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
         </p>
     </section>
 
@@ -727,19 +689,19 @@
             </div>
             <div class="feature">
                 <h3>Auto-sync</h3>
-                <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
+                <p>A background watcher detects git changes and re-indexes when configured. The reindex policy controls whether refreshes use full or incremental indexing.</p>
             </div>
             <div class="feature">
                 <h3>Team-shared graph artifact</h3>
-                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates bootstrap from it and skip the full reindex.</p>
+                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates can bootstrap from it before any configured refresh.</p>
             </div>
             <div class="feature">
                 <h3>3D graph visualization</h3>
                 <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
-                <h3>15 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>check_index_coverage</code>, <code>manage_adr</code>, and 7 more.</p>
+                <h3>Streamlined + classic MCP tools</h3>
+                <p>Default tools include <code>search_graph</code>, <code>trace_path</code>, <code>query_graph</code>, <code>search_code</code>, and <code>get_code</code>. Classic mode exposes 15 individual tools including <code>index_repository</code>, <code>get_architecture</code>, <code>get_code_snippet</code>, and <code>manage_adr</code>.</p>
             </div>
             <div class="feature">
                 <h3>Cypher graph queries</h3>
@@ -804,9 +766,9 @@
            (arm64/amd64), and Windows (amd64).</p>
 
         <h3>How does it stay up to date as I edit code?</h3>
-        <p>A background watcher detects file changes and re-indexes incrementally — typically a sub-millisecond
-           no-op when nothing changed. You only run a manual index for the first build or after a large
-           <code>git pull</code>.</p>
+        <p>A background watcher detects git changes and can re-index automatically when configured.
+           The default refresh path favors correctness with a full atomic rebuild; incremental reindexing
+           remains an explicit policy setting.</p>
 
         <h3>Why is there no built-in LLM?</h3>
         <p>Other code-graph tools embed an LLM to translate natural language into graph queries, which means

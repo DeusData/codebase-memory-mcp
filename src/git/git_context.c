@@ -1,99 +1,116 @@
 #include "git/git_context.h"
 
+#include "git/git_command.h"
+
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
-#include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
-enum {
-    GIT_CMD_MAX = 1024,
-    GIT_OUTPUT_MAX = 4096,
-};
+typedef enum {
+    GIT_CONTEXT_BATCH_OK = 0,
+    GIT_CONTEXT_BATCH_FALLBACK,
+    GIT_CONTEXT_BATCH_NOT_GIT,
+} git_context_batch_status_t;
 
-static char *git_strdup(const char *s) {
-    if (!s) {
-        s = "";
-    }
-    size_t n = strlen(s) + 1;
-    char *out = (char *)malloc(n);
-    if (!out) {
-        return NULL;
-    }
-    memcpy(out, s, n);
-    return out;
-}
+typedef struct {
+    char *worktree_root;
+    char *git_dir;
+    char *git_common_dir;
+    char *head_sha;
+    char *branch;
+    char *abs_common_dir;
+} git_context_batch_t;
 
-static void trim_newlines(char *s) {
-    if (!s) {
+static void git_context_batch_free(git_context_batch_t *batch) {
+    if (!batch) {
         return;
     }
-    size_t n = strlen(s);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
-        s[--n] = '\0';
-    }
+    free(batch->worktree_root);
+    free(batch->git_dir);
+    free(batch->git_common_dir);
+    free(batch->head_sha);
+    free(batch->branch);
+    free(batch->abs_common_dir);
+    memset(batch, 0, sizeof(*batch));
 }
 
-static bool git_validate_repo_path(const char *repo_path) {
-    if (!cbm_validate_shell_arg(repo_path)) {
-        return false;
+static git_context_batch_status_t resolve_context_batch(const char *path,
+                                                        git_context_batch_t *batch) {
+    memset(batch, 0, sizeof(*batch));
+    /*
+     * rev-parse evaluates these selectors in order and emits one line per
+     * selector. Keeping the relative and absolute common-dir values in the
+     * same child preserves the public field spellings while retaining Git's
+     * cross-platform canonical path for repository identity.
+     *
+     * Normal work is two contained children including merge-base, rather than
+     * seven. Runtime and spawn latency are O(1) in field count, output memory is
+     * O(1) (six bounded lines), and no shared state is introduced for concurrent
+     * callers. Older Git and unborn HEAD behavior use the exact legacy probes.
+     */
+    const char *const args[] = {"rev-parse",
+                                "--show-toplevel",
+                                "--git-dir",
+                                "--git-common-dir",
+                                "HEAD",
+                                "--abbrev-ref",
+                                "HEAD",
+                                "--path-format=absolute",
+                                "--git-common-dir",
+                                NULL};
+    cbm_git_output_t output;
+    cbm_proc_result_t result;
+    if (cbm_git_run_argv(path, args, NULL, &output, &result) != 0) {
+        return GIT_CONTEXT_BATCH_FALLBACK;
     }
-#ifdef _WIN32
-    for (const char *p = repo_path; *p; p++) {
-        if (*p == '%' || *p == '!' || *p == '^') {
-            return false;
+    if (result.outcome != CBM_PROC_CLEAN) {
+        bool no_git_output = output.size == 0;
+        cbm_git_output_cleanup(&output);
+        return no_git_output ? GIT_CONTEXT_BATCH_NOT_GIT : GIT_CONTEXT_BATCH_FALLBACK;
+    }
+
+    FILE *stream = cbm_fopen(output.path, "rb");
+    if (!stream) {
+        cbm_git_output_cleanup(&output);
+        return GIT_CONTEXT_BATCH_FALLBACK;
+    }
+
+    char **fields[] = {&batch->worktree_root, &batch->git_dir, &batch->git_common_dir,
+                       &batch->head_sha,      &batch->branch,  &batch->abs_common_dir};
+    bool valid = true;
+    for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+        char line[CBM_GIT_OUTPUT_BUFSZ];
+        if (!fgets(line, (int)sizeof(line), stream)) {
+            valid = false;
+            break;
+        }
+        size_t length = strlen(line);
+        bool truncated = length > 0 && line[length - 1] != '\n' && !feof(stream);
+        cbm_git_trim_newlines(line);
+        if (truncated || line[0] == '\0' || !(*fields[index] = cbm_strdup(line))) {
+            valid = false;
+            break;
         }
     }
-#endif
-    return true;
-}
-
-static int git_capture(const char *repo_path, const char *git_args, char **out) {
-    if (!out) {
-        return CBM_NOT_FOUND;
+    if (valid) {
+        int extra = fgetc(stream);
+        valid = extra == EOF && !ferror(stream);
     }
-    *out = NULL;
-    if (!repo_path || !git_args || !git_validate_repo_path(repo_path)) {
-        return CBM_NOT_FOUND;
+    int close_status = fclose(stream);
+    cbm_git_output_cleanup(&output);
+    if (!valid || close_status != 0) {
+        git_context_batch_free(batch);
+        return GIT_CONTEXT_BATCH_FALLBACK;
     }
-
-    char cmd[GIT_CMD_MAX];
-#ifdef _WIN32
-    const char *null_dev = "NUL";
-#else
-    const char *null_dev = "/dev/null";
-#endif
-    /* Double quotes work for POSIX shells and cmd.exe. cbm_validate_shell_arg()
-     * rejects quote/backslash/substitution metacharacters before interpolation. */
-    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", repo_path, git_args, null_dev);
-    if (n < 0 || n >= (int)sizeof(cmd)) {
-        return CBM_NOT_FOUND;
-    }
-
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return CBM_NOT_FOUND;
-    }
-
-    char buf[GIT_OUTPUT_MAX];
-    if (!fgets(buf, sizeof(buf), fp)) {
-        cbm_pclose(fp);
-        return CBM_NOT_FOUND;
-    }
-    trim_newlines(buf);
-
-    int rc = cbm_pclose(fp);
-    if (rc != 0 || buf[0] == '\0') {
-        return CBM_NOT_FOUND;
-    }
-
-    *out = git_strdup(buf);
-    return *out ? 0 : CBM_NOT_FOUND;
+    return GIT_CONTEXT_BATCH_OK;
 }
 
 static bool path_is_absolute(const char *path) {
@@ -112,7 +129,7 @@ static bool path_is_absolute(const char *path) {
 
 static char *join_root_relative(const char *root, const char *rel) {
     if (!root || !root[0]) {
-        return git_strdup(rel);
+        return cbm_strdup(rel);
     }
     int n = snprintf(NULL, 0, "%s/%s", root, rel);
     if (n < 0) {
@@ -146,25 +163,25 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
                                    const char *git_common_dir, const char *abs_common_dir) {
     char *root = NULL;
     if (abs_common_dir && abs_common_dir[0] && path_is_absolute(abs_common_dir)) {
-        root = git_strdup(abs_common_dir);
+        root = cbm_strdup(abs_common_dir);
         if (!root) {
             return NULL;
         }
     } else {
         const char *src = git_common_dir && git_common_dir[0] ? git_common_dir : worktree_root;
         if (!src) {
-            return git_strdup("");
+            return cbm_strdup("");
         }
 #ifndef _WIN32
-        root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(input_path, src);
+        root = path_is_absolute(src) ? cbm_strdup(src) : join_root_relative(input_path, src);
         if (!root) {
             return NULL;
         }
         {
-            char resolved[4096];
+            char resolved[CBM_GIT_OUTPUT_BUFSZ];
             if (realpath(root, resolved) != NULL) {
                 free(root);
-                root = git_strdup(resolved);
+                root = cbm_strdup(resolved);
                 if (!root) {
                     return NULL;
                 }
@@ -172,7 +189,7 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
         }
 #else
         (void)input_path;
-        root = path_is_absolute(src) ? git_strdup(src) : join_root_relative(worktree_root, src);
+        root = path_is_absolute(src) ? cbm_strdup(src) : join_root_relative(worktree_root, src);
         if (!root) {
             return NULL;
         }
@@ -194,6 +211,57 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
 #endif
 
     return root;
+}
+
+static int resolve_current_branch(const char *path, char **out_branch) {
+    if (!out_branch) {
+        return CBM_NOT_FOUND;
+    }
+    *out_branch = NULL;
+    if (!path || !path[0]) {
+        return CBM_NOT_FOUND;
+    }
+    char branch[CBM_GIT_OUTPUT_BUFSZ];
+    int exit_code = CBM_NOT_FOUND;
+    const char *const args[] = {"symbolic-ref", "--quiet", "--short", "HEAD", NULL};
+    if (cbm_git_run_first_line_buf(path, args, branch, sizeof(branch), &exit_code) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    const char *resolved = exit_code == 0 && branch[0] ? branch : exit_code == 1 ? "DETACHED" : NULL;
+    if (!resolved) {
+        return CBM_NOT_FOUND;
+    }
+    *out_branch = cbm_strdup(resolved);
+    return *out_branch ? 0 : CBM_NOT_FOUND;
+}
+
+static void resolve_context_legacy(const char *path, cbm_git_context_t *out,
+                                   char **out_abs_common_dir) {
+    const char *const show_toplevel[] = {"rev-parse", "--show-toplevel", NULL};
+    if (cbm_git_capture_first_line(path, show_toplevel, &out->worktree_root) != 0) {
+        out->is_git = false;
+        return;
+    }
+    out->is_git = true;
+
+    const char *const git_dir[] = {"rev-parse", "--git-dir", NULL};
+    if (cbm_git_capture_first_line(path, git_dir, &out->git_dir) != 0) {
+        out->git_dir = cbm_strdup("");
+    }
+    const char *const git_common_dir[] = {"rev-parse", "--git-common-dir", NULL};
+    if (cbm_git_capture_first_line(path, git_common_dir, &out->git_common_dir) != 0) {
+        out->git_common_dir = cbm_strdup("");
+    }
+    const char *const verify_head[] = {"rev-parse", "--verify", "HEAD", NULL};
+    if (cbm_git_capture_first_line(path, verify_head, &out->head_sha) != 0) {
+        out->head_sha = cbm_strdup("");
+    }
+    if (resolve_current_branch(path, &out->branch) != 0) {
+        out->branch = NULL;
+    }
+    const char *const absolute_common_dir[] = {"rev-parse", "--path-format=absolute",
+                                               "--git-common-dir", NULL};
+    (void)cbm_git_capture_first_line(path, absolute_common_dir, out_abs_common_dir);
 }
 
 static char *slug_from_branch(const char *branch, bool detached) {
@@ -228,7 +296,7 @@ static char *slug_from_branch(const char *branch, bool detached) {
 
     if (slug[0] == '\0') {
         free(slug);
-        return git_strdup(fallback);
+        return cbm_strdup(fallback);
     }
     return slug;
 }
@@ -259,50 +327,65 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
-    out->input_path = git_strdup(path);
+    out->input_path = cbm_strdup(path);
     if (!out->input_path) {
         return CBM_NOT_FOUND;
     }
 
-    struct stat st;
-    out->root_exists = (stat(path, &st) == 0);
+    out->root_exists = cbm_file_exists(path);
     if (!out->root_exists) {
         return 0;
     }
 
-    if (git_capture(path, "rev-parse --show-toplevel", &out->worktree_root) != 0) {
+    git_context_batch_t batch;
+    git_context_batch_status_t batch_status = resolve_context_batch(path, &batch);
+    if (batch_status == GIT_CONTEXT_BATCH_NOT_GIT) {
         out->is_git = false;
         return 0;
     }
-    out->is_git = true;
-
-    if (git_capture(path, "rev-parse --git-dir", &out->git_dir) != 0) {
-        out->git_dir = git_strdup("");
+    char *abs_common_dir = NULL;
+    if (batch_status == GIT_CONTEXT_BATCH_OK) {
+        out->is_git = true;
+        out->worktree_root = batch.worktree_root;
+        out->git_dir = batch.git_dir;
+        out->git_common_dir = batch.git_common_dir;
+        out->head_sha = batch.head_sha;
+        out->branch = batch.branch;
+        abs_common_dir = batch.abs_common_dir;
+        memset(&batch, 0, sizeof(batch));
+        if (strcmp(out->branch, "HEAD") == 0) {
+            char *detached = cbm_strdup("DETACHED");
+            if (!detached) {
+                cbm_git_context_free(out);
+                free(abs_common_dir);
+                return CBM_NOT_FOUND;
+            }
+            free(out->branch);
+            out->branch = detached;
+        }
+    } else {
+        resolve_context_legacy(path, out, &abs_common_dir);
     }
-    if (git_capture(path, "rev-parse --git-common-dir", &out->git_common_dir) != 0) {
-        out->git_common_dir = git_strdup("");
+    if (!out->is_git) {
+        free(abs_common_dir);
+        return 0;
     }
-    if (git_capture(path, "rev-parse --verify HEAD", &out->head_sha) != 0) {
-        out->head_sha = git_strdup("");
-    }
-
-    if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
-        out->branch = git_strdup("DETACHED");
+    if (out->branch && strcmp(out->branch, "DETACHED") == 0) {
         out->is_detached = true;
     }
 
     out->is_worktree =
         out->git_dir && out->git_common_dir && strcmp(out->git_dir, out->git_common_dir) != 0;
-    /* git 2.31+ canonical absolute common-dir (best-effort; NULL on older git,
-     * where derive_canonical_root falls back to the relative common-dir). */
-    char *abs_common_dir = NULL;
-    (void)git_capture(path, "rev-parse --path-format=absolute --git-common-dir", &abs_common_dir);
     out->canonical_root =
         derive_canonical_root(path, out->worktree_root, out->git_common_dir, abs_common_dir);
     free(abs_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
-    if (git_capture(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
-        out->base_sha = git_strdup("");
+    if (out->head_sha && out->head_sha[0]) {
+        const char *const merge_base[] = {"merge-base", "HEAD", "@{upstream}", NULL};
+        (void)cbm_git_capture_first_line(path, merge_base, &out->base_sha);
+    }
+    if (!out->base_sha) {
+        out->base_sha = cbm_strdup("");
     }
 
     if (!out->git_dir || !out->git_common_dir || !out->head_sha || !out->branch ||
@@ -312,6 +395,10 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     }
 
     return 0;
+}
+
+int cbm_git_current_branch(const char *path, char **out_branch) {
+    return resolve_current_branch(path, out_branch);
 }
 
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
@@ -354,24 +441,6 @@ static bool append_fmt_checked(char *buf, int buf_size, int *off, const char *fm
     return true;
 }
 
-static int json_escaped_len(const char *src) {
-    if (!src) {
-        return 0;
-    }
-    int len = 0;
-    for (int i = 0; src[i]; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
-            len += 2;
-        } else if (c < 0x20) {
-            len += 6; /* \u00XX */
-        } else {
-            len++;
-        }
-    }
-    return len;
-}
-
 static bool json_append_bool(char *buf, int buf_size, int *off, const char *name, bool value,
                              bool comma) {
     return append_fmt_checked(buf, buf_size, off, "\"%s\":%s%s", name, value ? "true" : "false",
@@ -380,14 +449,17 @@ static bool json_append_bool(char *buf, int buf_size, int *off, const char *name
 
 static bool json_append_string(char *buf, int buf_size, int *off, const char *name,
                                const char *value, bool comma) {
-    int needed = json_escaped_len(value ? value : "");
-    char *escaped = malloc((size_t)needed + 1);
+    size_t needed = cbm_json_escaped_len(value);
+    if (needed >= (size_t)INT_MAX) {
+        return false;
+    }
+    char *escaped = malloc(needed + 1);
     if (!escaped) {
         return false;
     }
-    int actual = cbm_json_escape(escaped, needed + 1, value ? value : "");
-    bool ok = actual == needed && append_fmt_checked(buf, buf_size, off, "\"%s\":\"%s\"%s", name,
-                                                     escaped, comma ? "," : "");
+    int actual = cbm_json_escape(escaped, (int)needed + 1, value);
+    bool ok = (size_t)actual == needed && append_fmt_checked(buf, buf_size, off, "\"%s\":\"%s\"%s",
+                                                             name, escaped, comma ? "," : "");
     free(escaped);
     return ok;
 }

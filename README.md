@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. Zero dependencies. Plug and play across 43 supported automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. MCP exposes a streamlined default tool set with advanced tools available on demand. Zero dependencies. Plug and play across 11 coding agents.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -32,12 +32,12 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
-- **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
+- **156 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **43 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
+- **One command across supported agents** — `install` auto-detects Claude Code, Claude Desktop, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, standalone Kilo, the legacy Kilo VS Code extension, VS Code, Cursor, Windsurf, OpenClaw, Kiro, and Junie, then adds only the MCP entries, owned instruction blocks, skills, and hooks each client supports.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **16 MCP tools** (classic mode; a streamlined subset is the default) — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
@@ -143,13 +143,13 @@ Open `http://localhost:9749` in your browser. The UI is owned by the shared coor
 
 ### Auto-Index
 
-Enable automatic indexing on MCP session start:
+Enable automatic indexing at MCP session startup or first graph-backed use:
 
 ```bash
 codebase-memory-mcp config set auto_index true
 ```
 
-When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
+When enabled, new projects are indexed automatically at startup or first graph-backed use. With `auto_watch=true`, indexed projects are registered with the background watcher for Git-based change detection; refreshes use the configured reindex policy. Configurable file limit: `config set auto_index_limit 50000`.
 
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
 
@@ -221,7 +221,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - `SEMANTICALLY_RELATED` (vocabulary-mismatch, same-language, score ≥ 0.80)
 
 ### Indexing pipeline
-- **158 vendored tree-sitter grammars** compiled into the binary
+- **156 vendored tree-sitter grammars** compiled into the binary
 - **Generic package / module resolution** — bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, Kustomize overlays as graph nodes
 - **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer (parameter binding, return-type inference, generic substitution, JSX component dispatch, JSDoc inference for plain JS files, namespace + trait + late-static-binding resolution for PHP, file-scoped namespaces + records + LINQ method syntax for C#, class-hierarchy + overload + lambda resolution for Java, extension-function + scope-function resolution for Kotlin, trait-method + UFCS resolution for Rust)
@@ -229,22 +229,22 @@ The install script placed beside the binary is **reported, not deleted** — uni
 
 ### Distribution & operation
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
+- **Auto-sync**: Background watcher detects git changes and re-indexes automatically when configured
 - **Route nodes**: REST endpoints are first-class graph entities
-- **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
+- **CLI mode**: `codebase-memory-mcp cli search_graph --project my-project --name-pattern '.*Handler.*'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
 
 ## Team-Shared Graph Artifact
 
 Commit a single compressed file to your repo and your teammates skip the reindex.
 
-`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact is decompressed and incremental indexing fills in their local diff.
+`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index with persistence enabled, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact can bootstrap their local graph before any configured refresh.
 
 - **Format**: SQLite database, indexes stripped, `VACUUM INTO` compacted, then zstd 1.5.7 compressed (8–13:1 ratio typical)
 - **Two tiers**:
   - **Best** (`zstd -9` + index strip + `VACUUM INTO`) — written on explicit `index_repository`
-  - **Fast** (`zstd -3`) — written by the watcher for low-latency incremental updates
-- **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing — avoiding the full reindex cost
+  - **Fast** (`zstd -3`) — written by the watcher when it refreshes an existing artifact
+- **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then applies the configured refresh policy
 - **No merge pain**: a `.gitattributes` line with `merge=ours` is auto-created on first export, so concurrent edits don't produce conflicts on the binary artifact
 - **Optional**: never committed unless you want it. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
@@ -269,6 +269,11 @@ Agent: presents the call chain in plain English
 ## Performance
 
 Benchmarked on Apple M3 Pro:
+
+Reproducible experiment runs use the fact-table contract in
+[Benchmark Experiments](docs/BENCHMARK_EXPERIMENTS.md) and the normative terms in
+[Benchmark Terminology](docs/BENCHMARK_TERMINOLOGY.md). The latter distinguishes
+lifecycle wall time from overlapping component work before any ratio is reported.
 
 | Operation | Time | Notes |
 |-----------|------|-------|
@@ -394,6 +399,19 @@ build/c/test-runner --list-suites   # what is available
 scripts/package-release.sh <linux|darwin|windows> <amd64|arm64>
 ```
 
+The standard and release pathways use the Makefile's optimized production defaults
+(`-O2`). For an inspectable local development binary, append debug flags through the
+same build entry point; the final override wins over the production optimization:
+
+```bash
+scripts/build.sh EXTRA_CFLAGS="-g -O0 -fno-omit-frame-pointer" \
+  EXTRA_CXXFLAGS="-g -O0 -fno-omit-frame-pointer"
+```
+
+Use `make -f Makefile.cbm test`, `test-tsan`, or `test-leak` for sanitizer and
+lifecycle validation; those targets already select their purpose-built compiler and
+allocator configurations.
+
 ### Manual MCP Configuration
 
 <details>
@@ -412,32 +430,22 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with
+its tools listed. The streamlined subset is the default; run
+`codebase-memory-mcp config set tool_mode classic` for all 16. Persisted
+configuration changes the live shared daemon, while a process environment
+override applies only when it is present in the daemon process that serves the
+session.
 
 </details>
 
 ## Multi-Agent Support
 
-`install` configures 43 client surfaces: 37 detected automatically and 6
-conditional or explicit. “Conditional” means the installer writes only when the
+`install` configures 43 supported automatic/conditional client surfaces: 37 detected
+automatically and 6 conditional or explicit. “Conditional” means the installer writes only when the
 documented platform or an explicit, already-existing config path proves the
 target is active. It never flips experimental feature flags, enables plugins,
 YOLO modes, global permission bypasses, or third-party instruction trust.
-
-Where a client has a documented custom-agent format, the installer creates three
-exact-owned definitions from one canonical contract:
-
-- **Scout (Tier 1)** — about 3–4 narrow calls for fast positive, provisional discovery; no absence, exhaustive-impact, or dead-code claims.
-- **Verify (Tier 2, default)** — task-directed graph evidence, exact source checks, path coverage for every cited file, and scope coverage before negative claims.
-- **Auditor (Tier 3)** — bounded scope, current index generation, complete relevant pagination, broader relationship checks, and explicit unresolved limitations.
-
-Every direct tier batches `check_index_coverage` for its evidence paths and reads
-flagged ranges or skipped/excluded files directly. A clean coverage result means
-only “no recorded gap,” never proof of completeness. Clients without safe child
-MCP access receive the same three tiers as parent-handoff agents; the parent must
-supply project, generation, pagination state, graph evidence, and coverage
-results. Updates migrate only byte-identical prior Verify definitions and never
-overwrite user-modified agents.
 
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
@@ -462,7 +470,7 @@ overwrite user-modified agents.
 | Warp | Detected, skill only | UI, Warp Drive, or per invocation (manual) | Shared `~/.agents/skills/codebase-memory/SKILL.md` |
 | Qwen Code | Detected | `.qwen/settings.json` | `QWEN.md`, skill, three explicit read/graph-tool agents; `SessionStart`, `SubagentStart`, and post-`ReadFile` coverage |
 | GitHub Copilot CLI | Detected | `$COPILOT_HOME/mcp-config.json` | Instructions, skill, three read-only agents; `sessionStart` + `subagentStart` |
-| Factory Droid | Detected | `.factory/mcp.json` | `AGENTS.md`, skill, three droids with exact per-tier graph-tool lists (without additive whole-server exposure); `SessionStart` + post-`Read` coverage on macOS/Linux, withheld on Windows |
+| Factory Droid | Detected | `.factory/mcp.json` | `AGENTS.md`, skill, three droids with exact per-tier graph-tool lists; `SessionStart` + post-`Read` coverage on macOS/Linux, withheld on Windows |
 | Crush | Detected | `.config/crush/crush.json` | Managed context path with explicit parent-to-child handoff |
 | Goose | Detected | `.config/goose/config.yaml` | `.goosehints` |
 | Mistral Vibe | Detected | `$VIBE_HOME/config.toml` | `AGENTS.md`, skill, and three matched agent/prompt pairs with explicit read-only graph-tool allowlists |
@@ -485,87 +493,20 @@ overwrite user-modified agents.
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
 
-### Sessions, compaction, and subagents
+Claude Desktop is additionally supported as a detected MCP-only desktop
+surface through its platform `claude_desktop_config.json`; it is outside the
+43 coding-agent registry matrix above.
 
-Hooks installed by this project are fail-open and context-only. Claude Code's
-`PreToolUse` observes `Grep`/`Glob` and injects matching graph symbols as
-`additionalContext`; `PostToolUse` on `Read` adds targeted coverage context when
-the graph could not fully parse or index that file. It never denies or replaces
-the requested tool call.
-
-Claude Code, Codex CLI, Qwen Code, GitHub Copilot CLI, and VS Code's Copilot
-runtime receive paired session/subagent context where the vendor exposes a
-documented context-output contract. Codex users must review and trust installed
-hooks through `/hooks`; changing a hook definition changes its trust hash, so an
-update can require re-trust. Qoder uses `SessionStart`, `SubagentStart`, and
-post-`Read` coverage, including its documented PowerShell executor on Windows.
-Kimi uses `UserPromptSubmit`, while Hermes uses `pre_llm_call`; both retain their
-documented Windows execution paths. Devin installs
-`UserPromptSubmit` and `PostCompaction` on macOS/Linux and adds `SessionStart`
-only when Claude's equivalent managed hook is not present. GitLab Duo gets a
-narrowly scoped macOS/Linux user `SessionStart` entry on its experimental hook
-surface. GitLab Duo, Devin, and Factory hooks are withheld on Windows
-because those vendors do not document a deterministic shell/executor contract
-there. Gemini CLI, Factory Droid, and Augment also add documented post-read/view
-coverage context but expose no equivalent documented child-start context.
-
-For runtimes without a stable context-producing lifecycle event, durable files
-carry the contract across fresh sessions and compaction: verify the graph project
-and index freshness, query structural facts in the parent, then pass the project,
-qualified symbols, paths, and call-chain evidence in every delegated task.
-Claude, Codex, Gemini, Kiro, Qwen, Copilot, CodeBuddy, OpenCode, Kilo, Vibe,
-Qoder, Junie, and Factory receive Scout, Verify, and Auditor graph profiles.
-Kiro embeds this MCP server with `--tool-profile scout` for Scout and
-`--tool-profile analysis` for Verify/Auditor. Junie registers equivalent named
-server aliases because its subagent schema filters by server rather than by
-individual tool. Both process profiles use positive allowlists: Scout exposes
-seven fast inspection tools, Analysis exposes eleven, and future or mutating
-tools remain unavailable until explicitly reviewed. If either Junie alias
-collides with user configuration, the installer preserves it and installs
-parent-handoff profiles instead. Qoder combines its documented named-server
-selection with exact tier-specific MCP tool IDs. Factory uses exact registered
-MCP tool IDs without its additive `mcpServers` field, which would expose the
-whole server. Codex, Kilo, Vibe, and other capable formats likewise enumerate
-the narrowest supported tool set. Rovo, Cursor, Augment, Pochi, and Cline use parent handoff where direct
-child MCP is unavailable or unsafe; Pochi is limited to `readFile`, and Cline
-child agents cannot use MCP.
-
-Cline's file hooks auto-activate when present, and current Cline does not
-reliably consume their context output, so automatic adapters are withheld and
-older owned adapters are cleaned up. CodeBuddy's beta, version-gated hooks are
-not auto-installed. Junie's EAP
-`SessionStart` output is documented as ignored, so no context hook is installed.
-Junie custom agents remain EAP-dependent. Qoder can resolve higher-priority
-project or plugin agents before user agents with the same name; reload the
-client after installation or profile changes.
-Cursor context
-hooks are withheld: session context injection has a known race, `subagentStart`
-is control-only, and read-only subagents cannot safely receive MCP access. Rovo
-has no documented session context-output hook, and Bob
-documents neither a suitable hook nor a custom-agent surface. Those surfaces are
-not approximated with invented augmentation. Kimi plugins, Amp plugins, and
-GitLab experimental global skills remain opt-in.
-
-OpenClaw reinjects the `Codebase Knowledge Graph (codebase-memory-mcp)` AGENTS
-section after compaction and places the same guidance in `TOOLS.md`, the bootstrap
-files inherited by its subagents. Automatic augmentation covers the active/default
-workspace. Separate `agents.list[].workspace` directories require making that
-workspace active for installation or copying the managed block there.
-
-The installed Claude shim is named `cbm-code-discovery-gate` for backward
-compatibility; despite the legacy name, it never gates or blocks.
-
-### Manual or UI-managed integrations
-
-These are intentionally not counted as automatic installs: Qodo MCP is added
-through its UI and may be governed by enterprise allowlists; Warp MCP is managed
-through Warp Drive/UI or per invocation (only the shared skill is automatic);
-JetBrains AI Assistant / ACP is IDE-managed; GitHub Copilot coding agent, Jules,
-and CodeRabbit are cloud/repository-managed; Replit exposes a remote/service
-integration rather than a stable local user-global client; BLACKBOX AI does not
-document a stable arbitrary user-global MCP/instruction/agent schema; Plandex has
-no stable global registry safe to mutate; and SWE-agent uses explicit YAML and is
-no longer a suitable automatic global target.
+**Hooks are structurally non-blocking** (exit code 0, every failure path).
+For Claude Code, the non-blocking `PreToolUse` augmenter observes `Grep`, `Glob`,
+and `Read`. It injects graph matches for searches and indexing-coverage notes for
+reads as `additionalContext`; it never denies the underlying tool call. For Codex,
+Gemini CLI, and Antigravity, a `SessionStart` hook
+injects a one-line code-discovery reminder as session context (Gemini CLI also
+keeps its `BeforeTool` reminder).
+The installed Claude shim file is named `cbm-code-discovery-gate` for
+backward compatibility with existing installs; despite the legacy name it
+never gates and never blocks.
 
 ## CLI Mode
 
@@ -599,7 +540,7 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
+| `index_repository` | Index a repository into the graph. Auto-sync can refresh it after that when configured. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
@@ -609,7 +550,7 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 | Tool | Description |
 |------|-------------|
 | `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
-| `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
+| `trace_path` | BFS traversal — who calls a function and what it calls. Depth 1-5. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
@@ -639,13 +580,13 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 
 `query_graph` is a read-only openCypher subset:
 
-- **Clauses**: `MATCH`, `OPTIONAL MATCH`, multiple `MATCH`, `WHERE`, `WITH` (+ `WITH … WHERE`), `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, `UNWIND`, `UNION` / `UNION ALL`, `CASE`.
+- **Clauses**: `MATCH`, `OPTIONAL MATCH`, multiple `MATCH`, `WHERE`, `WITH` (+ `WITH … WHERE` and later match stages), `RETURN`, multi-key `ORDER BY` on projected fields or aliases, `SKIP`, `LIMIT`, `DISTINCT`, `UNWIND`, `UNION` / `UNION ALL`, `CASE`.
 - **Patterns**: labelled nodes, label alternation `(n:A|B)`, relationship types/direction, variable-length paths `[*1..3]`, inline property maps.
 - **WHERE**: `= <> < <= > >=`, `AND/OR/XOR/NOT`, `IN`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `IS [NOT] NULL`, regex `=~`, label test `n:Label`, and `EXISTS { (n)-[:TYPE]->() }` (single-hop existence — great for dead-code, e.g. `WHERE NOT EXISTS { (f)<-[:CALLS]-() }`).
-- **Aggregates**: `count` (+`DISTINCT`), `sum`, `avg`, `min`, `max`, `collect`.
+- **Aggregates**: `count`, `sum`, `avg`, `min`, `max`, `collect` (all accept `DISTINCT` arguments).
 - **Functions**: `labels`, `type`, `id`, `keys`, `properties`; `toLower/toUpper/toString/toInteger/toFloat/toBoolean`; `size`, `length`, `trim/ltrim/rtrim`, `reverse`; `coalesce`, `substring`, `replace`, `left`, `right`.
 
-Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported functions, list/map literals, comprehensions, path functions, parameters) **fails with a clear `unsupported …` error** rather than returning empty results.
+Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported functions, list/map literals, comprehensions, path functions, parameters) **fails with a clear `unsupported …` error** rather than returning empty results. Valid queries that match zero rows return a hint naming any label or relationship type not present in that project's graph, plus a short summary of the vocabulary that is.
 
 ## Ignoring Files
 
@@ -656,12 +597,33 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 ## Configuration
 
 ```bash
-codebase-memory-mcp config list                          # show all settings
-codebase-memory-mcp config set auto_index true           # auto-index on session start
+codebase-memory-mcp config list                          # show common effective settings
+codebase-memory-mcp config describe pagerank_damping     # show default, accepted extent, and tuning guidance
+codebase-memory-mcp config set auto_index true           # auto-index on startup/first use
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
+codebase-memory-mcp config set tool_mode streamlined     # concise surface; reveal advanced tools on demand
+codebase-memory-mcp config set auto_index_deps true      # index installed dependency APIs
+codebase-memory-mcp config set auto_dep_limit 20         # import-ranked dependency package cap; 0=unlimited
+codebase-memory-mcp config set dep_max_files 1000        # per-package source-file cap; 0=unlimited
+codebase-memory-mcp config preset list                   # list named capability/API configurations
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-disabled
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-enabled
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set default_response_format json  # full JSON objects instead of compact TOON tables
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+Normal streamlined exploration uses the core tools without a reveal; first-use
+indexing and first-response codebase context are automatic when configured. Use
+`_hidden_tools` only for explicit advanced operations such as `check_index_coverage`,
+`index_repository`, or `index_dependencies`. Classic mode advertises those tools
+directly and uses `search_graph`, then `trace_path`, then `get_code_snippet` for
+structural discovery. Automatic repository indexing obeys
+`auto_index`/`auto_index_limit`; automatic dependency indexing obeys
+`auto_index_deps`/`auto_dep_limit`/`dep_max_files` and is disabled by default.
+Packages above `dep_max_files` are skipped rather than partially indexed. Explicit
+`index_dependencies` calls remain available; disabling automation does not delete
+dependency projects that are already indexed.
 
 ### Environment Variables
 
@@ -747,14 +709,14 @@ codebase-memory-mcp ships a **lightweight C implementation of language type-reso
 
 **Two-layer architecture:**
 
-1. **Tree-sitter pass** — fast, syntactic, runs for every one of the 158 languages. Extracts definitions, calls, imports.
+1. **Tree-sitter pass** — fast, syntactic, runs for every one of the 156 languages. Extracts definitions, calls, imports.
 2. **Hybrid LSP pass** — type-aware, runs above the tree-sitter pass per-language. Refines call edges using the import graph plus a per-file or pre-built cross-file definition registry. Languages without a Hybrid LSP pass yet fall back to textual resolution, so you always get *some* answer.
 
 The result is a knowledge graph accurate enough to drive `trace_path` across packages, inheritance hierarchies, and stdlib calls — without paying for a language server process per project.
 
 ## Language Support
 
-158 languages, all parsed via vendored tree-sitter grammars compiled into the binary. Benchmarked against 64 real open-source repositories (78 to 49K nodes):
+156 languages, all parsed via vendored tree-sitter grammars compiled into the binary. Benchmarked against 64 real open-source repositories (78 to 49K nodes):
 
 | Tier | Score | Languages |
 |------|-------|-----------|
@@ -770,7 +732,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   daemon/             Per-account session coordination, IPC, lifecycle, shared jobs/watchers
-  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (16 classic tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (43 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
@@ -780,7 +742,7 @@ src/
   traces/             Runtime trace ingestion
   ui/                 Embedded HTTP server + 3D graph visualization
   foundation/         Platform abstractions (threads, filesystem, logging, memory)
-internal/cbm/         Vendored tree-sitter grammars (158 languages) + AST extraction engine
+internal/cbm/         Vendored tree-sitter grammars (156 languages) + AST extraction engine
 ```
 
 ## Security

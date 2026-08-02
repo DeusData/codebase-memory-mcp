@@ -26,6 +26,7 @@
  */
 
 #include "rust_lsp.h"
+#include "foundation/platform.h"
 #include "rust_cargo.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -70,8 +71,7 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
 
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (dbg && dbg[0]);
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 /* Doubling-array push of a `(local, full-path)` use entry. */
@@ -4762,7 +4762,7 @@ static void rust_build_registry_from_defs(CBMArena *arena, CBMTypeRegistry *reg,
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 
-    /* Phase A: register every Class/Type/Trait/Function/Method definition. */
+    /* Phase A: register every type-like, Function, and Method definition. */
     for (int i = 0; i < result->defs.count; i++) {
         CBMDefinition *d = &result->defs.items[i];
         if (!d->qualified_name || !d->name)

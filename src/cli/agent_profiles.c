@@ -7,6 +7,8 @@
  */
 #include "cli/agent_profiles.h"
 
+#include "cli/config_toml_edit.h"
+
 #include "yyjson/yyjson.h"
 
 #include <stdbool.h>
@@ -290,6 +292,23 @@ static const char *tier_server_profile(cbm_graph_tier_t tier) {
     return tier == CBM_GRAPH_TIER_SCOUT ? "scout" : "analysis";
 }
 
+enum { PROFILE_TOML_PATH_CAPACITY = 8192 };
+
+static bool append_codex_mcp_transport(profile_buffer_t *buffer, cbm_graph_tier_t tier,
+                                       const char *binary_path) {
+    if (!binary_path) {
+        return profile_buffer_append(buffer,
+                                     "\n[mcp_servers.codebase-memory-mcp]\nenabled_tools = [");
+    }
+    char escaped[PROFILE_TOML_PATH_CAPACITY];
+    return cbm_toml_escape_basic_string(binary_path, escaped, sizeof(escaped)) == 0 &&
+           profile_buffer_append(buffer, "\n[mcp_servers.codebase-memory-mcp]\ncommand = \"") &&
+           profile_buffer_append(buffer, escaped) &&
+           profile_buffer_append(buffer, "\"\nargs = [\"--tool-profile\", \"") &&
+           profile_buffer_append(buffer, tier_server_profile(tier)) &&
+           profile_buffer_append(buffer, "\"]\nenabled_tools = [");
+}
+
 static const char *dialect_tool_prefix(cbm_graph_profile_dialect_t dialect) {
     switch (dialect) {
     case CBM_GRAPH_DIALECT_CLAUDE:
@@ -453,7 +472,7 @@ static char *render_kiro_profile(cbm_graph_tier_t tier, cbm_graph_access_t acces
 
 static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dialect_t dialect,
                                 cbm_graph_tier_t tier, cbm_graph_access_t access,
-                                const char *prompt) {
+                                const char *binary_path, const char *prompt) {
     const char *slug = cbm_graph_tier_slug(tier);
     const char *display = cbm_graph_tier_display_name(tier);
     const char *description = profile_description(tier, access);
@@ -479,8 +498,7 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             !profile_buffer_append(buffer, prompt) || !profile_buffer_append(buffer, "\"\"\"\n")) {
             return false;
         }
-        if (direct && (!profile_buffer_append(
-                           buffer, "\n[mcp_servers.codebase-memory-mcp]\nenabled_tools = [") ||
+        if (direct && (!append_codex_mcp_transport(buffer, tier, binary_path) ||
                        !append_toml_mcp_tools(buffer, dialect, tier, false) ||
                        !profile_buffer_append(buffer, "]\n"))) {
             return false;
@@ -613,7 +631,10 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
 char *cbm_render_graph_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_tier_t tier,
                                cbm_graph_access_t access, const char *binary_path) {
     if (!dialect_valid(dialect) || !tier_valid(tier) || !access_valid(access) ||
-        (access == CBM_GRAPH_ACCESS_DIRECT && !cbm_graph_dialect_direct_capable(dialect))) {
+        (access == CBM_GRAPH_ACCESS_DIRECT && !cbm_graph_dialect_direct_capable(dialect)) ||
+        (access == CBM_GRAPH_ACCESS_DIRECT &&
+         (dialect == CBM_GRAPH_DIALECT_CODEX || dialect == CBM_GRAPH_DIALECT_KIRO) &&
+         (!binary_path || !binary_path[0]))) {
         return NULL;
     }
     char *prompt = cbm_render_graph_prompt(tier, access);
@@ -627,7 +648,27 @@ char *cbm_render_graph_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_ti
     }
     profile_buffer_t buffer;
     profile_buffer_init(&buffer);
-    bool ok = render_profile_text(&buffer, dialect, tier, access, prompt);
+    bool ok = render_profile_text(&buffer, dialect, tier, access, binary_path, prompt);
+    free(prompt);
+    if (!ok) {
+        profile_buffer_discard(&buffer);
+        return NULL;
+    }
+    return profile_buffer_finish(&buffer);
+}
+
+char *cbm_render_legacy_codex_graph_profile(cbm_graph_tier_t tier) {
+    if (!tier_valid(tier)) {
+        return NULL;
+    }
+    char *prompt = cbm_render_graph_prompt(tier, CBM_GRAPH_ACCESS_DIRECT);
+    if (!prompt) {
+        return NULL;
+    }
+    profile_buffer_t buffer;
+    profile_buffer_init(&buffer);
+    bool ok = render_profile_text(&buffer, CBM_GRAPH_DIALECT_CODEX, tier, CBM_GRAPH_ACCESS_DIRECT,
+                                  NULL, prompt);
     free(prompt);
     if (!ok) {
         profile_buffer_discard(&buffer);

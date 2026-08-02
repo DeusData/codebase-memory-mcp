@@ -54,12 +54,10 @@ static inline cbm_store_t *rh_open_indexed(RProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project)
         return NULL;
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir)
+        return NULL;
+    cbm_mkdir_p(cache_dir, 0755);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);

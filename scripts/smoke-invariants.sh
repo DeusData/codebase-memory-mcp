@@ -63,6 +63,24 @@ fi
 # Absolutise the binary so cwd changes never break invocation.
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 
+# Bind direct worker probes to these exact executable bytes, using the same
+# portable SHA-256 selection as tests/test_worker_watchdog.sh. The production
+# worker argv rejects absent or mismatched fingerprints before indexing.
+if command -v shasum >/dev/null 2>&1; then
+    BUILD_FINGERPRINT="$(shasum -a 256 "$BINARY" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+    BUILD_FINGERPRINT="$(sha256sum "$BINARY" | awk '{print $1}')"
+elif command -v openssl >/dev/null 2>&1; then
+    BUILD_FINGERPRINT="$(openssl dgst -sha256 "$BINARY" | awk '{print $NF}')"
+else
+    echo "FAIL: setup: no SHA-256 command available for worker build binding" >&2
+    exit 2
+fi
+if [[ ! "$BUILD_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "FAIL: setup: invalid worker build fingerprint '$BUILD_FINGERPRINT'" >&2
+    exit 2
+fi
+
 FAILURES=0
 PASSES=0
 
@@ -86,6 +104,15 @@ native_path() {
 
 # Per-run scratch root; everything created lives under here for clean teardown.
 SCRATCH="$(mktemp -d 2>/dev/null || mktemp -d -t cbmsmoke)"
+# Keep the smoke battery hermetic: list_projects and every index/query call must
+# see only databases created by this run, never the user's potentially large or
+# concurrently-open cache. Classic mode is explicit because this battery checks
+# every individual tool; streamlined/reveal parity has its own focused tests.
+SMOKE_CACHE="$SCRATCH/cache"
+mkdir -p "$SMOKE_CACHE"
+export CBM_CACHE_DIR
+CBM_CACHE_DIR="$(native_path "$SMOKE_CACHE")"
+export CBM_TOOL_MODE=classic
 cleanup() {
     # Best-effort: kill any lingering server, close fds, remove scratch.
     if [ -n "${SERVER_PID:-}" ]; then
@@ -119,7 +146,8 @@ run_bounded() {
         # -s KILL: force-kill at the deadline. The binary catches SIGTERM for a
         # graceful shutdown, so a busy-spin (e.g. a stuck external scanner) would
         # survive plain `timeout`'s TERM and hang the runner forever. timeout still
-        # exits 124 on the deadline regardless of the signal used.
+        # reports either 124 or 137 on the deadline depending on the coreutils
+        # version when SIGKILL is the selected timeout signal.
         "$tobin" -s KILL "$secs" "$@" >"$of" 2>&1
         RB_RC=$?
     else
@@ -163,6 +191,23 @@ cli_call() {
     # cli_call <seconds> <tool> [json_args] [--json]
     local secs="$1"; shift
     run_bounded "$secs" "$BINARY" cli "$@"
+    CLI_OUT="$RB_OUT"
+    CLI_RC="$RB_RC"
+}
+
+# Run the exact build-bound worker argv used by the supervisor. This is only
+# for fault-injector honesty baselines: daemon hosts must never honor ambient
+# requests to disable supervision, while the worker role intentionally indexes
+# in-process and therefore exposes an injected crash or hang to run_bounded.
+worker_call() {
+    # worker_call <seconds> <args_json> <response_path>
+    local secs="$1"
+    local args_json="$2"
+    local response_path="$3"
+    run_bounded "$secs" "$BINARY" cli --index-worker \
+        --index-worker-build "$BUILD_FINGERPRINT" \
+        index_repository "$args_json" \
+        --response-out "$response_path"
     CLI_OUT="$RB_OUT"
     CLI_RC="$RB_RC"
 }
@@ -322,7 +367,7 @@ PYEOF
 
 # ── Invariant 6: index a tiny repo via CLI → nodes>0 and exit 0 ────────────
 inv_index_cli() {
-    cli_call 90 --json index_repository "{\"repo_path\":\"$TEST_REPO_NATIVE\"}"
+    cli_call 90 --json index_repository --repo-path "$TEST_REPO_NATIVE"
     if [ "$CLI_RC" -eq 124 ]; then
         fail "index-cli" "index_repository hung (>90s)"
         return
@@ -349,7 +394,7 @@ print(max((int(x) for x in m), default=0))' 2>/dev/null)"
 
 # ── Invariant: index_status reports a ready, non-empty project ─────────────
 inv_index_status_cli() {
-    cli_call 30 --json index_status "{\"project\":\"$PROJ_NAME\"}"
+    cli_call 30 --json index_status --project "$PROJ_NAME"
     if [ "$CLI_RC" -gt 128 ]; then
         fail "index-status" "crashed (signal $((CLI_RC-128)))"
         return
@@ -435,8 +480,12 @@ mcp_start() {
     return 0
 }
 
-# Send one JSON-RPC line and read exactly one response line, bounded.
-# Sets MCP_RESP. Returns 0 if a line arrived within the bound, 1 on timeout.
+# Send one JSON-RPC request and read through notifications until its matching
+# response arrives. MCP notifications may be interleaved after any state change
+# (for example notifications/tools/list_changed after indexing), so treating the
+# next line as the response shifts every later assertion. The deadline covers
+# the whole correlation loop rather than restarting for each notification.
+# Sets MCP_RESP. Returns 0 for the matching response, 1 on timeout/EOF.
 MCP_RESP=""
 mcp_send_recv() {
     # mcp_send_recv <request_json> <timeout_secs>
@@ -444,11 +493,42 @@ mcp_send_recv() {
     MCP_RESP=""
     # If we already abandoned a wedged server, fail instantly (no wait).
     [ "$SERVER_WEDGED" -eq 1 ] && return 1
+    local expected_id
+    expected_id="$(printf '%s' "$req" | "$PY" -c '
+import json,sys
+try:
+    print(json.dumps(json.load(sys.stdin).get("id"), separators=(",", ":")))
+except Exception:
+    print("")
+' 2>/dev/null)"
+    [ -n "$expected_id" ] && [ "$expected_id" != "null" ] || return 1
     printf '%s\n' "$req" >&3 2>/dev/null || return 1
-    # `read -t` is the bounded wait — NO sleep loop.
-    if IFS= read -t "$secs" -r MCP_RESP <&4; then
-        return 0
-    fi
+    local deadline=$((SECONDS + secs))
+    local remaining line response_id
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        remaining=$((deadline - SECONDS))
+        if ! IFS= read -t "$remaining" -r line <&4; then
+            break
+        fi
+        response_id="$(printf '%s' "$line" | "$PY" -c '
+import json,sys
+try:
+    print(json.dumps(json.load(sys.stdin).get("id"), separators=(",", ":")))
+except Exception:
+    print("")
+' 2>/dev/null)"
+        if [ "$response_id" = "$expected_id" ]; then
+            MCP_RESP="$line"
+            return 0
+        fi
+        # A valid notification has no id and can be skipped. Any malformed
+        # stdout or different response id is a protocol/client-order failure,
+        # not a notification and not a server hang; preserve it for diagnostics.
+        if [ "$response_id" != "null" ]; then
+            MCP_RESP="$line"
+            return 1
+        fi
+    done
     # Timeout. If the process is still alive it is wedged — abandon it so the
     # rest of the battery does not pay this bound repeatedly.
     if mcp_alive; then
@@ -521,9 +601,9 @@ inv_mcp_initialize() {
 }
 
 # ── Invariant 4: tools/list returns all expected tools ─────────────────────
-# Cross-check against the canonical 14-tool list (TOOLS[] in src/mcp/mcp.c).
-EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status detect_changes manage_adr ingest_traces"
-EXPECTED_TOOL_COUNT=14
+# Cross-check against the canonical classic-tool list (TOOLS[] in src/mcp/mcp.c).
+EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes manage_adr ingest_traces index_dependencies"
+EXPECTED_TOOL_COUNT="$(printf '%s\n' "$EXPECTED_TOOLS" | wc -w | tr -d ' ')"
 inv_tools_list() {
     if ! mcp_alive; then
         fail "tools-list" "server not alive"
@@ -626,7 +706,7 @@ inv_every_tool() {
         return
     fi
 
-    # name|minimal-args (JSON object) for the remaining 13 tools.
+    # name|minimal-args (JSON object) for the remaining classic tools.
     # Args chosen to be minimally valid per TOOLS[] required fields.
     local p="$PROJ_NAME"
     local -a CALLS
@@ -640,9 +720,11 @@ inv_every_tool() {
         "search_code|{\"project\":\"$p\",\"pattern\":\"def \"}"
         "list_projects|{}"
         "index_status|{\"project\":\"$p\"}"
+        "check_index_coverage|{\"project\":\"$p\"}"
         "detect_changes|{\"project\":\"$p\"}"
         "manage_adr|{\"project\":\"$p\",\"mode\":\"get\"}"
         "ingest_traces|{\"project\":\"$p\",\"traces\":[]}"
+        "index_dependencies|{\"project\":\"$p\",\"packages\":[\"__cbm_smoke_missing_dep__\"],\"source_paths\":[\"/cbm/definitely/not/here\"]}"
         "delete_project|{\"project\":\"__cbm_smoke_nonexistent__\"}"
     )
 
@@ -751,7 +833,7 @@ inv_malformed_input() {
 
 # Index a non-existent repo via CLI → graceful (no crash), as a standalone check.
 inv_nonexistent_repo_cli() {
-    cli_call 30 --json index_repository '{"repo_path":"/cbm/definitely/not/here/zzz"}'
+    cli_call 30 --json index_repository --repo-path /cbm/definitely/not/here/zzz
     if [ "$CLI_RC" -eq 124 ]; then
         fail "nonexistent-repo-cli" "hung on non-existent repo path"
     elif [ "$CLI_RC" -gt 128 ]; then
@@ -769,7 +851,7 @@ inv_empty_repo_cli() {
     local empty="$SCRATCH/empty_repo"
     mkdir -p "$empty"
     local en; en="$(native_path "$empty")"
-    cli_call 30 --json index_repository "{\"repo_path\":\"$en\"}"
+    cli_call 30 --json index_repository --repo-path "$en"
     if [ "$CLI_RC" -eq 124 ]; then
         fail "empty-repo-cli" "hung on empty repo"
     elif [ "$CLI_RC" -gt 128 ]; then
@@ -792,7 +874,7 @@ inv_garbage_files_cli() {
     "$PY" -c 'open("'"$grepo"'/long.js","w").write("var x = \""+"a"*500000+"\";\n")' 2>/dev/null || true
     git -C "$grepo" init -q 2>/dev/null || true
     local gn; gn="$(native_path "$grepo")"
-    cli_call 60 --json index_repository "{\"repo_path\":\"$gn\"}"
+    cli_call 60 --json index_repository --repo-path "$gn"
     if [ "$CLI_RC" -eq 124 ]; then
         fail "garbage-files-cli" "hung indexing garbage/non-UTF8/long-line repo"
     elif [ "$CLI_RC" -gt 128 ]; then
@@ -820,15 +902,16 @@ inv_crasher_skipped_cli() {
     git -C "$crepo" init -q 2>/dev/null || true
     local cn; cn="$(native_path "$crepo")"
 
-    # Honesty baseline: supervisor OFF → the injected fault must escape as a signal.
+    # Honesty baseline: invoke the exact build-bound worker role directly, so
+    # the injected fault must escape as a signal. A normal CLI call now routes
+    # through a marked daemon host, which correctly refuses ambient requests to
+    # disable its mandatory supervisor.
     export CBM_TEST_CRASH_ON=crash_me
-    export CBM_INDEX_SUPERVISOR=0
-    cli_call 60 index_repository "{\"repo_path\":\"$cn\"}"
+    worker_call 60 "{\"repo_path\":\"$cn\"}" "$SCRATCH/crash_baseline_response"
     local base_rc="$CLI_RC"
-    unset CBM_INDEX_SUPERVISOR
 
     # Supervisor ON (default) → the crash must be contained AND skipped-and-continued.
-    cli_call 90 index_repository "{\"repo_path\":\"$cn\"}"
+    cli_call 90 index_repository --repo-path "$cn"
     local sup_rc="$CLI_RC"
     local sup_out="$CLI_OUT"
     unset CBM_TEST_CRASH_ON
@@ -870,9 +953,10 @@ print(max((int(x) for x in m), default=0))' 2>/dev/null)"
 # spin) must be QUARANTINED: the supervisor's quiet-timeout kills the worker,
 # classifies it as a HANG, pins the exact file via the marker, quarantines it as
 # phase="hang", and re-spawns until a clean run indexes the GOOD files while
-# reporting the hanger as a phase="hang" skip. Honest guard: with the supervisor
-# OFF the injected hang must genuinely NOT complete within a bound (rc=124, the
-# vacuity guard — proving the injector really hangs); with it ON + a SHORT
+# reporting the hanger as a phase="hang" skip. Honest guard: the direct
+# build-bound worker must genuinely NOT complete within a bound (timeout status
+# 124 or 137, depending on coreutils), proving the injector really hangs;
+# the daemon-supervised call with a SHORT
 # CBM_INDEX_WORKER_TIMEOUT_S the run must COMPLETE (rc<128, not 124), report
 # status="indexed" + the hanger as phase="hang", index the good file (nodes>0),
 # and NOT skip the good file.
@@ -884,20 +968,18 @@ inv_hanger_skipped_cli() {
     git -C "$hrepo" init -q 2>/dev/null || true
     local hn; hn="$(native_path "$hrepo")"
 
-    # Honesty baseline: supervisor OFF → the injected hang must NOT complete within
-    # the bound. The bounded runner fires (rc=124), proving the injector hangs.
+    # Honesty baseline: invoke the exact build-bound worker role directly. It
+    # must NOT complete within the bound, proving the injector actually hangs.
     export CBM_TEST_HANG_ON=hang_me
-    export CBM_INDEX_SUPERVISOR=0
-    cli_call 12 index_repository "{\"repo_path\":\"$hn\"}"
+    worker_call 12 "{\"repo_path\":\"$hn\"}" "$SCRATCH/hang_baseline_response"
     local base_rc="$CLI_RC"
-    unset CBM_INDEX_SUPERVISOR
 
     # Supervisor ON (default) + a SHORT no-progress timeout → the hang must be
     # detected fast, contained, and skipped-and-continued. Recovery spends two
     # ~5s timeouts (first parallel run, then the single-threaded recovery run) so
     # this invariant legitimately takes ~10-15s; it MUST still complete.
     export CBM_INDEX_WORKER_TIMEOUT_S=5
-    cli_call 90 index_repository "{\"repo_path\":\"$hn\"}"
+    cli_call 90 index_repository --repo-path "$hn"
     local sup_rc="$CLI_RC"
     local sup_out="$CLI_OUT"
     unset CBM_INDEX_WORKER_TIMEOUT_S
@@ -913,8 +995,8 @@ t=sys.stdin.read().replace("\\","").replace("\"","")
 m=re.findall(r"nodes\s*[:=]\s*(\d+)", t)
 print(max((int(x) for x in m), default=0))' 2>/dev/null)"
 
-    if [ "$base_rc" -ne 124 ]; then
-        fail "hanger-skipped-cli" "baseline did not hang (rc=$base_rc, want 124) — injector inactive, guard would be vacuous"
+    if [ "$base_rc" -ne 124 ] && [ "$base_rc" -ne 137 ]; then
+        fail "hanger-skipped-cli" "baseline did not hang (rc=$base_rc, want timeout status 124 or 137) — injector inactive, guard would be vacuous"
     elif [ "$sup_rc" -eq 124 ]; then
         fail "hanger-skipped-cli" "supervised run hung (rc=124) — hang not contained"
     elif [ "$sup_rc" -gt 128 ]; then

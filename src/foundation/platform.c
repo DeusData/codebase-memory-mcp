@@ -6,11 +6,15 @@
 #include "platform.h"
 
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform_internal.h"
+#include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CBM_NSEC_PER_SEC 1000000000ULL
@@ -57,6 +61,29 @@ uint64_t cbm_platform_scale_counter_ns(uint64_t counter, uint64_t frequency) {
     return fraction_ns > UINT64_MAX - whole_ns ? UINT64_MAX : whole_ns + fraction_ns;
 }
 
+bool cbm_platform_parse_proc_stat_group(const char *stat_line, int64_t *process_group,
+                                        bool *execution_quiescent) {
+    if (!stat_line || !process_group || !execution_quiescent) {
+        return false;
+    }
+    const char *command_end = strrchr(stat_line, ')');
+    char state = '\0';
+    long long parent = 0;
+    long long group = 0;
+    if (!command_end || sscanf(command_end + 1, " %c %lld %lld", &state, &parent, &group) != 3 ||
+        state == '\0' || group <= 0) {
+        return false;
+    }
+    (void)parent;
+    *process_group = (int64_t)group;
+    *execution_quiescent = state == 'Z' || state == 'X';
+    return true;
+}
+
+bool cbm_platform_proc_entry_vanished(int error_code) {
+    return error_code == ENOENT || error_code == ESRCH;
+}
+
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
  * Windows drive letters are case-insensitive, but a lowercase one (as agent
  * CWDs often report, e.g. Claude Code's "c:\...") otherwise produces a distinct
@@ -84,6 +111,11 @@ static void cbm_canonicalize_drive(char *path) {
 #include <io.h>
 #include <sys/stat.h>
 #include "foundation/win_utf8.h"
+
+cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid) {
+    (void)pgid;
+    return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+}
 
 void *cbm_mmap_read(const char *path, size_t *out_size) {
     if (!path || !out_size) {
@@ -212,10 +244,157 @@ char *cbm_normalize_path_sep(char *path) {
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #else
 #include <sched.h>
 #endif
+
+cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid) {
+    if (pgid <= 0) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+#ifdef __APPLE__
+    /* KERN_PROC_PGRP omits retained zombies on current macOS kernels. Query the
+     * zombie-inclusive table and filter e_pgid ourselves. */
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t required = 0;
+    if (sysctl(mib, 4, NULL, &required, NULL, 0) != 0) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    size_t slack = 16U * sizeof(struct kinfo_proc);
+    if (required > SIZE_MAX - slack) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    size_t capacity = required + slack;
+    struct kinfo_proc *entries = (struct kinfo_proc *)calloc(1, capacity);
+    if (!entries) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    size_t received = capacity;
+    if (sysctl(mib, 4, entries, &received, NULL, 0) != 0 || received > capacity ||
+        received % sizeof(*entries) != 0) {
+        free(entries);
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+
+    bool saw_member = false;
+    size_t count = received / sizeof(*entries);
+    for (size_t i = 0; i < count; i++) {
+        if ((int64_t)entries[i].kp_eproc.e_pgid != pgid) {
+            continue;
+        }
+        saw_member = true;
+        if (entries[i].kp_proc.p_stat != SZOMB) {
+            free(entries);
+            return CBM_PLATFORM_PROCESS_GROUP_ACTIVE;
+        }
+    }
+    free(entries);
+    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+#elif defined(__linux__)
+    cbm_dir_t *directory = cbm_opendir("/proc");
+    if (!directory) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    bool saw_member = false;
+    bool snapshot_unknown = false;
+    for (;;) {
+        /* POSIX readdir distinguishes EOF from failure through errno. Reset it
+         * for each wrapper call so a truncated /proc snapshot stays fail-closed.
+         * The scan remains O(P) runtime and O(1) auxiliary memory. */
+        errno = 0;
+        cbm_dirent_t *entry = cbm_readdir(directory);
+        if (!entry) {
+            if (errno != 0) {
+                snapshot_unknown = true;
+            }
+            break;
+        }
+        if (!entry->name[0]) {
+            continue;
+        }
+        errno = 0;
+        char *pid_end = NULL;
+        long long pid_value = strtoll(entry->name, &pid_end, 10);
+        if (errno == ERANGE || !pid_end || *pid_end != '\0' || pid_value <= 0 ||
+            (long long)(pid_t)pid_value != pid_value) {
+            continue;
+        }
+
+        /* Filter by process group before opening procfs. A busy host can lose
+         * unrelated /proc entries continuously while processes exit; allowing
+         * those races to poison the owned group's snapshot made quiescence
+         * depend on system-wide process churn. getpgid() either proves the
+         * entry is unrelated or selects it for the fail-closed stat read below.
+         * The scan remains O(P) runtime/O(1) memory for P processes, but reduces
+         * procfs opens and parsing from O(P) to O(G) for G group members. */
+        pid_t entry_group = getpgid((pid_t)pid_value);
+        if (entry_group < 0) {
+            if (!cbm_platform_proc_entry_vanished(errno)) {
+                snapshot_unknown = true;
+            }
+            continue;
+        }
+        if ((int64_t)entry_group != pgid) {
+            continue;
+        }
+
+        char path[CBM_PATH_MAX];
+        int written = snprintf(path, sizeof(path), "/proc/%s/stat", entry->name);
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            snapshot_unknown = true;
+            continue;
+        }
+        errno = 0;
+        FILE *file = cbm_fopen(path, "r");
+        if (!file) {
+            if (!cbm_platform_proc_entry_vanished(errno)) {
+                snapshot_unknown = true;
+            }
+            continue;
+        }
+        char stat_line[4096];
+        errno = 0;
+        bool read_ok = fgets(stat_line, sizeof(stat_line), file) != NULL;
+        int read_error = errno;
+        bool read_failed = ferror(file) != 0;
+        (void)fclose(file);
+        if (!read_ok) {
+            /* Linux does not pin a process through an open /proc/<pid> file.
+             * If it exits between fopen and fgets, the read usually fails with
+             * ESRCH. Treat only that proven disappearance (or ENOENT) like the
+             * equivalent pre-open race; ambiguous EOF and every other error
+             * remain UNKNOWN so live members cannot be missed. */
+            if (!read_failed || !cbm_platform_proc_entry_vanished(read_error)) {
+                snapshot_unknown = true;
+            }
+            continue;
+        }
+        int64_t process_group = 0;
+        bool execution_quiescent = false;
+        if (!cbm_platform_parse_proc_stat_group(stat_line, &process_group, &execution_quiescent)) {
+            snapshot_unknown = true;
+            continue;
+        }
+        if (process_group != pgid) {
+            continue;
+        }
+        saw_member = true;
+        if (!execution_quiescent) {
+            cbm_closedir(directory);
+            return CBM_PLATFORM_PROCESS_GROUP_ACTIVE;
+        }
+    }
+    cbm_closedir(directory);
+    if (snapshot_unknown) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+#else
+    return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+#endif
+}
 
 /* ── Memory mapping ──────────────────────────── */
 
@@ -255,6 +434,9 @@ void cbm_munmap(void *addr, size_t size) {
 /* ── Timing ───────────────────────────── */
 
 #ifdef __APPLE__
+/* Both histories fixed the same lazy-initialization race here. pthread_once
+ * replaces the hand-rolled compare-exchange plus spin-wait, and the identity
+ * fallback keeps a zeroed timebase from dividing by zero. */
 static mach_timebase_info_data_t timebase_info = {1, 1};
 static pthread_once_t timebase_once = PTHREAD_ONCE_INIT;
 
@@ -306,17 +488,17 @@ int cbm_nprocs(void) {
 
 bool cbm_file_exists(const char *path) {
     struct stat st;
-    return stat(path, &st) == 0;
+    return cbm_stat(path, &st) == 0;
 }
 
 bool cbm_is_dir(const char *path) {
     struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return cbm_stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 int64_t cbm_file_size(const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (cbm_stat(path, &st) != 0) {
         return CBM_NOT_FOUND;
     }
     return (int64_t)st.st_size;
@@ -355,7 +537,8 @@ extern char **environ;
 #define CBM_ENVIRON environ
 #endif
 
-static const char *platform_copy_environment_value(char *buf, size_t buf_sz, const char *value) {
+static const char *cbm_platform_copy_environment_value(char *buf, size_t buf_sz,
+                                                       const char *value) {
     if (!buf || buf_sz == 0 || !value) {
         return NULL;
     }
@@ -368,9 +551,18 @@ static const char *platform_copy_environment_value(char *buf, size_t buf_sz, con
     return buf;
 }
 
-const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+typedef enum {
+    CBM_PLATFORM_ENV_MISSING = 0,
+    CBM_PLATFORM_ENV_EMPTY,
+    CBM_PLATFORM_ENV_VALUE,
+    CBM_PLATFORM_ENV_TOO_LONG,
+    CBM_PLATFORM_ENV_ERROR,
+} cbm_platform_env_status_t;
+
+static cbm_platform_env_status_t cbm_platform_read_environment_value(const char *name, char *buf,
+                                                                     size_t buf_sz) {
     if (!name || !name[0] || !buf || buf_sz == 0) {
-        return NULL;
+        return CBM_PLATFORM_ENV_ERROR;
     }
     buf[0] = '\0';
 #ifdef _WIN32
@@ -391,32 +583,37 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
             DWORD environment_error = GetLastError();
             if (needed == 0U) {
                 if (environment_error == ERROR_ENVVAR_NOT_FOUND) {
-                    return fallback ? platform_copy_environment_value(buf, buf_sz, fallback) : NULL;
+                    return CBM_PLATFORM_ENV_MISSING;
                 }
                 /* An existing empty variable is distinct from a missing one. */
-                return buf;
+                return environment_error == ERROR_SUCCESS ? CBM_PLATFORM_ENV_EMPTY
+                                                          : CBM_PLATFORM_ENV_ERROR;
             }
             wchar_t *wval = calloc((size_t)needed, sizeof(*wval));
             if (!wval) {
-                return NULL;
+                return CBM_PLATFORM_ENV_ERROR;
             }
             SetLastError(ERROR_SUCCESS);
             DWORD got = GetEnvironmentVariableW(wname, wval, needed);
             DWORD read_error = GetLastError();
             if (got >= needed || (got == 0U && read_error != ERROR_SUCCESS)) {
                 free(wval);
-                return NULL;
+                return CBM_PLATFORM_ENV_ERROR;
+            }
+            if (got == 0U) {
+                free(wval);
+                return CBM_PLATFORM_ENV_EMPTY;
             }
             char *utf8 = cbm_wide_to_utf8(wval);
             free(wval);
             if (!utf8) {
-                return NULL;
+                return CBM_PLATFORM_ENV_ERROR;
             }
-            const char *copied = platform_copy_environment_value(buf, buf_sz, utf8);
+            const char *copied = cbm_platform_copy_environment_value(buf, buf_sz, utf8);
             free(utf8);
-            return copied;
+            return copied ? CBM_PLATFORM_ENV_VALUE : CBM_PLATFORM_ENV_TOO_LONG;
         }
-        return NULL;
+        return CBM_PLATFORM_ENV_ERROR;
     }
 #else
     char **env = CBM_ENVIRON;
@@ -424,15 +621,68 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
         size_t nlen = strlen(name);
         for (; *env; env++) {
             if (strncmp(*env, name, nlen) == 0 && (*env)[nlen] == '=') {
-                return platform_copy_environment_value(buf, buf_sz, *env + nlen + SKIP_ONE);
+                const char *value = *env + nlen + SKIP_ONE;
+                if (!value[0]) {
+                    return CBM_PLATFORM_ENV_EMPTY;
+                }
+                return cbm_platform_copy_environment_value(buf, buf_sz, value)
+                           ? CBM_PLATFORM_ENV_VALUE
+                           : CBM_PLATFORM_ENV_TOO_LONG;
             }
         }
     }
 #endif
-    if (fallback) {
-        return platform_copy_environment_value(buf, buf_sz, fallback);
+    return CBM_PLATFORM_ENV_MISSING;
+}
+
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    cbm_platform_env_status_t result = cbm_platform_read_environment_value(name, buf, buf_sz);
+    if (result == CBM_PLATFORM_ENV_VALUE || result == CBM_PLATFORM_ENV_EMPTY) {
+        return buf;
+    }
+    if (result == CBM_PLATFORM_ENV_MISSING && fallback) {
+        return cbm_platform_copy_environment_value(buf, buf_sz, fallback);
     }
     return NULL;
+}
+
+static char cbm_ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static bool cbm_ascii_eq_ignore_case(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        if (cbm_ascii_lower(*a) != cbm_ascii_lower(*b)) {
+            return false;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+bool cbm_env_flag_enabled(const char *name) {
+    char buf[CBM_SZ_32];
+    const char *value = cbm_safe_getenv(name, buf, sizeof(buf), NULL);
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+    return strcmp(value, "0") != 0 && !cbm_ascii_eq_ignore_case(value, "false") &&
+           !cbm_ascii_eq_ignore_case(value, "off") && !cbm_ascii_eq_ignore_case(value, "no");
+}
+
+bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present) {
+    if (present) {
+        *present = false;
+    }
+    cbm_platform_env_status_t result = cbm_platform_read_environment_value(name, buf, buf_sz);
+    if (present && (result == CBM_PLATFORM_ENV_VALUE || result == CBM_PLATFORM_ENV_TOO_LONG)) {
+        *present = true;
+    }
+    return result == CBM_PLATFORM_ENV_VALUE;
 }
 
 /* ── Home directory (cross-platform) ───────────────────── */
