@@ -11,6 +11,7 @@
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
 #include "foundation/constants.h"
+#include "foundation/compat.h" // cbm_strcasestr
 #include "foundation/compat_fs.h"
 
 enum { LANG_SCAN_PASSES = 2 };
@@ -453,7 +454,10 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Qt QML */
     {".qml", CBM_LANG_QML},
 
-    /* CFML / ColdFusion — .cfc components are script-dialect; .cfm are tag templates */
+    /* CFML / ColdFusion — .cfm are tag templates; .cfc components may be EITHER
+     * script-dialect (component { ... }) or tag-dialect (<cfcomponent> ...). The
+     * table default is script; tag-based .cfc are resolved by content in
+     * cbm_disambiguate_cfc(). */
     {".cfc", CBM_LANG_CFSCRIPT},
     {".cfm", CBM_LANG_CFML},
 
@@ -1121,4 +1125,75 @@ CBMLanguage cbm_disambiguate_inc(const char *path) {
         line = nl + SKIP_ONE;
     }
     return CBM_LANG_BITBAKE;
+}
+
+/* Case-insensitive prefix match (portable — no strncasecmp dependency). */
+static bool starts_with_ci(const char *s, const char *prefix) {
+    for (; *prefix; s++, prefix++) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Disambiguate .cfc files: a ColdFusion component may be written in the script
+ * dialect ("component { ... }", parsed by the JS-like cfscript grammar) or the
+ * tag dialect ("<cfcomponent> ... <cffunction>", parsed by the HTML-derived cfml
+ * grammar). The extension table defaults to cfscript because that is what modern
+ * Lucee/ACF templates use, but large legacy codebases are predominantly tag-based
+ * and feeding those to the wrong grammar fails wholesale. Routing rules:
+ *   1. A "<cfcomponent" or top-level "<cffunction" tag ⇒ tag dialect. (The latter
+ *      catches "bare" tag components that omit the <cfcomponent> wrapper.) This
+ *      wins regardless of any leading <!---/<cfscript>, so it is checked first.
+ *   2. Otherwise the file is script-dialect content. Find the first significant
+ *      token, skipping whitespace and <!--- ---> comments:
+ *        - a leading "<cfscript>" wrapper is still script content ⇒ cfscript;
+ *        - a different leading tag (e.g. <cfquery> in a bare-tag file) ⇒ cfml;
+ *        - anything else ("component { ... }") ⇒ cfscript.
+ * Defaults to CBM_LANG_CFSCRIPT on any doubt (preserves table behaviour). */
+CBMLanguage cbm_disambiguate_cfc(const char *path) {
+    if (!path) {
+        return CBM_LANG_CFSCRIPT;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_CFSCRIPT;
+    }
+
+    /* Read a generous head: tag components can carry a large license/revision
+     * comment block before the <cfcomponent> opener. */
+    char buf[CBM_SZ_16K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_16K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    /* Rule 1: explicit tag-component markers ⇒ tag dialect. */
+    if (cbm_strcasestr(buf, "<cfcomponent") != NULL || cbm_strcasestr(buf, "<cffunction") != NULL) {
+        return CBM_LANG_CFML;
+    }
+
+    /* Rule 2: locate the first significant token, past whitespace and comments. */
+    const char *p = buf;
+    for (;;) {
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (starts_with_ci(p, "<!---")) {
+            const char *end = strstr(p + SLEN("<!---"), "--->");
+            if (!end) {
+                break; /* comment runs past the buffer — treat as no token */
+            }
+            p = end + SLEN("--->");
+            continue;
+        }
+        break;
+    }
+    if (*p == '<') {
+        /* A leading <cfscript> wrapper is script content; any other leading tag
+         * (bare-tag file) is tag content. */
+        return starts_with_ci(p, "<cfscript") ? CBM_LANG_CFSCRIPT : CBM_LANG_CFML;
+    }
+    return CBM_LANG_CFSCRIPT;
 }

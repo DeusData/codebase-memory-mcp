@@ -1249,6 +1249,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
     cbm_extract_definitions(&ctx);
+    cbm_extract_embedded_defs(&ctx); // defs inside <cfscript> blocks of CFML tag files
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
 

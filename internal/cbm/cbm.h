@@ -726,6 +726,8 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+void cbm_extract_definitions_body(CBMExtractCtx *ctx); // no Module node (for sub-trees)
+void cbm_extract_embedded_defs(CBMExtractCtx *ctx);    // re-parse embedded script blocks for defs
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
