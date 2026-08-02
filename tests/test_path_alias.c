@@ -32,6 +32,7 @@ enum {
     PATH_ALIAS_PARENT_FILE_CAP_BYTES = 64 * 1024,
     PATH_ALIAS_LARGE_CONFIG_PADDING_BYTES = PATH_ALIAS_PARENT_FILE_CAP_BYTES + 1024,
     PATH_ALIAS_ENTRY_JSON_BYTES = 80,
+    PATH_ALIAS_FIXTURE_DIR_MODE = 0700,
 };
 
 /* Build a path alias map programmatically (no file I/O), respecting the
@@ -325,7 +326,11 @@ static bool path_alias_tree_fixture_create(path_alias_tree_fixture_t *fixture, s
     for (size_t i = 0; i < segment_count; i++) {
         char *next_abs = path_alias_join(current_abs, segment);
         char *next_rel = path_alias_join(current_rel, segment);
-        if (!next_abs || !next_rel || cbm_mkdir(next_abs) != 0) {
+        /* Reuse the production UTF-8/extended-length directory owner. Each
+         * call adds one component, so fixture creation remains O(total path
+         * bytes) live memory and O(segment_count * final path bytes) time. */
+        if (!next_abs || !next_rel ||
+            !cbm_mkdir_p(next_abs, PATH_ALIAS_FIXTURE_DIR_MODE)) {
             free(next_rel);
             free(next_abs);
             free(segment);

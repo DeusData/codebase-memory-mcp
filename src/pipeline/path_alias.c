@@ -290,7 +290,11 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
     if (resource_failure) {
         *resource_failure = false;
     }
-    FILE *f = cbm_fopen(abs_path, "r");
+    /* Read exact repository bytes. Windows text mode translates CRLF while
+     * ftell() reports the physical extent, so an exact-size read would reject
+     * valid native-line-ending configs as short. Binary mode keeps the
+     * existing O(N) runtime/O(N) peak-buffer contract platform-independent. */
+    FILE *f = cbm_fopen(abs_path, "rb");
     if (!f) {
         return NULL;
     }
