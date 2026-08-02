@@ -39,6 +39,7 @@
 #include <mach-o/dyld.h>
 #endif
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <zlib.h>
 #include "../src/foundation/compat_fs.h"
@@ -11695,14 +11696,20 @@ TEST(cli_config_pagerank_numeric_ranges_are_enforced) {
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
 
+    /* Compiler limit macros are C expressions, not necessarily decimal text:
+     * GCC spells INT_MAX as 0x7fffffff and DBL_MAX as a cast expression. Format
+     * their values through the same locale-independent decimal grammar exposed
+     * by config rather than stringifying implementation-specific source. */
+    char maximum[CBM_SZ_32];
+    int written = snprintf(maximum, sizeof(maximum), "%d", CBM_PAGERANK_MAX_ITER_MAX);
+    ASSERT_TRUE(written > 0 && (size_t)written < sizeof(maximum));
+
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER,
                              CBM_STRINGIFY(CBM_PAGERANK_MAX_ITER_MIN)),
               0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "10000"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "10001"), 0);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER,
-                             CBM_STRINGIFY(CBM_PAGERANK_MAX_ITER_MAX)),
-              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, maximum), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "0"), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "1.5"), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_MAX_ITER, "2147483648"), 0);
@@ -11721,9 +11728,10 @@ TEST(cli_config_pagerank_numeric_ranges_are_enforced) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, CBM_PAGERANK_EPSILON_STR), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "1.0"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "2.0"), 0);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON,
-                             CBM_STRINGIFY(CBM_PAGERANK_EPSILON_MAX)),
-              0);
+    written = snprintf(maximum, sizeof(maximum), "%.*g", DBL_DECIMAL_DIG,
+                       CBM_PAGERANK_EPSILON_MAX);
+    ASSERT_TRUE(written > 0 && (size_t)written < sizeof(maximum));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, maximum), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "0"), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_PAGERANK_EPSILON, "nan"), 0);
 
@@ -11732,9 +11740,7 @@ TEST(cli_config_pagerank_numeric_ranges_are_enforced) {
               0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "100.0"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "100.1"), 0);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS,
-                             CBM_STRINGIFY(CBM_PAGERANK_EDGE_WEIGHT_MAX)),
-              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, maximum), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "-0.1"), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "nan"), 0);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EDGE_WEIGHT_CALLS, "inf"), 0);
@@ -12945,7 +12951,7 @@ TEST(cli_reference_harnesses_uninstall_owned_entries_only) {
 
     const char *config_rel[] = {".qwen/settings.json", ".codeium/windsurf/mcp_config.json"};
     char binary[768];
-    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    cbm_agent_installed_binary_path_for_testing(tmpdir, binary, sizeof(binary));
     char config_paths[2][768];
     for (size_t i = 0; i < 2; i++) {
         snprintf(config_paths[i], sizeof(config_paths[i]), "%s/%s", tmpdir, config_rel[i]);

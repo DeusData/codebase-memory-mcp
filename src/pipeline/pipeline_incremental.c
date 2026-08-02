@@ -346,7 +346,7 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
         }
 
         struct stat st;
-        if (stat(files[i].path, &st) != 0) {
+        if (cbm_stat(files[i].path, &st) != 0) {
             changed[i] = true;
             n_changed++;
             continue;
@@ -388,9 +388,9 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
  * out_mode_skipped. Caller frees both output arrays.
  *
  * A stored file is classified as:
- *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR. Its nodes will
+ *   - "deleted"      — `cbm_stat()` returns ENOENT or ENOTDIR. Its nodes will
  *                       be purged and its hash row dropped.
- *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
+ *   - "mode-skipped" — `cbm_stat()` succeeds. The file exists on disk but the
  *                       current discovery pass didn't visit it (e.g. excluded
  *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
  *                       must be preserved AND its hash row must be carried
@@ -417,14 +417,14 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
  *     not a deletion signal.
  *   - snprintf truncation (combined path ≥ CBM_SZ_4K) → preserve. We can't
  *     reliably stat a truncated path. Treat as mode-skipped.
- *   - stat() errno != ENOENT/ENOTDIR (EACCES, EIO, ELOOP, transient NFS,
+ *   - cbm_stat() errno != ENOENT/ENOTDIR (EACCES, EIO, ELOOP, transient NFS,
  *     etc.) → preserve. The file may exist; we just can't see it right now.
  *     Treat as mode-skipped.
  *
  * Allocation failure is not an uncertainty signal: return CBM_STORE_ERR so the
  * caller can avoid publishing a partial incremental classification.
  *
- * Note: we use stat() (not lstat()) on purpose. A symlink whose target was
+ * Note: we use cbm_stat() (not lstat()) on purpose. A symlink whose target was
  * deleted should be classified as deleted from the indexer's perspective
  * because the indexer follows symlinks during discovery — a stale symlink
  * has no source to parse. */
@@ -497,7 +497,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
             preserve = true;
         } else {
             struct stat st;
-            if (stat(abs_path, &st) == 0) {
+            if (cbm_stat(abs_path, &st) == 0) {
                 /* File exists on disk — mode-skipped, not deleted. */
                 preserve = true;
             } else if (errno != ENOENT && errno != ENOTDIR) {
@@ -645,7 +645,7 @@ static void incr_observe_file_metadata(const cbm_file_info_t *file, char *out_ha
         (void)cbm_file_content_hash(file->path, out_hash, out_hash_sz);
     }
     struct stat st;
-    if (stat(file->path, &st) == 0) {
+    if (cbm_stat(file->path, &st) == 0) {
         if (out_mtime_ns) {
             *out_mtime_ns = cbm_stat_mtime_ns(&st);
         }
@@ -1038,7 +1038,7 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
      * during the run, and write fresh hash rows for visited files. */
     for (int i = 0; i < file_count; i++) {
         struct stat st;
-        if (stat(files[i].path, &st) != 0) {
+        if (cbm_stat(files[i].path, &st) != 0) {
             current_failed++;
             continue;
         }

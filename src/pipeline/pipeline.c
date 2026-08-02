@@ -652,7 +652,7 @@ static int pipeline_store_project_files_current(cbm_store_t *store, const char *
     for (int i = 0; i < file_count; i++) {
         cbm_file_hash_t *hash = cbm_ht_get(ht, files[i].rel_path);
         struct stat st;
-        if (!hash || stat(files[i].path, &st) != 0) {
+        if (!hash || cbm_stat(files[i].path, &st) != 0) {
             current = false;
             break;
         }
@@ -1969,7 +1969,7 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
         return CBM_NOT_FOUND;
     }
     struct stat db_st;
-    if (stat(db_path, &db_st) != 0) {
+    if (cbm_stat(db_path, &db_st) != 0) {
         free(db_path);
         return CBM_NOT_FOUND;
     }
@@ -2176,7 +2176,7 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
     }
     for (int i = 0; i < file_count; i++) {
         struct stat fst;
-        if (stat(files[i].path, &fst) != 0) {
+        if (cbm_stat(files[i].path, &fst) != 0) {
             (void)cbm_store_rollback(store);
             cbm_log_error("pipeline.err", "phase", "persist_hashes_stat", "file",
                           files[i].rel_path ? files[i].rel_path : "");
@@ -2785,7 +2785,7 @@ static bool db_sidecars_absent(const char *db_path) {
             return false;
         }
         struct stat side_st;
-        if (stat(side, &side_st) == 0 || errno != ENOENT) {
+        if (cbm_stat(side, &side_st) == 0 || errno != ENOENT) {
             return false;
         }
     }
@@ -2795,7 +2795,7 @@ static bool db_sidecars_absent(const char *db_path) {
 static bool prepare_publish_destination(const char *final_path, bool final_existed,
                                         bool backup_succeeded) {
     struct stat current_st;
-    bool final_exists_now = stat(final_path, &current_st) == 0;
+    bool final_exists_now = cbm_stat(final_path, &current_st) == 0;
     if (final_exists_now != final_existed) {
         return false;
     }
@@ -2867,7 +2867,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
     struct stat final_st;
-    bool final_existed = stat(final_path, &final_st) == 0;
+    bool final_existed = cbm_stat(final_path, &final_st) == 0;
     char *staging_path = create_staging_path(final_path);
     if (!staging_path) {
         free(final_path);

@@ -36,6 +36,14 @@
 #ifdef __APPLE__
 #include <spawn.h>
 extern char **environ;
+#ifdef CBM_ENABLE_TEST_SEAMS
+static cbm_subprocess_darwin_post_spawn_test_hook_t darwin_post_spawn_test_hook;
+
+void cbm_subprocess_set_darwin_post_spawn_hook_for_testing(
+    cbm_subprocess_darwin_post_spawn_test_hook_t hook) {
+    darwin_post_spawn_test_hook = hook;
+}
+#endif
 #endif
 #endif
 
@@ -1158,6 +1166,11 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     pid_t pid = -1;
 #ifdef __APPLE__
     bool spawned = cbm_darwin_spawn_managed(process, input, output, error_output, &pid);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (spawned && darwin_post_spawn_test_hook) {
+        darwin_post_spawn_test_hook((long)pid);
+    }
+#endif
 #else
     bool spawned = false;
 #endif
@@ -1182,12 +1195,17 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
         (void)close(error_output);
     }
 
-    /* The Darwin spawn attribute or fork child establishes the group before
-     * exec; the parent repeats it to remove fork scheduler-order races. EACCES
-     * is accepted only after proving the expected isolated process group. */
-    bool contained = setpgid(pid, pid) == 0;
-    if (!contained && (errno == EACCES || errno == EPERM || errno == ESRCH)) {
-        contained = getpgid(pid) == pid;
+    /* A successful Darwin posix_spawnp used POSIX_SPAWN_SETPGROUP with pgroup
+     * zero, so the child was atomically contained at creation. Rechecking a
+     * short-lived child here is incorrect: Darwin reports ESRCH once it is a
+     * zombie even though containment succeeded. The fork fallback still needs
+     * the parent-side proof to remove its scheduler-order race. */
+    bool contained = spawned;
+    if (!contained) {
+        contained = setpgid(pid, pid) == 0;
+        if (!contained && (errno == EACCES || errno == EPERM || errno == ESRCH)) {
+            contained = getpgid(pid) == pid;
+        }
     }
     if (!contained) {
         (void)kill(pid, SIGKILL);

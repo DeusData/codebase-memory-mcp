@@ -9,6 +9,7 @@
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -93,10 +94,48 @@ TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
 #else
         close(descriptor);
 #endif
+    }
+
+    static const char probe[] = "probe";
+    FILE *probe_file = created ? cbm_fopen(file_template, "wb") : NULL;
+    bool probe_written = false;
+    if (probe_file) {
+        bool write_ok =
+            fwrite(probe, sizeof(probe) - SKIP_ONE, SKIP_ONE, probe_file) == SKIP_ONE;
+        bool close_ok = fclose(probe_file) == 0;
+        probe_written = write_ok && close_ok;
+    }
+    struct stat directory_state = {0};
+    struct stat file_state = {0};
+    int directory_stat = cbm_stat(base, &directory_state);
+    int file_stat = cbm_stat(file_template, &file_state);
+    cbm_file_identity_t directory_identity = {0};
+    cbm_file_identity_t file_identity = {0};
+    cbm_file_identity_t repeated_file_identity = {0};
+    bool directory_identity_read = cbm_file_identity_read(base, &directory_identity);
+    bool file_identity_read = cbm_file_identity_read(file_template, &file_identity);
+    bool repeated_file_identity_read =
+        cbm_file_identity_read(file_template, &repeated_file_identity);
+    if (created) {
         (void)cbm_unlink(file_template);
     }
+    errno = 0;
+    int missing_stat = cbm_stat(file_template, &file_state);
+    int missing_error = errno;
     (void)cbm_rmdir(base);
     ASSERT_TRUE(created);
+    ASSERT_TRUE(probe_written);
+    ASSERT_EQ(directory_stat, 0);
+    ASSERT_TRUE(S_ISDIR(directory_state.st_mode));
+    ASSERT_EQ(file_stat, 0);
+    ASSERT_TRUE(S_ISREG(file_state.st_mode));
+    ASSERT_EQ(file_state.st_size, (off_t)(sizeof(probe) - SKIP_ONE));
+    ASSERT_TRUE(directory_identity_read);
+    ASSERT_TRUE(file_identity_read);
+    ASSERT_TRUE(repeated_file_identity_read);
+    ASSERT_TRUE(cbm_file_identity_equal(&file_identity, &repeated_file_identity));
+    ASSERT_EQ(missing_stat, -1);
+    ASSERT_EQ(missing_error, ENOENT);
     /* The returned path must keep the caller's UTF-8 directory intact. */
     ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
     PASS();
@@ -149,6 +188,15 @@ TEST(platform_proc_stat_group_parser_handles_parentheses_and_states) {
     ASSERT_FALSE(cbm_platform_parse_proc_stat_group(
         "123 (missing fields) R 7", &process_group, &execution_quiescent));
     ASSERT_FALSE(cbm_platform_parse_proc_stat_group(NULL, &process_group, &execution_quiescent));
+    PASS();
+}
+
+TEST(platform_proc_entry_disappearance_is_narrow) {
+    ASSERT_TRUE(cbm_platform_proc_entry_vanished(ENOENT));
+    ASSERT_TRUE(cbm_platform_proc_entry_vanished(ESRCH));
+    ASSERT_FALSE(cbm_platform_proc_entry_vanished(0));
+    ASSERT_FALSE(cbm_platform_proc_entry_vanished(EACCES));
+    ASSERT_FALSE(cbm_platform_proc_entry_vanished(EIO));
     PASS();
 }
 
@@ -794,6 +842,7 @@ SUITE(platform) {
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
     RUN_TEST(platform_proc_stat_group_parser_handles_parentheses_and_states);
+    RUN_TEST(platform_proc_entry_disappearance_is_narrow);
     RUN_TEST(platform_now_ns_concurrent_first_call);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);

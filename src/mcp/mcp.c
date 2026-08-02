@@ -5998,7 +5998,7 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
         return false;
     }
     struct stat adr_st;
-    return stat(adr_path, &adr_st) == 0;
+    return cbm_stat(adr_path, &adr_st) == 0;
 }
 /* ── Tool handler implementations ─────────────────────────────── */
 
@@ -6023,7 +6023,7 @@ static cbm_store_t *open_validated_cbm_query_store(cbm_mcp_server_t *srv, const 
     }
 
     /* Check SQLite magic bytes (first 16 bytes = "SQLite format 3\0") */
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         cbm_log_warn("db.skip", "path", path, "reason", "cannot_open");
         return NULL;
@@ -6349,7 +6349,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             continue;
         }
         struct stat st;
-        if (stat(full_path, &st) != 0) {
+        if (cbm_stat(full_path, &st) != 0) {
             continue;
         }
 
@@ -6830,8 +6830,15 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv, char *raw_proje
     }
 
     project_expand_t pe;
-    if (!raw_project && srv->session_project[0]) {
-        pe.value = heap_strdup(srv->session_project);
+    if (!raw_project &&
+        (srv->session_project[0] || (srv->current_project && srv->current_project[0]))) {
+        /* An omitted project selects the session project when one exists, then
+         * the logical project already bound to an embedded/in-memory store.
+         * Keep the selected name heap-owned because resolve_store may replace
+         * srv->current_project. This is O(P) time/memory for project length P. */
+        const char *implicit_project =
+            srv->session_project[0] ? srv->session_project : srv->current_project;
+        pe.value = heap_strdup(implicit_project);
         pe.mode = MATCH_PREFIX;
     } else {
         pe = expand_project_param(srv, raw_project); /* raw_project freed inside */
@@ -8899,6 +8906,53 @@ static char *query_graph_no_rows_hint(cbm_store_t *store, const char *view_proje
     return cbm_sb_finish(&msg);
 }
 
+/* Populate query diagnostics once for both JSON and TOON serializers. The
+ * metadata work is independent of result serialization: O(1) for overlay and
+ * dirty counts plus the existing derived-view checks, with O(1) auxiliary
+ * state outside yyjson's bounded diagnostic nodes. */
+static void add_query_graph_response_metadata(
+    yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store, const char *project,
+    const char *query, const cbm_cypher_result_t *result,
+    const cbm_store_overlay_node_view_summary_t *overlay_summary, bool used_active_cypher_nodes,
+    bool missed_graph, bool has_dirty_counts, int dirty_pending, int dirty_overlay_ready,
+    const char *args) {
+    add_query_graph_derived_warnings(doc, root, store, project, query, result);
+    bool overlay_limitation_reported = false;
+    if (used_active_cypher_nodes) {
+        add_overlay_active_cypher_freshness(doc, root, overlay_summary);
+    } else if (!missed_graph) {
+        overlay_limitation_reported = add_canonical_only_overlay_freshness(
+            doc, root, store, project,
+            "query_graph preserves canonical id() semantics for this Cypher query shape; "
+            "ready overlay rows require a supported active-query shape or compaction.");
+    }
+    if (has_dirty_counts) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        if (!used_active_cypher_nodes) {
+            add_canonical_only_read_model(doc, root);
+        }
+        if (!used_active_cypher_nodes && !overlay_limitation_reported && !missed_graph) {
+            add_response_warning(
+                doc, root,
+                "query_graph reads canonical graph rows; dirty file changes may be absent "
+                "until overlay or reindex completes.");
+        } else if (used_active_cypher_nodes && dirty_pending > 0) {
+            add_response_warning(
+                doc, root,
+                "query_graph used ready overlay node rows, but pending dirty files may still "
+                "be absent until overlay or reindex completes.");
+        }
+    }
+    char *ignored_label = cbm_mcp_get_string_arg(args, "label");
+    if (ignored_label) {
+        add_response_warning(
+            doc, root,
+            "cypher/query is present; label, name_pattern, file_pattern, sort_by, and other "
+            "search filters are ignored. Express them in the Cypher WHERE clause.");
+        free(ignored_label);
+    }
+}
+
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
     if (response_format == CBM_MCP_OUTPUT_INVALID) {
@@ -8985,15 +9039,13 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
 
-    /* Preserve freshness diagnostics in JSON whenever overlays or dirty files
-     * are involved; clean canonical queries use compact TOON by default. */
+    /* The explicit per-call format always wins over the configured default.
+     * Freshness metadata is shared below so neither serializer loses it. */
     bool qg_legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     bool has_dirty_counts =
         get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready);
-    qg_legacy_json = qg_legacy_json || overlay_ready ||
-                     (has_dirty_counts && (dirty_pending > 0 || dirty_overlay_ready > 0));
 
     char *json = NULL;
     if (!qg_legacy_json) {
@@ -9024,6 +9076,20 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_toon_scalar_str(&sb, "hint",
                                 vocab_hint ? vocab_hint : QUERY_GRAPH_NO_ROWS_FALLBACK_HINT);
             free(vocab_hint); /* TOON builder copies into the sb */
+        }
+        yyjson_mut_doc *metadata_doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *metadata_root = metadata_doc ? yyjson_mut_obj(metadata_doc) : NULL;
+        if (metadata_root) {
+            yyjson_mut_doc_set_root(metadata_doc, metadata_root);
+            add_query_graph_response_metadata(metadata_doc, metadata_root, store, project, query,
+                                              &result, &overlay_summary, used_active_cypher_nodes,
+                                              missed_graph, has_dirty_counts, dirty_pending,
+                                              dirty_overlay_ready, args);
+            response_toon_append_freshness(&sb, metadata_root);
+            response_toon_append_warnings(&sb, metadata_root);
+        }
+        if (metadata_doc) {
+            yyjson_mut_doc_free(metadata_doc);
         }
         json = cbm_sb_finish(&sb);
     } else {
@@ -9070,41 +9136,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             free(vocab_hint);
         }
 
-        add_query_graph_derived_warnings(doc, root, store, project, query, &result);
-        bool overlay_limitation_reported = false;
-        if (used_active_cypher_nodes) {
-            add_overlay_active_cypher_freshness(doc, root, &overlay_summary);
-        } else if (!missed_graph) {
-            overlay_limitation_reported = add_canonical_only_overlay_freshness(
-                doc, root, store, project,
-                "query_graph preserves canonical id() semantics for this Cypher query shape; "
-                "ready overlay rows require a supported active-query shape or compaction.");
-        }
-        if (has_dirty_counts) {
-            add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-            if (!used_active_cypher_nodes) {
-                add_canonical_only_read_model(doc, root);
-            }
-            if (!used_active_cypher_nodes && !overlay_limitation_reported && !missed_graph) {
-                add_response_warning(
-                    doc, root,
-                    "query_graph reads canonical graph rows; dirty file changes may be absent "
-                    "until overlay or reindex completes.");
-            } else if (used_active_cypher_nodes && dirty_pending > 0) {
-                add_response_warning(
-                    doc, root,
-                    "query_graph used ready overlay node rows, but pending dirty files may still "
-                    "be absent until overlay or reindex completes.");
-            }
-        }
-        char *ignored_label = cbm_mcp_get_string_arg(args, "label");
-        if (ignored_label) {
-            add_response_warning(
-                doc, root,
-                "cypher/query is present; label, name_pattern, file_pattern, sort_by, and other "
-                "search filters are ignored. Express them in the Cypher WHERE clause.");
-            free(ignored_label);
-        }
+        add_query_graph_response_metadata(
+            doc, root, store, project, query, &result, &overlay_summary, used_active_cypher_nodes,
+            missed_graph, has_dirty_counts, dirty_pending, dirty_overlay_ready, args);
         json = yy_doc_to_str(doc);
         yyjson_mut_doc_free(doc);
     }
@@ -9328,7 +9362,7 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
         return "unavailable";
     }
     struct stat st;
-    if (stat(abs_path, &st) != 0) {
+    if (cbm_stat(abs_path, &st) != 0) {
         return "missing";
     }
     if (!cbm_path_within_root(root_path, abs_path)) {
@@ -15416,7 +15450,7 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
     } else {
         n = snprintf(
             cmd, cmd_sz,
-            "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File "
+            "powershell -Command \"Get-ChildItem -LiteralPath '%s' -Recurse -File "
             "-ErrorAction SilentlyContinue | Select-String -Pattern "
             "(Get-Content -Encoding UTF8 -LiteralPath '%s')%s%s -ErrorAction SilentlyContinue "
             "| ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
@@ -18792,7 +18826,7 @@ static bool db_has_content(const char *db_path) {
  * Returns false on any error (conservative: don't trigger unnecessary reindex). */
 static bool db_is_stale(const char *db_path, const char *repo_path, int max_age_seconds) {
     struct stat db_st;
-    if (stat(db_path, &db_st) != 0)
+    if (cbm_stat(db_path, &db_st) != 0)
         return false;
     time_t db_mtime = db_st.st_mtime;
 

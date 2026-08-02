@@ -827,6 +827,8 @@ TEST(config_response_format_json_with_toon_override) {
     free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_EQ(resp[0], '{');
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"rows\""));
     free(resp);
 
     raw = cbm_mcp_handle_tool(srv, "get_graph_schema",
@@ -835,6 +837,7 @@ TEST(config_response_format_json_with_toon_override) {
     free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_EQ(resp[0], '{');
+    ASSERT_NULL(strstr(resp, "\"error\""));
     free(resp);
 
     char args[256];

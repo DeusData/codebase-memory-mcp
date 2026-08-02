@@ -851,7 +851,7 @@ const char *cbm_detect_shell_rc(const char *home_dir) {
         /* Prefer .bashrc, fall back to .bash_profile */
         snprintf(buf, sizeof(buf), "%s/.bashrc", home_dir);
         struct stat st;
-        if (stat(buf, &st) == 0) {
+        if (cbm_stat(buf, &st) == 0) {
             return buf;
         }
         snprintf(buf, sizeof(buf), "%s/.bash_profile", home_dir);
@@ -876,14 +876,14 @@ const char *cbm_detect_shell_rc(const char *home_dir) {
 #define PATH_DELIM ":"
 #endif
 
-/* Check if a path exists and is executable.
- * On Windows, stat() doesn't set S_IXUSR — just check existence. */
+/* Check if a path exists and is executable. On Windows the metadata API does
+ * not set S_IXUSR, so existence is the portable executable predicate. */
 static bool is_executable(const char *path) {
     struct stat st;
 #ifdef _WIN32
-    return stat(path, &st) == 0;
+    return cbm_stat(path, &st) == 0;
 #else
-    return stat(path, &st) == 0 && (st.st_mode & S_IXUSR);
+    return cbm_stat(path, &st) == 0 && (st.st_mode & S_IXUSR);
 #endif
 }
 
@@ -982,12 +982,12 @@ static bool cbm_agent_cli_exists(const char *name, const char *home_dir) {
 /* ── File utilities ───────────────────────────────────────────── */
 
 int cbm_copy_file(const char *src, const char *dst) {
-    FILE *in = fopen(src, "rb");
+    FILE *in = cbm_fopen(src, "rb");
     if (!in) {
         return CLI_ERR;
     }
 
-    FILE *out = fopen(dst, "wb");
+    FILE *out = cbm_fopen(dst, "wb");
     if (!out) {
         (void)fclose(in);
         return CLI_ERR;
@@ -1023,7 +1023,7 @@ int cbm_copy_file(const char *src, const char *dst) {
 static bool cbm_same_file(const char *a, const char *b) {
     struct stat sa;
     struct stat sb;
-    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+    if (cbm_stat(a, &sa) != 0 || cbm_stat(b, &sb) != 0) {
         return false;
     }
 #ifdef _WIN32
@@ -1433,7 +1433,7 @@ static bool cbm_remove_empty_directory(const char *path, bool dry_run) {
 #ifndef _WIN32
     if (lstat(path, &state) != 0 || !S_ISDIR(state.st_mode)) {
 #else
-    if (stat(path, &state) != 0 || !S_ISDIR(state.st_mode)) {
+    if (cbm_stat(path, &state) != 0 || !S_ISDIR(state.st_mode)) {
 #endif
         return false;
     }
@@ -1481,7 +1481,7 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
             continue;
         }
 #else
-        if (stat(skill_path, &skill_state) == 0 && !S_ISDIR(skill_state.st_mode)) {
+        if (cbm_stat(skill_path, &skill_state) == 0 && !S_ISDIR(skill_state.st_mode)) {
             continue;
         }
 #endif
@@ -1489,7 +1489,7 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
         /* Check if already exists */
         if (!force) {
             struct stat st;
-            if (stat(file_path, &st) == 0) {
+            if (cbm_stat(file_path, &st) == 0) {
                 continue;
             }
         }
@@ -1525,13 +1525,13 @@ int cbm_remove_skills(const char *skills_dir, bool dry_run) {
 #ifndef _WIN32
         if (lstat(skill_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
 #else
-        if (stat(skill_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (cbm_stat(skill_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
 #endif
             continue;
         }
 
         struct stat file_state;
-        if (stat(file_path, &file_state) != 0) {
+        if (cbm_stat(file_path, &file_state) != 0) {
             continue;
         }
 
@@ -2192,7 +2192,7 @@ static bool dir_exists(const char *path) {
 #ifndef _WIN32
     return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
 #else
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return cbm_stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
 }
 
@@ -3239,7 +3239,7 @@ const char *cbm_get_agent_instructions(void) {
 
 /* Read entire file into malloc'd buffer. Returns NULL on error. */
 static char *read_file_str(const char *path, size_t *out_len) {
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         if (out_len) {
             *out_len = 0;
@@ -5928,7 +5928,7 @@ static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file
     }
 
     /* Check if already present in rc file */
-    FILE *f = fopen(rc_file, "r");
+    FILE *f = cbm_fopen(rc_file, "r");
     if (f) {
         char buf[CLI_BUF_2K];
         while (fgets(buf, sizeof(buf), f)) {
@@ -5946,7 +5946,7 @@ static int cbm_ensure_path_for_platform(const char *bin_dir, const char *rc_file
         return 0;
     }
 
-    f = fopen(rc_file, "a");
+    f = cbm_fopen(rc_file, "a");
     if (!f) {
         return CLI_ERR;
     }
@@ -8506,7 +8506,7 @@ static bool cbm_agent_registry_path_exists(const char *path, const void *context
 #ifndef _WIN32
     return path && path[0] && lstat(path, &state) == 0 && !S_ISLNK(state.st_mode);
 #else
-    return path && path[0] && stat(path, &state) == 0;
+    return path && path[0] && cbm_stat(path, &state) == 0;
 #endif
 }
 
@@ -9146,7 +9146,7 @@ static void install_vscode_profile_configs(const char *code_user, const char *bi
         char profile_path[CLI_BUF_1K];
         snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
         struct stat st;
-        if (stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (cbm_stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
             continue;
         }
         char cp[CLI_BUF_1K];
@@ -9173,7 +9173,7 @@ static void uninstall_vscode_profile_configs(const char *code_user, const char *
         char profile_dir[CLI_BUF_1K];
         snprintf(profile_dir, sizeof(profile_dir), "%s/%s", profiles_dir, entry->name);
         struct stat state;
-        if (stat(profile_dir, &state) != 0 || !S_ISDIR(state.st_mode)) {
+        if (cbm_stat(profile_dir, &state) != 0 || !S_ISDIR(state.st_mode)) {
             continue;
         }
         char config_path[CLI_BUF_1K];
@@ -10210,7 +10210,7 @@ int cbm_cmd_install(int argc, char **argv) {
     (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
 
     struct stat target_status;
-    bool target_exists = (stat(bin_target, &target_status) == 0);
+    bool target_exists = (cbm_stat(bin_target, &target_status) == 0);
     bool same_binary = cbm_same_file(self_path, bin_target);
     bool do_copy = !same_binary && (!target_exists || force);
 
@@ -10645,7 +10645,7 @@ static int cbm_remove_managed_instructions(const char *instructions_path) {
     if (lstat(instructions_path, &state) == 0 && S_ISREG(state.st_mode) && state.st_size == 0 &&
         cbm_unlink(instructions_path) != 0) {
 #else
-    if (stat(instructions_path, &state) == 0 && S_ISREG(state.st_mode) && state.st_size == 0 &&
+    if (cbm_stat(instructions_path, &state) == 0 && S_ISREG(state.st_mode) && state.st_size == 0 &&
         cbm_unlink(instructions_path) != 0) {
 #endif
         return CLI_ERR;
@@ -11602,7 +11602,7 @@ static void cli_uninstall_report_leftover_installer(const char *bin_path, bool d
             continue;
         }
         struct stat installer_status;
-        if (stat(installer_path, &installer_status) != 0) {
+        if (cbm_stat(installer_path, &installer_status) != 0) {
             continue;
         }
         if (dry_run) {
@@ -11739,7 +11739,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp", home);
 #endif
     struct stat binary_status;
-    bool binary_exists = stat(bin_path, &binary_status) == 0;
+    bool binary_exists = cbm_stat(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
     if (!dry_run && binary_exists) {
         cbm_activation_transaction_status_t stage_status =
@@ -11856,7 +11856,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
     const char *tmp_archive = args.tmp_archive;
     const char *ext = args.ext;
     const char *bin_dest = args.bin_dest;
-    FILE *f = fopen(tmp_archive, "rb");
+    FILE *f = cbm_fopen(tmp_archive, "rb");
     if (!f) {
         (void)fprintf(stderr, "error: cannot open %s\n", tmp_archive);
         return CLI_TRUE;

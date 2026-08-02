@@ -196,16 +196,59 @@ static bool has_stale_freshness_view(const char *json, const char *view_name) {
            strstr(json, "\"stale_views\"") && strstr(json, view_name);
 }
 
-static bool has_dirty_freshness_counts(const char *json, int pending, int overlay_ready) {
+static bool has_dirty_freshness_counts(const char *response, int pending, int overlay_ready) {
     char pending_buf[CBM_SZ_64];
     char overlay_buf[CBM_SZ_64];
+    char toon_pending_buf[CBM_SZ_64];
+    char toon_overlay_buf[CBM_SZ_64];
     snprintf(pending_buf, sizeof(pending_buf), "\"dirty_files_pending\":%d", pending);
     snprintf(overlay_buf, sizeof(overlay_buf), "\"dirty_files_overlay_ready\":%d",
              overlay_ready);
-    return json && strstr(json, "\"freshness\"") &&
-           strstr(json, "\"state\":\"dirty_with_warning\"") &&
-           strstr(json, "\"stale_scope\":\"dirty_files\"") &&
-           strstr(json, pending_buf) && strstr(json, overlay_buf);
+    snprintf(toon_pending_buf, sizeof(toon_pending_buf), "freshness_dirty_files_pending: %d",
+             pending);
+    snprintf(toon_overlay_buf, sizeof(toon_overlay_buf),
+             "freshness_dirty_files_overlay_ready: %d", overlay_ready);
+    if (!response) {
+        return false;
+    }
+    bool json_metadata = strstr(response, "\"freshness\"") &&
+                         strstr(response, "\"state\":\"dirty_with_warning\"") &&
+                         strstr(response, "\"stale_scope\":\"dirty_files\"") &&
+                         strstr(response, pending_buf) && strstr(response, overlay_buf);
+    bool toon_metadata = strstr(response, "freshness_state: dirty_with_warning") &&
+                         strstr(response, "freshness_stale_scope: dirty_files") &&
+                         strstr(response, toon_pending_buf) && strstr(response, toon_overlay_buf);
+    return json_metadata || toon_metadata;
+}
+
+/* Freshness facts are one logical contract with JSON and TOON serializers.
+ * Keep format mapping in these helpers so behavioral tests cannot accidentally
+ * pin the configured default to one wire representation. Each check is O(N)
+ * in response bytes with O(1) auxiliary memory. */
+static bool has_freshness_string(const char *response, const char *key, const char *value) {
+    char json_fragment[CBM_SZ_256];
+    char toon_fragment[CBM_SZ_256];
+    if (!response || !key || !value) {
+        return false;
+    }
+    int json_n = snprintf(json_fragment, sizeof(json_fragment), "\"%s\":\"%s\"", key, value);
+    int toon_n = snprintf(toon_fragment, sizeof(toon_fragment), "freshness_%s: %s", key, value);
+    return json_n >= 0 && (size_t)json_n < sizeof(json_fragment) && toon_n >= 0 &&
+           (size_t)toon_n < sizeof(toon_fragment) &&
+           (strstr(response, json_fragment) || strstr(response, toon_fragment));
+}
+
+static bool has_freshness_integer(const char *response, const char *key, int value) {
+    char json_fragment[CBM_SZ_256];
+    char toon_fragment[CBM_SZ_256];
+    if (!response || !key) {
+        return false;
+    }
+    int json_n = snprintf(json_fragment, sizeof(json_fragment), "\"%s\":%d", key, value);
+    int toon_n = snprintf(toon_fragment, sizeof(toon_fragment), "freshness_%s: %d", key, value);
+    return json_n >= 0 && (size_t)json_n < sizeof(json_fragment) && toon_n >= 0 &&
+           (size_t)toon_n < sizeof(toon_fragment) &&
+           (strstr(response, json_fragment) || strstr(response, toon_fragment));
 }
 
 static int mcp_store_node_qn_exists(cbm_store_t *store, const char *project,
@@ -1568,6 +1611,85 @@ TEST(tool_list_projects_includes_tmp_prefixed_project) {
     cbm_rmdir(cache);
     PASS();
 }
+
+#ifdef _WIN32
+/* Project discovery and query resolution validate each database before opening
+ * it. Keep that validation on the same UTF-8 path contract as the store: one
+ * CJK cache path must work end-to-end for both surfaces. Fixture setup and
+ * teardown are O(P) in the path length plus the normal O(database pages) store
+ * work, with no retained allocation beyond the server/store lifetimes. */
+TEST(tool_list_and_query_projects_in_cjk_cache_path_windows) {
+    char *temporary = th_mktempdir("cbm-mcp-cjk-cache");
+    ASSERT_NOT_NULL(temporary);
+    char temporary_copy[CBM_SZ_1K];
+    ASSERT_TRUE(snprintf(temporary_copy, sizeof(temporary_copy), "%s", temporary) > 0);
+
+    char cache[CBM_SZ_1K];
+    int written = snprintf(cache, sizeof(cache), "%s/%s", temporary_copy,
+                           "\xE4\xB8\xAD\xE6\x96\x87\xE7\xBC\x93\xE5\xAD\x98");
+    ASSERT_TRUE(written > 0 && (size_t)written < sizeof(cache));
+    ASSERT_EQ(th_mkdir_p(cache), 0);
+
+    static const char project[] = "cjk-cache-project";
+    char db_path[CBM_SZ_1K];
+    written = snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    ASSERT_TRUE(written > 0 && (size_t)written < sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, temporary_copy), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "CjkCacheVisible",
+                       .qualified_name = "cjk.cache.CjkCacheVisible",
+                       .file_path = "src/cache.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    cbm_store_close(store);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    const char *saved_auto = getenv("CBM_AUTO_INDEX");
+    char *saved_auto_copy = saved_auto ? cbm_strdup(saved_auto) : NULL;
+    bool environment_ready = cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                             cbm_setenv("CBM_AUTO_INDEX", "false", 1) == 0;
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    bool server_ready = srv != NULL;
+    char *response = srv ? cbm_mcp_handle_tool(srv, "list_projects", "{}") : NULL;
+    char *inner = response ? extract_text_content(response) : NULL;
+    bool list_ready = inner && strstr(inner, project);
+    free(inner);
+    free(response);
+
+    response = srv ? cbm_mcp_handle_tool(
+                         srv, "query_graph",
+                         "{\"project\":\"cjk-cache-project\","
+                         "\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 1\"}")
+                   : NULL;
+    inner = response ? extract_text_content(response) : NULL;
+    bool query_ready = inner && strstr(inner, "CjkCacheVisible") &&
+                       !strstr(inner, "project not found");
+    free(inner);
+    free(response);
+    if (srv) {
+        cbm_mcp_server_free(srv);
+    }
+
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    if (saved_auto_copy) {
+        ASSERT_EQ(cbm_setenv("CBM_AUTO_INDEX", saved_auto_copy, 1), 0);
+    } else {
+        ASSERT_EQ(cbm_unsetenv("CBM_AUTO_INDEX"), 0);
+    }
+    free(saved_auto_copy);
+    th_cleanup(temporary_copy);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(list_ready);
+    ASSERT_TRUE(query_ready);
+    PASS();
+}
+#endif
 
 TEST(tool_list_projects_first_context_resolves_session_store) {
     char cache[CBM_SZ_256];
@@ -4652,10 +4774,11 @@ TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(inner[0] != '\0' && inner[0] != '{');
     ASSERT_NOT_NULL(strstr(inner, "QueryStillVisible"));
-    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "warnings"));
     ASSERT_NOT_NULL(strstr(inner, "query_graph reads canonical graph rows"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "canonical_only"));
     ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
 
     free(inner);
@@ -4706,10 +4829,11 @@ TEST(tool_query_graph_uses_ready_overlay_for_node_only_query) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(inner[0] != '\0' && inner[0] != '{');
     ASSERT_NULL(strstr(inner, "OldVisibleInCypher"));
     ASSERT_NOT_NULL(strstr(inner, "FreshHiddenFromCypher"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":1"));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
+    ASSERT_TRUE(has_freshness_integer(inner, "active_file_tombstones", 1));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
 
     free(inner);
@@ -4763,9 +4887,9 @@ TEST(tool_query_graph_uses_additive_overlay_without_tombstone) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "StableVisibleInCypher"));
     ASSERT_NOT_NULL(strstr(inner, "FreshAdditiveCypher"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":0"));
-    ASSERT_NOT_NULL(strstr(inner, "\"overlay_owned_nodes_visible\":1"));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
+    ASSERT_TRUE(has_freshness_integer(inner, "active_file_tombstones", 0));
+    ASSERT_TRUE(has_freshness_integer(inner, "overlay_owned_nodes_visible", 1));
 
     free(inner);
     free(resp);
@@ -4839,7 +4963,7 @@ TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay) {
     ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
     ASSERT_NULL(strstr(inner, "OldSource"));
     ASSERT_NOT_NULL(strstr(inner, "\"0.9\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
 
     free(inner);
@@ -4857,7 +4981,7 @@ TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay) {
     ASSERT_NOT_NULL(strstr(inner, "FreshSource"));
     ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
     ASSERT_NULL(strstr(inner, "OldSource"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
     free(inner);
     free(resp);
@@ -4874,7 +4998,7 @@ TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay) {
     ASSERT_NOT_NULL(strstr(inner, "FreshSource"));
     ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
     ASSERT_NULL(strstr(inner, "OldSource"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
     free(inner);
     free(resp);
@@ -4891,7 +5015,7 @@ TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay) {
     ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
     ASSERT_NULL(strstr(inner, "FreshSource"));
     ASSERT_NULL(strstr(inner, "OldSource"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
     free(inner);
     free(resp);
@@ -4965,7 +5089,7 @@ TEST(tool_query_graph_uses_active_variable_length_relationship_query_with_ready_
     ASSERT_NOT_NULL(strstr(inner, "FreshVarSource"));
     ASSERT_NOT_NULL(strstr(inner, "OldVarTarget"));
     ASSERT_NULL(strstr(inner, "OldVarSource"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
 
     free(inner);
@@ -4983,7 +5107,7 @@ TEST(tool_query_graph_uses_active_variable_length_relationship_query_with_ready_
     ASSERT_NOT_NULL(strstr(inner, "FreshVarSource"));
     ASSERT_NOT_NULL(strstr(inner, "OldVarTarget"));
     ASSERT_NULL(strstr(inner, "OldVarSource"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
 
     free(inner);
@@ -5050,7 +5174,7 @@ TEST(tool_query_graph_uses_active_edges_for_degree_and_exists) {
     ASSERT_NOT_NULL(strstr(inner, "FreshDerivedSource"));
     ASSERT_NULL(strstr(inner, "OldDerivedSource"));
     ASSERT_NOT_NULL(strstr(inner, "\"1\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
     free(inner);
     free(resp);
@@ -5067,7 +5191,7 @@ TEST(tool_query_graph_uses_active_edges_for_degree_and_exists) {
     ASSERT_NOT_NULL(strstr(inner, "FreshDerivedSource"));
     ASSERT_NULL(strstr(inner, "OldDerivedSource"));
     ASSERT_NULL(strstr(inner, "StableTarget"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_TRUE(has_freshness_string(inner, "read_model", "overlay_active_nodes"));
     ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
     free(inner);
     free(resp);
@@ -18420,6 +18544,9 @@ SUITE(mcp) {
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
+#ifdef _WIN32
+    RUN_TEST(tool_list_and_query_projects_in_cjk_cache_path_windows);
+#endif
     RUN_TEST(tool_list_projects_first_context_resolves_session_store);
     RUN_TEST(tool_index_repository_first_context_uses_published_target_project);
     RUN_TEST(tool_index_repository_unpublished_result_keeps_session_context);

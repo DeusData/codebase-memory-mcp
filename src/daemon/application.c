@@ -365,7 +365,7 @@ static bool application_regular_db_exists(const char *project) {
         return false;
     }
     struct stat status;
-    return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+    return cbm_stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
 static cbm_daemon_application_watch_t *application_find_watch_locked(
@@ -2334,7 +2334,7 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     }
     struct stat root_status;
     canonical =
-        canonical && stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
+        canonical && cbm_stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
     bool set =
         canonical && cbm_mcp_server_set_session_context(session->mcp, canonical_root,
                                                         allowed_present ? canonical_allowed : NULL);
@@ -3204,7 +3204,7 @@ static int application_background_index(cbm_daemon_application_t *application,
     char canonical_root[APPLICATION_PATH_CAP];
     struct stat root_status;
     if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
-        stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        cbm_stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
         return -1;
     }
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);

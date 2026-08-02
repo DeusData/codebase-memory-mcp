@@ -671,7 +671,7 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
             return CBM_STORE_ERR;
         }
         struct stat st;
-        if (stat(files[i].path, &st) != 0) {
+        if (cbm_stat(files[i].path, &st) != 0) {
             (void)cbm_store_rollback(store);
             return CBM_STORE_ERR;
         }
@@ -720,7 +720,7 @@ int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_d
         return CBM_STORE_ERR;
     }
     struct stat st;
-    if (stat(file->path, &st) != 0) {
+    if (cbm_stat(file->path, &st) != 0) {
         return CBM_STORE_ERR;
     }
     if (cbm_pipeline_content_hash_file(file->path, delta->file_content_hash,
