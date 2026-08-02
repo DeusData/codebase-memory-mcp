@@ -35,7 +35,7 @@ static void git_dirty_hash_file_metadata(const char *repo_path, char **paths, in
             continue;
         }
         struct stat st;
-        if (stat(abs_path, &st) == 0) {
+        if (cbm_stat(abs_path, &st) == 0) {
             int64_t mtime_ns = cbm_stat_mtime_ns(&st);
             int64_t size = (int64_t)st.st_size;
             *hash = git_dirty_hash_update(*hash, (const unsigned char *)&mtime_ns,

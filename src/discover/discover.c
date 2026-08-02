@@ -822,28 +822,6 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     return lang;
 }
 
-/* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */
-static int wide_stat(const char *path, struct stat *st) {
-#ifdef _WIN32
-    wchar_t *wpath = cbm_path_to_wide(path);
-    if (!wpath) {
-        return CBM_NOT_FOUND;
-    }
-    struct _stat64 wst;
-    int ret = _wstat64(wpath, &wst);
-    free(wpath);
-    if (ret != 0) {
-        return CBM_NOT_FOUND;
-    }
-    st->st_mode = wst.st_mode;
-    st->st_size = wst.st_size;
-    st->st_mtime = wst.st_mtime;
-    return 0;
-#else
-    return stat(path, st);
-#endif
-}
-
 /* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
  * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
  * discovery from walking through a junction that points outside the project
@@ -858,7 +836,7 @@ static int safe_stat(const char *abs_path, struct stat *st) {
             return CBM_NOT_FOUND;
         }
     }
-    return wide_stat(abs_path, st);
+    return cbm_stat(abs_path, st);
 #else
     if (lstat(abs_path, st) != 0) {
         return CBM_NOT_FOUND;
@@ -919,7 +897,7 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
     char gi_path[CBM_SZ_4K];
     snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", frame->dir);
     struct stat gi_st;
-    if (wide_stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
+    if (cbm_stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
         return cbm_gitignore_load(gi_path);
     }
     return NULL;
@@ -1116,7 +1094,7 @@ static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size
     char dot_git[CBM_SZ_4K];
     snprintf(dot_git, sizeof(dot_git), "%s/.git", repo_path);
     struct stat st;
-    if (wide_stat(dot_git, &st) != 0) {
+    if (cbm_stat(dot_git, &st) != 0) {
         return false;
     }
     if (S_ISDIR(st.st_mode)) {
@@ -1230,7 +1208,7 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
 
     /* Verify directory exists */
     struct stat st;
-    if (wide_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (cbm_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         return CBM_DISCOVER_ERROR;
     }
 
@@ -1259,7 +1237,7 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     gitignore = cbm_gitignore_load(gi_path);
     if (is_git_repo) {
         path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
-        has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
+        has_git_config = cbm_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
 
         char exc_path[CBM_SZ_4K];
         path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");

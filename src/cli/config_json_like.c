@@ -1383,7 +1383,7 @@ static int jl_read_file(const char *path, char **content_out, size_t *length_out
     *missing_out = false;
     memset(snapshot_out, 0, sizeof(*snapshot_out));
 #ifdef _WIN32
-    wchar_t *wide_path = cbm_utf8_to_wide(path);
+    wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_path) {
         return -1;
     }
@@ -1561,8 +1561,8 @@ static int jl_sync_parent_directory(const char *path) {
 
 static int jl_replace_atomic(const char *temp_path, const char *path, bool destination_exists) {
 #ifdef _WIN32
-    wchar_t *wide_temp = cbm_utf8_to_wide(temp_path);
-    wchar_t *wide_path = cbm_utf8_to_wide(path);
+    wchar_t *wide_temp = cbm_path_to_wide(temp_path);
+    wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_temp || !wide_path) {
         free(wide_temp);
         free(wide_path);

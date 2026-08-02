@@ -179,6 +179,15 @@ enum { CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL = 0 };
  * claiming cross-platform execution. */
 int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && defined(__APPLE__)
+/* Run synchronously after posix_spawnp has created a contained child and before
+ * the parent publishes it. Tests use this to hold an immediate-exit child as a
+ * zombie without adding timing sleeps to production code. */
+typedef void (*cbm_subprocess_darwin_post_spawn_test_hook_t)(long pid);
+void cbm_subprocess_set_darwin_post_spawn_hook_for_testing(
+    cbm_subprocess_darwin_post_spawn_test_hook_t hook);
+#endif
+
 #ifndef _WIN32
 /* Pre-exec descriptor hygiene shared by every POSIX child launcher. Resolve the
  * finite fallback bound before fork, then close descriptors in the child.

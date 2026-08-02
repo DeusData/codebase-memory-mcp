@@ -1254,26 +1254,13 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
 
 /* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
  * On POSIX, lstat + S_ISLNK avoids following symlink cycles. On Windows
- * we use the UTF-8-safe wide stat (mirroring discover.c's wide_stat);
+ * we use the centralized UTF-8-safe cbm_stat();
  * reparse points (junctions/symlinks) are detected separately by
  * pkgmap_is_reparse_point below before we descend. Mirrors discover.c's
  * safe_stat. */
 static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_path_to_wide(abs_path);
-    if (!wpath) {
-        return CBM_NOT_FOUND;
-    }
-    struct _stat64 wst;
-    int ret = _wstat64(wpath, &wst);
-    free(wpath);
-    if (ret != 0) {
-        return CBM_NOT_FOUND;
-    }
-    st->st_mode = wst.st_mode;
-    st->st_size = wst.st_size;
-    st->st_mtime = wst.st_mtime;
-    return 0;
+    return cbm_stat(abs_path, st);
 #else
     if (lstat(abs_path, st) != 0) {
         return CBM_NOT_FOUND;

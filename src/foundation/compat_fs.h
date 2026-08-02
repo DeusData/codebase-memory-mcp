@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "foundation/constants.h"
 
@@ -48,6 +49,14 @@ int cbm_pclose(FILE *f);
 int cbm_pclose_exit_code(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
+
+/* Read metadata for a UTF-8 filesystem path. POSIX delegates to stat();
+ * Windows converts once to UTF-16 and uses _wstat64 so non-ASCII and extended
+ * paths never pass through the ANSI CRT. The Windows conversion costs O(P)
+ * runtime and O(P) transient memory for P path bytes; POSIX remains O(1)
+ * wrapper overhead. Returns 0 on success and -1 with errno preserved on
+ * failure. */
+int cbm_stat(const char *path, struct stat *out);
 
 enum {
     CBM_FILE_CONTENT_HASH_HEX_LEN = (int)(sizeof(uint64_t) * PAIR_LEN),

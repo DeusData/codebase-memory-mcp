@@ -783,7 +783,7 @@ bool cbm_artifact_exists(const char *repo_path) {
     }
 
     struct stat st;
-    if (stat(zst_path, &st) != 0 || st.st_size == 0) {
+    if (cbm_stat(zst_path, &st) != 0 || st.st_size == 0) {
         return false;
     }
 

@@ -130,6 +130,42 @@ struct cbm_dir {
     bool done;
 };
 
+int cbm_stat(const char *path, struct stat *out) {
+    if (!path || !out) {
+        errno = EINVAL;
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    wchar_t *wide_path = cbm_path_to_wide(path);
+    if (!wide_path) {
+        if (errno == 0) {
+            errno = EINVAL;
+        }
+        return CBM_NOT_FOUND;
+    }
+    struct _stat64 wide_state;
+    int rc = _wstat64(wide_path, &wide_state);
+    int saved_error = errno;
+    free(wide_path);
+    errno = saved_error;
+    if (rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+    *out = (struct stat){0};
+    out->st_dev = wide_state.st_dev;
+    out->st_ino = wide_state.st_ino;
+    out->st_mode = wide_state.st_mode;
+    out->st_nlink = wide_state.st_nlink;
+    out->st_uid = wide_state.st_uid;
+    out->st_gid = wide_state.st_gid;
+    out->st_rdev = wide_state.st_rdev;
+    out->st_size = wide_state.st_size;
+    out->st_atime = wide_state.st_atime;
+    out->st_mtime = wide_state.st_mtime;
+    out->st_ctime = wide_state.st_ctime;
+    return 0;
+}
+
 bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
     if (out) {
         *out = (cbm_file_identity_t){0};
@@ -145,7 +181,7 @@ bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
     }
     HANDLE handle = CreateFileW(wpath, FILE_READ_ATTRIBUTES,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     free(wpath);
     if (handle == INVALID_HANDLE_VALUE) {
         return false;
@@ -979,6 +1015,14 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+int cbm_stat(const char *path, struct stat *out) {
+    if (!path || !out) {
+        errno = EINVAL;
+        return CBM_NOT_FOUND;
+    }
+    return stat(path, out);
+}
+
 bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
     if (out) {
         *out = (cbm_file_identity_t){0};
@@ -987,7 +1031,7 @@ bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
         return false;
     }
     struct stat state;
-    if (stat(path, &state) != 0) {
+    if (cbm_stat(path, &state) != 0) {
         return false;
     }
     out->volume = (uint64_t)state.st_dev;

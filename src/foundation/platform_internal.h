@@ -22,6 +22,11 @@ uint64_t cbm_platform_scale_counter_ns(uint64_t counter, uint64_t frequency);
 bool cbm_platform_parse_proc_stat_group(const char *stat_line, int64_t *process_group,
                                         bool *execution_quiescent);
 
+/* Return true only when a /proc process entry is proven to have disappeared
+ * between enumeration and inspection. Access, I/O, and ambiguous EOF failures
+ * remain fail-closed so a live group member cannot be mistaken for a zombie. */
+bool cbm_platform_proc_entry_vanished(int error_code);
+
 /* Inspect whether a POSIX process group has any member that can still execute.
  * UNKNOWN is fail-closed: the platform lacks a process table, access was denied,
  * or a snapshot could not be read consistently. Windows subprocess containment

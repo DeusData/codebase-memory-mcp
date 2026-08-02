@@ -406,7 +406,7 @@ static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char
     char abs[CBM_SZ_4K];
     snprintf(abs, sizeof(abs), "%s/%s", root_path, rel);
     struct stat st;
-    if (stat(abs, &st) == 0) {
+    if (cbm_stat(abs, &st) == 0) {
         int64_t mt = cbm_stat_mtime_ns(&st);
         int64_t sz = (int64_t)st.st_size;
         h = sig_fold(h, &mt, sizeof(mt));
@@ -483,7 +483,7 @@ static void watcher_record_dirty_path(cbm_watcher_t *w, const project_state_t *s
     if (n >= 0 && (size_t)n < sizeof(abs_path)) {
         (void)cbm_file_content_hash(abs_path, observed_hash, sizeof(observed_hash));
         struct stat st;
-        if (stat(abs_path, &st) == 0) {
+        if (cbm_stat(abs_path, &st) == 0) {
             observed_mtime_ns = cbm_stat_mtime_ns(&st);
             observed_size = (int64_t)st.st_size;
         }
@@ -831,7 +831,7 @@ static root_status_t root_status(const char *root_path, int *out_errno) {
         return ROOT_UNCERTAIN;
     }
     struct stat st;
-    if (stat(root_path, &st) == 0) {
+    if (cbm_stat(root_path, &st) == 0) {
         /* Exists but is no longer a directory → the root directory is gone. */
         return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
     }
@@ -1181,7 +1181,7 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 /* Init baseline for a project: check if git, get HEAD, count files */
 static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     struct stat st;
-    if (stat(s->root_path, &st) != 0) {
+    if (cbm_stat(s->root_path, &st) != 0) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;

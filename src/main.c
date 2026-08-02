@@ -669,7 +669,7 @@ static char *cli_slurp_stream(FILE *f) {
 
 /* Slurp a file path into a heap, NUL-terminated string. Caller frees. */
 static char *cli_slurp_file(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }

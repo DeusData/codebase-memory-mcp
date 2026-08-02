@@ -10344,8 +10344,11 @@ TEST(envscan_accepts_root_path_longer_than_512_bytes) {
         int appended = snprintf(scan_root + used, sizeof(scan_root) - used,
                                 "/component_%03d_abcdefghijkl", component++);
         ASSERT_TRUE(appended > 0 && (size_t)appended < sizeof(scan_root) - used);
-        ASSERT_EQ(cbm_mkdir(scan_root), 0);
     }
+    /* Create the complete deep path once through the same UTF-8/extended-path
+     * helper used by production. Re-running mkdir-p for every prefix would add
+     * avoidable O(D * P) test setup work for depth D and final path length P. */
+    ASSERT_EQ(th_mkdir_p(scan_root), 0);
     char file_path[CBM_SZ_2K];
     int file_len = snprintf(file_path, sizeof(file_path), "%s/config.sh", scan_root);
     ASSERT_TRUE(file_len > 0 && (size_t)file_len < sizeof(file_path));

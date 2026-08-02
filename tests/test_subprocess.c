@@ -321,6 +321,42 @@ static void subprocess_test_pause(void) {
     (void)cbm_nanosleep(&delay, NULL);
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && defined(__APPLE__)
+enum { CBM_DARWIN_ZOMBIE_OBSERVE_TIMEOUT_MS = 1000 };
+static bool darwin_post_spawn_observed_zombie;
+
+static void hold_darwin_managed_child_as_zombie(long child_pid) {
+    uint64_t deadline = cbm_now_ms() + CBM_DARWIN_ZOMBIE_OBSERVE_TIMEOUT_MS;
+    do {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (waitid(P_PID, (id_t)child_pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            info.si_pid == (pid_t)child_pid) {
+            darwin_post_spawn_observed_zombie = true;
+            return;
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline);
+}
+
+TEST(subprocess_darwin_managed_spawn_accepts_immediate_exit_zombie) {
+    darwin_post_spawn_observed_zombie = false;
+    cbm_subprocess_set_darwin_post_spawn_hook_for_testing(hold_darwin_managed_child_as_zombie);
+
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/usr/bin/true";
+    cbm_proc_result_t result = {0};
+    int run_rc = cbm_subprocess_run(&opts, &result);
+
+    cbm_subprocess_set_darwin_post_spawn_hook_for_testing(NULL);
+    ASSERT_TRUE(darwin_post_spawn_observed_zombie);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(result.tree_quiesced);
+    PASS();
+}
+#endif
+
 static bool poll_until_terminal(cbm_subprocess_t *process, int timeout_ms, cbm_proc_result_t *out) {
     uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
     do {
@@ -1354,6 +1390,9 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_outcome_str);
     RUN_TEST(subprocess_run_clean);
     RUN_TEST(subprocess_short_child_uses_fast_reap_window);
+#if defined(CBM_ENABLE_TEST_SEAMS) && defined(__APPLE__)
+    RUN_TEST(subprocess_darwin_managed_spawn_accepts_immediate_exit_zombie);
+#endif
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_resolves_literal_binary_name_from_path);
     RUN_TEST(subprocess_run_crash_is_crash);

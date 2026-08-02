@@ -80,6 +80,10 @@ bool cbm_platform_parse_proc_stat_group(const char *stat_line, int64_t *process_
     return true;
 }
 
+bool cbm_platform_proc_entry_vanished(int error_code) {
+    return error_code == ENOENT || error_code == ESRCH;
+}
+
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
  * Windows drive letters are case-insensitive, but a lowercase one (as agent
  * CWDs often report, e.g. Claude Code's "c:\...") otherwise produces a distinct
@@ -295,8 +299,18 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
     }
     bool saw_member = false;
     bool snapshot_unknown = false;
-    cbm_dirent_t *entry = NULL;
-    while ((entry = cbm_readdir(directory)) != NULL) {
+    for (;;) {
+        /* POSIX readdir distinguishes EOF from failure through errno. Reset it
+         * for each wrapper call so a truncated /proc snapshot stays fail-closed.
+         * The scan remains O(P) runtime and O(1) auxiliary memory. */
+        errno = 0;
+        cbm_dirent_t *entry = cbm_readdir(directory);
+        if (!entry) {
+            if (errno != 0) {
+                snapshot_unknown = true;
+            }
+            break;
+        }
         if (!entry->name[0]) {
             continue;
         }
@@ -319,16 +333,26 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
         errno = 0;
         FILE *file = cbm_fopen(path, "r");
         if (!file) {
-            if (errno != ENOENT && errno != ESRCH) {
+            if (!cbm_platform_proc_entry_vanished(errno)) {
                 snapshot_unknown = true;
             }
             continue;
         }
         char stat_line[4096];
+        errno = 0;
         bool read_ok = fgets(stat_line, sizeof(stat_line), file) != NULL;
+        int read_error = errno;
+        bool read_failed = ferror(file) != 0;
         (void)fclose(file);
         if (!read_ok) {
-            snapshot_unknown = true;
+            /* Linux does not pin a process through an open /proc/<pid> file.
+             * If it exits between fopen and fgets, the read usually fails with
+             * ESRCH. Treat only that proven disappearance (or ENOENT) like the
+             * equivalent pre-open race; ambiguous EOF and every other error
+             * remain UNKNOWN so live members cannot be missed. */
+            if (!read_failed || !cbm_platform_proc_entry_vanished(read_error)) {
+                snapshot_unknown = true;
+            }
             continue;
         }
         int64_t process_group = 0;
@@ -448,17 +472,17 @@ int cbm_nprocs(void) {
 
 bool cbm_file_exists(const char *path) {
     struct stat st;
-    return stat(path, &st) == 0;
+    return cbm_stat(path, &st) == 0;
 }
 
 bool cbm_is_dir(const char *path) {
     struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    return cbm_stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 int64_t cbm_file_size(const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (cbm_stat(path, &st) != 0) {
         return CBM_NOT_FOUND;
     }
     return (int64_t)st.st_size;
