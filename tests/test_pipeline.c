@@ -1280,6 +1280,61 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
 
 static cbm_config_t *incremental_test_config(const char *cache_dir);
 
+/* Nix attrpath qualification, end to end. A call inside a scoped binding must
+ * source to the QUALIFIED definition.
+ *
+ * This has to be a pipeline test rather than an extraction one. Definition QNs
+ * (extract_defs.c) and call-scope QNs (extract_unified.c) are computed by two
+ * separate functions. If they disagree by even one segment, the CALLS edge names
+ * a source node that was never minted and is dropped at write — with no error,
+ * and with every extraction-level assertion still passing. Only the store sees it.
+ *
+ * Both callers below are scoped, one by an enclosing attrset and one by a dotted
+ * attrpath, so this covers both routes into the qualified name. */
+TEST(pipeline_nix_scoped_binding_calls_resolve) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char nix_path[512];
+    snprintf(nix_path, sizeof(nix_path), "%s/lib.nix", g_tmpdir);
+    FILE *nf = fopen(nix_path, "w");
+    if (!nf) {
+        teardown_test_repo();
+        FAIL("failed to write nix fixture");
+    }
+    fprintf(nf, "{ prelude }:\n"
+                "let\n"
+                "  nixTarget = t: t + 1;\n"
+                "in\n"
+                "{\n"
+                "  setA = { nixCaller = x: nixTarget x; };\n"
+                "  outer.inner.nixDeepCaller = y: nixTarget y;\n"
+                "}\n");
+    fclose(nf);
+
+    char nix_db[512];
+    snprintf(nix_db, sizeof(nix_db), "%s/test_nix_calls.db", g_tmpdir);
+
+    cbm_pipeline_t *np = cbm_pipeline_new(g_tmpdir, nix_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(np);
+    ASSERT_EQ(cbm_pipeline_run(np), 0);
+
+    cbm_store_t *ns = cbm_store_open_path(nix_db);
+    ASSERT_NOT_NULL(ns);
+    const char *nix_project = cbm_pipeline_project_name(np);
+
+    /* Scoped by an enclosing attrset: the def QN is proj.lib.setA.nixCaller. */
+    ASSERT(cross_file_call_exists(ns, nix_project, "nixCaller", "nixTarget"));
+    /* Scoped by a dotted attrpath: proj.lib.outer.inner.nixDeepCaller. */
+    ASSERT(cross_file_call_exists(ns, nix_project, "nixDeepCaller", "nixTarget"));
+
+    cbm_store_close(ns);
+    cbm_pipeline_free(np);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: incremental re-index of an edited file must NOT drop inbound
  * cross-file CALLS edges whose source lives in an UNCHANGED file.
  *
@@ -3589,6 +3644,104 @@ TEST(pipeline_go_cross_package_call) {
     PASS();
 }
 
+/* End-to-end (issue #551 item 1): two SwiftPM packages, Core and App,
+ * indexed under one root. App declares a local path dependency on Core and
+ * a target dependency on Core's product; App.swift does a bare
+ * `import Core`. This only resolves because Core's OWN Package.swift
+ * self-registers "Core" -> Core/Sources/Core in the shared pkgmap, landing
+ * App.swift's IMPORTS edge on that directory's Folder node -- proving real
+ * cross-package resolution. Asserts the EXACT provider node (the
+ * Core/Sources/Core Folder, found by its real QN, not a substring guess)
+ * and the exact edge (from App.swift's own file node to that provider) --
+ * stronger than repro_issue408.c/repro_issue56.c's own count/substring
+ * checks, which this test intentionally does not settle for. */
+TEST(pipeline_swift_cross_package_import) {
+    const char *files[] = {
+        "Core/Package.swift",
+        "Core/Sources/Core/Core.swift",
+        "App/Package.swift",
+        "App/Sources/App/App.swift",
+    };
+    const char *contents[] = {
+        ("let package = Package(\n"
+         "    name: \"Core\",\n"
+         "    products: [.library(name: \"Core\", targets: [\"Core\"])],\n"
+         "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+         ")\n"),
+
+        "public func coreValue() -> Int {\n    return 1\n}\n",
+
+        ("let package = Package(\n"
+         "    name: \"App\",\n"
+         "    dependencies: [.package(path: \"../Core\")],\n"
+         "    targets: [.target(name: \"App\", dependencies: [\n"
+         "        .product(name: \"Core\", package: \"Core\")\n"
+         "    ])]\n"
+         ")\n"),
+
+        ("import Core\n\n"
+         "func run() -> Int {\n    return coreValue()\n}\n"),
+    };
+
+    if (setup_lang_repo(files, contents, 4) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* The exact provider node: the Folder for Core/Sources/Core, which is
+     * exactly what Core/Package.swift's OWN self-registration resolves to
+     * (see cbm_pkgmap_build: pkg name "Core" -> fqn_module(entry_rel)).
+     * cbm_pipeline_fqn_module and cbm_pipeline_fqn_folder agree on this
+     * path (no extension on any segment to strip), so this is the same QN
+     * the structural pass gave the real Folder node -- not a guess. */
+    char *provider_qn = cbm_pipeline_fqn_folder(proj, "Core/Sources/Core");
+    ASSERT_NOT_NULL(provider_qn);
+    cbm_node_t provider = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, provider_qn, &provider), CBM_STORE_OK);
+    ASSERT_STR_EQ(provider.label, "Folder");
+    free(provider_qn);
+
+    /* The exact importing file node: App/Sources/App/App.swift. */
+    char *importer_qn = cbm_pipeline_fqn_compute(proj, "App/Sources/App/App.swift", "__file__");
+    ASSERT_NOT_NULL(importer_qn);
+    cbm_node_t importer = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, importer_qn, &importer), CBM_STORE_OK);
+    free(importer_qn);
+
+    /* The IMPORTS edge must run from THAT importer to THAT provider --
+     * not merely "some edge lands on a QN containing Core" (a node named
+     * e.g. "AppCore" would have false-passed the old substring check). */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, importer.id, "IMPORTS", &edges, &ec),
+             CBM_STORE_OK);
+
+    bool found_exact_edge = false;
+    for (int i = 0; i < ec; i++) {
+        if (edges[i].target_id == provider.id) {
+            found_exact_edge = true;
+        }
+    }
+    ASSERT_TRUE(found_exact_edge);
+
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_node_free_fields(&provider);
+    cbm_node_free_fields(&importer);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_python_cross_module_call) {
     /* Port of TestPythonCrossModuleCallViaImport */
     const char *files[] = {"utils.py", "main.py"};
@@ -5490,10 +5643,10 @@ TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor) {
 TEST(pipeline_file_delta_descriptor_from_gbuf) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
-    int64_t file_id = cbm_gbuf_upsert_node(gb, "File", "main.go", "proj.main.__file__",
-                                           "main.go", 1, 1, "{}");
-    int64_t run_id = cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run",
-                                          "main.go", 3, 5, "{\"is_exported\":true}");
+    int64_t file_id =
+        cbm_gbuf_upsert_node(gb, "File", "main.go", "proj.main.__file__", "main.go", 1, 1, "{}");
+    int64_t run_id = cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run", "main.go", 3, 5,
+                                          "{\"is_exported\":true}");
     int64_t helper_id = cbm_gbuf_upsert_node(gb, "Function", "Helper", "proj.helper.Helper",
                                              "helper.go", 1, 3, "{\"is_exported\":true}");
     ASSERT_GT(file_id, 0);
@@ -5704,8 +5857,8 @@ TEST(pipeline_file_delta_preserves_sibling_named_imports_to_shared_target) {
 TEST(pipeline_file_delta_descriptor_marks_unsupported_edges) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
-    int64_t run_id = cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run",
-                                          "main.go", 3, 5, "{}");
+    int64_t run_id =
+        cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run", "main.go", 3, 5, "{}");
     ASSERT_GT(run_id, 0);
     ASSERT_GT(cbm_gbuf_insert_edge(gb, run_id, 9999, "CALLS", "{}"), 0);
 
@@ -10122,6 +10275,259 @@ static int has_binding_value(const cbm_env_binding_t *bindings, int count, const
     return 0;
 }
 
+enum {
+    ENVSCAN_WIDE_DIRECTORY_COUNT = CBM_SZ_256 + 17,
+    ENVSCAN_OLD_FILE_LIMIT_BYTES = CBM_SZ_1K * CBM_SZ_1K,
+};
+
+static int envscan_write_large_file(const char *path, const char *first_line, size_t total_bytes) {
+    FILE *file = cbm_fopen(path, "wb");
+    if (!file) {
+        return -1;
+    }
+    size_t written = strlen(first_line);
+    if (written > total_bytes || fwrite(first_line, 1, written, file) != written) {
+        (void)fclose(file);
+        return -1;
+    }
+    static const char padding[] = "# padding keeps this a valid ignored shell comment\n";
+    while (written < total_bytes) {
+        size_t remaining = total_bytes - written;
+        size_t chunk = remaining < sizeof(padding) - 1U ? remaining : sizeof(padding) - 1U;
+        if (fwrite(padding, 1, chunk, file) != chunk) {
+            (void)fclose(file);
+            return -1;
+        }
+        written += chunk;
+    }
+    return fclose(file);
+}
+
+TEST(envscan_walks_more_than_256_pending_directories) {
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_wide_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    for (int i = 0; i < ENVSCAN_WIDE_DIRECTORY_COUNT; i++) {
+        char dir_path[CBM_SZ_512];
+        char file_path[CBM_SZ_512];
+        int dir_len = snprintf(dir_path, sizeof(dir_path), "%s/d_%03d", tmpdir, i);
+        int file_len = snprintf(file_path, sizeof(file_path), "%s/config.sh", dir_path);
+        ASSERT_TRUE(dir_len > 0 && (size_t)dir_len < sizeof(dir_path));
+        ASSERT_TRUE(file_len > 0 && (size_t)file_len < sizeof(file_path));
+        ASSERT_EQ(cbm_mkdir(dir_path), 0);
+        ASSERT_EQ(th_write_file(file_path, "export WIDE_URL=https://wide.example.test/v1\n"), 0);
+    }
+
+    cbm_env_binding_t *bindings = calloc(ENVSCAN_WIDE_DIRECTORY_COUNT, sizeof(*bindings));
+    ASSERT_NOT_NULL(bindings);
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, ENVSCAN_WIDE_DIRECTORY_COUNT);
+    ASSERT_EQ(count, ENVSCAN_WIDE_DIRECTORY_COUNT);
+
+    free(bindings);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_accepts_root_path_longer_than_512_bytes) {
+    char cleanup_root[CBM_SZ_256];
+    char scan_root[CBM_SZ_2K];
+    snprintf(cleanup_root, sizeof(cleanup_root), "/tmp/cbm_envscan_longroot_XXXXXX");
+    if (!cbm_mkdtemp(cleanup_root))
+        FAIL("tmpdir");
+    snprintf(scan_root, sizeof(scan_root), "%s", cleanup_root);
+
+    int component = 0;
+    while (strlen(scan_root) <= CBM_SZ_512) {
+        size_t used = strlen(scan_root);
+        int appended = snprintf(scan_root + used, sizeof(scan_root) - used,
+                                "/component_%03d_abcdefghijkl", component++);
+        ASSERT_TRUE(appended > 0 && (size_t)appended < sizeof(scan_root) - used);
+        ASSERT_EQ(cbm_mkdir(scan_root), 0);
+    }
+    char file_path[CBM_SZ_2K];
+    int file_len = snprintf(file_path, sizeof(file_path), "%s/config.sh", scan_root);
+    ASSERT_TRUE(file_len > 0 && (size_t)file_len < sizeof(file_path));
+    ASSERT_EQ(th_write_file(file_path, "export LONG_ROOT_URL=https://long.example.test/v1\n"), 0);
+
+    cbm_env_binding_t bindings[2] = {0};
+    int count = cbm_scan_project_env_urls(scan_root, bindings, 2);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "LONG_ROOT_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "LONG_ROOT_URL")->file_path, "config.sh");
+
+    th_rmtree(cleanup_root);
+    PASS();
+}
+
+TEST(envscan_uses_shared_file_size_policy) {
+    char tmpdir[CBM_SZ_256];
+    char file_path[CBM_SZ_512];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_large_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    snprintf(file_path, sizeof(file_path), "%s/config.sh", tmpdir);
+    ASSERT_EQ(envscan_write_large_file(file_path,
+                                       "export LARGE_FILE_URL=https://large.example.test/v1\n",
+                                       (size_t)ENVSCAN_OLD_FILE_LIMIT_BYTES + CBM_SZ_1K),
+              0);
+
+    cbm_env_binding_t bindings[2] = {0};
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 2);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "LARGE_FILE_URL"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_parses_one_complete_line_across_old_buffer_boundary) {
+    char tmpdir[CBM_SZ_256];
+    char file_path[CBM_SZ_512];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_longline_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    snprintf(file_path, sizeof(file_path), "%s/config.sh", tmpdir);
+
+    const char assignment[] = "BOUNDARY_URL=https://boundary.example.test/v1\n";
+    size_t prefix_len = CBM_SZ_2K - strlen("BOUNDARY_URL=https");
+    char *line = malloc(prefix_len + sizeof(assignment));
+    ASSERT_NOT_NULL(line);
+    memset(line, ' ', prefix_len);
+    memcpy(line + prefix_len, assignment, sizeof(assignment));
+    ASSERT_EQ(th_write_file(file_path, line), 0);
+    free(line);
+
+    cbm_env_binding_t bindings[2] = {0};
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 2);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "BOUNDARY_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "BOUNDARY_URL")->value,
+                  "https://boundary.example.test/v1");
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+enum {
+    ENVSCAN_CONCURRENT_SCANNER_COUNT = 4,
+    ENVSCAN_CONCURRENT_SCAN_REPETITIONS = 16,
+};
+
+typedef struct {
+    const char *root;
+    int successful_scans;
+} envscan_thread_context_t;
+
+static void *envscan_concurrent_scan_worker(void *opaque) {
+    envscan_thread_context_t *context = opaque;
+    for (int i = 0; i < ENVSCAN_CONCURRENT_SCAN_REPETITIONS; i++) {
+        cbm_env_binding_t binding = {0};
+        int count = cbm_scan_project_env_urls(context->root, &binding, 1);
+        if (count == 1 && strcmp(binding.key, "CONCURRENT_URL") == 0 &&
+            strcmp(binding.value, "https://concurrent.example.test/v1") == 0) {
+            context->successful_scans++;
+        }
+    }
+    return NULL;
+}
+
+TEST(envscan_concurrent_first_use_and_cleanup_reinitialize) {
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_threads_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    write_temp_file(tmpdir, "config.sh",
+                    "export CONCURRENT_URL=https://concurrent.example.test/v1\n");
+
+    /* Force the workers through the lazy first-use path together. The TSan
+     * target proves publication of the shared compiled regexes is ordered. */
+    cbm_envscan_free_patterns();
+    cbm_thread_t threads[ENVSCAN_CONCURRENT_SCANNER_COUNT];
+    envscan_thread_context_t contexts[ENVSCAN_CONCURRENT_SCANNER_COUNT] = {0};
+    int created = 0;
+    for (; created < ENVSCAN_CONCURRENT_SCANNER_COUNT; created++) {
+        contexts[created].root = tmpdir;
+        if (cbm_thread_create(&threads[created], 0, envscan_concurrent_scan_worker,
+                              &contexts[created]) != 0) {
+            break;
+        }
+    }
+    for (int i = 0; i < created; i++) {
+        ASSERT_EQ(cbm_thread_join(&threads[i]), 0);
+        ASSERT_EQ(contexts[i].successful_scans, ENVSCAN_CONCURRENT_SCAN_REPETITIONS);
+    }
+    ASSERT_EQ(created, ENVSCAN_CONCURRENT_SCANNER_COUNT);
+
+    cbm_envscan_free_patterns();
+    cbm_env_binding_t binding = {0};
+    ASSERT_EQ(cbm_scan_project_env_urls(tmpdir, &binding, 1), 1);
+    ASSERT_STR_EQ(binding.key, "CONCURRENT_URL");
+    ASSERT_STR_EQ(binding.value, "https://concurrent.example.test/v1");
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_reports_unrepresentable_key_and_value_without_truncating) {
+    char tmpdir[CBM_SZ_256];
+    char file_path[CBM_SZ_512];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_fields_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    snprintf(file_path, sizeof(file_path), "%s/config.sh", tmpdir);
+
+    const char normal_url[] = "https://field.example.test/v1";
+    const char value_key[] = "VALUE_URL=";
+    const char value_prefix[] = "https://field.example.test/";
+    const size_t key_length = sizeof(((cbm_env_binding_t *)0)->key);
+    const size_t value_length = sizeof(((cbm_env_binding_t *)0)->value);
+    FILE *file = cbm_fopen(file_path, "wb");
+    ASSERT_NOT_NULL(file);
+    for (size_t i = 0; i < key_length; i++) {
+        ASSERT_NEQ(fputc('K', file), EOF);
+    }
+    ASSERT_NEQ(fputc('=', file), EOF);
+    ASSERT_EQ(fwrite(normal_url, 1, strlen(normal_url), file), strlen(normal_url));
+    ASSERT_NEQ(fputc('\n', file), EOF);
+    ASSERT_EQ(fwrite(value_key, 1, strlen(value_key), file), strlen(value_key));
+    ASSERT_EQ(fwrite(value_prefix, 1, strlen(value_prefix), file), strlen(value_prefix));
+    for (size_t i = strlen(value_prefix); i < value_length; i++) {
+        ASSERT_NEQ(fputc('v', file), EOF);
+    }
+    ASSERT_NEQ(fputc('\n', file), EOF);
+    ASSERT_EQ(fclose(file), 0);
+
+    cbm_env_binding_t bindings[2] = {0};
+    pipeline_capture_logs_start();
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 2);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(count, 0);
+    ASSERT_NOT_NULL(strstr(logs, "reason=binding_unrepresentable"));
+    ASSERT_NOT_NULL(strstr(logs, "constraint=key_capacity"));
+    ASSERT_NOT_NULL(strstr(logs, "constraint=value_capacity"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_preserves_caller_output_capacity) {
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_capacity_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    write_temp_file(tmpdir, "config.sh",
+                    "export FIRST_URL=https://first.example.test/v1\n"
+                    "export SECOND_URL=https://second.example.test/v1\n");
+
+    cbm_env_binding_t bindings[2] = {0};
+    cbm_str_copy(bindings[1].key, sizeof(bindings[1].key), "UNTOUCHED");
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 1);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(bindings[1].key, "UNTOUCHED");
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(envscan_dockerfile_env_urls) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_dock_XXXXXX");
@@ -10535,6 +10941,332 @@ static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
     return 0;
 }
 
+/* Helper: return the entry_rel registered for `name`, or NULL. */
+static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return e->items[i].entry_rel;
+    }
+    return NULL;
+}
+
+/* ── SwiftPM Package.swift manifest resolution (issue #551 item 1) ──
+ *
+ * parse_package_swift is a literal pattern-extractor (mirrors
+ * parse_cargo_toml), not a Swift evaluator. These call cbm_pkgmap_try_parse
+ * directly, covering the RED categories the maintainer asked for (local
+ * path deps, remote identities, products not aliasing, targets, target-name
+ * deps, literal + computed `path:`, and comment/string false positives)
+ * plus fail-closed ambiguous-name cases. See pipeline_swift_cross_package_import
+ * above for the full end-to-end proof. */
+
+TEST(pkgmap_swift_targets_registers_module) {
+    static const char src[] =
+        "// swift-tools-version:5.9\n"
+        "import PackageDescription\n"
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* PackageDescription executableTarget declarations create importable Swift
+ * modules just like regular target declarations. The manifest scanner must
+ * recognize the factory itself rather than keying capability to one spelling. */
+TEST(pkgmap_swift_executable_target_registers_module) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Tooling\",\n"
+        "    targets: [.executableTarget(name: \"Tooling\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "Tools/Package.swift", src, (int)strlen(src),
+                                     &entries));
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Tooling"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Tooling"), "Tools/Sources/Tooling");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Manifest paths are input data, not a semantic output budget. A fixed local
+ * buffer used to return a plausible but truncated module path. Keep the full
+ * value or fail allocation; never silently redirect an IMPORTS edge. */
+TEST(pkgmap_swift_literal_path_is_not_silently_truncated) {
+    enum { SEGMENTS = 180 };
+    char path[SEGMENTS * sizeof("nested/") + sizeof("Module")];
+    size_t used = 0;
+    for (int i = 0; i < SEGMENTS; i++) {
+        memcpy(path + used, "nested/", sizeof("nested/") - 1);
+        used += sizeof("nested/") - 1;
+    }
+    memcpy(path + used, "Module", sizeof("Module"));
+
+    const char *prefix =
+        "let package = Package(name: \"Deep\", targets: [.target(name: \"Deep\", path: \"";
+    const char *suffix = "\")])\n";
+    size_t source_len = strlen(prefix) + strlen(path) + strlen(suffix);
+    char *source = malloc(source_len + 1);
+    ASSERT_NOT_NULL(source);
+    snprintf(source, source_len + 1, "%s%s%s", prefix, path, suffix);
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "Deep/Package.swift", source, (int)source_len,
+                                     &entries));
+    const char *entry = pkg_entries_entry_for(&entries, "Deep");
+    ASSERT_NOT_NULL(entry);
+    ASSERT_EQ(strlen(entry), strlen("Deep/") + strlen(path));
+    ASSERT_TRUE(strlen(entry) >= strlen("/Module"));
+    ASSERT_STR_EQ(entry + strlen(entry) - strlen("/Module"), "/Module");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    free(source);
+    PASS();
+}
+
+/* Products deliberately do NOT self-register a separate alias: a product
+ * name is not generally an importable module (SwiftPM lets it alias
+ * multiple targets, or none sharing its own name), so only the underlying
+ * target -- under its OWN name -- registers. */
+TEST(pkgmap_swift_products_do_not_register_alias) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    products: [.library(name: \"CoreKit\", targets: [\"CoreImpl\"])],\n"
+        "    targets: [.target(name: \"CoreImpl\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreImpl"), "Core/Sources/CoreImpl");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Regression: a target whose `name:` is the LAST argument, immediately
+ * followed by the call's own closing ')' with no trailing comma, must still
+ * register. swift_quoted_literal's terminator check used to compare against
+ * `end` with a strict '<', but every caller passes the wrapping call's own
+ * ')' position AS `end` -- so the literal's closing quote landing exactly
+ * on that boundary was wrongly rejected as "unterminated". Every other
+ * fixture in this file happens to follow `name:` with `dependencies:` or a
+ * comma, so this specific shape was previously untested and unnoticed. */
+TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\")]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A literal `path:` argument overrides the Sources/<name> convention. */
+TEST(pkgmap_swift_target_honors_literal_path) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", path: \"Vendor/CoreLegacy\")]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Vendor/CoreLegacy");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A `path:` argument that IS present but not a bare literal (computed) is
+ * unknowable -- SwiftPM would not use the Sources/<name> convention here,
+ * so guessing it anyway would mint a location likely to be wrong. Skip the
+ * target entirely (fail closed), even though its `name:` is a valid
+ * literal. */
+TEST(pkgmap_swift_target_computed_path_fails_closed) {
+    static const char src[] =
+        "let customPath = computePath()\n"
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", path: customPath)]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A `.target(` spelled inside a `//` line comment, a nesting-aware
+ * slash-star block comment, or a string literal must never be mistaken for a live
+ * declaration -- the bug a raw strstr scan cannot avoid. Only the one real
+ * target registers. */
+TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
+    static const char src[] =
+        "// .target(name: \"Decoy\")\n"
+        "/* outer /* nested */ still a comment: .target(name: \"NestedDecoy\") */\n"
+        "let manifestSnippet = \".target(name: \\\"StringDecoy\\\")\"\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "NestedDecoy"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "StringDecoy"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Local path + remote url dependencies (`.package(path:)` / `.package(url:)`)
+ * mint NO entries of their own -- mirroring package.json/Cargo.toml, only a
+ * manifest's OWN products/targets self-register. A local sibling's name is
+ * produced by ITS OWN Package.swift when the repo-wide walk reaches it
+ * (see repro_issue408.c's JS-workspace analog); a remote dependency has no
+ * local path to point at, so nothing is minted (fail-closed). */
+TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    dependencies: [\n"
+        "        .package(path: \"../Core\"),\n"
+        "        .package(url: \"https://github.com/example/RemoteKit.git\", from: \"1.0.0\")\n"
+        "    ],\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "RemoteKit"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Only App itself (the declaring target) registers -- a bare same-package
+ * target-name dependency ("Core") and a cross-package product dependency
+ * (Utils/UtilsPkg) name OTHER modules, not this manifest's own
+ * products/targets, so neither mints an entry. */
+TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\", dependencies: [\n"
+        "        \"Core\",\n"
+        "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+        "    ])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Utils"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "UtilsPkg"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Fail-closed on any `name:` that is not a bare literal: a computed
+ * variable, and a literal concatenated with a dynamic suffix (which a
+ * naive quote-scan would wrongly accept as "App"). Neither mints an entry,
+ * though the manifest is still recognized and parsed. */
+TEST(pkgmap_swift_ambiguous_target_name_fails_closed) {
+    static const char dynamic_src[] =
+        "let generatedName = \"App\" + String(buildNumber)\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: generatedName, dependencies: [])]\n"
+        ")\n";
+    static const char concat_src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\" + suffix, dependencies: [])]\n"
+        ")\n";
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", dynamic_src,
+                                     (int)strlen(dynamic_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", concat_src,
+                                     (int)strlen(concat_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* The repo-wide manifest walker must also recognize "Package.swift" -- a
+ * second code path (is_pkgmap_manifest_basename) from the direct
+ * cbm_pkgmap_try_parse calls above. */
+TEST(pkgmap_swift_scan_repo_finds_nested_manifest) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_swift_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/Core", tmpdir);
+    cbm_mkdir(dir);
+    write_temp_file(tmpdir, "Core/Package.swift",
+                    "let package = Package(\n"
+                    "    name: \"Core\",\n"
+                    "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                    ")\n");
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* The pkgmap repo walk must honor discovery exclusions (issue #792: a
  * gitignored huge subtree kept the pkgmap walk busy for 15 minutes).
  * Control run first (no exclusions → BOTH manifests parsed) so the
@@ -10580,6 +11312,433 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     cbm_pkg_entries_free(&entries);
 
     th_rmtree(tmpdir);
+    PASS();
+}
+
+enum {
+    /* Exceeds the former 1,024-byte resolver buffer after prefix/appended path. */
+    PKGMAP_LONG_TEST_FILL = 1100,
+};
+
+static char *pkgmap_long_test_value(const char *prefix, char fill, size_t fill_count) {
+    size_t prefix_len = strlen(prefix);
+    char *value = malloc(prefix_len + fill_count + 1);
+    if (!value) {
+        return NULL;
+    }
+    memcpy(value, prefix, prefix_len);
+    memset(value + prefix_len, fill, fill_count);
+    value[prefix_len + fill_count] = '\0';
+    return value;
+}
+
+/* Package entry resolution must preserve the complete manifest directory and
+ * entry value. A fixed join buffer can otherwise redirect an import to a
+ * plausible but different module. */
+TEST(pkgmap_package_json_entry_is_not_silently_truncated) {
+    char *directory = pkgmap_long_test_value("packages/", 'p', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(directory);
+    size_t rel_path_len = strlen(directory) + strlen("/package.json");
+    char *rel_path = malloc(rel_path_len + 1);
+    ASSERT_NOT_NULL(rel_path);
+    snprintf(rel_path, rel_path_len + 1, "%s/package.json", directory);
+
+    static const char source[] = "{\"name\":\"@org/deep\",\"main\":\"src/index.js\"}";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(
+        cbm_pkgmap_try_parse("package.json", rel_path, source, (int)strlen(source), &entries));
+    const char *resolved = pkg_entries_entry_for(&entries, "@org/deep");
+    ASSERT_NOT_NULL(resolved);
+    size_t expected_len = strlen(directory) + strlen("/src/index");
+    ASSERT_EQ(strlen(resolved), expected_len);
+    ASSERT_STR_EQ(resolved + strlen(directory), "/src/index");
+
+    cbm_pkg_entries_free(&entries);
+    free(rel_path);
+    free(directory);
+    PASS();
+}
+
+/* The filesystem walker must preserve each platform-supported path byte. A
+ * local fixed buffer otherwise makes two distinct deep entries alias before
+ * stat, exclusion matching, or manifest parsing sees them. */
+TEST(pkgmap_walk_path_join_is_not_silently_truncated) {
+    char *directory = pkgmap_long_test_value("workspace/", 'w', PKGMAP_LONG_TEST_FILL);
+    char *name = pkgmap_long_test_value("package-", 'n', PKGMAP_LONG_TEST_FILL);
+    if (!directory || !name) {
+        free(name);
+        free(directory);
+        FAIL("walker path fixture allocation");
+    }
+    size_t expected_len = strlen(directory) + SKIP_ONE + strlen(name);
+    char *joined = cbm_pkgmap_join_path(directory, name);
+    bool exact = joined && strlen(joined) == expected_len &&
+                 memcmp(joined, directory, strlen(directory)) == 0 &&
+                 joined[strlen(directory)] == '/' &&
+                 strcmp(joined + strlen(directory) + SKIP_ONE, name) == 0;
+
+    free(joined);
+    free(name);
+    free(directory);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(pkgmap_walk_reaches_manifest_beyond_legacy_depth_cap) {
+    enum {
+        /* The former walker stopped at 64 recursive frames. This finite tree
+         * stays well inside platform path limits while proving deeper content
+         * is not silently omitted. */
+        PKGMAP_DEEP_TEST_LEVELS = 80,
+    };
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_deep_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("deep pkgmap tmpdir");
+    }
+
+    char *directory = cbm_strdup(tmpdir);
+    for (int level = 0; directory && level < PKGMAP_DEEP_TEST_LEVELS; level++) {
+        char *next = cbm_pkgmap_join_path(directory, "d");
+        free(directory);
+        directory = next;
+    }
+    char *manifest = directory ? cbm_pkgmap_join_path(directory, "package.json") : NULL;
+    bool fixture_ready = directory && manifest && cbm_mkdir_p(directory, 0700);
+    FILE *file = fixture_ready ? cbm_fopen(manifest, "wb") : NULL;
+    static const char source[] = "{\"name\":\"@org/deep\",\"main\":\"index.js\"}\n";
+    if (file) {
+        bool wrote =
+            fwrite(source, SKIP_ONE, sizeof(source) - SKIP_ONE, file) == sizeof(source) - SKIP_ONE;
+        int close_result = fclose(file);
+        fixture_ready = wrote && close_result == 0;
+    } else {
+        fixture_ready = false;
+    }
+    if (!fixture_ready) {
+        free(manifest);
+        free(directory);
+        th_rmtree(tmpdir);
+        FAIL("deep pkgmap fixture");
+    }
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    int parsed = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool found = pkg_entries_has_name(&entries, "@org/deep");
+    cbm_pkg_entries_free(&entries);
+    free(manifest);
+    free(directory);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(parsed, 1);
+    ASSERT_TRUE(found);
+    PASS();
+}
+
+/* A directory symlink back to an active ancestor must not duplicate manifests
+ * or keep the now-unbounded iterative walk alive. Windows uses reparse-point
+ * inspection for the equivalent junction/symlink rule and has separate
+ * compile/platform gates because creating one requires platform privileges. */
+TEST(pkgmap_walk_does_not_follow_directory_symlink_cycle) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink cycle; Windows reparse behavior is compile-gated");
+#else
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_cycle_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("pkgmap cycle tmpdir");
+    }
+    write_temp_file(tmpdir, "package.json", "{\"name\":\"@org/root\",\"main\":\"index.js\"}\n");
+
+    char *cycle_path = cbm_pkgmap_join_path(tmpdir, "cycle");
+    bool fixture_ready = cycle_path && symlink(tmpdir, cycle_path) == 0;
+    if (!fixture_ready) {
+        free(cycle_path);
+        th_rmtree(tmpdir);
+        FAIL("pkgmap cycle symlink");
+    }
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    int parsed = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool exact = parsed == 1 && entries.count == 1 && pkg_entries_has_name(&entries, "@org/root");
+    cbm_pkg_entries_free(&entries);
+    int unlink_result = unlink(cycle_path);
+    free(cycle_path);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(unlink_result, 0);
+    ASSERT_TRUE(exact);
+    PASS();
+#endif
+}
+
+/* Every manifest parser must preserve the same exact directory identity. This
+ * table exercises the seven parsers that historically rebuilt entry paths in
+ * independent 1,024-byte buffers; one shared fixture prevents ecosystem fixes
+ * from drifting while keeping each parser's manifest semantics distinct. */
+TEST(pkgmap_manifest_ecosystems_preserve_long_entry_paths) {
+    typedef struct {
+        const char *basename;
+        const char *source;
+        const char *package_name;
+        const char *entry_suffix;
+    } pkgmap_manifest_case_t;
+    static const pkgmap_manifest_case_t cases[] = {
+        {"pyproject.toml", "[project]\nname = \"deep_pkg\"\n", "deep_pkg", "src/deep_pkg/__init__"},
+        {"composer.json",
+         "{\"name\":\"vendor/package\",\"autoload\":{\"psr-4\":{\"Vendor\\\\\":\"src/\"}}}",
+         "Vendor\\", "src"},
+        {"pubspec.yaml", "name: deep_dart\n", "deep_dart", "lib"},
+        {"pom.xml",
+         "<project><groupId>com.example</groupId><artifactId>demo</artifactId></project>",
+         "com.example.demo", "src/main/java"},
+        {"build.gradle", "group = 'com.example'\n", "com.example", "src/main/java"},
+        {"mix.exs", "app: :deep_app,\n", "deep_app", "lib/deep_app"},
+        {"deep.gemspec", "spec.name = 'deep_gem'\n", "deep_gem", "lib/deep_gem"},
+    };
+
+    char *directory = pkgmap_long_test_value("packages/", 'e', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(directory);
+    const char *failed_case = NULL;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t rel_path_len = strlen(directory) + SKIP_ONE + strlen(cases[i].basename);
+        char *rel_path = malloc(rel_path_len + SKIP_ONE);
+        size_t expected_len = strlen(directory) + SKIP_ONE + strlen(cases[i].entry_suffix);
+        char *expected = malloc(expected_len + SKIP_ONE);
+        if (!rel_path || !expected) {
+            free(rel_path);
+            free(expected);
+            failed_case = "fixture allocation";
+            break;
+        }
+        snprintf(rel_path, rel_path_len + SKIP_ONE, "%s/%s", directory, cases[i].basename);
+        snprintf(expected, expected_len + SKIP_ONE, "%s/%s", directory, cases[i].entry_suffix);
+
+        cbm_pkg_entries_t entries;
+        cbm_pkg_entries_init(&entries);
+        bool parsed = cbm_pkgmap_try_parse(cases[i].basename, rel_path, cases[i].source,
+                                           (int)strlen(cases[i].source), &entries);
+        const char *actual = pkg_entries_entry_for(&entries, cases[i].package_name);
+        if (!parsed || !actual || strcmp(actual, expected) != 0) {
+            failed_case = cases[i].basename;
+        }
+        cbm_pkg_entries_free(&entries);
+        free(expected);
+        free(rel_path);
+    }
+    free(directory);
+
+    if (failed_case) {
+        FAIL(failed_case);
+    }
+    PASS();
+}
+
+/* Maven coordinates form a lookup key, not a display abbreviation. Preserve
+ * every groupId and artifactId byte so two long coordinates cannot collapse
+ * to the same truncated package name. */
+TEST(pkgmap_pom_coordinates_are_not_silently_truncated) {
+    enum {
+        FORMAT_PLACEHOLDER_BYTES = sizeof("%s") - SKIP_ONE,
+    };
+    char *group_id = pkgmap_long_test_value("com.example.", 'g', PKGMAP_LONG_TEST_FILL);
+    char *artifact_id = pkgmap_long_test_value("artifact_", 'a', PKGMAP_LONG_TEST_FILL);
+    if (!group_id || !artifact_id) {
+        free(artifact_id);
+        free(group_id);
+        FAIL("coordinate fixture allocation");
+    }
+
+    static const char source_format[] =
+        "<project><groupId>%s</groupId><artifactId>%s</artifactId></project>";
+    size_t source_size = strlen(source_format) - PAIR_LEN * FORMAT_PLACEHOLDER_BYTES +
+                         strlen(group_id) + strlen(artifact_id) + SKIP_ONE;
+    char *source = malloc(source_size);
+    if (!source) {
+        free(artifact_id);
+        free(group_id);
+        FAIL("POM fixture allocation");
+    }
+    int written = snprintf(source, source_size, source_format, group_id, artifact_id);
+    bool source_exact = written > 0 && (size_t)written < source_size;
+
+    size_t coordinate_size = strlen(group_id) + SKIP_ONE + strlen(artifact_id) + SKIP_ONE;
+    char *coordinate = malloc(coordinate_size);
+    if (!coordinate) {
+        free(source);
+        free(artifact_id);
+        free(group_id);
+        FAIL("coordinate result allocation");
+    }
+    written = snprintf(coordinate, coordinate_size, "%s.%s", group_id, artifact_id);
+    bool coordinate_exact = written > 0 && (size_t)written < coordinate_size;
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool parsed = source_exact && coordinate_exact &&
+                  cbm_pkgmap_try_parse("pom.xml", "pom.xml", source, (int)strlen(source), &entries);
+    const char *entry = parsed ? pkg_entries_entry_for(&entries, coordinate) : NULL;
+    bool exact = entry && strcmp(entry, "src/main/java") == 0;
+
+    cbm_pkg_entries_free(&entries);
+    free(coordinate);
+    free(source);
+    free(artifact_id);
+    free(group_id);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+/* Manifest parsing shares the repository's configurable per-file policy. A
+ * historical 1 MiB local cap silently discarded valid package metadata even
+ * when CBM_MAX_FILE_BYTES explicitly allowed the file. */
+TEST(pkgmap_manifest_above_legacy_cap_uses_shared_file_limit) {
+    enum {
+        LEGACY_MANIFEST_CAP_BYTES = CBM_SZ_1K * CBM_SZ_1K,
+        SHARED_MANIFEST_CAP_MIB = 2,
+        SHARED_MANIFEST_CAP_BYTES = SHARED_MANIFEST_CAP_MIB * LEGACY_MANIFEST_CAP_BYTES,
+        MANIFEST_WRITE_CHUNK_BYTES = CBM_SZ_4K,
+    };
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_large_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/package.json", tmpdir);
+    FILE *manifest = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(manifest);
+    char padding[MANIFEST_WRITE_CHUNK_BYTES];
+    memset(padding, ' ', sizeof(padding));
+    size_t remaining = LEGACY_MANIFEST_CAP_BYTES + SKIP_ONE;
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(padding) ? remaining : sizeof(padding);
+        ASSERT_EQ(fwrite(padding, SKIP_ONE, chunk, manifest), chunk);
+        remaining -= chunk;
+    }
+    static const char body[] = "{\"name\":\"@org/large\",\"main\":\"src/index.js\"}";
+    ASSERT_EQ(fwrite(body, SKIP_ONE, sizeof(body) - SKIP_ONE, manifest), sizeof(body) - SKIP_ONE);
+    ASSERT_EQ(fclose(manifest), 0);
+
+    const char *saved_raw = getenv("CBM_MAX_FILE_BYTES");
+    char *saved = saved_raw ? cbm_strdup(saved_raw) : NULL;
+    char shared_cap_raw[CBM_SZ_32];
+    char legacy_cap_raw[CBM_SZ_32];
+    int shared_cap_len =
+        snprintf(shared_cap_raw, sizeof(shared_cap_raw), "%d", SHARED_MANIFEST_CAP_BYTES);
+    int legacy_cap_len =
+        snprintf(legacy_cap_raw, sizeof(legacy_cap_raw), "%d", LEGACY_MANIFEST_CAP_BYTES);
+    ASSERT(shared_cap_len > 0 && (size_t)shared_cap_len < sizeof(shared_cap_raw));
+    ASSERT(legacy_cap_len > 0 && (size_t)legacy_cap_len < sizeof(legacy_cap_raw));
+    ASSERT_EQ(cbm_setenv("CBM_MAX_FILE_BYTES", shared_cap_raw, 1), 0);
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    int parsed = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool found = pkg_entries_has_name(&entries, "@org/large");
+    cbm_pkg_entries_free(&entries);
+
+    ASSERT_EQ(cbm_setenv("CBM_MAX_FILE_BYTES", legacy_cap_raw, 1), 0);
+    pipeline_capture_logs_start();
+    cbm_pkg_entries_init(&entries);
+    int rejected = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool rejected_found = pkg_entries_has_name(&entries, "@org/large");
+    cbm_pkg_entries_free(&entries);
+    const char *logs = pipeline_capture_logs_end();
+    bool logged_reason = strstr(logs, "msg=pkgmap.manifest_skipped") != NULL &&
+                         strstr(logs, "reason=oversized") != NULL &&
+                         strstr(logs, "constraint=CBM_MAX_FILE_BYTES") != NULL;
+
+    saved ? cbm_setenv("CBM_MAX_FILE_BYTES", saved, 1) : cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    free(saved);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(parsed, 1);
+    ASSERT_TRUE(found);
+    ASSERT_EQ(rejected, 0);
+    ASSERT_FALSE(rejected_found);
+    ASSERT_TRUE(logged_reason);
+    PASS();
+}
+
+TEST(pkgmap_prefix_slash_result_is_not_silently_truncated) {
+    char *base = pkgmap_long_test_value("proj.", 's', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(base);
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, cbm_strdup("example.com/root"), cbm_strdup(base));
+    cbm_pipeline_set_pkgmap(pkgmap);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj"};
+
+    char *resolved = cbm_pipeline_resolve_module(&ctx, "main.go", "example.com/root/pkg/utils");
+    size_t expected_len = strlen(base) + strlen(".pkg.utils");
+    char *expected = malloc(expected_len + 1);
+    ASSERT_NOT_NULL(expected);
+    snprintf(expected, expected_len + 1, "%s.pkg.utils", base);
+    ASSERT_NOT_NULL(resolved);
+    ASSERT_STR_EQ(resolved, expected);
+
+    free(expected);
+    free(resolved);
+    free(base);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
+    PASS();
+}
+
+TEST(pkgmap_prefix_dot_result_is_not_silently_truncated) {
+    char *base = pkgmap_long_test_value("mapped/", 'd', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(base);
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, cbm_strdup("com.example"), cbm_strdup(base));
+    cbm_pipeline_set_pkgmap(pkgmap);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj"};
+
+    char *resolved = cbm_pipeline_resolve_module(&ctx, "Main.java", "com.example.Feature.Type");
+    size_t input_len = strlen(base) + strlen("/Feature/Type");
+    char *input = malloc(input_len + 1);
+    ASSERT_NOT_NULL(input);
+    snprintf(input, input_len + 1, "%s/Feature/Type", base);
+    char *expected = cbm_pipeline_fqn_module("proj", input);
+    ASSERT_NOT_NULL(resolved);
+    ASSERT_NOT_NULL(expected);
+    ASSERT_STR_EQ(resolved, expected);
+
+    free(expected);
+    free(input);
+    free(resolved);
+    free(base);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
+    PASS();
+}
+
+TEST(pkgmap_prefix_backslash_result_is_not_silently_truncated) {
+    char *base = pkgmap_long_test_value("mapped/", 'b', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(base);
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, cbm_strdup("App\\"), cbm_strdup(base));
+    cbm_pipeline_set_pkgmap(pkgmap);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj"};
+
+    char *resolved = cbm_pipeline_resolve_module(&ctx, "index.php", "App\\Controllers\\Foo");
+    size_t input_len = strlen(base) + strlen("/Controllers/Foo");
+    char *input = malloc(input_len + 1);
+    ASSERT_NOT_NULL(input);
+    snprintf(input, input_len + 1, "%s/Controllers/Foo", base);
+    char *expected = cbm_pipeline_fqn_module("proj", input);
+    ASSERT_NOT_NULL(resolved);
+    ASSERT_NOT_NULL(expected);
+    ASSERT_STR_EQ(resolved, expected);
+
+    free(expected);
+    free(input);
+    free(resolved);
+    free(base);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
     PASS();
 }
 
@@ -12264,6 +13423,196 @@ TEST(import_symbol_fallback_prefers_import_path_over_insertion_order) {
     ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.openapi.models.OAuth2");
 
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_resolution_long_header_prefers_source_relative_file) {
+    char *directory = pkgmap_long_test_value("include/", 'h', PKGMAP_LONG_TEST_FILL);
+    char *source_rel = directory ? cbm_pkgmap_join_path(directory, "main.c") : NULL;
+    char *target_rel = directory ? cbm_pkgmap_join_path(directory, "config.h") : NULL;
+    if (!directory || !source_rel || !target_rel) {
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long header fixture allocation");
+    }
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!gb) {
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long header graph allocation");
+    }
+    int64_t wrong = cbm_gbuf_upsert_node(gb, "File", "config.h", "proj.other.config.__file__",
+                                         "other/config.h", 1, 1, "{}");
+    int64_t expected = cbm_gbuf_upsert_node(gb, "File", "config.h", "proj.deep.config.__file__",
+                                            target_rel, 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "config.h", .module_path = "config.h"};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, source_rel, "proj.deep.main.__file__", &imp, NULL);
+    bool exact = wrong > 0 && expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    free(target_rel);
+    free(source_rel);
+    free(directory);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_long_sibling_path_is_exact) {
+    char *directory = pkgmap_long_test_value("styles/", 's', PKGMAP_LONG_TEST_FILL);
+    char *source_rel = directory ? cbm_pkgmap_join_path(directory, "main.scss") : NULL;
+    char *target_rel = directory ? cbm_pkgmap_join_path(directory, "_vars.scss") : NULL;
+    char *target_qn = target_rel ? cbm_pipeline_fqn_module("proj", target_rel) : NULL;
+    if (!directory || !source_rel || !target_rel || !target_qn) {
+        free(target_qn);
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long sibling fixture allocation");
+    }
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!gb) {
+        free(target_qn);
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long sibling graph allocation");
+    }
+    int64_t expected =
+        cbm_gbuf_upsert_node(gb, "Module", "_vars", target_qn, target_rel, 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "vars", .module_path = "vars"};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, source_rel, "proj.recipes.main.__file__", &imp, NULL);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    free(target_qn);
+    free(target_rel);
+    free(source_rel);
+    free(directory);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_long_namespace_key_and_qn_are_exact) {
+    char *namespace_key = pkgmap_long_test_value("org.", 'n', PKGMAP_LONG_TEST_FILL);
+    char *target_qn = pkgmap_long_test_value("proj.", 'q', PKGMAP_LONG_TEST_FILL);
+    if (!namespace_key || !target_qn) {
+        free(target_qn);
+        free(namespace_key);
+        FAIL("long namespace fixture allocation");
+    }
+    size_t module_size = strlen(namespace_key) + sizeof(".*");
+    char *module_path = malloc(module_size);
+    if (!module_path) {
+        free(target_qn);
+        free(namespace_key);
+        FAIL("long namespace import allocation");
+    }
+    snprintf(module_path, module_size, "%s.*", namespace_key);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    CBMHashTable *namespace_map = cbm_ht_create(CBM_SZ_16);
+    if (!gb || !namespace_map) {
+        cbm_ht_free(namespace_map);
+        cbm_gbuf_free(gb);
+        free(module_path);
+        free(target_qn);
+        free(namespace_key);
+        FAIL("long namespace graph or map allocation");
+    }
+    int64_t expected =
+        cbm_gbuf_upsert_node(gb, "File", "namespace.py", target_qn, "namespace.py", 1, 1, "{}");
+    cbm_ht_set(namespace_map, namespace_key, target_qn);
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "*", .module_path = module_path};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "consumer.py", "proj.consumer.__file__", &imp, namespace_map);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_ht_free(namespace_map);
+    cbm_gbuf_free(gb);
+    free(module_path);
+    free(target_qn);
+    free(namespace_key);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_namespace_map_normalizes_declaration_and_import) {
+    CBMFileResult result = {0};
+    result.namespace_name = "Acme::Tools";
+    CBMFileResult *results[] = {&result};
+    const char *rels[] = {"src/tools.php"};
+    CBMHashTable *namespace_map = cbm_pipeline_namespace_map_build("proj", results, rels, SKIP_ONE);
+    char *target_qn = cbm_pipeline_fqn_compute("proj", rels[0], "__file__");
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!namespace_map || !target_qn || !gb) {
+        cbm_pipeline_namespace_map_free(namespace_map);
+        free(target_qn);
+        cbm_gbuf_free(gb);
+        FAIL("namespace normalization fixture allocation");
+    }
+
+    int64_t expected =
+        cbm_gbuf_upsert_node(gb, "File", "tools.php", target_qn, rels[0], 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "*", .module_path = "Acme\\Tools\\*"};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "src/consumer.php", "proj.src.consumer.__file__", &imp, namespace_map);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_pipeline_namespace_map_free(namespace_map);
+    free(target_qn);
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_symbol_fallback_has_no_segment_limit) {
+    static const char module_path[] = "rootcandidate.a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t";
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t expected = cbm_gbuf_upsert_node(
+        gb, "Class", "rootcandidate", "proj.unrelated.RootCandidate", "target.py", 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "alias", .module_path = module_path};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "consumer.py", "proj.consumer.__file__", &imp, NULL);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_long_symbol_name_is_exact) {
+    char *symbol = pkgmap_long_test_value("Symbol", 'x', PKGMAP_LONG_TEST_FILL);
+    if (!symbol) {
+        FAIL("long symbol fixture allocation");
+    }
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!gb) {
+        free(symbol);
+        FAIL("long symbol graph allocation");
+    }
+    int64_t expected = cbm_gbuf_upsert_node(gb, "Class", symbol, "proj.unrelated.LongSymbol",
+                                            "target.py", 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "alias", .module_path = symbol};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "consumer.py", "proj.consumer.__file__", &imp, NULL);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    free(symbol);
+    ASSERT_TRUE(exact);
     PASS();
 }
 
@@ -17835,14 +19184,23 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(
         cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(p));
 
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
+    cbm_config_close(cfg);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p),
-              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_MIN_MS * 1000);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "999999"), 0);
+              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS * 1000);
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "999999"), 0);
+    cbm_config_close(cfg);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "999999"), 0);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p),
-              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_MAX_MS * 1000);
+              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS * 1000);
 
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
@@ -19623,6 +20981,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
+    RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_full_and_incremental_persist_file_state);
     RUN_TEST(pipeline_incremental_full_index_rebuilds_owner_metadata);
@@ -19665,6 +21024,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation);
     RUN_TEST(pipeline_python_pyo3_import_resolves_rust_function_calls);
     RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
     RUN_TEST(pipeline_incremental_reexport_target_matches_full);
@@ -19782,9 +21142,39 @@ SUITE(pipeline) {
     RUN_TEST(envscan_skips_ignored_dirs);
     RUN_TEST(envscan_does_not_follow_links_outside_root);
     RUN_TEST(envscan_non_url_values_skipped);
+    RUN_TEST(envscan_walks_more_than_256_pending_directories);
+    RUN_TEST(envscan_accepts_root_path_longer_than_512_bytes);
+    RUN_TEST(envscan_uses_shared_file_size_policy);
+    RUN_TEST(envscan_parses_one_complete_line_across_old_buffer_boundary);
+    RUN_TEST(envscan_concurrent_first_use_and_cleanup_reinitialize);
+    RUN_TEST(envscan_reports_unrepresentable_key_and_value_without_truncating);
+    RUN_TEST(envscan_preserves_caller_output_capacity);
+    /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
+    RUN_TEST(pkgmap_swift_targets_registers_module);
+    RUN_TEST(pkgmap_swift_executable_target_registers_module);
+    RUN_TEST(pkgmap_swift_literal_path_is_not_silently_truncated);
+    RUN_TEST(pkgmap_swift_products_do_not_register_alias);
+    RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);
+    RUN_TEST(pkgmap_swift_target_honors_literal_path);
+    RUN_TEST(pkgmap_swift_target_computed_path_fails_closed);
+    RUN_TEST(pkgmap_swift_target_in_comment_or_string_not_registered);
+    RUN_TEST(pkgmap_swift_dependencies_do_not_leak_entries);
+    RUN_TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry);
+    RUN_TEST(pkgmap_swift_ambiguous_target_name_fails_closed);
+    RUN_TEST(pkgmap_swift_scan_repo_finds_nested_manifest);
+    RUN_TEST(pkgmap_package_json_entry_is_not_silently_truncated);
+    RUN_TEST(pkgmap_walk_path_join_is_not_silently_truncated);
+    RUN_TEST(pkgmap_walk_reaches_manifest_beyond_legacy_depth_cap);
+    RUN_TEST(pkgmap_walk_does_not_follow_directory_symlink_cycle);
+    RUN_TEST(pkgmap_manifest_ecosystems_preserve_long_entry_paths);
+    RUN_TEST(pkgmap_pom_coordinates_are_not_silently_truncated);
+    RUN_TEST(pkgmap_manifest_above_legacy_cap_uses_shared_file_limit);
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
+    RUN_TEST(pkgmap_prefix_slash_result_is_not_silently_truncated);
+    RUN_TEST(pkgmap_prefix_dot_result_is_not_silently_truncated);
+    RUN_TEST(pkgmap_prefix_backslash_result_is_not_silently_truncated);
     RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
@@ -19827,6 +21217,12 @@ SUITE(pipeline) {
     RUN_TEST(import_map_from_edges_follows_package_reexport);
     RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
     RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
+    RUN_TEST(import_resolution_long_header_prefers_source_relative_file);
+    RUN_TEST(import_resolution_long_sibling_path_is_exact);
+    RUN_TEST(import_resolution_long_namespace_key_and_qn_are_exact);
+    RUN_TEST(import_resolution_namespace_map_normalizes_declaration_and_import);
+    RUN_TEST(import_resolution_symbol_fallback_has_no_segment_limit);
+    RUN_TEST(import_resolution_long_symbol_name_is_exact);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);

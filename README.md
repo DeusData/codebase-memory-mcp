@@ -557,8 +557,10 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 | `get_code_snippet` | Read source code for a function by qualified name. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
-| `manage_adr` | CRUD for Architecture Decision Records. |
+| `manage_adr` | CRUD for Architecture Decision Records. Query modes do not wait behind a same-project reindex; writes remain serialized. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+
+`manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
 
 ## Graph Data Model
 
@@ -581,7 +583,7 @@ JSON arguments can also be piped on stdin. Inline JSON remains accepted for back
 - **Clauses**: `MATCH`, `OPTIONAL MATCH`, multiple `MATCH`, `WHERE`, `WITH` (+ `WITH … WHERE` and later match stages), `RETURN`, multi-key `ORDER BY` on projected fields or aliases, `SKIP`, `LIMIT`, `DISTINCT`, `UNWIND`, `UNION` / `UNION ALL`, `CASE`.
 - **Patterns**: labelled nodes, label alternation `(n:A|B)`, relationship types/direction, variable-length paths `[*1..3]`, inline property maps.
 - **WHERE**: `= <> < <= > >=`, `AND/OR/XOR/NOT`, `IN`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `IS [NOT] NULL`, regex `=~`, label test `n:Label`, and `EXISTS { (n)-[:TYPE]->() }` (single-hop existence — great for dead-code, e.g. `WHERE NOT EXISTS { (f)<-[:CALLS]-() }`).
-- **Aggregates**: `count` (+`DISTINCT`), `sum`, `avg`, `min`, `max`, `collect`.
+- **Aggregates**: `count`, `sum`, `avg`, `min`, `max`, `collect` (all accept `DISTINCT` arguments).
 - **Functions**: `labels`, `type`, `id`, `keys`, `properties`; `toLower/toUpper/toString/toInteger/toFloat/toBoolean`; `size`, `length`, `trim/ltrim/rtrim`, `reverse`; `coalesce`, `substring`, `replace`, `left`, `right`.
 
 Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported functions, list/map literals, comprehensions, path functions, parameters) **fails with a clear `unsupported …` error** rather than returning empty results. Valid queries that match zero rows return a hint naming any label or relationship type not present in that project's graph, plus a short summary of the vocabulary that is.
@@ -596,6 +598,7 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 
 ```bash
 codebase-memory-mcp config list                          # show common effective settings
+codebase-memory-mcp config describe pagerank_damping     # show default, accepted extent, and tuning guidance
 codebase-memory-mcp config set auto_index true           # auto-index on startup/first use
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set tool_mode streamlined     # concise surface; reveal advanced tools on demand

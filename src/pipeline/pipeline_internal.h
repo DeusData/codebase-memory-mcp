@@ -836,6 +836,11 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
                           int source_len, cbm_pkg_entries_t *entries);
 
+/* Join an owned package-map walker path without a semantic length ceiling.
+ * For P output bytes: O(P) runtime and returned memory, O(1) auxiliary memory.
+ * Caller frees the result. */
+char *cbm_pkgmap_join_path(const char *dir, const char *name);
+
 /* Merge per-worker entries into a hash table. Returns NULL if no entries. */
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name);
@@ -952,17 +957,12 @@ typedef struct {
     char old_path[CBM_SZ_512]; /* non-empty only for renames */
 } cbm_changed_file_t;
 
-typedef struct {
-    char path[CBM_SZ_512];
-    int start_line;
-    int end_line;
-} cbm_changed_hunk_t;
+/* cbm_changed_hunk_t + cbm_parse_hunks moved to pipeline.h (public — consumed
+ * by src/mcp/mcp.c's detect_changes for line-scoped seed detection). Visible
+ * here via the `#include "pipeline/pipeline.h"` above. */
 
 /* Parse git diff --name-status output. Returns count written to out. */
 int cbm_parse_name_status(const char *output, cbm_changed_file_t *out, int max_out);
-
-/* Parse git diff --unified=0 output. Returns count written to out. */
-int cbm_parse_hunks(const char *output, cbm_changed_hunk_t *out, int max_out);
 
 /* Parse "start,count" or "start" → (start, count). */
 void cbm_parse_range(const char *s, int *out_start, int *out_count);

@@ -21,7 +21,7 @@
         free(_r);                    \
     } while (0)
 
-enum { FQN_DEEP_SEGMENT_COUNT = 300 };
+enum { FQN_DEEP_SEGMENT_COUNT = 300, FQN_LONG_RELATIVE_FILL = 1100 };
 
 static char *fqn_deep_path(const char *tail) {
     size_t tail_len = strlen(tail);
@@ -422,6 +422,83 @@ TEST(fqn_module_deep) {
     PASS();
 }
 
+TEST(fqn_relative_import_preserves_language_forms) {
+    struct {
+        const char *source;
+        const char *module;
+        const char *expected;
+    } cases[] = {
+        {"src/features/consumer.ts", "./nested/util.js", "src/features/nested/util"},
+        {"src/features/consumer.ts", "../shared/helpers.ts", "src/shared/helpers"},
+        {"src/features/consumer.ts", "./foo.test.ts", "src/features/foo.test"},
+        {"src/features/consumer.ts", "./.hidden", "src/features/.hidden"},
+        {"src/features/consumer.py", ".helpers", "src/features/helpers"},
+        {"src/features/consumer.py", "..shared.helpers", "src/shared/helpers"},
+        {"src/features/consumer.py", "...shared", "shared"},
+        {"src/features/consumer.py", ".", "src/features"},
+        {"src/features/consumer.py", "..", "src"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *actual = cbm_pipeline_resolve_relative_import(cases[i].source, cases[i].module);
+        ASSERT_NOT_NULL(actual);
+        ASSERT_STR_EQ(actual, cases[i].expected);
+        free(actual);
+    }
+    PASS();
+}
+
+/* Relative-import resolution must preserve both a long importing directory
+ * and a long imported segment. The former 1,024-byte staging buffer either
+ * dropped the importer's directory suffix or returned NULL before the caller
+ * could construct the module QN. This logical-path test is intentionally
+ * independent of any host filesystem component limit. */
+TEST(fqn_relative_import_preserves_exact_long_paths) {
+    char *fill = malloc((size_t)FQN_LONG_RELATIVE_FILL + 1U);
+    ASSERT_NOT_NULL(fill);
+    memset(fill, 'd', FQN_LONG_RELATIVE_FILL);
+    fill[FQN_LONG_RELATIVE_FILL] = '\0';
+
+    size_t source_size = strlen("root//consumer.ts") + strlen(fill) + 1U;
+    size_t expected_source_size = strlen("root//helpers") + strlen(fill) + 1U;
+    size_t module_size = strlen("./.ts") + strlen(fill) + 1U;
+    size_t expected_module_size = strlen("src/") + strlen(fill) + 1U;
+    char *source = malloc(source_size);
+    char *expected_source = malloc(expected_source_size);
+    char *module = malloc(module_size);
+    char *expected_module = malloc(expected_module_size);
+    if (!source || !expected_source || !module || !expected_module) {
+        free(expected_module);
+        free(module);
+        free(expected_source);
+        free(source);
+        free(fill);
+        FAIL("long relative-import fixture allocation");
+    }
+    snprintf(source, source_size, "root/%s/consumer.ts", fill);
+    snprintf(expected_source, expected_source_size, "root/%s/helpers", fill);
+    snprintf(module, module_size, "./%s.ts", fill);
+    snprintf(expected_module, expected_module_size, "src/%s", fill);
+
+    char *from_long_source = cbm_pipeline_resolve_relative_import(source, "./helpers.ts");
+    char *from_long_js_module = cbm_pipeline_resolve_relative_import("src/consumer.ts", module);
+    snprintf(module, module_size, ".%s", fill);
+    char *from_long_python_module = cbm_pipeline_resolve_relative_import("src/consumer.py", module);
+    bool exact = from_long_source && strcmp(from_long_source, expected_source) == 0 &&
+                 from_long_js_module && strcmp(from_long_js_module, expected_module) == 0 &&
+                 from_long_python_module && strcmp(from_long_python_module, expected_module) == 0;
+
+    free(from_long_python_module);
+    free(from_long_js_module);
+    free(from_long_source);
+    free(expected_module);
+    free(module);
+    free(expected_source);
+    free(source);
+    free(fill);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
 /* ================================================================
  * cbm_pipeline_fqn_folder
  * ================================================================ */
@@ -770,6 +847,8 @@ SUITE(fqn) {
     RUN_TEST(fqn_module_null_path);
     RUN_TEST(fqn_module_null_project);
     RUN_TEST(fqn_module_deep);
+    RUN_TEST(fqn_relative_import_preserves_language_forms);
+    RUN_TEST(fqn_relative_import_preserves_exact_long_paths);
 
     /* fqn_folder */
     RUN_TEST(fqn_folder_basic);

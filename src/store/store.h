@@ -1511,13 +1511,31 @@ typedef struct {
     double score;
 } cbm_vector_result_t;
 
-/* Search for nodes similar to the given query keywords using stored RI vectors.
- * Builds a merged query vector from the keywords, then does cosine scan via
- * the cbm_cosine_i8 SQL function joined with the nodes table.
- * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+/* Search stored RI vectors using the minimum cosine similarity across every
+ * nonempty keyword, so every keyword must be relevant. Selection is exact:
+ * every eligible node is scored and a bounded heap retains the requested top
+ * K (or the default response size when limit <= 0). Runtime is
+ * O(N * (Q*D + log K)); auxiliary memory is O(Q*D + K), excluding copied
+ * output strings, for N nodes, Q keywords, and vector dimension D. Results are
+ * sorted by score DESC with node-id tie order. Caller releases them with
+ * cbm_store_free_vector_results(). */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef enum {
+    CBM_STORE_TEST_VECTOR_ALLOC_NONE = 0,
+    CBM_STORE_TEST_VECTOR_ALLOC_KEYWORDS,
+    CBM_STORE_TEST_VECTOR_ALLOC_RESULT_STRING,
+    CBM_STORE_TEST_VECTOR_ALLOC_RESULT_RESERVE,
+} cbm_store_test_vector_alloc_site_t;
+
+/* Fail one vector-search allocation site after successful_before matching
+ * allocations. Thread-local and disabled by default. */
+void cbm_store_test_fail_vector_allocation(cbm_store_test_vector_alloc_site_t site,
+                                           int successful_before);
+#endif
 
 /* Free vector search results. */
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);

@@ -2,6 +2,8 @@
 #define CBM_MCP_INTERNAL_H
 
 #include "mcp/mcp.h"
+#include "pipeline/pipeline.h" /* cbm_changed_hunk_t */
+#include "store/store.h"       /* cbm_node_t */
 
 /* White-box fault injection for deterministic cross-platform quarantine
  * safety tests. This header is internal and is not part of the MCP API. */
@@ -32,6 +34,7 @@ bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv);
 #ifdef CBM_ENABLE_TEST_SEAMS
 uint64_t cbm_mcp_server_query_store_open_count_for_testing(const cbm_mcp_server_t *srv);
 uint64_t cbm_mcp_server_request_mem_collect_count_for_testing(const cbm_mcp_server_t *srv);
+void cbm_mcp_test_fail_next_semantic_keyword_allocation(void);
 #endif
 
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
@@ -42,6 +45,16 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
  * without retaining per-file results. A false result means the count exceeded
  * file_limit or could not be established before the bounded deadline; every
  * such failure is fail-closed because this is the memory-admission guard. */
+/* Map an internal resolver strategy (as recorded on a CALLS edge by
+ * pass_calls.c) to the CLOSED public class published by trace_path's
+ * include_evidence output: "lsp" | "language_rule" | "heuristic" |
+ * "unresolved". NULL only for a NULL/empty strategy.
+ *
+ * Exposed so tests/test_mcp.c can pin every strategy production can emit to a
+ * known class — a new resolver KIND must fail there rather than leaking an
+ * unmapped internal name into a user-visible field. */
+const char *cbm_mcp_edge_strategy_class(const char *strategy);
+
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
 
@@ -57,5 +70,11 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
  * conclusion. file_count_out receives -1 when no count was needed. */
 bool cbm_mcp_auto_index_within_configured_limit(const char *root_path, int configured_limit,
                                                 int *file_count_out);
+
+/* detect_changes seed scoping (#1363): does `node`'s line range overlap any
+ * recorded hunk for `file`? Exposed for direct unit testing of the overlap
+ * logic, independent of the git/subprocess/index plumbing around it. */
+bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *hunks,
+                              int hunk_count, const char *file);
 
 #endif

@@ -1009,6 +1009,12 @@ static bool application_session_mutation_begin(void *context, const char *projec
            application_mutation_begin_internal(session->application, session, project, true);
 }
 
+static bool application_session_mutation_try_begin(void *context, const char *project) {
+    cbm_daemon_application_session_t *session = context;
+    return session &&
+           application_mutation_begin_internal(session->application, session, project, false);
+}
+
 static void application_session_mutation_end(void *context, const char *project) {
     cbm_daemon_application_session_t *session = context;
     if (session) {
@@ -2259,6 +2265,8 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,
                                               application_session_mutation_end, session);
+    cbm_mcp_server_set_project_mutation_try_guard(session->mcp,
+                                                  application_session_mutation_try_begin);
     session->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     session->application = application;
     session->client_id = client_id;

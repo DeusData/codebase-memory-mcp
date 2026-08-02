@@ -4,18 +4,52 @@
  * Provides lexing, parsing, planning, and execution of a subset of
  * Cypher queries against the cbm_store graph database.
  *
- * Supported syntax:
- *   MATCH (n:Label)-[:TYPE*1..3]->(m:Label {prop: "val"})
- *   WHERE n.name =~ ".*pattern.*" AND m.label = "Function"
- *   RETURN n.name, COUNT(m) AS cnt ORDER BY cnt DESC LIMIT 10
+ * The stable, project-independent capability contract is exposed by
+ * cbm_cypher_capability_schema() below. Keep examples and project-specific
+ * graph vocabulary out of this header so they cannot become a second,
+ * drifting definition of executable syntax.
  */
 #ifndef CBM_CYPHER_H
 #define CBM_CYPHER_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <foundation/constants.h>
 #include <store/store.h>
+
+/* Stable, project-independent definition of the supported read-only language.
+ * Graph labels, relationship types, properties, counts, and observed patterns
+ * are a separate project vocabulary and never alter this schema. Increment the
+ * version only for an intentional capability-contract change. */
+#define CBM_CYPHER_CAPABILITY_SCHEMA_ID "cbm.read-only-cypher"
+#define CBM_CYPHER_CAPABILITY_SCHEMA_VERSION 1
+
+typedef struct {
+    const char *schema_id;
+    unsigned int version;
+    const char *const *clauses;
+    size_t clause_count;
+    const char *const *patterns;
+    size_t pattern_count;
+    const char *const *predicates;
+    size_t predicate_count;
+    const char *const *aggregate_functions;
+    size_t aggregate_function_count;
+    const char *const *keyword_scalar_functions;
+    size_t keyword_scalar_function_count;
+    const char *const *named_scalar_functions;
+    size_t named_scalar_function_count;
+    const char *const *multi_argument_functions;
+    size_t multi_argument_function_count;
+    const char *const *semantics;
+    size_t semantic_count;
+    const char *const *unsupported;
+    size_t unsupported_count;
+} cbm_cypher_capability_schema_t;
+
+/* Returns process-lifetime immutable storage in O(1) time and memory. */
+const cbm_cypher_capability_schema_t *cbm_cypher_capability_schema(void);
 
 /* ── Token types ────────────────────────────────────────────────── */
 
@@ -141,6 +175,7 @@ typedef struct {
     int count;
     int capacity;
     char *error; /* NULL if no error */
+    bool failed; /* sticky even if allocating error text also fails */
 } cbm_lex_result_t;
 
 /* Tokenize a Cypher query string. Caller must call cbm_lex_free(). */
@@ -261,7 +296,7 @@ typedef struct {
     const char *alias;     /* NULL if no alias */
     const char *func;      /* "COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT",
                               "toLower", "toUpper", "toString" or NULL */
-    bool distinct;         /* COUNT(DISTINCT x) — count unique values (#239) */
+    bool distinct;         /* DISTINCT aggregate argument */
     cbm_case_expr_t *kase; /* CASE expression (NULL if not CASE) */
     cbm_func_arg_t *args;  /* args for a multi-argument function (NULL if none) */
     int arg_count;
@@ -384,11 +419,49 @@ void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
 /* Test-only physical-plan seam. true forces the whole-pattern matcher for
  * otherwise indexed single-segment patterns; false restores automatic choice. */
 void cbm_cypher_test_force_whole_pattern_provider(bool force);
+typedef enum {
+    CBM_CYPHER_TEST_LEX_ALLOC_NONE = 0,
+    CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_ARRAY,
+    CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_TEXT,
+    CBM_CYPHER_TEST_LEX_ALLOC_STRING_TEXT,
+} cbm_cypher_test_lex_alloc_site_t;
+/* Fail one lexer allocation at `site` after `successful_before` successful
+ * allocations at that site. A negative count disables it. */
+void cbm_cypher_test_fail_lex_allocation(cbm_cypher_test_lex_alloc_site_t site,
+                                         int successful_before);
+typedef enum {
+    CBM_CYPHER_TEST_AGG_ALLOC_NONE = 0,
+    CBM_CYPHER_TEST_AGG_ALLOC_INITIAL,
+    CBM_CYPHER_TEST_AGG_ALLOC_GROUP_ENTRY,
+    CBM_CYPHER_TEST_AGG_ALLOC_GROUP_ARRAY_GROWTH,
+    CBM_CYPHER_TEST_AGG_ALLOC_VALUE_ARRAY_GROWTH,
+    CBM_CYPHER_TEST_AGG_ALLOC_VALUE_COPY,
+    CBM_CYPHER_TEST_AGG_ALLOC_DISTINCT_INDEX,
+} cbm_cypher_test_agg_alloc_site_t;
+/* Fail one aggregation allocation at `site` after `successful_before`
+ * successful allocations at that same site. A negative count disables it. */
+void cbm_cypher_test_fail_aggregation_allocation(cbm_cypher_test_agg_alloc_site_t site,
+                                                 int successful_before);
+/* Count aggregate string-list reallocations on the calling thread. */
+void cbm_cypher_test_reset_aggregate_list_growths(void);
+uint64_t cbm_cypher_test_aggregate_list_growths(void);
+/* Fail label-alternation result-vector growth after the requested number of
+ * successful growths on the calling thread; a negative count disables it. */
+void cbm_cypher_test_fail_label_alternation_growth(int successful_before);
+/* Fail one row-DISTINCT encoded-key copy after the requested number of
+ * successful copies; a negative count disables it. */
+void cbm_cypher_test_fail_row_distinct_key_copy(int successful_before);
 #endif
 /* Test-only logical work counter for aggregate group lookup. Tracking is
  * dormant until reset, so production queries do not retain per-query data. */
 void cbm_cypher_test_reset_group_lookup_probes(void);
 uint64_t cbm_cypher_test_group_lookup_probes(void);
+/* Test-only logical work counter for aggregate DISTINCT membership probes. */
+void cbm_cypher_test_reset_aggregate_distinct_probes(void);
+uint64_t cbm_cypher_test_aggregate_distinct_probes(void);
+/* Test-only logical work counter for full projected-row DISTINCT probes. */
+void cbm_cypher_test_reset_row_distinct_probes(void);
+uint64_t cbm_cypher_test_row_distinct_probes(void);
 
 /* Worst-case binding slot count for a node cross-join. Computes the count in
  * size_t and rejects any that would not fit the int binding counter or would

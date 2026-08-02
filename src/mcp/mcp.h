@@ -185,6 +185,10 @@ typedef char *(*cbm_mcp_index_executor_fn)(void *context, const char *repo_path,
 typedef bool (*cbm_mcp_project_mutation_begin_fn)(void *context, const char *project);
 typedef void (*cbm_mcp_project_mutation_end_fn)(void *context, const char *project);
 
+/* Nonblocking counterpart for opportunistic writes during a read request. A
+ * successful call is released through the primary mutation guard's end hook. */
+typedef bool (*cbm_mcp_project_mutation_try_begin_fn)(void *context, const char *project);
+
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
@@ -256,6 +260,12 @@ void cbm_mcp_server_set_index_log_callback(cbm_mcp_server_t *srv, cbm_proc_log_c
 void cbm_mcp_server_set_project_mutation_guard(cbm_mcp_server_t *srv,
                                                cbm_mcp_project_mutation_begin_fn begin,
                                                cbm_mcp_project_mutation_end_fn end, void *context);
+
+/* Configure an optional nonblocking acquire for the configured mutation
+ * guard. If no try hook is set, a read that requires recovery fails with a
+ * configuration error rather than invoking the blocking begin callback. */
+void cbm_mcp_server_set_project_mutation_try_guard(cbm_mcp_server_t *srv,
+                                                   cbm_mcp_project_mutation_try_begin_fn try_begin);
 
 /* Read one complete MCP message from in. Supports newline-delimited JSON and
  * Content-Length framing, including additional headers. Returns 1 on success,

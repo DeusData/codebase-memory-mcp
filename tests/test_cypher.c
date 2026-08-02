@@ -8,20 +8,30 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_thread.h"
 #include <cypher/cypher.h>
+#include <limits.h>
 #include <sqlite3.h>
 #include <store/store.h>
+#include <yyjson/yyjson.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#ifndef _WIN32
-#include <sys/wait.h> /* fork/waitpid crash-isolation for the projection-width guard */
-#include <unistd.h>
-#endif
 
 /* ══════════════════════════════════════════════════════════════════
  *  LEXER TESTS
  * ══════════════════════════════════════════════════════════════════ */
+
+enum {
+    CYPHER_TEST_LONG_TOKEN_BYTES = 5000,
+    CYPHER_TEST_QUOTED_STRING_OVERHEAD = 3,
+    CYPHER_TEST_TOKEN_GROWTH_COUNT = 33,
+    CYPHER_TEST_REPEATED_VARIABLE_COUNT = 3,
+    CYPHER_TEST_DYNAMIC_PROPERTY_COUNT = 10,
+    CYPHER_TEST_JSON_STRING_MEMBER_OVERHEAD = 5,
+    CYPHER_TEST_STAR_COLUMN_COUNT = 4,
+    CYPHER_TEST_DEFAULT_COLUMN_COUNT = 3,
+    CYPHER_TEST_DISTINCT_VALUE_BYTES = CBM_SZ_2K,
+};
 
 TEST(cypher_lex_simple_match) {
     cbm_lex_result_t r = {0};
@@ -87,12 +97,11 @@ TEST(cypher_lex_single_quote_string) {
     PASS();
 }
 
-TEST(cypher_lex_string_overflow) {
-    /* Build a string literal longer than 4096 bytes to verify we don't
-     * overflow the stack buffer in lex_string_literal. */
-    const int big = 5000;
+TEST(cypher_lex_preserves_long_string) {
+    /* A safety guard must not silently change the literal's query meaning. */
+    const int big = CYPHER_TEST_LONG_TOKEN_BYTES;
     /* query: "AAAA...A"  (quotes included) */
-    char *query = malloc(big + 3); /* quote + big chars + quote + NUL */
+    char *query = malloc((size_t)big + CYPHER_TEST_QUOTED_STRING_OVERHEAD);
     ASSERT_NOT_NULL(query);
     query[0] = '"';
     memset(query + 1, 'A', big);
@@ -105,11 +114,120 @@ TEST(cypher_lex_string_overflow) {
     ASSERT_NULL(r.error);
     ASSERT_GTE(r.count, 1);
     ASSERT_EQ(r.tokens[0].type, TOK_STRING);
-    /* The string should be truncated to CBM_SZ_4K - 1 (4095) characters. */
-    ASSERT_EQ((int)strlen(r.tokens[0].text), 4095);
+    ASSERT_EQ((int)strlen(r.tokens[0].text), big);
 
     cbm_lex_free(&r);
     free(query);
+    PASS();
+}
+
+TEST(cypher_lex_preserves_long_identifier) {
+    const int length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    char *identifier = malloc((size_t)length + SKIP_ONE);
+    ASSERT_NOT_NULL(identifier);
+    memset(identifier, 'a', (size_t)length);
+    identifier[length] = '\0';
+
+    cbm_lex_result_t r = {0};
+    ASSERT_EQ(cbm_lex(identifier, &r), 0);
+    ASSERT_NULL(r.error);
+    ASSERT_GTE(r.count, 1);
+    ASSERT_EQ(r.tokens[0].type, TOK_IDENT);
+    ASSERT_EQ((int)strlen(r.tokens[0].text), length);
+
+    cbm_lex_free(&r);
+    free(identifier);
+    PASS();
+}
+
+TEST(cypher_lex_rejects_unterminated_string) {
+    cbm_lex_result_t r = {0};
+    ASSERT_EQ(cbm_lex("RETURN 'unterminated", &r), CBM_NOT_FOUND);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "unterminated string literal"));
+    cbm_lex_free(&r);
+    PASS();
+}
+
+TEST(cypher_lex_rejects_unterminated_block_comment) {
+    cbm_lex_result_t r = {0};
+    ASSERT_EQ(cbm_lex("MATCH (n) /* unterminated", &r), CBM_NOT_FOUND);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "unterminated block comment"));
+    cbm_lex_free(&r);
+    PASS();
+}
+
+TEST(cypher_lex_rejects_unknown_character) {
+    cbm_lex_result_t r = {0};
+    ASSERT_EQ(cbm_lex("MATCH (n) @ RETURN n", &r), CBM_NOT_FOUND);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "unsupported character '@'"));
+    cbm_lex_free(&r);
+    PASS();
+}
+
+TEST(cypher_lex_allocation_failures_are_atomic) {
+    static const struct {
+        cbm_cypher_test_lex_alloc_site_t site;
+        const char *query;
+        const char *expected_error;
+        int successful_before;
+        int expected_published_tokens;
+    } cases[] = {
+        {CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_ARRAY, "MATCH", "growing Cypher token storage", 0, 0},
+        {CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_TEXT, "MATCH RETURN", "copying Cypher token text", 1,
+         1},
+        {CBM_CYPHER_TEST_LEX_ALLOC_STRING_TEXT, "RETURN 'value'",
+         "decoding Cypher string literal", 0, 1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cbm_lex_result_t r = {0};
+        cbm_cypher_test_fail_lex_allocation(cases[i].site, cases[i].successful_before);
+        int rc = cbm_lex(cases[i].query, &r);
+        cbm_cypher_test_fail_lex_allocation(CBM_CYPHER_TEST_LEX_ALLOC_NONE, -1);
+        ASSERT_EQ(rc, CBM_NOT_FOUND);
+        ASSERT_TRUE(r.failed);
+        ASSERT_NOT_NULL(r.error);
+        ASSERT_NOT_NULL(strstr(r.error, cases[i].expected_error));
+        ASSERT_EQ(r.count, cases[i].expected_published_tokens);
+        cbm_lex_free(&r);
+    }
+
+    size_t growth_query_size = (size_t)CYPHER_TEST_TOKEN_GROWTH_COUNT * PAIR_LEN + SKIP_ONE;
+    char *growth_query = malloc(growth_query_size);
+    ASSERT_NOT_NULL(growth_query);
+    for (int i = 0; i < CYPHER_TEST_TOKEN_GROWTH_COUNT; i++) {
+        growth_query[(size_t)i * PAIR_LEN] = 'n';
+        growth_query[(size_t)i * PAIR_LEN + SKIP_ONE] = ' ';
+    }
+    growth_query[growth_query_size - SKIP_ONE] = '\0';
+    cbm_lex_result_t growth = {0};
+    cbm_cypher_test_fail_lex_allocation(CBM_CYPHER_TEST_LEX_ALLOC_TOKEN_ARRAY, 1);
+    int growth_rc = cbm_lex(growth_query, &growth);
+    cbm_cypher_test_fail_lex_allocation(CBM_CYPHER_TEST_LEX_ALLOC_NONE, -1);
+    ASSERT_EQ(growth_rc, CBM_NOT_FOUND);
+    ASSERT_NOT_NULL(growth.error);
+    ASSERT_NOT_NULL(strstr(growth.error, "growing Cypher token storage"));
+    ASSERT_EQ(growth.count, CBM_SZ_32);
+    cbm_lex_free(&growth);
+    free(growth_query);
+
+    cbm_lex_result_t recovered = {0};
+    ASSERT_EQ(cbm_lex("MATCH", &recovered), 0);
+    ASSERT_FALSE(recovered.failed);
+    cbm_lex_free(&recovered);
+    PASS();
+}
+
+TEST(cypher_parse_propagates_lex_error) {
+    cbm_query_t *query = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (n) @ RETURN n", &query, &error), CBM_NOT_FOUND);
+    ASSERT_NULL(query);
+    ASSERT_NOT_NULL(error);
+    ASSERT_NOT_NULL(strstr(error, "unsupported character '@'"));
+    free(error);
     PASS();
 }
 
@@ -443,6 +561,69 @@ TEST(cypher_parse_return_order_limit) {
     PASS();
 }
 
+TEST(cypher_parse_preserves_query_sized_label) {
+    static const char prefix[] = "MATCH (n:";
+    static const char suffix[] = ") RETURN n";
+    const size_t label_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    const size_t query_size = (sizeof(prefix) - SKIP_ONE) + label_length + sizeof(suffix);
+    char *query = malloc(query_size);
+    ASSERT_NOT_NULL(query);
+    size_t offset = 0;
+    memcpy(query + offset, prefix, sizeof(prefix) - SKIP_ONE);
+    offset += sizeof(prefix) - SKIP_ONE;
+    memset(query + offset, 'L', label_length);
+    offset += label_length;
+    memcpy(query + offset, suffix, sizeof(suffix));
+
+    cbm_query_t *parsed = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse(query, &parsed, &error), 0);
+    ASSERT_NULL(error);
+    ASSERT_NOT_NULL(parsed);
+    ASSERT_NOT_NULL(cbm_query_pattern(parsed).nodes[0].label);
+    ASSERT_EQ(strlen(cbm_query_pattern(parsed).nodes[0].label), label_length);
+    for (size_t i = 0; i < label_length; i++) {
+        ASSERT_EQ(cbm_query_pattern(parsed).nodes[0].label[i], 'L');
+    }
+
+    cbm_query_free(parsed);
+    free(query);
+    PASS();
+}
+
+TEST(cypher_parse_preserves_query_sized_case_value_reference) {
+    static const char prefix[] = "MATCH (n) RETURN CASE WHEN n.name = 'x' THEN ";
+    static const char suffix[] = ".property ELSE false END AS value";
+    const size_t variable_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    const size_t expected_length = variable_length + sizeof(".property") - SKIP_ONE;
+    const size_t query_size = (sizeof(prefix) - SKIP_ONE) + variable_length + sizeof(suffix);
+    char *query = malloc(query_size);
+    ASSERT_NOT_NULL(query);
+    size_t offset = 0;
+    memcpy(query + offset, prefix, sizeof(prefix) - SKIP_ONE);
+    offset += sizeof(prefix) - SKIP_ONE;
+    memset(query + offset, 'v', variable_length);
+    offset += variable_length;
+    memcpy(query + offset, suffix, sizeof(suffix));
+
+    cbm_query_t *parsed = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse(query, &parsed, &error), 0);
+    ASSERT_NULL(error);
+    ASSERT_NOT_NULL(parsed);
+    ASSERT_NOT_NULL(parsed->ret);
+    ASSERT_NOT_NULL(parsed->ret->items[0].kase);
+    ASSERT_EQ(parsed->ret->items[0].kase->branch_count, 1);
+    const char *then_value = parsed->ret->items[0].kase->branches[0].then_val;
+    ASSERT_NOT_NULL(then_value);
+    ASSERT_EQ(strlen(then_value), expected_length);
+    ASSERT_STR_EQ(then_value + variable_length, ".property");
+
+    cbm_query_free(parsed);
+    free(query);
+    PASS();
+}
+
 TEST(cypher_parse_return_distinct) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -534,6 +715,204 @@ static cbm_store_t *setup_cypher_store(void) {
     cbm_store_insert_edge(s, &e4);
 
     return s;
+}
+
+/* The public capability registry is the stable language contract, not merely
+ * MCP prose. Execute every advertised function name through the real parser
+ * and evaluator so a registry/parser drift fails locally. There are a fixed C
+ * names and a bounded fixture; runtime is O(C) and retained memory is O(1)
+ * beyond each normal one-row query result. Clause/pattern/predicate semantics
+ * have dedicated tests below because synthesizing those from prose would
+ * create a second parser in the test suite. */
+TEST(cypher_capability_registry_functions_are_executable) {
+    const cbm_cypher_capability_schema_t *schema = cbm_cypher_capability_schema();
+    ASSERT_NOT_NULL(schema);
+    ASSERT_TRUE(schema == cbm_cypher_capability_schema());
+    ASSERT_STR_EQ(schema->schema_id, CBM_CYPHER_CAPABILITY_SCHEMA_ID);
+    ASSERT_EQ(schema->version, CBM_CYPHER_CAPABILITY_SCHEMA_VERSION);
+
+    cbm_store_t *store = setup_cypher_store();
+    ASSERT_NOT_NULL(store);
+    char query[CBM_SZ_512];
+
+    for (size_t i = 0; i < schema->aggregate_function_count; i++) {
+        const char *name = schema->aggregate_functions[i];
+        int written =
+            strcmp(name, "count") == 0
+                ? snprintf(query, sizeof(query), "MATCH (n) RETURN %s(*)", name)
+                : snprintf(query, sizeof(query), "MATCH (n) RETURN %s(n.start_line)", name);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(query));
+        cbm_cypher_result_t result = {0};
+        ASSERT_EQ(cbm_cypher_execute(store, query, "test", 1, &result), CBM_STORE_OK);
+        ASSERT_NULL(result.error);
+        cbm_cypher_result_free(&result);
+    }
+
+    for (size_t i = 0; i < schema->keyword_scalar_function_count; i++) {
+        int written = snprintf(query, sizeof(query), "MATCH (n) RETURN %s(n.name) LIMIT 1",
+                               schema->keyword_scalar_functions[i]);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(query));
+        cbm_cypher_result_t result = {0};
+        ASSERT_EQ(cbm_cypher_execute(store, query, "test", 1, &result), CBM_STORE_OK);
+        ASSERT_NULL(result.error);
+        cbm_cypher_result_free(&result);
+    }
+
+    for (size_t i = 0; i < schema->named_scalar_function_count; i++) {
+        const char *name = schema->named_scalar_functions[i];
+        int written;
+        if (strcmp(name, "type") == 0) {
+            written = snprintf(query, sizeof(query), "MATCH ()-[r]->() RETURN %s(r) LIMIT 1", name);
+        } else if (strcmp(name, "labels") == 0 || strcmp(name, "id") == 0 ||
+                   strcmp(name, "keys") == 0 || strcmp(name, "properties") == 0) {
+            written = snprintf(query, sizeof(query), "MATCH (n) RETURN %s(n) LIMIT 1", name);
+        } else {
+            written = snprintf(query, sizeof(query), "MATCH (n) RETURN %s(n.name) LIMIT 1", name);
+        }
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(query));
+        cbm_cypher_result_t result = {0};
+        ASSERT_EQ(cbm_cypher_execute(store, query, "test", 1, &result), CBM_STORE_OK);
+        ASSERT_NULL(result.error);
+        cbm_cypher_result_free(&result);
+    }
+
+    for (size_t i = 0; i < schema->multi_argument_function_count; i++) {
+        const char *name = schema->multi_argument_functions[i];
+        int written;
+        if (strcmp(name, "coalesce") == 0) {
+            written = snprintf(query, sizeof(query),
+                               "MATCH (n) RETURN %s(n.name, 'fallback') LIMIT 1", name);
+        } else if (strcmp(name, "substring") == 0) {
+            written =
+                snprintf(query, sizeof(query), "MATCH (n) RETURN %s(n.name, 0, 1) LIMIT 1", name);
+        } else if (strcmp(name, "replace") == 0) {
+            written = snprintf(query, sizeof(query),
+                               "MATCH (n) RETURN %s(n.name, 'a', 'b') LIMIT 1", name);
+        } else {
+            written =
+                snprintf(query, sizeof(query), "MATCH (n) RETURN %s(n.name, 1) LIMIT 1", name);
+        }
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(query));
+        cbm_cypher_result_t result = {0};
+        ASSERT_EQ(cbm_cypher_execute(store, query, "test", 1, &result), CBM_STORE_OK);
+        ASSERT_NULL(result.error);
+        cbm_cypher_result_free(&result);
+    }
+
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_query_sized_order_expression_and_column) {
+    static const char match_prefix[] = "MATCH (";
+    static const char return_prefix[] = ":Function) RETURN ";
+    static const char order_prefix[] = ".name ORDER BY ";
+    static const char suffix[] = ".name DESC";
+    const size_t variable_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    const size_t expected_expression_length = variable_length + sizeof(".name") - SKIP_ONE;
+    const size_t query_size = (sizeof(match_prefix) - SKIP_ONE) +
+                              (sizeof(return_prefix) - SKIP_ONE) +
+                              (sizeof(order_prefix) - SKIP_ONE) + sizeof(suffix) +
+                              variable_length * CYPHER_TEST_REPEATED_VARIABLE_COUNT;
+    char *query = malloc(query_size);
+    ASSERT_NOT_NULL(query);
+    size_t offset = 0;
+    memcpy(query + offset, match_prefix, sizeof(match_prefix) - SKIP_ONE);
+    offset += sizeof(match_prefix) - SKIP_ONE;
+    memset(query + offset, 'v', variable_length);
+    offset += variable_length;
+    memcpy(query + offset, return_prefix, sizeof(return_prefix) - SKIP_ONE);
+    offset += sizeof(return_prefix) - SKIP_ONE;
+    memset(query + offset, 'v', variable_length);
+    offset += variable_length;
+    memcpy(query + offset, order_prefix, sizeof(order_prefix) - SKIP_ONE);
+    offset += sizeof(order_prefix) - SKIP_ONE;
+    memset(query + offset, 'v', variable_length);
+    offset += variable_length;
+    memcpy(query + offset, suffix, sizeof(suffix));
+
+    cbm_query_t *parsed = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse(query, &parsed, &error), 0);
+    ASSERT_NULL(error);
+    ASSERT_NOT_NULL(parsed);
+    ASSERT_EQ(parsed->ret->order_count, 1);
+    ASSERT_EQ(strlen(parsed->ret->order_items[0].expression), expected_expression_length);
+    cbm_query_free(parsed);
+
+    cbm_store_t *store = setup_cypher_store();
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.col_count, 1);
+    ASSERT_EQ(strlen(result.columns[0]), expected_expression_length);
+    ASSERT_EQ(result.row_count, 4);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    free(query);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_query_sized_star_and_default_columns) {
+    static const char prefix[] = "MATCH (";
+    static const char star_suffix[] = ":Function) RETURN *";
+    static const char default_suffix[] = ":Function)";
+    static const char *const star_column_suffixes[CYPHER_TEST_STAR_COLUMN_COUNT] = {
+        ".name", ".qualified_name", ".label", ".file_path"};
+    static const char *const default_column_suffixes[CYPHER_TEST_DEFAULT_COLUMN_COUNT] = {
+        ".name", ".qualified_name", ".label"};
+    const size_t variable_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    size_t star_size = sizeof(prefix) - SKIP_ONE + variable_length + sizeof(star_suffix);
+    size_t default_size = sizeof(prefix) - SKIP_ONE + variable_length + sizeof(default_suffix);
+    char *star_query = malloc(star_size);
+    char *default_query = malloc(default_size);
+    ASSERT_NOT_NULL(star_query);
+    ASSERT_NOT_NULL(default_query);
+    memcpy(star_query, prefix, sizeof(prefix) - SKIP_ONE);
+    memset(star_query + sizeof(prefix) - SKIP_ONE, 'v', variable_length);
+    memcpy(star_query + sizeof(prefix) - SKIP_ONE + variable_length, star_suffix,
+           sizeof(star_suffix));
+    memcpy(default_query, prefix, sizeof(prefix) - SKIP_ONE);
+    memset(default_query + sizeof(prefix) - SKIP_ONE, 'v', variable_length);
+    memcpy(default_query + sizeof(prefix) - SKIP_ONE + variable_length, default_suffix,
+           sizeof(default_suffix));
+
+    cbm_store_t *store = setup_cypher_store();
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, star_query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.col_count, CYPHER_TEST_STAR_COLUMN_COUNT);
+    for (int i = 0; i < CYPHER_TEST_STAR_COLUMN_COUNT; i++) {
+        ASSERT_EQ(strlen(result.columns[i]), variable_length + strlen(star_column_suffixes[i]));
+        ASSERT_EQ(memcmp(result.columns[i], star_query + sizeof(prefix) - SKIP_ONE,
+                         variable_length),
+                  0);
+        ASSERT_STR_EQ(result.columns[i] + variable_length, star_column_suffixes[i]);
+    }
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store, default_query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.col_count, CYPHER_TEST_DEFAULT_COLUMN_COUNT);
+    for (int i = 0; i < CYPHER_TEST_DEFAULT_COLUMN_COUNT; i++) {
+        ASSERT_EQ(strlen(result.columns[i]),
+                  variable_length + strlen(default_column_suffixes[i]));
+        ASSERT_EQ(memcmp(result.columns[i], default_query + sizeof(prefix) - SKIP_ONE,
+                         variable_length),
+                  0);
+        ASSERT_STR_EQ(result.columns[i] + variable_length, default_column_suffixes[i]);
+    }
+    cbm_cypher_result_free(&result);
+
+    cbm_store_close(store);
+    free(default_query);
+    free(star_query);
+    PASS();
 }
 
 typedef struct {
@@ -706,14 +1085,127 @@ TEST(cypher_exec_optional_empty_label_no_overflow) {
     PASS();
 }
 
-/* Arithmetic-boundary companion to the zero-label overflow above. Upstream's
- * historical allocation contract sized a full node cross-join from
- * bind_count * extra_count; as a plain int, that product could wrap past
- * INT_MAX to a negative/garbage malloc size (the large-graph #627 failure
- * mode). The fork executor instead caps geometric growth at max_new, while
- * cbm_cypher_cross_join_alloc preserves and validates the former arithmetic
- * contract in O(1) time and O(1) memory. Test that seam directly without
- * allocating billions of bindings. */
+/* Output limits must not become hidden matching limits. This query expands far
+ * more rows than max_output_rows, then applies the output cap after matching;
+ * the geometrically grown binding array must remain memory-safe under ASan. */
+TEST(cypher_exec_optional_rel_output_limit_does_not_bound_matching) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    enum { LEAF_COUNT = 20, CALLEE_COUNT = 300, OUTPUT_ROWS = 5 };
+    /* The hub is inserted first and produces many matches; the leaves exercise
+     * null-extension after that expansion without tying working memory to the
+     * much smaller requested output window. */
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    for (int i = 0; i < LEAF_COUNT; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "leaf%02d", i);
+        snprintf(qn, sizeof(qn), "test.leaf%02d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = nm, .qualified_name = qn};
+        cbm_store_upsert_node(s, &leaf);
+    }
+
+    for (int i = 0; i < CALLEE_COUNT; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "callee%d", i);
+        snprintf(qn, sizeof(qn), "test.callee%d", i);
+        cbm_node_t callee = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &callee);
+        cbm_edge_t e = {.project = "test", .source_id = hub_id, .target_id = cid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.name", "test",
+        OUTPUT_ROWS, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, OUTPUT_ROWS);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Reproduce-first: after the working-row budget is exhausted, OPTIONAL MATCH
+ * must fail explicitly rather than FABRICATE a "no match" row for a source
+ * that genuinely has matches.
+ *
+ * process_edges / expand_var_length used to carry the budget in the LOOP
+ * condition (`ei < edge_count && *new_count < max_new`), so once new_count hit
+ * max_new they stopped iterating entirely and never incremented match_count —
+ * even though neighbours existed. expand_pattern_rels' ungated fallback then saw
+ * match_count == 0 and emitted an unbound row. `WHERE b IS NULL` reads that as
+ * "nothing points here", so a dead-code query reported LIVE code as dead.
+ *
+ * Shape: A saturates the explicit budget, B has no callees, and C has five.
+ * The null filter follows WITH so it cannot be pushed into relationship
+ * candidate evaluation: this deliberately exercises real intermediate-row
+ * exhaustion rather than rejecting exact O(E)-time predicate pushdown that
+ * avoids materializing non-qualifying rows. Returning a partial success could
+ * misclassify C as dead; the fork's stable contract returns an actionable
+ * error instead. */
+TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    enum { A_CALLEE_COUNT = 40, C_CALLEE_COUNT = 5, WORKING_ROWS = 30 };
+    cbm_node_t a = {.project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t b = {.project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    cbm_node_t c = {.project = "test", .label = "Function", .name = "C", .qualified_name = "test.C"};
+    int64_t a_id = cbm_store_upsert_node(s, &a);
+    (void)cbm_store_upsert_node(s, &b); /* B: no outgoing CALLS at all */
+    int64_t c_id = cbm_store_upsert_node(s, &c);
+    ASSERT_GT(a_id, 0);
+    ASSERT_GT(c_id, 0);
+
+    /* Callees are label Var so they do not inflate scan_count/bind_cap. */
+    for (int i = 0; i < A_CALLEE_COUNT; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "acallee%d", i);
+        snprintf(qn, sizeof(qn), "test.acallee%d", i);
+        cbm_node_t t = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t tid = cbm_store_upsert_node(s, &t);
+        cbm_edge_t e = {.project = "test", .source_id = a_id, .target_id = tid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+    for (int i = 0; i < C_CALLEE_COUNT; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "ccallee%d", i);
+        snprintf(qn, sizeof(qn), "test.ccallee%d", i);
+        cbm_node_t t = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t tid = cbm_store_upsert_node(s, &t);
+        cbm_edge_t e = {.project = "test", .source_id = c_id, .target_id = tid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    cbm_cypher_limits_t limits = {.max_output_rows = 3, .max_working_rows = WORKING_ROWS};
+    int rc = cbm_cypher_execute_with_limits(
+        s, "MATCH (f:Function) OPTIONAL MATCH (f)-[:CALLS]->(g) "
+           "WITH f, g WHERE g IS NULL RETURN f.name",
+        "test", &limits, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget"));
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Arithmetic-boundary companion to the zero-label overflow above. The legacy
+ * full cross-join allocation multiplied bind_count by extra_count; validate
+ * that compatibility seam in O(1) runtime and O(1) memory without allocating
+ * billions of bindings. The active executor grows only to its configured
+ * working-row budget. */
 TEST(cypher_cross_join_alloc_rejects_overflow) {
     enum {
         CROSS_JOIN_INT_OVERFLOW_FACTOR = 46341,
@@ -739,6 +1231,71 @@ TEST(cypher_cross_join_alloc_rejects_overflow) {
     ASSERT_EQ(cbm_cypher_cross_join_alloc(NORMAL_BINDING_COUNT, 0, false, &n), 0);
     ASSERT_EQ(n, (size_t)1);
 
+    PASS();
+}
+
+/* Companion to the truncation regression: when the expansion does NOT saturate
+ * the ceiling, every leaf's OPTIONAL fallback row must survive with its target
+ * unbound. A `row_count > 0` check is too weak — it can pass on hub rows alone —
+ * so this asserts a specific leaf appears with an empty b.name, and that a real
+ * expanded hub row is present too. */
+TEST(cypher_exec_optional_rel_leaf_fallback_survives) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* 1 hub (2 CALLS edges) + 3 leaves (no edges). The executor starts from a
+     * small geometric binding capacity and the default working-row budget is
+     * far above this six-row result, so this exercises fallback correctness and
+     * amortized O(1) append growth rather than the saturation path. */
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    for (int i = 0; i < 3; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "leaf%d", i);
+        snprintf(qn, sizeof(qn), "test.leaf%d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = nm, .qualified_name = qn};
+        cbm_store_upsert_node(s, &leaf);
+    }
+    for (int i = 0; i < 2; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "callee%d", i);
+        snprintf(qn, sizeof(qn), "test.callee%d", i);
+        cbm_node_t callee = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &callee);
+        cbm_edge_t e = {.project = "test", .source_id = hub_id, .target_id = cid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    /* Scan for a leaf fallback row (a.name = "leaf0", b.name unbound = "") and a
+     * real expanded hub row (a.name = "hub", b.name non-empty). */
+    bool leaf_fallback = false;
+    bool hub_expanded = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *a = r.rows[i][0];
+        const char *b = r.rows[i][1];
+        if (strcmp(a, "leaf0") == 0 && b[0] == '\0') {
+            leaf_fallback = true;
+        }
+        if (strcmp(a, "hub") == 0 && b[0] != '\0') {
+            hub_expanded = true;
+        }
+    }
+    ASSERT_TRUE(leaf_fallback); /* the OPTIONAL no-match row survived */
+    ASSERT_TRUE(hub_expanded);  /* the expansion still produced bound rows */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -1209,6 +1766,66 @@ TEST(cypher_func_labels) {
     PASS();
 }
 
+TEST(cypher_func_labels_preserves_query_sized_label) {
+    const size_t label_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    char *label = malloc(label_length + SKIP_ONE);
+    ASSERT_NOT_NULL(label);
+    memset(label, 'L', label_length);
+    label[label_length] = '\0';
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "labels", "/tmp/labels"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "labels",
+                       .label = label,
+                       .name = "LongLabel",
+                       .qualified_name = "labels.LongLabel",
+                       .file_path = "labels.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(store, &node) > 0);
+    free(label);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, "MATCH (n) RETURN labels(n)", "labels", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 1);
+    const char *serialized = result.rows[0][0];
+    ASSERT_EQ(strlen(serialized), label_length + sizeof("[\"\"]") - SKIP_ONE);
+    ASSERT_EQ(serialized[0], '[');
+    ASSERT_EQ(serialized[SKIP_ONE], '"');
+    for (size_t i = 0; i < label_length; i++) {
+        ASSERT_EQ(serialized[i + PAIR_LEN], 'L');
+    }
+    ASSERT_EQ(serialized[label_length + PAIR_LEN], '"');
+    ASSERT_EQ(serialized[label_length + PAIR_LEN + SKIP_ONE], ']');
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_func_labels_json_escapes_bytes) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "labels", "/tmp/labels"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "labels",
+                       .label = "Type\"\\\n\t",
+                       .name = "EscapedLabel",
+                       .qualified_name = "labels.EscapedLabel",
+                       .file_path = "labels.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(store, &node) > 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, "MATCH (n) RETURN labels(n)", "labels", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "[\"Type\\\"\\\\\\n\\t\"]");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(cypher_func_type) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -1530,6 +2147,35 @@ TEST(cypher_func_keys) {
     PASS();
 }
 
+TEST(cypher_func_keys_dynamic_null_escape_and_dedup) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "keys", "/tmp/keys"), CBM_STORE_OK);
+    cbm_node_t node = {
+        .project = "keys",
+        .label = "Function",
+        .name = "Keyed",
+        .qualified_name = "keys.Keyed",
+        .file_path = "keys.c",
+        .properties_json = "{\"dynamic\":\"value\",\"empty\":\"\",\"null_value\":null,"
+                           "\"name\":\"shadow\",\"quoted\\\"key\":1}",
+    };
+    ASSERT_TRUE(cbm_store_upsert_node(store, &node) > 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, "MATCH (n:Function) RETURN keys(n)", "keys", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0],
+                  "[\"name\",\"qualified_name\",\"label\",\"file_path\",\"dynamic\","
+                  "\"empty\",\"quoted\\\"key\"]");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(cypher_func_properties) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -1559,6 +2205,155 @@ TEST(cypher_func_tointeger_tofloat) {
     PASS();
 }
 
+TEST(cypher_func_casts_preserve_logical_type_and_reject_invalid_numbers) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "casts", "/tmp/casts"), CBM_STORE_OK);
+    cbm_node_t node = {
+        .project = "casts",
+        .label = "Function",
+        .name = "CastTarget",
+        .qualified_name = "casts.CastTarget",
+        .file_path = "casts.c",
+        .start_line = 10,
+        .properties_json =
+            "{\"zero\":0,\"integer\":2,\"floating\":2.75,\"true_value\":true,"
+            "\"false_value\":false,\"integer_text\":\"42\","
+            "\"float_text\":\"11.5\",\"partial\":\"12junk\","
+            "\"overflow\":\"9223372036854775808\","
+            "\"max_text\":\"9223372036854775807\","
+            "\"min_text\":\"-9223372036854775808\","
+            "\"below_min\":\"-9223372036854775809\","
+            "\"plus_text\":\"+42\",\"leading_decimal\":\".5\","
+            "\"trailing_decimal\":\"1.\",\"leading_zeroes\":\"001\","
+            "\"signed_zeroes\":\"-001\",\"plus_zeroes\":\"+001\","
+            "\"zero_fraction\":\"000.5\",\"signed_zero_fraction\":\"-000.5\","
+            "\"spaced_number\":\" 42 \","
+            "\"precise_text\":\"1.2345678901234567\","
+            "\"lower_float\":-9.223372036854776e18,"
+            "\"upper_float\":9.223372036854776e18,\"null_value\":null}",
+    };
+    ASSERT_TRUE(cbm_store_upsert_node(store, &node) > 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(
+                  store,
+                  "MATCH (n:Function) RETURN "
+                  "toBoolean(n.zero), toBoolean(n.integer), toBoolean(n.true_value), "
+                  "toBoolean(n.false_value), toBoolean(n.integer_text), "
+                  "toInteger(n.true_value), toInteger(n.false_value), "
+                  "toInteger(n.floating), toInteger(n.integer_text), "
+                  "toInteger(n.partial), toInteger(n.overflow), toInteger(n.null_value), "
+                  "toFloat(n.integer), toFloat(n.float_text), toFloat(n.partial), "
+                  "toInteger(n.max_text), toInteger(n.min_text), toInteger(n.below_min), "
+                  "toInteger(n.lower_float), toInteger(n.upper_float), "
+                  "toInteger(n.plus_text), toInteger(n.leading_decimal), "
+                  "toInteger(n.trailing_decimal), toInteger(n.leading_zeroes), "
+                  "toInteger(n.signed_zeroes), toInteger(n.plus_zeroes), "
+                  "toInteger(n.zero_fraction), toInteger(n.signed_zero_fraction), "
+                  "toInteger(n.spaced_number), toFloat(n.plus_text), "
+                  "toFloat(n.leading_decimal), toFloat(n.trailing_decimal), "
+                  "toFloat(n.leading_zeroes), toFloat(n.signed_zeroes), "
+                  "toFloat(n.plus_zeroes), toFloat(n.zero_fraction), "
+                  "toFloat(n.signed_zero_fraction), toFloat(n.spaced_number), "
+                  "toFloat(n.precise_text)",
+                  "casts", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    const char *expected[] = {
+        "false", "true", "true", "false", "", "1", "0", "2", "42", "", "", "", "2",
+        "11.5", "", "9223372036854775807", "-9223372036854775808", "",
+        "-9223372036854775808", "", "42", "0", "1", "1", "-1", "1", "0", "0", "42",
+        "42", "0.5", "1", "1", "-1", "1", "0.5", "-0.5", "42",
+        "1.2345678901234567"};
+    ASSERT_EQ(result.col_count, (int)(sizeof(expected) / sizeof(expected[0])));
+    for (int column = 0; column < result.col_count; column++) {
+        ASSERT_STR_EQ(result.rows[0][column], expected[column]);
+    }
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) WITH n.start_line AS line "
+                                 "RETURN toBoolean(line), toInteger(line), toFloat(line)",
+                                 "casts", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "true");
+    ASSERT_STR_EQ(result.rows[0][1], "10");
+    ASSERT_STR_EQ(result.rows[0][2], "10");
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(
+                  store,
+                  "MATCH (n:Function) WITH id(n) AS identifier, "
+                  "toString(n.integer) AS integer_text, size(n.integer_text) AS text_length "
+                  "RETURN toBoolean(identifier), toBoolean(integer_text), "
+                  "toBoolean(text_length)",
+                  "casts", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "true");
+    ASSERT_STR_EQ(result.rows[0][1], "");
+    ASSERT_STR_EQ(result.rows[0][2], "true");
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(
+                  store,
+                  "MATCH (n:Function) WITH n.zero AS zero, COUNT(n) AS total "
+                  "RETURN toBoolean(zero), toBoolean(total), toInteger(total)",
+                  "casts", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "false");
+    ASSERT_STR_EQ(result.rows[0][1], "true");
+    ASSERT_STR_EQ(result.rows[0][2], "1");
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(
+                  store,
+                  "UNWIND [0, 2, 2.0, true, false, \"2\", null] AS x "
+                  "MATCH (n:Function) RETURN toBoolean(x), toInteger(x), toFloat(x)",
+                  "casts", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 7);
+    const char *unwind_expected[][3] = {
+        {"false", "0", "0"}, {"true", "2", "2"}, {"", "2", "2"}, {"true", "1", ""},
+        {"false", "0", ""},  {"", "2", "2"},     {"", "", ""},
+    };
+    for (int row = 0; row < result.row_count; row++) {
+        for (int column = 0; column < result.col_count; column++) {
+            ASSERT_STR_EQ(result.rows[row][column], unwind_expected[row][column]);
+        }
+    }
+    cbm_cypher_result_free(&result);
+
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_func_casts_require_exactly_one_argument) {
+    cbm_store_t *store = setup_cypher_store();
+    ASSERT_NOT_NULL(store);
+    const char *queries[] = {
+        "MATCH (n:Function) RETURN toInteger()",
+        "MATCH (n:Function) RETURN toFloat(n.start_line, n.end_line)",
+        "MATCH (n:Function) RETURN toBoolean()",
+    };
+    for (size_t query_index = 0; query_index < sizeof(queries) / sizeof(queries[0]); query_index++) {
+        cbm_cypher_result_t result = {0};
+        ASSERT_TRUE(cbm_cypher_execute(store, queries[query_index], "test", 0, &result) != 0);
+        ASSERT_NOT_NULL(result.error);
+        cbm_cypher_result_free(&result);
+    }
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(cypher_func_size_reverse) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -1573,6 +2368,36 @@ TEST(cypher_func_size_reverse) {
     ASSERT_STR_EQ(r.rows[0][2], "rorrEgoL");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_func_trim_variants_and_odd_reverse) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "trim", "/tmp/trim"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "trim",
+                       .label = "Function",
+                       .name = " \tvalue\r\n",
+                       .qualified_name = "trim.value",
+                       .file_path = "trim.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(store, &node) > 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) RETURN trim(n.name), ltrim(n.name), "
+                                 "rtrim(n.name), reverse(n.name)",
+                                 "trim", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 4);
+    ASSERT_STR_EQ(result.rows[0][0], "value");
+    ASSERT_STR_EQ(result.rows[0][1], "value\r\n");
+    ASSERT_STR_EQ(result.rows[0][2], " \tvalue");
+    ASSERT_STR_EQ(result.rows[0][3], "\n\reulav\t ");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
     PASS();
 }
 
@@ -1592,6 +2417,34 @@ TEST(cypher_func_multiarg) {
     ASSERT_STR_EQ(r.rows[0][2], "Order");     /* right("HandleOrder",5) */
     ASSERT_STR_EQ(r.rows[0][3], "HandleReq"); /* replace Order->Req */
     ASSERT_STR_EQ(r.rows[0][4], "fallback");  /* coalesce: f.missing empty -> literal */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_func_multiarg_exact_edge_cases) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'HandleOrder' "
+        "RETURN replace('aaaaa','aa','b'), replace('abc','','x'), replace('a','long','x'), "
+        "replace('abc','abd','x'), "
+        "substring(f.name,999,2), substring(f.name,6,0), "
+        "right(f.name,2147483647), coalesce(f.missing,'','fallback')",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_EQ(r.col_count, 8);
+    ASSERT_STR_EQ(r.rows[0][0], "bba");
+    ASSERT_STR_EQ(r.rows[0][1], "abc");
+    ASSERT_STR_EQ(r.rows[0][2], "a");
+    ASSERT_STR_EQ(r.rows[0][3], "abc");
+    ASSERT_STR_EQ(r.rows[0][4], "");
+    ASSERT_STR_EQ(r.rows[0][5], "");
+    ASSERT_STR_EQ(r.rows[0][6], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][7], "");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -1710,6 +2563,8 @@ TEST(cypher_issue874_where_unsupported_func_error) {
     ASSERT_EQ(rc, -1);
     ASSERT_NOT_NULL(err);
     ASSERT_TRUE(strstr(err, "unsupported function 'foo'") != NULL);
+    ASSERT_NOT_NULL(strstr(err, "coalesce"));
+    ASSERT_NOT_NULL(strstr(err, "right"));
     free(err);
     PASS();
 }
@@ -2117,6 +2972,55 @@ TEST(cypher_exec_with_distinct_issue238) {
     PASS();
 }
 
+TEST(cypher_exec_with_distinct_preserves_values_differing_after_inline_prefix) {
+    static const char json_prefix[] = "{\"payload\":\"";
+    static const char json_suffix[] = "\"}";
+    static const char *const names[] = {"first", "second"};
+    static const char *const qualified_names[] = {"test.first", "test.second"};
+    const size_t value_length = CYPHER_TEST_DISTINCT_VALUE_BYTES;
+    const size_t json_size = sizeof(json_prefix) - SKIP_ONE + value_length + sizeof(json_suffix);
+    char *json = malloc(json_size);
+    ASSERT_NOT_NULL(json);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "test", "/tmp/test"), CBM_STORE_OK);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t offset = 0;
+        memcpy(json + offset, json_prefix, sizeof(json_prefix) - SKIP_ONE);
+        offset += sizeof(json_prefix) - SKIP_ONE;
+        memset(json + offset, 'v', value_length);
+        json[offset + value_length - SKIP_ONE] = (char)('a' + i);
+        offset += value_length;
+        memcpy(json + offset, json_suffix, sizeof(json_suffix));
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qualified_names[i],
+                           .file_path = "distinct.c",
+                           .properties_json = json};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                "MATCH (n:Function) WITH DISTINCT n.payload AS p "
+                                "RETURN p ORDER BY p",
+                                "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 2);
+    ASSERT_EQ(strlen(result.rows[0][0]), value_length);
+    ASSERT_EQ(strlen(result.rows[1][0]), value_length);
+    ASSERT_EQ(result.rows[0][0][value_length - SKIP_ONE], 'a');
+    ASSERT_EQ(result.rows[1][0][value_length - SKIP_ONE], 'b');
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    free(json);
+    PASS();
+}
+
 /* issue #241: label tests in WHERE clauses (openCypher `WHERE n:Label`) —
  * previously a parse error. */
 TEST(cypher_exec_where_label_test_issue241) {
@@ -2180,6 +3084,82 @@ TEST(cypher_exec_count_distinct_issue239) {
     PASS();
 }
 
+TEST(cypher_exec_aggregate_distinct_preserves_entity_identity_and_collect_semantics) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_node_t same_display_name = {.project = "test",
+                                    .label = "Function",
+                                    .name = "HandleOrder",
+                                    .qualified_name = "test.other.HandleOrder",
+                                    .file_path = "other_handler.go",
+                                    .start_line = 5};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &same_display_name) > 0);
+
+    cbm_cypher_result_t count = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (f:Function) RETURN COUNT(DISTINCT f)", "test", 0,
+                                 &count),
+              0);
+    /* Two nodes may share a display name but remain distinct graph entities. */
+    ASSERT_EQ(count.row_count, 1);
+    ASSERT_STR_EQ(count.rows[0][0], "5");
+    cbm_cypher_result_free(&count);
+
+    cbm_cypher_result_t collect = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (f:Function) RETURN COLLECT(DISTINCT f.label)",
+                                 "test", 0, &collect),
+              0);
+    ASSERT_EQ(collect.row_count, 1);
+    ASSERT_STR_EQ(collect.rows[0][0], "[\"Function\"]");
+    cbm_cypher_result_free(&collect);
+
+    cbm_cypher_result_t numeric = {0};
+    ASSERT_EQ(cbm_cypher_execute(
+                  s,
+                  "MATCH (f:Function) RETURN SUM(DISTINCT f.start_line), "
+                  "AVG(DISTINCT f.start_line), MIN(DISTINCT f.start_line), "
+                  "MAX(DISTINCT f.start_line)",
+                  "test", 0, &numeric),
+              0);
+    ASSERT_EQ(numeric.row_count, 1);
+    ASSERT_STR_EQ(numeric.rows[0][0], "15");
+    ASSERT_STR_EQ(numeric.rows[0][1], "5");
+    ASSERT_STR_EQ(numeric.rows[0][2], "0");
+    ASSERT_STR_EQ(numeric.rows[0][3], "10");
+    cbm_cypher_result_free(&numeric);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_collect_json_escapes_core_string_values) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = "quote\"slash\\line\n",
+                       .qualified_name = "test.escaped",
+                       .file_path = "escaped.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (n:Function) RETURN COLLECT(n.name)", "test", 0,
+                                 &result),
+              0);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "[\"quote\\\"slash\\\\line\\n\"]");
+    yyjson_doc *doc = yyjson_read(result.rows[0][0], strlen(result.rows[0][0]), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *list = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_is_arr(list));
+    ASSERT_EQ(yyjson_arr_size(list), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get_first(list)), node.name);
+    yyjson_doc_free(doc);
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* issue #373: an unsupported computed expression in WITH/RETURN (an unknown
  * function like split(...) or list indexing [..]) must FAIL LOUDLY with a clear
  * "unsupported function" error rather than silently projecting an empty column
@@ -2210,11 +3190,18 @@ TEST(cypher_exec_unknown_func_return_errors) {
     ASSERT_TRUE(rc != 0);
     ASSERT_NOT_NULL(r.error);
     ASSERT_TRUE(strstr(r.error, "unsupported function") != NULL);
+    ASSERT_NOT_NULL(strstr(r.error, "count"));
+    ASSERT_NOT_NULL(strstr(r.error, "properties"));
+    ASSERT_NOT_NULL(strstr(r.error, "coalesce"));
+    ASSERT_NOT_NULL(strstr(r.error, "right"));
     cbm_cypher_result_free(&r);
 
     cbm_store_close(s);
     PASS();
 }
+
+enum { CYPHER_AGGREGATE_GROWTH_GROUP_COUNT = 600 };
+static cbm_store_t *setup_cypher_aggregate_group_store(int group_count);
 
 /* issue #242: openCypher label alternation in MATCH — (n:A|B). */
 TEST(cypher_exec_label_alternation_issue242) {
@@ -2235,6 +3222,33 @@ TEST(cypher_exec_label_alternation_issue242) {
     cbm_cypher_result_free(&r2);
 
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_label_alternation_growth_failure_is_atomic) {
+    cbm_store_t *store = setup_cypher_aggregate_group_store(CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t module = {.project = "test",
+                         .label = "Module",
+                         .name = "module",
+                         .qualified_name = "test.module",
+                         .file_path = "module.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(store, &module) > 0);
+
+    cbm_cypher_result_t result = {0};
+    /* Module grows the first vector; Function then needs a second growth while
+     * the scan owns both the first result and the new per-label result. */
+    cbm_cypher_test_fail_label_alternation_growth(1);
+    int rc =
+        cbm_cypher_execute(store, "MATCH (n:Module|Function) RETURN n.name", "test", 0, &result);
+    cbm_cypher_test_fail_label_alternation_growth(-1);
+
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(result.error);
+    ASSERT_NOT_NULL(strstr(result.error, "allocate memory"));
+    ASSERT_EQ(result.row_count, 0);
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
     PASS();
 }
 
@@ -3452,6 +4466,28 @@ TEST(cypher_exec_count_star) {
     PASS();
 }
 
+/* #1111: type(r) grouped with count(*) must return the actual relationship type,
+ * not the row count. ret_agg_build_key/ret_agg_emit_row classified aggregate vs.
+ * scalar columns with a bare `item->func` truthy check, so type(r) (a non-aggregate
+ * function, func != NULL) was misrouted into the aggregate-value branch and
+ * formatted via format_agg_value's default case, silently substituting the row
+ * count for the relationship type. */
+TEST(cypher_issue1111_return_type_count_group) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a)-[r]->(b) RETURN type(r) AS t, count(*) AS n ORDER BY n DESC", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "CALLS");
+    ASSERT_STR_EQ(r.rows[0][1], "3");
+    ASSERT_STR_EQ(r.rows[1][0], "DEFINES");
+    ASSERT_STR_EQ(r.rows[1][1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_skip) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -3632,6 +4668,51 @@ TEST(cypher_exec_with_node_groupvar_prop) {
     ASSERT_STR_EQ(r.rows[0][0], "validate.go"); /* was "" before the fix */
     ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
     ASSERT_STR_EQ(r.rows[0][2], "test.ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1111, WITH variant: the same misrouting in with_agg_build_key/with_agg_accumulate/
+ * execute_with_aggregate's per-column func check. */
+TEST(cypher_issue1111_with_type_count_group) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (a)-[r]->(b) WITH type(r) AS t, count(*) AS n RETURN t, n ORDER BY n DESC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "CALLS");
+    ASSERT_STR_EQ(r.rows[0][1], "3");
+    ASSERT_STR_EQ(r.rows[1][0], "DEFINES");
+    ASSERT_STR_EQ(r.rows[1][1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1111 follow-up (review from DeusData on #1221): with_agg_find_or_create's
+ * bare-node-carry check only tested `!property && variable`, so an entity-
+ * introspection alias like `labels(f) AS l` (variable set, property NULL, func
+ * set) was ALSO tagged with the source node's id. A later `l.file_path` then
+ * hit node_prop's stub re-fetch heuristic (id set, file_path/label both NULL on
+ * the virtual stub) and silently returned HandleOrder's real file_path instead
+ * of "" for the non-node alias `l`. */
+TEST(cypher_issue1111_with_scalar_func_alias_no_node_leak) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = \"HandleOrder\" "
+                                "WITH labels(f) AS l, COUNT(*) AS c "
+                                "RETURN l, l.file_path, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "[\"Function\"]");
+    ASSERT_STR_EQ(r.rows[0][1], ""); /* was "handler.go" before the fix */
+    ASSERT_STR_EQ(r.rows[0][2], "1");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -4237,6 +5318,29 @@ TEST(cypher_exec_union_all) {
     PASS();
 }
 
+TEST(cypher_union_requires_identical_column_schema) {
+    cbm_store_t *store = setup_cypher_store();
+    ASSERT_NOT_NULL(store);
+    const char *queries[] = {
+        "MATCH (f:Function) RETURN f.name AS name UNION ALL "
+        "MATCH (g:Function) RETURN g.name AS different_name",
+        "MATCH (f:Function) RETURN f.name AS name UNION ALL "
+        "MATCH (g:Function) RETURN g.name AS name, g.label AS label",
+    };
+    for (size_t query_index = 0; query_index < sizeof(queries) / sizeof(queries[0]);
+         query_index++) {
+        cbm_cypher_result_t result = {0};
+        int rc = cbm_cypher_execute(store, queries[query_index], "test", 0, &result);
+        ASSERT_TRUE(rc != 0);
+        ASSERT_NOT_NULL(result.error);
+        ASSERT_NOT_NULL(strstr(result.error, "identical column"));
+        ASSERT_EQ(result.row_count, 0);
+        cbm_cypher_result_free(&result);
+    }
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(cypher_exec_union_all_respects_caller_output_cap) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4269,9 +5373,9 @@ TEST(cypher_exec_union_deduplicates_complete_branches_before_output_cap) {
         ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
     }
 
-    const char *query = "MATCH (f:Function) RETURN f.name "
+    const char *query = "MATCH (f:Function) RETURN f.name AS name "
                         "UNION "
-                        "MATCH (m:Module) WHERE m.name = \"Missing\" RETURN m.name";
+                        "MATCH (m:Module) WHERE m.name = \"Missing\" RETURN m.name AS name";
     cbm_cypher_limits_t limits = {.max_output_rows = 2, .max_working_rows = 3};
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute_with_limits(s, query, "union-cap", &limits, &r);
@@ -4772,14 +5876,6 @@ TEST(cypher_multi_prop_projection_no_alias) {
     PASS();
 }
 
-/* Result projection writes into fixed-width per-row stack arrays
- * (vals[CBM_SZ_32] / func_bufs[CBM_SZ_32][…] in execute_return_simple and its
- * siblings), indexed by the parsed RETURN item count. The parser must bound
- * that count to the array width; an over-wide RETURN has to be rejected, not
- * allowed to run and write past the arrays. Drive a >32-column RETURN in a
- * forked child so a stack overwrite (ASan abort, or a raw segfault) shows up
- * as a killing signal instead of taking down the whole runner; the bounded
- * path returns an ordinary error and the child exits cleanly. */
 /* Property projection must return the WHOLE value of composite properties.
  * json_extract_prop() scanned a non-string value up to the first ',' — so an
  * array/object property was truncated at its first INTERNAL comma. Real-world
@@ -4833,37 +5929,538 @@ TEST(cypher_exec_prop_string_with_escaped_quote) {
     PASS();
 }
 
-TEST(cypher_wide_return_projection_bounded) {
-#ifdef _WIN32
-    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the parse-time bound is platform-agnostic");
-#else
+static cbm_store_t *setup_repeated_dynamic_property_store(const char *key, char fill,
+                                                           size_t value_length) {
+    size_t key_length = strlen(key);
+    size_t json_size = sizeof("{\"") - SKIP_ONE + key_length +
+                       sizeof("\":\"") - SKIP_ONE + value_length + sizeof("\"}");
+    char *properties_json = malloc(json_size);
+    if (!properties_json) {
+        return NULL;
+    }
+    size_t offset = 0;
+    memcpy(properties_json + offset, "{\"", sizeof("{\"") - SKIP_ONE);
+    offset += sizeof("{\"") - SKIP_ONE;
+    memcpy(properties_json + offset, key, key_length);
+    offset += key_length;
+    memcpy(properties_json + offset, "\":\"", sizeof("\":\"") - SKIP_ONE);
+    offset += sizeof("\":\"") - SKIP_ONE;
+    memset(properties_json + offset, fill, value_length);
+    offset += value_length;
+    memcpy(properties_json + offset, "\"}", sizeof("\"}"));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    if (!store || cbm_store_upsert_project(store, "test", "/tmp/test") != CBM_STORE_OK) {
+        cbm_store_close(store);
+        free(properties_json);
+        return NULL;
+    }
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = "LargeProperty",
+                       .qualified_name = "test.LargeProperty",
+                       .file_path = "large.c",
+                       .properties_json = properties_json};
+    if (cbm_store_upsert_node(store, &node) <= 0) {
+        cbm_store_close(store);
+        store = NULL;
+    }
+    free(properties_json);
+    return store;
+}
+
+static bool text_is_repeated(const char *text, char expected, size_t expected_length) {
+    if (!text || strlen(text) != expected_length) {
+        return false;
+    }
+    for (size_t i = 0; i < expected_length; i++) {
+        if (text[i] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool collect_is_single_repeated_string(const char *text, char expected,
+                                               size_t expected_length) {
+    static const size_t json_array_overhead = sizeof("[\"\"]") - SKIP_ONE;
+    if (!text || strlen(text) != expected_length + json_array_overhead || text[0] != '[' ||
+        text[SKIP_ONE] != '"' ||
+        text[expected_length + json_array_overhead - PAIR_LEN] != '"' ||
+        text[expected_length + json_array_overhead - SKIP_ONE] != ']') {
+        return false;
+    }
+    for (size_t i = 0; i < expected_length; i++) {
+        if (text[i + PAIR_LEN] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(cypher_exec_preserves_large_dynamic_property_in_aggregation) {
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    cbm_store_t *store = setup_repeated_dynamic_property_store("payload", 'v', value_length);
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                "MATCH (n:Function) RETURN n.payload, count(*) AS total",
+                                "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 2);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'v', value_length));
+    ASSERT_STR_EQ(result.rows[0][1], "1");
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_large_dynamic_property_across_with) {
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    cbm_store_t *store = setup_repeated_dynamic_property_store("payload", 'v', value_length);
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                "MATCH (n:Function) WITH n.payload AS carried RETURN carried",
+                                "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'v', value_length));
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_large_dynamic_property_across_grouped_with) {
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    cbm_store_t *store = setup_repeated_dynamic_property_store("payload", 'v', value_length);
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(
+                  store,
+                  "MATCH (n:Function) WITH n.payload AS carried, count(*) AS total "
+                  "RETURN carried, total",
+                  "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 2);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'v', value_length));
+    ASSERT_STR_EQ(result.rows[0][1], "1");
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_query_sized_default_with_alias) {
+    static const char prefix[] = "MATCH (n:Function) WITH n.";
+    static const char separator[] = " RETURN n.";
+    const size_t key_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    const size_t query_size = sizeof(prefix) - SKIP_ONE + key_length +
+                              sizeof(separator) - SKIP_ONE + key_length + SKIP_ONE;
+    char *key = malloc(key_length + SKIP_ONE);
+    char *query = malloc(query_size);
+    ASSERT_NOT_NULL(key);
+    ASSERT_NOT_NULL(query);
+    memset(key, 'k', key_length);
+    key[key_length] = '\0';
+    size_t offset = 0;
+    memcpy(query + offset, prefix, sizeof(prefix) - SKIP_ONE);
+    offset += sizeof(prefix) - SKIP_ONE;
+    memcpy(query + offset, key, key_length);
+    offset += key_length;
+    memcpy(query + offset, separator, sizeof(separator) - SKIP_ONE);
+    offset += sizeof(separator) - SKIP_ONE;
+    memcpy(query + offset, key, key_length);
+    offset += key_length;
+    query[offset] = '\0';
+
+    cbm_store_t *store = setup_repeated_dynamic_property_store(key, 'v', key_length);
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'v', key_length));
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    free(query);
+    free(key);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_large_dynamic_property_in_scalar_function) {
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    cbm_store_t *store = setup_repeated_dynamic_property_store("payload", 'v', value_length);
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) RETURN toUpper(n.payload) AS payload, "
+                                 "size(n.payload), length(n.payload), reverse(n.payload), "
+                                 "trim(n.payload), ltrim(n.payload), rtrim(n.payload)",
+                                 "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 7);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'V', value_length));
+    ASSERT_STR_EQ(result.rows[0][1], "5000");
+    ASSERT_STR_EQ(result.rows[0][2], "5000");
+    for (int column = 3; column < result.col_count; column++) {
+        ASSERT_TRUE(text_is_repeated(result.rows[0][column], 'v', value_length));
+    }
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_large_dynamic_property_in_multiarg_functions) {
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    cbm_store_t *store = setup_repeated_dynamic_property_store("payload", 'v', value_length);
+    ASSERT_NOT_NULL(store);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) RETURN substring(n.payload,0,5000), "
+                                 "left(n.payload,5000), right(n.payload,5000), "
+                                 "replace(n.payload,'v','w'), coalesce(n.missing,n.payload)",
+                                 "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 5);
+    for (int column = 0; column < result.col_count; column++) {
+        ASSERT_TRUE(
+            text_is_repeated(result.rows[0][column], column == 3 ? 'w' : 'v', value_length));
+    }
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) WITH replace(n.payload,'v','w') AS payload "
+                                 "RETURN payload",
+                                 "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'w', value_length));
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) RETURN replace(n.payload,'v','w') AS payload, "
+                                 "count(*) AS matches",
+                                 "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'w', value_length));
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) WITH replace(n.payload,'v','w') AS payload, "
+                                 "count(*) AS matches RETURN payload",
+                                 "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(text_is_repeated(result.rows[0][0], 'w', value_length));
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) "
+                                 "WHERE substring(n.payload,4999,1) = 'v' RETURN n.name",
+                                 "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "LargeProperty");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_large_dynamic_property_in_collect_and_with) {
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    cbm_store_t *store = setup_repeated_dynamic_property_store("payload", 'v', value_length);
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, "MATCH (n:Function) RETURN collect(n.payload)", "test",
+                                 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(collect_is_single_repeated_string(result.rows[0][0], 'v', value_length));
+    cbm_cypher_result_free(&result);
+
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                "MATCH (n:Function) WITH collect(n.payload) AS values "
+                                "RETURN values",
+                                "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_TRUE(collect_is_single_repeated_string(result.rows[0][0], 'v', value_length));
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_exec_preserves_query_sized_dynamic_property_key_and_value) {
+    static const char json_prefix[] = "{\"";
+    static const char json_separator[] = "\":\"";
+    static const char json_suffix[] = "\"}";
+    static const char query_prefix[] = "MATCH (n:Function) RETURN n.";
+    const size_t key_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    const size_t value_length = CYPHER_TEST_LONG_TOKEN_BYTES;
+    const size_t json_size = (sizeof(json_prefix) - SKIP_ONE) + key_length +
+                             (sizeof(json_separator) - SKIP_ONE) + value_length +
+                             sizeof(json_suffix);
+    char *properties_json = malloc(json_size);
+    ASSERT_NOT_NULL(properties_json);
+    size_t offset = 0;
+    memcpy(properties_json + offset, json_prefix, sizeof(json_prefix) - SKIP_ONE);
+    offset += sizeof(json_prefix) - SKIP_ONE;
+    memset(properties_json + offset, 'k', key_length);
+    offset += key_length;
+    memcpy(properties_json + offset, json_separator, sizeof(json_separator) - SKIP_ONE);
+    offset += sizeof(json_separator) - SKIP_ONE;
+    memset(properties_json + offset, 'V', value_length);
+    offset += value_length;
+    memcpy(properties_json + offset, json_suffix, sizeof(json_suffix));
+
+    const size_t query_size = (sizeof(query_prefix) - SKIP_ONE) + key_length + SKIP_ONE;
+    char *query = malloc(query_size);
+    ASSERT_NOT_NULL(query);
+    memcpy(query, query_prefix, sizeof(query_prefix) - SKIP_ONE);
+    memset(query + sizeof(query_prefix) - SKIP_ONE, 'k', key_length);
+    query[query_size - SKIP_ONE] = '\0';
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = "LongProperty",
+                       .qualified_name = "test.LongProperty",
+                       .file_path = "long.c",
+                       .properties_json = properties_json};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 1);
+    ASSERT_EQ(strlen(result.rows[0][0]), value_length);
+    for (size_t i = 0; i < value_length; i++) {
+        ASSERT_EQ(result.rows[0][0][i], 'V');
+    }
+
+    cbm_cypher_result_free(&result);
+    static const char where_prefix[] = "MATCH (n:Function) WHERE n.";
+    static const char where_separator[] = " = '";
+    static const char where_suffix[] = "' RETURN n.name";
+    const size_t where_query_size = (sizeof(where_prefix) - SKIP_ONE) + key_length +
+                                    (sizeof(where_separator) - SKIP_ONE) + value_length +
+                                    sizeof(where_suffix);
+    char *where_query = malloc(where_query_size);
+    ASSERT_NOT_NULL(where_query);
+    offset = 0;
+    memcpy(where_query + offset, where_prefix, sizeof(where_prefix) - SKIP_ONE);
+    offset += sizeof(where_prefix) - SKIP_ONE;
+    memset(where_query + offset, 'k', key_length);
+    offset += key_length;
+    memcpy(where_query + offset, where_separator, sizeof(where_separator) - SKIP_ONE);
+    offset += sizeof(where_separator) - SKIP_ONE;
+    memset(where_query + offset, 'V', value_length);
+    offset += value_length;
+    memcpy(where_query + offset, where_suffix, sizeof(where_suffix));
+
+    ASSERT_EQ(cbm_cypher_execute(store, where_query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "LongProperty");
+    cbm_cypher_result_free(&result);
+
+    static const char keys_prefix[] = "[\"name\",\"qualified_name\",\"label\",\"file_path\",\"";
+    static const char keys_suffix[] = "\"]";
+    ASSERT_EQ(cbm_cypher_execute(store, "MATCH (n:Function) RETURN keys(n)", "test", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 1);
+    ASSERT_EQ(strlen(result.rows[0][0]),
+              sizeof(keys_prefix) - SKIP_ONE + key_length + sizeof(keys_suffix) - SKIP_ONE);
+    ASSERT_TRUE(memcmp(result.rows[0][0], keys_prefix, sizeof(keys_prefix) - SKIP_ONE) == 0);
+    for (size_t i = 0; i < key_length; i++) {
+        ASSERT_EQ(result.rows[0][0][sizeof(keys_prefix) - SKIP_ONE + i], 'k');
+    }
+    ASSERT_STR_EQ(result.rows[0][0] + sizeof(keys_prefix) - SKIP_ONE + key_length, keys_suffix);
+    cbm_cypher_result_free(&result);
+
+    free(where_query);
+    cbm_store_close(store);
+    free(query);
+    free(properties_json);
+    PASS();
+}
+
+TEST(cypher_exec_dynamic_property_projection_exceeds_tls_ring_without_aliasing) {
+    char names[CYPHER_TEST_DYNAMIC_PROPERTY_COUNT][CBM_SZ_16];
+    char values[CYPHER_TEST_DYNAMIC_PROPERTY_COUNT][CBM_SZ_16];
+    size_t json_length = PAIR_LEN; /* opening and closing braces */
+    size_t query_length = sizeof("MATCH (n:Function) RETURN ") - SKIP_ONE;
+    for (int i = 0; i < CYPHER_TEST_DYNAMIC_PROPERTY_COUNT; i++) {
+        snprintf(names[i], sizeof(names[i]), "p%d", i);
+        snprintf(values[i], sizeof(values[i]), "value_%d", i);
+        json_length +=
+            strlen(names[i]) + strlen(values[i]) + CYPHER_TEST_JSON_STRING_MEMBER_OVERHEAD;
+        query_length += sizeof("n.") - SKIP_ONE + strlen(names[i]);
+        if (i > 0) {
+            json_length += SKIP_ONE;
+            query_length += PAIR_LEN;
+        }
+    }
+    char *properties_json = malloc(json_length + SKIP_ONE);
+    char *query = malloc(query_length + SKIP_ONE);
+    ASSERT_NOT_NULL(properties_json);
+    ASSERT_NOT_NULL(query);
+
+    size_t json_offset = 0;
+    size_t query_offset = 0;
+    properties_json[json_offset++] = '{';
+    static const char query_prefix[] = "MATCH (n:Function) RETURN ";
+    memcpy(query, query_prefix, sizeof(query_prefix) - SKIP_ONE);
+    query_offset += sizeof(query_prefix) - SKIP_ONE;
+    for (int i = 0; i < CYPHER_TEST_DYNAMIC_PROPERTY_COUNT; i++) {
+        if (i > 0) {
+            properties_json[json_offset++] = ',';
+            query[query_offset++] = ',';
+            query[query_offset++] = ' ';
+        }
+        int json_written = snprintf(properties_json + json_offset,
+                                    json_length + SKIP_ONE - json_offset, "\"%s\":\"%s\"",
+                                    names[i], values[i]);
+        ASSERT_GT(json_written, 0);
+        json_offset += (size_t)json_written;
+        query[query_offset++] = 'n';
+        query[query_offset++] = '.';
+        size_t name_length = strlen(names[i]);
+        memcpy(query + query_offset, names[i], name_length);
+        query_offset += name_length;
+    }
+    properties_json[json_offset++] = '}';
+    properties_json[json_offset] = '\0';
+    query[query_offset] = '\0';
+    ASSERT_EQ(json_offset, json_length);
+    ASSERT_EQ(query_offset, query_length);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = "WideProperties",
+                       .qualified_name = "test.WideProperties",
+                       .file_path = "wide.c",
+                       .properties_json = properties_json};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store, query, "test", 0, &result), 0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, CYPHER_TEST_DYNAMIC_PROPERTY_COUNT);
+    for (int i = 0; i < CYPHER_TEST_DYNAMIC_PROPERTY_COUNT; i++) {
+        ASSERT_STR_EQ(result.rows[0][i], values[i]);
+    }
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    free(query);
+    free(properties_json);
+    PASS();
+}
+
+enum { CYPHER_WIDE_PROJECTION_COLUMN_COUNT = 48 };
+
+TEST(cypher_wide_return_projection_is_query_sized) {
     char query[4096];
     int off = snprintf(query, sizeof(query), "MATCH (f:Function) RETURN ");
-    for (int i = 0; i < 48; i++) { /* 48 > CBM_SZ_32 (32) fixed columns */
+    for (int i = 0; i < CYPHER_WIDE_PROJECTION_COLUMN_COUNT; i++) {
         off += snprintf(query + off, sizeof(query) - (size_t)off, "%sf.p%d", i ? ", " : "", i);
     }
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        cbm_store_t *s = setup_cypher_store();
-        cbm_cypher_result_t r = {0};
-        (void)cbm_cypher_execute(s, query, "test", 0, &r);
-        cbm_cypher_result_free(&r);
-        cbm_store_close(s);
-        _exit(0); /* reached only when execution did NOT overflow */
+    off += snprintf(query + off, sizeof(query) - (size_t)off, " ORDER BY ");
+    for (int i = 0; i < CYPHER_WIDE_PROJECTION_COLUMN_COUNT; i++) {
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "%sf.p%d", i ? ", " : "", i);
     }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFSIGNALED(status)) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "wide RETURN killed by signal %d — projection stack overflow",
-                 WTERMSIG(status));
-        FAIL(msg);
-    }
-    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_TRUE(off > 0 && (size_t)off < sizeof(query));
+
+    cbm_store_t *store = setup_cypher_store();
+    ASSERT_NOT_NULL(store);
+    cbm_cypher_result_t result = {0};
+    int rc = cbm_cypher_execute(store, query, "test", 0, &result);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.col_count, CYPHER_WIDE_PROJECTION_COLUMN_COUNT);
+    ASSERT_EQ(result.row_count, 4);
+    ASSERT_STR_EQ(result.columns[0], "f.p0");
+    ASSERT_STR_EQ(result.columns[CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1], "f.p47");
+    ASSERT_STR_EQ(result.rows[0][CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1], "");
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
     PASS();
-#endif
+}
+
+TEST(cypher_wide_aggregate_projections_are_query_sized) {
+    char return_query[4096];
+    int return_offset = snprintf(return_query, sizeof(return_query), "MATCH (f:Function) RETURN ");
+    for (int i = 0; i < CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1; i++) {
+        return_offset +=
+            snprintf(return_query + return_offset, sizeof(return_query) - (size_t)return_offset,
+                     "%sf.p%d", i ? ", " : "", i);
+    }
+    return_offset += snprintf(return_query + return_offset,
+                              sizeof(return_query) - (size_t)return_offset, ", count(f.name) AS c");
+    ASSERT_TRUE(return_offset > 0 && (size_t)return_offset < sizeof(return_query));
+
+    char with_query[8192];
+    int with_offset = snprintf(with_query, sizeof(with_query), "MATCH (f:Function) WITH ");
+    for (int i = 0; i < CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1; i++) {
+        with_offset += snprintf(with_query + with_offset, sizeof(with_query) - (size_t)with_offset,
+                                "%sf.p%d AS p%d", i ? ", " : "", i, i);
+    }
+    with_offset += snprintf(with_query + with_offset, sizeof(with_query) - (size_t)with_offset,
+                            ", count(f.name) AS c RETURN ");
+    for (int i = 0; i < CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1; i++) {
+        with_offset += snprintf(with_query + with_offset, sizeof(with_query) - (size_t)with_offset,
+                                "%sp%d", i ? ", " : "", i);
+    }
+    with_offset +=
+        snprintf(with_query + with_offset, sizeof(with_query) - (size_t)with_offset, ", c");
+    ASSERT_TRUE(with_offset > 0 && (size_t)with_offset < sizeof(with_query));
+
+    cbm_store_t *store = setup_cypher_store();
+    ASSERT_NOT_NULL(store);
+    const char *queries[] = {return_query, with_query};
+    for (size_t query_index = 0; query_index < sizeof(queries) / sizeof(queries[0]);
+         query_index++) {
+        cbm_cypher_result_t result = {0};
+        int rc = cbm_cypher_execute(store, queries[query_index], "test", 0, &result);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(result.col_count, CYPHER_WIDE_PROJECTION_COLUMN_COUNT);
+        ASSERT_EQ(result.row_count, 1);
+        ASSERT_STR_EQ(result.columns[CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1], "c");
+        ASSERT_STR_EQ(result.rows[0][CYPHER_WIDE_PROJECTION_COLUMN_COUNT - 1], "4");
+        cbm_cypher_result_free(&result);
+    }
+    cbm_store_close(store);
+    PASS();
 }
 
 /* #601: an unbounded whole-graph OPTIONAL MATCH can run for minutes before the
@@ -4914,15 +6511,17 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
     PASS();
 }
 
-TEST(cypher_aggregate_group_lookup_is_linear_across_growth) {
-    enum { GROUP_COUNT = 600, NAME_SIZE = 32, QN_SIZE = 64 };
+static cbm_store_t *setup_cypher_aggregate_group_store(int group_count) {
+    enum { NAME_SIZE = 32, QN_SIZE = 64 };
     cbm_store_t *s = cbm_store_open_memory();
-    ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    if (!s || cbm_store_upsert_project(s, "test", "/tmp/test") != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
 
     /* More than the 256-entry initial aggregate capacity exercises array
      * relocation. Every row has a distinct key, the quadratic worst case. */
-    for (int i = 0; i < GROUP_COUNT; i++) {
+    for (int i = 0; i < group_count; i++) {
         char name[NAME_SIZE];
         char qn[QN_SIZE];
         snprintf(name, sizeof(name), "group_%04d", i);
@@ -4932,8 +6531,17 @@ TEST(cypher_aggregate_group_lookup_is_linear_across_growth) {
                            .name = name,
                            .qualified_name = qn,
                            .file_path = "groups.c"};
-        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+        if (cbm_store_upsert_node(s, &node) <= 0) {
+            cbm_store_close(s);
+            return NULL;
+        }
     }
+    return s;
+}
+
+TEST(cypher_aggregate_group_lookup_is_linear_across_growth) {
+    cbm_store_t *s = setup_cypher_aggregate_group_store(CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_NOT_NULL(s);
 
     const char *queries[] = {
         "MATCH (n:Function) RETURN n.qualified_name AS q, count(*) AS c ORDER BY q",
@@ -4942,15 +6550,16 @@ TEST(cypher_aggregate_group_lookup_is_linear_across_growth) {
     for (size_t qi = 0; qi < sizeof(queries) / sizeof(queries[0]); qi++) {
         cbm_cypher_result_t r = {0};
         cbm_cypher_test_reset_group_lookup_probes();
-        int rc = cbm_cypher_execute(s, queries[qi], "test", GROUP_COUNT + 1, &r);
+        int rc =
+            cbm_cypher_execute(s, queries[qi], "test", CYPHER_AGGREGATE_GROWTH_GROUP_COUNT + 1, &r);
         uint64_t probes = cbm_cypher_test_group_lookup_probes();
 
         ASSERT_EQ(rc, 0);
-        ASSERT_EQ(r.row_count, GROUP_COUNT);
+        ASSERT_EQ(r.row_count, CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
         ASSERT_STR_EQ(r.rows[0][0], "test.group_0000");
-        ASSERT_STR_EQ(r.rows[GROUP_COUNT - 1][0], "test.group_0599");
+        ASSERT_STR_EQ(r.rows[CYPHER_AGGREGATE_GROWTH_GROUP_COUNT - 1][0], "test.group_0599");
         ASSERT_STR_EQ(r.rows[0][1], "1");
-        ASSERT_LTE(probes, (uint64_t)GROUP_COUNT * 2u);
+        ASSERT_LTE(probes, (uint64_t)CYPHER_AGGREGATE_GROWTH_GROUP_COUNT * 2u);
         cbm_cypher_result_free(&r);
     }
 
@@ -4958,15 +6567,246 @@ TEST(cypher_aggregate_group_lookup_is_linear_across_growth) {
     PASS();
 }
 
+TEST(cypher_aggregate_distinct_lookup_is_expected_linear) {
+    cbm_store_t *s = setup_cypher_aggregate_group_store(CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_NOT_NULL(s);
+
+    const char *queries[] = {
+        "MATCH (n:Function) RETURN COUNT(DISTINCT n.name)",
+        "MATCH (n:Function) WITH COUNT(DISTINCT n.name) AS n RETURN n",
+        "MATCH (n:Function) RETURN COLLECT(DISTINCT n.name)",
+    };
+    for (size_t query_index = 0; query_index < sizeof(queries) / sizeof(queries[0]);
+         query_index++) {
+        cbm_cypher_result_t result = {0};
+        cbm_cypher_test_reset_aggregate_distinct_probes();
+        int rc = cbm_cypher_execute(s, queries[query_index], "test", 1, &result);
+        uint64_t probes = cbm_cypher_test_aggregate_distinct_probes();
+
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(result.row_count, 1);
+        /* A hash-backed set performs one expected-constant membership probe per
+         * input. The factor permits a checked insert probe without hiding the
+         * former N*(N-1)/2 scan. */
+        ASSERT_LTE(probes, (uint64_t)CYPHER_AGGREGATE_GROWTH_GROUP_COUNT * PAIR_LEN);
+        cbm_cypher_result_free(&result);
+    }
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_row_distinct_lookup_is_expected_linear) {
+    cbm_store_t *store = setup_cypher_aggregate_group_store(CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_NOT_NULL(store);
+
+    cbm_cypher_result_t result = {0};
+    cbm_cypher_test_reset_row_distinct_probes();
+    int rc = cbm_cypher_execute(store, "MATCH (n:Function) RETURN DISTINCT n.name", "test",
+                                CYPHER_AGGREGATE_GROWTH_GROUP_COUNT + SKIP_ONE, &result);
+    uint64_t probes = cbm_cypher_test_row_distinct_probes();
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.row_count, CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_LTE(probes, (uint64_t)CYPHER_AGGREGATE_GROWTH_GROUP_COUNT * PAIR_LEN);
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_row_distinct_length_prefix_prevents_column_boundary_collision) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "distinct", "/tmp/distinct"), CBM_STORE_OK);
+    cbm_node_t nodes[] = {
+        {.project = "distinct",
+         .label = "Function",
+         .name = "First",
+         .qualified_name = "distinct.First",
+         .file_path = "distinct.c",
+         .properties_json = "{\"left\":\"a\",\"right\":\"bc\"}"},
+        {.project = "distinct",
+         .label = "Function",
+         .name = "Second",
+         .qualified_name = "distinct.Second",
+         .file_path = "distinct.c",
+         .properties_json = "{\"left\":\"ab\",\"right\":\"c\"}"},
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        ASSERT_TRUE(cbm_store_upsert_node(store, &nodes[i]) > 0);
+    }
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(store,
+                                 "MATCH (n:Function) RETURN DISTINCT n.left, n.right "
+                                 "ORDER BY n.left",
+                                 "distinct", 0, &result),
+              0);
+    ASSERT_NULL(result.error);
+    ASSERT_EQ(result.row_count, 2);
+    ASSERT_STR_EQ(result.rows[0][0], "a");
+    ASSERT_STR_EQ(result.rows[0][1], "bc");
+    ASSERT_STR_EQ(result.rows[1][0], "ab");
+    ASSERT_STR_EQ(result.rows[1][1], "c");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(cypher_row_distinct_key_copy_failure_is_atomic) {
+    cbm_store_t *store = setup_cypher_store();
+    ASSERT_NOT_NULL(store);
+
+    for (int successful_before = 0; successful_before <= SKIP_ONE; successful_before++) {
+        cbm_cypher_result_t result = {0};
+        cbm_cypher_test_fail_row_distinct_key_copy(successful_before);
+        int rc = cbm_cypher_execute(store, "MATCH (n:Function) RETURN DISTINCT n.name", "test", 0,
+                                    &result);
+        cbm_cypher_test_fail_row_distinct_key_copy(-1);
+        ASSERT_TRUE(rc != 0);
+        ASSERT_NOT_NULL(result.error);
+        ASSERT_NOT_NULL(strstr(result.error, "allocate memory"));
+        ASSERT_EQ(result.row_count, 0);
+        cbm_cypher_result_free(&result);
+    }
+
+    cbm_store_close(store);
+    PASS();
+}
+
+static int assert_cypher_agg_allocation_failure(cbm_store_t *store, const char *query,
+                                                cbm_cypher_test_agg_alloc_site_t site,
+                                                int successful_before) {
+    cbm_cypher_result_t result = {0};
+    cbm_cypher_test_fail_aggregation_allocation(site, successful_before);
+    int rc = cbm_cypher_execute(store, query, "test", 0, &result);
+    cbm_cypher_test_fail_aggregation_allocation(CBM_CYPHER_TEST_AGG_ALLOC_NONE, -1);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(result.error);
+    ASSERT_NOT_NULL(strstr(result.error, "allocate memory"));
+    ASSERT_EQ(result.row_count, 0);
+    cbm_cypher_result_free(&result);
+    return 0;
+}
+
+TEST(cypher_aggregation_allocation_failures_are_atomic) {
+    cbm_store_t *small = setup_cypher_store();
+    ASSERT_NOT_NULL(small);
+    const char *group_query =
+        "MATCH (n:Function) RETURN n.qualified_name AS q, count(*) AS c ORDER BY q";
+
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, group_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_INITIAL, 0),
+              0);
+    /* One group owns its key, eight parallel arrays, and two projected-value
+     * copies. Fail each construction point to prove partial cleanup. */
+    for (int successful = 0; successful < 11; successful++) {
+        ASSERT_EQ(assert_cypher_agg_allocation_failure(
+                      small, group_query, CBM_CYPHER_TEST_AGG_ALLOC_GROUP_ENTRY, successful),
+                  0);
+    }
+
+    const char *with_group_query =
+        "MATCH (n:Function) WITH n.qualified_name AS q, count(*) AS c RETURN q, c ORDER BY q";
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, with_group_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_INITIAL, 0),
+              0);
+    /* WITH owns its key, ten parallel arrays, and two projected-value copies. */
+    for (int successful = 0; successful < 13; successful++) {
+        ASSERT_EQ(assert_cypher_agg_allocation_failure(
+                      small, with_group_query, CBM_CYPHER_TEST_AGG_ALLOC_GROUP_ENTRY, successful),
+                  0);
+    }
+
+    const char *collect_query =
+        "MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name, COLLECT(g.name)";
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, collect_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_VALUE_ARRAY_GROWTH, 0),
+              0);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, collect_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_VALUE_COPY, 0),
+              0);
+    const char *distinct_query =
+        "MATCH (f:Function)-[:CALLS]->(g:Function) RETURN COUNT(DISTINCT g.name)";
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, distinct_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_VALUE_ARRAY_GROWTH, 0),
+              0);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, distinct_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_VALUE_COPY, 0),
+              0);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, distinct_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_DISTINCT_INDEX, 0),
+              0);
+    const char *with_distinct_query = "MATCH (f:Function)-[:CALLS]->(g:Function) "
+                                      "WITH COUNT(DISTINCT g.name) AS n RETURN n";
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, with_distinct_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_VALUE_ARRAY_GROWTH, 0),
+              0);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(small, with_distinct_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_VALUE_COPY, 0),
+              0);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(
+                  small, with_distinct_query, CBM_CYPHER_TEST_AGG_ALLOC_DISTINCT_INDEX, 0),
+              0);
+    cbm_store_close(small);
+
+    cbm_store_t *many = setup_cypher_aggregate_group_store(CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_NOT_NULL(many);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(many, group_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_GROUP_ARRAY_GROWTH, 0),
+              0);
+    ASSERT_EQ(assert_cypher_agg_allocation_failure(many, with_group_query,
+                                                   CBM_CYPHER_TEST_AGG_ALLOC_GROUP_ARRAY_GROWTH, 0),
+              0);
+    cbm_store_close(many);
+    PASS();
+}
+
+TEST(cypher_aggregate_value_lists_grow_geometrically) {
+    cbm_store_t *store = setup_cypher_aggregate_group_store(CYPHER_AGGREGATE_GROWTH_GROUP_COUNT);
+    ASSERT_NOT_NULL(store);
+
+    const char *queries[] = {
+        "MATCH (n:Function) RETURN COLLECT(n.name)",
+        "MATCH (n:Function) RETURN COUNT(DISTINCT n.name)",
+        "MATCH (n:Function) WITH COUNT(DISTINCT n.name) AS n RETURN n",
+    };
+    for (size_t query_index = 0; query_index < sizeof(queries) / sizeof(queries[0]);
+         query_index++) {
+        cbm_cypher_result_t result = {0};
+        cbm_cypher_test_reset_aggregate_list_growths();
+        int rc = cbm_cypher_execute(store, queries[query_index], "test", 1, &result);
+        uint64_t growths = cbm_cypher_test_aggregate_list_growths();
+
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(result.row_count, 1);
+        /* A doubling vector grows at most once per size_t bit. This portable
+         * logarithmic bound rejects the former one-realloc-per-value path. */
+        ASSERT_LTE(growths, (uint64_t)(sizeof(size_t) * CHAR_BIT));
+        cbm_cypher_result_free(&result);
+    }
+
+    cbm_store_close(store);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
+    RUN_TEST(cypher_capability_registry_functions_are_executable);
     /* Lexer */
     RUN_TEST(cypher_lex_simple_match);
     RUN_TEST(cypher_lex_relationship);
     RUN_TEST(cypher_lex_string_literal);
     RUN_TEST(cypher_lex_single_quote_string);
-    RUN_TEST(cypher_lex_string_overflow);
+    RUN_TEST(cypher_lex_preserves_long_string);
+    RUN_TEST(cypher_lex_preserves_long_identifier);
+    RUN_TEST(cypher_lex_rejects_unterminated_string);
+    RUN_TEST(cypher_lex_rejects_unterminated_block_comment);
+    RUN_TEST(cypher_lex_rejects_unknown_character);
+    RUN_TEST(cypher_lex_allocation_failures_are_atomic);
+    RUN_TEST(cypher_parse_propagates_lex_error);
     RUN_TEST(cypher_lex_number);
     RUN_TEST(cypher_lex_operators);
     RUN_TEST(cypher_lex_keywords_case_insensitive);
@@ -4989,18 +6829,31 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_return_simple);
     RUN_TEST(cypher_parse_return_count);
     RUN_TEST(cypher_parse_return_order_limit);
+    RUN_TEST(cypher_parse_preserves_query_sized_label);
+    RUN_TEST(cypher_parse_preserves_query_sized_case_value_reference);
     RUN_TEST(cypher_parse_return_distinct);
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
     /* Execution */
+    RUN_TEST(cypher_exec_preserves_query_sized_order_expression_and_column);
+    RUN_TEST(cypher_exec_preserves_query_sized_star_and_default_columns);
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
     RUN_TEST(cypher_aggregate_group_lookup_is_linear_across_growth);
+    RUN_TEST(cypher_aggregate_distinct_lookup_is_expected_linear);
+    RUN_TEST(cypher_row_distinct_lookup_is_expected_linear);
+    RUN_TEST(cypher_row_distinct_length_prefix_prevents_column_boundary_collision);
+    RUN_TEST(cypher_row_distinct_key_copy_failure_is_atomic);
+    RUN_TEST(cypher_aggregation_allocation_failures_are_atomic);
+    RUN_TEST(cypher_aggregate_value_lists_grow_geometrically);
     RUN_TEST(cypher_exec_file_contains_pushes_down_beyond_seed_window);
     RUN_TEST(cypher_exec_output_cap_does_not_limit_predicate_scan);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
     RUN_TEST(cypher_cross_join_alloc_rejects_overflow);
+    RUN_TEST(cypher_exec_optional_rel_output_limit_does_not_bound_matching);
+    RUN_TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match);
+    RUN_TEST(cypher_exec_optional_rel_leaf_fallback_survives);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_rejects_list_index_after_function_result);
     RUN_TEST(cypher_rejects_unconsumed_trailing_tokens);
@@ -5024,6 +6877,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_starts_with);
     RUN_TEST(cypher_exec_return_properties);
     RUN_TEST(cypher_func_labels);
+    RUN_TEST(cypher_func_labels_preserves_query_sized_label);
+    RUN_TEST(cypher_func_labels_json_escapes_bytes);
     RUN_TEST(cypher_func_type);
     RUN_TEST(cypher_exec_binds_every_node_and_edge_variable_beyond_inline_capacity);
     RUN_TEST(cypher_exec_default_projection_includes_every_variable_beyond_inline_capacity);
@@ -5032,10 +6887,15 @@ SUITE(cypher) {
     RUN_TEST(cypher_active_overlay_id_query_uses_canonical_identity);
     RUN_TEST(cypher_active_overlay_whole_pattern_preserves_edge_identity);
     RUN_TEST(cypher_func_keys);
+    RUN_TEST(cypher_func_keys_dynamic_null_escape_and_dedup);
     RUN_TEST(cypher_func_properties);
     RUN_TEST(cypher_func_tointeger_tofloat);
+    RUN_TEST(cypher_func_casts_preserve_logical_type_and_reject_invalid_numbers);
+    RUN_TEST(cypher_func_casts_require_exactly_one_argument);
     RUN_TEST(cypher_func_size_reverse);
+    RUN_TEST(cypher_func_trim_variants_and_odd_reverse);
     RUN_TEST(cypher_func_multiarg);
+    RUN_TEST(cypher_func_multiarg_exact_edge_cases);
     RUN_TEST(cypher_issue874_where_coalesce_numeric);
     RUN_TEST(cypher_issue874_where_coalesce_string);
     RUN_TEST(cypher_issue874_where_coalesce_not_and);
@@ -5061,9 +6921,13 @@ SUITE(cypher) {
     /* Go test ports */
     RUN_TEST(cypher_exec_distinct);
     RUN_TEST(cypher_exec_with_distinct_issue238);
+    RUN_TEST(cypher_exec_with_distinct_preserves_values_differing_after_inline_prefix);
     RUN_TEST(cypher_exec_where_label_test_issue241);
     RUN_TEST(cypher_exec_label_alternation_issue242);
+    RUN_TEST(cypher_label_alternation_growth_failure_is_atomic);
     RUN_TEST(cypher_exec_count_distinct_issue239);
+    RUN_TEST(cypher_exec_aggregate_distinct_preserves_entity_identity_and_collect_semantics);
+    RUN_TEST(cypher_exec_collect_json_escapes_core_string_values);
     RUN_TEST(cypher_exec_unsupported_func_errors_issue373);
     RUN_TEST(cypher_exec_unknown_func_return_errors);
     RUN_TEST(cypher_exec_inline_props);
@@ -5130,6 +6994,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_max);
     RUN_TEST(cypher_exec_collect);
     RUN_TEST(cypher_exec_count_star);
+    RUN_TEST(cypher_issue1111_return_type_count_group);
     RUN_TEST(cypher_parse_skip);
     RUN_TEST(cypher_parse_sum_avg);
     RUN_TEST(cypher_parse_collect);
@@ -5143,6 +7008,8 @@ SUITE(cypher) {
     /* Phase 6: WITH clause */
     RUN_TEST(cypher_exec_with_rename);
     RUN_TEST(cypher_exec_with_count);
+    RUN_TEST(cypher_issue1111_with_type_count_group);
+    RUN_TEST(cypher_issue1111_with_scalar_func_alias_no_node_leak);
     RUN_TEST(cypher_exec_with_node_groupvar_prop);
     RUN_TEST(cypher_exec_with_where);
     RUN_TEST(cypher_exec_with_orderby_limit);
@@ -5174,6 +7041,7 @@ SUITE(cypher) {
     /* Phase 8: UNION */
     RUN_TEST(cypher_exec_union);
     RUN_TEST(cypher_exec_union_all);
+    RUN_TEST(cypher_union_requires_identical_column_schema);
     RUN_TEST(cypher_exec_union_all_respects_caller_output_cap);
     RUN_TEST(cypher_exec_union_deduplicates_complete_branches_before_output_cap);
     RUN_TEST(cypher_exec_limits_separate_output_cap_from_working_budget);
@@ -5189,8 +7057,18 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_unwind_cross_product_obeys_working_row_budget);
     RUN_TEST(cypher_parse_unwind_oversized_literal_no_overflow);
     RUN_TEST(cypher_parse_unwind_many_elements_no_overflow);
-    RUN_TEST(cypher_wide_return_projection_bounded);
+    RUN_TEST(cypher_wide_return_projection_is_query_sized);
+    RUN_TEST(cypher_wide_aggregate_projections_are_query_sized);
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);
     RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
+    RUN_TEST(cypher_exec_preserves_large_dynamic_property_in_aggregation);
+    RUN_TEST(cypher_exec_preserves_large_dynamic_property_across_with);
+    RUN_TEST(cypher_exec_preserves_large_dynamic_property_across_grouped_with);
+    RUN_TEST(cypher_exec_preserves_query_sized_default_with_alias);
+    RUN_TEST(cypher_exec_preserves_large_dynamic_property_in_scalar_function);
+    RUN_TEST(cypher_exec_preserves_large_dynamic_property_in_multiarg_functions);
+    RUN_TEST(cypher_exec_preserves_large_dynamic_property_in_collect_and_with);
+    RUN_TEST(cypher_exec_preserves_query_sized_dynamic_property_key_and_value);
+    RUN_TEST(cypher_exec_dynamic_property_projection_exceeds_tls_ring_without_aliasing);
 }

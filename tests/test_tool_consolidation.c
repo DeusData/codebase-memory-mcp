@@ -258,6 +258,16 @@ TEST(streamlined_mode_shows_default_user_tools) {
 }
 
 TEST(query_graph_description_repeats_current_executable_schema) {
+    /* A stateless catalog has no server cache owner. Its generated description
+     * must survive the temporary builder's release because yyjson serializes a
+     * copy, and it must advertise the same invariant contract as live modes. */
+    char *stateless_tools = cbm_mcp_tools_list(NULL);
+    ASSERT_NOT_NULL(stateless_tools);
+    ASSERT_NOT_NULL(
+        strstr(stateless_tools, "Stable Cypher capability schema cbm.read-only-cypher/v1"));
+    ASSERT_NOT_NULL(strstr(stateless_tools, "coalesce/substring/replace/left/right"));
+    free(stateless_tools);
+
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *store = cbm_mcp_server_store(srv);
@@ -282,10 +292,8 @@ TEST(query_graph_description_repeats_current_executable_schema) {
     int64_t target_id = cbm_store_upsert_node(store, &target);
     ASSERT_GT(source_id, 0);
     ASSERT_GT(target_id, 0);
-    cbm_edge_t edge = {.project = project,
-                       .source_id = source_id,
-                       .target_id = target_id,
-                       .type = "CALLS"};
+    cbm_edge_t edge = {
+        .project = project, .source_id = source_id, .target_id = target_id, .type = "CALLS"};
     ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
 
     char *saved_mode = save_tool_mode();
@@ -297,18 +305,22 @@ TEST(query_graph_description_repeats_current_executable_schema) {
             char *tools = cbm_mcp_tools_list(srv);
             ASSERT_NOT_NULL(tools);
             ASSERT_NOT_NULL(strstr(tools, "Supported read-only Cypher subset"));
+            ASSERT_NOT_NULL(
+                strstr(tools, "Stable Cypher capability schema cbm.read-only-cypher/v1"));
+            ASSERT_NOT_NULL(
+                strstr(tools, "count/sum/avg/min/max/collect with DISTINCT aggregate arguments"));
+            ASSERT_NOT_NULL(strstr(tools, "coalesce/substring/replace/left/right"));
+            ASSERT_NOT_NULL(strstr(tools, "relationship-unique trails"));
             ASSERT_NOT_NULL(strstr(tools, "Node properties: name, qualified_name, file_path"));
             ASSERT_NOT_NULL(strstr(tools, "complexity"));
-            ASSERT_NOT_NULL(strstr(
-                tools, "MATCH (source:Function)-[:CALLS]->(target:Function)"));
+            ASSERT_NOT_NULL(strstr(tools, "MATCH (source:Function)-[:CALLS]->(target:Function)"));
             free(tools);
         }
     }
     restore_tool_mode(saved_mode);
 
     char *response = cbm_mcp_handle_tool(
-        srv, "query_graph",
-        "{\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 1\"}");
+        srv, "query_graph", "{\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 1\"}");
     ASSERT_NOT_NULL(response);
     ASSERT_NULL(strstr(response, "Supported read-only Cypher subset"));
     ASSERT_NULL(strstr(response, "Node properties: name, qualified_name, file_path"));

@@ -75,6 +75,7 @@ Inspect or change values with the CLI:
 ```bash
 codebase-memory-mcp config list
 codebase-memory-mcp config get auto_index
+codebase-memory-mcp config describe pagerank_damping
 codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config reset auto_index

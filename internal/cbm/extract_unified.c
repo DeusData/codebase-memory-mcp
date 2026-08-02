@@ -684,7 +684,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
-    char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
     if (!name || !name[0]) {
         return NULL;
     }
@@ -705,13 +705,25 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    /* Nix: a binding's own attrpath contributes scope (`a.b.fn = …`), and the def
+     * extractor bakes it into the def QN. Compose it identically here — otherwise
+     * an in-body call sources to a QN one or more segments short of the def, and
+     * the edge is dropped at write. */
+    const char *qn_name = name;
+    if (ctx->language == CBM_LANG_NIX) {
+        qn_name = cbm_nix_qn_name(ctx->arena, node, ctx->source, name);
+        if (!qn_name || !qn_name[0]) {
+            return NULL;
+        }
+    }
+
     if (state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    const char *qn =
-        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name, ctx->language);
+    const char *qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
+                                                 ctx->language);
     if (ctx->language == CBM_LANG_RUST) {
         qn = cbm_rust_cfg_qualified_name(ctx->arena, node, ctx->source, qn);
     }
@@ -722,6 +734,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         return objectscript_get_class_name(ctx, node);
+    }
+    /* Nix: an attrset-valued `binding` is a named scope. Same shared helper the def
+     * extractor's compute_class_qn uses — these are two separate functions, and a
+     * one-segment disagreement between them drops every CALLS edge sourced from a
+     * nested binding. */
+    if (ctx->language == CBM_LANG_NIX) {
+        return cbm_nix_binding_scope_qn(ctx, node, state ? state->enclosing_class_qn : NULL);
     }
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
@@ -1580,16 +1599,26 @@ static bool push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 state->os_type_map.class_base_count = 0;
             }
         }
-    } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
-        TSNode prev = ts_node_prev_sibling(node);
-        while (!ts_node_is_null(prev) && strcmp(ts_node_type(prev), "function_signature") != 0 &&
-               strcmp(ts_node_type(prev), "method_signature") != 0) {
-            prev = ts_node_prev_sibling(prev);
+    } else if (ctx->language == CBM_LANG_NIX && strcmp(ts_node_type(node), "binding") == 0 &&
+               cbm_nix_binding_is_attrset_scope(node)) {
+        /* Nix: a binding whose value is an attribute set is a named scope, exactly
+         * as is_namespace_scope_kind treats it on the def side. Pushing it here is
+         * what makes an in-body call source to `proj.file.setA.fn` rather than the
+         * bare `proj.file.fn` that no node carries once defs are attrpath-qualified. */
+        const char *cqn = compute_class_qn(ctx, node, state);
+        if (cqn) {
+            if (!push_scope(state, SCOPE_CLASS, depth, cqn)) {
+                return false;
+            }
         }
-        if (!ts_node_is_null(prev)) {
-            const char *fqn = compute_func_qn(ctx, prev, spec, state);
-            if (fqn) {
-                if (!push_scope(state, SCOPE_FUNC, depth, fqn)) {
+    } else if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
+        TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        if (!ts_node_is_null(type_node)) {
+            char *type_name = cbm_node_text(ctx->arena, type_node, ctx->source);
+            if (type_name && type_name[0]) {
+                const char *tqn =
+                    cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);
+                if (!push_scope(state, SCOPE_CLASS, depth, tqn)) {
                     return false;
                 }
             }

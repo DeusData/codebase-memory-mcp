@@ -89,6 +89,8 @@ int cbm_rename_replace(const char *src, const char *dst);
  * UTF-8 through the ANSI CRT (#973). out must be >= 4096 bytes. Returns 1 on
  * success, 0 otherwise. */
 int cbm_canonical_path(const char *path, char *out, size_t out_sz);
+/* Canonicalize an existing path into exact heap storage. Caller frees. */
+char *cbm_canonical_path_alloc(const char *path);
 
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);

@@ -12,14 +12,12 @@
 #include "foundation/constants.h"
 
 enum { REG_INIT_CAP = 16, REG_MIN_CANDIDATES = 3, REG_RESOLVED = 1, REG_SUFFIX_ALLOC = 2 };
-/* Names with more registered definitions than this are unresolvable by name
- * alone: candidate_count_penalty already floors their confidence to ~3/count
- * (<= 0.006 at 256), so the emitted edge is noise — while the candidate walk
- * (reachability + scoring per candidate, re-done per file) is the dominant
- * resolution cost on identifier-dense repos. On the Linux kernel, 274 names
- * exceed 256 candidates ("list_head" 7188, "flags" 5520, "dev" 4374, ...) and
- * accounted for ~900 s of the 987 s usage-resolution CPU. Bail out early. */
-enum { REG_MAX_CANDIDATES = 256 };
+/* Bare names above this measured scan budget carry no exact disambiguating
+ * signal and candidate_count_penalty floors their confidence to noise. On the
+ * Linux kernel, scanning those names accounted for ~900 s of 987 s usage-
+ * resolution CPU. Qualified-tail and import-reachability signals are evaluated
+ * before this guard and therefore remain exact at every representable count. */
+enum { REG_UNSIGNALLED_CANDIDATE_SCAN_LIMIT = 256 };
 #define REG_FULL_CONF 1.0
 #define REG_HALF_PENALTY 0.5
 
@@ -29,6 +27,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
+#include "foundation/str_intern.h"
 #include "foundation/str_util.h"
 
 #include <math.h>
@@ -76,12 +75,10 @@ const char *cbm_confidence_band(double score) {
 typedef CBM_DYN_ARRAY(char *) qn_array_t;
 
 struct cbm_registry {
-    /* Interned label strings (<=~30 distinct labels; owned here, freed in
-     * _free). The exact map's VALUES point into this pool instead of one
-     * strdup per registered definition (~8.5M strdups on the kernel). */
-    char *label_pool[64];
-    int label_pool_n;
-    /* exact: qualifiedName → label string (heap-owned copies) */
+    /* The exact map's values borrow stable strings from this pool instead of
+     * one strdup per registered definition (~8.5M copies on the kernel). */
+    CBMInternPool *label_pool;
+    /* exact: heap-owned qualifiedName → borrowed interned label */
     CBMHashTable *exact;
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
@@ -139,22 +136,72 @@ static int candidate_score(const char *candidate_qn, const char *module_qn) {
     return score;
 }
 
+typedef struct {
+    const char *best;
+    int best_score;
+    int count;
+} candidate_selection_t;
+
+static void candidate_selection_consider(candidate_selection_t *selection, const char *candidate,
+                                         const char *module_qn) {
+    int score = candidate_score(candidate, module_qn);
+    if (score > selection->best_score || (score == selection->best_score && selection->best &&
+                                          strcmp(candidate, selection->best) < 0)) {
+        selection->best_score = score;
+        selection->best = candidate;
+    }
+    selection->count++;
+}
+
+static char *registry_temp_buffer(char *inline_storage, size_t inline_capacity, size_t required,
+                                  bool *owned) {
+    if (!inline_storage || !owned || required == 0) {
+        return NULL;
+    }
+    *owned = false;
+    if (required <= inline_capacity) {
+        return inline_storage;
+    }
+    char *allocated = malloc(required);
+    if (allocated) {
+        *owned = true;
+    }
+    return allocated;
+}
+
+/* Typical qualified names stay allocation-free in caller-owned inline storage;
+ * longer logical identities receive one exact checked fallback allocation. */
+static char *registry_join_qualified(const char *left, const char *right, char *inline_storage,
+                                     size_t inline_capacity, bool *owned) {
+    if (!left || !right || !owned) {
+        return NULL;
+    }
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    if (left_len > SIZE_MAX - right_len || left_len + right_len > SIZE_MAX - PAIR_LEN) {
+        return NULL;
+    }
+    size_t size = left_len + right_len + PAIR_LEN;
+    char *joined = registry_temp_buffer(inline_storage, inline_capacity, size, owned);
+    if (!joined) {
+        return NULL;
+    }
+    memcpy(joined, left, left_len);
+    joined[left_len] = '.';
+    memcpy(joined + left_len + SKIP_ONE, right, right_len + SKIP_ONE);
+    return joined;
+}
+
 /* Pick candidate with highest composite score. Equal-score ties are resolved
  * lexically so resolver output does not depend on registry insertion order
  * (full index traversal vs incremental store seeding can differ). */
 static const char *best_by_import_distance(const char **candidates, int count,
                                            const char *module_qn) {
-    const char *best = NULL;
-    int best_score = CBM_NOT_FOUND;
+    candidate_selection_t selection = {.best_score = CBM_NOT_FOUND};
     for (int i = 0; i < count; i++) {
-        int score = candidate_score(candidates[i], module_qn);
-        if (score > best_score ||
-            (score == best_score && best && strcmp(candidates[i], best) < 0)) {
-            best_score = score;
-            best = candidates[i];
-        }
+        candidate_selection_consider(&selection, candidates[i], module_qn);
     }
-    return best;
+    return selection.best;
 }
 
 /* ── Per-file is_import_reachable memoization cache ───────────────
@@ -285,8 +332,22 @@ void cbm_registry_resolve_cache_end(void) {
     _resolve_cache = NULL;
 }
 
-/* Check if candidate's module prefix appears in import map values.
- * Uses stack buffer to avoid malloc/free per call in hot resolution loop.
+static bool qualified_prefix_related(const char *left, size_t left_len, const char *right,
+                                     size_t right_len) {
+    size_t common_len = left_len < right_len ? left_len : right_len;
+    if (memcmp(left, right, common_len) != 0) {
+        return false;
+    }
+    return left_len == right_len ||
+           (left_len < right_len ? right[left_len] == '.' : left[right_len] == '.');
+}
+
+/* Check whether a candidate module and an import value are equal or have an
+ * ancestor/descendant relationship at a qualified-name component boundary.
+ * Raw substring matching made `proj.mod2` reachable through `proj.mod299`.
+ * Length-delimited comparison also preserves module identities beyond the old
+ * 512-byte scratch buffer without allocation.
+ *
  * Per-file memoization via TLS cache: repeated lookups of the same
  * candidate_qn (same name appears in many call sites) become O(1)
  * after the first computation. */
@@ -300,21 +361,13 @@ static bool is_import_reachable(const char *candidate_qn, const char **import_va
             return false;
     }
 
-    char cand_mod[CBM_SZ_512];
     const char *last = strrchr(candidate_qn, '.');
-    if (last) {
-        size_t len = (size_t)(last - candidate_qn);
-        if (len >= sizeof(cand_mod)) {
-            len = sizeof(cand_mod) - SKIP_ONE;
-        }
-        memcpy(cand_mod, candidate_qn, len);
-        cand_mod[len] = '\0';
-    } else {
-        snprintf(cand_mod, sizeof(cand_mod), "%s", candidate_qn);
-    }
+    size_t candidate_module_len = last ? (size_t)(last - candidate_qn) : strlen(candidate_qn);
     bool reachable = false;
     for (int i = 0; i < import_count; i++) {
-        if (strstr(cand_mod, import_vals[i]) || strstr(import_vals[i], cand_mod)) {
+        const char *import_value = import_vals[i];
+        if (import_value && qualified_prefix_related(candidate_qn, candidate_module_len,
+                                                     import_value, strlen(import_value))) {
             reachable = true;
             break;
         }
@@ -327,6 +380,22 @@ static bool is_import_reachable(const char *candidate_qn, const char **import_va
         }
     }
     return reachable;
+}
+
+/* Select every import-reachable candidate without a fixed intermediate array.
+ * Runtime remains O(A * I * M) in the existing reachability model, while live
+ * auxiliary storage is O(1) rather than O(min(A, 256)). Per-file memoization
+ * keeps repeated candidate/import probes O(1) after their first evaluation. */
+static candidate_selection_t select_import_reachable(const qn_array_t *arr,
+                                                     const char **import_vals, int import_count,
+                                                     const char *module_qn) {
+    candidate_selection_t selection = {.best_score = CBM_NOT_FOUND};
+    for (int i = 0; i < arr->count; i++) {
+        if (is_import_reachable(arr->items[i], import_vals, import_count)) {
+            candidate_selection_consider(&selection, arr->items[i], module_qn);
+        }
+    }
+    return selection;
 }
 
 /* Scale confidence inversely with candidate count. */
@@ -481,12 +550,20 @@ cbm_registry_t *cbm_registry_new(void) {
     }
     r->exact = cbm_ht_create(CBM_SZ_1K);
     r->by_name = cbm_ht_create(CBM_SZ_512);
+    r->label_pool = cbm_intern_create();
+    if (!r->exact || !r->by_name || !r->label_pool) {
+        cbm_intern_free(r->label_pool);
+        cbm_ht_free(r->by_name);
+        cbm_ht_free(r->exact);
+        free(r);
+        return NULL;
+    }
     return r;
 }
 
 static void free_label(const char *key, void *value, void *ud) {
     (void)ud;
-    (void)value; /* interned in the registry's label_pool */
+    (void)value; /* borrowed from the registry's label_pool */
     free((void *)key);
 }
 
@@ -510,9 +587,7 @@ void cbm_registry_free(cbm_registry_t *r) {
     cbm_ht_free(r->by_name);
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
-    for (int i = 0; i < r->label_pool_n; i++) {
-        free(r->label_pool[i]);
-    }
+    cbm_intern_free(r->label_pool);
     free(r);
 }
 
@@ -529,21 +604,9 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         return;
     }
 
-    /* Intern the label (bounded set; linear scan is fine at this size). */
-    const char *interned = NULL;
-    for (int i = 0; i < r->label_pool_n; i++) {
-        if (strcmp(r->label_pool[i], label) == 0) {
-            interned = r->label_pool[i];
-            break;
-        }
-    }
-    if (!interned && r->label_pool_n < (int)(sizeof(r->label_pool) / sizeof(r->label_pool[0]))) {
-        r->label_pool[r->label_pool_n] = strdup(label);
-        interned = r->label_pool[r->label_pool_n];
-        r->label_pool_n++;
-    }
+    const char *interned = cbm_intern(r->label_pool, label);
     if (!interned) {
-        return; /* pool exhausted (cannot happen with sane label sets) */
+        return;
     }
 
     /* Store in exact map: QN → interned label. The key is the registry's ONE
@@ -652,14 +715,19 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
             return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
         }
     }
-    char candidate[CBM_SZ_512];
-    if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
-    } else {
-        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
+    char candidate_inline[CBM_SZ_512];
+    bool candidate_owned = false;
+    char *candidate =
+        registry_join_qualified(resolved, suffix && suffix[0] ? suffix : prefix, candidate_inline,
+                                sizeof(candidate_inline), &candidate_owned);
+    if (!candidate) {
+        return empty_result();
     }
     /* Use cbm_ht_get_key to get the persistent heap-owned key string */
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
+    if (candidate_owned) {
+        free(candidate);
+    }
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
     }
@@ -671,19 +739,17 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * scan ran per unresolved call and dominated elasticsearch's resolve
      * phase (94% of samples: 700k-entry foreach + strlen per entry). */
     if (suffix && suffix[0]) {
-        char resolved_dot[CBM_SZ_512];
-        char dot_suffix[CBM_SZ_256];
-        snprintf(resolved_dot, sizeof(resolved_dot), "%s.", resolved);
-        snprintf(dot_suffix, sizeof(dot_suffix), ".%s", suffix);
         qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(suffix));
         if (arr) {
-            size_t rd_len = strlen(resolved_dot);
-            size_t ds_len = strlen(dot_suffix);
+            size_t resolved_len = strlen(resolved);
+            size_t suffix_len = strlen(suffix);
             for (int i = 0; i < arr->count; i++) {
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
-                if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
-                    strcmp(qn + klen - ds_len, dot_suffix) == 0) {
+                if (klen > resolved_len && klen > suffix_len && qn[resolved_len] == '.' &&
+                    qn[klen - suffix_len - SKIP_ONE] == '.' &&
+                    memcmp(qn, resolved, resolved_len) == 0 &&
+                    memcmp(qn + klen - suffix_len, suffix, suffix_len) == 0) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
                 }
@@ -696,15 +762,30 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
 /* Strategy 2: Same-module match */
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
                                             const char *suffix, const char *module_qn) {
-    char candidate[CBM_SZ_512];
-    snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, callee_name);
+    char candidate_inline[CBM_SZ_512];
+    bool candidate_owned = false;
+    char *candidate = registry_join_qualified(module_qn, callee_name, candidate_inline,
+                                              sizeof(candidate_inline), &candidate_owned);
+    if (!candidate) {
+        return empty_result();
+    }
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
+    if (candidate_owned) {
+        free(candidate);
+    }
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     }
     if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
+        candidate = registry_join_qualified(module_qn, suffix, candidate_inline,
+                                            sizeof(candidate_inline), &candidate_owned);
+        if (!candidate) {
+            return empty_result();
+        }
         stored_key = cbm_ht_get_key(r->exact, candidate);
+        if (candidate_owned) {
+            free(candidate);
+        }
         if (stored_key) {
             return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
         }
@@ -716,23 +797,15 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
 static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const char *module_qn,
                                                    const char **import_vals, int import_count,
                                                    bool callee_qualified) {
-    const char *filtered[CBM_SZ_256];
-    int fcount = 0;
-    for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
-        if (is_import_reachable(arr->items[i], import_vals, import_count)) {
-            filtered[fcount++] = arr->items[i];
-        }
-    }
-    if (fcount == SKIP_ONE) {
+    candidate_selection_t reachable =
+        select_import_reachable(arr, import_vals, import_count, module_qn);
+    if (reachable.count == SKIP_ONE) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
+        return (cbm_resolution_t){reachable.best, "suffix_match", conf, arr->count};
     }
-    if (fcount > SKIP_ONE) {
-        const char *best = best_by_import_distance(filtered, fcount, module_qn);
-        if (best) {
-            double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
-            return (cbm_resolution_t){best, "suffix_match", conf, fcount};
-        }
+    if (reachable.count > SKIP_ONE && reachable.best) {
+        double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, reachable.count);
+        return (cbm_resolution_t){reachable.best, "suffix_match", conf, reachable.count};
     }
     if (callee_qualified) {
         return empty_result();
@@ -764,12 +837,22 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
  * leave behavior unchanged. */
 static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
-    char dotted[CBM_SZ_512];
+    size_t callee_len = strlen(callee_name);
+    if (callee_len == SIZE_MAX) {
+        return NULL;
+    }
+    char dotted_inline[CBM_SZ_512];
+    bool dotted_owned = false;
+    char *dotted = registry_temp_buffer(dotted_inline, sizeof(dotted_inline), callee_len + SKIP_ONE,
+                                        &dotted_owned);
+    if (!dotted) {
+        return NULL;
+    }
     size_t w = 0;
-    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+    for (const char *s = callee_name; *s;) {
         if (s[0] == ':' && s[1] == ':') {
             dotted[w++] = '.';
-            s += 2;
+            s += sizeof("::") - SKIP_ONE;
         } else {
             dotted[w++] = *s++;
         }
@@ -777,7 +860,10 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     dotted[w] = '\0';
     /* Must be qualified (contain a '.') — a bare name matches every candidate
      * and carries no disambiguating signal. */
-    if (!callee_has_qualified_separator(dotted)) {
+    if (!strchr(dotted, '.')) {
+        if (dotted_owned) {
+            free(dotted);
+        }
         return NULL;
     }
     const char *match = NULL;
@@ -796,9 +882,13 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
             continue;
         }
         if (match) {
-            return NULL; /* ambiguous — more than one qualified tail matches */
+            match = NULL; /* ambiguous — more than one qualified tail matches */
+            break;
         }
         match = qn;
+    }
+    if (dotted_owned) {
+        free(dotted);
     }
     return match;
 }
@@ -811,9 +901,6 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
         return empty_result();
-    }
-    if (arr->count > REG_MAX_CANDIDATES) {
-        return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
 
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
@@ -840,6 +927,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     if (import_vals && import_count > 0) {
         return resolve_multi_with_imports(arr, module_qn, import_vals, import_count,
                                           callee_has_qualified_separator(callee_name));
+    }
+    if (arr->count > REG_UNSIGNALLED_CANDIDATE_SCAN_LIMIT) {
+        return empty_result();
     }
     const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (best) {
@@ -872,7 +962,9 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
      * Both separators are unambiguous, so handling "::" never affects "."-only
      * callees. */
-    char prefix[CBM_SZ_256] = {0};
+    char prefix_inline[CBM_SZ_256];
+    const char *prefix = callee_name;
+    char *owned_prefix = NULL;
     const char *suffix = NULL;
     const char *dot = strchr(callee_name, '.');
     const char *colons = strstr(callee_name, "::");
@@ -880,23 +972,27 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     size_t sep_len = SKIP_ONE; /* length of '.' */
     if (colons && (!sep || colons < sep)) {
         sep = colons;
-        sep_len = 2; /* length of "::" */
+        sep_len = sizeof("::") - SKIP_ONE;
     }
     if (sep) {
-        size_t plen = sep - callee_name;
-        if (plen >= sizeof(prefix)) {
-            plen = sizeof(prefix) - SKIP_ONE;
+        size_t prefix_len = (size_t)(sep - callee_name);
+        bool prefix_owned = false;
+        char *exact_prefix = registry_temp_buffer(prefix_inline, sizeof(prefix_inline),
+                                                  prefix_len + SKIP_ONE, &prefix_owned);
+        if (exact_prefix) {
+            memcpy(exact_prefix, callee_name, prefix_len);
+            exact_prefix[prefix_len] = '\0';
         }
-        memcpy(prefix, callee_name, plen);
-        prefix[plen] = '\0';
+        owned_prefix = prefix_owned ? exact_prefix : NULL;
+        prefix = exact_prefix;
         suffix = sep + sep_len;
-    } else {
-        snprintf(prefix, sizeof(prefix), "%s", callee_name);
     }
 
     /* Strategy 1: import map */
-    cbm_resolution_t res =
-        resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
+    cbm_resolution_t res = prefix ? resolve_import_map(r, prefix, suffix, import_map_keys,
+                                                       import_map_vals, import_map_count)
+                                  : empty_result();
+    free(owned_prefix);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
         res = resolve_same_module(r, callee_name, suffix, module_qn);
@@ -925,18 +1021,6 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
 
-/* Filter candidates by import reachability. Returns count of reachable. */
-static int filter_import_reachable(const char **candidates, int count, const char **import_vals,
-                                   int import_count, const char **out, int max_out) {
-    int n = 0;
-    for (int i = 0; i < count && n < max_out; i++) {
-        if (is_import_reachable(candidates[i], import_vals, import_count)) {
-            out[n++] = candidates[i];
-        }
-    }
-    return n;
-}
-
 cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const char *callee_name,
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count) {
@@ -952,10 +1036,6 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
     if (!arr || arr->count == 0) {
         return no_match;
     }
-    if (arr->count > REG_MAX_CANDIDATES) {
-        return no_match; /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
-    }
-
     bool have_imports = (import_map_vals && import_map_count > 0);
 
     /* Single candidate */
@@ -969,17 +1049,17 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
     }
 
     /* Multiple candidates: filter by import reachability */
-    const char *filtered[CBM_SZ_256];
-    int fcount = arr->count;
-    const char **fptr = (const char **)arr->items;
-
+    candidate_selection_t reachable = {0};
     if (have_imports) {
-        fcount = filter_import_reachable((const char **)arr->items, arr->count, import_map_vals,
-                                         import_map_count, filtered, CBM_SZ_256);
-        fptr = filtered;
+        reachable = select_import_reachable(arr, import_map_vals, import_map_count, module_qn);
+    } else if (arr->count > REG_UNSIGNALLED_CANDIDATE_SCAN_LIMIT) {
+        return no_match;
     }
 
-    if (fcount == 0) {
+    if (have_imports && reachable.count == 0) {
+        if (arr->count > REG_UNSIGNALLED_CANDIDATE_SCAN_LIMIT) {
+            return no_match;
+        }
         /* No import-reachable — use originals with penalty */
         const char *best =
             best_by_import_distance((const char **)arr->items, arr->count, module_qn);
@@ -991,17 +1071,23 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
              candidate_count_penalty(CONF_FUZZY_MULTI * REG_HALF_PENALTY, arr->count), arr->count},
             true};
     }
-    if (fcount == SKIP_ONE) {
-        return (cbm_fuzzy_result_t){
-            {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
-            true};
+    if (have_imports && reachable.count == SKIP_ONE) {
+        return (cbm_fuzzy_result_t){{reachable.best, "fuzzy",
+                                     candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count),
+                                     arr->count},
+                                    true};
     }
-    const char *best = best_by_import_distance(fptr, fcount, module_qn);
+    const char *best =
+        have_imports ? reachable.best
+                     : best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (!best) {
         return no_match;
     }
     return (cbm_fuzzy_result_t){
-        {best, "fuzzy", candidate_count_penalty(CONF_FUZZY_MULTI, fcount), fcount}, true};
+        {best, "fuzzy",
+         candidate_count_penalty(CONF_FUZZY_MULTI, have_imports ? reachable.count : arr->count),
+         have_imports ? reachable.count : arr->count},
+        true};
 }
 
 /* ── FindEndingWith ─────────────────────────────────────────────── */

@@ -1313,9 +1313,9 @@ int cbm_write_file_atomic(const char *dest_path, const void *data, size_t len,
  * canonicalization corrupts the path (#973).  GetFullPathNameW alone is also
  * only lexical and would let an allowed-root check follow a junction outside
  * the root.  Returns 0 when the path does not exist or cannot be resolved. */
-int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
-    if (!path || !out || out_sz == 0) {
-        return 0;
+char *cbm_canonical_path_alloc(const char *path) {
+    if (!path) {
+        return NULL;
     }
 #ifdef _WIN32
     wchar_t *wpath = cbm_path_to_wide(path);
@@ -1367,16 +1367,28 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     }
     char *utf8 = cbm_wide_to_utf8(wfull);
     free(wfull);
-    if (!utf8) {
+    return utf8;
+#else
+    return realpath(path, NULL);
+#endif
+}
+
+int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz == 0) {
         return 0;
     }
-    size_t len = strlen(utf8);
-    if (len >= out_sz) {
-        free(utf8);
+#ifdef _WIN32
+    char *canonical = cbm_canonical_path_alloc(path);
+    if (!canonical) {
         return 0;
     }
-    memcpy(out, utf8, len + 1);
-    free(utf8);
+    size_t length = strlen(canonical);
+    if (length >= out_sz) {
+        free(canonical);
+        return 0;
+    }
+    memcpy(out, canonical, length + 1U);
+    free(canonical);
     return 1;
 #else
     /* Callers pass >= 4K buffers (>= PATH_MAX on our platforms). */
