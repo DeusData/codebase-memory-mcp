@@ -1773,6 +1773,9 @@ TEST(daemon_ipc_no_spawn_probe_distinguishes_absent_active_and_busy) {
 
 TEST(daemon_ipc_transport_probe_distinguishes_reservation_from_listener) {
     static const char key[] = "3141592653589793";
+    /* A queued probe peer is immediately accept-ready; this small bound only
+     * distinguishes an empty queue without adding material suite latency. */
+    enum { EMPTY_QUEUE_ACCEPT_TIMEOUT_MS = 10 };
     char parent[TEST_PATH_CAP] = {0};
     char runtime_dir[TEST_PATH_CAP] = {0};
     cbm_daemon_ipc_endpoint_t *endpoint = NULL;
@@ -1780,9 +1783,11 @@ TEST(daemon_ipc_transport_probe_distinguishes_reservation_from_listener) {
     cbm_daemon_ipc_participant_guard_t *participant = NULL;
     cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
     cbm_daemon_ipc_listener_t *listener = NULL;
+    cbm_daemon_ipc_connection_t *probe_connection = NULL;
     int acquired = -1;
     int reserved_transport = -1;
     int listening_transport = -1;
+    int queued_after_probe = -1;
 
     if (ipc_test_parent_new(parent, "transport-reservation")) {
         endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
@@ -1805,8 +1810,11 @@ TEST(daemon_ipc_transport_probe_distinguishes_reservation_from_listener) {
     }
     if (listener) {
         listening_transport = cbm_daemon_ipc_transport_probe(endpoint);
+        queued_after_probe =
+            cbm_daemon_ipc_accept(listener, EMPTY_QUEUE_ACCEPT_TIMEOUT_MS, &probe_connection);
     }
 
+    cbm_daemon_ipc_connection_close(probe_connection);
     cbm_daemon_ipc_listener_close(listener);
     cbm_daemon_ipc_lifetime_reservation_release(reservation);
     bool participant_released = cbm_daemon_ipc_participant_guard_release(&participant);
@@ -1817,6 +1825,8 @@ TEST(daemon_ipc_transport_probe_distinguishes_reservation_from_listener) {
     ASSERT_EQ(reserved_transport, 0);
     ASSERT_NOT_NULL(listener);
     ASSERT_EQ(listening_transport, 1);
+    ASSERT_EQ(queued_after_probe, 0);
+    ASSERT_NULL(probe_connection);
     ASSERT_TRUE(participant_released);
     ASSERT_NULL(participant);
     PASS();

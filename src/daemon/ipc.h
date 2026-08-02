@@ -117,11 +117,14 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
 
 /* Observe only the current generation's secure transport, without treating a
  * startup lock or lifetime reservation as a listener. Returns 1 when a local
- * connection succeeds or the validated transport is busy/pending, 0 when no
+ * owner-only socket or generation-addressed pipe has been published, 0 when no
  * transport has been published, and -1 when ownership or safety cannot be
- * proven. This immediate O(1)-space probe lets lifecycle coordinators keep
- * waiting for a reserved generation without spending a full connect timeout
- * polling a socket/pipe that does not exist yet. */
+ * proven. It does not connect or consume an accept slot; callers authenticate
+ * the subsequent real connection. For P endpoint/rendezvous path bytes the
+ * probe uses O(P) runtime and O(1) auxiliary memory. Lifecycle coordinators can
+ * therefore keep waiting for a reserved generation without spending a full
+ * connect timeout polling an absent socket/pipe or creating a probe-only worker
+ * lifecycle on a present transport. */
 int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint);
 
 /* Observe the daemon-generation lifetime reservation without spawning a
