@@ -31,6 +31,7 @@ static const direct_dialect_expectation_t direct_dialects[] = {
     {CBM_GRAPH_DIALECT_FACTORY, "mcp__codebase-memory-mcp__check_index_coverage",
      "tools: [\"Read\", \"LS\", \"Grep\", \"Glob\"", "source read/grep fallback"},
     {CBM_GRAPH_DIALECT_VIBE, "agent_type = \"subagent\"", "\"read_file\"", "\"grep_search\""},
+    {CBM_GRAPH_DIALECT_OMP, "read-summarize: false", "  - read\n", "  - grep\n"},
 };
 
 static const cbm_graph_profile_dialect_t handoff_only_dialects[] = {
@@ -67,6 +68,7 @@ TEST(agent_profiles_stable_tier_identity) {
     ASSERT_FALSE(cbm_graph_dialect_direct_capable(CBM_GRAPH_DIALECT_AUGMENT));
     ASSERT_FALSE(cbm_graph_dialect_direct_capable(CBM_GRAPH_DIALECT_CURSOR));
     ASSERT_FALSE(cbm_graph_dialect_direct_capable(CBM_GRAPH_DIALECT_ROVO));
+    ASSERT_TRUE(cbm_graph_dialect_direct_capable(CBM_GRAPH_DIALECT_OMP));
     ASSERT_FALSE(cbm_graph_dialect_direct_capable(CBM_GRAPH_DIALECT_POCHI));
     ASSERT_FALSE(cbm_graph_dialect_direct_capable(CBM_GRAPH_DIALECT_COUNT));
     ASSERT_NULL(cbm_graph_tier_slug(CBM_GRAPH_TIER_COUNT));
@@ -266,6 +268,26 @@ TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs) {
     PASS();
 }
 
+TEST(agent_profiles_omp_direct_has_prefixed_tools_and_handoff_excludes_mcp) {
+    char *direct = cbm_render_graph_profile(CBM_GRAPH_DIALECT_OMP, CBM_GRAPH_TIER_VERIFY,
+                                            CBM_GRAPH_ACCESS_DIRECT, NULL);
+    ASSERT_NOT_NULL(direct);
+    ASSERT_NOT_NULL(strstr(direct, "mcp__codebase_memory_mcp_check_index_coverage"));
+    ASSERT_NOT_NULL(strstr(direct, "mcp__codebase_memory_mcp_search_graph"));
+    ASSERT_NOT_NULL(strstr(direct, "read-summarize: false"));
+    ASSERT_NOT_NULL(strstr(direct, "autoloadSkills: [codebase-memory]"));
+    ASSERT_NULL(strstr(direct, "mcp__codebase-memory-mcp__"));
+    ASSERT(!profile_has_mutator(direct));
+    free(direct);
+    char *handoff = cbm_render_graph_profile(CBM_GRAPH_DIALECT_OMP, CBM_GRAPH_TIER_VERIFY,
+                                             CBM_GRAPH_ACCESS_HANDOFF, NULL);
+    ASSERT_NOT_NULL(handoff);
+    ASSERT_NULL(strstr(handoff, "mcp__codebase_memory_mcp_"));
+    ASSERT_NULL(strstr(handoff, "mcp__codebase-memory-mcp__"));
+    free(handoff);
+    PASS();
+}
+
 SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_stable_tier_identity);
     RUN_TEST(agent_profiles_direct_dialects_are_coverage_aware_and_read_only);
@@ -275,5 +297,6 @@ SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_server_level_dialects_hard_enforce_read_only_tools);
     RUN_TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path);
     RUN_TEST(agent_profiles_vibe_uses_matching_prompt_identifier_and_contract);
+    RUN_TEST(agent_profiles_omp_direct_has_prefixed_tools_and_handoff_excludes_mcp);
     RUN_TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs);
 }

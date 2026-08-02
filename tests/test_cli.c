@@ -4274,14 +4274,15 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Pochi",
         "Pi",
         "Sourcegraph Cody",
+        "Oh My Pi (omp)",
     };
-    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 43U);
+    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 44U);
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
-    if (!strstr(data, "43 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "44 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("README must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("README must describe all 44 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4294,9 +4295,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("pkg/npm/README.md");
     if (!data)
         FAIL("could not read npm README for supported-agent contract");
-    if (!strstr(data, "43 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "44 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("npm README must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("npm README must describe all 44 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4309,9 +4310,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/index.html");
     if (!data)
         FAIL("could not read docs/index.html for supported-agent contract");
-    if (!strstr(data, "configures 43 automatic/conditional client surfaces")) {
+    if (!strstr(data, "configures 44 automatic/conditional client surfaces")) {
         free(data);
-        FAIL("landing page must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("landing page must describe all 44 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4330,7 +4331,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
             FAIL("CLI help must list every automatic/conditional client surface");
         }
     }
-    if (!strstr(data, "Supported automatic/conditional client surfaces (43)")) {
+    if (!strstr(data, "Supported automatic/conditional client surfaces (44)")) {
         free(data);
         FAIL("CLI help must not describe all conditional surfaces as auto-detected");
     }
@@ -4339,10 +4340,10 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/llms.txt");
     if (!data)
         FAIL("could not read docs/llms.txt for supported-agent contract");
-    if (!strstr(data, "43 automatic/conditional client surfaces") ||
-        !strstr(data, "37 automatically detected") || !strstr(data, "6 conditional/explicit")) {
+    if (!strstr(data, "44 automatic/conditional client surfaces") ||
+        !strstr(data, "38 automatically detected") || !strstr(data, "6 conditional/explicit")) {
         free(data);
-        FAIL("llms.txt must describe the 43-surface 37+6 support matrix accurately");
+        FAIL("llms.txt must describe the 44-surface 38+6 support matrix accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -6237,6 +6238,300 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
         !modified_preserved)
         FAIL("Kimi, Rovo, and Amp must install documented durable context with exact-owned "
              "cleanup and no trust or permission widening");
+    PASS();
+}
+TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {
+        "HOME",           "PATH",     "OMP_PROFILE",    "PI_CODING_AGENT_DIR",
+        "XDG_CONFIG_HOME", "APPDATA",
+    };
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char binary_path[640];
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+
+    char omp_default_dir[640];
+    char omp_profile_dir[640];
+    char omp_relocated_dir[640];
+    char omp_default_mcp[768];
+    char omp_profile_mcp[768];
+    char omp_relocated_mcp[768];
+    char omp_default_agent[768];
+    char omp_profile_agent[768];
+    char omp_relocated_agent[768];
+    snprintf(omp_default_dir, sizeof(omp_default_dir), "%s/.omp/agent", tmpdir);
+    snprintf(omp_profile_dir, sizeof(omp_profile_dir), "%s/.omp/profiles/work/agent", tmpdir);
+    snprintf(omp_relocated_dir, sizeof(omp_relocated_dir), "%s/custom-agent", tmpdir);
+    snprintf(omp_default_mcp, sizeof(omp_default_mcp), "%s/mcp.json", omp_default_dir);
+    snprintf(omp_profile_mcp, sizeof(omp_profile_mcp), "%s/mcp.json", omp_profile_dir);
+    snprintf(omp_relocated_mcp, sizeof(omp_relocated_mcp), "%s/mcp.json", omp_relocated_dir);
+    snprintf(omp_default_agent, sizeof(omp_default_agent), "%s/agents/codebase-memory.md",
+             omp_default_dir);
+    snprintf(omp_profile_agent, sizeof(omp_profile_agent), "%s/agents/codebase-memory.md",
+             omp_profile_dir);
+    snprintf(omp_relocated_agent, sizeof(omp_relocated_agent), "%s/agents/codebase-memory.md",
+             omp_relocated_dir);
+    test_mkdirp(omp_default_dir);
+    test_mkdirp(omp_profile_dir);
+    test_mkdirp(omp_relocated_dir);
+
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    /* Case 1: documented fallback (no env overrides). */
+    char *default_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *default_doc =
+        default_plan ? yyjson_read(default_plan, strlen(default_plan), 0) : NULL;
+    yyjson_val *default_root = default_doc ? yyjson_doc_get_root(default_doc) : NULL;
+    bool default_plan_ok =
+        default_plan && strstr(default_plan, "\"omp\"") &&
+        test_json_string_array_contains(default_root, "config_files_planned", omp_default_mcp) &&
+        test_json_string_array_contains(default_root, "agent_files_planned", omp_default_agent) &&
+        !test_json_string_array_contains(default_root, "instruction_files_planned",
+                                         omp_default_dir);
+    yyjson_doc_free(default_doc);
+    free(default_plan);
+
+    /* Case 2: OMP_PROFILE=work routes to ~/.omp/profiles/<name>/agent. */
+    cbm_setenv("OMP_PROFILE", "work", 1);
+    char *profile_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *profile_doc =
+        profile_plan ? yyjson_read(profile_plan, strlen(profile_plan), 0) : NULL;
+    yyjson_val *profile_root = profile_doc ? yyjson_doc_get_root(profile_doc) : NULL;
+    bool profile_plan_ok =
+        profile_plan && strstr(profile_plan, "\"omp\"") &&
+        test_json_string_array_contains(profile_root, "config_files_planned", omp_profile_mcp) &&
+        test_json_string_array_contains(profile_root, "agent_files_planned", omp_profile_agent) &&
+        !test_json_string_array_contains(profile_root, "config_files_planned", omp_default_mcp) &&
+        !test_json_string_array_contains(profile_root, "agent_files_planned", omp_default_agent);
+    yyjson_doc_free(profile_doc);
+    free(profile_plan);
+    cbm_unsetenv("OMP_PROFILE");
+
+    /* Case 3: PI_CODING_AGENT_DIR relocates the resolved agent dir. The
+     * target must already exist on disk for the registry to recognize the
+     * client, which matches how end users opt in to a shared layout. */
+    cbm_setenv("PI_CODING_AGENT_DIR", omp_relocated_dir, 1);
+    char *relocated_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *relocated_doc =
+        relocated_plan ? yyjson_read(relocated_plan, strlen(relocated_plan), 0) : NULL;
+    yyjson_val *relocated_root = relocated_doc ? yyjson_doc_get_root(relocated_doc) : NULL;
+    bool relocated_plan_ok =
+        relocated_plan && strstr(relocated_plan, "\"omp\"") &&
+        test_json_string_array_contains(relocated_root, "config_files_planned",
+                                        omp_relocated_mcp) &&
+        test_json_string_array_contains(relocated_root, "agent_files_planned",
+                                        omp_relocated_agent);
+    yyjson_doc_free(relocated_doc);
+    free(relocated_plan);
+    cbm_unsetenv("PI_CODING_AGENT_DIR");
+
+    /* Case 4: invalid profile characters must fall back to the documented
+     * ~/.omp/agent path rather than emit something unsafe. */
+    cbm_setenv("OMP_PROFILE", "bad;name", 1);
+    char *fallback_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *fallback_doc =
+        fallback_plan ? yyjson_read(fallback_plan, strlen(fallback_plan), 0) : NULL;
+    yyjson_val *fallback_root = fallback_doc ? yyjson_doc_get_root(fallback_doc) : NULL;
+    bool fallback_plan_ok =
+        fallback_plan && strstr(fallback_plan, "\"omp\"") &&
+        test_json_string_array_contains(fallback_root, "config_files_planned", omp_default_mcp) &&
+        !test_json_string_array_contains(fallback_root, "config_files_planned", omp_profile_mcp);
+    yyjson_doc_free(fallback_doc);
+    free(fallback_plan);
+    cbm_unsetenv("OMP_PROFILE");
+
+    /* None of the plan-only invocations may have written OMP-owned content. */
+    struct stat state;
+    bool plan_did_not_mutate =
+        (stat(omp_default_mcp, &state) != 0) &&
+        (stat(omp_default_agent, &state) != 0) &&
+        (stat(omp_profile_mcp, &state) != 0) &&
+        (stat(omp_profile_agent, &state) != 0) &&
+        (stat(omp_relocated_mcp, &state) != 0) &&
+        (stat(omp_relocated_agent, &state) != 0);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!default_plan_ok || !profile_plan_ok || !relocated_plan_ok || !fallback_plan_ok ||
+        !plan_did_not_mutate) {
+        fprintf(stderr,
+                "omp diag default=%d profile=%d relocated=%d fallback=%d plan_clean=%d\n",
+                default_plan_ok, profile_plan_ok, relocated_plan_ok, fallback_plan_ok,
+                plan_did_not_mutate);
+        FAIL("OMP must resolve ~/.omp/agent under the documented fallback, honor OMP_PROFILE "
+             "named-profile layout, follow PI_CODING_AGENT_DIR relocations, and never write a "
+             "global AGENTS.md");
+    }
+    PASS();
+}
+
+
+TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-lifecycle-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR",
+                                     "XDG_CONFIG_HOME", "APPDATA"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char agent_dir[640];
+    char mcp_path[768];
+    char instructions_path[768];
+    char skill_path[768];
+    char scout_path[768];
+    char verify_path[768];
+    char auditor_path[768];
+    char binary_path[640];
+    snprintf(agent_dir, sizeof(agent_dir), "%s/.omp/profiles/work/agent", tmpdir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/mcp.json", agent_dir);
+    snprintf(instructions_path, sizeof(instructions_path), "%s/AGENTS.md", agent_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", agent_dir);
+    snprintf(scout_path, sizeof(scout_path), "%s/agents/codebase-memory-scout.md", agent_dir);
+    snprintf(verify_path, sizeof(verify_path), "%s/agents/codebase-memory.md", agent_dir);
+    snprintf(auditor_path, sizeof(auditor_path), "%s/agents/codebase-memory-auditor.md", agent_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    test_mkdirp(agent_dir);
+    const char *user_instructions = "# User safety policy\nNever publish without approval.\n";
+    write_test_file(instructions_path, user_instructions);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("OMP_PROFILE", "work", 1);
+
+    int install_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *installed_mcp = read_test_file_alloc(mcp_path);
+    char *installed_instructions = read_test_file_alloc(instructions_path);
+    bool installed =
+        install_rc == 0 && installed_mcp && strstr(installed_mcp, "codebase-memory-mcp") &&
+        strstr(installed_mcp, binary_path) && installed_instructions &&
+        strcmp(installed_instructions, user_instructions) == 0 &&
+        test_file_contains_all(skill_path,
+                               (const char *const[]){"search_graph", "trace_path",
+                                                   "Sessions and Subagents"},
+                               3U) &&
+        test_file_contains_all(scout_path,
+                               (const char *const[]){"autoloadSkills: [codebase-memory]",
+                                                   "mcp__codebase_memory_mcp_search_graph"},
+                               2U) &&
+        test_file_contains_all(verify_path,
+                               (const char *const[]){"read-summarize: false",
+                                                   "mcp__codebase_memory_mcp_trace_path"},
+                               2U) &&
+        test_file_contains_all(auditor_path,
+                               (const char *const[]){"autoloadSkills: [codebase-memory]",
+                                                   "mcp__codebase_memory_mcp_check_index_coverage"},
+                               2U);
+    free(installed_mcp);
+    free(installed_instructions);
+
+    const char *modified_verify =
+        "---\nname: codebase-memory\ndescription: User-owned OMP profile.\n---\n";
+    write_test_file(verify_path, modified_verify);
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    struct stat state;
+    char *preserved_instructions = read_test_file_alloc(instructions_path);
+    char *preserved_verify = read_test_file_alloc(verify_path);
+    char *mcp_after = read_test_file_alloc(mcp_path);
+    bool uninstalled =
+        uninstall_rc == 0 && preserved_instructions &&
+        strcmp(preserved_instructions, user_instructions) == 0 && preserved_verify &&
+        strcmp(preserved_verify, modified_verify) == 0 && stat(skill_path, &state) != 0 &&
+        stat(scout_path, &state) != 0 && stat(auditor_path, &state) != 0 &&
+        (!mcp_after || !strstr(mcp_after, "codebase-memory-mcp"));
+    free(preserved_instructions);
+    free(preserved_verify);
+    free(mcp_after);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!installed || !uninstalled) {
+        fprintf(stderr, "omp lifecycle diag install=%d uninstall=%d\n", installed, uninstalled);
+        FAIL("OMP named-profile install/uninstall must use the effective directory, remove only "
+             "canonical owned files, and preserve user AGENTS.md and modified profiles");
+    }
+    PASS();
+}
+
+TEST(cli_registry_omp_relocated_dry_run_is_non_mutating) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-dry-run-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR",
+                                     "XDG_CONFIG_HOME", "APPDATA"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char agent_dir[640];
+    char mcp_path[768];
+    char instructions_path[768];
+    char skill_path[768];
+    char verify_path[768];
+    char binary_path[640];
+    snprintf(agent_dir, sizeof(agent_dir), "%s/custom-agent", tmpdir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/mcp.json", agent_dir);
+    snprintf(instructions_path, sizeof(instructions_path), "%s/AGENTS.md", agent_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", agent_dir);
+    snprintf(verify_path, sizeof(verify_path), "%s/agents/codebase-memory.md", agent_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    test_mkdirp(agent_dir);
+    const char *user_instructions = "# Existing OMP instructions\nKeep this byte-identical.\n";
+    write_test_file(instructions_path, user_instructions);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("PI_CODING_AGENT_DIR", agent_dir, 1);
+
+    int dry_run_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    struct stat state;
+    char *instructions_after = read_test_file_alloc(instructions_path);
+    bool unchanged = dry_run_rc == 0 && instructions_after &&
+                     strcmp(instructions_after, user_instructions) == 0 &&
+                     stat(mcp_path, &state) != 0 && stat(skill_path, &state) != 0 &&
+                     stat(verify_path, &state) != 0;
+    free(instructions_after);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!unchanged)
+        FAIL("OMP relocated dry-run must not create MCP, skill, agent, or instruction content");
     PASS();
 }
 
@@ -11926,6 +12221,9 @@ SUITE(cli) {
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);
+    RUN_TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir);
+    RUN_TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content);
+    RUN_TEST(cli_registry_omp_relocated_dry_run_is_non_mutating);
     RUN_TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context);
 #ifndef _WIN32
     RUN_TEST(cli_registry_hook_cleanup_is_independent_from_mcp_ownership);
