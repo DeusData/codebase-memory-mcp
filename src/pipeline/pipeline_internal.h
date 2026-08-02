@@ -123,6 +123,10 @@ typedef struct {
     /* ObjectScript method-return-type table built from extracted definitions
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
+
+    /* Version tag for cross-version diff queries (e.g. "28.0", "30.0").
+     * When set, appended to every extracted node's properties JSON. */
+    const char *version_tag;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
