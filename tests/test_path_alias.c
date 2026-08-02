@@ -9,6 +9,7 @@
 #include "test_framework.h"
 #include "../src/pipeline/path_alias.h"
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -232,7 +233,7 @@ TEST(path_alias_find_for_file_nearest_ancestor) {
 /* ── End-to-end via the loader: real tsconfig in a tmp dir ─────── */
 
 static int write_file(const char *path, const char *content) {
-    FILE *f = fopen(path, "w");
+    FILE *f = cbm_fopen(path, "w");
     if (!f) {
         return -1;
     }
@@ -294,7 +295,10 @@ static void path_alias_tree_fixture_free(path_alias_tree_fixture_t *fixture) {
 static bool path_alias_tree_fixture_create(path_alias_tree_fixture_t *fixture, size_t segment_count,
                                            size_t segment_bytes, const char *config) {
     memset(fixture, 0, sizeof(*fixture));
-    char tmpl[] = "/tmp/cbm_palias_exact_XXXXXX";
+    /* Windows cbm_mkdtemp expands /tmp through %TEMP%; retain the centralized
+     * capacity contract so a long or Unicode temporary root cannot overwrite
+     * this stack buffer. Runtime and auxiliary memory remain O(1). */
+    char tmpl[CBM_SZ_256] = "/tmp/cbm_palias_exact_XXXXXX";
     char *root = cbm_mkdtemp(tmpl);
     if (!root) {
         return false;
@@ -599,7 +603,7 @@ TEST(path_alias_loader_rejects_posix_symlink_cycle) {
 }
 
 TEST(path_alias_loader_monorepo) {
-    char tmpl[256];
+    char tmpl[CBM_SZ_256];
     snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_XXXXXX");
     char *root = cbm_mkdtemp(tmpl);
     ASSERT_NOT_NULL(root);
@@ -660,7 +664,7 @@ TEST(path_alias_loader_monorepo) {
 /* ── Monorepo alias climbing out of its tsconfig's directory (#730) ── */
 
 TEST(path_alias_loader_monorepo_dotdot_climb) {
-    char tmpl[256];
+    char tmpl[CBM_SZ_256];
     snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_climb_XXXXXX");
     char *root = cbm_mkdtemp(tmpl);
     ASSERT_NOT_NULL(root);
@@ -708,7 +712,7 @@ TEST(path_alias_loader_monorepo_dotdot_climb) {
  * Control run first (no exclusions → both configs collected) so the
  * exclusion assertion below cannot pass vacuously. */
 TEST(path_alias_loader_honors_discovery_exclusions) {
-    char tmpl[256];
+    char tmpl[CBM_SZ_256];
     snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_excl_XXXXXX");
     char *root = cbm_mkdtemp(tmpl);
     ASSERT_NOT_NULL(root);
@@ -759,7 +763,7 @@ TEST(path_alias_loader_honors_discovery_exclusions) {
 /* ── Loader returns NULL when no configs found ─────────────────── */
 
 TEST(path_alias_loader_no_configs) {
-    char tmpl[256];
+    char tmpl[CBM_SZ_256];
     snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_palias_empty_XXXXXX");
     char *root = cbm_mkdtemp(tmpl);
     ASSERT_NOT_NULL(root);
