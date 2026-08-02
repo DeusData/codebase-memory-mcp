@@ -287,6 +287,16 @@ static const char *cfml_branch_types[] = {
     "cf_if_tag",     "cf_elseif_tag",   "cf_else_tag",      "if_statement",
     "for_statement", "while_statement", "switch_statement", NULL};
 static const char *cfml_module_types[] = {"program", "component_file", NULL};
+// The cfml (HTML-derived) grammar keeps the body of a <cfscript> block as an
+// opaque cf_script_content token — it does NOT parse the script-dialect
+// functions inside. Re-parse that slice with the cfscript grammar (extract_
+// definitions = true) so those functions become real definitions. (Contrast the
+// comment above: embedded <cfscript> functions only "appear as function_
+// declaration" once re-parsed here; in the raw cfml tree they are unparsed text.)
+static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
+    {"cf_script_tag", "cf_script_content", CBM_LANG_CFSCRIPT, true},
+    {NULL, NULL, 0, false},
+};
 
 // ==================== RUST ====================
 static const char *rust_func_types[] = {"function_item", "function_signature_item",
@@ -874,24 +884,24 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // so the existing ES import extractor sees real import_statement nodes.
 // Terminator: an entry whose script_node_type is NULL.
 static const CBMEmbeddedLangSpec vue_embedded_imports[] = {
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, false},
+    {NULL, NULL, 0, false},
 };
 static const CBMEmbeddedLangSpec svelte_embedded_imports[] = {
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, false},
+    {NULL, NULL, 0, false},
 };
 static const CBMEmbeddedLangSpec html_embedded_imports[] = {
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, false},
+    {NULL, NULL, 0, false},
 };
 static const CBMEmbeddedLangSpec astro_embedded_imports[] = {
     /* Astro component scripts live in the `---` frontmatter fence, which the
      * grammar keeps as an unparsed frontmatter_js_block. Re-parse that slice
      * with the JS grammar so `import X from './X.astro'` becomes a real edge. */
-    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT},
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
-    {NULL, NULL, 0},
+    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT, false},
+    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT, false},
+    {NULL, NULL, 0, false},
 };
 
 // ==================== VUE ====================
@@ -2077,7 +2087,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_CFML] = {CBM_LANG_CFML, cfml_func_types, empty_types, empty_types, cfml_module_types,
                        cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
                        empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
-                       NULL},
+                       cfml_embedded_imports},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,

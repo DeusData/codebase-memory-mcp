@@ -730,6 +730,8 @@ void cbm_extract_definitions(CBMExtractCtx *ctx);
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
+void cbm_extract_definitions_body(CBMExtractCtx *ctx); // no Module node (for sub-trees)
+void cbm_extract_embedded_defs(CBMExtractCtx *ctx);    // re-parse embedded script blocks for defs
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);

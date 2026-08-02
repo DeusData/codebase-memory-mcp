@@ -14,6 +14,13 @@ typedef struct {
     const char *script_node_type;  // e.g. "script_element"
     const char *content_node_type; // e.g. "raw_text"
     CBMLanguage embedded_language; // grammar used to re-parse the content slice
+    // When true, the re-parsed inner AST is also walked for DEFINITIONS, not just
+    // imports — e.g. CFML tag components whose <cfscript> body (cf_script_tag ->
+    // cf_script_content) holds script-dialect functions the HTML-derived cfml
+    // grammar keeps as opaque content. Kept on this small struct (a handful of
+    // instances) rather than as a CBMLangSpec field, which would trip
+    // -Wmissing-field-initializers across every language row.
+    bool extract_definitions;
 } CBMEmbeddedLangSpec;
 
 // CBMLangSpec mirrors Go's lang.LanguageSpec with NULL-terminated string arrays.
