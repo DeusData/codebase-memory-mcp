@@ -314,16 +314,32 @@ cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid
         if (!entry->name[0]) {
             continue;
         }
-        bool numeric = true;
-        for (const unsigned char *p = (const unsigned char *)entry->name; *p; p++) {
-            if (*p < (unsigned char)'0' || *p > (unsigned char)'9') {
-                numeric = false;
-                break;
-            }
-        }
-        if (!numeric) {
+        errno = 0;
+        char *pid_end = NULL;
+        long long pid_value = strtoll(entry->name, &pid_end, 10);
+        if (errno == ERANGE || !pid_end || *pid_end != '\0' || pid_value <= 0 ||
+            (long long)(pid_t)pid_value != pid_value) {
             continue;
         }
+
+        /* Filter by process group before opening procfs. A busy host can lose
+         * unrelated /proc entries continuously while processes exit; allowing
+         * those races to poison the owned group's snapshot made quiescence
+         * depend on system-wide process churn. getpgid() either proves the
+         * entry is unrelated or selects it for the fail-closed stat read below.
+         * The scan remains O(P) runtime/O(1) memory for P processes, but reduces
+         * procfs opens and parsing from O(P) to O(G) for G group members. */
+        pid_t entry_group = getpgid((pid_t)pid_value);
+        if (entry_group < 0) {
+            if (!cbm_platform_proc_entry_vanished(errno)) {
+                snapshot_unknown = true;
+            }
+            continue;
+        }
+        if ((int64_t)entry_group != pgid) {
+            continue;
+        }
+
         char path[CBM_PATH_MAX];
         int written = snprintf(path, sizeof(path), "/proc/%s/stat", entry->name);
         if (written < 0 || (size_t)written >= sizeof(path)) {
