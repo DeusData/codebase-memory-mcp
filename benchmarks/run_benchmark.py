@@ -5687,6 +5687,16 @@ def clone_pinned_repo(url: str, revision: str, target: Path, timeout: int) -> Pa
             "corpus revision must be a full 40-character commit hash or "
             f"{UNPINNED_REVISION!r}, got {revision!r}"
         )
+    # The only place this harness mutates a directory with git: init, remote add, fetch
+    # and switch --detach. Callers only ever pass a cache path, but pointed at a real
+    # checkout the detach would move that repository's HEAD and could strand work there.
+    # Refusing an existing repository makes that impossible rather than merely unlikely.
+    if (Path(target) / ".git").exists():
+        raise RuntimeError(
+            f"refusing to clone into {target}: it is already a git repository. "
+            "Pass an empty directory, or point at the existing checkout with "
+            "--corpus-repo <id>=PATH instead of cloning over it."
+        )
     target.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     steps = [

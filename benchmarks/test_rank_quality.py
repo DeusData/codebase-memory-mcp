@@ -332,6 +332,27 @@ def test_workload_corpora_clone_their_current_tip() -> None:
     assert len(pinned) + len(unpinned) == len(registry)
 
 
+def test_clone_refuses_to_touch_a_directory_that_is_already_a_repository() -> None:
+    """clone_pinned_repo is the only harness function that mutates a directory: it runs
+    git init, remote add, fetch and switch --detach. Pointed at a real checkout, the
+    detach would move that repository's HEAD. Accepting the unpinned sentinel widened
+    which corpora can reach it, so it refuses a directory that already has a .git."""
+    existing = isolated_git_repo()
+    try:
+        rb.clone_pinned_repo("https://example.invalid/x", rb.UNPINNED_REVISION, existing, 5)
+    except RuntimeError as error:
+        assert "already a git repository" in str(error)
+        assert str(existing) in str(error)
+    else:
+        raise AssertionError("clone ran against an existing repository")
+    # The existing repository is untouched: still on its own commit, still not detached.
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=existing, text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    assert head != "HEAD", "clone detached an existing repository's HEAD"
+
+
 def test_clone_rejects_a_malformed_revision_but_allows_the_declared_sentinel() -> None:
     """A typo'd sha must not silently clone the default branch and be reported as the
     pinned tree; only the declared sentinel opts into tip-cloning."""
@@ -991,6 +1012,27 @@ def test_container_corpus_staging_path_is_pinned_by_revision() -> None:
     assert first.startswith("/benchmark/corpora/cosign-")
 
 
+def isolated_git_repo() -> Path:
+    """A throwaway repository with one commit, provably outside any real checkout.
+
+    `staged_corpus_revision` reads `git rev-parse HEAD`, so exercising its unpinned path
+    needs a repository that has a commit. The assertion is the point: it makes isolation
+    an enforced precondition rather than an assumption about what mkdtemp returns, so a
+    future edit cannot quietly point repository-mutating commands at a real checkout.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="cbm-rank-test-")).resolve()
+    system_temp = Path(tempfile.gettempdir()).resolve()
+    assert directory.is_relative_to(system_temp), directory
+    assert not (directory / ".git").exists(), directory
+    for command in (
+        ["git", "init", "--quiet"],
+        ["git", "-c", "user.email=t@e", "-c", "user.name=t", "commit",
+         "--quiet", "--allow-empty", "-m", "c"],
+    ):
+        subprocess.run(command, cwd=directory, check=True, capture_output=True)
+    return directory
+
+
 def test_container_stages_workload_corpora_by_their_resolved_commit() -> None:
     """Guards: the four mined-workload corpora carry the unpinned sentinel rather than
     a sha. Keying their staged directory on that literal would give every
@@ -999,13 +1041,7 @@ def test_container_stages_workload_corpora_by_their_resolved_commit() -> None:
     pinned = {"id": "cosign", "revision": "a" * 40}
     assert rc.staged_corpus_revision(pinned, Path("/nonexistent"), 5) == "a" * 40
 
-    repository = Path(tempfile.mkdtemp())
-    for command in (
-        ["git", "init", "--quiet"],
-        ["git", "-c", "user.email=t@e", "-c", "user.name=t", "commit",
-         "--quiet", "--allow-empty", "-m", "c"],
-    ):
-        subprocess.run(command, cwd=repository, check=True, capture_output=True)
+    repository = isolated_git_repo()
     resolved = rc.staged_corpus_revision(
         {"id": "autorun", "revision": rb.UNPINNED_REVISION}, repository, 30
     )
