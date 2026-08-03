@@ -119,6 +119,25 @@ with otherwise identical specs, and never infer cross-cohort comparability from 
 shared OS image alone. Native execution retains its existing configurable compiler
 selection.
 
+To run the fixed nine-cell synthetic rank diagnostic through that same isolated
+container path, generate its matrix from the canonical hypothesis registry and pass the
+result to the coordinator:
+
+```sh
+uv run python benchmarks/campaign_specs.py \
+  --quick-hypotheses \
+  --out-dir /durable/ignored/path/rank-hypotheses-spec
+
+uv run python benchmarks/run_container_experiment.py \
+  --matrix-spec /durable/ignored/path/rank-hypotheses-spec/rank-hypotheses-quick-v2.json \
+  --experiment-root /durable/ignored/path/rank-hypotheses \
+  --cpus 4 --memory 6g --workers 4
+```
+
+The generated matrix contains exactly nine profiles, one MCP repetition, no real-corpus
+dependency, and no suite-duration target. Its per-cell timeout is a subprocess safety
+boundary recorded in the matrix, not an expected duration or suite cutoff.
+
 `schema/` contains schemas for records emitted by current tooling.
 `terminology.json` defines every normative fact, step, join, and formula identifier.
 The generated human view remains in `docs/BENCHMARK_TERMINOLOGY.md`, and the full

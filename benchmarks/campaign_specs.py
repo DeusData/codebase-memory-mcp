@@ -16,6 +16,8 @@ of `corpora-v1.json` and this file's constants.
 Usage:
     python3 benchmarks/campaign_specs.py --out-dir /durable/path/campaign-specs
     python3 benchmarks/campaign_specs.py --print rank-quality
+    python3 benchmarks/campaign_specs.py --quick-hypotheses \
+        --out-dir /durable/path/rank-hypotheses-spec
 """
 
 from __future__ import annotations
@@ -459,15 +461,41 @@ def main(argv: list[str] | None = None) -> int:
             "Defaults to all of: " + ", ".join(POPULARITY_CORPORA)
         ),
     )
+    parser.add_argument(
+        "--quick-hypotheses",
+        action="store_true",
+        help=(
+            "Write only the fixed nine-cell synthetic rank diagnostic used by the "
+            "unified evidence suite. It always uses one MCP repetition; --corpora and "
+            "non-default --repetitions are rejected."
+        ),
+    )
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=int, default=2400)
     args = parser.parse_args(argv)
 
     chosen = tuple(name.strip() for name in args.corpora.split(",") if name.strip())
     try:
-        specs = build_all_specs(
-            args.ref, args.repetitions, args.timeout_seconds, chosen or None
-        )
+        if args.quick_hypotheses:
+            if chosen:
+                raise ValueError(
+                    "--quick-hypotheses uses the synthetic fixture and cannot be "
+                    "combined with --corpora"
+                )
+            if args.repetitions != 1:
+                raise ValueError(
+                    "--quick-hypotheses has one fixed MCP repetition; omit "
+                    "--repetitions or pass 1"
+                )
+            specs = [
+                build_quick_hypothesis_spec(
+                    args.ref, timeout_seconds=args.timeout_seconds
+                )
+            ]
+        else:
+            specs = build_all_specs(
+                args.ref, args.repetitions, args.timeout_seconds, chosen or None
+            )
     except ValueError as error:
         parser.error(str(error))
     if args.print_arm:

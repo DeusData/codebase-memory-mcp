@@ -1632,6 +1632,35 @@ def test_quick_hypothesis_profiles_cover_semantics_numerics_and_lifecycle() -> N
         assert all(question["question"] for question in profile["questions"])
 
 
+def test_campaign_cli_writes_only_the_fixed_quick_hypothesis_spec() -> None:
+    """The Docker coordinator accepts a matrix file, so the fixed nine-cell suite
+    needs a supported generator path rather than an undocumented Python import."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output = Path(tmpdir)
+        assert (
+            cs.main(
+                [
+                    "--quick-hypotheses",
+                    "--out-dir",
+                    str(output),
+                    "--timeout-seconds",
+                    "90",
+                ]
+            )
+            == 0
+        )
+        generated = sorted(output.glob("*.json"))
+
+        assert [path.name for path in generated] == ["rank-hypotheses-quick-v2.json"]
+        document = json.loads(generated[0].read_text(encoding="utf-8"))
+        assert document == json.loads(
+            json.dumps(cs.build_quick_hypothesis_spec("HEAD", timeout_seconds=90))
+        )
+        assert len(document["profiles"]) == 9
+        assert document["repetitions"] == 1
+        assert document["transports"] == ["mcp"]
+
+
 def test_rank_probe_reads_directional_node_scores_and_edge_linkrank_together() -> None:
     directory = Path(tempfile.mkdtemp())
     make_rank_db(
