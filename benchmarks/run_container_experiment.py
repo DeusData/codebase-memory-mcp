@@ -24,7 +24,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "test-infrastructure" / "Dockerfile"
 # Staged corpora live beside the bundle on the work volume, outside /results, because
@@ -231,6 +230,21 @@ def load_benchmark_module() -> Any:
     return module
 
 
+def load_experiment_module() -> Any:
+    """Reuse the canonical product-environment parser at the outer boundary."""
+    cached = sys.modules.get("run_experiments")
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("run_experiments.py")
+    spec = importlib.util.spec_from_file_location("run_experiments", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load the experiment harness from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["run_experiments"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def corpus_env_key(corpus_id: str) -> str:
     """Spelled by run_benchmark.py so the writer and the reader cannot disagree."""
     return load_benchmark_module().corpus_env_key(corpus_id)
@@ -246,9 +260,7 @@ def container_corpus_path(corpus_id: str, revision: str) -> str:
     return f"{CONTAINER_CORPUS_ROOT}/{corpus_id}-{revision[:12]}"
 
 
-def staged_corpus_revision(
-    entry: dict[str, Any], source: Path, timeout: int
-) -> str:
+def staged_corpus_revision(entry: dict[str, Any], source: Path, timeout: int) -> str:
     """The commit a staged corpus is keyed and reported by.
 
     A pinned entry supplies its own 40-character sha. The four mined-workload corpora
@@ -301,7 +313,9 @@ def corpora_required_by_spec(document: Any) -> list[str]:
             for key, value in node.items():
                 if key == "benchmark_args" and isinstance(value, list):
                     found.extend(
-                        item for item in corpora_in_arguments(value) if isinstance(item, str)
+                        item
+                        for item in corpora_in_arguments(value)
+                        if isinstance(item, str)
                     )
                 else:
                     visit(value)
@@ -809,6 +823,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image")
     parser.add_argument("--docker", default="docker")
     parser.add_argument(
+        "--invocation-surface",
+        choices=("run_container_experiment.py", "run_experiments.py --container"),
+        default="run_container_experiment.py",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--product-env",
+        action="append",
+        default=[],
+        metavar="CBM_KEY=VALUE",
+        help="Candidate environment for automatic --quick/--full container presets.",
+    )
+    parser.add_argument(
         "--corpus",
         action="append",
         default=[],
@@ -867,6 +894,22 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         args.build_jobs = resolve_build_jobs(args.cpus, args.build_jobs)
         args.runner_arguments = validate_forwarded_arguments(args.runner_arguments)
         args.platform = native_linux_platform(platform.machine())
+        experiment_module = load_experiment_module()
+        args.product_environment = (
+            experiment_module.parse_product_environment_arguments(args.product_env)
+        )
+        declared_workers = args.product_environment.pop("CBM_WORKERS", None)
+        if declared_workers not in {None, str(args.resources["workers"])}:
+            raise ValueError(
+                "--product-env CBM_WORKERS conflicts with the container resource "
+                f"budget: environment={declared_workers} "
+                f"coordinator={args.resources['workers']}"
+            )
+        if args.matrix_spec is not None and args.product_environment:
+            raise ValueError(
+                "--product-env only applies to container --quick/--full; put explicit "
+                "matrix environments in the matrix spec"
+            )
     except ValueError as error:
         parser.error(str(error))
     args.experiment_root = args.experiment_root.expanduser().resolve()
@@ -1017,6 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
                     "--product-env",
                     f"CBM_WORKERS={args.resources['workers']}",
                 ]
+            for key, value in sorted(args.product_environment.items()):
+                runner_arguments.extend(("--product-env", f"{key}={value}"))
             runner_arguments.extend(("--build-jobs", str(args.build_jobs)))
             runner_arguments.extend(args.runner_arguments)
 
@@ -1088,6 +1133,7 @@ def main(argv: list[str] | None = None) -> int:
                 "resources": args.resources,
                 "build_jobs": args.build_jobs,
                 "default_build_environment": DEFAULT_BUILD_ENVIRONMENT,
+                "invocation_surface": args.invocation_surface,
                 "work_volume": work_volume,
                 "results_volume": results_volume,
                 "volumes_retained_for_resume": True,

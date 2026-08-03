@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "run_experiments.py"
 SPEC = importlib.util.spec_from_file_location("run_benchmark_experiments", SCRIPT)
 assert SPEC and SPEC.loader
@@ -346,6 +345,66 @@ class BenchmarkExperimentTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             EXPERIMENT.parse_arguments(
                 ["--full", "--product-env", "CBM_CACHE_DIR=/tmp/not-isolated"]
+            )
+
+    def test_container_is_an_execution_flag_on_the_canonical_experiment_cli(
+        self,
+    ) -> None:
+        args = EXPERIMENT.parse_arguments(
+            [
+                "--matrix-spec",
+                "rank.json",
+                "--experiment-root",
+                "/durable/rank",
+                "--container",
+                "--cpus",
+                "4",
+                "--memory",
+                "6g",
+                "--workers",
+                "4",
+                "--audit-only",
+            ]
+        )
+        command = EXPERIMENT.build_container_delegate_command(args)
+
+        self.assertTrue(args.container)
+        self.assertEqual(command[0], sys.executable)
+        self.assertIn("run_container_experiment.py", command[1])
+        self.assertIn("--matrix-spec", command)
+        self.assertIn(str(Path("rank.json").resolve()), command)
+        self.assertIn(str(Path("/durable/rank").resolve()), command)
+        self.assertIn("--audit-only", command)
+        self.assertIn("run_experiments.py --container", command)
+        self.assertNotIn("--build-jobs", command)
+
+        with self.assertRaises(SystemExit):
+            EXPERIMENT.parse_arguments(
+                [
+                    "--matrix-spec",
+                    "rank.json",
+                    "--experiment-root",
+                    "/durable/rank",
+                    "--container",
+                ]
+            )
+        with self.assertRaises(SystemExit):
+            EXPERIMENT.parse_arguments(["--quick", "--cpus", "4"])
+        with self.assertRaises(SystemExit):
+            EXPERIMENT.parse_arguments(
+                [
+                    "--plan",
+                    "plan.json",
+                    "--experiment-root",
+                    "/durable/rank",
+                    "--container",
+                    "--cpus",
+                    "4",
+                    "--memory",
+                    "6g",
+                    "--workers",
+                    "4",
+                ]
             )
 
     def test_default_candidates_use_current_upstream_stable_run_premerge_and_head(

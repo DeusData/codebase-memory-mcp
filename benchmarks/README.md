@@ -77,16 +77,16 @@ worktrees or harness metadata; a selected existing worktree may have its ordinar
 `build/` output refreshed to verify the requested toolchain identity.
 See [the complete matrix example](../docs/BENCHMARK_EXPERIMENTS.md#reusable-ref-based-matrices).
 
-For cross-build measurements while the host daemon remains active, use the native
-container coordinator. It creates an exact Git bundle, runs the same experiment
-runner with no host bind mounts, and exports immutable results back to the named
-history:
+For cross-build measurements while the host daemon remains active, select container
+execution on the same experiment CLI. It creates an exact Git bundle, runs the same
+experiment runner with no host bind mounts, and exports immutable results back to the
+named history:
 
 ```sh
-uv run python benchmarks/run_container_experiment.py \
+uv run python benchmarks/run_experiments.py \
   --matrix-spec /absolute/path/development-comparison.json \
   --experiment-root /durable/ignored/path/development-comparison \
-  --cpus 4 --memory 8g --workers 4
+  --container --cpus 4 --memory 8g --workers 4
 ```
 
 CPU, memory, and worker budgets are required rather than guessed. Candidate builds
@@ -130,10 +130,10 @@ uv run python benchmarks/campaign_specs.py \
   --quick-hypotheses \
   --out-dir /durable/ignored/path/rank-hypotheses-spec
 
-uv run python benchmarks/run_container_experiment.py \
+uv run python benchmarks/run_experiments.py \
   --matrix-spec /durable/ignored/path/rank-hypotheses-spec/rank-hypotheses-quick-v2.json \
   --experiment-root /durable/ignored/path/rank-hypotheses \
-  --cpus 4 --memory 6g --workers 4
+  --container --cpus 4 --memory 6g --workers 4
 ```
 
 The generated matrix contains exactly nine profiles, one MCP repetition, no real-corpus
@@ -216,8 +216,8 @@ actually runs. Either way `cases[0].fixture.corpus_overlay` records which happen
 ## Run the whole campaign in Docker
 
 The host daemon enforces an exact-build cohort, so a candidate that differs from an active
-daemon is correctly rejected. The container coordinator sidesteps that without weakening
-it: no host bind mounts, an exact Git bundle, and pinned corpora carried in.
+daemon is correctly rejected. The `--container` execution path sidesteps that without
+weakening it: no host bind mounts, an exact Git bundle, and pinned corpora carried in.
 
 ```sh
 # 1. Generate the four arms. --corpora runs a pilot first; drop it for the sweep.
@@ -225,10 +225,10 @@ uv run python benchmarks/campaign_specs.py \
     --out-dir /durable/ignored/path/campaign-specs --corpora flask
 
 # 2. One arm per invocation. Corpora named in the spec are staged automatically.
-uv run python benchmarks/run_container_experiment.py \
+uv run python benchmarks/run_experiments.py \
     --matrix-spec /durable/ignored/path/campaign-specs/rank-quality-v1.json \
     --experiment-root /durable/ignored/path/campaign \
-    --cpus 6 --memory 6g --workers 4 \
+    --container --cpus 6 --memory 6g --workers 4 \
     --clone-missing-real-repos
 
 # 3. Roll every arm up into one verdict document.

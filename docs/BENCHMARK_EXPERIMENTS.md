@@ -314,20 +314,28 @@ embedding machine-specific paths in the reusable source matrix.
 
 ### Container isolation
 
-`benchmarks/run_container_experiment.py` is a thin isolation coordinator around the
-same `run_experiments.py` entry point. Use it when several exact builds must exercise
-their real daemon-backed CLI or MCP paths without joining the host account's active
-exact-build cohort:
+Container execution is selected on the same `run_experiments.py` interface used for
+native experiments. Internally, `run_container_experiment.py` remains a thin isolation
+adapter around that scientific runner. Use `--container` when several exact builds
+must exercise their real daemon-backed CLI or MCP paths without joining the host
+account's active exact-build cohort:
 
 ```sh
-uv run python benchmarks/run_container_experiment.py \
+uv run python benchmarks/run_experiments.py \
   --matrix-spec /absolute/path/development-comparison.json \
   --experiment-root /durable/ignored/path/development-comparison \
+  --container \
   --cpus 4 \
   --memory 8g \
   --workers 4 \
-  -- --minimum-free-gb 4
+  --minimum-free-gb 4
 ```
+
+Remove only `--container` and its CPU, memory, and worker budget to execute the same
+matrix natively. Matrix paths, experiment roots, transport, candidate refs, product
+environment, resume, and `--audit-only` retain one spelling. The adapter's direct CLI
+remains available for compatibility and low-level diagnosis, but it is not the primary
+user interface.
 
 The coordinator is intentionally smaller than the benchmark engine:
 
@@ -384,6 +392,26 @@ hashes remain under `runsets/<run-key>/`; container environment manifests remain
 under the history's `manifests/` directory.
 Rerunning the same source spec and root resumes completed cells. A failed candidate
 still exports partial immutable evidence before the coordinator returns an error.
+
+The audit trail is layered rather than reconstructed from console output:
+
+- the history-level container manifest records invocation surface, exact source and
+  repository snapshot identities, Docker engine/platform metadata, stable runtime
+  image identity plus raw image metadata, resource budget, volume names, and all
+  adapter arguments;
+- the runset archives source and effective matrix bytes with SHA-256, resolved refs,
+  compiler/flags, binary hashes, immutable plan identity, and host/container snapshot;
+- each attempt retains its command, environment overrides, start/end metadata, exit
+  status, stdout, stderr, result bytes, fact tables, artifact hashes, and completion
+  marker; interrupted and failed attempts remain evidence;
+- report and comparison records cite the exact cells and fact occurrences used for
+  every quality result or eligible timing relation;
+- `--audit-only` validates the same run key, plan, cells, hashes, attempts, and report
+  inventory without executing another measured attempt.
+
+This hierarchy makes configuration and results inspectable from retained JSON even
+when terminal logs are unavailable. Console output is operational feedback, not the
+system of record.
 
 After the export is verified and no resume is required, remove only the two exact
 volume names printed by the coordinator:

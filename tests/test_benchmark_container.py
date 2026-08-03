@@ -11,7 +11,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 SCRIPT = (
     Path(__file__).resolve().parents[1] / "benchmarks" / "run_container_experiment.py"
 )
@@ -180,6 +179,51 @@ class BenchmarkContainerContractTest(unittest.TestCase):
 
         self.assertEqual(automatic.build_jobs, 16)
         self.assertEqual(constrained.build_jobs, 6)
+
+    def test_automatic_container_product_environment_uses_shared_validation(
+        self,
+    ) -> None:
+        common = [
+            "--experiment-root",
+            "/durable/cbm-benchmark-history",
+            "--cpus",
+            "4",
+            "--memory",
+            "8g",
+            "--workers",
+            "4",
+        ]
+        with mock.patch.object(CONTAINER.platform, "machine", return_value="arm64"):
+            args = CONTAINER.parse_arguments(
+                [
+                    *common,
+                    "--quick",
+                    "--invocation-surface",
+                    "run_experiments.py --container",
+                    "--product-env",
+                    "CBM_WORKERS=4",
+                    "--product-env",
+                    "CBM_DIAGNOSTICS=1",
+                ]
+            )
+
+        self.assertEqual(args.product_environment, {"CBM_DIAGNOSTICS": "1"})
+        self.assertEqual(args.invocation_surface, "run_experiments.py --container")
+
+        with self.assertRaises(SystemExit):
+            CONTAINER.parse_arguments(
+                [*common, "--quick", "--product-env", "CBM_WORKERS=3"]
+            )
+        with self.assertRaises(SystemExit):
+            CONTAINER.parse_arguments(
+                [
+                    *common,
+                    "--matrix-spec",
+                    "rank.json",
+                    "--product-env",
+                    "CBM_DIAGNOSTICS=1",
+                ]
+            )
 
     def test_bundle_excludes_stash_and_recovery_namespaces(self) -> None:
         arguments = CONTAINER.bundle_revision_arguments()

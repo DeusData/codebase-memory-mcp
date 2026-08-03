@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
+CONTAINER_COORDINATOR = Path(__file__).with_name("run_container_experiment.py")
 with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
     CONFIG_SPELLING_SPEC = json.load(stream)
 if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
@@ -2577,7 +2578,14 @@ def build_parser() -> argparse.ArgumentParser:
             "under --candidate-root."
         ),
     )
-    parser.add_argument("--build-jobs", type=int, default=2)
+    parser.add_argument(
+        "--build-jobs",
+        type=int,
+        help=(
+            "Candidate build parallelism. Native execution defaults to 2; container "
+            "execution defaults to its declared --cpus budget."
+        ),
+    )
     parser.add_argument(
         "--allow-temporary-experiment-root",
         "--allow-temporary-campaign-root",
@@ -2630,6 +2638,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Generated Markdown path (default: versioned runset report under EXPERIMENT_ROOT/reports).",
     )
+    container = parser.add_argument_group(
+        "container execution",
+        "Use the same experiment interface with --container; the existing Docker "
+        "coordinator remains an internal isolation adapter.",
+    )
+    container.add_argument("--container", action="store_true")
+    container.add_argument("--cpus", type=float)
+    container.add_argument("--memory")
+    container.add_argument("--workers", type=int)
+    container.add_argument("--image", dest="container_image")
+    container.add_argument("--docker", default="docker")
+    container.add_argument("--corpus", action="append", default=[])
+    container.add_argument("--corpus-repo", action="append", default=[])
+    container.add_argument("--corpus-manifest", default="")
+    container.add_argument("--clone-missing-real-repos", action="store_true")
+    container.add_argument("--corpus-timeout", type=int, default=1800)
     return parser
 
 
@@ -2642,7 +2666,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(
             "--experiment-root (legacy alias: --campaign-root) is required with --plan or --matrix-spec"
         )
-    if args.build_jobs <= 0:
+    if args.build_jobs is not None and args.build_jobs <= 0:
         parser.error("--build-jobs must be positive")
     candidate_ref_overrides: dict[str, str] = {}
     for value in args.candidate_ref_overrides:
@@ -2662,7 +2686,117 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     except ValueError as error:
         parser.error(str(error))
     args.candidate_ref = candidate_ref_overrides
+    container_resource_values = (args.cpus, args.memory, args.workers)
+    container_specific = bool(
+        any(value is not None for value in container_resource_values)
+        or args.container_image
+        or args.corpus
+        or args.corpus_repo
+        or args.corpus_manifest
+        or args.clone_missing_real_repos
+        or args.corpus_timeout != 1800
+    )
+    if args.container:
+        if args.plan is not None:
+            parser.error(
+                "--container accepts --quick, --full, or a ref-based --matrix-spec; "
+                "expanded plans contain host binary paths and cannot be remapped safely"
+            )
+        if args.experiment_root is None:
+            parser.error("--experiment-root is required with --container")
+        missing = [
+            flag
+            for flag, value in zip(
+                ("--cpus", "--memory", "--workers"),
+                container_resource_values,
+                strict=True,
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "--container requires an explicit resource budget: "
+                + ", ".join(missing)
+            )
+        if args.candidate_root or args.candidate_search_roots:
+            parser.error(
+                "--candidate-root and --candidate-search-root are native paths; "
+                "container candidates use the retained named work volume"
+            )
+        if args.report_out:
+            parser.error(
+                "--report-out cannot name a host path under --container; the canonical "
+                "report is exported under EXPERIMENT_ROOT/runsets/<run-key>/reports"
+            )
+    elif container_specific:
+        parser.error(
+            "container resource, image, and corpus options require --container"
+        )
+    if args.build_jobs is None and not args.container:
+        args.build_jobs = 2
     return args
+
+
+def build_container_delegate_command(args: argparse.Namespace) -> list[str]:
+    """Translate the canonical CLI into the internal Docker coordinator interface."""
+    if not args.container:
+        raise ValueError("container delegation requires --container")
+    if args.matrix_spec is not None:
+        source = ["--matrix-spec", str(args.matrix_spec.expanduser().resolve())]
+    elif args.preset is not None:
+        source = [f"--{args.preset}"]
+    else:  # parse_arguments rejects plans and supplies the quick default.
+        raise ValueError("container delegation requires a matrix or automatic preset")
+    assert args.experiment_root is not None
+    experiment_root = validate_experiment_root(
+        args.experiment_root,
+        allow_temporary=args.allow_temporary_experiment_root,
+    )
+    command = [
+        sys.executable,
+        str(CONTAINER_COORDINATOR),
+        *source,
+        "--experiment-root",
+        str(experiment_root),
+        "--cpus",
+        f"{args.cpus:g}",
+        "--memory",
+        args.memory,
+        "--workers",
+        str(args.workers),
+        "--docker",
+        args.docker,
+        "--corpus-timeout",
+        str(args.corpus_timeout),
+        "--invocation-surface",
+        "run_experiments.py --container",
+    ]
+    if args.build_jobs is not None:
+        command.extend(("--build-jobs", str(args.build_jobs)))
+    if args.container_image:
+        command.extend(("--image", args.container_image))
+    for corpus_id in args.corpus:
+        command.extend(("--corpus", corpus_id))
+    for corpus_repo in args.corpus_repo:
+        command.extend(("--corpus-repo", corpus_repo))
+    if args.corpus_manifest:
+        command.extend(("--corpus-manifest", args.corpus_manifest))
+    if args.clone_missing_real_repos:
+        command.append("--clone-missing-real-repos")
+    for key, value in sorted(args.product_environment.items()):
+        command.extend(("--product-env", f"{key}={value}"))
+
+    forwarded: list[str] = []
+    if args.preset is not None:
+        forwarded.extend(("--transport", args.transport))
+        for label, ref in sorted(args.candidate_ref.items()):
+            forwarded.extend(("--candidate-ref", f"{label}={ref}"))
+    forwarded.extend(("--minimum-free-gb", f"{args.minimum_free_gb:g}"))
+    forwarded.extend(("--stale-lock-hours", f"{args.stale_lock_hours:g}"))
+    if args.audit_only:
+        forwarded.append("--audit-only")
+    command.extend(("--", *forwarded))
+    return command
 
 
 def _commit_datetime_slug(repository: Path, revision: str) -> str:
@@ -2743,6 +2877,14 @@ def prepare_automatic_experiment(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
+
+    if args.container:
+        process = subprocess.run(
+            build_container_delegate_command(args),
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+        )
+        return process.returncode
 
     if args.preset is not None:
         experiment_root, matrix_spec = prepare_automatic_experiment(args)
