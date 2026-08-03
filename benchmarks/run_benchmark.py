@@ -3148,7 +3148,7 @@ def declared_stale_views(oracles: dict[str, Any]) -> list[str]:
 # PR #879's pass scores Function, Method and Class (pass_importance.c:172-215). Without
 # this scope the top ranks are File and Module nodes — the first full campaign ranked
 # go.mod, .github/workflows/build.yaml, Makefile and src/server.h above every function,
-# so utility_contamination read 0.000 on the two corpora chosen for having hub
+# so the top-K rates read 0.000 on the two corpora chosen for having hub
 # utilities. A node with no file_path is outside the repository (builtins.str reached
 # redis's PageRank top 10) and cannot be scaffolding, a utility, or architecture.
 # A node outside the repository cannot be scaffolding, a utility, or architecture, so it
@@ -3162,9 +3162,9 @@ RANK_PROBE_SCOPE = (
     "AND n.file_path <> '' AND n.file_path NOT LIKE '<%'"
 )
 
-# Every callable symbol's in/out degree, for structural_utilities. Same scope as the
+# Every callable symbol's in/out degree, for structural_leaf_hubs. Same scope as the
 # score probes so "is this a utility" and "is this ranked" describe the same population.
-UTILITY_DEGREE_SQL = (
+LEAF_HUB_DEGREE_SQL = (
     "SELECT n.qualified_name, d.total_in, d.total_out "
     "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
     "WHERE n.project = ? AND " + RANK_PROBE_SCOPE
@@ -3172,13 +3172,35 @@ UTILITY_DEGREE_SQL = (
 # A utility is defined by the shape PR #151 named — "they have the highest fan-in" —
 # not by its name. Both cuts are relative to the corpus so the definition transfers
 # across languages and repository sizes without a vocabulary.
-UTILITY_FAN_IN_QUANTILE = 0.99
-UTILITY_MAX_FAN_OUT_RATIO = 0.1
-UTILITY_MIN_POPULATION = 20
+LEAF_HUB_FAN_IN_QUANTILE = 0.99
+LEAF_HUB_MAX_FAN_OUT_RATIO = 0.1
+LEAF_HUB_MIN_POPULATION = 20
 
 
-def structural_utilities(nodes: list[dict[str, Any]]) -> frozenset[str]:
-    """Symbols that are utilities by shape: very high fan-in, near-zero fan-out.
+def structural_leaf_hubs(nodes: list[dict[str, Any]]) -> frozenset[str]:
+    """Symbols with very high fan-in and near-zero fan-out. A shape, not a category.
+
+    NAMED CAREFULLY. This was called `structural_utilities` and its output was reported
+    as `utility_contamination`, which read as adjudicating PR #151's claim that the
+    highest-fan-in symbols are utilities. It cannot do that, for two reasons found by
+    running it on real corpora:
+
+    1. Circular. It selects fan-in above the corpus's own quantile, while the `degree`
+       and `in_degree` scorers rank BY fan-in, so the top K of a fan-in ranking sits
+       above the quantile almost by construction and the rate approaches 1.0 regardless
+       of what those symbols are.
+    2. It does not identify utilities. On scikit-learn it selected
+       `sklearn.base.BaseEstimator`, the library's central abstraction; on redis it
+       selected hiredis's `redisCommand` and `redisReply`. Those are architecture, which
+       is the opposite of the intended meaning.
+
+    The underlying problem admits no calibration: PR #151's claim IS "high fan-in means
+    utilities", so no fan-in-derived definition can test it without assuming it. What
+    would work is a category label independent of degree — the project's own declared
+    public surface — which is not built yet.
+
+    So this stays as an honest descriptive statistic about graph shape, and the campaign
+    reports H1/H5 as not measurable rather than deciding them from it.
 
     Replaces a hand-written marker list (`log`, `fmt`, `printf`, `malloc`, ...). That
     list was the weakest instrument in the campaign for a specific reason: the campaign's
@@ -3205,7 +3227,7 @@ def structural_utilities(nodes: list[dict[str, Any]]) -> frozenset[str]:
         if isinstance(node.get("total_in"), int)
         and isinstance(node.get("total_out"), int)
     ]
-    if len(degrees) < UTILITY_MIN_POPULATION:
+    if len(degrees) < LEAF_HUB_MIN_POPULATION:
         # Too few symbols for a quantile to mean anything. Reporting nothing is honest;
         # picking a fixed threshold here would reintroduce the arbitrariness this
         # function exists to remove.
@@ -3214,7 +3236,7 @@ def structural_utilities(nodes: list[dict[str, Any]]) -> frozenset[str]:
     # Clamped to leave at least the top element above the cut. Without the clamp the
     # quantile index lands on the maximum in any population under ~100, so the one
     # symbol the metric exists to find is the one excluded by the strict comparison.
-    index = max(0, min(len(fan_in) - 2, int(UTILITY_FAN_IN_QUANTILE * len(fan_in))))
+    index = max(0, min(len(fan_in) - 2, int(LEAF_HUB_FAN_IN_QUANTILE * len(fan_in))))
     cut = fan_in[index]
     if cut <= 0:
         return frozenset()
@@ -3223,7 +3245,7 @@ def structural_utilities(nodes: list[dict[str, Any]]) -> frozenset[str]:
         for name, incoming, outgoing in degrees
         # Strictly above the cut: a flat graph where every symbol sits at the quantile
         # has no hubs, and calling them all utilities would invert the metric.
-        if incoming > cut and outgoing <= UTILITY_MAX_FAN_OUT_RATIO * incoming
+        if incoming > cut and outgoing <= LEAF_HUB_MAX_FAN_OUT_RATIO * incoming
     )
 
 RANK_PROBE_SQL: dict[str, str] = {
@@ -3615,14 +3637,14 @@ def run_rank_score_probes(
     # window. Computing it per scorer would let a scorer's own ranking influence what
     # counts as a utility, which is the circularity scaffolding@K already avoids.
     try:
-        utility_names = structural_utilities(
+        leaf_hub_names = structural_leaf_hubs(
             [
                 {"qualified_name": row[0], "total_in": row[1], "total_out": row[2]}
-                for row in query_tuples(db_path, UTILITY_DEGREE_SQL, (project,))
+                for row in query_tuples(db_path, LEAF_HUB_DEGREE_SQL, (project,))
             ]
         )
     except sqlite3.Error:
-        utility_names = frozenset()
+        leaf_hub_names = frozenset()
 
     scorers: dict[str, Any] = {}
     ranked_by_scorer: dict[str, list[tuple[Any, ...]]] = {}
@@ -3671,7 +3693,7 @@ def run_rank_score_probes(
             # claimed ("highest fan-in") and it needs no vocabulary. The lexical count
             # is retained beside it, not replaced, so the two can be compared and a
             # disagreement is visible rather than silently resolved in one's favour.
-            utility = sum(1 for row in window if row[0] in utility_names)
+            leaf_hubs = sum(1 for row in window if row[0] in leaf_hub_names)
             lexical = sum(1 for row in window if is_utility_symbol(row[0]))
             scaffolding = (
                 None
@@ -3681,8 +3703,8 @@ def run_rank_score_probes(
             )
             by_cutoff[str(cutoff)] = {
                 "window_size": len(window),
-                "utility_contamination": utility / len(window),
-                "utility_contamination_lexical": lexical / len(window),
+                "leaf_hub_rate": leaf_hubs / len(window),
+                "lexical_marker_rate": lexical / len(window),
                 "scaffolding": scaffolding,
             }
         entry["by_cutoff"] = by_cutoff
@@ -3723,8 +3745,8 @@ def run_rank_score_probes(
         "top_n": top_n,
         "cutoffs": list(cutoffs),
         "scaffolding_labels_present": scaffolding_paths is not None,
-        "structural_utility_count": len(utility_names),
-        "structural_utility_sample": sorted(utility_names)[:10],
+        "structural_leaf_hub_count": len(leaf_hub_names),
+        "structural_leaf_hub_sample": sorted(leaf_hub_names)[:10],
         "utility_token_count": len(UTILITY_SYMBOL_TOKENS),
         "scorers": scorers,
         "comparisons": comparisons,
@@ -6697,7 +6719,7 @@ def rank_fixture_overlay_decision(
     `create_rank_quality_repo` writes `zz_order_core`, eight lexical decoys and eight
     callers into `repo_dir` — the same directory `copy_git_revision_to_dir` materializes a
     pinned corpus into. Overlaying them on a real corpus means the indexed graph is not
-    the tree `corpora-v1.json` pins, and `scaffolding@K` / `utility_contamination@K` /
+    the tree `corpora-v1.json` pins, and `scaffolding@K` / `leaf_hub_rate@K` /
     `tau vs degree` are then computed over nine files the corpus does not contain.
 
     That cost would buy a planted positive control if anything checked it, but no real

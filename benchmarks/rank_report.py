@@ -64,6 +64,7 @@ DIRECTORY_ISSUES: dict[str, tuple[str, ...]] = {
 # mode is not full, so full is the only reference arm a loss can be measured against.
 REFERENCE_INDEX_MODE = "full"
 UTILITY_CUTOFF = "10"
+METRIC_ALIASES = {"leaf_hub_rate": ("utility_contamination",)}
 SCAFFOLDING_CUTOFF = "10"
 DEGREE_BASELINE = "degree"
 SYNTHETIC_CORPUS = "synthetic-rank-v1"
@@ -139,8 +140,14 @@ def cutoff_metric(case: dict[str, Any], cutoff: str, metric: str) -> dict[str, A
         if not isinstance(entry, dict) or not entry.get("applicable"):
             continue
         window = (entry.get("by_cutoff") or {}).get(cutoff)
-        if isinstance(window, dict) and metric in window:
-            values[name] = window[metric]
+        if not isinstance(window, dict):
+            continue
+        # utility_contamination is the pre-rename spelling of leaf_hub_rate; accepted so
+        # runsets recorded before the rename still parse rather than reading as empty.
+        for key in (metric, *METRIC_ALIASES.get(metric, ())):
+            if key in window:
+                values[name] = window[key]
+                break
     return values
 
 
@@ -483,20 +490,38 @@ def contamination_verdict(
 
 
 def utility_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """H5: is `ORDER BY degree DESC` the more utility-contaminated arm, or the cleaner one?"""
-    return contamination_verdict(
-        rows,
-        hypothesis="H5",
-        metric_name="utility_contamination",
-        cutoff=UTILITY_CUTOFF,
-        when_degree_worse="degree DESC is the more utility-contaminated arm",
-        when_degree_better=(
-            "degree DESC is the cleaner arm; the PR #151 objection holds on this evidence"
+    """H5: NOT MEASURABLE with any instrument this campaign currently has.
+
+    PR #151's claim is that the highest-fan-in symbols are utilities. Testing it needs a
+    definition of "utility" that does not itself use fan-in, and neither candidate
+    qualifies: the lexical marker list is independent of fan-in but fired on one corpus
+    only, and the structural leaf-hub shape is general but selects by the very quantity
+    the degree scorers rank by, so it approaches 1.0 by construction and labelled
+    sklearn.base.BaseEstimator and hiredis redisCommand as utilities.
+
+    Reported as not measurable rather than computed, because a verdict from a circular
+    metric is worse than none: it reads as evidence. The leaf-hub and lexical rates are
+    still emitted as descriptive statistics for whoever builds the real instrument.
+    """
+    scoped, other = discriminating(rows, "H5")
+    _, _, paired = paired_means(scoped, "pagerank")
+    return {
+        "hypothesis": "H5",
+        "metric": "leaf_hub_rate",
+        "cutoff": int(UTILITY_CUTOFF),
+        "supported": None,
+        "status": "not_measurable",
+        "corpora_compared": len(paired),
+        "corpora_with_signal": len(corpora_with_signal(paired)),
+        "signal_corpora": corpora_with_signal(paired),
+        "not_discriminating": sorted({row["corpus"] for row in other}),
+        "statement": (
+            "not measurable: identifying a utility requires a definition independent of "
+            "fan-in, and every current one is either non-general (lexical marker list) "
+            "or circular with the degree scorers it would judge (leaf-hub shape). "
+            "leaf_hub_rate is reported below as a descriptive statistic, not a verdict."
         ),
-        when_absent=(
-            "no corpus registered for H5 produced both a degree and a pagerank ranking"
-        ),
-    )
+    }
 
 
 def scaffolding_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -624,7 +649,7 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
     """Reduce campaign result documents to tables, verdicts and a content address."""
     cases = rank_cases(documents)
     usable, excluded = partition_usable(cases)
-    utility_rows = scorer_table(usable, UTILITY_CUTOFF, "utility_contamination")
+    utility_rows = scorer_table(usable, UTILITY_CUTOFF, "leaf_hub_rate")
     scaffolding_rows = [
         row
         for row in scorer_table(usable, SCAFFOLDING_CUTOFF, "scaffolding")
@@ -635,7 +660,7 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
         "schema_version": 1,
         "corpora": sorted({case["corpus_id"] for case in usable}),
         "index_modes": sorted({str(case.get("index_mode")) for case in usable}),
-        "utility_contamination": utility_rows,
+        "leaf_hub_rate": utility_rows,
         "scaffolding": scaffolding_rows,
         "degree_agreement": agreement_rows,
         "silent_drop": silent_drop(usable),
@@ -748,10 +773,11 @@ def render_markdown(rollup: dict[str, Any]) -> str:
     lines.extend(["## Ranking", ""])
     lines.extend(
         scorer_section(
-            f"Utility contamination @{UTILITY_CUTOFF}",
-            rollup["utility_contamination"],
-            "Lower is cleaner. `degree` is the baseline PR #151 proposed instead of "
-            "PageRank; a higher value there than for `pagerank` inverts that objection.",
+            f"Leaf-hub rate @{UTILITY_CUTOFF} (descriptive, not a verdict)",
+            rollup["leaf_hub_rate"],
+            "Fraction of the top-K whose fan-in is above the corpus's 99th percentile "
+            "with near-zero fan-out. NOT a utility count and NOT evidence about PR #151: "
+            "the degree scorers rank by the same quantity this selects on.",
         )
     )
     lines.extend(

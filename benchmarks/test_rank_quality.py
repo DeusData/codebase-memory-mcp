@@ -135,7 +135,42 @@ def test_allowlist_covers_every_tunable_knob() -> None:
 
 # --- utility-symbol classification ----------------------------------------------
 
-def test_structural_utility_is_derived_from_the_graph_not_a_word_list() -> None:
+def test_leaf_hub_rate_is_named_for_what_it_measures() -> None:
+    """The metric was called utility_contamination and read as adjudicating PR #151's
+    claim that high fan-in means utilities. It cannot: it SELECTS by high fan-in while
+    degree and in_degree RANK by high fan-in, so it approaches 1.0 by construction, and
+    on real corpora it selected sklearn.base.BaseEstimator and hiredis's redisCommand.
+    It is a real structural statistic under an accurate name, and nothing more."""
+    directory = Path(tempfile.mkdtemp())
+    make_rank_db(
+        directory,
+        [(f"ordinary{i}", "src/o.c", 5, 1.0) for i in range(20)]
+        + [("zmalloc", "src/z.c", 900, 5.0), ("processCommand", "src/s.c", 40, 90.0)],
+    )
+    window = rb.run_rank_score_probes(directory, "p", top_n=22, cutoffs=(1,))[
+        "scorers"
+    ]["degree"]["by_cutoff"]["1"]
+    assert "leaf_hub_rate" in window
+    assert "lexical_marker_rate" in window
+    # The discredited name must be gone, so no consumer can read a claim into it.
+    assert "utility_contamination" not in window
+
+
+def test_h5_is_reported_as_not_measurable_rather_than_decided() -> None:
+    """A verdict computed from a circular metric is worse than no verdict: it looks like
+    evidence. H5 states plainly that no current instrument can adjudicate it."""
+    rollup = rr.build_rollup(
+        [rollup_case(name, utility={"degree": 0.9, "pagerank": 0.1})
+         for name in ("cosign", "redis", "runc")]
+    )
+    verdict = rollup["verdicts"]["H5"]
+    assert verdict["supported"] is None
+    assert verdict["status"] == "not_measurable"
+    assert "circular" in verdict["statement"].lower()
+    assert rollup["validation"]["passed"] is False
+
+
+def test_structural_leaf_hubs_are_derived_from_the_graph_not_a_word_list() -> None:
     """The campaign's thesis is that hardcoded word lists do not generalize, so a word
     list cannot be the instrument that decides H5. PR #151's actual claim is structural:
     "they have the highest fan-in". A utility is a symbol many things call that calls
@@ -152,32 +187,32 @@ def test_structural_utility_is_derived_from_the_graph_not_a_word_list() -> None:
         {"qualified_name": "a.serverCron", "total_in": 40, "total_out": 35},
         {"qualified_name": "a.main", "total_in": 0, "total_out": 60},
     ]
-    utilities = rb.structural_utilities(nodes)
+    utilities = rb.structural_leaf_hubs(nodes)
     assert "a.zmalloc" in utilities
     assert "a.serverCron" not in utilities
     assert "a.main" not in utilities
 
 
-def test_structural_utility_scales_the_threshold_to_the_corpus() -> None:
+def test_structural_leaf_hubs_scale_the_threshold_to_the_corpus() -> None:
     """A fixed fan-in threshold would find no utilities in a small repository and label
     half of a large one. The cut is relative to the corpus's own distribution."""
     small = [
         {"qualified_name": f"s.f{i}", "total_in": i, "total_out": 5} for i in range(1, 21)
     ]
     small.append({"qualified_name": "s.hub", "total_in": 400, "total_out": 0})
-    assert "s.hub" in rb.structural_utilities(small)
+    assert "s.hub" in rb.structural_leaf_hubs(small)
     # A flat graph with no hub has no utilities, rather than an arbitrary top slice.
     flat = [
         {"qualified_name": f"f.f{i}", "total_in": 10, "total_out": 10} for i in range(30)
     ]
-    assert rb.structural_utilities(flat) == frozenset()
+    assert rb.structural_leaf_hubs(flat) == frozenset()
 
 
-def test_structural_utility_needs_enough_symbols_to_have_a_distribution() -> None:
+def test_structural_leaf_hubs_need_enough_symbols_for_a_distribution() -> None:
     """Three symbols have no distribution to take a quantile of; guessing one would
     reintroduce exactly the arbitrariness this replaces."""
-    assert rb.structural_utilities([{"qualified_name": "a", "total_in": 9, "total_out": 0}]) is not None
-    assert rb.structural_utilities([]) == frozenset()
+    assert rb.structural_leaf_hubs([{"qualified_name": "a", "total_in": 9, "total_out": 0}]) is not None
+    assert rb.structural_leaf_hubs([]) == frozenset()
 
 
 def test_utility_markers_match_tokens_not_substrings() -> None:
@@ -215,10 +250,10 @@ def test_probes_rank_only_callable_symbols() -> None:
     ranked = [row["qualified_name"] for row in probes["scorers"]["degree"]["top_ranked"]]
     assert ranked == ["repo.src.zmalloc", "repo.src.processCommand"]
     window = probes["scorers"]["degree"]["by_cutoff"]["2"]
-    assert window["utility_contamination_lexical"] == 0.5
+    assert window["lexical_marker_rate"] == 0.5
     # Four symbols are too few for a fan-in quantile, so the structural definition
     # reports nothing rather than guessing. That is the honest answer here.
-    assert window["utility_contamination"] == 0.0
+    assert window["leaf_hub_rate"] == 0.0
 
 
 def test_probes_exclude_symbols_outside_the_repository() -> None:
@@ -266,8 +301,8 @@ def test_probes_rank_every_scorer_and_expose_degree_utility_bias() -> None:
     probes = rb.run_rank_score_probes(directory, "p", top_n=24, cutoffs=(2, 4))
     assert probes["available"]
     assert set(probes["scorers"]) == set(rb.RANK_PROBE_SQL)
-    degree = probes["scorers"]["degree"]["by_cutoff"]["2"]["utility_contamination"]
-    pagerank = probes["scorers"]["pagerank"]["by_cutoff"]["2"]["utility_contamination"]
+    degree = probes["scorers"]["degree"]["by_cutoff"]["2"]["leaf_hub_rate"]
+    pagerank = probes["scorers"]["pagerank"]["by_cutoff"]["2"]["leaf_hub_rate"]
     assert degree > pagerank, (degree, pagerank)
 
 
@@ -579,7 +614,7 @@ def test_report_rows_follow_the_emitted_cutoffs() -> None:
         "rank_score_probes": probes,
     }
     rows = sr.rank_scorer_details([case])
-    assert rows and any(row["utility_contamination"] is not None for row in rows)
+    assert rows and any(row["leaf_hub_rate"] is not None for row in rows)
     assert {row["cutoff"] for row in rows if row["cutoff"] != "n/a"} == {"1", "2"}
 
 
@@ -1205,6 +1240,7 @@ def rollup_case(
     scaffolding: dict[str, float | None] | None = None,
     rho: dict[str, float] | None = None,
     fresh: bool = True,
+    discriminates: list[str] | None = None,
 ) -> dict[str, Any]:
     scorers = {
         name: {
@@ -1213,8 +1249,12 @@ def rollup_case(
             "by_cutoff": {
                 "10": {
                     "window_size": 10,
-                    "utility_contamination": value,
-                    "scaffolding": (scaffolding or {}).get(name),
+                    "leaf_hub_rate": value,
+                    # Defaults to the leaf-hub value so one helper can drive either
+                    # verdict path; an explicit scaffolding dict overrides it.
+                    "scaffolding": (scaffolding or {}).get(name, value)
+                    if scaffolding is not None
+                    else value,
                 }
             },
         }
@@ -1225,7 +1265,7 @@ def rollup_case(
         "cases": [
             {
                 "scenario": "rank_quality",
-                "corpus": {"id": corpus, "revision": "a" * 40, "discriminates": ["H5"]},
+                "corpus": {"id": corpus, "revision": "a" * 40, "discriminates": discriminates or ["H4", "H5"]},
                 "fixture": {"corpus_overlay": "suppressed"},
                 "rank_score_staleness": {"available": True, "rank_views_fresh": fresh},
                 "rank_score_probes": {
@@ -1258,7 +1298,7 @@ def test_rollup_reports_utility_contamination_per_scorer() -> None:
     """H1 and H5 in one table: PR #151 says PageRank surfaces utility popularity and
     degree gives the same signal more cheaply. Both directions have to be readable."""
     rollup = rr.build_rollup([rollup_case("cosign", utility={"degree": 0.6, "pagerank": 0.2})])
-    row = next(r for r in rollup["utility_contamination"] if r["corpus"] == "cosign")
+    row = next(r for r in rollup["leaf_hub_rate"] if r["corpus"] == "cosign")
     assert row["scores"]["degree"] == 0.6
     assert row["scores"]["pagerank"] == 0.2
 
@@ -1266,16 +1306,16 @@ def test_rollup_reports_utility_contamination_per_scorer() -> None:
 def test_rollup_verdict_names_the_direction_including_against_us() -> None:
     """The campaign has to be able to conclude the maintainer was right. A rollup that
     can only report a win is not evidence."""
-    favours_pagerank = rr.build_rollup(
+    degree_worse = rr.build_rollup(
         [rollup_case("cosign", utility={"degree": 0.6, "pagerank": 0.2})]
-    )["verdicts"]["H5"]
-    assert favours_pagerank["supported"] is True
+    )["verdicts"]["H4"]
+    assert degree_worse["supported"] is True
 
-    favours_degree = rr.build_rollup(
+    degree_better = rr.build_rollup(
         [rollup_case("cosign", utility={"degree": 0.1, "pagerank": 0.5})]
-    )["verdicts"]["H5"]
-    assert favours_degree["supported"] is False
-    assert "degree" in favours_degree["statement"].lower()
+    )["verdicts"]["H4"]
+    assert degree_better["supported"] is False
+    assert "degree" in degree_better["statement"].lower()
 
 
 def test_h2_ignores_the_synthetic_fixture() -> None:
@@ -1308,7 +1348,7 @@ def test_rollup_calls_a_tie_inconclusive_rather_than_a_win() -> None:
     have claimed a refutation from a corpus that measured nothing."""
     all_zero = rr.build_rollup(
         [rollup_case("flask", utility={"degree": 0.0, "pagerank": 0.0})]
-    )["verdicts"]["H5"]
+    )["verdicts"]["H4"]
     assert all_zero["supported"] is None
     # All-zero is the more specific diagnosis and takes precedence: the metric did not
     # discriminate, which is different from two scores that genuinely tied.
@@ -1319,7 +1359,7 @@ def test_rollup_calls_a_tie_inconclusive_rather_than_a_win() -> None:
             rollup_case(name, utility={"degree": 0.2, "pagerank": 0.2})
             for name in ("cosign", "redis", "runc")
         ]
-    )["verdicts"]["H5"]
+    )["verdicts"]["H4"]
     assert equal_but_measured["supported"] is None
     assert "no measurable difference" in equal_but_measured["statement"]
 
@@ -1336,9 +1376,9 @@ def test_rollup_scores_a_hypothesis_only_on_corpora_registered_for_it() -> None:
             **rollup_case("redis", utility={"degree": 0.6, "pagerank": 0.2}),
         },
     ]
-    cases[0]["cases"][0]["corpus"]["discriminates"] = ["H4"]
-    cases[1]["cases"][0]["corpus"]["discriminates"] = ["H5"]
-    verdict = rr.build_rollup(cases)["verdicts"]["H5"]
+    cases[0]["cases"][0]["corpus"]["discriminates"] = ["H2"]
+    cases[1]["cases"][0]["corpus"]["discriminates"] = ["H4"]
+    verdict = rr.build_rollup(cases)["verdicts"]["H4"]
     assert verdict["corpora_compared"] == 1
     assert verdict["degree_mean"] == 0.6
     assert verdict["not_discriminating"] == ["flask"]
@@ -1413,7 +1453,7 @@ def test_a_verdict_from_all_zero_measurements_is_provisional() -> None:
     verdict from corpora whose every scorer measured 0.000. A metric that did not move
     on any corpus did not measure anything, whatever its mean says."""
     flat = rollup_case("cosign", utility={"degree": 0.0, "pagerank": 0.0})
-    verdict = rr.build_rollup([flat])["verdicts"]["H5"]
+    verdict = rr.build_rollup([flat])["verdicts"]["H4"]
     assert verdict["corpora_with_signal"] == 0
     assert verdict["status"] == "provisional"
 
@@ -1424,7 +1464,7 @@ def test_a_verdict_counts_only_corpora_where_the_metric_moved() -> None:
     reports a campaign result from a single measurement."""
     zero = rollup_case("cosign", utility={"degree": 0.0, "pagerank": 0.0})
     signal = rollup_case("redis", utility={"degree": 0.0, "pagerank": 0.1})
-    verdict = rr.build_rollup([zero, signal])["verdicts"]["H5"]
+    verdict = rr.build_rollup([zero, signal])["verdicts"]["H4"]
     assert verdict["corpora_compared"] == 2
     assert verdict["corpora_with_signal"] == 1
     assert verdict["status"] == "provisional"
@@ -1436,7 +1476,7 @@ def test_a_verdict_is_stated_only_with_enough_corpora_carrying_signal() -> None:
         rollup_case(name, utility={"degree": 0.4, "pagerank": 0.1})
         for name in ("cosign", "redis", "runc")
     ]
-    verdict = rr.build_rollup(cases)["verdicts"]["H5"]
+    verdict = rr.build_rollup(cases)["verdicts"]["H4"]
     assert verdict["corpora_with_signal"] == 3
     assert verdict["status"] == "stated"
     assert verdict["supported"] is True
@@ -1472,13 +1512,13 @@ def test_rollup_renders_markdown_without_inventing_absent_values() -> None:
     """scaffolding@K is null for an unlabelled corpus; the table must say so rather
     than print 0.000, which would read as "no scaffolding in the top 10"."""
     text = rr.render_markdown(rr.build_rollup([rollup_case("redis")]))
-    assert "utility contamination" in text.lower()
+    assert "leaf-hub rate" in text.lower()
     assert "0.000" not in text.split("Scaffolding")[-1].split("\n\n")[0]
 
 
 def test_rollup_tolerates_documents_without_rank_probes() -> None:
     assert rr.build_rollup([])["verdicts"]["H5"]["corpora_compared"] == 0
-    assert rr.build_rollup([{"cases": [{"scenario": "other"}]}])["utility_contamination"] == []
+    assert rr.build_rollup([{"cases": [{"scenario": "other"}]}])["leaf_hub_rate"] == []
 
 
 def main() -> int:

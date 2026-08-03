@@ -273,7 +273,7 @@ def rank_scorer_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mixes candidate generation with ordering, whereas the probes read each score column
     over the same graph. "degree" is present because PR #151 rejected PageRank on the
     grounds that ORDER BY degree DESC "gives you the same ranking signal"; spearman_rho
-    and top_k_jaccard are what test that claim, and utility_contamination is what tests
+    and top_k_jaccard are what test that claim, and leaf_hub_rate is what describes
     the accompanying claim that PageRank merely surfaces utility popularity.
     """
     details: list[dict[str, Any]] = []
@@ -317,7 +317,7 @@ def rank_scorer_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "status": f"N/A ({entry.get('reason', 'unavailable')})",
                         "top_symbol": "n/a",
                         "cutoff": "n/a",
-                        "utility_contamination": None,
+                        "leaf_hub_rate": None,
                         "scaffolding": None,
                     }
                 )
@@ -336,7 +336,11 @@ def rank_scorer_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "status": f"ranked {entry.get('ranked_count')}",
                         "top_symbol": top_symbol,
                         "cutoff": cutoff,
-                        "utility_contamination": metrics.get("utility_contamination"),
+                        # utility_contamination is the pre-rename spelling; read both
+                        # so runsets recorded before the rename still render.
+                        "leaf_hub_rate": metrics.get(
+                            "leaf_hub_rate", metrics.get("utility_contamination")
+                        ),
                         "scaffolding": metrics.get("scaffolding"),
                     }
                 )
@@ -2428,7 +2432,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "predicates under test would make the metric circular.",
             "",
             "| Candidate | Corpus | Scorer | Status | Top-1 symbol | Cutoff | "
-            "Utility contamination | Scaffolding | ρ vs degree | Jaccard | Probe ms | "
+            "Leaf-hub rate | Scaffolding | ρ vs degree | Jaccard | Probe ms | "
             "Rank views fresh |",
             "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
         )
@@ -2447,7 +2451,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                         display(detail["status"]),
                         display(detail["top_symbol"]),
                         display(detail["cutoff"]),
-                        display(detail["utility_contamination"], 3),
+                        display(detail["leaf_hub_rate"], 3),
                         display(detail["scaffolding"], 3),
                         display(detail["spearman_rho"], 4),
                         display(detail["top_k_jaccard"], 3),
