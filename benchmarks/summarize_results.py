@@ -216,6 +216,47 @@ def config_signature(
     return next(iter(signatures)) if len(signatures) == 1 else None
 
 
+def report_parameter_values(reports: list[dict[str, Any]], key: str) -> list[str]:
+    """Return stable, deduplicated scalar/list values from retained JSON parameters."""
+    values: set[str] = set()
+    for report in reports:
+        parameters = report.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        value = parameters.get(key)
+        items = value if isinstance(value, list) else [value]
+        values.update(
+            str(item)
+            for item in items
+            if isinstance(item, (str, int, float, bool)) and str(item)
+        )
+    return sorted(values)
+
+
+def report_parameter_sources(reports: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Deduplicate config provenance already carried by each auditable report input."""
+    records: dict[tuple[str, str, str], dict[str, str]] = {}
+    for report in reports:
+        parameters = report.get("parameters")
+        sources = (
+            parameters.get("parameter_sources")
+            if isinstance(parameters, dict)
+            else None
+        )
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            record = {
+                "option": str(source.get("option") or "unspecified"),
+                "source": str(source.get("source") or "unreported"),
+                "macros": str(source.get("macros") or "unreported"),
+            }
+            records[(record["source"], record["option"], record["macros"])] = record
+    return [records[key] for key in sorted(records)]
+
+
 def quality_oracle_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     details: list[dict[str, Any]] = []
     for case_index, case in enumerate(cases, start=1):
@@ -289,9 +330,7 @@ def rank_scorer_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         corpus_id = str(corpus.get("id")) if isinstance(corpus, dict) else "n/a"
         staleness = case.get("rank_score_staleness")
         rank_views_fresh = (
-            staleness.get("rank_views_fresh")
-            if isinstance(staleness, dict)
-            else None
+            staleness.get("rank_views_fresh") if isinstance(staleness, dict) else None
         )
         scorers = probes.get("scorers")
         comparisons = probes.get("comparisons") or {}
@@ -878,6 +917,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                         quality_miss_is_explicit_ablation(report, case)
                     )
     pair_quality_details = semantic_pair_quality_details(cases)
+    rank_details = rank_scorer_details(cases)
     signature = config_signature(reports)
     override_map = dict(signature) if signature is not None else {}
     capability_config_keys = {
@@ -926,6 +966,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     speedups: list[float] = []
     peak_rss: list[int] = []
     query_latency_ms: list[float] = []
+    attempt_elapsed_seconds: list[float] = []
     cold_query_latency_ms: list[float] = []
     query_response_bytes: list[float] = []
     query_response_tokens: list[float] = []
@@ -941,6 +982,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     dependency_incremental_ms: list[float] = []
     dependency_fresh_ms: list[float] = []
     dependency_packages: list[float] = []
+    for report in reports:
+        provenance = report.get("experiment_provenance")
+        attempt = provenance.get("attempt") if isinstance(provenance, dict) else None
+        elapsed = attempt.get("elapsed_seconds") if isinstance(attempt, dict) else None
+        if isinstance(elapsed, (int, float)):
+            attempt_elapsed_seconds.append(float(elapsed))
     for case in cases:
         lifecycle = case.get("pair_lifecycle")
         if isinstance(lifecycle, dict):
@@ -1341,6 +1388,14 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_range_ms": (min(query_latency_ms), max(query_latency_ms))
         if query_latency_ms
         else None,
+        "attempt_observations": len(attempt_elapsed_seconds),
+        "attempt_p50_seconds": percentile(attempt_elapsed_seconds, 0.50),
+        "attempt_range_seconds": (
+            min(attempt_elapsed_seconds),
+            max(attempt_elapsed_seconds),
+        )
+        if attempt_elapsed_seconds
+        else None,
         "incremental_observations": len(incremental_ms),
         "incremental_range_ms": (min(incremental_ms), max(incremental_ms))
         if incremental_ms
@@ -1373,7 +1428,27 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": findings,
         "quality_details": quality_oracle_details(cases),
-        "rank_scorer_details": rank_scorer_details(cases),
+        "rank_scorer_details": rank_details,
+        "measured_rank_scorers": sorted(
+            {
+                str(detail["scorer"])
+                for detail in rank_details
+                if not str(detail.get("status", "")).startswith("N/A")
+            }
+        ),
+        "unavailable_rank_scorers": sorted(
+            {
+                str(detail["scorer"])
+                for detail in rank_details
+                if str(detail.get("status", "")).startswith("N/A")
+            }
+        ),
+        "cell_names": report_parameter_values(reports, "cell_name"),
+        "expected_observables": report_parameter_values(reports, "expected_observable"),
+        "evidence_scopes": report_parameter_values(reports, "evidence_scope"),
+        "informs_hypotheses": report_parameter_values(reports, "informs_hypotheses"),
+        "transports": report_parameter_values(reports, "transport"),
+        "parameter_sources": report_parameter_sources(reports),
         "pair_quality_details": pair_quality_details,
         "mutation_details": mutation_reindex_details(
             cases,
@@ -2054,10 +2129,245 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def compact_configuration(row: dict[str, Any]) -> str:
+    """Render recorded configuration data compactly without inventing missing defaults."""
+    signature = row.get("capability_signature")
+    if signature is None:
+        return str(row.get("capabilities") or "mixed or unreported configuration")
+    if not signature:
+        return "product defaults (exact values not persisted in this input)"
+    pairs = list(signature)
+    values = {value for _, value in pairs}
+    if (
+        len(values) == 1
+        and len(pairs) > 1
+        and all(key.startswith("edge_weight_") for key, _ in pairs)
+    ):
+        return f"all {len(pairs)} edge weights={pairs[0][1]}"
+    return "; ".join(f"{key}={value}" for key, value in pairs)
+
+
+def measurement_with_count(value: Any, count: int) -> str:
+    return f"{display(value, 3)} (n={count})"
+
+
+def parameter_source_summary(row: dict[str, Any]) -> str:
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for record in row.get("parameter_sources") or []:
+        if not isinstance(record, dict):
+            continue
+        source = str(record.get("source") or "unreported")
+        grouped[source].append(record)
+    if not grouped:
+        return "defaults; no override source"
+    summaries: list[str] = []
+    for source, records in sorted(grouped.items()):
+        options = sorted(
+            {str(record.get("option") or "unspecified") for record in records}
+        )
+        if len(records) == 1:
+            macros = str(records[0].get("macros") or "unreported")
+            summaries.append(f"{source} [{macros}] ({options[0]})")
+        else:
+            summaries.append(
+                f"{source} ({len(options)} options: {', '.join(options)}; "
+                "exact macros in retained JSON)"
+            )
+    return "; ".join(summaries)
+
+
+def configuration_interpretation(row: dict[str, Any], tied_best_count: int) -> str:
+    decision = str(row.get("decision") or "unknown")
+    if decision.startswith("REJECT") or decision.startswith("BELOW"):
+        return (
+            "Fails a recorded gate on this workload; do not select this configuration."
+        )
+    if row.get("quality_score") is None:
+        return "Passes recorded gates, but this input has no comparable retrieval-quality score."
+    if tied_best_count > 1:
+        return (
+            "Tied on recorded retrieval quality; latency and memory remain descriptive at "
+            f"n={max(row.get('full_observations', 0), row.get('query_observations', 0))}."
+        )
+    return "Passes recorded gates; compare only with the same workload and evidence contract."
+
+
+def render_executive_assessment(rows: list[dict[str, Any]]) -> list[str]:
+    passing = [row for row in rows if str(row.get("decision", "")).startswith("PASS")]
+    failing = [row for row in rows if row not in passing]
+    quality_values = [
+        float(row["quality_score"])
+        for row in passing
+        if isinstance(row.get("quality_score"), (int, float))
+    ]
+    best_quality = max(quality_values) if quality_values else None
+    tied_best = [
+        row
+        for row in passing
+        if best_quality is not None
+        and isinstance(row.get("quality_score"), (int, float))
+        and math.isclose(float(row["quality_score"]), best_quality)
+    ]
+    baseline = next(
+        (
+            row
+            for row in rows
+            if "baseline" in str(row.get("candidate", "")).lower()
+            or any("baseline" in name.lower() for name in row.get("cell_names") or [])
+        ),
+        None,
+    )
+    recommendations: list[str] = []
+    if baseline in passing:
+        if len(tied_best) > 1 and baseline in tied_best:
+            recommendations.append(
+                "**Keep the recorded baseline.** No configuration winner: "
+                f"{len(tied_best)} passing configurations tie at retrieval quality "
+                f"{display(best_quality, 3)} on the recorded workload."
+            )
+        else:
+            recommendations.append(
+                "**Keep the recorded baseline unless a fully measured eligible alternative "
+                "dominates it.** The current report does not establish such a replacement."
+            )
+    elif tied_best:
+        recommendations.append(
+            "**Do not choose among the quality leaders yet.** "
+            f"{len(tied_best)} configurations share the best recorded retrieval quality."
+        )
+    else:
+        recommendations.append(
+            "**Do not select a configuration from this report.** Comparable task-quality "
+            "evidence is absent or every candidate failed a recorded gate."
+        )
+    if failing:
+        recommendations.append(
+            "**Exclude recorded gate failures from tuning.** "
+            + ", ".join(str(row["candidate"]) for row in failing)
+            + " failed or fell below a declared target on this workload."
+        )
+    if any(
+        row.get("full_observations", 0) < 2 or row.get("query_observations", 0) < 2
+        for row in rows
+    ):
+        recommendations.append(
+            "**Treat latency and memory as diagnostic, not comparative.** At least one row "
+            "has fewer than two full-index or repeated-query observations; run repeated, "
+            "same-workload measurements before claiming a performance winner."
+        )
+
+    lines = [
+        "## Executive assessment",
+        "",
+        "### Top recommendations",
+        "",
+    ]
+    lines.extend(
+        f"{index}. {recommendation}"
+        for index, recommendation in enumerate(recommendations, 1)
+    )
+    lines.extend(
+        [
+            "",
+            "## Configuration and measured performance",
+            "",
+            "| Cell | Recorded configuration / overrides | Decision | MRR | nDCG@5 | End-to-end attempt p50 s | Initial/full index p50 ms | Repeated query p50 ms | Peak RSS MB | Interpretation |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in rows:
+        cell = ", ".join(row.get("cell_names") or []) or str(row["candidate"])
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    display(cell),
+                    display(compact_configuration(row)),
+                    display(row["decision"]),
+                    display(row["quality_score"], 3),
+                    display(row["ndcg_at_5"], 3),
+                    display(
+                        measurement_with_count(
+                            row["attempt_p50_seconds"],
+                            row["attempt_observations"],
+                        )
+                    ),
+                    display(
+                        measurement_with_count(
+                            row["full_p50_ms"], row["full_observations"]
+                        )
+                    ),
+                    display(
+                        measurement_with_count(
+                            row["query_latency_p50_ms"], row["query_observations"]
+                        )
+                    ),
+                    display(row["peak_rss_mb"]),
+                    display(configuration_interpretation(row, len(tied_best))),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Mechanism and workflow coverage",
+            "",
+            "| Cell | Expected observable | Persisted rank scorers measured | Hypotheses | Workflow | Evidence scope | Parameter provenance |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+    for row in rows:
+        cell = ", ".join(row.get("cell_names") or []) or str(row["candidate"])
+        measured = ", ".join(row.get("measured_rank_scorers") or []) or "none reported"
+        unavailable = ", ".join(row.get("unavailable_rank_scorers") or [])
+        scorers = f"{measured}; unavailable: {unavailable}" if unavailable else measured
+        workflow = (
+            f"{row.get('execution_orders') or 'unknown'} / "
+            f"{', '.join(row.get('transports') or []) or 'unknown transport'}"
+        )
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    display(cell),
+                    display(
+                        "; ".join(row.get("expected_observables") or []) or "unreported"
+                    ),
+                    display(scorers),
+                    display(
+                        ", ".join(row.get("informs_hypotheses") or []) or "unreported"
+                    ),
+                    display(workflow),
+                    display(
+                        "; ".join(row.get("evidence_scopes") or []) or "unreported"
+                    ),
+                    display(parameter_source_summary(row)),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "Mechanisms absent from this table were not measured by these inputs; absence is not "
+            "a zero, failure, or implied equivalence. The retained JSON report inputs and fact "
+            "comparison JSON remain the audit authority for every displayed value.",
+            "",
+        ]
+    )
+    return lines
+
+
 def render_markdown(rows: list[dict[str, Any]]) -> str:
     mark_pareto_frontier(rows)
     lines = [
         "# Codebase Memory performance and quality summary",
+        "",
+        *render_executive_assessment(rows),
+        "## Detailed evidence",
+        "",
+        "The following tables preserve the complete existing benchmark detail behind the concise assessment.",
         "",
         "| Candidate | Decision | Overall quality† | Retrieval MRR | Pair F1 | Hit@1 | Hit@5 | nDCG@5 | "
         "Core graph | Full graph freshness | Task success | Graph error | "
@@ -2424,9 +2734,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "Each row ranks one persisted score over the same graph, so ordering is "
             "isolated from candidate generation. `degree` is the baseline arm because "
             "PR #151 rejected PageRank on the grounds that `ORDER BY degree DESC` "
-            "already \"gives you the same ranking signal\"; a high ρ and Jaccard support "
+            'already "gives you the same ranking signal"; a high ρ and Jaccard support '
             "that claim, and a higher utility contamination for `degree` than for "
-            "`pagerank` contradicts the accompanying \"just utility popularity\" claim. "
+            '`pagerank` contradicts the accompanying "just utility popularity" claim. '
             "Scaffolding is null unless Tier-A labels (a language test runner's own "
             "verdict) were supplied, because filling it from one of the string "
             "predicates under test would make the metric circular.",

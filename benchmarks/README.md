@@ -143,6 +143,13 @@ The generated matrix contains exactly nine profiles, one MCP repetition, no real
 dependency, and no suite-duration target. Its per-cell timeout is a subprocess safety
 boundary recorded in the matrix, not an expected duration or suite cutoff.
 
+The generated Markdown report leads with data-derived recommendations, recorded configuration
+and overrides, measurement counts, end-to-end attempt time, scorer/mechanism coverage, workflow,
+evidence scope, and parameter provenance before the complete detailed tables. The Markdown is a
+decision view; the hashed derived inputs, raw `result.json`/`attempt.json` receipts, and
+fact-comparison JSON are the audit authority. A mechanism absent from the coverage table was not
+measured by that run and must not be interpreted as a zero or a losing result.
+
 `schema/` contains schemas for records emitted by current tooling.
 `terminology.json` defines every normative fact, step, join, and formula identifier.
 The generated human view remains in `docs/BENCHMARK_TERMINOLOGY.md`, and the full

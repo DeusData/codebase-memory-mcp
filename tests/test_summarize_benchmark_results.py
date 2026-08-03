@@ -1509,6 +1509,149 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("[8.0, 20.0]", markdown)
         self.assertIn("descriptive min–max ranges, not confidence intervals", markdown)
 
+    def test_report_leads_with_configuration_mechanism_and_workflow_assessment(
+        self,
+    ) -> None:
+        def rank_report(
+            *,
+            cell_name: str,
+            overrides: dict[str, str],
+            quality_score: float,
+            quality_passed: bool,
+        ) -> dict:
+            case = {
+                "scenario": "rank_quality",
+                "passed": quality_passed,
+                "quality_target_met": quality_passed,
+                "initial_fast_full": {"elapsed_ms": 80, "peak_rss_mb": 39},
+                "oracles": {
+                    "passed": quality_passed,
+                    "quality": {
+                        "applicable_count": 1,
+                        "passed_count": int(quality_passed),
+                        "score": quality_score,
+                        "hit_at_1": quality_score,
+                        "hit_at_5": quality_score,
+                        "mean_ndcg_at_5": quality_score,
+                        "ndcg_applicable_count": 1,
+                    },
+                    "probe": {
+                        "elapsed_ms": 13,
+                        "repeated_json_latency_ms": {"median": 12},
+                    },
+                },
+                "rank_score_probes": {
+                    "available": True,
+                    "scorers": {
+                        "degree": {
+                            "applicable": True,
+                            "ranked_count": 17,
+                            "elapsed_ms": 0.3,
+                            "top_ranked": [{"qualified_name": "fixture.entry"}],
+                            "by_cutoff": {"10": {"leaf_hub_rate": 0.0}},
+                        },
+                        "pagerank": {
+                            "applicable": quality_passed,
+                            "reason": "rank rows unavailable",
+                            "ranked_count": 17,
+                            "elapsed_ms": 0.4,
+                            "top_ranked": [{"qualified_name": "fixture.entry"}],
+                            "by_cutoff": {"10": {"leaf_hub_rate": 0.0}},
+                        },
+                    },
+                    "comparisons": {},
+                },
+            }
+            item = report(case)
+            item["mode"] = "capability_quality"
+            item["experiment_provenance"] = {"attempt": {"elapsed_seconds": 1.5}}
+            item["parameters"].update(
+                {
+                    "cell_name": cell_name,
+                    "config_profile": "candidate_native_configuration",
+                    "config_overrides": overrides,
+                    "evidence_scope": (
+                        "synthetic rank fixture; real multilingual evidence required"
+                    ),
+                    "execution_order": "paired_interleaved",
+                    "expected_observable": "ranking, quality, latency, and memory",
+                    "informs_hypotheses": ["H3", "H4"],
+                    "parameter_sources": [
+                        {
+                            "option": next(iter(overrides), "defaults"),
+                            "source": "src/pagerank/pagerank.h",
+                            "macros": "CBM_PAGERANK_DAMPING",
+                        }
+                    ],
+                    "transport": "mcp",
+                }
+            )
+            return item
+
+        baseline = SUMMARY.summarize_group(
+            "head.baseline.mcp.rank_quality",
+            [
+                rank_report(
+                    cell_name="RANK-CELL-01 — baseline",
+                    overrides={},
+                    quality_score=1.0,
+                    quality_passed=True,
+                )
+            ],
+        )
+        lower_damping = SUMMARY.summarize_group(
+            "head.shorter-propagation.mcp.rank_quality",
+            [
+                rank_report(
+                    cell_name="RANK-CELL-05 — shorter propagation",
+                    overrides={"pagerank_damping": "0.7"},
+                    quality_score=1.0,
+                    quality_passed=True,
+                )
+            ],
+        )
+        one_iteration = SUMMARY.summarize_group(
+            "head.declared-minimum-iterations.mcp.rank_quality",
+            [
+                rank_report(
+                    cell_name="RANK-CELL-07 — declared minimum iterations",
+                    overrides={"pagerank_max_iter": "1"},
+                    quality_score=0.0,
+                    quality_passed=False,
+                )
+            ],
+        )
+
+        markdown = SUMMARY.render_markdown([baseline, lower_damping, one_iteration])
+
+        self.assertEqual(baseline["cell_names"], ["RANK-CELL-01 — baseline"])
+        self.assertEqual(baseline["transports"], ["mcp"])
+        self.assertEqual(baseline["measured_rank_scorers"], ["degree", "pagerank"])
+        self.assertLess(
+            markdown.index("## Executive assessment"),
+            markdown.index("## Detailed evidence"),
+        )
+        self.assertIn("### Top recommendations", markdown)
+        self.assertIn("Keep the recorded baseline", markdown)
+        self.assertIn("No configuration winner", markdown)
+        self.assertIn("## Configuration and measured performance", markdown)
+        self.assertIn("Recorded configuration / overrides", markdown)
+        self.assertIn("pagerank_damping=0.7", markdown)
+        self.assertIn("pagerank_max_iter=1", markdown)
+        self.assertIn("End-to-end attempt p50 s", markdown)
+        self.assertIn("1.500 (n=1)", markdown)
+        self.assertIn("80.000 (n=1)", markdown)
+        self.assertIn("12.000 (n=1)", markdown)
+        self.assertIn("## Mechanism and workflow coverage", markdown)
+        self.assertIn("degree, pagerank", markdown)
+        self.assertIn("paired_interleaved / mcp", markdown)
+        self.assertIn("src/pagerank/pagerank.h", markdown)
+        self.assertIn("CBM_PAGERANK_DAMPING", markdown)
+        self.assertIn(
+            "Mechanisms absent from this table were not measured by these inputs",
+            markdown,
+        )
+
     def test_pareto_reason_lists_missing_axes_for_ineligible_row(self) -> None:
         row = SUMMARY.summarize_group(
             "incomplete",
