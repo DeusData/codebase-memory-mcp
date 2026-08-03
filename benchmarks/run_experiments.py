@@ -68,6 +68,10 @@ BUILD_ENVIRONMENT_KEYS = frozenset(
 
 
 SCHEMA_VERSION = 1
+# Must stay in sync with QUALITY_BACKGROUND_CAPABILITIES in run_benchmark.py: the plan
+# layer rejects a spec the benchmark layer would refuse anyway, so the failure arrives
+# at plan-expansion time instead of hours into a runset.
+QUALITY_BACKGROUND_CAPABILITIES = frozenset({"similarity", "semantic_edges", "rank"})
 EXPERIMENT_DEFINITION_VERSION = 1
 DEFAULT_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_STALE_LOCK_SECONDS = 6 * 60 * 60
@@ -1331,9 +1335,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             "capability_quality cannot be combined with a self_dogfood workload"
         )
     if quality_background is not None:
-        if capability_quality not in {"similarity", "semantic_edges"}:
+        if capability_quality not in QUALITY_BACKGROUND_CAPABILITIES:
             raise ValueError(
-                "quality_background requires capability_quality similarity or semantic_edges"
+                "quality_background requires capability_quality "
+                + ", ".join(sorted(QUALITY_BACKGROUND_CAPABILITIES))
             )
         if not isinstance(quality_background, dict):
             raise ValueError("quality_background must be an object")

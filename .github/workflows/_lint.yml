@@ -20,6 +20,18 @@ jobs:
       - name: No-skips policy (tests pass or fail)
         run: bash scripts/check-no-test-skips.sh
 
+      # Runs before the C toolchain setup so a harness regression fails in seconds
+      # rather than after the cppcheck build. Pure stdlib: no binary, no network,
+      # synthetic SQLite fixtures and the checked-in manifests only.
+      - name: Benchmark harness tests
+        run: python3 benchmarks/test_rank_quality.py
+
+      # The allowlist is generated from CBM_CONFIG_REGISTRY and the cbm_config_get_*
+      # call sites, so a config change that does not regenerate it is caught here
+      # instead of silently letting a stale key through benchmark validation.
+      - name: Benchmark config-key allowlist is current
+        run: python3 benchmarks/generate_config_keys.py --check
+
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
 

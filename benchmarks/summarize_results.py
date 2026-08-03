@@ -266,6 +266,83 @@ def quality_oracle_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return details
 
 
+def rank_scorer_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per persisted score, per case, from case["rank_score_probes"].
+
+    These rows are the head-to-head the tool-level oracles cannot give: search_graph
+    mixes candidate generation with ordering, whereas the probes read each score column
+    over the same graph. "degree" is present because PR #151 rejected PageRank on the
+    grounds that ORDER BY degree DESC "gives you the same ranking signal"; spearman_rho
+    and top_k_jaccard are what test that claim, and utility_contamination is what tests
+    the accompanying claim that PageRank merely surfaces utility popularity.
+    """
+    details: list[dict[str, Any]] = []
+    for case_index, case in enumerate(cases, start=1):
+        probes = case.get("rank_score_probes")
+        if not isinstance(probes, dict) or not probes.get("available"):
+            continue
+        scenario = str(case.get("scenario") or f"case {case_index}")
+        corpus = case.get("corpus")
+        # Never invent a corpus id: a run driven by --quality-background-repo without
+        # --corpus has no registry entry, and labelling it "synthetic-rank-v1" would
+        # misattribute real-corpus numbers to the synthetic fixture.
+        corpus_id = str(corpus.get("id")) if isinstance(corpus, dict) else "n/a"
+        staleness = case.get("rank_score_staleness")
+        rank_views_fresh = (
+            staleness.get("rank_views_fresh")
+            if isinstance(staleness, dict)
+            else None
+        )
+        scorers = probes.get("scorers")
+        comparisons = probes.get("comparisons") or {}
+        if not isinstance(scorers, dict):
+            continue
+        for name, entry in scorers.items():
+            if not isinstance(entry, dict):
+                continue
+            comparison = comparisons.get(f"{name}_vs_degree") or {}
+            common = {
+                "scenario": scenario,
+                "corpus": corpus_id,
+                "scorer": str(name),
+                "spearman_rho": comparison.get("spearman_rho"),
+                "top_k_jaccard": comparison.get("top_k_jaccard"),
+                "elapsed_ms": entry.get("elapsed_ms"),
+                "rank_views_fresh": rank_views_fresh,
+            }
+            if not entry.get("applicable"):
+                details.append(
+                    {
+                        **common,
+                        "status": f"N/A ({entry.get('reason', 'unavailable')})",
+                        "top_symbol": "n/a",
+                        "cutoff": "n/a",
+                        "utility_contamination": None,
+                        "scaffolding": None,
+                    }
+                )
+                continue
+            top = entry.get("top_ranked") or []
+            top_symbol = str(top[0].get("qualified_name")) if top else "n/a"
+            # One row per cutoff, read from whatever cutoffs the producer emitted.
+            # Hardcoding "10"/"40" here would silently render an all-n/a table the
+            # moment run_rank_score_probes is called with different cutoffs.
+            by_cutoff = entry.get("by_cutoff") or {}
+            for cutoff in sorted(by_cutoff, key=lambda value: int(value)):
+                metrics = by_cutoff[cutoff] or {}
+                details.append(
+                    {
+                        **common,
+                        "status": f"ranked {entry.get('ranked_count')}",
+                        "top_symbol": top_symbol,
+                        "cutoff": cutoff,
+                        "utility_contamination": metrics.get("utility_contamination"),
+                        "scaffolding": metrics.get("scaffolding"),
+                    }
+                )
+    return details
+
+
 def compact_witness(value: Any, limit: int = 96) -> str:
     if not isinstance(value, str) or not value:
         return ""
@@ -1292,6 +1369,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": findings,
         "quality_details": quality_oracle_details(cases),
+        "rank_scorer_details": rank_scorer_details(cases),
         "pair_quality_details": pair_quality_details,
         "mutation_details": mutation_reindex_details(
             cases,
@@ -2333,6 +2411,56 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                 )
             )
             + " |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Persisted ranking score comparison",
+            "",
+            "Each row ranks one persisted score over the same graph, so ordering is "
+            "isolated from candidate generation. `degree` is the baseline arm because "
+            "PR #151 rejected PageRank on the grounds that `ORDER BY degree DESC` "
+            "already \"gives you the same ranking signal\"; a high ρ and Jaccard support "
+            "that claim, and a higher utility contamination for `degree` than for "
+            "`pagerank` contradicts the accompanying \"just utility popularity\" claim. "
+            "Scaffolding is null unless Tier-A labels (a language test runner's own "
+            "verdict) were supplied, because filling it from one of the string "
+            "predicates under test would make the metric circular.",
+            "",
+            "| Candidate | Corpus | Scorer | Status | Top-1 symbol | Cutoff | "
+            "Utility contamination | Scaffolding | ρ vs degree | Jaccard | Probe ms | "
+            "Rank views fresh |",
+            "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        )
+    )
+    scorer_row_count = 0
+    for row in rows:
+        for detail in row.get("rank_scorer_details", []):
+            scorer_row_count += 1
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        display(row["candidate"]),
+                        display(detail["corpus"]),
+                        display(detail["scorer"]),
+                        display(detail["status"]),
+                        display(detail["top_symbol"]),
+                        display(detail["cutoff"]),
+                        display(detail["utility_contamination"], 3),
+                        display(detail["scaffolding"], 3),
+                        display(detail["spearman_rho"], 4),
+                        display(detail["top_k_jaccard"], 3),
+                        display(detail["elapsed_ms"], 1),
+                        display(detail["rank_views_fresh"]),
+                    )
+                )
+                + " |"
+            )
+    if not scorer_row_count:
+        lines.append(
+            "| all | n/a | n/a | No persisted ranking score probes recorded | n/a | "
+            "n/a | n/a | n/a | n/a | n/a | n/a | n/a |"
         )
     lines.extend(
         (

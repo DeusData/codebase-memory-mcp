@@ -2,9 +2,9 @@
 #ifndef CBM_PROFILE_TERMS_GENERATED_H
 #define CBM_PROFILE_TERMS_GENERATED_H
 
-#define CBM_BENCHMARK_TERMINOLOGY_VERSION "1.1.0"
+#define CBM_BENCHMARK_TERMINOLOGY_VERSION "1.2.0"
 #define CBM_BENCHMARK_TERMINOLOGY_SHA256 \
-    "04b73a6474ea9f257448ff09f136b0ed675452afee5c75bfd7d21a7b9bdc6bee"
+    "e54dedbcddcf531bf3bb691003d64759816a39c9e41e4cbef2baf1fd65e9f4d7"
 
 #define CBM_BENCHMARK_STEP_IDS(X)                           \
     X(STARTUP, "startup")                                   \

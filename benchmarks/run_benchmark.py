@@ -12,9 +12,11 @@ import argparse
 from contextlib import closing, suppress
 import gzip
 import hashlib
+import importlib.util
 from itertools import pairwise
 import json
 import math
+import statistics
 import os
 import platform
 import queue
@@ -39,6 +41,22 @@ if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
     raise RuntimeError(
         f"unsupported benchmark config spelling schema: {CONFIG_SPELLING_SPEC_PATH}"
     )
+
+DEFAULT_CORPORA_MANIFEST = Path(__file__).with_name("corpora-v1.json")
+
+# Every benchmark repository - corpora and the fastapi probe alike - is cached here.
+BENCH_REPO_CACHE_ROOT = Path.home() / ".cache" / "codebase-memory-mcp" / "bench-repos"
+# Declared by the workload corpora in corpora-v1.json: their value is the query
+# distribution mined against whatever the operator had indexed, so no single commit
+# describes them. The commit actually measured is read from the checkout and recorded.
+UNPINNED_REVISION = "resolve-at-run-time"
+
+CONFIG_KEYS_PATH = Path(__file__).with_name("config-keys-v1.json")
+with CONFIG_KEYS_PATH.open(encoding="utf-8") as stream:
+    CONFIG_KEYS_SPEC = json.load(stream)
+if CONFIG_KEYS_SPEC.get("schema_version") != 1:
+    raise RuntimeError(f"unsupported benchmark config key schema: {CONFIG_KEYS_PATH}")
+KNOWN_CONFIG_KEYS = frozenset(CONFIG_KEYS_SPEC["keys"])
 
 BENCHMARK_TERMINOLOGY_PATH = Path(__file__).with_name("terminology.json")
 with BENCHMARK_TERMINOLOGY_PATH.open(encoding="utf-8") as stream:
@@ -298,6 +316,12 @@ MCP_CAPABILITY_SURFACES = (
 )
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
+# Capabilities whose fixture may be overlaid on a real checked-out repository via
+# --quality-background-repo. "rank" is included so ranking quality can be measured on
+# real corpora rather than only on the synthetic create_rank_quality_repo fixture,
+# which contains eight lexical decoys and no test files at all.
+QUALITY_BACKGROUND_CAPABILITIES = frozenset({"similarity", "semantic_edges", "rank"})
+
 CAPABILITY_QUALITY_CASES = (
     "rank",
     "dependencies",
@@ -3114,6 +3138,599 @@ def declared_stale_views(oracles: dict[str, Any]) -> list[str]:
     return sorted(views)
 
 
+# One ranked list per scorer, read straight from a retained project database. Our three
+# scores live in dedicated tables (src/store/store.c:591-615); PR #879's importance is a
+# JSON key inside nodes.properties instead, so it needs json_extract and yields zero rows
+# on a binary without that pass. "degree" is the maintainer's own one-line alternative
+# from PR #151 ("ORDER BY degree DESC ... gives you the same ranking signal") and is the
+# REQUIRED baseline arm, not an afterthought.
+# The dispute is about callable symbols. PR #151 names log.Error() and fmt.Sprintf();
+# PR #879's pass scores Function, Method and Class (pass_importance.c:172-215). Without
+# this scope the top ranks are File and Module nodes — the first full campaign ranked
+# go.mod, .github/workflows/build.yaml, Makefile and src/server.h above every function,
+# so utility_contamination read 0.000 on the two corpora chosen for having hub
+# utilities. A node with no file_path is outside the repository (builtins.str reached
+# redis's PageRank top 10) and cannot be scaffolding, a utility, or architecture.
+# A node outside the repository cannot be scaffolding, a utility, or architecture, so it
+# must not occupy a rank. Two spellings mean "not a file": an empty path, and an
+# angle-bracket sentinel such as "<python-builtins>" (internal/cbm/lsp/py_builtins.c:84)
+# or "<jvm-default-package>" (src/mcp/mcp.c:13880). Excluding only the empty spelling let
+# builtins.str, builtins.list and builtins.list.append take ranks 1, 3 and 5 of redis's
+# PageRank top 10 — in a C repository.
+RANK_PROBE_SCOPE = (
+    "n.label IN ('Function','Method','Class') "
+    "AND n.file_path <> '' AND n.file_path NOT LIKE '<%'"
+)
+
+# Every callable symbol's in/out degree, for structural_utilities. Same scope as the
+# score probes so "is this a utility" and "is this ranked" describe the same population.
+UTILITY_DEGREE_SQL = (
+    "SELECT n.qualified_name, d.total_in, d.total_out "
+    "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
+    "WHERE n.project = ? AND " + RANK_PROBE_SCOPE
+)
+# A utility is defined by the shape PR #151 named — "they have the highest fan-in" —
+# not by its name. Both cuts are relative to the corpus so the definition transfers
+# across languages and repository sizes without a vocabulary.
+UTILITY_FAN_IN_QUANTILE = 0.99
+UTILITY_MAX_FAN_OUT_RATIO = 0.1
+UTILITY_MIN_POPULATION = 20
+
+
+def structural_utilities(nodes: list[dict[str, Any]]) -> frozenset[str]:
+    """Symbols that are utilities by shape: very high fan-in, near-zero fan-out.
+
+    Replaces a hand-written marker list (`log`, `fmt`, `printf`, `malloc`, ...). That
+    list was the weakest instrument in the campaign for a specific reason: the campaign's
+    own thesis is that hardcoded, non-general string criteria fail at scale, so deciding
+    its headline metric with one was self-refuting. It also only ever fired on a single
+    corpus, because the vocabulary happened to match C.
+
+    This is what PR #151 actually claimed, stated structurally: *"PageRank on a call
+    graph would rank log.Error() and fmt.Sprintf() as the most important functions in
+    any codebase, because they have the highest fan-in."* A symbol that many things call
+    and that calls almost nothing itself is a leaf utility whatever it is named, in
+    whatever language.
+
+    Both thresholds are relative to the corpus's own distribution, so the definition does
+    not need retuning per repository: fan-in above the 99th percentile, and fan-out no
+    more than a tenth of that symbol's fan-in. A graph with no hub yields the empty set
+    rather than an arbitrary top slice.
+
+    Time and memory are O(n) plus one O(n log n) sort of the fan-in values.
+    """
+    degrees = [
+        (str(node["qualified_name"]), int(node["total_in"]), int(node["total_out"]))
+        for node in nodes
+        if isinstance(node.get("total_in"), int)
+        and isinstance(node.get("total_out"), int)
+    ]
+    if len(degrees) < UTILITY_MIN_POPULATION:
+        # Too few symbols for a quantile to mean anything. Reporting nothing is honest;
+        # picking a fixed threshold here would reintroduce the arbitrariness this
+        # function exists to remove.
+        return frozenset()
+    fan_in = sorted(value for _, value, _ in degrees)
+    # Clamped to leave at least the top element above the cut. Without the clamp the
+    # quantile index lands on the maximum in any population under ~100, so the one
+    # symbol the metric exists to find is the one excluded by the strict comparison.
+    index = max(0, min(len(fan_in) - 2, int(UTILITY_FAN_IN_QUANTILE * len(fan_in))))
+    cut = fan_in[index]
+    if cut <= 0:
+        return frozenset()
+    return frozenset(
+        name
+        for name, incoming, outgoing in degrees
+        # Strictly above the cut: a flat graph where every symbol sits at the quantile
+        # has no hubs, and calling them all utilities would invert the metric.
+        if incoming > cut and outgoing <= UTILITY_MAX_FAN_OUT_RATIO * incoming
+    )
+
+RANK_PROBE_SQL: dict[str, str] = {
+    "pagerank": (
+        "SELECT n.qualified_name, n.file_path, p.rank AS s "
+        "FROM nodes n JOIN pagerank p ON p.node_id = n.id "
+        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
+    ),
+    "weighted_in": (
+        "SELECT n.qualified_name, n.file_path, d.weighted_in AS s "
+        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
+        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
+    ),
+    "linkrank_in": (
+        "SELECT n.qualified_name, n.file_path, d.linkrank_in AS s "
+        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
+        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
+    ),
+    "degree": (
+        "SELECT n.qualified_name, n.file_path, (d.total_in + d.total_out) AS s "
+        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
+        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
+    ),
+    "in_degree": (
+        "SELECT n.qualified_name, n.file_path, d.total_in AS s "
+        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
+        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
+    ),
+    "importance": (
+        "SELECT n.qualified_name, n.file_path, "
+        "CAST(json_extract(n.properties,'$.importance') AS REAL) AS s "
+        "FROM nodes n WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " "
+        "AND json_extract(n.properties,'$.importance') IS NOT NULL "
+        "ORDER BY s DESC, n.qualified_name LIMIT ?"
+    ),
+}
+
+# Logging, formatting and allocation helpers carry the highest raw fan-in in most
+# codebases. PR #151: "PageRank on a call graph would rank log.Error() and fmt.Sprintf()
+# as the most important functions in any codebase ... that's not architectural
+# importance - it's just utility popularity." Measuring that claim needs a fixed,
+# declared list rather than a judgement call at reporting time.
+# How many ranked rows each scorer keeps in the report as a readable head sample. This
+# is presentation only; the metrics are computed over the cutoffs, not this depth.
+TOP_RANKED_SAMPLE = 10
+
+# Matched as whole identifier tokens (see is_utility_symbol), never as substrings.
+# Deliberately excludes "trace", "debug", "warn" and "free": they collide with ordinary
+# production identifiers such as this project's own trace_path, and a marker that fires
+# on the corpus under test would inflate exactly the number the campaign reports.
+UTILITY_SYMBOL_TOKENS: frozenset[str] = frozenset(
+    {
+        "log", "logf", "logger", "printf", "sprintf", "fprintf", "println", "puts",
+        "malloc", "calloc", "realloc", "zmalloc", "zfree", "zrealloc", "xmalloc",
+        "memcpy", "memmove", "memset", "strlen", "strcmp", "strcpy", "strdup",
+        "assert", "errorf", "wrapf", "panic", "fatal", "abort",
+    }
+)
+
+
+def spearman_rho(left: list[float], right: list[float]) -> float | None:
+    """Spearman rank correlation, or None when it is undefined for these inputs.
+
+    statistics.correlation(method="ranked") is Spearman and handles tied ranks; it
+    raises StatisticsError for the two undefined cases (fewer than two points, or a
+    constant input), which callers here want as None rather than an exception.
+    """
+    if len(left) != len(right):
+        return None
+    try:
+        return statistics.correlation(left, right, method="ranked")
+    except statistics.StatisticsError:
+        return None
+
+
+# Derived views published by cbm_pagerank_compute (src/pagerank/pagerank.c). When any of
+# these is stale, search_graph silently degrades: sort_by "linkrank"/"calls" fall back to
+# (in_deg + out_deg) at src/store/store.c:11695-11711 with nothing in the response saying
+# so. A ranking measurement taken through that fallback is not a measurement of the score
+# it claims to test, so every rank oracle records this alongside its result.
+RANK_DERIVED_VIEWS = ("pagerank", "linkrank", "node_degree")
+
+
+def rank_score_staleness(
+    cache_dir: Path, project: str, oracles: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Record whether the persisted ranking views were stale when oracles ran.
+
+    Takes the union of what the tool responses declared and what the freshness ledger
+    persisted, the same combination the incremental path already uses, because the two
+    can disagree: a response can report stale_with_warning after derived_view_state has
+    been re-marked fresh, and a view can be marked stale in the ledger without any
+    response having said so.
+    """
+    try:
+        db_path = find_project_db(cache_dir)
+    except (RuntimeError, OSError) as exc:
+        return {"available": False, "reason": str(exc)}
+    try:
+        persisted = persisted_stale_views(db_path, project)
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+    declared = declared_stale_views(oracles) if oracles else []
+    stale = sorted(set(declared) | set(persisted))
+    stale_rank_views = [view for view in RANK_DERIVED_VIEWS if view in stale]
+    return {
+        "available": True,
+        "stale_views": stale,
+        "declared_stale_views": sorted(declared),
+        "persisted_stale_views": sorted(persisted),
+        "stale_rank_views": stale_rank_views,
+        # True means the ranking numbers in this case are trustworthy as a measurement
+        # of the requested score rather than of the degree fallback.
+        "rank_views_fresh": not stale_rank_views,
+    }
+
+
+def is_utility_symbol(qualified_name: str | None) -> bool:
+    """Match utility markers on identifier-token boundaries, not bare substrings.
+
+    Bare `in` matching inflates the metric on the very corpora under test: "trace"
+    matches this project's own `trace_path`, "free" matches `freeze`, "debug" matches
+    ordinary identifiers. Splitting the qualified name into tokens on non-alphanumeric
+    boundaries and on camelCase humps keeps `zmalloc`, `serverLog` and `fmt.Sprintf`
+    matching while leaving `trace_path` alone.
+    """
+    if not qualified_name:
+        return False
+    tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+", qualified_name)
+        if token
+    }
+    return bool(tokens & UTILITY_SYMBOL_TOKENS)
+
+
+DEFAULT_LABELS_DIR = Path(__file__).resolve().with_name("labels")
+# One row per indexed file. Grouping in SQL keeps the transfer proportional to the file
+# count rather than the node count, which is one to two orders of magnitude larger.
+COVERAGE_PROBE_SQL = (
+    "SELECT file_path, COUNT(*) FROM nodes "
+    "WHERE project = ? AND file_path IS NOT NULL AND file_path <> '' "
+    "GROUP BY file_path"
+)
+
+
+def load_module_beside(name: str) -> Any:
+    """Import a sibling benchmarks/ module by path, reusing an already-loaded copy.
+
+    Same importlib pattern autotune.py uses for run_experiments.py helpers. Registering
+    in sys.modules keeps one instance, so a caller that also loads the module directly
+    sees the same objects rather than a second copy with equal-but-not-identical state.
+    """
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name(f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def scaffolding_paths_from_document(document: dict[str, Any]) -> frozenset[str] | None:
+    """Test-file paths from a label document, or None when it classified nothing.
+
+    None rather than an empty set when no source could classify anything, because the
+    two mean different things: "no independent source could speak" must report null,
+    while an empty set would claim the corpus contains no test files. A project the
+    runner did classify and found no tests in is a real zero, so the cases are separated
+    by whether anything was classified rather than by the test count.
+    """
+    counts = document.get("counts") or {}
+    if not counts.get("test") and not counts.get("not_test"):
+        return None
+    return frozenset(
+        row["file_path"]
+        for row in document.get("labels", [])
+        if row.get("is_test") is True
+    )
+
+
+def derive_scaffolding_paths(
+    corpus_id: str, source_repo: Path | None, timeout: int
+) -> frozenset[str] | None:
+    """Label a corpus's test files by reading the corpus, not a checked-in file.
+
+    Labels are data derived from a corpus, so storing them in this repository would add
+    generated JSON that can drift from the tree actually indexed. Deriving them from the
+    staged checkout at run time keeps one implementation and makes that drift impossible.
+
+    Runs against the source checkout rather than the materialized copy: the copy is
+    produced by `git archive` and has no `.git`, and the derivation reads the project's
+    tracked file list. Never raises — a run that already produced oracles must not abort
+    because a label source was unreadable; it reports null instead.
+    """
+    if source_repo is None or not Path(source_repo).is_dir():
+        return None
+    try:
+        labeller = load_module_beside("generate_test_labels")
+        document = labeller.build_labels(corpus_id, Path(source_repo))
+    except Exception:  # noqa: BLE001 - a label source is never worth failing a run over
+        return None
+    return scaffolding_paths_from_document(document)
+
+
+def load_scaffolding_paths(corpus_id: str, labels_dir: str) -> frozenset[str] | None:
+    """Tier-A test-file labels for a corpus, or None when none were generated.
+
+    The labels come from the project's own test declaration or its language toolchain's
+    rule (benchmarks/generate_test_labels.py), never from one of this server's seven
+    test predicates — those are the thing under measurement, so deriving the label from
+    them would make scaffolding@K a test of the classifier against itself.
+
+    None rather than an empty set when no label file exists, because the two mean
+    different things: "no independent labels were supplied" must report null, while an
+    empty set would claim the corpus has no tests.
+    """
+    if not corpus_id:
+        return None
+    root = Path(labels_dir).expanduser() if labels_dir else DEFAULT_LABELS_DIR
+    path = root / f"{corpus_id}.json"
+    if not path.is_file():
+        return None
+    document = json.loads(path.read_text(encoding="utf-8"))
+    counts = document.get("counts") or {}
+    # A file whose sources classified nothing is not a measurement. redis is C and jest
+    # declares its test configuration in JavaScript, so both label files are entirely
+    # "unknown"; returning an empty set would claim those corpora contain no test files
+    # and print scaffolding@K as a clean 0.000. A corpus the runner did classify and
+    # found no tests in is a real zero, so the two cases are distinguished by whether
+    # anything was classified at all rather than by the test count alone.
+    if not counts.get("test") and not counts.get("not_test"):
+        return None
+    return frozenset(
+        row["file_path"]
+        for row in document.get("labels", [])
+        if row.get("is_test") is True
+    )
+
+
+RANK_FINGERPRINT_SQL = (
+    "SELECT n.qualified_name, p.rank FROM nodes n JOIN pagerank p ON p.node_id = n.id "
+    "WHERE n.project = ? ORDER BY n.qualified_name"
+)
+
+
+def rank_table_fingerprint(cache_dir: Path, project: str) -> str | None:
+    """Content hash of the published pagerank table, or None when there is no database.
+
+    The knob-efficacy canary compares this between two cells that differ only by one
+    edge-weight config value. Equal fingerprints mean the knob changed nothing, which is
+    the failure cbm_config_value_is_valid (src/cli/cli.c:7160-7173) makes silent: it
+    returns true for keys absent from CBM_CONFIG_REGISTRY, so a typo'd or removed knob
+    is persisted, exits 0, and yields a clean run reporting a difference of exactly
+    zero — indistinguishable from "tuning does not help".
+
+    Ordered by qualified_name rather than by rank so the hash tracks the scores rather
+    than a tie-ordering that SQLite is free to vary between runs.
+    """
+    try:
+        db_path = find_project_db(cache_dir)
+    except (RuntimeError, OSError):
+        return None
+    try:
+        rows = query_tuples(db_path, RANK_FINGERPRINT_SQL, (project,))
+    except sqlite3.Error:
+        return None
+    digest = hashlib.sha256()
+    for qualified_name, rank in rows:
+        # repr() of the float, so a difference below display precision still registers.
+        digest.update(f"{qualified_name}\t{rank!r}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def run_corpus_coverage_probe(
+    cache_dir: Path,
+    project: str,
+    *,
+    predicted_loss: dict[str, Any] | None = None,
+    index_mode: str = "",
+) -> dict[str, Any]:
+    """Which files reached the graph, attributed to their top-level directory.
+
+    The silent-exclusion issues (#1406 scripts/, #1219 assets/, #1184 deploy/, #411
+    whole subtrees) all make the same claim: a directory is absent from the index and
+    nothing says so. A file count alone cannot support or refute that; a per-directory
+    count states exactly which name disappeared.
+
+    Read from the graph rather than from an index log line, so the number is what a
+    query can actually reach rather than what the indexer reported attempting.
+
+    index_mode is a matrix-spec field (run_experiments.py:1301), so one run observes one
+    mode. The across-mode diff is therefore a cross-runset operation and lives in the
+    campaign rollup, not here.
+
+    Time and memory are O(indexed files) after SQLite's grouped scan; the node table is
+    read once through the same read-only path as the score probes.
+    """
+    try:
+        db_path = find_project_db(cache_dir)
+    except (RuntimeError, OSError) as exc:
+        return {"available": False, "reason": str(exc)}
+    started = time.monotonic()
+    try:
+        rows = query_tuples(db_path, COVERAGE_PROBE_SQL, (project,))
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+    directories: dict[str, int] = {}
+    extensions: dict[str, int] = {}
+    node_total = 0
+    for file_path, node_count in rows:
+        text = str(file_path)
+        # "" is the root, kept as its own bucket: attributing a root-level file to some
+        # directory would invent coverage that the graph does not have.
+        head = text.split("/", 1)[0] if "/" in text else ""
+        directories[head] = directories.get(head, 0) + 1
+        # A directory count cannot distinguish "this directory was skipped" from "these
+        # file types were skipped inside it". The first campaign lost files from
+        # directories on no published skip list, so the second mechanism has to be
+        # separable from the first.
+        name = text.rsplit("/", 1)[-1]
+        suffix = f".{name.rsplit('.', 1)[-1]}" if "." in name.lstrip(".") else ""
+        extensions[suffix] = extensions.get(suffix, 0) + 1
+        node_total += int(node_count)
+    result: dict[str, Any] = {
+        "available": True,
+        "elapsed_ms": (time.monotonic() - started) * 1000.0,
+        "indexed_file_count": len(rows),
+        "indexed_node_count": node_total,
+        "top_level_directories": dict(sorted(directories.items())),
+        "extensions": dict(sorted(extensions.items())),
+    }
+    if predicted_loss is not None:
+        # corpora-v1.json registers these before any indexing happens. Scoring the
+        # prediction here is what keeps it a prediction rather than a decoration.
+        #
+        # Which prediction applies depends on the mode: ALWAYS_SKIP_DIRS fires in every
+        # mode, while FAST_SKIP_DIRS is gated on mode != CBM_MODE_FULL
+        # (src/discover/discover.c:448-452). Scoring the fast list against a full run
+        # would report every correctly-indexed docs/ directory as a failed prediction.
+        present = set(directories)
+        checks = {
+            field: [str(name) for name in predicted_loss.get(field) or []]
+            for field in ("always_skipped_top_dirs", "fast_skipped_top_dirs")
+        }
+        applicable = set(checks["always_skipped_top_dirs"])
+        if index_mode and index_mode != "full":
+            applicable |= set(checks["fast_skipped_top_dirs"])
+        predicted_all = sorted(applicable)
+        result["predicted_loss_check"] = {
+            **checks,
+            "index_mode": index_mode,
+            "applicable_predictions": predicted_all,
+            "absent_as_predicted": [n for n in predicted_all if n not in present],
+            "present_despite_prediction": [n for n in predicted_all if n in present],
+        }
+    return result
+
+
+def run_rank_score_probes(
+    cache_dir: Path,
+    project: str,
+    *,
+    top_n: int = 40,
+    cutoffs: tuple[int, ...] = (10, 40),
+    scaffolding_paths: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Rank every persisted score over the same graph and compare them directly.
+
+    This is the head-to-head that the tool-level oracles cannot provide: search_graph
+    routes through BM25 and the hardcoded label boosts at src/mcp/mcp.c:7402-7419, so a
+    tool result mixes candidate generation with ordering. Reading the score columns
+    isolates the ordering, which is the thing under dispute.
+
+    scaffolding_paths carries Tier-A labels (a language test runner's own verdict). When
+    absent, scaffolding@K is reported as null rather than being filled in from one of the
+    seven string predicates under test, which would make the metric circular.
+    """
+    try:
+        db_path = find_project_db(cache_dir)
+    except (RuntimeError, OSError) as exc:
+        return {"available": False, "reason": str(exc)}
+
+    # Derived once per corpus from the graph itself, then applied to every scorer's
+    # window. Computing it per scorer would let a scorer's own ranking influence what
+    # counts as a utility, which is the circularity scaffolding@K already avoids.
+    try:
+        utility_names = structural_utilities(
+            [
+                {"qualified_name": row[0], "total_in": row[1], "total_out": row[2]}
+                for row in query_tuples(db_path, UTILITY_DEGREE_SQL, (project,))
+            ]
+        )
+    except sqlite3.Error:
+        utility_names = frozenset()
+
+    scorers: dict[str, Any] = {}
+    ranked_by_scorer: dict[str, list[tuple[Any, ...]]] = {}
+    for name, sql in RANK_PROBE_SQL.items():
+        started = time.monotonic()
+        try:
+            rows = query_tuples(db_path, sql, (project, top_n))
+        except sqlite3.Error as exc:
+            scorers[name] = {
+                "applicable": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            continue
+        # Named elapsed_ms exactly so fact_step_rows publishes each probe as a timing
+        # fact keyed by the scorer name; a bespoke key would make them invisible there.
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        if not rows:
+            # Expected for "importance" on a binary without PR #879's pass.
+            scorers[name] = {
+                "applicable": False,
+                "reason": "no rows; score not present in this database",
+                "elapsed_ms": elapsed_ms,
+            }
+            continue
+        ranked_by_scorer[name] = rows
+        entry: dict[str, Any] = {
+            "applicable": True,
+            "ranked_count": len(rows),
+            "elapsed_ms": elapsed_ms,
+            # Named for what it is (a head sample) rather than a fixed depth, so the
+            # key does not become a lie when cutoffs change.
+            "top_ranked_depth": TOP_RANKED_SAMPLE,
+            "top_ranked": [
+                {"qualified_name": row[0], "file_path": row[1], "score": row[2]}
+                for row in rows[:TOP_RANKED_SAMPLE]
+            ],
+        }
+        # Keyed by cutoff rather than baked into the key name, so a consumer can
+        # iterate cutoffs without reconstructing field names it has to guess.
+        by_cutoff: dict[str, Any] = {}
+        for cutoff in cutoffs:
+            window = rows[:cutoff]
+            if not window:
+                continue
+            # Structural is the reportable definition: it is what PR #151 actually
+            # claimed ("highest fan-in") and it needs no vocabulary. The lexical count
+            # is retained beside it, not replaced, so the two can be compared and a
+            # disagreement is visible rather than silently resolved in one's favour.
+            utility = sum(1 for row in window if row[0] in utility_names)
+            lexical = sum(1 for row in window if is_utility_symbol(row[0]))
+            scaffolding = (
+                None
+                if scaffolding_paths is None
+                else sum(1 for row in window if row[1] in scaffolding_paths)
+                / len(window)
+            )
+            by_cutoff[str(cutoff)] = {
+                "window_size": len(window),
+                "utility_contamination": utility / len(window),
+                "utility_contamination_lexical": lexical / len(window),
+                "scaffolding": scaffolding,
+            }
+        entry["by_cutoff"] = by_cutoff
+        scorers[name] = entry
+
+    # H2/H4: is degree "the same ranking signal" as PageRank, as PR #151 asserts?
+    comparisons: dict[str, Any] = {}
+    baseline = "degree"
+    if baseline in ranked_by_scorer:
+        base_rows = ranked_by_scorer[baseline]
+        base_scores = {row[0]: row[2] for row in base_rows}
+        base_top = {row[0] for row in base_rows[: cutoffs[0]]}
+        for name, rows in ranked_by_scorer.items():
+            if name == baseline:
+                continue
+            shared = [row for row in rows if row[0] in base_scores]
+            rho = spearman_rho(
+                [float(row[2]) for row in shared],
+                [float(base_scores[row[0]]) for row in shared],
+            )
+            other_top = {row[0] for row in rows[: cutoffs[0]]}
+            union = base_top | other_top
+            comparisons[f"{name}_vs_{baseline}"] = {
+                "spearman_rho": rho,
+                "shared_symbols": len(shared),
+                "top_k": cutoffs[0],
+                "top_k_jaccard": (
+                    len(base_top & other_top) / len(union) if union else None
+                ),
+                "interpretation": (
+                    "high spearman_rho and high top_k_jaccard support PR #151's claim "
+                    "that degree already gives the same ranking signal"
+                ),
+            }
+
+    return {
+        "available": True,
+        "top_n": top_n,
+        "cutoffs": list(cutoffs),
+        "scaffolding_labels_present": scaffolding_paths is not None,
+        "structural_utility_count": len(utility_names),
+        "structural_utility_sample": sorted(utility_names)[:10],
+        "utility_token_count": len(UTILITY_SYMBOL_TOKENS),
+        "scorers": scorers,
+        "comparisons": comparisons,
+    }
+
+
 def persisted_stale_views(db_path: Path, project: str) -> list[str]:
     """Read global derived-view state from the canonical SQLite freshness ledger."""
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
@@ -3524,6 +4141,7 @@ def resolve_config_overrides(profile: str, items: list[str]) -> dict[str, str]:
         raise ValueError(f"unknown config profile: {profile}")
     overrides = dict(CONFIG_PROFILES[profile])
     overrides.update(parse_config_overrides(items))
+    validate_config_overrides(overrides)
     return overrides
 
 
@@ -3560,9 +4178,36 @@ def index_mode_capability_applicability(index_mode: str) -> dict[str, dict[str, 
     return result
 
 
+def validate_config_overrides(overrides: dict[str, str]) -> None:
+    """Reject config keys the product would silently swallow.
+
+    cbm_config_value_is_valid (src/cli/cli.c) ends with
+
+        return true; /* preserve extension/private keys not owned by this registry */
+
+    so `config set <typo> <value>` is persisted, exits 0, and is recorded in the
+    cell's parameters.config_overrides as though it took effect. The experiment
+    then reports a difference of exactly zero, which reads identically to "this
+    knob does not matter". Failing here keeps an inert override from ever being
+    published as a measured condition.
+    """
+    unknown = sorted(set(overrides) - KNOWN_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(
+            "unknown config key(s) "
+            + ", ".join(repr(key) for key in unknown)
+            + f"; not listed in {CONFIG_KEYS_PATH.name}. Fix the spelling, or regenerate "
+            "the allowlist with benchmarks/generate_config_keys.py if the product's "
+            "config surface changed."
+        )
+
+
 def apply_config_overrides(
     binary: Path, env: dict[str, str], overrides: dict[str, str], timeout: int
 ) -> None:
+    # Keys are validated once at parse time in resolve_config_overrides, before any
+    # measurement starts. Validating here instead would raise deep inside the measured
+    # run, where the enclosing except-Exception handlers would have to cope with it.
     for key, value in overrides.items():
         run_config_set(binary, env, key, value, timeout)
 
@@ -4221,14 +4866,25 @@ def sqlite_cbm_source_span_label(label: str | None) -> int:
 
 
 def query_rows(db_path: Path, sql: str, params: tuple[Any, ...]) -> list[str]:
-    con = sqlite3.connect(str(db_path))
-    con.text_factory = decode_sqlite_text
-    con.create_function("cbm_source_span_label", 1, sqlite_cbm_source_span_label)
-    try:
-        rows = [str(row[0]) for row in con.execute(sql, params)]
-    finally:
-        con.close()
-    return rows
+    """First column of each row, as text. Fingerprinting and comparison callers use this."""
+    return [str(row[0]) for row in query_tuples(db_path, sql, params)]
+
+
+def query_tuples(
+    db_path: Path, sql: str, params: tuple[Any, ...]
+) -> list[tuple[Any, ...]]:
+    """Read every column of a read-only query. The single SQLite read primitive here.
+
+    query_rows projects this to its first column; the rank probes need the full
+    (qualified_name, file_path, score) triple. Opened mode=ro, matching
+    persisted_stale_views and copy_sqlite_snapshot, so no reader can mutate a retained
+    experiment database.
+    """
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as con:
+        con.text_factory = decode_sqlite_text
+        con.create_function("cbm_source_span_label", 1, sqlite_cbm_source_span_label)
+        return list(con.execute(sql, params))
 
 
 def canonical_query_rows(db_path: Path, project: str, sql: str) -> list[str]:
@@ -5008,29 +5664,226 @@ def clone_real_repo(url: str, target: Path, timeout: int) -> Path:
     return target
 
 
-def resolve_fastapi_source(args: argparse.Namespace, case_root: Path) -> Path:
+def clone_pinned_repo(url: str, revision: str, target: Path, timeout: int) -> Path:
+    """Materialize a corpus: an exact pinned commit, or an unpinned corpus's current tip.
+
+    clone_real_repo uses `git clone --depth=1`, which fetches only the default-branch
+    tip. Every popularity corpus in corpora-v1.json is pinned to an exact commit that is
+    usually NOT the tip, so a shallow clone would silently produce the wrong tree.
+    Fetching the revision directly keeps the download small and the checkout exact.
+
+    The workload corpora declare UNPINNED_REVISION instead, because their value is the
+    query distribution mined against whatever the operator had indexed rather than one
+    frozen tree. Those fetch HEAD. Only that declared sentinel opts in: any other
+    non-sha is rejected, so a typo'd revision cannot silently become "whatever is current"
+    and then be reported as the pinned tree.
+    """
+    if revision == UNPINNED_REVISION:
+        fetch_ref = "HEAD"
+    elif len(revision) == 40:
+        fetch_ref = revision
+    else:
+        raise RuntimeError(
+            "corpus revision must be a full 40-character commit hash or "
+            f"{UNPINNED_REVISION!r}, got {revision!r}"
+        )
+    target.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    steps = [
+        ["git", "init", "--quiet"],
+        ["git", "remote", "add", "origin", url],
+        # Fetching the commit itself, rather than a branch, is what makes the checkout
+        # exact. GitHub serves this, and it stays cheap: flask at its pinned commit
+        # fetches in under a second into a ~900 KB object store.
+        ["git", "fetch", "--quiet", "--depth=1", "origin", fetch_ref],
+        # `switch --detach` rather than `checkout`: unambiguous, and it cannot be
+        # confused with the file-restoring form of checkout.
+        ["git", "switch", "--quiet", "--detach", "FETCH_HEAD"],
+    ]
+    for step in steps:
+        proc, _ = command_result(step, env, timeout, target)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"{' '.join(step)} failed for {url}@{revision}: {proc.stderr.strip()}"
+            )
+    return target
+
+
+def verify_corpus_pin(repo_root: Path, entry: dict[str, Any], timeout: int) -> None:
+    """Fail loudly when a checkout is not at the commit the registry pins.
+
+    A corpus supplied via --corpus-repo or an env var is whatever the caller had on disk,
+    so the commit is worth asserting. The tree is deliberately NOT compared here:
+    `git rev-parse HEAD^{tree}` returns the committed tree, which is fixed once the
+    commit matches, so the comparison could never fail and would not detect working-tree
+    edits either. The measured tree is validated where it actually matters — the
+    `tree` that copy_git_revision_to_dir returns after `git archive` is what the
+    experiment indexed, and run_capability_quality compares that against the registry.
+    """
+    expected_revision = entry.get("revision")
+    if expected_revision == UNPINNED_REVISION:
+        return  # workload corpora resolve their revision at run time by design
+    if not expected_revision or len(expected_revision) != 40:
+        raise RuntimeError(
+            f"corpus {entry.get('id')!r} declares revision {expected_revision!r}, which "
+            f"is neither a 40-character commit hash nor {UNPINNED_REVISION!r}"
+        )
+    head = command_stdout(["git", "rev-parse", "HEAD"], timeout, repo_root).strip()
+    if head != expected_revision:
+        raise RuntimeError(
+            f"corpus {entry['id']!r} is at commit {head}, registry pins {expected_revision}"
+        )
+
+
+def corpus_cache_root() -> Path:
+    """Where benchmark corpora are cached. One definition, used by every resolver."""
+    return BENCH_REPO_CACHE_ROOT
+
+
+def corpus_env_key(corpus_id: str) -> str:
+    """Environment variable that points a corpus id at a checkout.
+
+    One definition because two processes have to agree on it: this resolver reads it,
+    and run_container_experiment.py writes it when staging corpora into a container
+    that has no network. A silent disagreement would look like a missing corpus.
+    """
+    return "CBM_BENCH_CORPUS_" + re.sub(r"[^A-Za-z0-9]", "_", corpus_id).upper()
+
+
+def resolve_benchmark_repo(
+    name: str,
+    *,
+    explicit: Path | None,
+    explicit_hint: str,
+    env_key: str,
+    is_present: Any,
+    timeout: int,
+    clone: Any | None,
+) -> Path:
+    """Find a benchmark repository, cloning only when the caller supplies a cloner.
+
+    The resolution order is the contract, and it is the same for every benchmark
+    repository so there is one convention to learn:
+
+      1. an explicit path the caller passed
+      2. the named environment variable
+      3. ~/.cache/codebase-memory-mcp/bench-repos/<name>
+      4. clone, only if the caller allowed it
+
+    A miss names every path that was searched, so a typo cannot be mistaken for a
+    network failure.
+    """
     candidates: list[Path] = []
-    if args.fastapi_repo:
-        candidates.append(Path(args.fastapi_repo).expanduser())
-    env_repo = os.environ.get("CBM_FASTAPI_REPO")
-    if env_repo:
-        candidates.append(Path(env_repo).expanduser())
-    candidates.extend(
-        [
-            Path.home() / "source" / "fastapi",
-            Path.home() / ".cache" / "codebase-memory-mcp" / "bench-repos" / "fastapi",
-        ]
-    )
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    from_env = os.environ.get(env_key)
+    if from_env:
+        candidates.append(Path(from_env).expanduser())
+    candidates.append(BENCH_REPO_CACHE_ROOT / name)
     for candidate in candidates:
-        if (candidate / FASTAPI_PROBE_REL_PATH).is_file():
-            return resolve_git_repo_root(candidate, args.timeout)
-    if not args.clone_missing_real_repos:
+        if is_present(candidate):
+            return resolve_git_repo_root(candidate, timeout)
+    if clone is None:
         searched = ", ".join(str(path) for path in candidates)
         raise RuntimeError(
-            "fastapi_insert_probe requires --fastapi-repo, CBM_FASTAPI_REPO, "
-            f"or --clone-missing-real-repos; searched: {searched}"
+            f"benchmark repository {name!r} not found; pass {explicit_hint}, set "
+            f"{env_key}, or allow --clone-missing-real-repos. Searched: {searched}"
         )
-    return clone_real_repo(args.fastapi_url, case_root / "source-fastapi", args.timeout)
+    return clone()
+
+
+def resolve_corpus_source(
+    corpus_id: str,
+    url: str,
+    revision: str,
+    args: argparse.Namespace,
+) -> Path:
+    """Find a corpus checkout, cloning the pinned commit only when allowed.
+
+    Resolution order mirrors resolve_fastapi_source so there is one convention to learn:
+      1. --corpus-repo <id>=<path>   (explicit, wins)
+      2. CBM_BENCH_CORPUS_<ID> env var
+      3. ~/.cache/codebase-memory-mcp/bench-repos/<id>
+      4. clone the pinned commit, only with --clone-missing-real-repos
+    Nothing is ever cloned implicitly: a missing corpus is an error naming every path
+    that was searched, so a typo cannot look like a network problem.
+    """
+    overrides = parse_key_value_arguments(
+        getattr(args, "corpus_repo", None) or [], "--corpus-repo"
+    )
+    allow_clone = bool(getattr(args, "clone_missing_real_repos", False))
+    return resolve_benchmark_repo(
+        corpus_id,
+        explicit=Path(overrides[corpus_id]) if corpus_id in overrides else None,
+        explicit_hint=f"--corpus-repo {corpus_id}=PATH",
+        env_key=corpus_env_key(corpus_id),
+        is_present=lambda candidate: (candidate / ".git").exists(),
+        timeout=args.timeout,
+        clone=(
+            (
+                lambda: clone_pinned_repo(
+                    url, revision, BENCH_REPO_CACHE_ROOT / corpus_id, args.timeout
+                )
+            )
+            if allow_clone
+            else None
+        ),
+    )
+
+
+def manifest_digest(explicit_path: str | None, default_path: Path | None) -> str | None:
+    """SHA-256 of the manifest actually used, or None when no manifest applies.
+
+    create_pair_quality_repo records manifest_sha256 for the same reason: without it a
+    report states which corpus id ran but not which registry defined it, so a later
+    edit to the registry silently changes what a published number meant.
+    """
+    path = Path(explicit_path).expanduser() if explicit_path else default_path
+    if path is None or not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_corpora_manifest(manifest_path: str) -> dict[str, dict[str, Any]]:
+    """Corpus id -> entry, from benchmarks/corpora-v1.json."""
+    path = Path(manifest_path).expanduser() if manifest_path else DEFAULT_CORPORA_MANIFEST
+    if not path.is_file():
+        raise ValueError(f"corpora manifest not found: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("schema_version") != 1:
+        raise ValueError(f"unsupported corpora manifest schema: {path}")
+    return {entry["id"]: entry for entry in document.get("corpora", [])}
+
+
+def resolve_fastapi_source(args: argparse.Namespace, case_root: Path) -> Path:
+    """fastapi is an unpinned benchmark repository, resolved by the shared ladder.
+
+    It keeps one extra legacy candidate (~/source/fastapi) and probes for a known file
+    rather than for .git, because that is what it did before the ladder was shared.
+    """
+    if args.fastapi_repo:
+        explicit: Path | None = Path(args.fastapi_repo).expanduser()
+    elif (Path.home() / "source" / "fastapi" / FASTAPI_PROBE_REL_PATH).is_file():
+        explicit = Path.home() / "source" / "fastapi"
+    else:
+        explicit = None
+    return resolve_benchmark_repo(
+        "fastapi",
+        explicit=explicit,
+        explicit_hint="--fastapi-repo PATH",
+        env_key="CBM_FASTAPI_REPO",
+        is_present=lambda candidate: (candidate / FASTAPI_PROBE_REL_PATH).is_file(),
+        timeout=args.timeout,
+        clone=(
+            (
+                lambda: clone_real_repo(
+                    args.fastapi_url, case_root / "source-fastapi", args.timeout
+                )
+            )
+            if args.clone_missing_real_repos
+            else None
+        ),
+    )
 
 
 def copy_git_head_to_dir(source_repo: Path, dest: Path, timeout: int) -> None:
@@ -5586,11 +6439,22 @@ def score_quality_oracles(
         applicable = bool(judgments) if graded else expected is not None
         passed = False
         rank: int | None = None
-        returned_count: int | None = None
         ndcg: float | None = None
+        response = result.get("response")
+        # Recorded for EVERY oracle, not just scorable ones. Behavioral-only probes have
+        # no judgments, so they are not applicable and contribute nothing to MRR, but
+        # their result count is the whole point of running them: it is how a zero-result
+        # or unstable answer becomes visible at all.
+        listed_items = ranked_items_from_response(response)
+        returned_count: int | None = (
+            len(listed_items) if listed_items is not None else None
+        )
         if applicable:
             applicable_count += 1
-            response = result.get("response")
+            # Scoring keeps its original extraction, including the single-item fallback
+            # for responses with no list shape. Widening it here would silently change
+            # rank and MRR for the existing git_history and http_links oracles, which
+            # score query_graph responses; that belongs in its own verified change.
             ranked_items = (
                 response.get("results")
                 if isinstance(response, dict)
@@ -5599,7 +6463,6 @@ def score_quality_oracles(
                 if isinstance(response, list)
                 else [response]
             )
-            returned_count = len(ranked_items)
             if graded:
                 ranking = score_ranked_relevance(ranked_items, judgments, cutoff=cutoff)
                 rank = ranking["first_relevant_rank"]
@@ -5791,6 +6654,201 @@ def run_self_dogfood_oracles(
     return oracles
 
 
+# The single query the rank oracle has always issued. Kept as the default so a run
+# without --rank-query-manifest is byte-identical to earlier runs and their cells stay
+# cache-valid (cell identity includes the command, run_experiments.py:93-110).
+DEFAULT_RANK_QUERY_BATTERY: tuple[dict[str, Any], ...] = (
+    {
+        "id": "central_order_search",
+        "family": "D",
+        "tool": "search_graph",
+        "arguments": {"label": "Function", "name_pattern": "order", "limit": 10},
+        "criterion": (
+            "rank the structurally central order workflow ahead of lexical-only decoys"
+        ),
+        "cutoff": 5,
+        "judgments": [{"expected_substring": "zz_order_core", "relevance": 3}],
+    },
+)
+
+
+def rank_fixture_overlay_decision(
+    capability: str, background: dict[str, Any] | None, args: argparse.Namespace
+) -> str:
+    """Whether the synthetic rank fixture is written into a materialized corpus tree.
+
+    Returns one of:
+
+      fixture-is-corpus  the fixture is the whole indexed repository (no background), or
+                         the capability's own established design overlays it deliberately
+      suppressed         a real corpus was materialized and the rank fixture is not added
+      overlaid           a real corpus was materialized and the fixture is planted anyway
+
+    `create_rank_quality_repo` writes `zz_order_core`, eight lexical decoys and eight
+    callers into `repo_dir` — the same directory `copy_git_revision_to_dir` materializes a
+    pinned corpus into. Overlaying them on a real corpus means the indexed graph is not
+    the tree `corpora-v1.json` pins, and `scaffolding@K` / `utility_contamination@K` /
+    `tau vs degree` are then computed over nine files the corpus does not contain.
+
+    That cost would buy a planted positive control if anything checked it, but no real
+    corpus in `rank-queries-v1/manifest.json` queries those symbols, so today it buys
+    nothing. Hence: suppressed by default for a real corpus, available through
+    `--rank-fixture-overlay`, and when it is on the canary query is appended so the
+    control actually runs (see rank_battery_with_overlay_control).
+
+    Rank-only by construction: similarity and semantic_edges overlay a pair fixture onto
+    background graph mass as their measurement design, and that is left untouched.
+    """
+    if capability != "rank" or background is None:
+        return "fixture-is-corpus"
+    return "overlaid" if getattr(args, "rank_fixture_overlay", False) else "suppressed"
+
+
+def rank_battery_with_overlay_control(
+    battery: tuple[dict[str, Any], ...], *, overlay_active: bool
+) -> tuple[dict[str, Any], ...]:
+    """Append the planted-canary query when the fixture is overlaid on a real corpus.
+
+    An overlay nobody queries is contamination rather than a control. Appending is
+    id-guarded so the synthetic corpus, which already declares this query, does not
+    count it twice in the applicable_count-weighted quality aggregate.
+    """
+    if not overlay_active:
+        return battery
+    declared = {query["id"] for query in battery}
+    return battery + tuple(
+        query for query in DEFAULT_RANK_QUERY_BATTERY if query["id"] not in declared
+    )
+
+
+def load_rank_query_battery(
+    manifest_path: str, corpus_id: str
+) -> tuple[dict[str, Any], ...]:
+    """Load one corpus's query battery from a versioned manifest.
+
+    Returns the built-in single-query battery when no manifest is supplied, which is
+    what keeps historical cells comparable. Path handling mirrors
+    create_pair_quality_repo's manifest discipline: schema pinned, relative paths only.
+    """
+    if not manifest_path:
+        return DEFAULT_RANK_QUERY_BATTERY
+    path = Path(manifest_path).expanduser()
+    if not path.is_file():
+        raise ValueError(f"rank query manifest not found: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("schema_version") != 1:
+        raise ValueError(f"unsupported rank query manifest schema: {path}")
+    corpora = document.get("corpora")
+    if not isinstance(corpora, dict):
+        raise ValueError(f"rank query manifest has no corpora object: {path}")
+    if corpus_id not in corpora:
+        available = ", ".join(sorted(corpora)) or "(none)"
+        raise ValueError(
+            f"corpus {corpus_id!r} is absent from {path.name}; available: {available}"
+        )
+    queries = corpora[corpus_id].get("queries")
+    if not isinstance(queries, list) or not queries:
+        raise ValueError(f"corpus {corpus_id!r} declares no queries in {path.name}")
+    # A manifest-level cutoff is the point of declaring one; without this the loop's
+    # hardcoded 5 silently won and the field was decorative.
+    default_cutoff = document.get("default_cutoff", 5)
+    resolved: list[dict[str, Any]] = []
+    for query in queries:
+        for field in ("id", "tool", "arguments"):
+            if field not in query:
+                raise ValueError(f"query in corpus {corpus_id!r} is missing {field!r}")
+        entry = dict(query)
+        entry.setdefault("cutoff", default_cutoff)
+        repetitions = entry.get("repetitions", 1)
+        if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
+            raise ValueError(
+                f"query {entry['id']!r} declares repetitions={repetitions!r}; "
+                "it must be a positive integer"
+            )
+        entry["repetitions"] = repetitions
+        resolved.append(entry)
+    return tuple(resolved)
+
+
+def manifest_corpus_disagreements(
+    battery_path: str, corpus_manifest_path: str
+) -> list[str]:
+    """Corpus ids present in one manifest but not the other.
+
+    Drift is easy to introduce and only surfaces mid-run: `--corpus ripgrep` resolves in
+    the registry, then fails when the battery is loaded. Listing both directions makes
+    the gap visible before a campaign starts rather than after.
+    """
+    if not battery_path:
+        return []
+    document = json.loads(Path(battery_path).expanduser().read_text(encoding="utf-8"))
+    battery_ids = set(document.get("corpora") or {})
+    registry_ids = set(load_corpora_manifest(corpus_manifest_path))
+    return [
+        *(
+            f"{name}: has queries but no corpus registry entry"
+            for name in sorted(battery_ids - registry_ids - {"synthetic-rank-v1"})
+        ),
+        *(
+            f"{name}: registered as a corpus but has no queries"
+            for name in sorted(registry_ids - battery_ids)
+        ),
+    ]
+
+
+def ranked_items_from_response(response: Any) -> list[Any] | None:
+    """Extract the ranked list from a tool response, or None if it has no list shape.
+
+    Mirrors the extraction score_quality_oracles performs, so per-query result counts
+    and the graded scores are always computed from the same list.
+    """
+    if isinstance(response, dict):
+        for key in ("results", "matches", "rows"):
+            if isinstance(response.get(key), list):
+                return response[key]
+        total = response.get("total_results")
+        if isinstance(total, int):
+            return [] if total == 0 else [None] * total
+        return None
+    if isinstance(response, list):
+        return response
+    return None
+
+
+def count_ranked_items(response: Any) -> int | None:
+    """Number of items a response listed, or None when it has no list shape."""
+    ranked = ranked_items_from_response(response)
+    return len(ranked) if ranked is not None else None
+
+
+def summarize_zero_result_behavior(oracles: dict[str, Any]) -> dict[str, Any]:
+    """Count zero-result answers across the battery.
+
+    Behavioral-only probes carry no judgments, so score_quality_oracles marks them
+    not-applicable and they contribute nothing to MRR. They still carry the signal the
+    recovered workload showed most often: search_code is 8% of real calls but ~70% of
+    all zero-result failures, and identical calls returned zero non-deterministically
+    (max_hits_per_page returned zero 18 of 54 times against a fixed index).
+    """
+    total = 0
+    zero = 0
+    zero_ids: list[str] = []
+    for name, oracle in oracles.items():
+        if not isinstance(oracle, dict) or "response" not in oracle:
+            continue
+        total += 1
+        ranked = ranked_items_from_response(oracle.get("response"))
+        if ranked is not None and not ranked:
+            zero += 1
+            zero_ids.append(name)
+    return {
+        "query_count": total,
+        "zero_result_count": zero,
+        "zero_result_rate": (zero / total) if total else None,
+        "zero_result_queries": sorted(zero_ids),
+    }
+
+
 def run_rank_quality_oracles(
     transport: str,
     binary: Path,
@@ -5799,36 +6857,86 @@ def run_rank_quality_oracles(
     args: argparse.Namespace,
     client: McpClient | None = None,
 ) -> dict[str, Any]:
-    oracles = {
-        "central_order_search": run_tool_call_for_transport(
+    battery = rank_battery_with_overlay_control(
+        load_rank_query_battery(
+            getattr(args, "rank_query_manifest", "") or "",
+            getattr(args, "corpus", "") or "synthetic-rank-v1",
+        ),
+        overlay_active=bool(getattr(args, "rank_overlay_active", False)),
+    )
+    oracles: dict[str, Any] = {}
+    expectations: dict[str, Any] = {}
+    for query in battery:
+        arguments = {"project": project, **query["arguments"]}
+        repetitions = int(query.get("repetitions", 1))
+        oracle = run_tool_call_for_transport(
             transport,
             binary,
             env,
-            "search_graph",
-            {
-                "project": project,
-                "label": "Function",
-                "name_pattern": "order",
-                "limit": 10,
-            },
+            query["tool"],
+            arguments,
             args.timeout,
             args.include_logs,
             client,
         )
-    }
-    expectations = {
-        "central_order_search": {
-            "criterion": (
-                "rank the structurally central order workflow ahead of lexical-only decoys"
-            ),
-            "cutoff": 5,
-            "judgments": [
-                {"expected_substring": "zz_order_core", "relevance": 3},
-            ],
+        if repetitions > 1:
+            # Some recovered calls returned results and zero results non-deterministically
+            # against a fixed index (max_hits_per_page: zero 18 of 54 times). A single
+            # call cannot see that, so repeat and record the spread. The first response is
+            # kept as the scored one so graded metrics stay comparable to a 1-rep run.
+            counts = [count_ranked_items(oracle.get("response"))]
+            for _ in range(repetitions - 1):
+                repeat = run_tool_call_for_transport(
+                    transport,
+                    binary,
+                    env,
+                    query["tool"],
+                    arguments,
+                    args.timeout,
+                    args.include_logs,
+                    client,
+                )
+                counts.append(count_ranked_items(repeat.get("response")))
+            observed = [value for value in counts if value is not None]
+            oracle["repetition_stability"] = {
+                "repetitions": repetitions,
+                "result_counts": counts,
+                "zero_result_repetitions": sum(
+                    1 for value in observed if value == 0
+                ),
+                "distinct_result_counts": len(set(observed)),
+                "stable": len(set(observed)) <= 1,
+            }
+        # fact_step_rows walks the report for any dict carrying elapsed_ms and emits a
+        # timing fact keyed by this query id, so latency, payload bytes and token
+        # estimates are already published. Only the query's identity is missing, so
+        # record that on the oracle rather than building a parallel measurement list.
+        oracle["query"] = {
+            "id": query["id"],
+            "family": query.get("family"),
+            "tool": query["tool"],
+            "arguments": dict(sorted(query["arguments"].items())),
+            "graded": bool(query.get("judgments")),
+            "behavioral_only": bool(query.get("behavioral_only")),
         }
-    }
+        oracles[query["id"]] = oracle
+        judgments = query.get("judgments") or []
+        if judgments:
+            expectations[query["id"]] = {
+                "criterion": query.get("criterion", query["id"]),
+                "cutoff": query.get("cutoff", 5),
+                "judgments": judgments,
+            }
     quality = score_quality_oracles(oracles, expectations)
+    behavior = summarize_zero_result_behavior(oracles)
     oracles["quality"] = quality
+    oracles["zero_result_behavior"] = behavior
+    oracles["rank_query_battery"] = {
+        "query_count": len(battery),
+        "graded_count": len(expectations),
+        "behavioral_only_count": len(battery) - len(expectations),
+        "query_ids": [query["id"] for query in battery],
+    }
     oracles["passed"] = quality["passed"]
     return oracles
 
@@ -6437,6 +7545,16 @@ def run_capability_quality(
                 if args.quality_background_repo
                 else None
             ),
+            # These three select what was measured, so they belong in the identity that
+            # feeds run_id. Without them two corpora resolving to the same background
+            # path, or two different query batteries, would hash identically.
+            "corpus": getattr(args, "corpus", "") or None,
+            "corpus_manifest_sha256": manifest_digest(
+                getattr(args, "corpus_manifest", "") or None, DEFAULT_CORPORA_MANIFEST
+            ),
+            "rank_query_manifest_sha256": manifest_digest(
+                getattr(args, "rank_query_manifest", "") or None, None
+            ),
         },
         "cleanup": {
             "requested": auto_root and not args.keep_work_root,
@@ -6447,14 +7565,41 @@ def run_capability_quality(
     exit_code = 1
     try:
         background = None
+        # `--corpus <id>` alone is enough: the registry supplies the URL, the pinned
+        # commit and the expected tree, so the caller does not have to restate them as
+        # --quality-background-repo/--revision and cannot accidentally disagree with the
+        # registry. An explicit --quality-background-repo still wins, for one-off runs.
+        corpus_id = getattr(args, "corpus", "") or ""
+        corpus_entry = None
+        expected_tree = None
+        if corpus_id and corpus_id != "synthetic-rank-v1":
+            registry = load_corpora_manifest(getattr(args, "corpus_manifest", ""))
+            if corpus_id not in registry:
+                raise ValueError(
+                    f"corpus {corpus_id!r} is absent from the corpus registry; "
+                    f"known: {', '.join(sorted(registry))}"
+                )
+            corpus_entry = registry[corpus_id]
+            if not args.quality_background_repo and corpus_entry.get("url"):
+                source = resolve_corpus_source(
+                    corpus_id,
+                    corpus_entry["url"],
+                    corpus_entry["revision"],
+                    args,
+                )
+                verify_corpus_pin(source, corpus_entry, args.timeout)
+                args.quality_background_repo = str(source)
+                args.quality_background_revision = corpus_entry["revision"]
+                expected_tree = corpus_entry.get("tree")
         if args.quality_background_revision and not args.quality_background_repo:
             raise ValueError(
                 "--quality-background-revision requires --quality-background-repo"
             )
         if args.quality_background_repo:
-            if capability not in {"similarity", "semantic_edges"}:
+            if capability not in QUALITY_BACKGROUND_CAPABILITIES:
                 raise ValueError(
-                    "quality background repository is supported only for similarity and semantic_edges"
+                    "quality background repository is supported only for "
+                    + ", ".join(sorted(QUALITY_BACKGROUND_CAPABILITIES))
                 )
             background = copy_git_revision_to_dir(
                 Path(args.quality_background_repo).expanduser(),
@@ -6463,6 +7608,14 @@ def run_capability_quality(
                 args.timeout,
                 excluded_prefixes=("benchmarks/semantic-pairs-v1/",),
             )
+            # The tree copy_git_revision_to_dir resolved is what git archive actually
+            # materialized, so this validates the bytes the experiment indexed rather
+            # than whatever HEAD happened to point at.
+            if expected_tree and background.get("tree") != expected_tree:
+                raise ValueError(
+                    f"corpus {corpus_id!r} materialized tree {background.get('tree')}, "
+                    f"registry pins {expected_tree}"
+                )
         fixture_factory = {
             "rank": create_rank_quality_repo,
             "dependencies": create_dependency_quality_repo,
@@ -6471,7 +7624,20 @@ def run_capability_quality(
             "git_history": create_git_history_quality_repo,
             "http_links": create_http_links_quality_repo,
         }[capability]
-        fixture = fixture_factory(repo_dir)
+        overlay = rank_fixture_overlay_decision(capability, background, args)
+        if overlay == "suppressed":
+            # Index exactly the pinned tree. Recorded either way so a reader of the
+            # result JSON never has to infer which bytes were scored.
+            fixture = {
+                "fixture_version": 1,
+                "capability": capability,
+                "language": "corpus",
+                "ranking_signal": "the corpus's own call graph",
+            }
+        else:
+            fixture = fixture_factory(repo_dir)
+        fixture["corpus_overlay"] = overlay
+        args.rank_overlay_active = overlay == "overlaid"
         apply_rank_refresh_override(binary, case_env, args.rank_refresh, args.timeout)
         apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
         lifecycle = None
@@ -6529,6 +7695,65 @@ def run_capability_quality(
             "background_repository": background,
             "initial_fast_full": indexed,
             "oracles": oracles,
+            "corpus": (
+                {
+                    "id": corpus_id,
+                    "repo": corpus_entry.get("repo"),
+                    "revision": corpus_entry.get("revision"),
+                    "tree": corpus_entry.get("tree"),
+                    "cohort": corpus_entry.get("cohort"),
+                    "discriminates": corpus_entry.get("discriminates"),
+                }
+                if corpus_entry
+                else None
+            ),
+            # Both are rank-specific: staleness of the ranking views only bears on a
+            # ranking measurement, and the probes read the ranking tables.
+            "rank_score_staleness": (
+                rank_score_staleness(cache_dir, project, oracles)
+                if capability == "rank"
+                else None
+            ),
+            "rank_score_probes": (
+                run_rank_score_probes(
+                    cache_dir,
+                    project,
+                    scaffolding_paths=(
+                        load_scaffolding_paths(corpus_id, args.labels_dir)
+                        if getattr(args, "labels_dir", "")
+                        else derive_scaffolding_paths(
+                            corpus_id,
+                            Path(args.quality_background_repo).expanduser()
+                            if args.quality_background_repo
+                            else None,
+                            args.timeout,
+                        )
+                    ),
+                )
+                if capability == "rank"
+                else None
+            ),
+            # Cheap enough to always emit on a rank run (one indexed scan of the
+            # published table), and it is the only way a later cell comparison can tell
+            # an inert config knob from one that genuinely does not help.
+            "rank_table_fingerprint": (
+                rank_table_fingerprint(cache_dir, project)
+                if capability == "rank"
+                else None
+            ),
+            # Coverage is not rank-specific in principle, but only a corpus run has a
+            # registry prediction to score, and only a real tree has directories worth
+            # attributing. Emitted whenever a corpus was materialized.
+            "corpus_coverage": (
+                run_corpus_coverage_probe(
+                    cache_dir,
+                    project,
+                    predicted_loss=(corpus_entry or {}).get("predicted_loss"),
+                    index_mode=args.index_mode,
+                )
+                if corpus_entry
+                else None
+            ),
             "pair_lifecycle": lifecycle,
             "execution_passed": True,
             "quality_target_met": (
@@ -7337,6 +8562,67 @@ def parse_args() -> argparse.Namespace:
         "--quality-background-revision",
         default="",
         help="Commit-ish copied by git archive for --quality-background-repo; experiments should use a full hash.",
+    )
+    parser.add_argument(
+        "--rank-query-manifest",
+        default="",
+        help=(
+            "Optional versioned query battery for capability-quality rank runs, e.g. "
+            "benchmarks/rank-queries-v1/manifest.json. Defaults to empty, which issues the "
+            "single built-in query so existing cells stay byte-identical and cache-valid."
+        ),
+    )
+    parser.add_argument(
+        "--corpus",
+        default="",
+        help=(
+            "Corpus id this run measures, e.g. cosign. One id keys everything: the query "
+            "set in --rank-query-manifest, the registry entry in --corpus-manifest, and "
+            "any --corpus-repo override. Defaults to synthetic-rank-v1, the built-in "
+            "fixture. An unknown id fails immediately rather than silently running nothing."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-repo",
+        action="append",
+        default=[],
+        metavar="ID=PATH",
+        help=(
+            "Point a corpus id from corpora-v1.json at an existing local checkout, "
+            "repeatable. Otherwise the harness looks at CBM_BENCH_CORPUS_<ID> and then "
+            "~/.cache/codebase-memory-mcp/bench-repos/<id>, and only clones the pinned "
+            "commit when --clone-missing-real-repos is also given."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-manifest",
+        default="",
+        help=(
+            "Corpus registry with pinned revisions and trees; defaults to "
+            "benchmarks/corpora-v1.json."
+        ),
+    )
+    parser.add_argument(
+        "--labels-dir",
+        default="",
+        help=(
+            "Directory of pre-generated Tier-A test labels named <corpus>.json. "
+            "Defaults to empty, which derives them from the measured checkout instead, "
+            "so no generated label data is stored. Either way a corpus no independent "
+            "source can classify reports scaffolding@K as null rather than inferring it "
+            "from this server's own test predicates."
+        ),
+    )
+    parser.add_argument(
+        "--rank-fixture-overlay",
+        action="store_true",
+        help=(
+            "Plant the synthetic rank fixture (zz_order_core plus eight lexical decoys) "
+            "into a real corpus as a positive control, and append its canary query to "
+            "the battery. Off by default: a real-corpus run indexes exactly the pinned "
+            "tree, so corpus-scoped scores are not diluted by symbols the corpus does "
+            "not contain. Has no effect without a corpus, where the fixture is the repo."
+        ),
     )
     parser.add_argument(
         "--matrix",

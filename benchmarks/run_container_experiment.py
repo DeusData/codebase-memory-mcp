@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -17,6 +18,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "test-infrastructure" / "Dockerfile"
+# Staged corpora live beside the bundle on the work volume, outside /results, because
+# they are measured input rather than exported output.
+CONTAINER_CORPUS_ROOT = "/benchmark/corpora"
+CORPUS_FLAG = "--corpus"
 DEFAULT_BUILD_ENVIRONMENT = {
     "CC": "clang-18",
     "CXX": "clang++-18",
@@ -133,6 +139,7 @@ def container_run_key(
     matrix_spec_sha256: str | None,
     resources: dict[str, Any],
     runner_arguments: list[str],
+    corpora: list[dict[str, str]] | None = None,
 ) -> str:
     """Identify one resumable measurement cohort inside a named history."""
     identity = {
@@ -145,10 +152,192 @@ def container_run_key(
             argument for argument in runner_arguments if argument != "--audit-only"
         ],
     }
+    # Staged corpora are measured input: two pins sharing a run key would resume into
+    # one runset and merge cells taken against different source trees. Absent rather
+    # than empty when nothing is staged, so run keys recorded before corpus staging
+    # existed still resolve to the same cohort.
+    if corpora:
+        identity["corpora"] = sorted(
+            ({"id": entry["id"], "revision": entry["revision"]} for entry in corpora),
+            key=lambda entry: entry["id"],
+        )
     payload = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode(
         "utf-8"
     )
     return hashlib.sha256(payload).hexdigest()[:24]
+
+
+def load_benchmark_module() -> Any:
+    """Reuse run_benchmark.py's corpus logic instead of restating it here.
+
+    Same importlib pattern autotune.py uses for run_experiments.py helpers. The
+    resolution ladder, the pin check and the environment-variable spelling stay defined
+    once, in the module that also reads them inside the container.
+    """
+    cached = sys.modules.get("run_benchmark")
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().with_name("run_benchmark.py")
+    spec = importlib.util.spec_from_file_location("run_benchmark", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load the benchmark harness from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["run_benchmark"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def corpus_env_key(corpus_id: str) -> str:
+    """Spelled by run_benchmark.py so the writer and the reader cannot disagree."""
+    return load_benchmark_module().corpus_env_key(corpus_id)
+
+
+def container_corpus_path(corpus_id: str, revision: str) -> str:
+    """Immutable, pin-keyed location for a staged corpus inside the work volume.
+
+    The work volume is retained so a runset can resume, and `docker cp` merges into an
+    existing directory rather than replacing it. Keying only by corpus id would leave
+    files from a previous pin in place and index a tree matching no commit.
+    """
+    return f"{CONTAINER_CORPUS_ROOT}/{corpus_id}-{revision[:12]}"
+
+
+def staged_corpus_revision(
+    entry: dict[str, Any], source: Path, timeout: int
+) -> str:
+    """The commit a staged corpus is keyed and reported by.
+
+    A pinned entry supplies its own 40-character sha. The four mined-workload corpora
+    declare "resolve-at-runtime" instead, so their commit is read from the checkout;
+    keying on the literal would give every state of that repository one directory and a
+    retained work volume would merge two different trees under one name.
+
+    Reading HEAD is sufficient rather than approximate: copy_git_revision_to_dir
+    materializes the corpus with `git archive`, which only ever sees committed content,
+    so uncommitted edits in the source checkout cannot reach the measured tree.
+    """
+    harness = load_benchmark_module()
+    revision = entry.get("revision") or ""
+    if len(revision) == 40:
+        return revision
+    if revision != harness.UNPINNED_REVISION:
+        # Same rule as verify_corpus_pin. Accepting any non-sha here would let a typo'd
+        # revision be staged as "whatever HEAD is" and then recorded as the measured
+        # commit, which is the failure the sentinel exists to make explicit.
+        raise RuntimeError(
+            f"corpus {entry.get('id')!r} declares revision {revision!r}, which is "
+            f"neither a 40-character commit hash nor {harness.UNPINNED_REVISION!r}"
+        )
+    return harness.command_stdout(["git", "rev-parse", "HEAD"], timeout, source).strip()
+
+
+def corpora_in_arguments(arguments: list[str]) -> list[str]:
+    """Corpus ids named by one benchmark_args list, in either flag spelling."""
+    found: list[str] = []
+    for index, argument in enumerate(arguments):
+        if argument == CORPUS_FLAG and index + 1 < len(arguments):
+            found.append(arguments[index + 1])
+        elif argument.startswith(f"{CORPUS_FLAG}="):
+            found.append(argument.split("=", 1)[1])
+    return found
+
+
+def corpora_required_by_spec(document: Any) -> list[str]:
+    """Corpus ids named by any benchmark_args list anywhere in a matrix spec.
+
+    run_experiments.py accepts benchmark_args at four levels — spec, candidates,
+    profiles and scenarios — and concatenates them (:1677-1680). The scan is recursive
+    rather than four fixed lookups so a level added later is covered without an edit
+    here, and so a corpus named only inside one profile is still staged.
+    """
+    found: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "benchmark_args" and isinstance(value, list):
+                    found.extend(
+                        item for item in corpora_in_arguments(value) if isinstance(item, str)
+                    )
+                else:
+                    visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(document)
+    return sorted(set(found))
+
+
+def stage_corpora(
+    *,
+    docker: str,
+    image: str,
+    work_volume: str,
+    corpus_ids: list[str],
+    corpus_repo: list[str],
+    corpus_manifest: str,
+    allow_clone: bool,
+    timeout: int,
+    container_name: str,
+) -> list[dict[str, str]]:
+    """Copy each pinned corpus into the work volume and report what was staged.
+
+    The measured container has no network and no host bind mount, so a corpus has to be
+    resolved and pin-verified on the host and then carried in. Resolution is
+    run_benchmark.py's own ladder (--corpus-repo, CBM_BENCH_CORPUS_<ID>, the shared
+    cache, then an explicitly allowed clone), so the host and the container agree on
+    which checkout a corpus id means.
+
+    Time and I/O are linear in the staged bytes, once per corpus per run; the work
+    volume is retained, but each pin lands in its own directory so a re-pin cannot
+    merge into stale files.
+    """
+    if not corpus_ids:
+        return []
+    harness = load_benchmark_module()
+    registry = harness.load_corpora_manifest(corpus_manifest)
+    resolution_args = argparse.Namespace(
+        corpus_repo=list(corpus_repo),
+        clone_missing_real_repos=allow_clone,
+        timeout=timeout,
+    )
+    staged: list[dict[str, str]] = []
+    for corpus_id in corpus_ids:
+        if corpus_id not in registry:
+            raise RuntimeError(
+                f"corpus {corpus_id!r} is absent from the corpus registry; known: "
+                + ", ".join(sorted(registry))
+            )
+        entry = registry[corpus_id]
+        source = harness.resolve_corpus_source(
+            corpus_id, entry["url"], entry["revision"], resolution_args
+        )
+        # Verify on the host, where the failure is cheap and the message is visible,
+        # rather than after a candidate build has already run inside the container.
+        harness.verify_corpus_pin(source, entry, timeout)
+        revision = staged_corpus_revision(entry, source, timeout)
+        destination = container_corpus_path(corpus_id, revision)
+        copy_to_volume(
+            docker,
+            image,
+            work_volume,
+            "/benchmark",
+            source,
+            container_name,
+            copy_destination=destination,
+        )
+        staged.append(
+            {
+                "id": corpus_id,
+                "revision": revision,
+                "registry_revision": entry.get("revision", ""),
+                "tree": entry.get("tree", ""),
+                "host_path": str(source),
+                "container_path": destination,
+            }
+        )
+    return staged
 
 
 def native_linux_platform(machine: str) -> str:
@@ -274,6 +463,7 @@ def build_measured_command(
     experiment_root: str,
     uid: int | None,
     gid: int | None,
+    corpus_environment: dict[str, str] | None = None,
 ) -> list[str]:
     command = [
         docker,
@@ -301,6 +491,10 @@ def build_measured_command(
     if uid is not None and gid is not None:
         command.extend(("--user", f"{uid}:{gid}"))
     for key, value in DEFAULT_BUILD_ENVIRONMENT.items():
+        command.extend(("--env", f"{key}={value}"))
+    # Rung 2 of run_benchmark.py's resolution ladder. Pointing at the staged copy this
+    # way means the container needs no new flag, no network, and no second resolver.
+    for key, value in sorted((corpus_environment or {}).items()):
         command.extend(("--env", f"{key}={value}"))
     source_key = repository_snapshot_sha256[:20]
     command.extend(
@@ -571,6 +765,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image")
     parser.add_argument("--docker", default="docker")
     parser.add_argument(
+        "--corpus",
+        action="append",
+        default=[],
+        metavar="ID",
+        help=(
+            "Stage this corpus into the container in addition to any named by the "
+            "matrix spec's benchmark_args, which are detected automatically. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-repo",
+        action="append",
+        default=[],
+        metavar="ID=PATH",
+        help=(
+            "Resolve a corpus id from an existing local checkout, repeatable. Same "
+            "spelling and precedence as run_benchmark.py: this wins, then "
+            "CBM_BENCH_CORPUS_<ID>, then ~/.cache/codebase-memory-mcp/bench-repos/<id>."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-manifest",
+        default="",
+        help="Corpus registry; defaults to benchmarks/corpora-v1.json.",
+    )
+    parser.add_argument(
+        "--clone-missing-real-repos",
+        action="store_true",
+        help=(
+            "Allow cloning a pinned corpus that is not already available. Cloning "
+            "happens on the host before the measured container starts, so the "
+            "measurement itself never depends on the network."
+        ),
+    )
+    parser.add_argument(
+        "--corpus-timeout",
+        type=int,
+        default=1800,
+        help="Seconds allowed for each host-side corpus resolution or clone.",
+    )
+    parser.add_argument(
         "runner_arguments",
         nargs=argparse.REMAINDER,
         help="Additional run_experiments.py arguments after --.",
@@ -739,12 +974,41 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             runner_arguments.extend(("--build-jobs", str(args.build_jobs)))
             runner_arguments.extend(args.runner_arguments)
+
+            # A campaign spec names its corpora in benchmark_args, so the caller does
+            # not have to restate them here and cannot accidentally stage a different
+            # set from the one the cells will ask for. --corpus adds to that.
+            spec_corpora = (
+                corpora_required_by_spec(
+                    json.loads(copied_matrix.read_text(encoding="utf-8"))
+                )
+                if args.matrix_spec is not None
+                else []
+            )
+            corpus_ids = sorted(set(spec_corpora) | set(args.corpus))
+            staged_corpora = stage_corpora(
+                docker=args.docker,
+                image=image,
+                work_volume=work_volume,
+                corpus_ids=corpus_ids,
+                corpus_repo=args.corpus_repo,
+                corpus_manifest=args.corpus_manifest,
+                allow_clone=args.clone_missing_real_repos,
+                timeout=args.corpus_timeout,
+                container_name=seed_name,
+            )
+            corpus_environment = {
+                corpus_env_key(entry["id"]): entry["container_path"]
+                for entry in staged_corpora
+            }
+
             run_key = container_run_key(
                 source_revision=source_revision,
                 repository_snapshot_sha256=repository_snapshot,
                 matrix_spec_sha256=effective_matrix_sha,
                 resources=args.resources,
                 runner_arguments=runner_arguments,
+                corpora=staged_corpora,
             )
             container_experiment_root = f"/results/runsets/{run_key}"
 
@@ -784,6 +1048,10 @@ def main(argv: list[str] | None = None) -> int:
                 "run_key": run_key,
                 "container_experiment_root": container_experiment_root,
                 "container_repository": f"/benchmark/sources/{source_key}",
+                # Which corpus bytes were measured, pin-verified on the host before the
+                # container started. Without this a published number names a corpus id
+                # but not the commit behind it.
+                "staged_corpora": staged_corpora,
             }
             manifest_path = write_container_manifest(
                 input_root,
@@ -837,6 +1105,7 @@ def main(argv: list[str] | None = None) -> int:
                 experiment_root=container_experiment_root,
                 uid=uid,
                 gid=gid,
+                corpus_environment=corpus_environment,
             )
             measured_process = subprocess.run(measured, text=True, check=False)
             export_results(

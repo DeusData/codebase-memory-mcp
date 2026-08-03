@@ -2160,6 +2160,170 @@
       "status": "existing",
       "term_id": "left_elapsed_divided_by_right_elapsed_v1",
       "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "0 to 1 inclusive",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "nonnegative number",
+      "definition": "Scaffolding@K is the fraction of a score's top K ranked symbols whose file is labeled a test by a source independent of this server: the project's own declared test configuration or the language toolchain's rule. It is null when no independent labels were supplied, and is never inferred from this server's own test predicates, because those predicates are the thing under measurement.",
+      "deprecated_replacement": null,
+      "display_name": "scaffolding@K",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "quality_metric",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py",
+        "benchmarks/generate_test_labels.py"
+      ],
+      "status": "existing",
+      "term_id": "scaffolding_at_k",
+      "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "0 to 1 inclusive",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "nonnegative number",
+      "definition": "Utility contamination@K is the fraction of a score's top K ranked symbols that are logging, formatting or allocation utilities, matched on whole identifier tokens rather than substrings. It tests the objection that a graph score surfaces utility popularity rather than architectural importance.",
+      "deprecated_replacement": null,
+      "display_name": "utility contamination@K",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "quality_metric",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py"
+      ],
+      "status": "existing",
+      "term_id": "utility_contamination_at_k",
+      "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "0 to 1 inclusive",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "nonnegative number",
+      "definition": "Silent drop rate is the fraction of a corpus's source files present under one index mode and absent under another, attributed to the directory name that excluded them. It quantifies coverage lost to built-in skip lists without any diagnostic in the response.",
+      "deprecated_replacement": null,
+      "display_name": "silent drop rate",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "quality_metric",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py",
+        "src/discover/discover.c"
+      ],
+      "status": "existing",
+      "term_id": "silent_drop_rate",
+      "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "values defined by the referenced benchmark schema",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "object or categorical record",
+      "definition": "Rank score staleness records whether the pagerank, linkrank and node_degree derived views were current when a ranking measurement ran, taking the union of views the tool responses declared stale and views the freshness ledger persisted as stale. A ranking number measured while these are stale describes the degree fallback rather than the requested score.",
+      "deprecated_replacement": null,
+      "display_name": "rank score staleness",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "freshness_and_correctness",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py",
+        "src/store/store.c"
+      ],
+      "status": "existing",
+      "term_id": "rank_score_staleness",
+      "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "values defined by the referenced benchmark schema",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "object or categorical record",
+      "definition": "Repetition stability is the set of result counts observed when one query is repeated against a fixed index, and whether they all agree. It detects calls that non-deterministically return results and zero results without any change to the index.",
+      "deprecated_replacement": null,
+      "display_name": "repetition stability",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "measurement",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py"
+      ],
+      "status": "existing",
+      "term_id": "repetition_stability",
+      "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "values defined by the referenced benchmark schema",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "object or categorical record",
+      "definition": "A behavioral-only probe is a battery query carrying no relevance judgments. It is excluded from rank-quality aggregates because no ground truth defines a correct answer, while still recording result count, latency and payload size.",
+      "deprecated_replacement": null,
+      "display_name": "behavioral-only probe",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "benchmark_concept",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py"
+      ],
+      "status": "existing",
+      "term_id": "behavioral_only_probe",
+      "unit": "dimensionless"
+    },
+    {
+      "aggregation_rule": "use the formula and repetition estimator recorded with the result",
+      "allowed_values_or_range": "values defined by the referenced benchmark schema",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "none beyond the term's normative definition",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; use recorded occurrence intervals and dependency relations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "object or categorical record",
+      "definition": "A reply detail profile is a named set of response-size configuration values such as search_limit and snippet_max_lines, applied so retrieval quality can be reported per response token rather than per query alone.",
+      "deprecated_replacement": null,
+      "display_name": "reply detail profile",
+      "examples": [],
+      "introduced_version": "1.2.0",
+      "kind": "benchmark_concept",
+      "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
+      "source_anchors": [
+        "benchmarks/run_benchmark.py"
+      ],
+      "status": "existing",
+      "term_id": "reply_detail_profile",
+      "unit": "dimensionless"
     }
   ],
   "schema_version": 1,
@@ -2182,5 +2346,5 @@
     "first_core_query",
     "first_all_fresh_query"
   ],
-  "terminology_version": "1.1.0"
+  "terminology_version": "1.2.0"
 }
