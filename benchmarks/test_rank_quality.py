@@ -135,6 +135,54 @@ def test_allowlist_covers_every_tunable_knob() -> None:
 
 # --- utility-symbol classification ----------------------------------------------
 
+def test_public_api_label_follows_the_language_rule_not_fan_in() -> None:
+    """The label H1/H5 need: independent of degree, so it can adjudicate PR #151's claim
+    that the highest-fan-in symbols are utilities rather than assuming it. Go's rule is
+    definitional — an identifier is exported iff it starts with an upper-case letter."""
+    assert rb.is_public_api("cmd.cosign.cli.attest.AttestCommand", "a/attest.go") is True
+    assert rb.is_public_api("pkg.cosign.mockAttestation", "pkg/verify_test.go") is False
+    # Python: a leading underscore anywhere in the dotted path marks the surface private,
+    # which is what makes sklearn._loss.loss internal while sklearn.base.BaseEstimator
+    # is public. The structural leaf-hub definition got that exact pair backwards.
+    assert rb.is_public_api("sklearn.base.BaseEstimator", "sklearn/base.py") is True
+    assert rb.is_public_api("sklearn._loss.loss.ArrayAPILossMixin", "sklearn/_loss/loss.py") is False
+    assert rb.is_public_api("flask.app.Flask._find_error_handler", "src/flask/app.py") is False
+    # Dunders are language protocol, not private surface.
+    assert rb.is_public_api("sklearn.base.BaseEstimator.__init__", "sklearn/base.py") is True
+
+
+def test_public_api_label_reports_unknown_rather_than_guessing() -> None:
+    """C publicity needs header parsing and Rust needs `pub`; neither is a name rule.
+    Reporting unknown keeps the metric honest instead of inventing a verdict for redis."""
+    assert rb.is_public_api("server.processCommand", "src/server.c") is None
+    assert rb.is_public_api("grep.searcher.Searcher", "crates/searcher/src/lib.rs") is None
+    assert rb.is_public_api("anything", "") is None
+
+
+def test_non_public_rate_is_measured_and_is_null_where_unknown() -> None:
+    """The replacement for leaf_hub_rate in the H1/H5 role. Null, not zero, on a corpus
+    whose language has no name-level publicity rule."""
+    go = Path(tempfile.mkdtemp())
+    make_rank_db(
+        go,
+        [(f"pkg.Exported{i}", "pkg/a.go", 50 - i, float(50 - i)) for i in range(5)]
+        + [("pkg.internalHelper", "pkg/a.go", 900, 99.0)],
+    )
+    window = rb.run_rank_score_probes(go, "p", top_n=6, cutoffs=(1,))["scorers"]["degree"][
+        "by_cutoff"
+    ]["1"]
+    # internalHelper has the highest degree, so it heads the degree ranking and it is
+    # not exported: exactly the shape PR #151 describes, measured without using fan-in.
+    assert window["non_public_rate"] == 1.0
+
+    c = Path(tempfile.mkdtemp())
+    make_rank_db(c, [("server.processCommand", "src/server.c", 5, 1.0)])
+    c_window = rb.run_rank_score_probes(c, "p", top_n=1, cutoffs=(1,))["scorers"]["degree"][
+        "by_cutoff"
+    ]["1"]
+    assert c_window["non_public_rate"] is None
+
+
 def test_leaf_hub_rate_is_named_for_what_it_measures() -> None:
     """The metric was called utility_contamination and read as adjudicating PR #151's
     claim that high fan-in means utilities. It cannot: it SELECTS by high fan-in while
@@ -156,9 +204,10 @@ def test_leaf_hub_rate_is_named_for_what_it_measures() -> None:
     assert "utility_contamination" not in window
 
 
-def test_h5_is_reported_as_not_measurable_rather_than_decided() -> None:
-    """A verdict computed from a circular metric is worse than no verdict: it looks like
-    evidence. H5 states plainly that no current instrument can adjudicate it."""
+def test_h5_is_not_measurable_without_the_public_api_label() -> None:
+    """A verdict computed from a fan-in-derived metric is worse than no verdict: it
+    looks like evidence. With no public-API verdicts, H5 says so instead of falling back
+    to leaf_hub_rate, which selects on the quantity the degree scorers rank by."""
     rollup = rr.build_rollup(
         [rollup_case(name, utility={"degree": 0.9, "pagerank": 0.1})
          for name in ("cosign", "redis", "runc")]
@@ -166,8 +215,23 @@ def test_h5_is_reported_as_not_measurable_rather_than_decided() -> None:
     verdict = rollup["verdicts"]["H5"]
     assert verdict["supported"] is None
     assert verdict["status"] == "not_measurable"
-    assert "circular" in verdict["statement"].lower()
+    assert "public-api" in verdict["statement"].lower()
+    assert "fan-in" in verdict["statement"].lower()
     assert rollup["validation"]["passed"] is False
+
+
+def test_h5_is_decided_once_the_public_api_label_is_present() -> None:
+    """The label is independent of degree, so a direction from it is meaningful. Go and
+    Python corpora supply it; C and Rust report null and contribute nothing."""
+    cases = [
+        rollup_case(name, non_public={"degree": 0.8, "pagerank": 0.3})
+        for name in ("cosign", "flask", "runc")
+    ]
+    verdict = rr.build_rollup(cases)["verdicts"]["H5"]
+    assert verdict["metric"] == "non_public_rate"
+    assert verdict["supported"] is True
+    assert verdict["status"] == "stated"
+    assert "without using fan-in" in verdict["statement"]
 
 
 def test_structural_leaf_hubs_are_derived_from_the_graph_not_a_word_list() -> None:
@@ -1241,6 +1305,7 @@ def rollup_case(
     rho: dict[str, float] | None = None,
     fresh: bool = True,
     discriminates: list[str] | None = None,
+    non_public: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     scorers = {
         name: {
@@ -1255,6 +1320,7 @@ def rollup_case(
                     "scaffolding": (scaffolding or {}).get(name, value)
                     if scaffolding is not None
                     else value,
+                    "non_public_rate": (non_public or {}).get(name),
                 }
             },
         }

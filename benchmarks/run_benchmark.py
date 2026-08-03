@@ -3177,6 +3177,56 @@ LEAF_HUB_MAX_FAN_OUT_RATIO = 0.1
 LEAF_HUB_MIN_POPULATION = 20
 
 
+def is_public_api(qualified_name: str, file_path: str) -> bool | None:
+    """Whether a symbol is part of its project's declared public surface.
+
+    This is the label H1/H5 need. PR #151's claim is that the highest-fan-in symbols are
+    utilities rather than architecture, so testing it requires a notion of "utility" that
+    does not itself use fan-in — otherwise the metric assumes its own conclusion, which is
+    what made leaf_hub_rate unusable for the purpose.
+
+    Publicity is decided by the language's own rule, not by a heuristic:
+
+      Go      exported iff the identifier begins with an upper-case letter. This is the
+              language specification, not a convention: the compiler enforces it.
+      Python  a leading underscore on any component of the dotted path marks that
+              component private (PEP 8, and what `from x import *` honours). Dunders are
+              language protocol rather than private surface.
+
+    Everything else returns None. C publicity needs header parsing, Rust needs `pub`,
+    and TypeScript needs `export`; none is a name-level rule, and guessing would put the
+    metric back where the marker list was. None means "not measurable here", and the
+    caller reports null rather than folding it in as a zero.
+    """
+    if not file_path or not qualified_name:
+        return None
+    suffix = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    identifier = qualified_name.rsplit(".", 1)[-1]
+    if not identifier:
+        return None
+    if suffix == "go":
+        return identifier[:1].isupper()
+    if suffix == "py":
+        for part in qualified_name.split("."):
+            if part.startswith("_") and not (part.startswith("__") and part.endswith("__")):
+                return False
+        return True
+    return None
+
+
+def non_public_rate(rows: list[tuple[Any, ...]]) -> float | None:
+    """Fraction of a ranked window outside the project's declared public surface.
+
+    None when the window's language has no name-level publicity rule, so a corpus the
+    label cannot speak to reports null instead of contributing a zero.
+    """
+    verdicts = [is_public_api(str(row[0]), str(row[1])) for row in rows]
+    known = [verdict for verdict in verdicts if verdict is not None]
+    if not known:
+        return None
+    return sum(1 for verdict in known if not verdict) / len(known)
+
+
 def structural_leaf_hubs(nodes: list[dict[str, Any]]) -> frozenset[str]:
     """Symbols with very high fan-in and near-zero fan-out. A shape, not a category.
 
@@ -3705,6 +3755,9 @@ def run_rank_score_probes(
                 "window_size": len(window),
                 "leaf_hub_rate": leaf_hubs / len(window),
                 "lexical_marker_rate": lexical / len(window),
+                # The fan-in-independent replacement in the H1/H5 role. Null where the
+                # language has no name-level publicity rule.
+                "non_public_rate": non_public_rate(window),
                 "scaffolding": scaffolding,
             }
         entry["by_cutoff"] = by_cutoff

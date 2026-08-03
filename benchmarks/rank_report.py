@@ -489,8 +489,19 @@ def contamination_verdict(
     }
 
 
-def utility_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """H5: NOT MEASURABLE with any instrument this campaign currently has.
+def utility_verdict(
+    rows: list[dict[str, Any]], non_public_rows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """H5: measured against the public-API label, which does not use fan-in.
+
+    PR #151's claim is that the highest-fan-in symbols are utilities, so a metric derived
+    from fan-in cannot test it — that is why leaf_hub_rate was demoted to descriptive.
+    The public-API label is independent of degree: Go's export rule and Python's
+    underscore privacy are name-level language rules. Where neither applies the label is
+    null and the corpus contributes nothing rather than a zero, so H5 reports
+    not_measurable rather than a direction derived from an empty set.
+
+    Superseded reasoning, kept because it is why this metric exists:
 
     PR #151's claim is that the highest-fan-in symbols are utilities. Testing it needs a
     definition of "utility" that does not itself use fan-in, and neither candidate
@@ -503,25 +514,42 @@ def utility_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
     metric is worse than none: it reads as evidence. The leaf-hub and lexical rates are
     still emitted as descriptive statistics for whoever builds the real instrument.
     """
-    scoped, other = discriminating(rows, "H5")
-    _, _, paired = paired_means(scoped, "pagerank")
-    return {
-        "hypothesis": "H5",
-        "metric": "leaf_hub_rate",
-        "cutoff": int(UTILITY_CUTOFF),
-        "supported": None,
-        "status": "not_measurable",
-        "corpora_compared": len(paired),
-        "corpora_with_signal": len(corpora_with_signal(paired)),
-        "signal_corpora": corpora_with_signal(paired),
-        "not_discriminating": sorted({row["corpus"] for row in other}),
-        "statement": (
-            "not measurable: identifying a utility requires a definition independent of "
-            "fan-in, and every current one is either non-general (lexical marker list) "
-            "or circular with the degree scorers it would judge (leaf-hub shape). "
-            "leaf_hub_rate is reported below as a descriptive statistic, not a verdict."
+    if not non_public_rows:
+        scoped, other = discriminating(rows, "H5")
+        _, _, paired = paired_means(scoped, "pagerank")
+        return {
+            "hypothesis": "H5",
+            "metric": "non_public_rate",
+            "cutoff": int(UTILITY_CUTOFF),
+            "supported": None,
+            "status": "not_measurable",
+            "corpora_compared": len(paired),
+            "corpora_with_signal": 0,
+            "signal_corpora": [],
+            "not_discriminating": sorted({row["corpus"] for row in other}),
+            "statement": (
+                "not measurable: no corpus produced a public-API verdict. The label is a "
+                "name-level language rule (Go export capitalisation, Python underscore "
+                "privacy) and returns null elsewhere, so C and Rust corpora cannot "
+                "contribute. leaf_hub_rate is descriptive only — it selects on the same "
+                "fan-in the degree scorers rank by, so it cannot adjudicate this."
+            ),
+        }
+    return contamination_verdict(
+        non_public_rows,
+        hypothesis="H5",
+        metric_name="non_public_rate",
+        cutoff=UTILITY_CUTOFF,
+        when_degree_worse=(
+            "degree DESC surfaces more non-public symbols than weighted PageRank, which "
+            "is the shape PR #151 described, measured without using fan-in"
         ),
-    }
+        when_degree_better=(
+            "degree DESC surfaces fewer non-public symbols than weighted PageRank; the "
+            "PR #151 objection does not hold on this evidence"
+        ),
+        when_absent="no corpus registered for H5 produced both rankings with the label",
+    )
 
 
 def scaffolding_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -650,6 +678,11 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
     cases = rank_cases(documents)
     usable, excluded = partition_usable(cases)
     utility_rows = scorer_table(usable, UTILITY_CUTOFF, "leaf_hub_rate")
+    non_public_rows = [
+        row
+        for row in scorer_table(usable, UTILITY_CUTOFF, "non_public_rate")
+        if any(value is not None for value in row["scores"].values())
+    ]
     scaffolding_rows = [
         row
         for row in scorer_table(usable, SCAFFOLDING_CUTOFF, "scaffolding")
@@ -661,6 +694,7 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
         "corpora": sorted({case["corpus_id"] for case in usable}),
         "index_modes": sorted({str(case.get("index_mode")) for case in usable}),
         "leaf_hub_rate": utility_rows,
+        "non_public_rate": non_public_rows,
         "scaffolding": scaffolding_rows,
         "degree_agreement": agreement_rows,
         "silent_drop": silent_drop(usable),
@@ -689,7 +723,7 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
         "verdicts": {
             "H2": agreement_verdict(agreement_rows),
             "H4": scaffolding_verdict(scaffolding_rows),
-            "H5": utility_verdict(utility_rows),
+            "H5": utility_verdict(utility_rows, non_public_rows),
         },
     }
     rollup["validation"] = validation_gate(rollup)
