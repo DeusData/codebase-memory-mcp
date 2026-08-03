@@ -2454,11 +2454,34 @@ def materialize_report_input(
                 parameters[key] = cell_parameters[key]
     source_sha = file_sha256(result_path)
     identity = cell_identity(cell)
-    document["experiment_provenance"] = {
+    provenance = {
         "cell_identity": identity,
         "source_result": str(result_path),
         "source_result_sha256": source_sha,
     }
+    attempt_path = result_path.with_name("attempt.json")
+    if attempt_path.is_file():
+        attempt = read_json_object(attempt_path)
+        attempt_identity = attempt.get("cell_identity")
+        if attempt_identity is not None and attempt_identity != identity:
+            raise RuntimeError(
+                f"attempt identity {attempt_identity!r} does not match cell {identity!r}"
+            )
+        provenance["attempt"] = {
+            "source_path": str(attempt_path),
+            "source_sha256": file_sha256(attempt_path),
+            **{
+                key: attempt[key]
+                for key in (
+                    "elapsed_seconds",
+                    "started_at_utc",
+                    "finished_at_utc",
+                    "returncode",
+                )
+                if key in attempt
+            },
+        }
+    document["experiment_provenance"] = provenance
     output = (
         experiment_root / "reports" / "inputs" / f"{identity}-{source_sha[:12]}.json"
     )

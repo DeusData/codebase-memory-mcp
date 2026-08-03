@@ -1709,6 +1709,55 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 EXPERIMENT.cell_identity(planned),
             )
 
+    def test_report_input_carries_hashed_attempt_timing_for_markdown_summary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            planned = cell(["benchmark", "{result_path}"])
+            identity = EXPERIMENT.cell_identity(planned)
+            attempt_root = root / "runs" / identity / "attempts" / "one"
+            attempt_root.mkdir(parents=True)
+            result = attempt_root / "result.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "binary_metadata": {"sha256": "b" * 64},
+                        "cases": [{"passed": True}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            attempt = attempt_root / "attempt.json"
+            attempt.write_text(
+                json.dumps(
+                    {
+                        "cell_identity": identity,
+                        "elapsed_seconds": 1.25,
+                        "started_at_utc": "2026-08-03T00:00:00Z",
+                        "finished_at_utc": "2026-08-03T00:00:01.25Z",
+                        "returncode": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            derived = EXPERIMENT.materialize_report_input(root, planned, result)
+            provenance = json.loads(derived.read_text())["experiment_provenance"]
+
+            self.assertEqual(provenance["attempt"]["elapsed_seconds"], 1.25)
+            self.assertEqual(provenance["attempt"]["returncode"], 0)
+            self.assertEqual(
+                provenance["attempt"]["source_sha256"],
+                EXPERIMENT.file_sha256(attempt),
+            )
+
+            attempt_document = json.loads(attempt.read_text())
+            attempt_document["cell_identity"] = "wrong-cell"
+            attempt.write_text(json.dumps(attempt_document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "does not match cell"):
+                EXPERIMENT.materialize_report_input(root, planned, result)
+
     def test_result_rejects_background_revision_or_tree_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
