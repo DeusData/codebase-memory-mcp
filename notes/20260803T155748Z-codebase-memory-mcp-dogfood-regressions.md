@@ -201,3 +201,31 @@ local fix now:
   to make benchmark subprocesses convenient.
 - Add an integration test that keeps build A leased, asks build B for status, then runs a
   stateful B command and verifies that both surfaces report the same conflict class.
+
+## D-005 recurrence — transport remains closed after the client turn resumes
+
+- Recurrence observed UTC: `2026-08-03T18:01:18Z`.
+- Recorded UTC: `2026-08-03T18:11:07Z`.
+- Project argument:
+  `/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge`.
+- Tool: `search_graph`.
+- Arguments: `pattern="build_quick_hypothesis_spec|run_container_experiment|materialize_container_matrix_spec|build_measured_command"`,
+  `file_pattern="benchmarks/*.py"`, `include_connected=true`, `limit=40`.
+
+The resumed client advertised the MCP tools again and supplied fresh project context, but
+the first serialized graph call still failed immediately:
+
+```text
+tool call error: tool call failed for `codebase-memory-mcp/search_graph`
+
+Caused by:
+    Transport closed
+```
+
+Reproduction: trigger D-005, continue the same conversation in a later agent turn, then
+issue one serialized `search_graph` request. Expected: a newly advertised tool connection
+is usable, or the client reports a structured reconnect action. Observed: the stale closed
+transport survives the resumed turn. Direct reads were therefore used for
+`benchmarks/campaign_specs.py`, `benchmarks/run_container_experiment.py`,
+`benchmarks/run_evidence_suite.py`, `benchmarks/README.md`, and their tests; Tier-2
+`check_index_coverage` remained impossible.
