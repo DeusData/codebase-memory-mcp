@@ -229,3 +229,78 @@ transport survives the resumed turn. Direct reads were therefore used for
 `benchmarks/campaign_specs.py`, `benchmarks/run_container_experiment.py`,
 `benchmarks/run_evidence_suite.py`, `benchmarks/README.md`, and their tests; Tier-2
 `check_index_coverage` remained impossible.
+
+## D-005 recurrence 2 — newly advertised Tier-2 calls still fail after compaction
+
+- Recurrence observed and recorded UTC: `2026-08-03T18:43:16Z`.
+- Source revision: `a67a91d2b191f723dc11873e4c51fc9537cbac1f`.
+- Source tree: `6de33913ca345b4e513cbf9a7cbc7c48ff47436b`.
+- Branch/worktree: `api-consolidation-merge` at
+  `/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge`.
+- Client context advertised the project as indexed, `auto_watch=true`, and Tier 2.
+- Calls were serialized in one tool invocation; no new concurrent request burst occurred.
+
+The first three post-compaction `search_graph` requests targeted distinct, existing Python
+surfaces:
+
+1. `pattern="*autotune*"`, `limit=20`, `include_dependencies=false`;
+2. `file_pattern="benchmarks/run_experiments.py"`, `mode="summary"`, `limit=20`;
+3. `file_pattern="benchmarks/rank_report.py"`, `pattern="*"`, `limit=20`.
+
+Every call immediately returned the same response:
+
+```text
+tool call error: tool call failed for `codebase-memory-mcp/search_graph`
+
+Caused by:
+    Transport closed
+```
+
+This recurrence is stronger than a stale-symbol explanation: the calls included a file-scoped
+summary that did not depend on resolving a particular qualified name, and they were issued after
+the client supplied a fresh automatic session context. Expected behavior is either a working new
+transport or a structured reconnect/retry instruction. Observed behavior is a re-advertised but
+unusable tool surface. Exact source reads were used for `benchmarks/autotune.py`,
+`benchmarks/campaign_specs.py`, `benchmarks/rank_hypotheses.py`,
+`benchmarks/rank_report.py`, `benchmarks/run_benchmark.py`,
+`benchmarks/run_container_experiment.py`, `benchmarks/run_evidence_suite.py`,
+`benchmarks/run_experiments.py`, `benchmarks/README.md`,
+`docs/BENCHMARK_EXPERIMENTS.md`, and their relevant tests. Tier-2
+`check_index_coverage` could not be completed.
+
+## D-005 recurrence 3 — explicit worktree project still uses the closed transport
+
+- Recurrence observed UTC: `2026-08-03T18:51:55Z`.
+- Recorded UTC: `2026-08-03T18:57:17Z`.
+- Source revision: `a67a91d2b191f723dc11873e4c51fc9537cbac1f`.
+- Source tree: `6de33913ca345b4e513cbf9a7cbc7c48ff47436b`.
+- Client again advertised the graph project as indexed, `auto_watch=true`, and Tier 2.
+- The call was serialized and was the first graph request after the new client context.
+
+Reproduction call:
+
+```text
+search_graph(
+  project="/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge",
+  file_pattern="benchmarks/run_evidence_suite.py",
+  mode="summary"
+)
+```
+
+Observed response:
+
+```text
+tool call error: tool call failed for `codebase-memory-mcp/search_graph`
+
+Caused by:
+    Transport closed
+```
+
+This attempt supplied the exact worktree path rather than the earlier derived project name,
+so project-name resolution is not a sufficient explanation. The tool was newly advertised
+and accepted the request schema, but the request reached the same closed transport. Expected:
+the first serialized request after fresh session context either succeeds or returns a
+structured reconnect action. Observed: the closed transport remains terminal across context
+refreshes and explicit project addressing. Direct numbered source reads and `rg` were used for
+the remaining benchmark, database-lifecycle, and report work; Tier-2
+`check_index_coverage` was still unavailable.

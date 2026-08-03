@@ -550,12 +550,15 @@ PageRank/LinkRank ablation is:
 --config-profile rank_disabled
 ```
 
-`benchmarks/autotune.py` is a safe frontend for the corresponding PageRank parameter
-sweep. It requires exact build metadata, generates a content-addressed rank-quality
-experiment, interleaves candidate-default and ablation repetitions, and stores the
-plan, results, logs, and report under a durable ignored result root. It does not
-change the normal user configuration or cache. Use `--plan-only` to validate and
-inspect the expanded cells before spending CPU time.
+`benchmarks/autotune.py` is the compatibility frontend for the corresponding fixed
+PageRank profile sweep. It requires exact build metadata, generates a content-addressed
+rank-quality experiment, interleaves candidate-default and ablation repetitions, and
+stores the plan, results, logs, and report under a durable ignored result root. It does
+not choose a winning configuration, tune against real multilingual corpora, or publish
+defaults. New native and container campaigns generate the matrix with
+`benchmarks/campaign_specs.py --quick-hypotheses` and execute it through the canonical
+`benchmarks/run_experiments.py` interface. Use `autotune.py --plan-only` only for retained
+compatibility workflows that need its binary-path plan.
 
 The independent `--mcp-surface-parity` mode records classic, streamlined before
 reveal, and the same streamlined process after reveal. It compares names plus the

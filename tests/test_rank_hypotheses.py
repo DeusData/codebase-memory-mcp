@@ -157,7 +157,16 @@ class EvidenceSuiteContractTest(unittest.TestCase):
         self.assertEqual(receipt["performance"]["expected_cells"], 4)
         self.assertGreater(receipt["hypotheses"]["candidate_cells"], 0)
         self.assertIn("run_experiments.py", " ".join(receipt["performance"]["command"]))
-        self.assertIn("autotune.py", " ".join(receipt["hypotheses"]["command"]))
+        self.assertIn(
+            "campaign_specs.py",
+            " ".join(receipt["hypotheses"]["preparation_command"]),
+        )
+        self.assertIn(
+            "--quick-hypotheses", receipt["hypotheses"]["preparation_command"]
+        )
+        self.assertIn("run_experiments.py", " ".join(receipt["hypotheses"]["command"]))
+        self.assertIn("--matrix-spec", receipt["hypotheses"]["command"])
+        self.assertNotIn("autotune.py", " ".join(receipt["hypotheses"]["command"]))
         self.assertIn("recovery_command", receipt["performance"])
         self.assertIn("recovery_command", receipt["hypotheses"])
         self.assertIn("git", receipt["environment"])
@@ -165,11 +174,48 @@ class EvidenceSuiteContractTest(unittest.TestCase):
         self.assertEqual(
             receipt["hypotheses"]["build"], dict(sorted(TEST_BUILD.items()))
         )
-        self.assertIn("-O3 -DNDEBUG", receipt["hypotheses"]["command"])
+        self.assertEqual(
+            receipt["hypotheses"]["build_provenance"]["status"],
+            "declared_expectation_pending_artifact_verification",
+        )
         self.assertNotIn("deadline", json.dumps(receipt).lower())
         self.assertNotIn("target_seconds", json.dumps(receipt).lower())
         self.assertIn(
             "no suite wall-clock target", receipt["hypotheses"]["runtime_policy"]
+        )
+
+    def test_container_receipt_changes_both_canonical_commands_by_the_same_flags(
+        self,
+    ) -> None:
+        receipt = SUITE.build_receipt(
+            repository=ROOT,
+            output_root=ROOT / ".worktrees" / "evidence-suite-container-test",
+            performance_preset="quick",
+            hypotheses_preset="quick",
+            rank_build=TEST_BUILD,
+            container={"cpus": 4.0, "memory": "6g", "workers": 4},
+        )
+
+        expected_suffix = [
+            "--container",
+            "--cpus",
+            "4",
+            "--memory",
+            "6g",
+            "--workers",
+            "4",
+        ]
+        self.assertEqual(receipt["execution"]["mode"], "container")
+        self.assertEqual(receipt["performance"]["command"][-7:], expected_suffix)
+        self.assertEqual(receipt["hypotheses"]["command"][-7:], expected_suffix)
+        self.assertNotIn("--container", receipt["hypotheses"]["preparation_command"])
+        self.assertEqual(
+            receipt["performance"]["public_entrypoint"],
+            "benchmarks/run_experiments.py",
+        )
+        self.assertEqual(
+            receipt["hypotheses"]["public_entrypoint"],
+            "benchmarks/run_experiments.py",
         )
 
     def test_full_performance_contract_has_no_suite_duration_control(self) -> None:

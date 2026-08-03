@@ -103,10 +103,11 @@ cbm_rank_refresh_publish_t cbm_rank_refresh_publish_from_pipeline(
 /* One owner for runtime defaults and generated registry/help strings. The
  * accepted extent reaches the full finite double representation: PageRank
  * weights must be finite and nonnegative, while the narrower ranges are
- * advisory starting points rather than capability limits. Defaults were tuned
- * on the repository's code-search ranking fixture (see pagerank.c and
- * benchmarks/autotune.py); recommendations preserve each edge kind's intended
- * scale relative to CALLS=1.0 and require workload measurement before changes. */
+ * advisory starting points rather than capability limits. Defaults have regression
+ * coverage on the repository's code-search ranking fixture; the fixed profile sweep in
+ * benchmarks/autotune.py evaluates alternatives but does not select or publish defaults.
+ * Recommendations preserve each edge kind's intended scale relative to CALLS=1.0 and
+ * require real-workload measurement before changes. */
 #define CBM_PAGERANK_EDGE_WEIGHT_MIN 0.0
 #define CBM_PAGERANK_EDGE_WEIGHT_MAX DBL_MAX
 

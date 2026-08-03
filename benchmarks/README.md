@@ -10,7 +10,10 @@ Primary entry points:
 - `summarize_results.py`: render quality-gated Markdown from retained result JSON.
 - `fact_comparisons.py`: derive parity, capability-delta, and lifecycle tables from
   canonical facts.
-- `autotune.py`: run the isolated PageRank tuning experiment.
+- `run_evidence_suite.py`: emit one auditable receipt whose performance and rank commands
+  both use `run_experiments.py`; add `--container` plus one resource budget to switch both.
+- `autotune.py`: compatibility frontend for the fixed native PageRank profile sweep. It
+  evaluates profiles but does not select or publish a tuned configuration.
 
 Rank-quality campaign files (see "Rank-quality campaign" below):
 
@@ -249,7 +252,7 @@ cells measured against a different tree.
 
 | Arm | `index_mode` | What it answers |
 |---|---|---|
-| `rank-quality-v1` | `full` | H1–H7. Full indexing keeps `FAST_SKIP_DIRS` out of the ranking comparison, so ordering is not confounded with coverage. Includes the cosign reply-detail frontier |
+| `rank-quality-v1` | `full` | H1/H2/H4/H5 node-ranking evidence and H6 instrumentation. It explicitly does not evaluate H3 cost or H7 held-out adaptation. Full indexing keeps `FAST_SKIP_DIRS` out of the ordering comparison. Includes the cosign reply-detail frontier |
 | `coverage-full-v1` | `full` | the reference arm for the silent-drop diff |
 | `coverage-moderate-v1` | `moderate` | coverage lost outside full mode |
 | `coverage-fast-v1` | `fast` | the mode 151 of upstream's 159 evaluation corpora use |
