@@ -1,8 +1,9 @@
 import importlib.util
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
-
 
 SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "autotune.py"
 SPEC = importlib.util.spec_from_file_location("autotune", SCRIPT)
@@ -12,6 +13,22 @@ SPEC.loader.exec_module(AUTOTUNE)
 
 
 class AutotuneTest(unittest.TestCase):
+    def test_cli_requires_exact_build_provenance(self) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            AUTOTUNE.parse_args([])
+
+        args = AUTOTUNE.parse_args(
+            [
+                "--build-target",
+                "make -f Makefile.cbm cbm",
+                "--compiler",
+                "Apple clang version 21.0.0",
+                "--cflags",
+                "-O3 -DNDEBUG",
+            ]
+        )
+        self.assertEqual(args.cflags, "-O3 -DNDEBUG")
+
     def test_matrix_uses_versioned_rank_fixture_and_auditable_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "cbm"
@@ -58,10 +75,43 @@ class AutotuneTest(unittest.TestCase):
         self.assertTrue(all(cell["transport"] == "mcp" for cell in plan["cells"]))
         self.assertTrue(
             all(
+                cell["parameters"]["cell_name"]
+                and cell["parameters"]["informs_hypotheses"]
+                and cell["parameters"]["questions"]
+                for cell in plan["cells"]
+            )
+        )
+        self.assertTrue(
+            all(
                 "benchmark_script_sha256" in cell["parameters"]
                 for cell in plan["cells"]
             )
         )
+
+    def test_quick_preflight_reuses_the_first_scientific_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "cbm"
+            binary.write_bytes(b"optimized binary")
+            full = AUTOTUNE.build_matrix_spec(
+                binary=binary,
+                revision="c" * 40,
+                repetitions=1,
+                timeout_seconds=60,
+                transports=["mcp"],
+                build={"target": "make cbm", "compiler": "clang 18", "cflags": "-O3"},
+            )
+            preflight = AUTOTUNE.build_preflight_spec(full)
+            runner = AUTOTUNE.load_experiment_runner()
+            full_plan = runner.expand_matrix_spec(full)
+            preflight_plan = runner.expand_matrix_spec(preflight)
+
+        self.assertEqual(len(preflight["profiles"]), 1)
+        self.assertEqual(preflight["profiles"][0], full["profiles"][0])
+        self.assertEqual(
+            runner.cell_identity(preflight_plan["cells"][0]),
+            runner.cell_identity(full_plan["cells"][0]),
+        )
+        self.assertEqual(len(full["profiles"]), len(AUTOTUNE.TUNING_PROFILES))
 
     def test_source_has_no_legacy_global_or_resource_path(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import sqlite3
 import statistics
 import subprocess
@@ -60,8 +61,12 @@ def make_rank_db(
         " name TEXT, qualified_name TEXT,"
         " file_path TEXT, properties TEXT DEFAULT '{}');"
         "CREATE TABLE pagerank(node_id INTEGER, project TEXT, rank REAL);"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY, project TEXT, source_id INT,"
+        " target_id INT, type TEXT, properties TEXT DEFAULT '{}');"
+        "CREATE TABLE linkrank(edge_id INTEGER, project TEXT, rank REAL);"
         "CREATE TABLE node_degree(node_id INTEGER, project TEXT, total_in INT,"
-        " total_out INT, weighted_in REAL, weighted_out REAL, linkrank_in REAL);"
+        " total_out INT, calls_in INT, calls_out INT, weighted_in REAL,"
+        " weighted_out REAL, linkrank_in REAL);"
     )
     for index, (qualified_name, file_path, degree, rank) in enumerate(rows, start=1):
         label = (labels or ["Function"] * len(rows))[index - 1]
@@ -79,14 +84,23 @@ def make_rank_db(
         )
         connection.execute("INSERT INTO pagerank VALUES(?,?,?)", (index, "p", rank))
         connection.execute(
-            "INSERT INTO node_degree VALUES(?,?,?,?,?,?,?)",
-            (index, "p", degree, 1, rank, rank / 2, rank / 3),
+            "INSERT INTO node_degree VALUES(?,?,?,?,?,?,?,?,?)",
+            (index, "p", degree, 1, degree, 1, rank, rank / 2, rank / 3),
         )
+        if index > 1:
+            connection.execute(
+                "INSERT INTO edges VALUES(?,?,?,?,?,?)",
+                (index - 1, "p", index, 1, "CALLS", "{}"),
+            )
+            connection.execute(
+                "INSERT INTO linkrank VALUES(?,?,?)", (index - 1, "p", rank / 4)
+            )
     connection.commit()
     connection.close()
 
 
 # --- config-key allowlist -------------------------------------------------------
+
 
 def test_unknown_config_key_is_rejected_at_parse_time() -> None:
     """Guards: cbm_config_value_is_valid accepts unknown keys, so a typo would run
@@ -98,9 +112,12 @@ def test_unknown_config_key_is_rejected_at_parse_time() -> None:
         assert "edge_weight_tsets" in str(error)
     else:
         raise AssertionError("typo'd config key was accepted")
-    assert rb.resolve_config_overrides(profile, ["edge_weight_tests=0.01"])[
-        "edge_weight_tests"
-    ] == "0.01"
+    assert (
+        rb.resolve_config_overrides(profile, ["edge_weight_tests=0.01"])[
+            "edge_weight_tests"
+        ]
+        == "0.01"
+    )
 
 
 def test_config_validation_raises_value_error_not_system_exit() -> None:
@@ -119,43 +136,64 @@ def test_capability_sets_agree_across_the_two_entry_points() -> None:
     capability set is duplicated. The plan layer rejecting a spec the benchmark layer
     would accept (or vice versa) fails a runset hours in, so assert they match here
     rather than trusting a keep-in-sync comment."""
-    assert (
-        rb.QUALITY_BACKGROUND_CAPABILITIES == re_.QUALITY_BACKGROUND_CAPABILITIES
-    ), (rb.QUALITY_BACKGROUND_CAPABILITIES, re_.QUALITY_BACKGROUND_CAPABILITIES)
+    assert rb.QUALITY_BACKGROUND_CAPABILITIES == re_.QUALITY_BACKGROUND_CAPABILITIES, (
+        rb.QUALITY_BACKGROUND_CAPABILITIES,
+        re_.QUALITY_BACKGROUND_CAPABILITIES,
+    )
     assert "rank" in rb.QUALITY_BACKGROUND_CAPABILITIES
 
 
 def test_allowlist_covers_every_tunable_knob() -> None:
     for key in (
-        "edge_weight_tests", "edge_weight_calls", "pagerank_damping",
-        "search_limit", "trace_max_results", "snippet_max_lines",
+        "edge_weight_tests",
+        "edge_weight_calls",
+        "pagerank_damping",
+        "search_limit",
+        "trace_max_results",
+        "snippet_max_lines",
     ):
         assert key in rb.KNOWN_CONFIG_KEYS, key
 
 
 # --- utility-symbol classification ----------------------------------------------
 
+
 def test_public_api_label_follows_the_language_rule_not_fan_in() -> None:
     """The label H1/H5 need: independent of degree, so it can adjudicate PR #151's claim
     that the highest-fan-in symbols are utilities rather than assuming it. Go's rule is
     definitional — an identifier is exported iff it starts with an upper-case letter."""
-    assert rb.is_public_api("cmd.cosign.cli.attest.AttestCommand", "a/attest.go") is True
+    assert (
+        rb.is_public_api("cmd.cosign.cli.attest.AttestCommand", "a/attest.go") is True
+    )
     assert rb.is_public_api("pkg.cosign.mockAttestation", "pkg/verify_test.go") is False
     # Python: a leading underscore anywhere in the dotted path marks the surface private,
     # which is what makes sklearn._loss.loss internal while sklearn.base.BaseEstimator
     # is public. The structural leaf-hub definition got that exact pair backwards.
     assert rb.is_public_api("sklearn.base.BaseEstimator", "sklearn/base.py") is True
-    assert rb.is_public_api("sklearn._loss.loss.ArrayAPILossMixin", "sklearn/_loss/loss.py") is False
-    assert rb.is_public_api("flask.app.Flask._find_error_handler", "src/flask/app.py") is False
+    assert (
+        rb.is_public_api(
+            "sklearn._loss.loss.ArrayAPILossMixin", "sklearn/_loss/loss.py"
+        )
+        is False
+    )
+    assert (
+        rb.is_public_api("flask.app.Flask._find_error_handler", "src/flask/app.py")
+        is False
+    )
     # Dunders are language protocol, not private surface.
-    assert rb.is_public_api("sklearn.base.BaseEstimator.__init__", "sklearn/base.py") is True
+    assert (
+        rb.is_public_api("sklearn.base.BaseEstimator.__init__", "sklearn/base.py")
+        is True
+    )
 
 
 def test_public_api_label_reports_unknown_rather_than_guessing() -> None:
     """C publicity needs header parsing and Rust needs `pub`; neither is a name rule.
     Reporting unknown keeps the metric honest instead of inventing a verdict for redis."""
     assert rb.is_public_api("server.processCommand", "src/server.c") is None
-    assert rb.is_public_api("grep.searcher.Searcher", "crates/searcher/src/lib.rs") is None
+    assert (
+        rb.is_public_api("grep.searcher.Searcher", "crates/searcher/src/lib.rs") is None
+    )
     assert rb.is_public_api("anything", "") is None
 
 
@@ -168,18 +206,18 @@ def test_non_public_rate_is_measured_and_is_null_where_unknown() -> None:
         [(f"pkg.Exported{i}", "pkg/a.go", 50 - i, float(50 - i)) for i in range(5)]
         + [("pkg.internalHelper", "pkg/a.go", 900, 99.0)],
     )
-    window = rb.run_rank_score_probes(go, "p", top_n=6, cutoffs=(1,))["scorers"]["degree"][
-        "by_cutoff"
-    ]["1"]
+    window = rb.run_rank_score_probes(go, "p", top_n=6, cutoffs=(1,))["scorers"][
+        "degree"
+    ]["by_cutoff"]["1"]
     # internalHelper has the highest degree, so it heads the degree ranking and it is
     # not exported: exactly the shape PR #151 describes, measured without using fan-in.
     assert window["non_public_rate"] == 1.0
 
     c = Path(tempfile.mkdtemp())
     make_rank_db(c, [("server.processCommand", "src/server.c", 5, 1.0)])
-    c_window = rb.run_rank_score_probes(c, "p", top_n=1, cutoffs=(1,))["scorers"]["degree"][
-        "by_cutoff"
-    ]["1"]
+    c_window = rb.run_rank_score_probes(c, "p", top_n=1, cutoffs=(1,))["scorers"][
+        "degree"
+    ]["by_cutoff"]["1"]
     assert c_window["non_public_rate"] is None
 
 
@@ -209,8 +247,10 @@ def test_h5_is_not_measurable_without_the_public_api_label() -> None:
     looks like evidence. With no public-API verdicts, H5 says so instead of falling back
     to leaf_hub_rate, which selects on the quantity the degree scorers rank by."""
     rollup = rr.build_rollup(
-        [rollup_case(name, utility={"degree": 0.9, "pagerank": 0.1})
-         for name in ("cosign", "redis", "runc")]
+        [
+            rollup_case(name, utility={"degree": 0.9, "pagerank": 0.1})
+            for name in ("cosign", "redis", "runc")
+        ]
     )
     verdict = rollup["verdicts"]["H5"]
     assert verdict["supported"] is None
@@ -247,28 +287,40 @@ def test_python_public_exports_are_read_from_package_init_files() -> None:
     assert {"LogisticRegression", "LinearModel"} <= exports
 
     # With the export set, a symbol defined in a private module is public.
-    assert rb.is_public_api(
-        "sklearn.linear_model._logistic.LogisticRegression",
-        "sklearn/linear_model/_logistic.py",
-        exports,
-    ) is True
+    assert (
+        rb.is_public_api(
+            "sklearn.linear_model._logistic.LogisticRegression",
+            "sklearn/linear_model/_logistic.py",
+            exports,
+        )
+        is True
+    )
     # A method of an exported class is public too: the class is the exported surface,
     # and a non-underscore method on it is part of that surface.
-    assert rb.is_public_api(
-        "sklearn.linear_model._base.LinearModel.fit",
-        "sklearn/linear_model/_base.py",
-        exports,
-    ) is True
+    assert (
+        rb.is_public_api(
+            "sklearn.linear_model._base.LinearModel.fit",
+            "sklearn/linear_model/_base.py",
+            exports,
+        )
+        is True
+    )
     # A genuinely internal symbol in the same private module stays private.
-    assert rb.is_public_api(
-        "sklearn.utils._testing.raises", "sklearn/utils/_testing.py", exports
-    ) is False
+    assert (
+        rb.is_public_api(
+            "sklearn.utils._testing.raises", "sklearn/utils/_testing.py", exports
+        )
+        is False
+    )
     # An underscore-prefixed member of an exported class is still private.
-    assert rb.is_public_api(
-        "sklearn.linear_model._base.LinearModel._decision",
-        "sklearn/linear_model/_base.py",
-        exports,
-    ) is False
+    assert (
+        rb.is_public_api(
+            "sklearn.linear_model._base.LinearModel._decision",
+            "sklearn/linear_model/_base.py",
+            exports,
+        )
+        is False
+    )
 
 
 def test_public_exports_survive_unparseable_sources() -> None:
@@ -280,17 +332,19 @@ def test_public_exports_survive_unparseable_sources() -> None:
     assert rb.python_public_exports(Path("/nonexistent")) == frozenset()
 
 
-def test_h5_is_decided_once_the_public_api_label_is_present() -> None:
-    """The label is independent of degree, so a direction from it is meaningful. Go and
-    Python corpora supply it; C and Rust report null and contribute nothing."""
+def test_h5_reports_an_effect_without_inventing_a_decision_threshold() -> None:
+    """The label is independent of degree, so its direction and magnitude are useful.
+    A supported/refuted label still requires a pre-registered decision rule."""
     cases = [
         rollup_case(name, non_public={"degree": 0.8, "pagerank": 0.3})
         for name in ("cosign", "flask", "runc")
     ]
     verdict = rr.build_rollup(cases)["verdicts"]["H5"]
     assert verdict["metric"] == "non_public_rate"
-    assert verdict["supported"] is True
-    assert verdict["status"] == "stated"
+    assert verdict["supported"] is None
+    assert verdict["status"] == "measured_descriptive"
+    assert verdict["effect_direction"] == "degree_higher"
+    assert math.isclose(verdict["effect_size"], 0.5)
     assert "without using fan-in" in verdict["statement"]
 
 
@@ -321,13 +375,15 @@ def test_structural_leaf_hubs_scale_the_threshold_to_the_corpus() -> None:
     """A fixed fan-in threshold would find no utilities in a small repository and label
     half of a large one. The cut is relative to the corpus's own distribution."""
     small = [
-        {"qualified_name": f"s.f{i}", "total_in": i, "total_out": 5} for i in range(1, 21)
+        {"qualified_name": f"s.f{i}", "total_in": i, "total_out": 5}
+        for i in range(1, 21)
     ]
     small.append({"qualified_name": "s.hub", "total_in": 400, "total_out": 0})
     assert "s.hub" in rb.structural_leaf_hubs(small)
     # A flat graph with no hub has no utilities, rather than an arbitrary top slice.
     flat = [
-        {"qualified_name": f"f.f{i}", "total_in": 10, "total_out": 10} for i in range(30)
+        {"qualified_name": f"f.f{i}", "total_in": 10, "total_out": 10}
+        for i in range(30)
     ]
     assert rb.structural_leaf_hubs(flat) == frozenset()
 
@@ -335,7 +391,12 @@ def test_structural_leaf_hubs_scale_the_threshold_to_the_corpus() -> None:
 def test_structural_leaf_hubs_need_enough_symbols_for_a_distribution() -> None:
     """Three symbols have no distribution to take a quantile of; guessing one would
     reintroduce exactly the arbitrariness this replaces."""
-    assert rb.structural_leaf_hubs([{"qualified_name": "a", "total_in": 9, "total_out": 0}]) is not None
+    assert (
+        rb.structural_leaf_hubs(
+            [{"qualified_name": "a", "total_in": 9, "total_out": 0}]
+        )
+        is not None
+    )
     assert rb.structural_leaf_hubs([]) == frozenset()
 
 
@@ -345,13 +406,20 @@ def test_utility_markers_match_tokens_not_substrings() -> None:
     for name in ("zmalloc", "serverLog", "fmt.Sprintf", "printf", "memcpy", "panic"):
         assert rb.is_utility_symbol(name), name
     for name in (
-        "trace_path", "cbm_trace_path", "freeze_index", "catalog",
-        "AttestCommand", "url_for", "LatestSnapshot", "debug_symbols",
+        "trace_path",
+        "cbm_trace_path",
+        "freeze_index",
+        "catalog",
+        "AttestCommand",
+        "url_for",
+        "LatestSnapshot",
+        "debug_symbols",
     ):
         assert not rb.is_utility_symbol(name), name
 
 
 # --- rank score probes ----------------------------------------------------------
+
 
 def test_probes_rank_only_callable_symbols() -> None:
     """Guards: with no label filter the first full campaign ranked go.mod,
@@ -371,7 +439,9 @@ def test_probes_rank_only_callable_symbols() -> None:
         labels=["File", "File", "Function", "Function"],
     )
     probes = rb.run_rank_score_probes(directory, "p", top_n=10, cutoffs=(2,))
-    ranked = [row["qualified_name"] for row in probes["scorers"]["degree"]["top_ranked"]]
+    ranked = [
+        row["qualified_name"] for row in probes["scorers"]["degree"]["top_ranked"]
+    ]
     assert ranked == ["repo.src.zmalloc", "repo.src.processCommand"]
     window = probes["scorers"]["degree"]["by_cutoff"]["2"]
     assert window["lexical_marker_rate"] == 0.5
@@ -402,7 +472,9 @@ def test_probes_exclude_symbols_outside_the_repository() -> None:
         labels=["Class", "Class", "Class", "Function"],
     )
     probes = rb.run_rank_score_probes(directory, "p", top_n=10, cutoffs=(1,))
-    ranked = [row["qualified_name"] for row in probes["scorers"]["degree"]["top_ranked"]]
+    ranked = [
+        row["qualified_name"] for row in probes["scorers"]["degree"]["top_ranked"]
+    ]
     assert ranked == ["repo.src.processCommand"]
 
 
@@ -445,21 +517,49 @@ def test_probe_timing_key_is_visible_to_the_fact_tables() -> None:
     which selects dicts carrying elapsed_ms."""
     directory = Path(tempfile.mkdtemp())
     make_rank_db(directory, [("a", "src/a.c", 5, 1.0)])
-    entry = rb.run_rank_score_probes(directory, "p", top_n=1, cutoffs=(1,))["scorers"]["degree"]
+    entry = rb.run_rank_score_probes(directory, "p", top_n=1, cutoffs=(1,))["scorers"][
+        "degree"
+    ]
     assert "elapsed_ms" in entry and "probe_elapsed_ms" not in entry
 
 
 # --- statistics -----------------------------------------------------------------
 
+
 def test_spearman_delegates_to_stdlib_and_handles_undefined_inputs() -> None:
     assert rb.spearman_rho([1, 2, 3], [3, 2, 1]) == statistics.correlation(
         [1, 2, 3], [3, 2, 1], method="ranked"
     )
-    for left, right in (([1, 1, 1], [1, 2, 3]), ([1], [2]), ([], []), ([1, 2], [1, 2, 3])):
+    for left, right in (
+        ([1, 1, 1], [1, 2, 3]),
+        ([1], [2]),
+        ([], []),
+        ([1, 2], [1, 2, 3]),
+    ):
         assert rb.spearman_rho(left, right) is None
 
 
+def test_rbo_top_weighting_parameter_is_named_and_reproducible() -> None:
+    left = ["a", "b", "c"]
+    right = ["a", "c", "b"]
+    assert 0.0 < rb.RANK_BIASED_OVERLAP_PERSISTENCE < 1.0
+    assert rb.rank_biased_overlap(left, right) == rb.rank_biased_overlap(
+        left, right, persistence=rb.RANK_BIASED_OVERLAP_PERSISTENCE
+    )
+
+
+def test_mcp_early_exit_error_retains_candidate_stderr() -> None:
+    client = rb.McpClient(Path("/nonexistent-cbm"), {}, timeout=1)
+    client.stderr_lines.append(
+        "CBM could not start because a conflicting CBM process is active"
+    )
+    error = client.server_exit_error("initialize")
+    assert "initialize" in str(error)
+    assert "conflicting CBM process is active" in str(error)
+
+
 # --- query battery --------------------------------------------------------------
+
 
 def test_default_battery_preserves_historical_cells() -> None:
     """Guards: any change to the default path invalidates cached cells, because cell
@@ -486,7 +586,9 @@ def test_workload_corpora_clone_their_current_tip() -> None:
     whatever the operator actually had. Both must be cloneable from the recorded url."""
     registry = rb.load_corpora_manifest("")
     pinned = [e for e in registry.values() if len(e.get("revision", "")) == 40]
-    unpinned = [e for e in registry.values() if e.get("revision") == rb.UNPINNED_REVISION]
+    unpinned = [
+        e for e in registry.values() if e.get("revision") == rb.UNPINNED_REVISION
+    ]
     assert pinned and unpinned
     assert len(pinned) + len(unpinned) == len(registry)
 
@@ -498,7 +600,9 @@ def test_clone_refuses_to_touch_a_directory_that_is_already_a_repository() -> No
     which corpora can reach it, so it refuses a directory that already has a .git."""
     existing = isolated_git_repo()
     try:
-        rb.clone_pinned_repo("https://example.invalid/x", rb.UNPINNED_REVISION, existing, 5)
+        rb.clone_pinned_repo(
+            "https://example.invalid/x", rb.UNPINNED_REVISION, existing, 5
+        )
     except RuntimeError as error:
         assert "already a git repository" in str(error)
         assert str(existing) in str(error)
@@ -507,7 +611,10 @@ def test_clone_refuses_to_touch_a_directory_that_is_already_a_repository() -> No
     # The existing repository is untouched: still on its own commit, still not detached.
     head = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=existing, text=True, capture_output=True, check=True,
+        cwd=existing,
+        text=True,
+        capture_output=True,
+        check=True,
     ).stdout.strip()
     assert head != "HEAD", "clone detached an existing repository's HEAD"
 
@@ -516,7 +623,9 @@ def test_clone_rejects_a_malformed_revision_but_allows_the_declared_sentinel() -
     """A typo'd sha must not silently clone the default branch and be reported as the
     pinned tree; only the declared sentinel opts into tip-cloning."""
     try:
-        rb.clone_pinned_repo("https://example.invalid/x", "abc123", Path(tempfile.mkdtemp()), 5)
+        rb.clone_pinned_repo(
+            "https://example.invalid/x", "abc123", Path(tempfile.mkdtemp()), 5
+        )
     except RuntimeError as error:
         assert "40-character" in str(error) or "resolve-at-run-time" in str(error)
     else:
@@ -555,7 +664,9 @@ def test_every_graded_judgment_survives_the_real_scorer() -> None:
             if not judgments:
                 continue
             graded += 1
-            scored = rb.score_ranked_relevance([], judgments, cutoff=query.get("cutoff", 5))
+            scored = rb.score_ranked_relevance(
+                [], judgments, cutoff=query.get("cutoff", 5)
+            )
             assert scored["judgment_count"] == len(judgments), query["id"]
     assert graded >= 2
 
@@ -569,7 +680,12 @@ def test_required_substrings_gate_a_wrong_path() -> None:
         }
     ]
     right = rb.score_ranked_relevance(
-        [{"qualified_name": "AttestCommand", "file_path": "cmd/cosign/cli/attest/attest.go"}],
+        [
+            {
+                "qualified_name": "AttestCommand",
+                "file_path": "cmd/cosign/cli/attest/attest.go",
+            }
+        ],
         judgments,
     )
     wrong = rb.score_ranked_relevance(
@@ -578,7 +694,19 @@ def test_required_substrings_gate_a_wrong_path() -> None:
     assert right["reciprocal_rank"] == 1.0 and wrong["reciprocal_rank"] == 0.0
 
 
+def test_one_judgment_cannot_repeatedly_inflate_ndcg_above_one() -> None:
+    """One target duplicated by a tool page is one judgment, not unlimited relevance."""
+    judgment = [{"expected_substring": "same", "relevance": 3}]
+    score = rb.score_ranked_relevance(
+        [{"name": "same"}, {"name": "same"}, {"name": "same"}], judgment, cutoff=3
+    )
+    assert score["matched_relevance"] == [3, 0, 0]
+    assert score["matched_judgment_count"] == 1
+    assert 0.0 <= score["ndcg_at_3"] <= 1.0
+
+
 # --- per-query evidence ---------------------------------------------------------
+
 
 def test_result_count_is_recorded_for_behavioral_only_queries() -> None:
     """Guards: returned_count sat inside `if applicable:`, so 28 of 31 manifest
@@ -606,7 +734,9 @@ def test_repetitions_capture_result_count_instability() -> None:
     results against a fixed index (max_hits_per_page: zero 18 of 54 times)."""
     calls = {"count": 0}
 
-    def flapping(transport, binary, env, tool, arguments, timeout, include_logs, client=None):
+    def flapping(
+        transport, binary, env, tool, arguments, timeout, include_logs, client=None
+    ):
         calls["count"] += 1
         results = [{"name": "x"}, {"name": "y"}] if calls["count"] % 2 else []
         return {"response": {"results": results}, "elapsed_ms": 1.0}
@@ -616,12 +746,20 @@ def test_repetitions_capture_result_count_instability() -> None:
     rb.run_tool_call_for_transport = flapping
     rb.load_rank_query_battery = lambda *args, **kwargs: (
         {
-            "id": "flaky", "family": "A", "tool": "search_code",
-            "arguments": {"pattern": "p"}, "repetitions": 6, "judgments": [],
+            "id": "flaky",
+            "family": "A",
+            "tool": "search_code",
+            "arguments": {"pattern": "p"},
+            "repetitions": 6,
+            "judgments": [],
         },
         {
-            "id": "single", "family": "A", "tool": "search_graph",
-            "arguments": {"pattern": "q"}, "repetitions": 1, "judgments": [],
+            "id": "single",
+            "family": "A",
+            "tool": "search_graph",
+            "arguments": {"pattern": "q"},
+            "repetitions": 1,
+            "judgments": [],
         },
     )
     try:
@@ -638,7 +776,63 @@ def test_repetitions_capture_result_count_instability() -> None:
     assert "repetition_stability" not in oracles["single"]
 
 
+def test_graded_search_graph_queries_compare_every_supported_rank_sort() -> None:
+    """The PR decision is PageRank versus cheaper graph scores, so scoring only the
+    default sort cannot answer it. One graded query must produce paired quality for every
+    rank sort already exposed by search_graph without changing the historical no-manifest
+    path."""
+    calls: list[dict[str, Any]] = []
+
+    def ranked_call(
+        transport, binary, env, tool, arguments, timeout, include_logs, client=None
+    ):
+        calls.append(dict(arguments))
+        sort_by = arguments.get("sort_by", "relevance")
+        results = (
+            [{"name": "target"}, {"name": "decoy"}]
+            if sort_by in {"relevance", "linkrank"}
+            else [{"name": "decoy"}, {"name": "target"}]
+        )
+        return {"response": {"results": results}, "elapsed_ms": 1.0}
+
+    original_call = rb.run_tool_call_for_transport
+    original_loader = rb.load_rank_query_battery
+    rb.run_tool_call_for_transport = ranked_call
+    rb.load_rank_query_battery = lambda *args, **kwargs: (
+        {
+            "id": "graded",
+            "family": "B",
+            "tool": "search_graph",
+            "arguments": {"pattern": "target", "limit": 5},
+            "criterion": "surface target",
+            "cutoff": 5,
+            "repetitions": 1,
+            "judgments": [{"expected_substring": "target", "relevance": 3}],
+        },
+    )
+    try:
+        args = argparse.Namespace(
+            timeout=10,
+            include_logs=False,
+            corpus="fixture",
+            rank_query_manifest="manifest.json",
+            rank_overlay_active=False,
+        )
+        oracles = rb.run_rank_quality_oracles("mcp", None, {}, "proj", args)
+    finally:
+        rb.run_tool_call_for_transport = original_call
+        rb.load_rank_query_battery = original_loader
+
+    variants = oracles["graded"]["scorer_variants"]
+    assert set(variants) == {"pagerank", "degree", "calls", "linkrank_in"}
+    assert variants["pagerank"]["quality"]["first_relevant_rank"] == 1
+    assert variants["degree"]["quality"]["first_relevant_rank"] == 2
+    assert oracles["scorer_variant_quality"]["pagerank"]["query_count"] == 1
+    assert len(calls) == 4
+
+
 # --- staleness ------------------------------------------------------------------
+
 
 def test_staleness_unions_declared_and_persisted_views() -> None:
     """Guards: the ledger alone misses a view a response declared stale, and a stale
@@ -648,16 +842,21 @@ def test_staleness_unions_declared_and_persisted_views() -> None:
     connection.execute(
         "CREATE TABLE derived_view_state (project TEXT, view_name TEXT, status TEXT)"
     )
-    connection.execute("INSERT INTO derived_view_state VALUES ('p','node_degree','stale')")
+    connection.execute(
+        "INSERT INTO derived_view_state VALUES ('p','node_degree','stale')"
+    )
     connection.commit()
     connection.close()
-    oracles = {"q": {"freshness": {"state": "stale_with_warning", "stale_views": ["pagerank"]}}}
+    oracles = {
+        "q": {"freshness": {"state": "stale_with_warning", "stale_views": ["pagerank"]}}
+    }
     result = rb.rank_score_staleness(directory, "p", oracles)
     assert set(result["stale_rank_views"]) == {"pagerank", "node_degree"}
     assert result["rank_views_fresh"] is False
 
 
 # --- SQLite readers -------------------------------------------------------------
+
 
 def test_query_rows_delegates_and_reads_are_read_only() -> None:
     directory = Path(tempfile.mkdtemp())
@@ -668,7 +867,10 @@ def test_query_rows_delegates_and_reads_are_read_only() -> None:
     connection.commit()
     connection.close()
     assert rb.query_rows(database, "SELECT a,b FROM t ORDER BY a", ()) == ["x", "y"]
-    assert rb.query_tuples(database, "SELECT a,b FROM t ORDER BY a", ()) == [("x", 1), ("y", 2)]
+    assert rb.query_tuples(database, "SELECT a,b FROM t ORDER BY a", ()) == [
+        ("x", 1),
+        ("y", 2),
+    ]
     try:
         rb.query_tuples(database, "INSERT INTO t VALUES('z',3)", ())
     except sqlite3.OperationalError:
@@ -679,13 +881,16 @@ def test_query_rows_delegates_and_reads_are_read_only() -> None:
 
 # --- corpus resolution ----------------------------------------------------------
 
+
 def test_missing_corpus_names_every_path_it_searched() -> None:
     entry = rb.load_corpora_manifest("")["cosign"]
     args = argparse.Namespace(
         corpus_repo=[], clone_missing_real_repos=False, timeout=30
     )
     try:
-        rb.resolve_corpus_source("nonexistent-corpus", entry["url"], entry["revision"], args)
+        rb.resolve_corpus_source(
+            "nonexistent-corpus", entry["url"], entry["revision"], args
+        )
     except RuntimeError as error:
         message = str(error)
         assert "--corpus-repo" in message and "Searched:" in message
@@ -695,7 +900,9 @@ def test_missing_corpus_names_every_path_it_searched() -> None:
 
 def test_pinned_clone_requires_a_full_commit_hash() -> None:
     try:
-        rb.clone_pinned_repo("https://example.invalid/x.git", "main", Path(tempfile.mkdtemp()), 5)
+        rb.clone_pinned_repo(
+            "https://example.invalid/x.git", "main", Path(tempfile.mkdtemp()), 5
+        )
     except RuntimeError as error:
         assert "40-character" in str(error)
     else:
@@ -721,6 +928,7 @@ def test_every_registered_corpus_pins_a_commit_and_tree() -> None:
 
 
 # --- report -------------------------------------------------------------------
+
 
 def test_report_rows_follow_the_emitted_cutoffs() -> None:
     """Guards: hardcoded "10"/"40" rendered an all-n/a table whenever the producer
@@ -759,6 +967,7 @@ def test_report_tolerates_cases_without_probes() -> None:
 
 # --- synthetic overlay on real corpora (A16) ------------------------------------
 
+
 def test_synthetic_rank_fixture_is_the_corpus_when_no_background_is_given() -> None:
     """The synthetic run must keep building the fixture: there is nothing else to index."""
     args = argparse.Namespace(rank_fixture_overlay=False)
@@ -771,7 +980,9 @@ def test_synthetic_rank_fixture_is_suppressed_on_a_real_corpus() -> None:
     real tree plus nine synthetic Python files and every corpus-scoped metric was
     computed over a graph the registry pin does not describe."""
     args = argparse.Namespace(rank_fixture_overlay=False)
-    assert rb.rank_fixture_overlay_decision("rank", {"tree": "abc"}, args) == "suppressed"
+    assert (
+        rb.rank_fixture_overlay_decision("rank", {"tree": "abc"}, args) == "suppressed"
+    )
 
 
 def test_synthetic_rank_fixture_is_kept_when_explicitly_requested() -> None:
@@ -803,7 +1014,9 @@ def test_overlay_control_query_is_appended_when_the_fixture_is_overlaid() -> Non
         judgment["expected_substring"] == "zz_order_core"
         for judgment in control["judgments"]
     )
-    assert rb.rank_battery_with_overlay_control(battery, overlay_active=False) == battery
+    assert (
+        rb.rank_battery_with_overlay_control(battery, overlay_active=False) == battery
+    )
 
 
 def test_overlay_control_query_is_not_duplicated() -> None:
@@ -821,13 +1034,13 @@ def test_no_real_corpus_battery_queries_the_synthetic_symbols() -> None:
     offenders = [
         corpus_id
         for corpus_id, corpus in document["corpora"].items()
-        if corpus_id != "synthetic-rank-v1"
-        and "zz_order_core" in json.dumps(corpus)
+        if corpus_id != "synthetic-rank-v1" and "zz_order_core" in json.dumps(corpus)
     ]
     assert not offenders, f"real corpora reference the synthetic fixture: {offenders}"
 
 
 # --- Tier-A scaffolding labels reach the probe ----------------------------------
+
 
 def make_pytest_project(directory: Path) -> Path:
     """A directory that declares its own pytest configuration. No git, no commits."""
@@ -882,12 +1095,16 @@ def test_label_rules_follow_the_language_toolchain_not_a_path_substring() -> Non
     """Go and Cargo state what a test file is; the label follows that definition rather
     than any string in the path. Exercised on file names alone, so it needs no corpus
     checkout and runs in CI."""
-    go = gl.build_labels("go", Path(tempfile.mkdtemp()), ["cmd/main.go", "pkg/a_test.go"])
+    go = gl.build_labels(
+        "go", Path(tempfile.mkdtemp()), ["cmd/main.go", "pkg/a_test.go"]
+    )
     verdicts = {row["file_path"]: row["is_test"] for row in go["labels"]}
     assert verdicts == {"cmd/main.go": False, "pkg/a_test.go": True}
     assert all(row["source"] == "spec" for row in go["labels"])
 
-    rust = gl.build_labels("rs", Path(tempfile.mkdtemp()), ["src/lib.rs", "tests/cli.rs"])
+    rust = gl.build_labels(
+        "rs", Path(tempfile.mkdtemp()), ["src/lib.rs", "tests/cli.rs"]
+    )
     verdicts = {row["file_path"]: row["is_test"] for row in rust["labels"]}
     # Cargo integration tests are declared by location; unit tests live inline in
     # #[cfg(test)] modules, which no file-level rule can see, so src/lib.rs is unknown.
@@ -923,7 +1140,9 @@ def test_an_all_unknown_label_file_reports_null_not_zero() -> None:
         json.dumps(
             {
                 "counts": {"test": 0, "not_test": 2, "unknown": 0},
-                "labels": [{"file_path": "a.py", "is_test": False, "source": "declared"}],
+                "labels": [
+                    {"file_path": "a.py", "is_test": False, "source": "declared"}
+                ],
             }
         ),
         encoding="utf-8",
@@ -956,6 +1175,7 @@ def test_no_corpus_derived_data_is_tracked_in_the_repository() -> None:
 
 
 # --- corpus coverage: which files actually reached the graph ---------------------
+
 
 def test_coverage_probe_counts_files_and_attributes_them_to_directories() -> None:
     """The silent-drop evidence: a per-directory count is what turns "fewer files" into
@@ -1046,14 +1266,19 @@ def test_coverage_probe_reports_unavailability_without_raising() -> None:
 
 # --- knob-efficacy canary -------------------------------------------------------
 
+
 def test_rank_table_fingerprint_changes_with_the_scores() -> None:
     """The canary compares this across config cells. A fingerprint that ignored the
     scores would report every knob as live regardless of what it did."""
     first, second = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
     make_rank_db(first, [("a", "a.c", 3, 1.0), ("b", "b.c", 2, 2.0)])
     make_rank_db(second, [("a", "a.c", 3, 1.0), ("b", "b.c", 2, 9.0)])
-    assert rb.rank_table_fingerprint(first, "p") != rb.rank_table_fingerprint(second, "p")
-    assert rb.rank_table_fingerprint(first, "p") == rb.rank_table_fingerprint(first, "p")
+    assert rb.rank_table_fingerprint(first, "p") != rb.rank_table_fingerprint(
+        second, "p"
+    )
+    assert rb.rank_table_fingerprint(first, "p") == rb.rank_table_fingerprint(
+        first, "p"
+    )
 
 
 def test_rank_table_fingerprint_is_absent_without_a_database() -> None:
@@ -1066,11 +1291,7 @@ def test_canary_arm_covers_every_ranking_knob() -> None:
     spec = cs.build_canary_spec("HEAD", 1, 600)
     labels = {profile["label"] for profile in spec["profiles"]}
     assert "baseline" in labels
-    swept = {
-        key
-        for profile in spec["profiles"]
-        for key in profile["config_overrides"]
-    }
+    swept = {key for profile in spec["profiles"] for key in profile["config_overrides"]}
     assert cs.RANKING_KNOBS <= swept
     # The canary runs on the synthetic fixture: a real corpus would cost minutes per
     # knob for a question the 17-file fixture answers.
@@ -1150,14 +1371,18 @@ def test_container_finds_every_corpus_named_anywhere_in_a_matrix_spec() -> None:
 
 
 def test_container_corpus_scan_ignores_unrelated_flags() -> None:
-    assert rc.corpora_required_by_spec({"benchmark_args": ["--index-mode", "fast"]}) == []
+    assert (
+        rc.corpora_required_by_spec({"benchmark_args": ["--index-mode", "fast"]}) == []
+    )
     assert rc.corpora_required_by_spec({}) == []
 
 
 def test_container_corpus_env_key_is_the_harness_definition() -> None:
     """The coordinator writes this variable and run_benchmark.py reads it. Two spellings
     would present as a corpus that resolves on the host and vanishes in the container."""
-    assert rb.corpus_env_key("ai-session-search") == "CBM_BENCH_CORPUS_AI_SESSION_SEARCH"
+    assert (
+        rb.corpus_env_key("ai-session-search") == "CBM_BENCH_CORPUS_AI_SESSION_SEARCH"
+    )
     for corpus_id in ("cosign", "ai-session-search", "codebase-memory-mcp", "runc"):
         assert rc.corpus_env_key(corpus_id) == rb.corpus_env_key(corpus_id)
 
@@ -1185,8 +1410,18 @@ def isolated_git_repo() -> Path:
     assert not (directory / ".git").exists(), directory
     for command in (
         ["git", "init", "--quiet"],
-        ["git", "-c", "user.email=t@e", "-c", "user.name=t", "commit",
-         "--quiet", "--allow-empty", "-m", "c"],
+        [
+            "git",
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "c",
+        ],
     ):
         subprocess.run(command, cwd=directory, check=True, capture_output=True)
     return directory
@@ -1219,6 +1454,7 @@ def test_container_stages_workload_corpora_by_their_resolved_commit() -> None:
 def test_container_run_key_separates_different_corpus_pins() -> None:
     """Resume is keyed by this. Two pins sharing a key would merge measurements taken
     against different source trees into one runset."""
+
     def key(revision: str) -> str:
         return rc.container_run_key(
             source_revision="c" * 40,
@@ -1235,6 +1471,7 @@ def test_container_run_key_separates_different_corpus_pins() -> None:
 
 # --- campaign matrix specs ------------------------------------------------------
 
+
 def resolved_candidate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Substitute a built candidate so the spec can be validated without a build.
 
@@ -1250,7 +1487,9 @@ def resolved_candidate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         candidate.pop("ref", None)
         candidate["revision"] = "0" * 40
         candidate["binary"] = str(stub_binary)
-        candidate["binary_sha256"] = hashlib.sha256(stub_binary.read_bytes()).hexdigest()
+        candidate["binary_sha256"] = hashlib.sha256(
+            stub_binary.read_bytes()
+        ).hexdigest()
         candidate["build"] = {
             "target": "make -j1 -f Makefile.cbm cbm",
             "compiler": "clang",
@@ -1291,7 +1530,11 @@ def test_coverage_specs_differ_only_in_index_mode() -> None:
     assert set(coverage) == {"full", "moderate", "fast"}
     stripped = [
         json.dumps(
-            {k: v for k, v in spec.items() if k not in {"index_mode", "harness_version"}},
+            {
+                k: v
+                for k, v in spec.items()
+                if k not in {"index_mode", "harness_version"}
+            },
             sort_keys=True,
         )
         for spec in coverage.values()
@@ -1353,7 +1596,69 @@ def test_rank_arm_covers_every_pinned_popularity_corpus() -> None:
     assert {"cosign", "jest", "runc", "flask", "redis", "ripgrep"} <= named
 
 
+def test_campaign_declares_only_hypotheses_its_cells_can_evaluate() -> None:
+    rank = cs.build_rank_spec("HEAD", 1, 60, ("flask",))
+    canary = cs.build_canary_spec("HEAD", 1, 60)
+    assert rank["evidence_contract"]["hypotheses"] == ["H1", "H2", "H4", "H5", "H6"]
+    assert rank["evidence_contract"]["not_evaluated"] == ["H3", "H7"]
+    assert canary["evidence_contract"]["role"] == "instrument_validity"
+    assert canary["evidence_contract"]["hypotheses"] == []
+    assert set(canary["evidence_contract"]["option_groups"]) == {
+        "ranking_semantics",
+        "numerical_convergence_controls",
+    }
+
+
+def test_quick_hypothesis_profiles_cover_semantics_numerics_and_lifecycle() -> None:
+    spec = cs.build_quick_hypothesis_spec("HEAD", timeout_seconds=90)
+    overrides = {
+        key
+        for profile in spec["profiles"]
+        for key in profile.get("config_overrides", {})
+    }
+    assert {"pagerank_damping", "pagerank_epsilon", "pagerank_max_iter"} <= overrides
+    assert any(profile["label"] == "rank-disabled" for profile in spec["profiles"])
+    assert any(
+        {"edge_weight_calls", "edge_weight_usage", "edge_weight_tests"}
+        <= set(profile.get("config_overrides", {}))
+        for profile in spec["profiles"]
+    )
+    assert "suite_cutoff" not in spec["runtime_policy"]
+    assert "one repetition" in spec["runtime_policy"]["design"]
+    for profile in spec["profiles"]:
+        assert profile["cell_name"]
+        assert profile["informs_hypotheses"]
+        assert profile["questions"]
+        assert all(question["question"] for question in profile["questions"])
+
+
+def test_rank_probe_reads_directional_node_scores_and_edge_linkrank_together() -> None:
+    directory = Path(tempfile.mkdtemp())
+    make_rank_db(
+        directory,
+        [("target", "src/a.py", 9, 4.0), ("caller", "src/b.py", 1, 2.0)],
+    )
+    probes = rb.run_rank_score_probes(directory, "p", top_n=2, cutoffs=(1, 2))
+    expected = {
+        "degree_unweighted_in",
+        "degree_unweighted_out",
+        "degree_unweighted_total",
+        "degree_weighted_in",
+        "degree_weighted_out",
+        "degree_weighted_total",
+        "calls_in",
+        "calls_out",
+        "calls_total",
+    }
+    assert expected <= set(probes["scorers"])
+    assert probes["edge_linkrank"]["applicable"] is True
+    assert probes["edge_linkrank"]["top_ranked"][0]["edge_type"] == "CALLS"
+    assert probes["edge_type_counts"] == {"CALLS": 1}
+    assert probes["scorer_registry"]["degree_weighted_out"]["direction"] == "out"
+
+
 # --- cross-corpus campaign rollup -----------------------------------------------
+
 
 def rollup_case(
     corpus: str,
@@ -1366,6 +1671,8 @@ def rollup_case(
     fresh: bool = True,
     discriminates: list[str] | None = None,
     non_public: dict[str, float] | None = None,
+    language: str = "Python",
+    repetition: int = 1,
 ) -> dict[str, Any]:
     scorers = {
         name: {
@@ -1387,11 +1694,16 @@ def rollup_case(
         for name, value in (utility or {"degree": 0.4, "pagerank": 0.1}).items()
     }
     return {
-        "parameters": {"index_mode": index_mode},
+        "parameters": {"index_mode": index_mode, "repetition": repetition},
         "cases": [
             {
                 "scenario": "rank_quality",
-                "corpus": {"id": corpus, "revision": "a" * 40, "discriminates": discriminates or ["H4", "H5"]},
+                "corpus": {
+                    "id": corpus,
+                    "revision": "a" * 40,
+                    "language": language,
+                    "discriminates": discriminates or ["H4", "H5"],
+                },
                 "fixture": {"corpus_overlay": "suppressed"},
                 "rank_score_staleness": {"available": True, "rank_views_fresh": fresh},
                 "rank_score_probes": {
@@ -1423,7 +1735,9 @@ def rollup_case(
 def test_rollup_reports_utility_contamination_per_scorer() -> None:
     """H1 and H5 in one table: PR #151 says PageRank surfaces utility popularity and
     degree gives the same signal more cheaply. Both directions have to be readable."""
-    rollup = rr.build_rollup([rollup_case("cosign", utility={"degree": 0.6, "pagerank": 0.2})])
+    rollup = rr.build_rollup(
+        [rollup_case("cosign", utility={"degree": 0.6, "pagerank": 0.2})]
+    )
     row = next(r for r in rollup["leaf_hub_rate"] if r["corpus"] == "cosign")
     assert row["scores"]["degree"] == 0.6
     assert row["scores"]["pagerank"] == 0.2
@@ -1435,12 +1749,15 @@ def test_rollup_verdict_names_the_direction_including_against_us() -> None:
     degree_worse = rr.build_rollup(
         [rollup_case("cosign", utility={"degree": 0.6, "pagerank": 0.2})]
     )["verdicts"]["H4"]
-    assert degree_worse["supported"] is True
+    assert degree_worse["supported"] is None
+    assert degree_worse["effect_direction"] == "degree_higher"
+    assert math.isclose(degree_worse["effect_size"], 0.4)
 
     degree_better = rr.build_rollup(
         [rollup_case("cosign", utility={"degree": 0.1, "pagerank": 0.5})]
     )["verdicts"]["H4"]
-    assert degree_better["supported"] is False
+    assert degree_better["supported"] is None
+    assert degree_better["effect_direction"] == "pagerank_higher"
     assert "degree" in degree_better["statement"].lower()
 
 
@@ -1455,7 +1772,8 @@ def test_h2_ignores_the_synthetic_fixture() -> None:
     verdict = rollup["verdicts"]["H2"]
     assert verdict["corpora_compared"] == 1
     assert verdict["spearman_mean"] == 0.36
-    assert verdict["supported"] is False
+    assert verdict["supported"] is None
+    assert verdict["status"] == "measured_descriptive"
 
 
 def test_rollup_reads_the_comparison_keys_the_probe_actually_emits() -> None:
@@ -1465,7 +1783,8 @@ def test_rollup_reads_the_comparison_keys_the_probe_actually_emits() -> None:
     "same ranking signal" claim was reported as no data."""
     rollup = rr.build_rollup([rollup_case("flask", rho={"pagerank": 0.363})])
     assert rollup["verdicts"]["H2"]["corpora_compared"] == 1
-    assert rollup["verdicts"]["H2"]["supported"] is False
+    assert rollup["verdicts"]["H2"]["supported"] is None
+    assert rollup["verdicts"]["H2"]["status"] == "measured_descriptive"
 
 
 def test_rollup_calls_a_tie_inconclusive_rather_than_a_win() -> None:
@@ -1523,8 +1842,11 @@ def test_rollup_diffs_coverage_across_index_modes_with_issue_citations() -> None
     issue that reported it or it is not sourced evidence."""
     rollup = rr.build_rollup(
         [
-            rollup_case("cosign", index_mode="full",
-                        directories={"cmd": 40, "scripts": 5, "hack": 3}),
+            rollup_case(
+                "cosign",
+                index_mode="full",
+                directories={"cmd": 40, "scripts": 5, "hack": 3},
+            ),
             rollup_case("cosign", index_mode="fast", directories={"cmd": 40}),
         ]
     )
@@ -1562,7 +1884,9 @@ def test_detail_frontier_reports_quality_per_response_token() -> None:
         "q1": {"response": {}, "response_token_estimate": 4000},
         "quality": {"mean_ndcg_at_5": 0.85, "mean_reciprocal_rank": 0.9},
     }
-    rows = {row["detail"]: row for row in rr.build_rollup([lean, rich])["detail_frontier"]}
+    rows = {
+        row["detail"]: row for row in rr.build_rollup([lean, rich])["detail_frontier"]
+    }
     assert rows["search_limit=10"]["response_tokens"] == 400
     assert rows["search_limit=10"]["ndcg_per_1k_tokens"] == 2.0
     # 0.05 more nDCG for 10x the tokens is a worse trade, and the table has to show it.
@@ -1574,14 +1898,18 @@ def test_detail_frontier_omits_cells_that_recorded_no_tokens() -> None:
     assert rr.build_rollup([rollup_case("cosign")])["detail_frontier"] == []
 
 
-def test_a_verdict_from_all_zero_measurements_is_provisional() -> None:
+def test_a_verdict_from_all_zero_measurements_is_explicitly_non_discriminating() -> (
+    None
+):
     """Guards all three defects found on the first real run: each printed a confident
     verdict from corpora whose every scorer measured 0.000. A metric that did not move
     on any corpus did not measure anything, whatever its mean says."""
     flat = rollup_case("cosign", utility={"degree": 0.0, "pagerank": 0.0})
     verdict = rr.build_rollup([flat])["verdicts"]["H4"]
     assert verdict["corpora_with_signal"] == 0
-    assert verdict["status"] == "provisional"
+    assert verdict["status"] == "measured_descriptive"
+    assert verdict["supported"] is None
+    assert "did not discriminate" in verdict["statement"]
 
 
 def test_a_verdict_counts_only_corpora_where_the_metric_moved() -> None:
@@ -1593,19 +1921,23 @@ def test_a_verdict_counts_only_corpora_where_the_metric_moved() -> None:
     verdict = rr.build_rollup([zero, signal])["verdicts"]["H4"]
     assert verdict["corpora_compared"] == 2
     assert verdict["corpora_with_signal"] == 1
-    assert verdict["status"] == "provisional"
-    assert "1 of 2" in verdict["statement"]
+    assert verdict["status"] == "measured_descriptive"
+    assert verdict["supported"] is None
+    assert math.isclose(verdict["effect_size"], -0.05)
 
 
-def test_a_verdict_is_stated_only_with_enough_corpora_carrying_signal() -> None:
+def test_more_signal_corpora_increase_coverage_but_do_not_create_a_decision_rule() -> (
+    None
+):
     cases = [
         rollup_case(name, utility={"degree": 0.4, "pagerank": 0.1})
         for name in ("cosign", "redis", "runc")
     ]
     verdict = rr.build_rollup(cases)["verdicts"]["H4"]
     assert verdict["corpora_with_signal"] == 3
-    assert verdict["status"] == "stated"
-    assert verdict["supported"] is True
+    assert verdict["status"] == "measured_descriptive"
+    assert verdict["supported"] is None
+    assert verdict["effect_size"] == 0.30000000000000004
 
 
 def test_validation_block_reports_every_precondition() -> None:
@@ -1613,14 +1945,22 @@ def test_validation_block_reports_every_precondition() -> None:
     validation = rr.build_rollup([rollup_case("cosign")])["validation"]
     assert validation["knob_canary_passed"] is None
     assert validation["no_cells_excluded"] is True
-    assert validation["provisional_verdicts"] == ["H2", "H4", "H5"]
+    assert validation["provisional_verdicts"] == [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7",
+    ]
     assert validation["passed"] is False
 
 
-def test_markdown_marks_a_provisional_verdict_in_the_table() -> None:
+def test_markdown_marks_results_as_not_decision_ready() -> None:
     text = rr.render_markdown(rr.build_rollup([rollup_case("cosign")]))
-    assert "provisional" in text.lower()
-    assert "NOT VALIDATED" in text
+    assert "measured_descriptive" in text
+    assert "NOT DECISION-READY" in text
 
 
 def test_rollup_manifest_is_content_addressed() -> None:
@@ -1628,10 +1968,16 @@ def test_rollup_manifest_is_content_addressed() -> None:
     SHA. A rollup whose bytes are not addressable cannot be cited later."""
     cases = [rollup_case("cosign")]
     first = rr.build_rollup(cases)
-    assert first["manifest"]["rollup_sha256"] == rr.build_rollup(cases)["manifest"]["rollup_sha256"]
-    assert first["manifest"]["rollup_sha256"] != rr.build_rollup(
-        [rollup_case("cosign", utility={"degree": 0.9, "pagerank": 0.1})]
-    )["manifest"]["rollup_sha256"]
+    assert (
+        first["manifest"]["rollup_sha256"]
+        == rr.build_rollup(cases)["manifest"]["rollup_sha256"]
+    )
+    assert (
+        first["manifest"]["rollup_sha256"]
+        != rr.build_rollup(
+            [rollup_case("cosign", utility={"degree": 0.9, "pagerank": 0.1})]
+        )["manifest"]["rollup_sha256"]
+    )
 
 
 def test_rollup_renders_markdown_without_inventing_absent_values() -> None:
@@ -1645,6 +1991,74 @@ def test_rollup_renders_markdown_without_inventing_absent_values() -> None:
 def test_rollup_tolerates_documents_without_rank_probes() -> None:
     assert rr.build_rollup([])["verdicts"]["H5"]["corpora_compared"] == 0
     assert rr.build_rollup([{"cases": [{"scenario": "other"}]}])["leaf_hub_rate"] == []
+
+
+def test_rollup_lists_all_hypotheses_with_names_and_honest_lifecycle() -> None:
+    rollup = rr.build_rollup([rollup_case("flask")])
+    assert set(rollup["verdicts"]) == {f"H{index}" for index in range(1, 8)}
+    assert rollup["verdicts"]["H3"]["status"] == "not_run"
+    assert rollup["verdicts"]["H6"]["status"] in {
+        "not_run",
+        "instrumented_not_evaluated",
+    }
+    assert rollup["verdicts"]["H7"]["status"] == "not_run"
+    assert all(
+        "name" in verdict and len(verdict["name"].split()) >= 3
+        for verdict in rollup["verdicts"].values()
+    )
+    text = rr.render_markdown(rollup)
+    assert "H3 — PageRank cost without task benefit" in text
+
+
+def test_repetitions_are_not_counted_as_independent_corpora() -> None:
+    documents = [
+        rollup_case("flask", rho={"pagerank": 0.2}, repetition=1),
+        rollup_case("flask", rho={"pagerank": 0.4}, repetition=2),
+    ]
+    verdict = rr.build_rollup(documents)["verdicts"]["H2"]
+    assert verdict["corpora_compared"] == 1
+    assert verdict["observation_count"] == 2
+    assert math.isclose(verdict["spearman_mean"], 0.3)
+
+
+def test_rollup_reports_paired_task_quality_for_each_search_rank_sort() -> None:
+    document = rollup_case("cosign")
+    document["cases"][0]["oracles"] = {
+        "scorer_variant_quality": {
+            "pagerank": {
+                "query_count": 1,
+                "mean_ndcg": 1.0,
+                "mean_reciprocal_rank": 1.0,
+                "hit_at_1_rate": 1.0,
+            },
+            "degree": {
+                "query_count": 1,
+                "mean_ndcg": 0.5,
+                "mean_reciprocal_rank": 0.5,
+                "hit_at_1_rate": 0.0,
+            },
+        }
+    }
+    rollup = rr.build_rollup([document])
+    rows = rollup["retrieval_quality_by_scorer"]
+    assert {row["scorer"] for row in rows} == {"pagerank", "degree"}
+    assert rollup["verdicts"]["H2"]["task_quality_corpora"] == 1
+    assert (
+        "paired graded-query quality" in rollup["verdicts"]["H2"]["statement"].lower()
+    )
+
+
+def test_rollup_reports_language_strata_without_treating_unknown_as_zero() -> None:
+    rollup = rr.build_rollup(
+        [
+            rollup_case("flask", language="Python"),
+            rollup_case("redis", language="C"),
+            rollup_case("legacy", language=""),
+        ]
+    )
+    assert rollup["language_strata"]["Python"]["corpora"] == ["flask"]
+    assert rollup["language_strata"]["C"]["corpora"] == ["redis"]
+    assert rollup["language_strata"]["unknown"]["corpora"] == ["legacy"]
 
 
 def main() -> int:

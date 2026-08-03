@@ -39,6 +39,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:  # Package import under tests; script-local import for direct execution.
+    from benchmarks import rank_hypotheses as rank_evidence
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    import rank_hypotheses as rank_evidence
+
 # Every silent-exclusion row cites the issue that reported that directory, so the table
 # is sourced evidence rather than an observation the reader has to take on trust.
 # Verified against the issue text and against src/discover/discover.c.
@@ -66,7 +71,8 @@ REFERENCE_INDEX_MODE = "full"
 UTILITY_CUTOFF = "10"
 METRIC_ALIASES = {"leaf_hub_rate": ("utility_contamination",)}
 SCAFFOLDING_CUTOFF = "10"
-DEGREE_BASELINE = "degree"
+DEGREE_BASELINE = rank_evidence.DEGREE_BASELINE
+LEGACY_DEGREE_BASELINE = "degree"
 SYNTHETIC_CORPUS = "synthetic-rank-v1"
 
 
@@ -94,7 +100,17 @@ def rank_cases(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     # Naming it here keeps every table keyed the same way, and the
                     # verdicts still exclude it because it registers no hypothesis.
                     "corpus_id": corpus.get("id") or SYNTHETIC_CORPUS,
+                    "language": corpus.get("language") or "unknown",
                     "index_mode": parameters.get("index_mode"),
+                    "repetition": (
+                        parameters.get("repetition")
+                        or document.get("repetition")
+                        or case.get("repetition")
+                    ),
+                    "config_profile": parameters.get("config_profile"),
+                    "cell_name": parameters.get("cell_name"),
+                    "informs_hypotheses": parameters.get("informs_hypotheses") or [],
+                    "questions": parameters.get("questions") or [],
                     # The knob canary reads these; they are run parameters rather than
                     # case fields, so they are carried down once here.
                     "config_overrides": parameters.get("config_overrides") or {},
@@ -162,13 +178,76 @@ def scorer_table(
         rows.append(
             {
                 "corpus": case["corpus_id"],
+                "language": case.get("language") or "unknown",
                 "index_mode": case.get("index_mode"),
                 "discriminates": (case.get("corpus") or {}).get("discriminates") or [],
+                "repetition": case.get("repetition"),
+                "config_profile": case.get("config_profile"),
+                "config_overrides": case.get("config_overrides") or {},
                 "cutoff": int(cutoff),
                 "scores": values,
             }
         )
     return sorted(rows, key=lambda row: (row["corpus"], str(row["index_mode"])))
+
+
+def scorer_value(scores: dict[str, Any], scorer: str) -> Any:
+    """Read a canonical scorer while accepting retained pre-registry documents."""
+    if scorer in scores:
+        return scores[scorer]
+    for alias, canonical in rank_evidence.SCORER_ALIASES.items():
+        if canonical == scorer and alias in scores:
+            return scores[alias]
+    return None
+
+
+def collapse_scorer_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse repetitions/detail cells to the independent corpus unit.
+
+    Means summarize repeated observations; they do not create extra sample units. For R
+    rows and S scorer names this is O(R*S) time and O(C*S) memory for C corpora.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["corpus"], []).append(row)
+    collapsed: list[dict[str, Any]] = []
+    for corpus, observations in sorted(grouped.items()):
+        names = sorted(
+            {name for observation in observations for name in observation["scores"]}
+        )
+        scores = {
+            name: mean(
+                [
+                    observation["scores"].get(name)
+                    for observation in observations
+                    if isinstance(observation["scores"].get(name), (int, float))
+                ]
+            )
+            for name in names
+        }
+        collapsed.append(
+            {
+                "corpus": corpus,
+                "language": next(
+                    (
+                        row.get("language")
+                        for row in observations
+                        if row.get("language") and row.get("language") != "unknown"
+                    ),
+                    "unknown",
+                ),
+                "discriminates": sorted(
+                    {
+                        value
+                        for row in observations
+                        for value in row.get("discriminates") or []
+                    }
+                ),
+                "observation_count": len(observations),
+                "scores": scores,
+            }
+        )
+    return collapsed
 
 
 def degree_agreement(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -188,11 +267,48 @@ def degree_agreement(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "corpus": case["corpus_id"],
+                "language": case.get("language") or "unknown",
                 "index_mode": case.get("index_mode"),
+                "repetition": case.get("repetition"),
                 "comparisons": comparisons,
             }
         )
     return sorted(rows, key=lambda row: (row["corpus"], str(row["index_mode"])))
+
+
+def retrieval_quality_by_scorer(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse paired graded-query sort variants to corpus/scorer evidence units."""
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    languages: dict[str, str] = {}
+    for case in cases:
+        if case["corpus_id"] == SYNTHETIC_CORPUS:
+            continue
+        summary = ((case.get("oracles") or {}).get("scorer_variant_quality")) or {}
+        languages[case["corpus_id"]] = case.get("language") or "unknown"
+        for scorer, values in summary.items():
+            if isinstance(values, dict):
+                grouped.setdefault((case["corpus_id"], scorer), []).append(values)
+    rows = []
+    for (corpus, scorer), observations in sorted(grouped.items()):
+        rows.append(
+            {
+                "corpus": corpus,
+                "language": languages.get(corpus, "unknown"),
+                "scorer": scorer,
+                "observation_count": len(observations),
+                "graded_query_count": sum(
+                    int(item.get("query_count") or 0) for item in observations
+                ),
+                "mean_ndcg": mean([item.get("mean_ndcg") for item in observations]),
+                "mean_reciprocal_rank": mean(
+                    [item.get("mean_reciprocal_rank") for item in observations]
+                ),
+                "hit_at_1_rate": mean(
+                    [item.get("hit_at_1_rate") for item in observations]
+                ),
+            }
+        )
+    return rows
 
 
 def silent_drop(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -346,17 +462,6 @@ def mean(values: list[float]) -> float | None:
     return sum(numeric) / len(numeric) if numeric else None
 
 
-# Below this, two means are one measurement's worth of noise apart and the campaign has
-# no direction to report. Without it a corpus where every scorer measured 0.000 printed
-# "degree DESC is the cleaner arm", which is a refutation invented from an absence.
-MEANINGFUL_DIFFERENCE = 1e-9
-
-# A direction stated from fewer corpora than this is one corpus's behaviour wearing a
-# campaign's clothes. Three is the smallest number that can show a pattern rather than a
-# case, and the first real run had exactly one corpus carrying the utility signal.
-MINIMUM_SIGNAL_CORPORA = 3
-
-
 def discriminating(rows: list[dict[str, Any]], hypothesis: str) -> tuple[list, list]:
     """Split rows by whether corpora-v1.json registered them for this hypothesis.
 
@@ -368,7 +473,9 @@ def discriminating(rows: list[dict[str, Any]], hypothesis: str) -> tuple[list, l
     """
     included, excluded = [], []
     for row in rows:
-        (included if hypothesis in (row.get("discriminates") or []) else excluded).append(row)
+        (
+            included if hypothesis in (row.get("discriminates") or []) else excluded
+        ).append(row)
     return included, excluded
 
 
@@ -378,12 +485,12 @@ def paired_means(
     paired = [
         row
         for row in rows
-        if isinstance(row["scores"].get(DEGREE_BASELINE), (int, float))
-        and isinstance(row["scores"].get(challenger), (int, float))
+        if isinstance(scorer_value(row["scores"], DEGREE_BASELINE), (int, float))
+        and isinstance(scorer_value(row["scores"], challenger), (int, float))
     ]
     return (
-        mean([row["scores"][DEGREE_BASELINE] for row in paired]),
-        mean([row["scores"][challenger] for row in paired]),
+        mean([scorer_value(row["scores"], DEGREE_BASELINE) for row in paired]),
+        mean([scorer_value(row["scores"], challenger) for row in paired]),
         paired,
     )
 
@@ -428,7 +535,8 @@ def contamination_verdict(
     corpus count and the number of corpora that produced any signal travel with it, so
     neither a one-corpus pilot nor a set of all-zero rows can read as a campaign result.
     """
-    scoped, other = discriminating(rows, hypothesis)
+    scoped_observations, other = discriminating(rows, hypothesis)
+    scoped = collapse_scorer_rows(scoped_observations)
     degree_mean, pagerank_mean, paired = paired_means(scoped, "pagerank")
     with_signal = corpora_with_signal(paired)
     verdict: dict[str, Any] = {
@@ -436,14 +544,11 @@ def contamination_verdict(
         "metric": metric_name,
         "cutoff": int(cutoff),
         "corpora_compared": len(paired),
+        "observation_count": sum(row.get("observation_count", 1) for row in paired),
         "corpora_with_signal": len(with_signal),
         "signal_corpora": with_signal,
         "not_discriminating": sorted({row["corpus"] for row in other}),
-        "status": (
-            "stated"
-            if len(with_signal) >= MINIMUM_SIGNAL_CORPORA
-            else "provisional"
-        ),
+        "status": "measured_descriptive" if paired else "not_run",
     }
     if degree_mean is None or pagerank_mean is None:
         return {**verdict, "supported": None, "statement": when_absent}
@@ -459,7 +564,7 @@ def contamination_verdict(
                 f"metric did not discriminate anything ({margin})"
             ),
         }
-    if abs(degree_mean - pagerank_mean) < MEANINGFUL_DIFFERENCE:
+    if degree_mean == pagerank_mean:
         return {
             **verdict,
             "supported": None,
@@ -468,23 +573,18 @@ def contamination_verdict(
                 f"({margin})"
             ),
         }
-    supported = degree_mean > pagerank_mean
-    caveat = (
-        ""
-        if verdict["status"] == "stated"
-        else (
-            f" — PROVISIONAL: only {len(with_signal)} of {len(paired)} corpora produced "
-            f"any signal ({', '.join(with_signal)}), below the {MINIMUM_SIGNAL_CORPORA} "
-            "required to state a direction"
-        )
-    )
+    degree_higher = degree_mean > pagerank_mean
     return {
         **verdict,
-        "supported": supported,
+        # Retained for old JSON readers; the report does not use it as a decision rule.
+        "supported": None,
+        "effect_direction": "degree_higher" if degree_higher else "pagerank_higher",
+        "effect_size": degree_mean - pagerank_mean,
+        "status": "measured_descriptive",
         "statement": (
-            f"{when_degree_worse} ({margin}){caveat}"
-            if supported
-            else f"{when_degree_better} ({margin}){caveat}"
+            f"{when_degree_worse} ({margin}); descriptive effect, not a thresholded verdict"
+            if degree_higher
+            else f"{when_degree_better} ({margin}); descriptive effect, not a thresholded verdict"
         ),
     }
 
@@ -569,62 +669,201 @@ def scaffolding_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def agreement_verdict(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """H2: PR #151 claims degree gives "the same ranking signal" as PageRank.
+    """H2 observations without an arbitrary equivalence cutoff.
 
-    Reads `<scorer>_vs_degree.spearman_rho`, the shape run_rank_score_probes emits.
+    Repetitions and detail profiles are averaged inside each corpus first. RBO/Jaccard
+    describe the returned top page; the legacy shared-row Spearman remains visible but
+    cannot establish equivalence because it ignores symbols absent from one page.
     """
-    values = [
-        comparison["spearman_rho"]
-        for row in rows
-        for name, comparison in row["comparisons"].items()
-        if name == "pagerank_vs_degree"
-        and isinstance(comparison, dict)
-        and isinstance(comparison.get("spearman_rho"), (int, float))
-    ]
-    average = mean(values)
-    corpora = sorted(
-        {
-            row["corpus"]
-            for row in rows
-            if isinstance(
-                (row["comparisons"].get("pagerank_vs_degree") or {}).get("spearman_rho"),
-                (int, float),
-            )
-        }
-    )
-    if average is None:
+
+    def comparison(row: dict[str, Any]) -> dict[str, Any]:
+        values = row.get("comparisons") or {}
+        for key in (
+            f"pagerank_vs_{DEGREE_BASELINE}",
+            "pagerank_vs_degree",
+        ):
+            if isinstance(values.get(key), dict):
+                return values[key]
+        return {}
+
+    observations: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        value = comparison(row)
+        if value:
+            observations.setdefault(row["corpus"], []).append(value)
+    per_corpus = []
+    for corpus, values in sorted(observations.items()):
+        per_corpus.append(
+            {
+                "corpus": corpus,
+                "observation_count": len(values),
+                "rank_biased_overlap": mean(
+                    [value.get("rank_biased_overlap") for value in values]
+                ),
+                "top_k_jaccard": mean([value.get("top_k_jaccard") for value in values]),
+                "shared_spearman_rho": mean(
+                    [
+                        value.get("shared_spearman_rho", value.get("spearman_rho"))
+                        for value in values
+                    ]
+                ),
+            }
+        )
+    if not per_corpus:
         return {
             "hypothesis": "H2",
             "supported": None,
             "corpora_compared": 0,
+            "observation_count": 0,
             "corpora_with_signal": 0,
             "signal_corpora": [],
-            "status": "provisional",
+            "status": "not_run",
             "statement": "no corpus produced a degree-to-pagerank correlation",
         }
-    # 0.9 is the threshold at which two orderings are interchangeable for a caller who
-    # only reads a top-K page; below it the two arms return materially different pages.
-    supported = average >= 0.9
-    status = "stated" if len(corpora) >= MINIMUM_SIGNAL_CORPORA else "provisional"
+    rbo = mean([row["rank_biased_overlap"] for row in per_corpus])
+    jaccard = mean([row["top_k_jaccard"] for row in per_corpus])
+    spearman = mean([row["shared_spearman_rho"] for row in per_corpus])
+    metric_summary = ", ".join(
+        f"{name}={value:.3f}"
+        for name, value in (
+            ("RBO", rbo),
+            ("Jaccard", jaccard),
+            ("shared-row Spearman", spearman),
+        )
+        if value is not None
+    )
+    corpora = [row["corpus"] for row in per_corpus]
     return {
         "hypothesis": "H2",
-        "supported": supported,
-        "corpora_compared": len(values),
-        # A correlation is a real measurement whether or not it is near zero, so signal
-        # here is the distinct-corpus count rather than a non-zero test.
+        "supported": None,
+        "corpora_compared": len(corpora),
+        "observation_count": sum(row["observation_count"] for row in per_corpus),
         "corpora_with_signal": len(corpora),
         "signal_corpora": corpora,
-        "status": status,
-        "spearman_mean": average,
+        "status": "measured_descriptive",
+        "rank_biased_overlap_mean": rbo,
+        "top_k_jaccard_mean": jaccard,
+        "spearman_mean": spearman,
+        "per_corpus": per_corpus,
         "statement": (
-            f"degree and PageRank order the graph near-identically "
-            f"(mean Spearman {average:.3f} over {len(values)} corpora), so the cheaper "
-            "signal is sufficient"
-            if supported
-            else f"degree and PageRank produce materially different orderings "
-            f"(mean Spearman {average:.3f} over {len(values)} corpora)"
+            f"measured {metric_summary or 'no numeric agreement metric'} over "
+            f"{len(corpora)} independent corpora and "
+            f"{sum(row['observation_count'] for row in per_corpus)} observations. "
+            "No equivalence/non-inferiority margin was pre-registered, so these effect "
+            "sizes are descriptive rather than a supported/refuted verdict."
         ),
     }
+
+
+def hypothesis_metadata(hypothesis_id: str, verdict: dict[str, Any]) -> dict[str, Any]:
+    definition = rank_evidence.HYPOTHESES[hypothesis_id]
+    return {
+        "hypothesis": hypothesis_id,
+        "name": definition["name"],
+        "question": definition["question"],
+        "family": definition["family"],
+        **verdict,
+    }
+
+
+def not_run_verdict(hypothesis_id: str, statement: str) -> dict[str, Any]:
+    return hypothesis_metadata(
+        hypothesis_id,
+        {
+            "supported": None,
+            "status": "not_run",
+            "corpora_compared": 0,
+            "observation_count": 0,
+            "corpora_with_signal": 0,
+            "signal_corpora": [],
+            "statement": statement,
+        },
+    )
+
+
+def utility_family_h1(h5: dict[str, Any]) -> dict[str, Any]:
+    """Represent H1 without pretending H5's shared observations are new evidence."""
+    return hypothesis_metadata(
+        "H1",
+        {
+            "supported": None,
+            "status": h5.get("status", "not_run"),
+            "corpora_compared": h5.get("corpora_compared", 0),
+            "observation_count": h5.get("observation_count", 0),
+            "corpora_with_signal": h5.get("corpora_with_signal", 0),
+            "signal_corpora": h5.get("signal_corpora", []),
+            "shared_evidence_with": "H5",
+            "independent_evidence": False,
+            "statement": (
+                "H1 and H5 share the same utility/public-surface observations; this row "
+                "does not count them twice. "
+                + str(h5.get("statement", "No shared evidence was measured."))
+            ),
+        },
+    )
+
+
+def linkrank_capability_verdict(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    observed = [
+        case
+        for case in cases
+        if ((case.get("rank_score_probes") or {}).get("edge_linkrank") or {}).get(
+            "applicable"
+        )
+    ]
+    if not observed:
+        return not_run_verdict(
+            "H6", "no cell emitted an applicable edge-level LinkRank ranking"
+        )
+    corpora = sorted({case["corpus_id"] for case in observed})
+    return hypothesis_metadata(
+        "H6",
+        {
+            "supported": None,
+            "status": "instrumented_not_evaluated",
+            "corpora_compared": len(corpora),
+            "observation_count": len(observed),
+            "corpora_with_signal": len(corpora),
+            "signal_corpora": corpora,
+            "statement": (
+                f"{len(observed)} cells over {len(corpora)} corpora emitted ranked "
+                "source-edge-target tuples. No judged edge/path task and node-only "
+                "candidate-budget control were run, so H6 has instrumentation but no verdict."
+            ),
+        },
+    )
+
+
+def language_strata(cases: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, set[str]] = {}
+    observations: dict[str, int] = {}
+    for case in cases:
+        language = str(case.get("language") or "unknown")
+        grouped.setdefault(language, set()).add(case["corpus_id"])
+        observations[language] = observations.get(language, 0) + 1
+    return {
+        language: {
+            "corpora": sorted(corpora),
+            "corpus_count": len(corpora),
+            "observation_count": observations[language],
+        }
+        for language, corpora in sorted(grouped.items())
+    }
+
+
+def cell_question_map(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate the audit mapping carried from matrix profile to result document."""
+    records: dict[str, dict[str, Any]] = {}
+    for case in cases:
+        name = case.get("cell_name")
+        if not isinstance(name, str) or not name:
+            continue
+        records[name] = {
+            "cell_name": name,
+            "informs_hypotheses": list(case.get("informs_hypotheses") or []),
+            "questions": list(case.get("questions") or []),
+        }
+    return [records[name] for name in sorted(records)]
 
 
 def validation_gate(rollup: dict[str, Any]) -> dict[str, Any]:
@@ -642,33 +881,21 @@ def validation_gate(rollup: dict[str, Any]) -> dict[str, Any]:
     provisional = sorted(
         name
         for name, verdict in rollup["verdicts"].items()
-        if verdict.get("status") != "stated"
+        if verdict.get("status") != "decision_ready"
     )
     checks = {
         "knob_canary_passed": canary,
         "no_cells_excluded": not rollup["excluded"],
         "fixture_overlay_declared": rollup["fixture_overlay"] != [],
         "provisional_verdicts": provisional,
-        "minimum_signal_corpora": MINIMUM_SIGNAL_CORPORA,
+        "decision_rule_pre_registered": False,
+        "independent_unit": "corpus; repetitions and detail profiles are observations",
     }
-    checks["passed"] = bool(
-        canary is True and checks["no_cells_excluded"] and not provisional
-    )
+    checks["passed"] = False
     checks["statement"] = (
-        "every precondition passed; the verdicts above may be quoted"
-        if checks["passed"]
-        else "NOT VALIDATED — "
-        + "; ".join(
-            reason
-            for reason in (
-                None if canary is True else f"knob canary {canary!r} rather than passed",
-                None if checks["no_cells_excluded"] else "cells were excluded",
-                None
-                if not provisional
-                else f"provisional verdicts: {', '.join(provisional)}",
-            )
-            if reason
-        )
+        "NOT DECISION-READY — no equivalence/non-inferiority margin or inferential "
+        "decision rule was pre-registered. Report the continuous effect sizes, corpus "
+        "coverage, and missing arms; do not quote supported/refuted labels."
     )
     return checks
 
@@ -689,20 +916,50 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
         if any(value is not None for value in row["scores"].values())
     ]
     agreement_rows = degree_agreement(usable)
+    retrieval_rows = retrieval_quality_by_scorer(usable)
+    h2 = hypothesis_metadata("H2", agreement_verdict(agreement_rows))
+    task_quality_corpora = len({row["corpus"] for row in retrieval_rows})
+    h2["task_quality_corpora"] = task_quality_corpora
+    h2["retrieval_quality_by_scorer"] = retrieval_rows
+    if retrieval_rows:
+        h2["statement"] += (
+            f" Paired graded-query quality was also measured for "
+            f"{len({row['scorer'] for row in retrieval_rows})} search rank modes over "
+            f"{task_quality_corpora} corpora; see retrieval_quality_by_scorer."
+        )
+    h4 = hypothesis_metadata("H4", scaffolding_verdict(scaffolding_rows))
+    h5 = hypothesis_metadata("H5", utility_verdict(utility_rows, non_public_rows))
+    h6 = linkrank_capability_verdict(usable)
     rollup: dict[str, Any] = {
         "schema_version": 1,
         "corpora": sorted({case["corpus_id"] for case in usable}),
         "index_modes": sorted({str(case.get("index_mode")) for case in usable}),
+        "language_strata": language_strata(usable),
+        "cell_question_map": cell_question_map(usable),
+        "evidence_units": {
+            "independent_unit": "corpus",
+            "corpus_count": len({case["corpus_id"] for case in usable}),
+            "observation_count": len(usable),
+            "warning": (
+                "repetitions, detail profiles, and config arms are repeated observations; "
+                "they are never counted as independent corpora"
+            ),
+        },
+        "hypothesis_registry": rank_evidence.public_hypothesis_registry(),
         "leaf_hub_rate": utility_rows,
         "non_public_rate": non_public_rows,
         "scaffolding": scaffolding_rows,
         "degree_agreement": agreement_rows,
+        "retrieval_quality_by_scorer": retrieval_rows,
         "silent_drop": silent_drop(usable),
         "predicted_loss_checks": [
             {
                 "corpus": case["corpus_id"],
                 "index_mode": case.get("index_mode"),
-                **((case.get("corpus_coverage") or {}).get("predicted_loss_check") or {}),
+                **(
+                    (case.get("corpus_coverage") or {}).get("predicted_loss_check")
+                    or {}
+                ),
             }
             for case in usable
             if (case.get("corpus_coverage") or {}).get("predicted_loss_check")
@@ -710,10 +967,7 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
         # Validity, not decoration: an overlaid fixture changes what every corpus-scoped
         # number means, so the state travels with the numbers.
         "fixture_overlay": sorted(
-            {
-                str((case.get("fixture") or {}).get("corpus_overlay"))
-                for case in usable
-            }
+            {str((case.get("fixture") or {}).get("corpus_overlay")) for case in usable}
         ),
         "detail_frontier": detail_frontier(usable),
         "excluded": excluded,
@@ -721,9 +975,19 @@ def build_rollup(documents: list[dict[str, Any]]) -> dict[str, Any]:
         # tuning number downstream of it a difference of exactly zero.
         "knob_canary": knob_canary(usable),
         "verdicts": {
-            "H2": agreement_verdict(agreement_rows),
-            "H4": scaffolding_verdict(scaffolding_rows),
-            "H5": utility_verdict(utility_rows, non_public_rows),
+            "H1": utility_family_h1(h5),
+            "H2": h2,
+            "H3": not_run_verdict(
+                "H3",
+                "no paired rank-enabled/rank-disabled production-scale cost and task-quality arm was analyzed",
+            ),
+            "H4": h4,
+            "H5": h5,
+            "H6": h6,
+            "H7": not_run_verdict(
+                "H7",
+                "no pre-registered default-versus-tuned held-out language/task comparison was analyzed",
+            ),
         },
     }
     rollup["validation"] = validation_gate(rollup)
@@ -764,32 +1028,32 @@ def render_markdown(rollup: dict[str, Any]) -> str:
     lines = [
         "# Rank-quality campaign rollup",
         "",
-        f"Corpora: {', '.join(rollup['corpora']) or 'none'}. "
-        f"Index modes: {', '.join(rollup['index_modes']) or 'none'}. "
-        f"Fixture overlay: {', '.join(rollup['fixture_overlay']) or 'n/a'}.",
+        (
+            f"Corpora: {', '.join(rollup['corpora']) or 'none'}. "
+            f"Index modes: {', '.join(rollup['index_modes']) or 'none'}. "
+            f"Fixture overlay: {', '.join(rollup['fixture_overlay']) or 'n/a'}."
+        ),
         "",
-        f"## Validation: {'PASSED' if rollup['validation']['passed'] else 'NOT VALIDATED'}",
+        f"## Validation: {'DECISION-READY' if rollup['validation']['passed'] else 'NOT DECISION-READY'}",
         "",
         rollup["validation"]["statement"],
         "",
-        "A verdict marked **provisional** is a computed label, not a finding, and must "
-        "not be quoted as one.",
+        (
+            "Continuous effects are observations. Without a pre-registered decision rule, "
+            "they are not supported/refuted findings."
+        ),
         "",
         "## Verdicts",
         "",
-        "| Hypothesis | Result | Status | Corpora | With signal | Statement |",
-        "|---|---|---|---|---|---|",
+        "| Hypothesis and plain-English name | Status | Corpora | Observations | Statement |",
+        "|---|---|---|---|---|",
     ]
-    for key in ("H2", "H4", "H5"):
+    for key in rank_evidence.HYPOTHESES:
         verdict = rollup["verdicts"][key]
-        result = {True: "supported", False: "refuted", None: "inconclusive"}[
-            verdict["supported"]
-        ]
-        status = verdict.get("status", "provisional")
-        marker = result if status == "stated" else f"_{result}_"
         lines.append(
-            f"| {key} | {marker} | {status} | {verdict['corpora_compared']} | "
-            f"{verdict.get('corpora_with_signal', 0)} | {verdict['statement']} |"
+            f"| {key} — {verdict['name']} | {verdict.get('status', 'unknown')} | "
+            f"{verdict.get('corpora_compared', 0)} | "
+            f"{verdict.get('observation_count', 0)} | {verdict['statement']} |"
         )
     canary = rollup["knob_canary"]
     state = {True: "passed", False: "FAILED", None: "not run"}[canary["passed"]]
@@ -805,6 +1069,33 @@ def render_markdown(rollup: dict[str, Any]) -> str:
         ]
     )
     lines.extend(["## Ranking", ""])
+    if rollup["retrieval_quality_by_scorer"]:
+        lines.extend(
+            [
+                "### Paired graded-query quality by search rank mode",
+                "",
+                "| Corpus | Language | Scorer | Graded queries | nDCG | MRR | Hit@1 |",
+                "|---|---|---|---|---|---|---|",
+            ]
+        )
+        for row in rollup["retrieval_quality_by_scorer"]:
+            lines.append(
+                f"| {row['corpus']} | {row['language']} | {row['scorer']} | "
+                f"{row['graded_query_count']} | {format_number(row['mean_ndcg'])} | "
+                f"{format_number(row['mean_reciprocal_rank'])} | "
+                f"{format_number(row['hit_at_1_rate'])} |"
+            )
+        lines.extend(
+            [
+                "",
+                (
+                    "Each corpus is one evidence unit; repeated cells are averaged. These "
+                    "are effect measurements, not a supported/refuted label without a "
+                    "declared decision rule."
+                ),
+                "",
+            ]
+        )
     lines.extend(
         scorer_section(
             f"Leaf-hub rate @{UTILITY_CUTOFF} (descriptive, not a verdict)",
@@ -857,14 +1148,23 @@ def render_markdown(rollup: dict[str, Any]) -> str:
         lines.extend(
             [
                 "",
-                "Quality per token, not per query: upstream #1382 measured recall "
-                "0.723 -> 0.525 purely from the graph arm returning less, an effect "
-                "larger than any plausible re-ranking gain.",
+                (
+                    "Quality per token, not per query: upstream #1382 measured recall "
+                    "0.723 -> 0.525 purely from the graph arm returning less, an effect "
+                    "larger than any plausible re-ranking gain."
+                ),
                 "",
             ]
         )
     if rollup["excluded"]:
-        lines.extend(["## Excluded from the verdicts", "", "| Corpus | Mode | Reason |", "|---|---|---|"])
+        lines.extend(
+            [
+                "## Excluded from the verdicts",
+                "",
+                "| Corpus | Mode | Reason |",
+                "|---|---|---|",
+            ]
+        )
         for row in rollup["excluded"]:
             lines.append(f"| {row['corpus']} | {row['index_mode']} | {row['reason']} |")
         lines.append("")
@@ -874,8 +1174,10 @@ def render_markdown(rollup: dict[str, Any]) -> str:
             "",
             f"- Rollup SHA-256: `{rollup['manifest']['rollup_sha256']}`",
             f"- Result documents: {rollup['manifest']['document_count']}",
-            f"- Rank-quality cases: {rollup['manifest']['case_count']} "
-            f"({rollup['manifest']['usable_case_count']} used)",
+            (
+                f"- Rank-quality cases: {rollup['manifest']['case_count']} "
+                f"({rollup['manifest']['usable_case_count']} used)"
+            ),
             "",
         ]
     )

@@ -10,29 +10,34 @@ from __future__ import annotations
 
 import argparse
 import ast
-from contextlib import closing, suppress
 import gzip
 import hashlib
 import importlib.util
-from itertools import pairwise
 import json
 import math
-import statistics
 import os
 import platform
 import queue
 import re
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
+from contextlib import closing, suppress
 from datetime import datetime, timezone
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
+
+try:  # Package import under tests; script-local import for direct execution.
+    from benchmarks import rank_hypotheses as rank_evidence
+except ModuleNotFoundError:  # pragma: no cover - selected by ``python benchmarks/...``
+    import rank_hypotheses as rank_evidence
 
 
 CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
@@ -2585,6 +2590,18 @@ class McpClient:
         with self.stderr_lock:
             return "\n".join(self.stderr_lines[mark:])
 
+    def server_exit_error(self, method: str) -> RuntimeError:
+        """Retain bounded candidate stderr when MCP exits before a response."""
+        with self.stderr_lock:
+            stderr_tail = self.stderr_lines[-FAILURE_TAIL_LINES:]
+        returncode = self.proc.poll() if self.proc else None
+        detail = (
+            f"; returncode={returncode}; stderr_tail={stderr_tail!r}"
+            if stderr_tail or returncode is not None
+            else ""
+        )
+        return RuntimeError(f"MCP server exited before response: {method}{detail}")
+
     def _send(self, message: dict[str, Any]) -> None:
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("MCP server is not running")
@@ -2608,7 +2625,7 @@ class McpClient:
                 raise TimeoutError(f"MCP request timed out: {method}")
             line = self.stdout_queue.get(timeout=remaining)
             if line is None:
-                raise RuntimeError(f"MCP server exited before response: {method}")
+                raise self.server_exit_error(method)
             try:
                 response = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -3198,7 +3215,9 @@ def python_public_exports(repo: Path) -> frozenset[str]:
         return frozenset()
     exported: set[str] = set()
     for init in root.rglob("__init__.py"):
-        if any(part in {".git", "node_modules", "vendor", "build"} for part in init.parts):
+        if any(
+            part in {".git", "node_modules", "vendor", "build"} for part in init.parts
+        ):
             continue
         try:
             tree = ast.parse(init.read_text(encoding="utf-8", errors="replace"))
@@ -3283,7 +3302,9 @@ def is_public_api(
         ):
             return True
         for part in parts:
-            if part.startswith("_") and not (part.startswith("__") and part.endswith("__")):
+            if part.startswith("_") and not (
+                part.startswith("__") and part.endswith("__")
+            ):
                 return False
         return True
     return None
@@ -3297,9 +3318,7 @@ def non_public_rate(
     None when the window's language has no name-level publicity rule, so a corpus the
     label cannot speak to reports null instead of contributing a zero.
     """
-    verdicts = [
-        is_public_api(str(row[0]), str(row[1]), python_exports) for row in rows
-    ]
+    verdicts = [is_public_api(str(row[0]), str(row[1]), python_exports) for row in rows]
     known = [verdict for verdict in verdicts if verdict is not None]
     if not known:
         return None
@@ -3377,40 +3396,30 @@ def structural_leaf_hubs(nodes: list[dict[str, Any]]) -> frozenset[str]:
         if incoming > cut and outgoing <= LEAF_HUB_MAX_FAN_OUT_RATIO * incoming
     )
 
+
+RANK_PROBE_CANONICAL_SQL = rank_evidence.build_rank_probe_sql(RANK_PROBE_SCOPE)
+# Public compatibility mapping: historical callers can still inspect ``degree``,
+# ``in_degree``, ``weighted_in``, and ``importance``. The probe executes only the
+# canonical SQL and materializes aliases afterward, avoiding duplicate database scans.
 RANK_PROBE_SQL: dict[str, str] = {
-    "pagerank": (
-        "SELECT n.qualified_name, n.file_path, p.rank AS s "
-        "FROM nodes n JOIN pagerank p ON p.node_id = n.id "
-        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
-    ),
-    "weighted_in": (
-        "SELECT n.qualified_name, n.file_path, d.weighted_in AS s "
-        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
-        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
-    ),
-    "linkrank_in": (
-        "SELECT n.qualified_name, n.file_path, d.linkrank_in AS s "
-        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
-        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
-    ),
-    "degree": (
-        "SELECT n.qualified_name, n.file_path, (d.total_in + d.total_out) AS s "
-        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
-        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
-    ),
-    "in_degree": (
-        "SELECT n.qualified_name, n.file_path, d.total_in AS s "
-        "FROM nodes n JOIN node_degree d ON d.node_id = n.id "
-        "WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " ORDER BY s DESC, n.qualified_name LIMIT ?"
-    ),
-    "importance": (
-        "SELECT n.qualified_name, n.file_path, "
-        "CAST(json_extract(n.properties,'$.importance') AS REAL) AS s "
-        "FROM nodes n WHERE n.project = ? AND " + RANK_PROBE_SCOPE + " "
-        "AND json_extract(n.properties,'$.importance') IS NOT NULL "
-        "ORDER BY s DESC, n.qualified_name LIMIT ?"
-    ),
+    **RANK_PROBE_CANONICAL_SQL,
+    **{
+        alias: RANK_PROBE_CANONICAL_SQL[target]
+        for alias, target in rank_evidence.SCORER_ALIASES.items()
+    },
 }
+
+RANK_EDGE_TYPE_COUNTS_SQL = (
+    "SELECT type, COUNT(*) FROM edges WHERE project = ? GROUP BY type ORDER BY type"
+)
+RANK_EDGE_LINKRANK_SQL = (
+    "SELECT source.qualified_name, target.qualified_name, e.type, lr.rank, "
+    "source.file_path, target.file_path "
+    "FROM linkrank lr JOIN edges e ON e.id = lr.edge_id "
+    "JOIN nodes source ON source.id = e.source_id "
+    "JOIN nodes target ON target.id = e.target_id "
+    "WHERE e.project = ? ORDER BY lr.rank DESC, e.id LIMIT ?"
+)
 
 # Logging, formatting and allocation helpers carry the highest raw fan-in in most
 # codebases. PR #151: "PageRank on a call graph would rank log.Error() and fmt.Sprintf()
@@ -3421,16 +3430,46 @@ RANK_PROBE_SQL: dict[str, str] = {
 # is presentation only; the metrics are computed over the cutoffs, not this depth.
 TOP_RANKED_SAMPLE = 10
 
+# RBO is a descriptive sensitivity metric, not a pass/fail rule. Publishing its depth
+# persistence beside every comparison keeps the top-weighting assumption auditable:
+# 0.9 assigns about 86% of finite weight to the first 20 ranks while retaining tail
+# disagreement. Callers can override it when performing a declared sensitivity analysis.
+RANK_BIASED_OVERLAP_PERSISTENCE = 0.9
+
 # Matched as whole identifier tokens (see is_utility_symbol), never as substrings.
 # Deliberately excludes "trace", "debug", "warn" and "free": they collide with ordinary
 # production identifiers such as this project's own trace_path, and a marker that fires
 # on the corpus under test would inflate exactly the number the campaign reports.
 UTILITY_SYMBOL_TOKENS: frozenset[str] = frozenset(
     {
-        "log", "logf", "logger", "printf", "sprintf", "fprintf", "println", "puts",
-        "malloc", "calloc", "realloc", "zmalloc", "zfree", "zrealloc", "xmalloc",
-        "memcpy", "memmove", "memset", "strlen", "strcmp", "strcpy", "strdup",
-        "assert", "errorf", "wrapf", "panic", "fatal", "abort",
+        "log",
+        "logf",
+        "logger",
+        "printf",
+        "sprintf",
+        "fprintf",
+        "println",
+        "puts",
+        "malloc",
+        "calloc",
+        "realloc",
+        "zmalloc",
+        "zfree",
+        "zrealloc",
+        "xmalloc",
+        "memcpy",
+        "memmove",
+        "memset",
+        "strlen",
+        "strcmp",
+        "strcpy",
+        "strdup",
+        "assert",
+        "errorf",
+        "wrapf",
+        "panic",
+        "fatal",
+        "abort",
     }
 )
 
@@ -3448,6 +3487,38 @@ def spearman_rho(left: list[float], right: list[float]) -> float | None:
         return statistics.correlation(left, right, method="ranked")
     except statistics.StatisticsError:
         return None
+
+
+def rank_biased_overlap(
+    left: list[str],
+    right: list[str],
+    *,
+    persistence: float = RANK_BIASED_OVERLAP_PERSISTENCE,
+) -> float | None:
+    """Finite extrapolated RBO for two top-weighted rankings.
+
+    Unlike Spearman over the intersection, RBO penalizes a symbol missing from either
+    top-K page. ``persistence`` is the probability of continuing to the next rank; 0.9
+    gives 86% of the finite weight to the first 20 positions. Runtime and memory are
+    O(K), where K is the longer bounded result page.
+    """
+    if not left or not right or not 0.0 < persistence < 1.0:
+        return None
+    depth = max(len(left), len(right))
+    left_seen: set[str] = set()
+    right_seen: set[str] = set()
+    weighted_agreement = 0.0
+    agreement = 0.0
+    for index in range(depth):
+        if index < len(left):
+            left_seen.add(left[index])
+        if index < len(right):
+            right_seen.add(right[index])
+        agreement = len(left_seen & right_seen) / (index + 1)
+        weighted_agreement += agreement * persistence**index
+    # The residual term extrapolates the agreement at the observed depth instead of
+    # silently treating every unobserved tail item as a disagreement.
+    return (1.0 - persistence) * weighted_agreement + agreement * persistence**depth
 
 
 # Derived views published by cbm_pagerank_compute (src/pagerank/pagerank.c). When any of
@@ -3505,7 +3576,9 @@ def is_utility_symbol(qualified_name: str | None) -> bool:
         return False
     tokens = {
         token.lower()
-        for token in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+", qualified_name)
+        for token in re.findall(
+            r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|[0-9]+", qualified_name
+        )
         if token
     }
     return bool(tokens & UTILITY_SYMBOL_TOKENS)
@@ -3758,6 +3831,8 @@ def run_rank_score_probes(
     absent, scaffolding@K is reported as null rather than being filled in from one of the
     seven string predicates under test, which would make the metric circular.
     """
+    if top_n <= 0 or not cutoffs or any(cutoff <= 0 for cutoff in cutoffs):
+        raise ValueError("rank probe top_n and every cutoff must be positive")
     try:
         db_path = find_project_db(cache_dir)
     except (RuntimeError, OSError) as exc:
@@ -3778,7 +3853,7 @@ def run_rank_score_probes(
 
     scorers: dict[str, Any] = {}
     ranked_by_scorer: dict[str, list[tuple[Any, ...]]] = {}
-    for name, sql in RANK_PROBE_SQL.items():
+    for name, sql in RANK_PROBE_CANONICAL_SQL.items():
         started = time.monotonic()
         try:
             rows = query_tuples(db_path, sql, (project, top_n))
@@ -3843,35 +3918,98 @@ def run_rank_score_probes(
         entry["by_cutoff"] = by_cutoff
         scorers[name] = entry
 
+    # Aliases are output compatibility, not extra experiments. Reusing the canonical
+    # rows keeps this expansion O(A) dictionaries and avoids A additional O(N log K)
+    # SQLite rankings for A historical names.
+    for alias, canonical in rank_evidence.SCORER_ALIASES.items():
+        canonical_entry = scorers.get(canonical)
+        if canonical_entry is None:
+            continue
+        scorers[alias] = {**canonical_entry, "alias_of": canonical}
+        if canonical in ranked_by_scorer:
+            ranked_by_scorer[alias] = ranked_by_scorer[canonical]
+
+    try:
+        edge_type_counts = {
+            str(row[0]): int(row[1])
+            for row in query_tuples(db_path, RANK_EDGE_TYPE_COUNTS_SQL, (project,))
+        }
+    except sqlite3.Error:
+        edge_type_counts = {}
+
+    edge_started = time.monotonic()
+    try:
+        edge_rows = query_tuples(db_path, RANK_EDGE_LINKRANK_SQL, (project, top_n))
+    except sqlite3.Error as exc:
+        edge_linkrank: dict[str, Any] = {
+            "applicable": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    else:
+        edge_elapsed_ms = (time.monotonic() - edge_started) * 1000.0
+        edge_linkrank = {
+            "applicable": bool(edge_rows),
+            "reason": None if edge_rows else "no persisted LinkRank edge rows",
+            "ranked_count": len(edge_rows),
+            "elapsed_ms": edge_elapsed_ms,
+            "top_ranked": [
+                {
+                    "source": row[0],
+                    "target": row[1],
+                    "edge_type": row[2],
+                    "score": row[3],
+                    "source_file": row[4],
+                    "target_file": row[5],
+                }
+                for row in edge_rows[:TOP_RANKED_SAMPLE]
+            ],
+            "interpretation": (
+                "This instruments H6 with ranked source-edge-target tuples; it is not an "
+                "H6 verdict until a judged edge/path task compares them with a node-only arm."
+            ),
+        }
+
     # H2/H4: is degree "the same ranking signal" as PageRank, as PR #151 asserts?
     comparisons: dict[str, Any] = {}
-    baseline = "degree"
+    baseline = rank_evidence.DEGREE_BASELINE
+    comparison_k = min(cutoffs)
     if baseline in ranked_by_scorer:
         base_rows = ranked_by_scorer[baseline]
         base_scores = {row[0]: row[2] for row in base_rows}
-        base_top = {row[0] for row in base_rows[: cutoffs[0]]}
-        for name, rows in ranked_by_scorer.items():
-            if name == baseline:
+        base_order = [str(row[0]) for row in base_rows[:comparison_k]]
+        base_top = set(base_order)
+        for name in RANK_PROBE_CANONICAL_SQL:
+            if name == baseline or name not in ranked_by_scorer:
                 continue
+            rows = ranked_by_scorer[name]
             shared = [row for row in rows if row[0] in base_scores]
             rho = spearman_rho(
                 [float(row[2]) for row in shared],
                 [float(base_scores[row[0]]) for row in shared],
             )
-            other_top = {row[0] for row in rows[: cutoffs[0]]}
+            other_order = [str(row[0]) for row in rows[:comparison_k]]
+            other_top = set(other_order)
             union = base_top | other_top
-            comparisons[f"{name}_vs_{baseline}"] = {
+            comparison = {
+                # Kept for old reports. It is explicitly over the shared bounded rows;
+                # RBO and Jaccard below account for missing symbols.
                 "spearman_rho": rho,
+                "shared_spearman_rho": rho,
                 "shared_symbols": len(shared),
-                "top_k": cutoffs[0],
+                "top_k": comparison_k,
                 "top_k_jaccard": (
                     len(base_top & other_top) / len(union) if union else None
                 ),
+                "rank_biased_overlap": rank_biased_overlap(base_order, other_order),
+                "rank_biased_overlap_persistence": RANK_BIASED_OVERLAP_PERSISTENCE,
                 "interpretation": (
-                    "high spearman_rho and high top_k_jaccard support PR #151's claim "
-                    "that degree already gives the same ranking signal"
+                    "high rank_biased_overlap and top_k_jaccard support interchangeable "
+                    "top pages; shared_spearman_rho alone does not penalize missing rows"
                 ),
             }
+            comparisons[f"{name}_vs_{baseline}"] = comparison
+            # Historical result readers key comparisons by ``*_vs_degree``.
+            comparisons[f"{name}_vs_degree"] = comparison
 
     return {
         "available": True,
@@ -3881,8 +4019,22 @@ def run_rank_score_probes(
         "structural_leaf_hub_count": len(leaf_hub_names),
         "structural_leaf_hub_sample": sorted(leaf_hub_names)[:10],
         "utility_token_count": len(UTILITY_SYMBOL_TOKENS),
+        "scorer_registry": rank_evidence.public_hypothesis_registry()["scorers"],
+        "scorer_aliases": dict(rank_evidence.SCORER_ALIASES),
         "scorers": scorers,
         "comparisons": comparisons,
+        "edge_type_counts": edge_type_counts,
+        "edge_linkrank": edge_linkrank,
+        "complexity": {
+            "node_score_queries": "O(S * N log K) time, O(S * K) retained rows",
+            "edge_linkrank_query": "O(E log K) time, O(K) retained rows",
+            "symbols": {
+                "S": "canonical scorers",
+                "N": "ranked nodes",
+                "E": "edges",
+                "K": "top_n",
+            },
+        },
     }
 
 
@@ -6011,7 +6163,9 @@ def manifest_digest(explicit_path: str | None, default_path: Path | None) -> str
 
 def load_corpora_manifest(manifest_path: str) -> dict[str, dict[str, Any]]:
     """Corpus id -> entry, from benchmarks/corpora-v1.json."""
-    path = Path(manifest_path).expanduser() if manifest_path else DEFAULT_CORPORA_MANIFEST
+    path = (
+        Path(manifest_path).expanduser() if manifest_path else DEFAULT_CORPORA_MANIFEST
+    )
     if not path.is_file():
         raise ValueError(f"corpora manifest not found: {path}")
     document = json.loads(path.read_text(encoding="utf-8"))
@@ -6473,7 +6627,15 @@ def score_ranked_relevance(
     *,
     cutoff: int = 5,
 ) -> dict[str, Any]:
-    """Score a bounded ranking against explicit graded substring judgments."""
+    """Score a bounded ranking with a one-result/one-judgment relevance join.
+
+    The legacy manifest identifies evidence with substrings, so matching remains
+    backward compatible. Each judgment is consumed at most once: otherwise duplicate
+    result rows can reuse one grade indefinitely, making measured DCG exceed ideal DCG
+    and nDCG exceed its mathematical [0, 1] domain. With R results and J judgments this
+    bounded reference join is O(R*J) time and O(J+R) memory; current pages and qrel sets
+    are both small.
+    """
     if cutoff <= 0:
         raise ValueError("relevance cutoff must be positive")
     valid_judgments = [
@@ -6494,17 +6656,33 @@ def score_ranked_relevance(
         and float(item["relevance"]) > 0
     ]
     all_relevance: list[float | int] = []
+    unmatched = set(range(len(valid_judgments)))
+    matched_judgments: list[int | None] = []
     for ranked_item in ranked_items:
         serialized = json.dumps(ranked_item, separators=(",", ":"), sort_keys=True)
-        relevance = max(
-            (
-                item["grade"]
-                for item in valid_judgments
-                if item["expected"] in serialized
-                and all(required in serialized for required in item["required"])
-            ),
-            default=0.0,
+        candidates = [
+            index
+            for index in unmatched
+            if valid_judgments[index]["expected"] in serialized
+            and all(
+                required in serialized
+                for required in valid_judgments[index]["required"]
+            )
+        ]
+        # A result is one document in the IR metric. If malformed qrels identify the
+        # same document more than once, consume only its highest grade and expose the
+        # unmatched duplicate in the audit fields below.
+        judgment_index = max(
+            candidates,
+            key=lambda index: (valid_judgments[index]["grade"], -index),
+            default=None,
         )
+        if judgment_index is None:
+            relevance = 0.0
+        else:
+            unmatched.remove(judgment_index)
+            relevance = valid_judgments[judgment_index]["grade"]
+        matched_judgments.append(judgment_index)
         all_relevance.append(int(relevance) if relevance.is_integer() else relevance)
     first_relevant_rank = next(
         (
@@ -6528,6 +6706,8 @@ def score_ranked_relevance(
     ]
     idcg = discounted_gain(ideal_relevance)
     ndcg = dcg / idcg if idcg > 0 else None
+    if ndcg is not None and not 0.0 <= ndcg <= 1.0:
+        raise AssertionError(f"nDCG escaped [0, 1]: {ndcg}")
     result = {
         "cutoff": cutoff,
         "judgment_count": len(valid_judgments),
@@ -6539,6 +6719,11 @@ def score_ranked_relevance(
         "ideal_dcg": idcg,
         "ndcg": ndcg,
         "matched_relevance": matched_relevance,
+        "matched_judgment_count": len(valid_judgments) - len(unmatched),
+        "unmatched_judgment_count": len(unmatched),
+        "matched_judgment_indices": matched_judgments[:cutoff],
+        "matching_mode": "legacy_substring_one_to_one",
+        "metric_domain_valid": ndcg is None or 0.0 <= ndcg <= 1.0,
     }
     result[f"dcg_at_{cutoff}"] = dcg
     result[f"ideal_dcg_at_{cutoff}"] = idcg
@@ -6836,6 +7021,17 @@ DEFAULT_RANK_QUERY_BATTERY: tuple[dict[str, Any], ...] = (
     },
 )
 
+# These are the rank modes already exposed by search_graph. The labels name the actual
+# stored statistic used by src/store/store.c:11679-11711; no experimental-only scorer is
+# introduced. The default no-manifest fixture remains byte-compatible and does not run
+# this comparison.
+RANK_QUERY_SORT_VARIANTS: tuple[tuple[str, str], ...] = (
+    ("relevance", "pagerank"),
+    ("degree", "degree"),
+    ("calls", "calls"),
+    ("linkrank", "linkrank_in"),
+)
+
 
 def rank_fixture_overlay_decision(
     capability: str, background: dict[str, Any] | None, args: argparse.Namespace
@@ -6925,7 +7121,11 @@ def load_rank_query_battery(
         entry = dict(query)
         entry.setdefault("cutoff", default_cutoff)
         repetitions = entry.get("repetitions", 1)
-        if not isinstance(repetitions, int) or isinstance(repetitions, bool) or repetitions < 1:
+        if (
+            not isinstance(repetitions, int)
+            or isinstance(repetitions, bool)
+            or repetitions < 1
+        ):
             raise ValueError(
                 f"query {entry['id']!r} declares repetitions={repetitions!r}; "
                 "it must be a positive integer"
@@ -7014,6 +7214,43 @@ def summarize_zero_result_behavior(oracles: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def summarize_scorer_variant_quality(oracles: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate paired graded-query quality by search_graph rank mode."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for oracle in oracles.values():
+        if not isinstance(oracle, dict):
+            continue
+        for scorer, variant in (oracle.get("scorer_variants") or {}).items():
+            quality = variant.get("quality") if isinstance(variant, dict) else None
+            if isinstance(quality, dict):
+                grouped.setdefault(scorer, []).append(quality)
+    summary: dict[str, Any] = {}
+    for scorer, rows in sorted(grouped.items()):
+        ndcg = [
+            float(row["ndcg"])
+            for row in rows
+            if isinstance(row.get("ndcg"), (int, float))
+        ]
+        reciprocal_rank = [
+            float(row["reciprocal_rank"])
+            for row in rows
+            if isinstance(row.get("reciprocal_rank"), (int, float))
+        ]
+        summary[scorer] = {
+            "query_count": len(rows),
+            "mean_ndcg": statistics.fmean(ndcg) if ndcg else None,
+            "mean_reciprocal_rank": (
+                statistics.fmean(reciprocal_rank) if reciprocal_rank else None
+            ),
+            "hit_at_1_rate": (
+                sum(bool(row.get("hit_at_1")) for row in rows) / len(rows)
+                if rows
+                else None
+            ),
+        }
+    return summary
+
+
 def run_rank_quality_oracles(
     transport: str,
     binary: Path,
@@ -7066,9 +7303,7 @@ def run_rank_quality_oracles(
             oracle["repetition_stability"] = {
                 "repetitions": repetitions,
                 "result_counts": counts,
-                "zero_result_repetitions": sum(
-                    1 for value in observed if value == 0
-                ),
+                "zero_result_repetitions": sum(1 for value in observed if value == 0),
                 "distinct_result_counts": len(set(observed)),
                 "stable": len(set(observed)) <= 1,
             }
@@ -7092,14 +7327,51 @@ def run_rank_quality_oracles(
                 "cutoff": query.get("cutoff", 5),
                 "judgments": judgments,
             }
+        if (
+            getattr(args, "rank_query_manifest", "")
+            and query["tool"] == "search_graph"
+            and judgments
+            and "sort_by" not in query["arguments"]
+        ):
+            variants: dict[str, Any] = {}
+            for sort_by, scorer in RANK_QUERY_SORT_VARIANTS:
+                variant = (
+                    {**oracle}
+                    if sort_by == "relevance"
+                    else run_tool_call_for_transport(
+                        transport,
+                        binary,
+                        env,
+                        query["tool"],
+                        {**arguments, "sort_by": sort_by},
+                        args.timeout,
+                        args.include_logs,
+                        client,
+                    )
+                )
+                ranked = ranked_items_from_response(variant.get("response")) or []
+                variant["sort_by"] = sort_by
+                variant["scorer"] = scorer
+                variant["quality"] = score_ranked_relevance(
+                    ranked, judgments, cutoff=int(query.get("cutoff", 5))
+                )
+                variants[scorer] = variant
+            oracle["scorer_variants"] = variants
     quality = score_quality_oracles(oracles, expectations)
     behavior = summarize_zero_result_behavior(oracles)
+    scorer_variant_quality = summarize_scorer_variant_quality(oracles)
     oracles["quality"] = quality
+    oracles["scorer_variant_quality"] = scorer_variant_quality
     oracles["zero_result_behavior"] = behavior
     oracles["rank_query_battery"] = {
         "query_count": len(battery),
         "graded_count": len(expectations),
         "behavioral_only_count": len(battery) - len(expectations),
+        "rank_sort_variant_query_count": sum(
+            len(oracle.get("scorer_variants") or {})
+            for oracle in oracles.values()
+            if isinstance(oracle, dict)
+        ),
         "query_ids": [query["id"] for query in battery],
     }
     oracles["passed"] = quality["passed"]
@@ -7867,6 +8139,7 @@ def run_capability_quality(
                     "revision": corpus_entry.get("revision"),
                     "tree": corpus_entry.get("tree"),
                     "cohort": corpus_entry.get("cohort"),
+                    "language": corpus_entry.get("language"),
                     "discriminates": corpus_entry.get("discriminates"),
                 }
                 if corpus_entry

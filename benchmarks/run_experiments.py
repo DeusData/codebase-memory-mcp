@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import suppress
 import hashlib
 import json
 import math
@@ -24,10 +23,10 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
-
 
 CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
 with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
@@ -1700,6 +1699,20 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 "benchmark_script_sha256": benchmark_sha256,
                                 "index_mode": index_mode,
                             }
+                            # Evidence annotations do not alter commands or capabilities.
+                            # Carry them into the immutable cell identity and derived report
+                            # input so every H experiment remains traceable to its plain-
+                            # English question after matrix expansion.
+                            for evidence_key in (
+                                "cell_name",
+                                "informs_hypotheses",
+                                "questions",
+                                "expected_observable",
+                                "parameter_sources",
+                                "evidence_scope",
+                            ):
+                                if evidence_key in profile:
+                                    parameters[evidence_key] = profile[evidence_key]
                             if product_environment:
                                 parameters["product_environment"] = dict(
                                     sorted(product_environment.items())
@@ -2425,7 +2438,17 @@ def materialize_report_input(
         parameters["capability_support"] = dict(sorted(support.items()))
     cell_parameters = cell.get("parameters")
     if isinstance(cell_parameters, dict):
-        for key in ("execution_order", "execution_block", "execution_position"):
+        for key in (
+            "execution_order",
+            "execution_block",
+            "execution_position",
+            "cell_name",
+            "informs_hypotheses",
+            "questions",
+            "expected_observable",
+            "parameter_sources",
+            "evidence_scope",
+        ):
             if key in cell_parameters:
                 parameters[key] = cell_parameters[key]
     source_sha = file_sha256(result_path)

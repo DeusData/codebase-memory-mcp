@@ -26,6 +26,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:  # Package import under tests; script-local import for direct execution.
+    from benchmarks import rank_hypotheses as rank_evidence
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    import rank_hypotheses as rank_evidence
+
 BENCHMARKS = Path(__file__).resolve().parent
 QUERY_MANIFEST = "benchmarks/rank-queries-v1/manifest.json"
 CORPUS_MANIFEST = "benchmarks/corpora-v1.json"
@@ -41,7 +46,13 @@ CORPUS_MANIFEST = "benchmarks/corpora-v1.json"
 # domain where the hardcoded criteria happen to hold, which under-samples the failure
 # the campaign exists to find.
 POPULARITY_CORPORA = (
-    "cosign", "jest", "runc", "flask", "redis", "ripgrep", "scikit-learn",
+    "cosign",
+    "jest",
+    "runc",
+    "flask",
+    "redis",
+    "ripgrep",
+    "scikit-learn",
 )
 
 # H1-H5 compare orderings over one graph, so they must not also vary coverage. Full
@@ -54,9 +65,15 @@ COVERAGE_INDEX_MODES = ("full", "moderate", "fast")
 # returning less. Sweeping it alongside a ranking change is what separates "ordered
 # better" from "returned more". Keys verified against config-keys-v1.json.
 DETAIL_PROFILES: tuple[tuple[str, dict[str, str]], ...] = (
-    ("detail-lean", {"search_limit": "10", "trace_max_results": "10", "snippet_max_lines": "40"}),
+    (
+        "detail-lean",
+        {"search_limit": "10", "trace_max_results": "10", "snippet_max_lines": "40"},
+    ),
     ("detail-default", {}),
-    ("detail-rich", {"search_limit": "200", "trace_max_results": "100", "snippet_max_lines": "400"}),
+    (
+        "detail-rich",
+        {"search_limit": "200", "trace_max_results": "100", "snippet_max_lines": "400"},
+    ),
 )
 # One corpus carries the detail frontier. Crossing every corpus with every detail level
 # would triple the campaign for a question that is about the detail axis, not the corpus.
@@ -68,33 +85,30 @@ CAPABILITY_SUPPORT = {"rank": True}
 # src/pagerank/pagerank.h:89-101,113-222 and validated against config-keys-v1.json.
 # A knob absent from this set is one the campaign never proved does anything, and a
 # sweep over it would report a difference of exactly zero whether it is live or inert.
-RANKING_KNOBS = frozenset(
-    {
-        "edge_weight_async_calls",
-        "edge_weight_calls",
-        "edge_weight_configures",
-        "edge_weight_decorates",
-        "edge_weight_default",
-        "edge_weight_defines",
-        "edge_weight_defines_method",
-        "edge_weight_http_calls",
-        "edge_weight_imports",
-        "edge_weight_member_of",
-        "edge_weight_tests",
-        "edge_weight_usage",
-        "edge_weight_writes",
-        "pagerank_damping",
-    }
-)
-# One extreme value per knob. Extreme because a knob that survives a 20x weight change
-# with an identical published table is inert beyond any doubt about numerical
-# resolution. pagerank_damping has a declared range, so it takes its own end value.
-KNOB_EXTREME_VALUE = "20.0"
-KNOB_EXTREME_OVERRIDES = {"pagerank_damping": "0.5"}
+RANKING_KNOBS = rank_evidence.RANK_OPTION_GROUPS["ranking_semantics"]
 # epsilon and max_iter are numerics rather than semantics: changing them changes how
 # precisely the same fixed point is reached, not which one. Sweeping them here would
 # report convergence noise as knob efficacy.
-NUMERIC_KNOBS = frozenset({"pagerank_epsilon", "pagerank_max_iter"})
+NUMERIC_KNOBS = rank_evidence.RANK_OPTION_GROUPS["numerical_convergence_controls"]
+PARAMETER_CONTRACTS = rank_evidence.parameter_macro_contracts()
+
+
+def declared_intervention(option: str) -> tuple[str, dict[str, str]]:
+    """Pick a non-default endpoint from the product's declared/recommended range."""
+    contract = PARAMETER_CONTRACTS[option]
+    if option == "pagerank_max_iter":
+        field = "declared_min"
+    elif contract.get("recommended_max") != contract["default"]:
+        field = "recommended_max"
+    else:
+        field = "recommended_min"
+    return contract[field], {
+        "option": option,
+        "selected_field": field,
+        "value": contract[field],
+        "source": contract["source"],
+        "macros": contract["macros"],
+    }
 
 
 def corpus_arguments(corpus_id: str) -> list[str]:
@@ -155,8 +169,20 @@ def corpus_profile(
     corpus_id: str, *, label: str | None = None, overrides: dict[str, str] | None = None
 ) -> dict[str, Any]:
     """One cell: one corpus, optionally under one reply-detail configuration."""
+    hypothesis_ids = ("H1", "H2", "H4", "H5", "H6")
+    cell_label = label or f"corpus-{corpus_id}"
     return {
-        "label": label or f"corpus-{corpus_id}",
+        "label": cell_label,
+        "cell_name": f"RANK-CORPUS — {cell_label}",
+        "informs_hypotheses": list(hypothesis_ids),
+        "questions": [
+            {
+                "id": hypothesis_id,
+                "name": rank_evidence.HYPOTHESES[hypothesis_id]["name"],
+                "question": rank_evidence.HYPOTHESES[hypothesis_id]["question"],
+            }
+            for hypothesis_id in hypothesis_ids
+        ],
         "config_profile": "candidate_native_configuration",
         "capabilities": {},
         "config_overrides": dict(overrides or {}),
@@ -188,11 +214,14 @@ def build_rank_spec(
     timeout_seconds: int,
     corpora: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """The H1-H7 arm: every popularity corpus at one index mode, plus the detail sweep.
+    """Real-corpus node/edge ranking arm plus the reply-detail sweep.
 
     Every scorer is read from the same graph by run_rank_score_probes, so the six-way
     comparison needs one candidate rather than six. Adding PR #879's `importance` arm is
     one more candidates[] entry pointing at its ref; it reports applicable: false here.
+
+    This arm instruments H1/H2/H4/H5/H6. It does not pair rank-on with rank-off cost or
+    tune across held-out language strata, so it must not claim H3 or H7.
     """
     chosen = selected_corpora(corpora)
     profiles = [corpus_profile(corpus_id) for corpus_id in chosen]
@@ -206,7 +235,7 @@ def build_rank_spec(
         # detail-default is already covered by the plain corpus profile
         if overrides and DETAIL_FRONTIER_CORPUS in chosen
     )
-    return base_spec(
+    spec = base_spec(
         harness_version="rank-quality-v1",
         campaign_arm="rank",
         index_mode=RANK_INDEX_MODE,
@@ -215,6 +244,14 @@ def build_rank_spec(
         repetitions=repetitions,
         timeout_seconds=timeout_seconds,
     )
+    spec["evidence_contract"] = {
+        "role": "real_corpus_rank_quality",
+        "hypotheses": ["H1", "H2", "H4", "H5", "H6"],
+        "not_evaluated": ["H3", "H7"],
+        "independent_unit": "corpus; repetitions and detail profiles are repeated observations",
+        "registry": rank_evidence.public_hypothesis_registry(),
+    }
+    return spec
 
 
 def build_canary_spec(
@@ -233,25 +270,67 @@ def build_canary_spec(
     profiles = [
         {
             "label": "baseline",
+            "cell_name": "RANK-CANARY — baseline published ranking",
             "config_profile": "candidate_native_configuration",
             "capabilities": {},
             "config_overrides": {},
             "benchmark_args": [],
+            "informs_hypotheses": ["H2", "H3", "H4", "H7"],
+            "questions": [
+                {
+                    "id": hypothesis_id,
+                    "name": rank_evidence.HYPOTHESES[hypothesis_id]["name"],
+                    "question": rank_evidence.HYPOTHESES[hypothesis_id]["question"],
+                }
+                for hypothesis_id in ("H2", "H3", "H4", "H7")
+            ],
         }
     ]
-    profiles.extend(
-        {
-            "label": f"knob-{knob}",
-            "config_profile": "candidate_native_configuration",
-            "capabilities": {},
-            "config_overrides": {
-                knob: KNOB_EXTREME_OVERRIDES.get(knob, KNOB_EXTREME_VALUE)
-            },
-            "benchmark_args": [],
-        }
-        for knob in sorted(RANKING_KNOBS)
-    )
-    return base_spec(
+    for knob in sorted(RANKING_KNOBS):
+        value, parameter_source = declared_intervention(knob)
+        hypothesis_ids = ("H2", "H4", "H7")
+        profiles.append(
+            {
+                "label": f"knob-{knob}",
+                "cell_name": f"RANK-CANARY — {knob} declared-range intervention",
+                "config_profile": "candidate_native_configuration",
+                "capabilities": {},
+                "config_overrides": {knob: value},
+                "benchmark_args": [],
+                "parameter_sources": [parameter_source],
+                "informs_hypotheses": list(hypothesis_ids),
+                "questions": [
+                    {
+                        "id": hypothesis_id,
+                        "name": rank_evidence.HYPOTHESES[hypothesis_id]["name"],
+                        "question": rank_evidence.HYPOTHESES[hypothesis_id]["question"],
+                    }
+                    for hypothesis_id in hypothesis_ids
+                ],
+            }
+        )
+    for knob in sorted(NUMERIC_KNOBS):
+        value, parameter_source = declared_intervention(knob)
+        profiles.append(
+            {
+                "label": f"numeric-{knob}",
+                "cell_name": f"RANK-CANARY — {knob} convergence control",
+                "config_profile": "candidate_native_configuration",
+                "capabilities": {},
+                "config_overrides": {knob: value},
+                "benchmark_args": [],
+                "parameter_sources": [parameter_source],
+                "informs_hypotheses": ["H3"],
+                "questions": [
+                    {
+                        "id": "H3",
+                        "name": rank_evidence.HYPOTHESES["H3"]["name"],
+                        "question": rank_evidence.HYPOTHESES["H3"]["question"],
+                    }
+                ],
+            }
+        )
+    spec = base_spec(
         harness_version="knob-canary-v1",
         campaign_arm="canary",
         index_mode=RANK_INDEX_MODE,
@@ -260,6 +339,55 @@ def build_canary_spec(
         repetitions=repetitions,
         timeout_seconds=timeout_seconds,
     )
+    spec["evidence_contract"] = {
+        "role": "instrument_validity",
+        "hypotheses": [],
+        "option_groups": ["ranking_semantics", "numerical_convergence_controls"],
+        "semantic_expectation": "fingerprint changes when the fixture contains the affected edge type",
+        "numerical_expectation": "publication, rank drift, and latency are measured; byte change is not required",
+    }
+    return spec
+
+
+def build_quick_hypothesis_spec(
+    ref: str = "HEAD", *, timeout_seconds: int
+) -> dict[str, Any]:
+    """Prioritized synthetic cells covering scorers, semantics, numerics, and lifecycle.
+
+    This is the bounded development diagnostic used by ``run_evidence_suite.py``. It is
+    intentionally not a cross-language quality verdict: a synthetic Python fixture can
+    establish wiring, metric domains, publication behavior, and relative cost, while the
+    real-corpus arm supplies language/task generalization evidence.
+    """
+    profiles = rank_evidence.quick_hypothesis_profiles()
+    for profile in profiles:
+        profile["benchmark_args"] = []
+    spec = base_spec(
+        harness_version="rank-hypotheses-quick-v2",
+        campaign_arm="hypothesis_quick",
+        index_mode=RANK_INDEX_MODE,
+        profiles=profiles,
+        ref=ref,
+        repetitions=1,
+        timeout_seconds=timeout_seconds,
+    )
+    spec["suite_name"] = rank_evidence.RANK_SUITE_NAME
+    spec["runtime_policy"] = {
+        "design": "one repetition per fixed evidence arm over MCP",
+        "measurement": "record actual elapsed time for every cell",
+    }
+    spec["evidence_contract"] = {
+        "role": "bounded_development_diagnostic",
+        "hypotheses": ["H2", "H3", "H4", "H6"],
+        "not_evaluated": ["H1", "H5", "H7"],
+        "limitations": [
+            "synthetic Python fixture only",
+            "H6 edge ranking is instrumented but has no judged edge/path task",
+            "H3 cost is a smoke estimate, not a production-scale overhead claim",
+        ],
+        "registry": rank_evidence.public_hypothesis_registry(),
+    }
+    return spec
 
 
 def build_coverage_specs(
@@ -354,7 +482,9 @@ def main(argv: list[str] | None = None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for spec in specs:
         path = args.out_dir / spec_filename(spec)
-        path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        path.write_text(
+            json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         # Read the flag rather than a fixed position: the canary's profiles carry no
         # workload flags at all, and indexing into them crashed generation after the
         # first arm was written.
