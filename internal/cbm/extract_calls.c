@@ -786,6 +786,65 @@ static char *extract_nickel_callee(CBMArena *a, TSNode node, const char *source,
     return NULL;
 }
 
+// Pkl: `unqualifiedAccessExpr` / `qualifiedAccessExpr` are the same node whether
+// they are a call (`helper(a)`) or a bare property read (`host`) — the only
+// discriminator is an `argumentList` child, so both are gated on it. For a
+// qualified call the method name is the `identifier` child that is not the
+// `receiver`; the receiver is prefixed only when it is itself a plain name
+// (`utils.fallback(a)` -> "utils.fallback", module-qualified, which cbm.c
+// shortens to the last dotted segment when resolving). A receiver that is itself
+// a call must NOT be prefixed: `s.trim().toLowerCase()` -> "toLowerCase", since
+// the receiver's text carries parens and would never resolve.
+// `newExpr` resolves to its `declaredType` so `new Server {}` links to the class.
+static char *extract_pkl_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "newExpr") == 0) {
+        // `new { ... }` with an inferred type has no declaredType child.
+        TSNode dt = cbm_find_child_by_kind(node, "declaredType");
+        return ts_node_is_null(dt) ? NULL : cbm_node_text(a, dt, source);
+    }
+
+    bool qualified = strcmp(nk, "qualifiedAccessExpr") == 0;
+    if (!qualified && strcmp(nk, "unqualifiedAccessExpr") != 0) {
+        return NULL;
+    }
+    // No argument list -> property read, not a call.
+    if (ts_node_is_null(cbm_find_child_by_kind(node, "argumentList"))) {
+        return NULL;
+    }
+
+    TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
+    TSNode name = (TSNode){0};
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (!ts_node_is_null(recv) && ts_node_eq(child, recv)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(child), "identifier") == 0) {
+            name = child;
+            break;
+        }
+    }
+    if (ts_node_is_null(name)) {
+        return NULL;
+    }
+    char *mn = cbm_node_text(a, name, source);
+    if (!mn || !mn[0]) {
+        return NULL;
+    }
+    if (!qualified || ts_node_is_null(recv)) {
+        return mn;
+    }
+    if (strcmp(ts_node_type(recv), "unqualifiedAccessExpr") == 0 &&
+        ts_node_is_null(cbm_find_child_by_kind(recv, "argumentList"))) {
+        char *rt = cbm_node_text(a, recv, source);
+        if (rt && rt[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", rt, mn);
+        }
+    }
+    return mn;
+}
+
 // Typst: a `call` node's callee is its `item` field (an ident), matching the
 // def-side resolution of `#let greet(name) = ...`.
 static char *extract_typst_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
@@ -1348,6 +1407,15 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         if (lean_is_in_type_position(node)) {
             return NULL;
         }
+    }
+
+    /* Pkl: resolve here and return unconditionally — the access-expr call node
+     * types double as plain property reads, so falling through to field-based or
+     * generic first-identifier resolution would mint a CALLS edge for every
+     * property read (a bare `host` has an `identifier` first child, which the
+     * generic fallback would happily emit). NULL here means "not a call". */
+    if (lang == CBM_LANG_PKL) {
+        return extract_pkl_callee(a, node, source, ts_node_type(node));
     }
 
     // Helm / Go templates: resolve `include "x"` / `template "x"` to the
