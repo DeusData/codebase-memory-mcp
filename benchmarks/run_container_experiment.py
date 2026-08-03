@@ -132,11 +132,54 @@ def repository_snapshot_sha256(
     return hashlib.sha256(payload).hexdigest()
 
 
+def runtime_image_sha256(metadata: dict[str, Any]) -> str:
+    """Hash runtime-relevant image bytes without BuildKit attestation metadata.
+
+    Docker's top-level OCI index digest can change when BuildKit regenerates provenance
+    even though the selected platform's configuration and root filesystem layers are
+    byte-identical. Conversely, an explicit image can retain its tag while changing the
+    compiler or filesystem. The resumable run key therefore uses the stable runtime
+    projection below rather than either the mutable tag or the attestation-bearing index.
+    """
+    architecture = metadata.get("Architecture")
+    operating_system = metadata.get("Os")
+    config = metadata.get("Config")
+    rootfs = metadata.get("RootFS")
+    if not isinstance(architecture, str) or not architecture:
+        raise ValueError("Docker image metadata lacks a non-empty Architecture")
+    if not isinstance(operating_system, str) or not operating_system:
+        raise ValueError("Docker image metadata lacks a non-empty Os")
+    if not isinstance(config, dict):
+        raise ValueError("Docker image metadata Config must be an object")
+    if not isinstance(rootfs, dict):
+        raise ValueError("Docker image metadata RootFS must be an object")
+    layers = rootfs.get("Layers")
+    if (
+        not isinstance(layers, list)
+        or not layers
+        or not all(isinstance(layer, str) and layer for layer in layers)
+    ):
+        raise ValueError(
+            "Docker image metadata RootFS.Layers must be non-empty strings"
+        )
+    identity = {
+        "architecture": architecture,
+        "os": operating_system,
+        "config": config,
+        "rootfs": rootfs,
+    }
+    payload = json.dumps(identity, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def container_run_key(
     *,
     source_revision: str,
     repository_snapshot_sha256: str,
     matrix_spec_sha256: str | None,
+    runtime_image_sha256: str,
     resources: dict[str, Any],
     runner_arguments: list[str],
     corpora: list[dict[str, str]] | None = None,
@@ -146,6 +189,7 @@ def container_run_key(
         "source_revision": source_revision,
         "repository_snapshot_sha256": repository_snapshot_sha256,
         "matrix_spec_sha256": matrix_spec_sha256,
+        "runtime_image_sha256": runtime_image_sha256,
         "resources": resources,
         # Audit-only changes execution, not the measured plan or environment.
         "runner_arguments": [
@@ -889,6 +933,7 @@ def main(argv: list[str] | None = None) -> int:
             f"image platform {image_metadata.get('Os')}/"
             f"{image_metadata.get('Architecture')} does not match {args.platform}"
         )
+    runtime_image_identity = runtime_image_sha256(image_metadata)
 
     history_key = hashlib.sha256(str(args.experiment_root).encode("utf-8")).hexdigest()[
         :16
@@ -1006,6 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_revision=source_revision,
                 repository_snapshot_sha256=repository_snapshot,
                 matrix_spec_sha256=effective_matrix_sha,
+                runtime_image_sha256=runtime_image_identity,
                 resources=args.resources,
                 runner_arguments=runner_arguments,
                 corpora=staged_corpora,
@@ -1025,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
                 "image": image,
                 "image_id": image_metadata.get("Id"),
                 "image_repo_digests": image_metadata.get("RepoDigests") or [],
+                "runtime_image_sha256": runtime_image_identity,
                 "docker_server": {
                     key: docker_info.get(key)
                     for key in (

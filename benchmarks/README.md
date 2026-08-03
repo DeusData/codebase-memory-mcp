@@ -108,8 +108,10 @@ Each measured source/spec/resource cohort is isolated under
 `runsets/<content-id>/`; `--audit-only` resolves to the same cohort and cannot create
 a second attempt. Canonical Git ref/commit content identifies the repository
 snapshot even when equivalent bundle pack bytes differ; the exact bundle SHA-256
-remains in the manifest. A different snapshot, spec, or resource budget cannot be
-misreported as an unplanned cell in the current runset.
+remains in the manifest. The run key also hashes the selected image's runtime
+configuration and root-filesystem layers while ignoring BuildKit's nondeterministic
+attestation index. A different snapshot, runtime image, spec, or resource budget cannot
+be misreported as an unplanned cell in the current runset.
 Container numbers are controlled Linux relative comparisons, not absolute macOS
 latency. See [Container isolation](../docs/BENCHMARK_EXPERIMENTS.md#container-isolation).
 Docker benchmarks default to Clang 18.1.3. The pinned image also provides GCC for

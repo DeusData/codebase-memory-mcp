@@ -1460,6 +1460,7 @@ def test_container_run_key_separates_different_corpus_pins() -> None:
             source_revision="c" * 40,
             repository_snapshot_sha256="d" * 64,
             matrix_spec_sha256=None,
+            runtime_image_sha256="e" * 64,
             resources={"cpus": 4, "memory": "8g", "workers": 4},
             runner_arguments=["--quick"],
             corpora=[{"id": "cosign", "revision": revision}],

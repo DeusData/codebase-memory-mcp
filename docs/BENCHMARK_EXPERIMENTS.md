@@ -366,9 +366,12 @@ The coordinator is intentionally smaller than the benchmark engine:
    the returned error names the retained volume and in-volume path for inspection.
 9. It derives a stable repository snapshot identity from the source revision and
    sorted Git ref/commit heads, independently of nondeterministic bundle pack bytes.
-   The 24-hexadecimal run key combines that snapshot with the effective matrix,
-   resource budget, and measurement arguments. The exact bundle SHA-256 remains in
-   the environment manifest. Each cohort runs under `runsets/<run-key>/`;
+   The 24-hexadecimal run key combines that snapshot with the effective matrix, the
+   selected image's runtime configuration and root-filesystem layers, resource budget,
+   and measurement arguments. BuildKit provenance can change the top-level OCI index
+   while those runtime bytes remain identical, so attestation metadata is recorded but
+   does not split a cohort. The exact bundle SHA-256 remains in the environment manifest.
+   Each cohort runs under `runsets/<run-key>/`;
    `--audit-only` deliberately retains the same key. Valid older cohorts therefore
    remain reloadable without being confused with genuinely unplanned cell
    directories in the current cohort.

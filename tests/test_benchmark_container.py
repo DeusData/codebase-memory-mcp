@@ -316,6 +316,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
             "source_revision": "a" * 40,
             "repository_snapshot_sha256": "b" * 64,
             "matrix_spec_sha256": "c" * 64,
+            "runtime_image_sha256": "d" * 64,
             "resources": {"cpus": 4.0, "memory": "8g", "workers": 4},
             "runner_arguments": ["--matrix-spec", "/benchmark/matrix.json"],
         }
@@ -331,6 +332,7 @@ class BenchmarkContainerContractTest(unittest.TestCase):
             ("source_revision", "d" * 40),
             ("repository_snapshot_sha256", "e" * 64),
             ("matrix_spec_sha256", "f" * 64),
+            ("runtime_image_sha256", "0" * 64),
             ("resources", {"cpus": 8.0, "memory": "8g", "workers": 4}),
             (
                 "runner_arguments",
@@ -343,6 +345,57 @@ class BenchmarkContainerContractTest(unittest.TestCase):
                     CONTAINER.container_run_key(**{**common, field: value}),
                 )
         self.assertRegex(measured, r"^[0-9a-f]{24}$")
+
+    def test_runtime_image_identity_ignores_attestation_but_hashes_runtime_bytes(
+        self,
+    ) -> None:
+        metadata = {
+            "Id": "sha256:index-a",
+            "RepoDigests": ["runtime@sha256:index-a"],
+            "Architecture": "arm64",
+            "Os": "linux",
+            "Config": {
+                "Env": ["PATH=/usr/bin"],
+                "Entrypoint": ["/bin/bash"],
+                "WorkingDir": "/src",
+            },
+            "RootFS": {
+                "Type": "layers",
+                "Layers": ["sha256:layer-a", "sha256:layer-b"],
+            },
+            "Metadata": {"LastTagTime": "2026-08-03T18:13:00Z"},
+        }
+        identity = CONTAINER.runtime_image_sha256(metadata)
+        equivalent_rebuild = {
+            **metadata,
+            "Id": "sha256:index-b",
+            "RepoDigests": ["runtime@sha256:index-b"],
+            "Metadata": {"LastTagTime": "2026-08-03T18:16:00Z"},
+        }
+
+        self.assertEqual(identity, CONTAINER.runtime_image_sha256(equivalent_rebuild))
+        self.assertNotEqual(
+            identity,
+            CONTAINER.runtime_image_sha256(
+                {
+                    **metadata,
+                    "RootFS": {
+                        "Type": "layers",
+                        "Layers": ["sha256:layer-a", "sha256:different-layer"],
+                    },
+                }
+            ),
+        )
+        self.assertNotEqual(
+            identity,
+            CONTAINER.runtime_image_sha256(
+                {
+                    **metadata,
+                    "Config": {**metadata["Config"], "WorkingDir": "/different"},
+                }
+            ),
+        )
+        self.assertRegex(identity, r"^[0-9a-f]{64}$")
 
     def test_export_merge_is_idempotent_and_rejects_changed_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
