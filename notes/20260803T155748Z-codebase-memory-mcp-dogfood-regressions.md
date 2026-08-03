@@ -304,3 +304,88 @@ structured reconnect action. Observed: the closed transport remains terminal acr
 refreshes and explicit project addressing. Direct numbered source reads and `rg` were used for
 the remaining benchmark, database-lifecycle, and report work; Tier-2
 `check_index_coverage` was still unavailable.
+
+## D-005 recovery boundary — a new app process restores the transport
+
+- Recovery verified UTC: `2026-08-03T19:48:03Z`.
+- Source revision: `e2d8fa48d34409eb3adf798c4ae23e4d09a168e4`.
+- Indexed project:
+  `Users-athundt-.claude-codebase-memory-mcp-.worktrees-api-consolidation-merge`.
+- Calls were serialized.
+
+After the desktop app crashed and restarted, the first `search_graph` call succeeded. The same
+connection then completed `trace_path`, `check_index_coverage`, `get_code`, and `index_status`.
+This narrows D-005: a new conversation turn, compaction, re-advertised tools, and explicit project
+addressing did not recover the transport, but a new app process did. The available evidence is
+consistent with a client/app-lifetime connection remaining closed after a concurrent request
+failure; it does not prove whether the close originates in the client, MCP bridge, or server.
+
+Reproduction:
+
+1. Trigger D-005 with concurrent graph requests.
+2. Verify that serialized requests remain closed across a later turn or compaction.
+3. Restart the desktop app without restarting the shared daemon.
+4. Issue one serialized `search_graph` request.
+
+Expected: the original session recovers automatically or returns a structured reconnect action.
+Observed: only the new app process restored graph calls. A transport regression test should cover
+both reconnect-in-place and reconnect-after-client-restart behavior and identify which process
+owns the failed connection.
+
+## D-001 recurrence — stale span is returned despite coverage knowing the file changed
+
+- Recurrence verified UTC: `2026-08-03T19:48:03Z`.
+- Requested symbol:
+  `Users-athundt-.claude-codebase-memory-mcp-.worktrees-api-consolidation-merge.src.pagerank.pagerank.edge_type_weight`.
+- Requested mode: `full`, `max_lines=80`, `compact=false`.
+
+The exact `qualified_name` came from a successful `search_graph` result. `get_code` reported
+`start_line=49`, `end_line=65`, retained the correct function name/signature, but returned the
+unrelated `CBM_ENABLE_TEST_SEAMS` block and the beginning of
+`cbm_pagerank_test_fail_scan_after`. The live source defines `edge_type_weight` at
+`src/pagerank/pagerank.c:99-107`.
+
+The same session's `check_index_coverage` reported `freshness=metadata_changed` for
+`src/pagerank/pagerank.c` and recommended `read_source_and_reindex`. The unsafe inconsistency is
+therefore not only stale metadata: `get_code` used the known-stale span without warning, refusing,
+or refreshing, while presenting current-looking symbol metadata.
+
+Exact call:
+
+```text
+get_code(
+  project="Users-athundt-.claude-codebase-memory-mcp-.worktrees-api-consolidation-merge",
+  qualified_name="Users-athundt-.claude-codebase-memory-mcp-.worktrees-api-consolidation-merge.src.pagerank.pagerank.edge_type_weight",
+  mode="full",
+  max_lines=80,
+  compact=false
+)
+```
+
+Root-cause acceptance test: mutate a watched file so a symbol moves, then call `get_code` before
+and after background refresh. The tool must either return source whose live range encloses the
+requested definition or return a structured stale-source error carrying the coverage action. It
+must never combine the selected symbol's name/signature with another symbol's body.
+
+## D-007 — freshness surfaces can simultaneously read as current and stale
+
+- Verified UTC: `2026-08-03T19:48:03Z`.
+- `index_status(verbose=true)` reported `status=ready`, Git
+  `head_sha=e2d8fa48d34409eb3adf798c4ae23e4d09a168e4`,
+  `head_matches_worktree=true`, and `worktree_dirty=false`.
+- `check_index_coverage` reported coverage generation `2026-07-30T01:53:35Z`,
+  `freshness=metadata_changed` for the C sources and `freshness=not_tracked` for several
+  benchmark Python files.
+- `search_graph` reported PageRank, LinkRank, and node-degree derived views stale.
+- `index_status` recorded `src/cli/cli.c:1-13308` as one parse-partial range.
+
+These fields may describe different layers—live Git state, persisted coverage generation, and
+derived-view freshness—but the response does not provide one top-level statement separating
+them. A caller can reasonably read `status=ready` plus `head_matches_worktree=true` as evidence
+that graph spans are current, even though `get_code` then returns a stale body.
+
+Reproduction: run `index_status(verbose=true)`, `check_index_coverage` for a changed file, and
+`get_code` for a moved symbol in sequence. Expected: one explicit source-freshness verdict and an
+actionable distinction among repository state, symbol/span generation, coverage generation, and
+derived-view generation. Observed: each surface is internally plausible but their composition is
+unsafe without expert interpretation.
