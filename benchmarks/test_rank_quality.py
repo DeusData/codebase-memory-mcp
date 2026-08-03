@@ -220,6 +220,66 @@ def test_h5_is_not_measurable_without_the_public_api_label() -> None:
     assert rollup["validation"]["passed"] is False
 
 
+def test_a_case_with_partial_scorer_coverage_is_dropped_not_compared() -> None:
+    """Guards: on a mixed-language corpus the public-API label can resolve for one
+    scorer's top-K and not another's — redis recorded degree=null with pagerank=0.000,
+    because pagerank's window reached a Python file and degree's stayed in C. Comparing
+    a measured rate against a null-derived one is apples-to-oranges."""
+    partial = rollup_case("redis", non_public={"degree": None, "pagerank": 0.0})
+    both = rollup_case("cosign", non_public={"degree": 0.4, "pagerank": 0.1})
+    verdict = rr.build_rollup([partial, both])["verdicts"]["H5"]
+    assert verdict["signal_corpora"] == ["cosign"]
+    assert verdict["corpora_compared"] == 1
+
+
+def test_python_public_exports_are_read_from_package_init_files() -> None:
+    """scikit-learn, pandas and numpy define in a private module and re-export from
+    __init__.py, so the underscore rule alone calls their public API private."""
+    repo = Path(tempfile.mkdtemp())
+    (repo / "sklearn" / "linear_model").mkdir(parents=True)
+    (repo / "sklearn" / "linear_model" / "__init__.py").write_text(
+        "from ._logistic import LogisticRegression\n"
+        "from ._base import LinearModel\n"
+        '__all__ = ["LogisticRegression", "LinearModel"]\n',
+        encoding="utf-8",
+    )
+    exports = rb.python_public_exports(repo)
+    assert {"LogisticRegression", "LinearModel"} <= exports
+
+    # With the export set, a symbol defined in a private module is public.
+    assert rb.is_public_api(
+        "sklearn.linear_model._logistic.LogisticRegression",
+        "sklearn/linear_model/_logistic.py",
+        exports,
+    ) is True
+    # A method of an exported class is public too: the class is the exported surface,
+    # and a non-underscore method on it is part of that surface.
+    assert rb.is_public_api(
+        "sklearn.linear_model._base.LinearModel.fit",
+        "sklearn/linear_model/_base.py",
+        exports,
+    ) is True
+    # A genuinely internal symbol in the same private module stays private.
+    assert rb.is_public_api(
+        "sklearn.utils._testing.raises", "sklearn/utils/_testing.py", exports
+    ) is False
+    # An underscore-prefixed member of an exported class is still private.
+    assert rb.is_public_api(
+        "sklearn.linear_model._base.LinearModel._decision",
+        "sklearn/linear_model/_base.py",
+        exports,
+    ) is False
+
+
+def test_public_exports_survive_unparseable_sources() -> None:
+    """A corpus with a syntax error under some Python version must not abort a run."""
+    repo = Path(tempfile.mkdtemp())
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "__init__.py").write_text("from ._x import (\n", encoding="utf-8")
+    assert rb.python_public_exports(repo) == frozenset()
+    assert rb.python_public_exports(Path("/nonexistent")) == frozenset()
+
+
 def test_h5_is_decided_once_the_public_api_label_is_present() -> None:
     """The label is independent of degree, so a direction from it is meaningful. Go and
     Python corpora supply it; C and Rust report null and contribute nothing."""

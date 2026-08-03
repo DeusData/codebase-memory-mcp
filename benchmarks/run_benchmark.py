@@ -9,6 +9,7 @@ measurements. Every workload uses an isolated cache and removes only paths it cr
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import closing, suppress
 import gzip
 import hashlib
@@ -3177,7 +3178,72 @@ LEAF_HUB_MAX_FAN_OUT_RATIO = 0.1
 LEAF_HUB_MIN_POPULATION = 20
 
 
-def is_public_api(qualified_name: str, file_path: str) -> bool | None:
+def python_public_exports(repo: Path) -> frozenset[str]:
+    """Names a Python project re-exports from its package __init__.py files.
+
+    Large Python libraries define in a private module and re-export publicly:
+    scikit-learn, pandas and numpy all do it. Without this, the underscore rule calls
+    sklearn.linear_model._logistic.LogisticRegression private when it is the library's
+    public API, and the corpus reports a non-public rate near 1.
+
+    Reads `__all__` entries and `from .module import Name` aliases, which are the two
+    forms that make a name part of the package surface. Parsed with ast rather than
+    regex so a string containing "__all__" cannot be mistaken for a declaration.
+
+    Never raises: an unparseable source file is skipped, and a missing tree yields the
+    empty set, because a label source is not worth failing a run over.
+    """
+    root = Path(repo)
+    if not root.is_dir():
+        return frozenset()
+    exported: set[str] = set()
+    for init in root.rglob("__init__.py"):
+        if any(part in {".git", "node_modules", "vendor", "build"} for part in init.parts):
+            continue
+        try:
+            tree = ast.parse(init.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        package = init.parent.name
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                # Relative (`from ._m import X`) and absolute self-imports
+                # (`from sklearn._config import X` inside sklearn/__init__.py) are both
+                # re-exports. scikit-learn uses the absolute form, so requiring a
+                # relative import missed its entire public surface.
+                own = node.level > 0 or (node.module or "").split(".")[0] == package
+                if own:
+                    exported.update(
+                        alias.asname or alias.name
+                        for alias in node.names
+                        if alias.name != "*" and not alias.name.startswith("_")
+                    )
+            elif isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if not any(
+                    isinstance(target, ast.Name) and target.id == "__all__"
+                    for target in targets
+                ):
+                    continue
+                # __all__ is often built by concatenation — scikit-learn writes
+                # `__all__ = [...] + [...]` — so every string constant in the assigned
+                # expression counts, not just a bare list literal.
+                exported.update(
+                    element.value
+                    for element in ast.walk(node.value)
+                    if isinstance(element, ast.Constant)
+                    and isinstance(element.value, str)
+                )
+    return frozenset(exported)
+
+
+def is_public_api(
+    qualified_name: str,
+    file_path: str,
+    python_exports: frozenset[str] = frozenset(),
+) -> bool | None:
     """Whether a symbol is part of its project's declared public surface.
 
     This is the label H1/H5 need. PR #151's claim is that the highest-fan-in symbols are
@@ -3207,20 +3273,33 @@ def is_public_api(qualified_name: str, file_path: str) -> bool | None:
     if suffix == "go":
         return identifier[:1].isupper()
     if suffix == "py":
-        for part in qualified_name.split("."):
+        parts = qualified_name.split(".")
+        # A re-exported name is public wherever it is defined, which is the convention
+        # large Python libraries use; the underscore rule alone misreads it. Any
+        # component may carry the export — for a method it is the class that is exported
+        # — but an underscore-prefixed terminal identifier is private regardless.
+        if not identifier.startswith("_") and any(
+            part in python_exports for part in parts
+        ):
+            return True
+        for part in parts:
             if part.startswith("_") and not (part.startswith("__") and part.endswith("__")):
                 return False
         return True
     return None
 
 
-def non_public_rate(rows: list[tuple[Any, ...]]) -> float | None:
+def non_public_rate(
+    rows: list[tuple[Any, ...]], python_exports: frozenset[str] = frozenset()
+) -> float | None:
     """Fraction of a ranked window outside the project's declared public surface.
 
     None when the window's language has no name-level publicity rule, so a corpus the
     label cannot speak to reports null instead of contributing a zero.
     """
-    verdicts = [is_public_api(str(row[0]), str(row[1])) for row in rows]
+    verdicts = [
+        is_public_api(str(row[0]), str(row[1]), python_exports) for row in rows
+    ]
     known = [verdict for verdict in verdicts if verdict is not None]
     if not known:
         return None
@@ -3666,6 +3745,7 @@ def run_rank_score_probes(
     top_n: int = 40,
     cutoffs: tuple[int, ...] = (10, 40),
     scaffolding_paths: frozenset[str] | None = None,
+    python_exports: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Rank every persisted score over the same graph and compare them directly.
 
@@ -3757,7 +3837,7 @@ def run_rank_score_probes(
                 "lexical_marker_rate": lexical / len(window),
                 # The fan-in-independent replacement in the H1/H5 role. Null where the
                 # language has no name-level publicity rule.
-                "non_public_rate": non_public_rate(window),
+                "non_public_rate": non_public_rate(window, python_exports),
                 "scaffolding": scaffolding,
             }
         entry["by_cutoff"] = by_cutoff
@@ -7803,6 +7883,11 @@ def run_capability_quality(
                 run_rank_score_probes(
                     cache_dir,
                     project,
+                    python_exports=python_public_exports(
+                        Path(args.quality_background_repo).expanduser()
+                    )
+                    if args.quality_background_repo
+                    else frozenset(),
                     scaffolding_paths=(
                         load_scaffolding_paths(corpus_id, args.labels_dir)
                         if getattr(args, "labels_dir", "")
