@@ -7607,13 +7607,29 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             cbm_index_worker_result_free(&wr2);
             break; /* good files indexed; quarantined files reported as crash/hang */
         }
-        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
+        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG ||
+            wr2.outcome == CBM_PROC_EXIT_NONZERO) {
             last_outcome = wr2.outcome;
             cbm_index_worker_result_free(&wr2);
-            /* crash vs hang: the phase this file is quarantined under and
-             * reported as in skipped[]. A fault signal → "crash"; a
-             * no-progress kill → "hang". */
-            const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
+            /* crash vs hang vs nonzero-exit: the phase this file is quarantined
+             * under and reported as in skipped[]. A fault signal → "crash"; a
+             * no-progress kill → "hang"; a graceful nonzero exit (e.g. an
+             * internal parse-limit/abort on a pathological file) → "error".
+             * EXIT_NONZERO is attributed via the SAME marker-journal suspect
+             * mechanism as a crash: the two-consecutive-strikes intersection
+             * below still guards against quarantining an innocent file, and a
+             * SYSTEMIC nonzero exit (e.g. a bad arg) produces no recurring
+             * suspect → the intersection is empty → give_up (correct). This
+             * makes a single pathological file skip-and-continue instead of
+             * aborting the whole chunk. */
+            const char *phase;
+            if (last_outcome == CBM_PROC_HANG) {
+                phase = "hang";
+            } else if (last_outcome == CBM_PROC_EXIT_NONZERO) {
+                phase = "error";
+            } else {
+                phase = "crash";
+            }
             int sus_n = 0;
             char **suspects = supervisor_read_suspects(marker_path, &sus_n);
             (void)remove(marker_path); /* fresh journal for the next re-run */
