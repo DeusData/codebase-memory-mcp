@@ -852,13 +852,34 @@ TEST(contract_calls_breadth) {
 /* Every graph edge type the pipeline can emit — used to print a histogram
  * when an edge contract fails, so a regression shows exactly what WAS
  * produced instead of the missing type. */
-static const char *ALL_EDGE_TYPES[] = {
-    "CALLS",         "CONFIGURES", "CONTAINS_FILE",  "CONTAINS_FOLDER", "DATA_FLOWS",
-    "DECORATES",     "DEFINES",    "DEFINES_METHOD", "DEPENDS_ON",      "FILE_CHANGES_WITH",
-    "GRAPHQL_CALLS", "GRPC_CALLS", "HANDLES",        "HTTP_CALLS",      "IMPLEMENTS",
-    "IMPORTS",       "INHERITS",   "INFRA_MAPS",     "OVERRIDE",        "SEMANTICALLY_RELATED",
-    "SIMILAR_TO",    "TESTS_FILE", "TESTS",          "TRPC_CALLS",      "USAGE",
-    "ASYNC_CALLS",   NULL};
+static const char *ALL_EDGE_TYPES[] = {"CALLS",
+                                       "CALL_REFERENCE",
+                                       "CONFIGURES",
+                                       "CONTAINS_FILE",
+                                       "CONTAINS_FOLDER",
+                                       "DATA_FLOWS",
+                                       "DECORATES",
+                                       "DEFINES",
+                                       "DEFINES_METHOD",
+                                       "DEPENDS_ON",
+                                       "FILE_CHANGES_WITH",
+                                       "GRAPHQL_CALLS",
+                                       "GRPC_CALLS",
+                                       "HANDLES",
+                                       "HTTP_CALLS",
+                                       "IMPLEMENTS",
+                                       "IMPORTS",
+                                       "INHERITS",
+                                       "INFRA_MAPS",
+                                       "OVERRIDE",
+                                       "SEMANTICALLY_RELATED",
+                                       "SIMILAR_TO",
+                                       "TESTS_FILE",
+                                       "TESTS",
+                                       "TRPC_CALLS",
+                                       "USAGE",
+                                       "ASYNC_CALLS",
+                                       NULL};
 
 static void dump_edge_histogram(cbm_store_t *store, const char *project) {
     if (!store) {

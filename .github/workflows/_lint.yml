@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Tests must pass or fail — no SKIPs except genuinely platform-specific
       # ones (SKIP_PLATFORM / #ifdef). Fails the lint phase on any plain SKIP().
@@ -49,3 +49,28 @@ jobs:
 
       - name: Lint (cppcheck + clang-format, no clang-tidy — enforced locally)
         run: scripts/lint.sh --ci CLANG_FORMAT=clang-format-20
+
+  # Memory-analyzer gate (user decision 2026-08-03: runner cost accepted).
+  # Path-sensitive clang-analyzer over the memory checks only: leak paths,
+  # null derefs, uninitialized reads. Its first run produced 9 real fixes;
+  # the gate is green because every false positive was RESTRUCTURED for
+  # provability (never suppressed — the NOLINT ban applies here too).
+  # Vendored-tree diagnostics are path-filtered, mirroring .cppcheck.
+  lint-mem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Install LLVM 22 (pinned analyzer toolchain)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-22
+
+      - name: Memory-analyzer gate
+        run: scripts/ci/lint-mem.sh clang-tidy-22

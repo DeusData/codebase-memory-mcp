@@ -48,7 +48,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Deploy */
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
-    ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+    ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
     "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",

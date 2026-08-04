@@ -55,6 +55,7 @@ typedef struct {
  * pick up the map of the nearest ancestor scope. */
 typedef struct {
     char *dir_prefix;
+    char *source_rel_path; /* selected config file (tsconfig beats jsconfig) */
     cbm_path_alias_map_t *map;
 } cbm_path_alias_scope_t;
 

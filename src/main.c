@@ -829,11 +829,13 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         /* Supervised worker: hand the full result string to the parent via the
          * response file before printing (parent reads it back on a clean exit). */
         const char *ro = cbm_index_worker_response_out();
+        bool worker_response_written = false;
         if (ro) {
             FILE *rf = cbm_fopen(ro, "wb");
             if (rf) {
-                (void)fputs(result, rf);
-                (void)fclose(rf);
+                int write_rc = fputs(result, rf);
+                int close_rc = fclose(rf);
+                worker_response_written = write_rc >= 0 && close_rc == 0;
             }
         }
         if (raw_json) {
@@ -847,14 +849,15 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         }
         exit_code = cbm_cli_exit_status_after_maintenance(exit_code, maintenance_cancelled);
         if (cbm_index_worker_active()) {
-            /* Supervised worker: the response is delivered (file + stdout).
-             * Skip the multi-GB teardown (server/store frees) — the process
-             * dies now and the OS reclaims everything wholesale; piecemeal
-             * free() of a kernel-scale graph costs minutes. _Exit skips
-             * atexit/LSan by design for this prod worker path. */
+            /* The supervisor protocol classifies the PROCESS, not the tool
+             * result: a valid MCP error response is a healthy worker outcome.
+             * Propagating cli_print_mcp_result's isError exit code made the
+             * parent discard that response and falsely report exit_nonzero as
+             * "crashed on a file". Fail only when the response transport itself
+             * failed. Skip multi-GB teardown; the OS reclaims it at exit. */
             cbm_log_info("index.worker.fast_exit", "action", "_Exit");
             fflush(NULL);
-            _Exit(exit_code);
+            _Exit(worker_response_written ? 0 : SKIP_ONE);
         }
         free(result);
     }

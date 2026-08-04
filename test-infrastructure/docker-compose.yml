@@ -47,6 +47,28 @@ services:
   # Overrides the default test.sh entrypoint to build + run the widened TSan
   # suite set. /usr/lib/ccache is first on PATH in the image, so CC=gcc is
   # ccache-masqueraded automatically (same as the ASan legs).
+  # MemorySanitizer lane (stage 2): MSan-instrumented libc++/zlib image, full
+  # coverage including the C++ preprocessing paths. See scripts/msan.sh.
+  test-msan:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.msan
+    platform: linux/arm64
+    init: true
+    volumes:
+      - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    # MSan's shadow layout has the same aarch64 high-entropy-ASLR problem as
+    # TSan (personality() blocked by the default seccomp profile) — same
+    # remedy, same safety argument: the container runs only our own tests.
+    security_opt: ["seccomp=unconfined"]
+    entrypoint: ["setarch", "-R", "bash", "scripts/msan.sh"]
+
   test-tsan:
     build:
       context: ..

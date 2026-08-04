@@ -13,6 +13,7 @@
 #include "../src/foundation/compat_thread.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <cli/agent_profiles.h>
 #include <cli/cli.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
@@ -4669,6 +4670,108 @@ TEST(cli_agent_reinstall_preserves_foreign_policy_entries) {
     PASS();
 }
 
+#ifndef _WIN32
+/* Regression for #1387: installing over an existing setup whose hook scripts
+ * are not byte-owned (manual install with a custom binary location, or a
+ * user-modified reminder) must NOT remove the existing, working hook entries
+ * from settings.json. The refused script rewrite is reported as an error and
+ * both the scripts and the entries survive byte-identically. */
+TEST(cli_install_preserves_hook_entries_when_scripts_unowned_issue1387) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hooks-preserve-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    if (!cbm_mkdir_p(hooks_dir, 0755))
+        FAIL("mkdir hooks_dir failed");
+
+    /* Gate script written by a manual install: BIN outside the managed target,
+     * so its bytes match no current or released installer-owned shape. */
+    static const char unowned_gate[] =
+        "#!/usr/bin/env bash\n"
+        "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+        "BIN=\"/opt/tools/cbm/codebase-memory-mcp\"\n"
+        "[ -x \"$BIN\" ] || exit 0\n"
+        "\"$BIN\" hook-augment 2>/dev/null\n"
+        "exit 0\n";
+    char gate_path[768];
+    snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(gate_path, unowned_gate);
+
+    /* Session reminder carrying a user-added line. */
+    static const char unowned_session[] =
+        "#!/usr/bin/env bash\n"
+        "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+        "echo my-extra-team-reminder\n";
+    char session_path[768];
+    snprintf(session_path, sizeof(session_path), "%s/cbm-session-reminder", hooks_dir);
+    write_test_file(session_path, unowned_session);
+
+    static const char settings_before[] =
+        "{\n"
+        "  \"hooks\": {\n"
+        "    \"PreToolUse\": [\n"
+        "      {\"matcher\": \"Grep|Glob\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-code-discovery-gate\", \"timeout\": 5}]},\n"
+        "      {\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"/usr/local/bin/my-own-guard\"}]}\n"
+        "    ],\n"
+        "    \"SessionStart\": [\n"
+        "      {\"matcher\": \"startup\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]},\n"
+        "      {\"matcher\": \"resume\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]},\n"
+        "      {\"matcher\": \"clear\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]},\n"
+        "      {\"matcher\": \"compact\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]}\n"
+        "    ]\n"
+        "  }\n"
+        "}\n";
+    char settings_path[768];
+    snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
+    write_test_file(settings_path, settings_before);
+
+    const char *const env_names[] = {"HOME", "PATH", "CLAUDE_CONFIG_DIR"};
+    char *saved[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    int install_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/other/codebase-memory-mcp", false, false);
+
+    char *settings = read_test_file_alloc(settings_path);
+    char *gate = read_test_file_alloc(gate_path);
+    char *session = read_test_file_alloc(session_path);
+    bool preserved =
+        install_rc != 0 /* the refused rewrites are reported, not silent */
+        && settings && strstr(settings, "~/.claude/hooks/cbm-code-discovery-gate") &&
+        strstr(settings, "Grep|Glob") && strstr(settings, "/usr/local/bin/my-own-guard") &&
+        strstr(settings, "\"startup\"") && strstr(settings, "\"resume\"") &&
+        strstr(settings, "\"clear\"") && strstr(settings, "\"compact\"") &&
+        strstr(settings, "~/.claude/hooks/cbm-session-reminder") && gate &&
+        strcmp(gate, unowned_gate) == 0 && session && strcmp(session, unowned_session) == 0;
+    free(settings);
+    free(gate);
+    free(session);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!preserved)
+        FAIL("install must preserve existing hook entries and scripts when the on-disk "
+             "scripts are unowned (#1387)");
+    PASS();
+}
+#endif
+
 TEST(cli_existing_agents_install_durable_child_context) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-durable-agents-XXXXXX");
@@ -4894,11 +4997,15 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     files_ok = files_ok && test_file_contains_all(path, claude_terms, 7U);
 
     snprintf(path, sizeof(path), "%s/agents/codebase-memory.toml", codex_home);
-    const char *const codex_terms[] = {
-        "name = \"codebase-memory\"",        "description = ",
-        "developer_instructions = ",         "sandbox_mode = \"read-only\"",
-        "[mcp_servers.codebase-memory-mcp]", "check_index_coverage"};
-    files_ok = files_ok && test_file_contains_all(path, codex_terms, 6U);
+    const char *const codex_terms[] = {"name = \"codebase-memory\"",
+                                       "description = ",
+                                       "developer_instructions = ",
+                                       "sandbox_mode = \"read-only\"",
+                                       "[mcp_servers.codebase-memory-mcp]",
+                                       "command = \"/opt/codebase-memory-mcp\"",
+                                       "args = [\"--tool-profile=analysis\"]",
+                                       "check_index_coverage"};
+    files_ok = files_ok && test_file_contains_all(path, codex_terms, 8U);
     char *profile = read_test_file_alloc(path);
     files_ok = files_ok && profile && !strstr(profile, "model =") &&
                !strstr(profile, "index_repository") && !strstr(profile, "delete_project") &&
@@ -5371,25 +5478,45 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
         "name = \"codebase-memory-scout\"\nuser_note = \"preserve scout\"\n";
     write_test_file(verify_path, legacy_verify);
     write_test_file(scout_path, foreign_scout);
+    char *rc1_auditor = cbm_render_graph_profile_codex_rc1(CBM_GRAPH_TIER_AUDIT);
+    if (!rc1_auditor)
+        FAIL("rc.1 auditor rendering must be available");
+    write_test_file(auditor_path, rc1_auditor);
+    free(rc1_auditor);
 
-    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    /* Uninstall renders expected content with the installed binary path, so
+     * install with that same path to exercise exact-content removal. */
+    char installed_binary[640];
+    char expected_command[768];
+#ifdef _WIN32
+    snprintf(installed_binary, sizeof(installed_binary), "%s/.local/bin/codebase-memory-mcp.exe",
+             tmpdir);
+#else
+    snprintf(installed_binary, sizeof(installed_binary), "%s/.local/bin/codebase-memory-mcp",
+             tmpdir);
+#endif
+    snprintf(expected_command, sizeof(expected_command), "command = \"%s\"", installed_binary);
+    char *plan = cbm_build_install_plan_json(tmpdir, installed_binary);
     bool plan_ok =
         plan && strstr(plan, scout_path) && strstr(plan, verify_path) && strstr(plan, auditor_path);
     free(plan);
 
-    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int install_rc = cbm_install_agent_configs(tmpdir, installed_binary, false, false);
     char *scout = read_test_file_alloc(scout_path);
     char *verify = read_test_file_alloc(verify_path);
     char *auditor = read_test_file_alloc(auditor_path);
-    bool installed = install_rc != 0 && scout && strcmp(scout, foreign_scout) == 0 && verify &&
-                     strcmp(verify, legacy_verify) != 0 && strstr(verify, "Tier 2") &&
-                     strstr(verify, "name = \"codebase-memory\"") &&
-                     strstr(verify, "check_index_coverage") && auditor &&
-                     strstr(auditor, "Tier 3") && strstr(auditor, "check_index_coverage") &&
-                     !strstr(verify, "index_repository") && !strstr(verify, "delete_project") &&
-                     !strstr(verify, "manage_adr") && !strstr(verify, "ingest_traces") &&
-                     !strstr(auditor, "index_repository") && !strstr(auditor, "delete_project") &&
-                     !strstr(auditor, "manage_adr") && !strstr(auditor, "ingest_traces");
+    bool installed =
+        install_rc != 0 && scout && strcmp(scout, foreign_scout) == 0 && verify &&
+        strcmp(verify, legacy_verify) != 0 && strstr(verify, "Tier 2") &&
+        strstr(verify, "name = \"codebase-memory\"") && strstr(verify, expected_command) &&
+        strstr(verify, "args = [\"--tool-profile=analysis\"]") &&
+        strstr(verify, "check_index_coverage") && auditor && strstr(auditor, expected_command) &&
+        strstr(auditor, "args = [\"--tool-profile=analysis\"]") && strstr(auditor, "Tier 3") &&
+        strstr(auditor, "check_index_coverage") && !strstr(verify, "index_repository") &&
+        !strstr(verify, "delete_project") && !strstr(verify, "manage_adr") &&
+        !strstr(verify, "ingest_traces") && !strstr(auditor, "index_repository") &&
+        !strstr(auditor, "delete_project") && !strstr(auditor, "manage_adr") &&
+        !strstr(auditor, "ingest_traces");
     free(scout);
     free(verify);
     free(auditor);
@@ -11911,6 +12038,9 @@ SUITE(cli) {
     RUN_TEST(cli_new_agent_install_plans_use_documented_paths);
     RUN_TEST(cli_new_agent_configs_use_documented_schemas);
     RUN_TEST(cli_agent_reinstall_preserves_foreign_policy_entries);
+#ifndef _WIN32
+    RUN_TEST(cli_install_preserves_hook_entries_when_scripts_unowned_issue1387);
+#endif
     RUN_TEST(cli_existing_agents_install_durable_child_context);
     RUN_TEST(cli_durable_profiles_follow_current_vendor_paths);
     RUN_TEST(cli_cline_data_dir_only_redirects_data_state);

@@ -2,8 +2,10 @@
  * repro_grammar_misc.c -- FINAL per-grammar INVARIANT battery covering the
  * remaining MISCELLANEOUS language family (hardware-description, CFML dialects,
  * niche scripting, structural assembly/linker/tablegen/ledger/IaC). This file
- * completes the all-159-grammar reproduce-first coverage: every CBM_LANG_* now
- * has a per-language RED/GREEN row on the bug-repro board.
+ * completes the all-161-grammar reproduce-first coverage: every grammar-backed
+ * CBM_LANG_* now has a per-language RED/GREEN row on the bug-repro board.
+ * CBM_LANG_OBJECTSCRIPT_EXPORT is intentionally excluded from the grammar
+ * count because Studio Export XML is transformed to ObjectScript UDL first.
  *
  * One TEST() per language so per-language RED/GREEN shows on the board. Each
  * test runs the battery dimension appropriate to what the language's lang_spec
@@ -31,6 +33,12 @@
  *                                              call: call_expression)
  *     SQL           -> CBM_LANG_SQL           (func: create_function; call:
  *                                              function_call/invocation/command)
+ *     OBJECTSCRIPT_UDL -> CBM_LANG_OBJECTSCRIPT_UDL
+ *                                             (func: method/classmethod/query;
+ *                                              call: four registered UDL forms)
+ *     OBJECTSCRIPT_ROUTINE -> CBM_LANG_OBJECTSCRIPT_ROUTINE
+ *                                             (func: tag; call: extrinsic_function/
+ *                                              routine_tag_call)
  *
  *   STRUCTURAL family (asm / linker / data / IaC) -> extract-clean +
  *   labels/fqn/ranges valid + defs-present (the entities each should extract) +
@@ -91,8 +99,9 @@
  *
  * HONEST RED CONTRACT (the point of this file): dimension 7 (callable-sourcing) is
  * expected RED for the non-LSP callable languages here. None of VERILOG /
- * SYSTEMVERILOG / VHDL / CFML / CFSCRIPT / RESCRIPT / SQUIRREL / PINE / TEMPL / SQL
- * has a dedicated cross-LSP rescue, so attribution depends solely on the
+ * SYSTEMVERILOG / VHDL / CFML / CFSCRIPT / RESCRIPT / SQUIRREL / PINE / TEMPL / SQL /
+ * OBJECTSCRIPT_UDL / OBJECTSCRIPT_ROUTINE has a dedicated cross-LSP rescue, so
+ * attribution depends solely on the
  * tree-sitter enclosing-func walk (cbm_find_enclosing_func + func_kinds_for_lang in
  * helpers.c). When that mapping does not match the grammar's emitted func node
  * types, the in-body call falls back to the Module QN -- exactly the enclosing-func
@@ -468,6 +477,67 @@ TEST(repro_grammar_misc_linkerscript) {
     return misc_robustness("LINKERSCRIPT", bad, CBM_LANG_LINKERSCRIPT, "link.ld");
 }
 
+/* ── OBJECTSCRIPT UDL (callable) ─────────────────────────────────────────────
+ * A class method calls another class method with a local value argument. The
+ * call is the registered class_method_call form; the other three UDL call forms
+ * remain enumerated by repro_call_node_manifest.
+ *
+ * Dims asserted: 1-8 + R. Studio Export XML is not a grammar row because it is
+ * transformed to this UDL language before extraction.
+ */
+TEST(repro_grammar_misc_objectscript_udl) {
+    static const char src[] = "Class Sample.Callbacks Extends %RegisteredObject\n"
+                              "{\n"
+                              "ClassMethod Accept(value As %String) As %String\n"
+                              "{\n"
+                              "    Quit value\n"
+                              "}\n"
+                              "ClassMethod Run(watched As %String) As %String\n"
+                              "{\n"
+                              "    Quit ##class(Sample.Callbacks).Accept(watched)\n"
+                              "}\n"
+                              "}\n";
+    static const char bad[] = "Class Sample.Callbacks Extends %RegisteredObject\n"
+                              "{\n"
+                              "ClassMethod Run(watched As %String) As %String\n"
+                              "{\n"
+                              "    Quit ##class(Sample.Callbacks).Accept(\n";
+    if (misc_single_file_battery("OBJECTSCRIPT_UDL", src, CBM_LANG_OBJECTSCRIPT_UDL,
+                                 "Callbacks.cls", "Method", NULL, "Accept") != 0)
+        return 1;
+    if (misc_robustness("OBJECTSCRIPT_UDL", bad, CBM_LANG_OBJECTSCRIPT_UDL, "Callbacks.cls") != 0)
+        return 1;
+    return misc_pipeline_battery("OBJECTSCRIPT_UDL", "Callbacks.cls", src);
+}
+
+/* ── OBJECTSCRIPT ROUTINE (callable) ─────────────────────────────────────────
+ * A parameterized routine tag invokes a sibling through the registered
+ * extrinsic_function form. routine_tag_call membership is covered separately by
+ * the literal call-node manifest.
+ *
+ * Dims asserted: 1-8 + R.
+ */
+TEST(repro_grammar_misc_objectscript_routine) {
+    static const char src[] = "SAMPLE\n"
+                              "    Quit\n"
+                              "Accept(value)\n"
+                              "    Quit value\n"
+                              "Run(watched)\n"
+                              "    Set result = $$Accept(watched)\n"
+                              "    Quit result\n";
+    static const char bad[] = "SAMPLE\n"
+                              "    Quit\n"
+                              "Run(watched)\n"
+                              "    Set result = $$Accept(\n";
+    if (misc_single_file_battery("OBJECTSCRIPT_ROUTINE", src, CBM_LANG_OBJECTSCRIPT_ROUTINE,
+                                 "Sample.mac", "Function", NULL, "Accept") != 0)
+        return 1;
+    if (misc_robustness("OBJECTSCRIPT_ROUTINE", bad, CBM_LANG_OBJECTSCRIPT_ROUTINE, "Sample.mac") !=
+        0)
+        return 1;
+    return misc_pipeline_battery("OBJECTSCRIPT_ROUTINE", "Sample.mac", src);
+}
+
 /* ── PINE (callable) ─────────────────────────────────────────────────────────
  * Idiomatic Pine Script v5 indicator: a user function `ema2` defined with
  * function_declaration_statement, and a call to the built-in `plot()` plus an
@@ -790,6 +860,8 @@ SUITE(repro_grammar_misc) {
     RUN_TEST(repro_grammar_misc_cfml);
     RUN_TEST(repro_grammar_misc_cfscript);
     RUN_TEST(repro_grammar_misc_linkerscript);
+    RUN_TEST(repro_grammar_misc_objectscript_udl);
+    RUN_TEST(repro_grammar_misc_objectscript_routine);
     RUN_TEST(repro_grammar_misc_pine);
     RUN_TEST(repro_grammar_misc_rescript);
     RUN_TEST(repro_grammar_misc_sql);

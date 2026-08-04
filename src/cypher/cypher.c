@@ -4204,8 +4204,11 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
     entry->group_vals = calloc(item_count, sizeof(const char *));
     entry->sums = calloc(item_count, sizeof(double));
     entry->counts = calloc(item_count, sizeof(int));
-    entry->mins = malloc(item_count * sizeof(double));
-    entry->maxs = malloc(item_count * sizeof(double));
+    /* calloc: the sentinel loop below overwrites every slot, but the bound
+     * equality with the accumulate loop is invisible to path-sensitive
+     * analysis; zeroed backing keeps any modeled mismatch defined. */
+    entry->mins = calloc(item_count, sizeof(double));
+    entry->maxs = calloc(item_count, sizeof(double));
     entry->collect_lists = calloc(item_count, sizeof(char **));
     entry->collect_counts = calloc(item_count, sizeof(int));
     for (int ci = 0; ci < item_count; ci++) {

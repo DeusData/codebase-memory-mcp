@@ -276,6 +276,12 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 
+# Step 5c: a worker-delivered MCP error is transport success. The outer CLI
+# still exits nonzero for the user-facing tool error, but the supervisor must
+# preserve that response instead of misreporting exit_nonzero as a file crash.
+echo "=== Step 5c: worker error-response transport regression ==="
+bash "$ROOT/tests/test_worker_error_response.sh"
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).

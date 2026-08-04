@@ -238,14 +238,34 @@ static void es_lang_cleanup(ES_LangProj *lp, cbm_store_t *store) {
 }
 
 /* Every graph edge type the pipeline can emit — used in diagnostic dumps. */
-static const char *ES_ALL_EDGE_TYPES[] = {
-    "CALLS",        "CONFIGURES",    "CONTAINS_FILE", "CONTAINS_FOLDER",
-    "DATA_FLOWS",   "DECORATES",     "DEFINES",       "DEFINES_METHOD",
-    "DEPENDS_ON",   "FILE_CHANGES_WITH", "GRAPHQL_CALLS", "GRPC_CALLS",
-    "HANDLES",      "HTTP_CALLS",    "IMPLEMENTS",    "IMPORTS",
-    "INHERITS",     "INFRA_MAPS",    "OVERRIDE",      "SEMANTICALLY_RELATED",
-    "SIMILAR_TO",   "TESTS_FILE",    "TESTS",         "TRPC_CALLS",
-    "USAGE",        "ASYNC_CALLS",   NULL};
+static const char *ES_ALL_EDGE_TYPES[] = {"CALLS",
+                                          "CALL_REFERENCE",
+                                          "CONFIGURES",
+                                          "CONTAINS_FILE",
+                                          "CONTAINS_FOLDER",
+                                          "DATA_FLOWS",
+                                          "DECORATES",
+                                          "DEFINES",
+                                          "DEFINES_METHOD",
+                                          "DEPENDS_ON",
+                                          "FILE_CHANGES_WITH",
+                                          "GRAPHQL_CALLS",
+                                          "GRPC_CALLS",
+                                          "HANDLES",
+                                          "HTTP_CALLS",
+                                          "IMPLEMENTS",
+                                          "IMPORTS",
+                                          "INHERITS",
+                                          "INFRA_MAPS",
+                                          "OVERRIDE",
+                                          "SEMANTICALLY_RELATED",
+                                          "SIMILAR_TO",
+                                          "TESTS_FILE",
+                                          "TESTS",
+                                          "TRPC_CALLS",
+                                          "USAGE",
+                                          "ASYNC_CALLS",
+                                          NULL};
 
 static void es_dump_edge_histogram(cbm_store_t *store, const char *project) {
     if (!store) {
@@ -276,6 +296,40 @@ static int es_edge_present(const ES_LangFile *files, int nfiles, const char *edg
     }
     es_lang_cleanup(&lp, store);
     return got >= floor;
+}
+
+static int es_exact_edge_by_name(const ES_LangFile *files, int nfiles, const char *edge_type,
+                                 const char *source_name, const char *target_name) {
+    ES_LangProj lp;
+    cbm_store_t *store = es_lang_index_files(&lp, files, nfiles);
+    cbm_node_t *sources = NULL;
+    cbm_node_t *targets = NULL;
+    int source_count = 0;
+    int target_count = 0;
+    int matches = -1;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, source_name, &sources, &source_count) ==
+            CBM_STORE_OK &&
+        cbm_store_find_nodes_by_name(store, lp.project, target_name, &targets, &target_count) ==
+            CBM_STORE_OK &&
+        source_count == 1 && target_count == 1) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(store, sources[0].id, edge_type, &edges,
+                                                &edge_count) == CBM_STORE_OK) {
+            matches = 0;
+            for (int i = 0; i < edge_count; i++) {
+                if (edges[i].target_id == targets[0].id) {
+                    matches++;
+                }
+            }
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_free_nodes(targets, target_count);
+    es_lang_cleanup(&lp, store);
+    return matches;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -744,16 +798,14 @@ TEST(es_decorates_attribute_csharp) {
  * resolves in the registry.  pass_usages.c handles this.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Python cross-file USAGE: main.py uses a class from models.py. */
+/* Python constructor syntax is a CALLS edge to the materialized Class node. */
 TEST(es_usage_crossfile_python) {
     static const ES_LangFile f[] = {
         {"models.py",
          "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py",
          "from .models import User\n\n\ndef create_user(name):\n    return User(name)\n"}};
-    /* Uncertain: USAGE edges for type instantiation may or may not be
-     * extracted for Python.  Assert the correct outcome. */
-    ASSERT_TRUE(es_edge_present(f, 2, "USAGE", 1));
+    ASSERT_EQ(es_exact_edge_by_name(f, 2, "CALLS", "create_user", "User"), 1);
     PASS();
 }
 

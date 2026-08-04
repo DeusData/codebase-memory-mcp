@@ -72,7 +72,7 @@ Legs:
   full (default)  arm64: test + build + TSan + smoke + portable smoke
                   + Windows mingw cross-compile check
   all             full + amd64 legs + Windows cross-compile/Wine check
-  test|build|smoke|tsan          single arm64 legs
+  test|build|smoke|tsan|msan     single arm64 legs
   amd64|test-amd64|tsan-amd64    amd64 legs (tsan-amd64 needs real amd64 HW)
   perf            arm64 incremental-perf leg (CBM_SKIP_PERF unset)
   shell|shell-alpine             interactive debug shell inside the image
@@ -161,6 +161,22 @@ case "${1:-full}" in
     tsan)
         echo "=== Linux arm64: ThreadSanitizer (data-race gate) ==="
         $COMPOSE run --rm test-tsan
+        ;;
+    msan)
+        # MemorySanitizer: uninitialized-read detection. Needs every linked
+        # library instrumented, which is what Dockerfile.msan's libc++/zlib
+        # build provides — hence its own image rather than a flag on the
+        # normal one. First run builds that image (slow); later runs hit the
+        # layer cache.
+        #
+        # arm64 note: MSan's shadow mapping is unreliable on aarch64 and the
+        # grammar suites stack-overflow there regardless of toolchain version
+        # (reproduced on clang 18 and clang 22). The GitHub leg runs x86-64,
+        # where the mapping is the well-trodden one, so a local arm64 failure
+        # in that specific shape is a platform artifact — check the CI leg
+        # before treating it as a code defect.
+        echo "=== Linux: MemorySanitizer (uninitialized-read gate) ==="
+        $COMPOSE run --rm test-msan
         ;;
     tsan-amd64)
         # NOTE: TSan's shadow memory is incompatible with x86_64-on-ARM

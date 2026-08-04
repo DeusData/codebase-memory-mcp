@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 
@@ -118,6 +119,42 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     d->entry.d_type = 0;
     return &d->entry;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
+    free(wpath);
+    if (!ok) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    out->is_symlink = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    out->is_regular = !out->is_directory && !out->is_symlink;
+    /* Compose the 64-bit values arithmetically rather than through
+     * ULARGE_INTEGER. Writing .LowPart/.HighPart and reading .QuadPart is
+     * correct -- it is a union -- but cppcheck does not model that aliasing and
+     * reports all four halves as assigned-but-never-read. This form says the
+     * same thing without the union, so the checker needs no exception. */
+    uint64_t file_size = ((uint64_t)data.nFileSizeHigh << 32) | (uint64_t)data.nFileSizeLow;
+    out->size = (int64_t)file_size;
+    uint64_t written = ((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32) |
+                       (uint64_t)data.ftLastWriteTime.dwLowDateTime;
+    enum { NANOSECONDS_PER_WINDOWS_TICK = 100 };
+    const uint64_t windows_to_unix_ticks = UINT64_C(116444736000000000);
+    out->mtime_ns =
+        written >= windows_to_unix_ticks
+            ? (int64_t)((written - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
+            : 0;
+    return 0;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -713,11 +750,49 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
-        d->entry.is_dir = (de->d_type == DT_DIR);
-        d->entry.d_type = de->d_type;
+        unsigned char type = de->d_type;
+#if defined(DT_UNKNOWN) && defined(AT_SYMLINK_NOFOLLOW)
+        if (type == DT_UNKNOWN) {
+            struct stat state;
+            if (fstatat(dirfd(d->dir), de->d_name, &state, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (S_ISDIR(state.st_mode)) {
+                    type = DT_DIR;
+                } else if (S_ISREG(state.st_mode)) {
+                    type = DT_REG;
+                } else if (S_ISLNK(state.st_mode)) {
+                    type = DT_LNK;
+                }
+            }
+        }
+#endif
+        d->entry.is_dir = (type == DT_DIR);
+        d->entry.d_type = type;
         return &d->entry;
     }
     return NULL;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    struct stat state;
+    if (lstat(path, &state) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    out->is_regular = S_ISREG(state.st_mode);
+    out->is_directory = S_ISDIR(state.st_mode);
+    out->is_symlink = S_ISLNK(state.st_mode);
+    out->size = (int64_t)state.st_size;
+#ifdef __APPLE__
+    out->mtime_ns = ((int64_t)state.st_mtimespec.tv_sec * INT64_C(1000000000)) +
+                    (int64_t)state.st_mtimespec.tv_nsec;
+#else
+    out->mtime_ns =
+        ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
+#endif
+    return 0;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -955,6 +1030,39 @@ int cbm_rename_replace(const char *src, const char *dst) {
 #endif
 }
 
+int cbm_rename_noreplace(const char *src, const char *dst) {
+    if (!src || !dst || !src[0] || !dst[0]) {
+        return CBM_NOT_FOUND;
+    }
+#ifdef _WIN32
+    wchar_t *wsrc = cbm_utf8_to_wide(src);
+    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    int ret = CBM_NOT_FOUND;
+    if (wsrc && wdst) {
+        ret = MoveFileExW(wsrc, wdst, MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)
+                  ? 0
+                  : CBM_NOT_FOUND;
+    }
+    free(wsrc);
+    free(wdst);
+    return ret;
+#else
+    /* link()+unlink() provides no-overwrite semantics portably (including
+     * macOS, where renameat2(RENAME_NOREPLACE) is unavailable). Both paths
+     * are adjacent database files and therefore on the same filesystem. */
+    if (link(src, dst) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (unlink(src) != 0) {
+        int saved_errno = errno;
+        (void)unlink(dst);
+        errno = saved_errno;
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+#endif
+}
+
 /* Remove a SQLite database's -wal/-shm/-journal sidecars (both platforms). Any code
  * path that installs a FRESH database file at a path where a previous
  * generation lived must call this first: SQLite decides whether to replay a
@@ -1005,4 +1113,78 @@ int cbm_remove_db_sidecars(const char *db_path) {
         result = CBM_NOT_FOUND;
     }
     return result;
+}
+
+/* ── Clone-or-copy ───────────────────────────────────────────────── */
+
+#if defined(__APPLE__)
+#include <sys/clonefile.h>
+#elif defined(__linux__)
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
+#include <fcntl.h>
+
+static int stream_copy_file(const char *src, const char *dst) {
+    FILE *in = cbm_fopen(src, "rb");
+    if (!in) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *out = cbm_fopen(dst, "wb");
+    if (!out) {
+        (void)fclose(in);
+        return CBM_NOT_FOUND;
+    }
+    char buf[CBM_SZ_64K];
+    size_t n;
+    int rc = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            rc = CBM_NOT_FOUND;
+            break;
+        }
+    }
+    if (ferror(in)) {
+        rc = CBM_NOT_FOUND;
+    }
+    (void)fclose(in);
+    if (fclose(out) != 0) {
+        rc = CBM_NOT_FOUND;
+    }
+    if (rc != 0) {
+        (void)cbm_unlink(dst);
+    }
+    return rc;
+}
+
+int cbm_clone_or_copy_file(const char *src, const char *dst) {
+    if (!src || !dst) {
+        return CBM_NOT_FOUND;
+    }
+#if defined(__APPLE__)
+    /* clonefile refuses to overwrite; the staging name is freshly minted by
+     * the caller, but clear any leftover defensively so the fast path is
+     * never abandoned for a stale artifact. */
+    (void)cbm_unlink(dst);
+    if (clonefile(src, dst, 0) == 0) {
+        return 0;
+    }
+#elif defined(__linux__)
+    int in_fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (in_fd >= 0) {
+        int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (out_fd >= 0) {
+            int cloned = ioctl(out_fd, FICLONE, in_fd);
+            int close_rc = close(out_fd);
+            (void)close(in_fd);
+            if (cloned == 0 && close_rc == 0) {
+                return 0;
+            }
+            (void)cbm_unlink(dst);
+        } else {
+            (void)close(in_fd);
+        }
+    }
+#endif
+    return stream_copy_file(src, dst);
 }

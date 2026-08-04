@@ -396,8 +396,9 @@ static const tool_def_t TOOLS[] = {
      "The three modes are independent and can be combined in a single call. "
      "RESPONSE: prefix-grouped tree rows by default — a shared (qn-prefix, file) group "
      "header printed once, then `name label lines in out` per row (full qn = group prefix "
-     "+ dot + name). in/out = TOTAL degree across ALL edge types (DEFINES, "
-     "USAGE, CALLS, ...), NOT caller/callee counts — use trace_path for callers. Add per-node "
+     "+ dot + name). in/out = selected degree across CALLS, USAGE, CALL_REFERENCE, "
+     "INHERITS, and IMPLEMENTS; other edge types are excluded. These are NOT caller/callee "
+     "counts — use trace_path for callers. Add per-node "
      "property columns via "
      "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); format=\"json\" returns "
      "the SAME tree model as structured JSON. "
@@ -4597,9 +4598,17 @@ static bool scc_build(const int64_t *src, const int64_t *tgt, int ecount, scc_gr
         memset(g, 0, sizeof(*g));
         return false;
     }
-    /* two-pass CSR fill */
+    /* two-pass CSR fill. Every endpoint is in ids[] by construction (ids is
+     * built from these same edge arrays), so a negative lookup is unreachable
+     * -- but that invariant is invisible to path-sensitive analysis, and a
+     * guard keeps a future collection bug from becoming an OOB write. Both
+     * passes must skip identically or the cursors desync. */
     for (int i = 0; i < ecount; i++) {
         int u = scc_id_index(g->ids, nv, src[i]);
+        int v = scc_id_index(g->ids, nv, tgt[i]);
+        if (u < 0 || v < 0) {
+            continue;
+        }
         g->adj_head[u + 1]++;
     }
     for (int i = 0; i < nv; i++) {
@@ -4616,13 +4625,18 @@ static bool scc_build(const int64_t *src, const int64_t *tgt, int ecount, scc_gr
     for (int i = 0; i < nv; i++) {
         cursor[i] = g->adj_head[i];
     }
+    int filled = 0;
     for (int i = 0; i < ecount; i++) {
         int u = scc_id_index(g->ids, nv, src[i]);
         int v = scc_id_index(g->ids, nv, tgt[i]);
+        if (u < 0 || v < 0) {
+            continue;
+        }
         g->adj[cursor[u]++] = v;
+        filled++;
     }
     free(cursor);
-    g->nedges = ecount;
+    g->nedges = filled;
     return true;
 }
 
@@ -4855,6 +4869,14 @@ static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t 
         scc_free(&g);
         return CBM_STORE_ERR;
     }
+    /* Tarjan assigns every vertex a component, so ncomp >= 1 whenever
+     * nverts >= 1 -- state it, so the zero-size-allocation path below is
+     * provably confined to the empty graph. */
+    if (g.nverts > 0 && ncomp <= 0) {
+        free(comp);
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
     /* size per component */
     int *csize = calloc((size_t)ncomp, sizeof(int));
     if (!csize) {
@@ -4914,10 +4936,15 @@ static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t 
         scc_free(&g);
         return CBM_STORE_ERR;
     }
-    for (int v = 0; v < g.nverts; v++) {
-        int sl = slot[comp[v]];
-        if (sl >= 0) {
-            members[sl][fill[sl]++] = g.ids[v];
+    /* With ncyc == 0 no slot is ever >= 0 (the slot loop can't assign one),
+     * so members -- NULL in that case -- is never indexed; make that
+     * invariant local instead of cross-loop so it is checkable. */
+    if (ncyc > 0) {
+        for (int v = 0; v < g.nverts; v++) {
+            int sl = slot[comp[v]];
+            if (sl >= 0) {
+                members[sl][fill[sl]++] = g.ids[v];
+            }
         }
     }
     free(fill);
@@ -4960,9 +4987,12 @@ static void arch_node_qn(cbm_store_t *store, int64_t id, char *out, size_t outsz
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
-    char *scope_path = cbm_mcp_get_string_arg(args, "path");
     cbm_store_t *store = resolve_store(srv, project);
+    /* REQUIRE_STORE returns without freeing anything but `project`, so every
+     * other allocation must come after it (scope_path leaked here before —
+     * caught by the clang-analyzer unix.Malloc lane). */
     REQUIRE_STORE(store, project);
+    char *scope_path = cbm_mcp_get_string_arg(args, "path");
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
@@ -11407,6 +11437,11 @@ static int read_bounded_line(FILE *in, char **line, size_t *cap, size_t max_byte
             if (!grown) {
                 return CBM_NOT_FOUND;
             }
+            /* Zero the tail: every byte of the buffer is then defined in any
+             * caller's model (parse_content_length reads up to one byte past
+             * the matched prefix), and a future over-read degrades to reading
+             * NULs instead of undefined memory. One memset per growth step. */
+            memset(grown + len, 0, new_cap - len);
             *line = grown;
             *cap = new_cap;
         }
@@ -11616,6 +11651,13 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
 
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     int fd = cbm_fileno(in);
+
+#ifdef _WIN32
+    /* Ensure stdio is in binary mode to prevent CRLF translation from corrupting
+     * Content-Length byte counts and causing fread() to hang. */
+    _setmode(cbm_fileno(in), _O_BINARY);
+    _setmode(cbm_fileno(out), _O_BINARY);
+#endif
 
     for (;;) {
         /* Poll with idle timeout so we can evict unused stores between requests.

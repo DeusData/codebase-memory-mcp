@@ -513,8 +513,15 @@ static void pb_flush_leaf(PageBuilder *pb) {
         pb->leaf_cap = old_cap == 0 ? INITIAL_LEAF_CAP : old_cap * GROWTH_FACTOR;
         void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
         if (!tmp) {
+            /* Leave a CONSISTENT empty state: leaf_count stale at >=1 with a
+             * NULL leaves array walked pb_finalize_* straight into
+             * leaves[0] (null deref, clang-analyzer traced it) whenever the
+             * final cell block was already flushed. Empty state routes every
+             * finalize path to its existing root=0 failure return. */
             free(pb->leaves);
             pb->leaves = NULL;
+            pb->leaf_count = 0;
+            pb->leaf_cap = 0;
             return;
         }
         pb->leaves = (PageRef *)tmp;
@@ -1050,8 +1057,11 @@ static bool pb_ensure_leaf_cap(PageBuilder *pb) {
     pb->leaf_cap = pb->leaf_cap == 0 ? INITIAL_LEAF_CAP : pb->leaf_cap * GROWTH_FACTOR;
     void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
     if (!tmp) {
+        /* Same consistent-empty contract as pb_flush_leaf's growth path. */
         free(pb->leaves);
         pb->leaves = NULL;
+        pb->leaf_count = 0;
+        pb->leaf_cap = 0;
         return false;
     }
     pb->leaves = (PageRef *)tmp;
