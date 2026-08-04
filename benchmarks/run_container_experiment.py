@@ -48,6 +48,14 @@ OWNED_RUNNER_FLAGS = frozenset(
     }
 )
 MEMORY_LIMIT_PATTERN = re.compile(r"^[1-9][0-9]*(?:b|k|m|g|t)$", re.IGNORECASE)
+WORK_VOLUME_RETENTION_FAILED_RUNS = "failed-runs"
+WORK_VOLUME_RETENTION_ALWAYS = "always"
+WORK_VOLUME_RETENTION_CHOICES = (
+    WORK_VOLUME_RETENTION_FAILED_RUNS,
+    WORK_VOLUME_RETENTION_ALWAYS,
+)
+DEFAULT_WORK_VOLUME_RETENTION = WORK_VOLUME_RETENTION_FAILED_RUNS
+WORK_VOLUME_STATUS_REMOVED = "removed_after_successful_export"
 CONTAINER_SCRIPT = r"""
 set -euo pipefail
 source_revision=$1
@@ -601,6 +609,22 @@ def merge_exported_tree(source: Path, destination: Path) -> None:
         os.replace(temporary, destination_path)
 
 
+def archive_source_bundle(
+    source: Path, destination: Path, expected_sha256: str
+) -> Path:
+    """Persist the exact measured Git bundle before its work volume is disposable."""
+    expected_name = f"repository-{expected_sha256}.bundle"
+    if source.name != expected_name or file_sha256(source) != expected_sha256:
+        raise RuntimeError("source bundle name or SHA-256 does not match its manifest")
+    merge_exported_tree(source.parent, destination)
+    archived = destination / expected_name
+    if file_sha256(archived) != expected_sha256:
+        raise RuntimeError(
+            f"archived source bundle failed SHA-256 verification: {archived}"
+        )
+    return archived
+
+
 def run_command(
     command: list[str],
     *,
@@ -649,6 +673,43 @@ def remove_container(docker: str, name: str) -> None:
     )
 
 
+def acquire_history_lock(docker: str, image: str, name: str) -> str:
+    """Serialize coordinators that share one history-level work volume."""
+    try:
+        created = run_command(
+            [
+                docker,
+                "create",
+                "--name",
+                name,
+                "--label",
+                "com.codebase-memory-mcp.benchmark=true",
+                "--label",
+                "com.codebase-memory-mcp.role=coordinator-lock",
+                "--entrypoint",
+                "/bin/true",
+                image,
+            ],
+            capture=True,
+        )
+        container_id = created.stdout.strip()
+        if not container_id:
+            raise RuntimeError(f"Docker did not return a container ID for {name}")
+        return container_id
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"benchmark history is already locked or Docker refused {name}; "
+            "inspect that exact container and remove it only if no coordinator is active"
+        ) from error
+
+
+def benchmark_volume_labels(role: str) -> dict[str, str]:
+    return {
+        "com.codebase-memory-mcp.benchmark": "true",
+        "com.codebase-memory-mcp.role": role,
+    }
+
+
 def ensure_volume(docker: str, name: str, role: str) -> None:
     inspect = subprocess.run(
         [docker, "volume", "inspect", name, "--format", "{{json .Labels}}"],
@@ -656,10 +717,7 @@ def ensure_volume(docker: str, name: str, role: str) -> None:
         capture_output=True,
         check=False,
     )
-    expected = {
-        "com.codebase-memory-mcp.benchmark": "true",
-        "com.codebase-memory-mcp.role": role,
-    }
+    expected = benchmark_volume_labels(role)
     if inspect.returncode == 0:
         labels = json.loads(inspect.stdout)
         if labels != expected:
@@ -680,6 +738,34 @@ def ensure_volume(docker: str, name: str, role: str) -> None:
             name,
         ]
     )
+
+
+def apply_work_volume_retention(
+    docker: str,
+    work_volume: str,
+    retention: str,
+    *,
+    successful: bool,
+) -> str:
+    """Retain failed work; remove only owned scratch after a successful export."""
+    if not successful:
+        return "retained_after_failure"
+    if retention == WORK_VOLUME_RETENTION_ALWAYS:
+        return "retained_by_policy"
+    if retention != DEFAULT_WORK_VOLUME_RETENTION:
+        raise ValueError(f"unsupported work-volume retention policy: {retention}")
+    expected = benchmark_volume_labels("work")
+    labels = docker_json(
+        docker,
+        ["volume", "inspect", work_volume, "--format", "{{json .Labels}}"],
+    )
+    if labels != expected:
+        raise RuntimeError(
+            f"Docker volume {work_volume} does not have the expected benchmark "
+            "ownership labels; it was not removed"
+        )
+    run_command([docker, "volume", "rm", work_volume])
+    return WORK_VOLUME_STATUS_REMOVED
 
 
 def copy_to_volume(
@@ -822,6 +908,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--image")
     parser.add_argument("--docker", default="docker")
+    parser.add_argument(
+        "--work-volume-retention",
+        choices=WORK_VOLUME_RETENTION_CHOICES,
+        default=DEFAULT_WORK_VOLUME_RETENTION,
+        help=(
+            "failed-runs removes owned work scratch after a successful verified export "
+            "but retains it after failure (default); always retains it after success too"
+        ),
+    )
     parser.add_argument(
         "--invocation-surface",
         choices=("run_container_experiment.py", "run_experiments.py --container"),
@@ -983,17 +1078,23 @@ def main(argv: list[str] | None = None) -> int:
     ]
     work_volume = f"cbm-benchmark-work-{history_key}"
     results_volume = f"cbm-benchmark-results-{history_key}"
-    ensure_volume(args.docker, work_volume, "work")
-    ensure_volume(args.docker, results_volume, "results")
+    history_lock_name = f"cbm-benchmark-lock-{history_key}"
+    history_lock_id = acquire_history_lock(args.docker, image, history_lock_name)
 
     name_prefix = f"cbm-benchmark-{history_key}-{os.getpid()}"
     seed_name = f"{name_prefix}-seed"
     measured_name = f"{name_prefix}-measured"
     export_name = f"{name_prefix}-export"
+    archived_bundle: Path | None = None
+    benchmark_succeeded = False
     try:
+        ensure_volume(args.docker, work_volume, "work")
+        ensure_volume(args.docker, results_volume, "results")
         with tempfile.TemporaryDirectory(prefix="cbm-benchmark-input-") as tmpdir:
             input_root = Path(tmpdir)
-            bundle = input_root / "repository.bundle"
+            bundle_staging = input_root / "source-bundles"
+            bundle_staging.mkdir()
+            bundle = bundle_staging / "repository.bundle"
             run_command(
                 [
                     "git",
@@ -1009,11 +1110,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             bundle_sha = file_sha256(bundle)
             bundle_name = f"repository-{bundle_sha}.bundle"
-            copied_bundle = input_root / bundle_name
+            copied_bundle = bundle_staging / bundle_name
             bundle.replace(copied_bundle)
             bundle_heads = parse_bundle_heads(copied_bundle)
             repository_snapshot = repository_snapshot_sha256(
                 source_revision, bundle_heads
+            )
+            archived_bundle = archive_source_bundle(
+                copied_bundle,
+                args.experiment_root / "source-bundles",
+                bundle_sha,
             )
             source_key = repository_snapshot[:20]
             copy_to_volume(
@@ -1134,9 +1240,16 @@ def main(argv: list[str] | None = None) -> int:
                 "build_jobs": args.build_jobs,
                 "default_build_environment": DEFAULT_BUILD_ENVIRONMENT,
                 "invocation_surface": args.invocation_surface,
+                "history_lock_container": history_lock_name,
+                "history_lock_container_id": history_lock_id,
                 "work_volume": work_volume,
                 "results_volume": results_volume,
+                "work_volume_retention": args.work_volume_retention,
+                "results_volume_retained_for_resume": True,
+                # Legacy pre-execution capability field. Final disposition is emitted
+                # only after successful export and ownership-checked cleanup.
                 "volumes_retained_for_resume": True,
+                "source_bundle_archive": str(archived_bundle),
                 "runner_arguments": runner_arguments,
                 "run_key": run_key,
                 "container_experiment_root": container_experiment_root,
@@ -1240,14 +1353,46 @@ def main(argv: list[str] | None = None) -> int:
                     f"{measured_process.returncode}; partial immutable results were "
                     f"exported to {args.experiment_root}{failure_log_detail}"
                 )
+        benchmark_succeeded = True
     except Exception as error:
+        work_volume_status = apply_work_volume_retention(
+            args.docker,
+            work_volume,
+            args.work_volume_retention,
+            successful=False,
+        )
+        bundle_detail = (
+            f"; source bundle archived at {archived_bundle}"
+            if archived_bundle is not None
+            else ""
+        )
         raise RuntimeError(
-            f"{error}; benchmark volumes retained for inspection or resume: "
-            f"{work_volume}, {results_volume}"
+            f"{error}; work volume {work_volume_status}: {work_volume}; "
+            f"results volume retained for inspection or resume: {results_volume}"
+            f"{bundle_detail}"
         ) from error
     finally:
         for name in (seed_name, measured_name, export_name):
             remove_container(args.docker, name)
+        if not benchmark_succeeded:
+            remove_container(args.docker, history_lock_id)
+
+    try:
+        try:
+            work_volume_status = apply_work_volume_retention(
+                args.docker,
+                work_volume,
+                args.work_volume_retention,
+                successful=True,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "container benchmark completed and immutable results were exported to "
+                f"{args.experiment_root}, but work-volume cleanup failed; inspect "
+                f"{work_volume}: {error}"
+            ) from error
+    finally:
+        remove_container(args.docker, history_lock_id)
 
     print(
         json.dumps(
@@ -1256,7 +1401,15 @@ def main(argv: list[str] | None = None) -> int:
                 "experiment_root": str(args.experiment_root),
                 "work_volume": work_volume,
                 "results_volume": results_volume,
-                "volumes_retained_for_resume": True,
+                "history_lock_container": history_lock_name,
+                "history_lock_container_id": history_lock_id,
+                "work_volume_retention": args.work_volume_retention,
+                "work_volume_status": work_volume_status,
+                "results_volume_retained_for_resume": True,
+                "volumes_retained_for_resume": (
+                    work_volume_status != WORK_VOLUME_STATUS_REMOVED
+                ),
+                "source_bundle_archive": str(archived_bundle),
             },
             sort_keys=True,
         )

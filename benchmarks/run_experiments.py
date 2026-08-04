@@ -30,6 +30,13 @@ from typing import Any
 
 CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
 CONTAINER_COORDINATOR = Path(__file__).with_name("run_container_experiment.py")
+WORK_VOLUME_RETENTION_FAILED_RUNS = "failed-runs"
+WORK_VOLUME_RETENTION_ALWAYS = "always"
+WORK_VOLUME_RETENTION_CHOICES = (
+    WORK_VOLUME_RETENTION_FAILED_RUNS,
+    WORK_VOLUME_RETENTION_ALWAYS,
+)
+DEFAULT_WORK_VOLUME_RETENTION = WORK_VOLUME_RETENTION_FAILED_RUNS
 with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
     CONFIG_SPELLING_SPEC = json.load(stream)
 if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
@@ -2672,6 +2679,15 @@ def build_parser() -> argparse.ArgumentParser:
     container.add_argument("--workers", type=int)
     container.add_argument("--image", dest="container_image")
     container.add_argument("--docker", default="docker")
+    container.add_argument(
+        "--work-volume-retention",
+        choices=WORK_VOLUME_RETENTION_CHOICES,
+        default=DEFAULT_WORK_VOLUME_RETENTION,
+        help=(
+            "failed-runs removes owned work scratch after a successful verified export "
+            "but retains it after failure (default); always retains it after success too"
+        ),
+    )
     container.add_argument("--corpus", action="append", default=[])
     container.add_argument("--corpus-repo", action="append", default=[])
     container.add_argument("--corpus-manifest", default="")
@@ -2718,6 +2734,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         or args.corpus_manifest
         or args.clone_missing_real_repos
         or args.corpus_timeout != 1800
+        or args.work_volume_retention != DEFAULT_WORK_VOLUME_RETENTION
     )
     if args.container:
         if args.plan is not None:
@@ -2793,6 +2810,8 @@ def build_container_delegate_command(args: argparse.Namespace) -> list[str]:
         str(args.corpus_timeout),
         "--invocation-surface",
         "run_experiments.py --container",
+        "--work-volume-retention",
+        args.work_volume_retention,
     ]
     if args.build_jobs is not None:
         command.extend(("--build-jobs", str(args.build_jobs)))

@@ -98,11 +98,13 @@ fractional CPU budgets round up to avoid leaving an available execution slot idl
 Use `--build-jobs N` only when build-memory pressure requires a smaller positive
 override. The resolved value is part of the run identity and environment manifest.
 The repository-relative `.worktrees/benchmark-candidates` default, build outputs, caches,
-daemon state, and result generation remain on two labeled Docker volumes; the
-coordinator prints their exact names and retains them for auditable resume. Rerun
-the same source spec and experiment root to resume, or remove the printed volumes
-after exported results are verified. The measured container is
-always native `arm64` or `amd64`, resource bounded, and removed on success or failure.
+daemon state, and result generation remain on two labeled Docker volumes during measurement.
+The coordinator first archives the exact Git bundle under
+`EXPERIMENT_ROOT/source-bundles/`. After a successful verified export it removes the owned work
+scratch by default, while failures retain it for inspection and resume; pass
+`--work-volume-retention always` to retain successful work too. The results volume remains
+available until its host export is audited and the exact printed volume is removed. The measured
+container is always native `arm64` or `amd64`, resource bounded, and removed on success or failure.
 Each invocation writes a content-addressed container-environment manifest, so changed
 arguments create a new audit record instead of replacing history. Failed candidate
 build logs are exported under `container-failures/<source-commit>/build-logs/`; if

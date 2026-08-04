@@ -363,6 +363,8 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 "6g",
                 "--workers",
                 "4",
+                "--work-volume-retention",
+                "always",
                 "--audit-only",
             ]
         )
@@ -375,6 +377,10 @@ class BenchmarkExperimentTest(unittest.TestCase):
         self.assertIn(str(Path("rank.json").resolve()), command)
         self.assertIn(str(Path("/durable/rank").resolve()), command)
         self.assertIn("--audit-only", command)
+        self.assertIn("--work-volume-retention", command)
+        self.assertEqual(
+            command[command.index("--work-volume-retention") + 1], "always"
+        )
         self.assertIn("run_experiments.py --container", command)
         self.assertNotIn("--build-jobs", command)
 

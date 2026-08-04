@@ -384,7 +384,19 @@ The coordinator is intentionally smaller than the benchmark engine:
    remain reloadable without being confused with genuinely unplanned cell
    directories in the current cohort.
 10. It removes every transient coordinator and measured container in a `finally`
-   path. The two labeled volumes remain for resume and their exact names are printed.
+    path. Before measurement, it copies the exact verified Git bundle to
+    `EXPERIMENT_ROOT/source-bundles/repository-<sha256>.bundle`. After a successful result
+    export, the default `--work-volume-retention failed-runs` policy verifies the work
+    volume's ownership labels and removes that multi-gigabyte scratch volume. Failures retain
+    it for inspection and resume. `--work-volume-retention always` preserves the prior
+    successful-run retention behavior. The much smaller results volume remains resumable in
+    both modes.
+11. A deterministic, labeled lock container serializes coordinators using the same experiment
+    root and remains present through successful work-volume cleanup. The coordinator captures its
+    immutable container ID and releases that exact ID, so a later container reusing the lock name
+    cannot be removed by the earlier process. A hard process/host failure may leave that stopped
+    lock as an intentional safety block; the next error names it. Inspect the exact container and
+    confirm that no coordinator is active before removing it.
 
 The experiment root is the human-selected history name; content-addressed source
 specs, resolved specs, plans, cells, reports, environment snapshots, and binary
@@ -413,13 +425,24 @@ This hierarchy makes configuration and results inspectable from retained JSON ev
 when terminal logs are unavailable. Console output is operational feedback, not the
 system of record.
 
-After the export is verified and no resume is required, remove only the two exact
-volume names printed by the coordinator:
+The successful default needs no work-volume cleanup. After the host export is audited and no
+volume-backed resume is required, remove only the exact results-volume name printed by the
+coordinator:
 
 ```sh
-docker volume rm cbm-benchmark-work-<history-id>
 docker volume rm cbm-benchmark-results-<history-id>
 ```
+
+If a run failed or used `--work-volume-retention always`, its output names the retained work
+volume and its disposition. Remove that exact work volume only after preserving any needed build
+logs and confirming the source bundle exists under `EXPERIMENT_ROOT/source-bundles/`; never use a
+broad volume prune for benchmark cleanup.
+
+Bundle archive and cleanup happen outside the measured container. For bundle size `B`, archive
+copying and SHA-256 verification add `O(B)` setup time, `O(1)` working memory, and `O(B)` durable
+host storage per distinct bundle byte hash. Successful work-volume removal is one Docker metadata
+operation. This trades roughly one repository bundle (about 174 MB in the 2026-07-31 campaigns)
+for avoiding retained work volumes of 3.6–9.4 GB each; exact sizes remain workload-dependent.
 
 The coordinator never stops the Docker backend because that could disrupt unrelated
 containers. After all benchmark work is complete, separately verify that no

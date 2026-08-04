@@ -180,6 +180,33 @@ class BenchmarkContainerContractTest(unittest.TestCase):
         self.assertEqual(automatic.build_jobs, 16)
         self.assertEqual(constrained.build_jobs, 6)
 
+    def test_work_volume_retention_defaults_to_failed_runs_and_accepts_always(
+        self,
+    ) -> None:
+        common = [
+            "--experiment-root",
+            "/durable/cbm-benchmark-history",
+            "--cpus",
+            "4",
+            "--memory",
+            "8g",
+            "--workers",
+            "4",
+        ]
+        with mock.patch.object(CONTAINER.platform, "machine", return_value="arm64"):
+            automatic = CONTAINER.parse_arguments([*common, "--quick"])
+            retained = CONTAINER.parse_arguments(
+                [
+                    *common,
+                    "--quick",
+                    "--work-volume-retention",
+                    "always",
+                ]
+            )
+
+        self.assertEqual(automatic.work_volume_retention, "failed-runs")
+        self.assertEqual(retained.work_volume_retention, "always")
+
     def test_automatic_container_product_environment_uses_shared_validation(
         self,
     ) -> None:
@@ -459,6 +486,109 @@ class BenchmarkContainerContractTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "different bytes"):
                 CONTAINER.merge_exported_tree(staged, destination)
+
+    def test_source_bundle_archive_is_content_addressed_and_hash_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "staging" / "repository.bundle"
+            source.parent.mkdir()
+            source.write_bytes(b"immutable git bundle bytes")
+            digest = CONTAINER.file_sha256(source)
+            source = source.rename(source.with_name(f"repository-{digest}.bundle"))
+
+            archived = CONTAINER.archive_source_bundle(
+                source,
+                root / "history" / "source-bundles",
+                digest,
+            )
+
+            self.assertEqual(
+                archived,
+                root / "history" / "source-bundles" / f"repository-{digest}.bundle",
+            )
+            self.assertEqual(CONTAINER.file_sha256(archived), digest)
+
+    def test_work_volume_retention_removes_only_owned_successful_scratch(self) -> None:
+        expected_labels = {
+            "com.codebase-memory-mcp.benchmark": "true",
+            "com.codebase-memory-mcp.role": "work",
+        }
+        with (
+            mock.patch.object(CONTAINER, "docker_json", return_value=expected_labels),
+            mock.patch.object(CONTAINER, "run_command") as run_command,
+        ):
+            removed = CONTAINER.apply_work_volume_retention(
+                "docker",
+                "cbm-benchmark-work-exact",
+                "failed-runs",
+                successful=True,
+            )
+            retained_failure = CONTAINER.apply_work_volume_retention(
+                "docker",
+                "cbm-benchmark-work-exact",
+                "failed-runs",
+                successful=False,
+            )
+            retained_policy = CONTAINER.apply_work_volume_retention(
+                "docker",
+                "cbm-benchmark-work-exact",
+                "always",
+                successful=True,
+            )
+
+        self.assertEqual(removed, "removed_after_successful_export")
+        self.assertEqual(retained_failure, "retained_after_failure")
+        self.assertEqual(retained_policy, "retained_by_policy")
+        run_command.assert_called_once_with(
+            ["docker", "volume", "rm", "cbm-benchmark-work-exact"]
+        )
+
+    def test_history_lock_returns_the_immutable_owned_container_id(self) -> None:
+        created = mock.Mock(stdout="sha256:immutable-lock-id\n")
+        with mock.patch.object(
+            CONTAINER, "run_command", return_value=created
+        ) as run_command:
+            lock_id = CONTAINER.acquire_history_lock(
+                "docker",
+                "runtime-image",
+                "cbm-benchmark-lock-exact-history",
+            )
+
+        self.assertEqual(lock_id, "sha256:immutable-lock-id")
+        run_command.assert_called_once_with(
+            [
+                "docker",
+                "create",
+                "--name",
+                "cbm-benchmark-lock-exact-history",
+                "--label",
+                "com.codebase-memory-mcp.benchmark=true",
+                "--label",
+                "com.codebase-memory-mcp.role=coordinator-lock",
+                "--entrypoint",
+                "/bin/true",
+                "runtime-image",
+            ],
+            capture=True,
+        )
+
+    def test_work_volume_cleanup_rejects_an_ownership_label_mismatch(self) -> None:
+        with (
+            mock.patch.object(
+                CONTAINER,
+                "docker_json",
+                return_value={"com.codebase-memory-mcp.role": "work"},
+            ),
+            mock.patch.object(CONTAINER, "run_command") as run_command,
+            self.assertRaisesRegex(RuntimeError, "ownership labels"),
+        ):
+            CONTAINER.apply_work_volume_retention(
+                "docker",
+                "not-owned-by-this-benchmark",
+                "failed-runs",
+                successful=True,
+            )
+        run_command.assert_not_called()
 
 
 if __name__ == "__main__":
