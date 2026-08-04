@@ -465,3 +465,31 @@ The required post-discovery `check_index_coverage` call reported `metadata_chang
 `read_source_and_reindex` for both benchmark modules and both focused test modules. It reported
 `docs/` and `notes/` as excluded/not tracked. Direct numbered source and the executed tests are
 therefore authoritative for this commit; this graph generation cannot verify the edited spans.
+
+## D-001 resolution — canonical stale spans are now withheld with a structured action
+
+- Fixed UTC: 2026-08-04, commit `081c528a9654` on `api-consolidation-merge`
+  (tree `898fd760ae9a`).
+- Root cause: `build_snippet_response` (`src/mcp/mcp.c`) sliced the live file with the
+  indexed canonical span without consulting the stored per-file mtime+size record that
+  `check_index_coverage` reads (`coverage_path_freshness`), so a file changed after
+  indexing yielded another symbol's body under the requested symbol's metadata.
+- Fix: before reading a canonical span (node id != `CBM_STORE_NO_NODE_ID`; signature
+  mode reads no live bytes and is not gated), the builder runs the same
+  `coverage_path_freshness` comparison; on `metadata_changed` the body is withheld and
+  the response carries `stale_span=true`, `freshness.source_file="metadata_changed"`,
+  and `freshness.action="read_source_and_reindex"` while retaining symbol metadata.
+  Overlay rows keep serving live dirty content; files with no stored hash keep the
+  prior best-effort read.
+- TDD reproduction: `snippet_stale_canonical_span_withholds_wrong_body`
+  (`tests/test_mcp.c`) stores the fixture file's hash, rewrites the file so the indexed
+  span holds filler lines, and failed at the pre-fix tree with
+  `strstr(resp, "filler-line") is not NULL` (the response served the filler under
+  `HandleRequest`'s metadata); it passes with the fix.
+  `snippet_fresh_canonical_span_serves_source` pins the `metadata_match` path so the
+  gate cannot false-positive on fresh files.
+- Gates at the fix commit: full ASan/UBSan suite 8,014 passed / 2 platform-specific
+  skips; `lint-ci` exit 0.
+- Still open: D-005 (transport close on concurrent calls; evidence points at the
+  client/app connection lifetime), D-006 product-level `daemon status` wording, and
+  D-007 (freshness surfaces compose unsafely).
