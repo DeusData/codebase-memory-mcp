@@ -389,3 +389,79 @@ Reproduction: run `index_status(verbose=true)`, `check_index_coverage` for a cha
 actionable distinction among repository state, symbol/span generation, coverage generation, and
 derived-view generation. Observed: each surface is internally plausible but their composition is
 unsafe without expert interpretation.
+
+## D-001 recurrence — Python symbols carry another function's source body
+
+- Recurrence verified UTC: `2026-08-04T01:26:46Z`.
+- Requested project path:
+  `/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge`.
+- Calls were serialized.
+
+`search_graph(pattern="^(ensure_volume|export_results|main|parse_args)$",
+file_pattern="benchmarks/run_container_experiment.py")` returned the expected current qualified
+names and identified `main` as the caller of both helpers. The following exact `get_code` calls
+then combined those names and signatures with unrelated live source:
+
+```text
+get_code(
+  project="/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge",
+  qualified_name="Users-athundt-.claude-codebase-memory-mcp-.worktrees-api-consolidation-merge.benchmarks.run_container_experiment.ensure_volume",
+  mode="full",
+  max_lines=120,
+  compact=false
+)
+```
+
+Observed metadata reported `start_line=400`, `end_line=430`, and signature
+`(docker: str, name: str, role: str)`, while the payload began with
+`native_linux_platform` and `validate_resources`. The live numbered source defines
+`ensure_volume` at `benchmarks/run_container_experiment.py:652-682` before the retention fix.
+
+The equivalent call for `export_results` reported `start_line=468`, `end_line=498`, and its
+correct signature, while returning the middle of `materialize_container_matrix_spec`. The live
+numbered source defines `export_results` at
+`benchmarks/run_container_experiment.py:720-750` before the retention fix. A `head_tail` request
+for `main` likewise reported stale `start_line=601`, `end_line=902` and began with `run_command`;
+the live definition begins at line 923.
+
+Reproduction: run the `search_graph` request above, copy each returned exact qualified name into
+`get_code`, and compare the returned payload with a numbered read of the reported file. Expected:
+the body and line range enclose the selected definition, or the tool returns a structured stale
+span error. Observed: correct symbol metadata is attached to another definition's body without a
+staleness warning. This confirms D-001 is not limited to C parsing or one symbol kind.
+
+### D-001 recurrence during immutable Docker-lock TDD
+
+- Recurrence verified UTC: `2026-08-04T02:09:44Z`.
+- Requested project path:
+  `/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge`.
+- Calls were serialized; the live Python file had uncommitted benchmark-lifecycle edits.
+
+`search_graph` with
+`name_pattern="^(main|archive_source_bundle|acquire_history_lock|apply_work_volume_retention|benchmark_volume_labels)$"`,
+`file_pattern="benchmarks/run_container_experiment.py"`, and `include_connected=true` returned only
+`main`, warned that PageRank, LinkRank, and node-degree views were stale, and did not return the
+four named live helpers. A subsequent exact call was:
+
+```text
+get_code(
+  project="/Users/athundt/.claude/codebase-memory-mcp/.worktrees/api-consolidation-merge",
+  qualified_name="Users-athundt-.claude-codebase-memory-mcp-.worktrees-api-consolidation-merge.benchmarks.run_container_experiment.main",
+  mode="head_tail",
+  max_lines=80,
+  compact=false
+)
+```
+
+Observed metadata again reported `start_line=601`, `end_line=902`, and the correct `main`
+signature, while the source payload began inside `merge_exported_tree` and then showed
+`archive_source_bundle` and `run_command`. The current numbered source defines `main` at
+`benchmarks/run_container_experiment.py:1018`; it now extends beyond line 1410. Expected: current
+`main` source, or a structured stale-span result that names the required refresh action. This
+recurrence also shows that a positive graph match is not sufficient evidence that adjacent newly
+added Python definitions are indexed.
+
+The required post-discovery `check_index_coverage` call reported `metadata_changed` with
+`read_source_and_reindex` for both benchmark modules and both focused test modules. It reported
+`docs/` and `notes/` as excluded/not tracked. Direct numbered source and the executed tests are
+therefore authoritative for this commit; this graph generation cannot verify the edited spans.
