@@ -100,6 +100,66 @@ static bool path_is_absolute(const char *path) {
 #endif
 }
 
+/* Read the "gitdir: <path>" pointer out of a gitlink FILE at <path>/.git.
+ * Returns false when .git is missing, a directory (ordinary repo), or holds no
+ * pointer. A relative pointer is resolved against path. */
+static bool read_gitlink_target(const char *path, char *out, size_t out_size) {
+    char dot_git[GIT_OUTPUT_MAX];
+    int n = snprintf(dot_git, sizeof(dot_git), "%s/.git", path);
+    if (n < 0 || n >= (int)sizeof(dot_git)) {
+        return false;
+    }
+    struct stat st;
+    if (stat(dot_git, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+
+    FILE *f = cbm_fopen(dot_git, "r");
+    if (!f) {
+        return false;
+    }
+    char line[GIT_OUTPUT_MAX];
+    bool got = false;
+    while (fgets(line, sizeof(line), f)) {
+        trim_newlines(line);
+        if (strncmp(line, "gitdir:", 7) != 0) {
+            continue;
+        }
+        const char *value = line + 7;
+        while (*value == ' ' || *value == '\t') {
+            value++;
+        }
+        if (!value[0]) {
+            break;
+        }
+        int written = path_is_absolute(value) ? snprintf(out, out_size, "%s", value)
+                                              : snprintf(out, out_size, "%s/%s", path, value);
+        got = written > 0 && written < (int)out_size;
+        break;
+    }
+    fclose(f);
+    return got;
+}
+
+bool cbm_git_is_linked_worktree(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    char git_dir[GIT_OUTPUT_MAX];
+    if (!read_gitlink_target(path, git_dir, sizeof(git_dir))) {
+        return false;
+    }
+    /* Only linked worktrees carry <gitdir>/commondir; a submodule gitlink
+     * points at <super>/.git/modules/<name>, which does not. */
+    char commondir[GIT_OUTPUT_MAX];
+    int n = snprintf(commondir, sizeof(commondir), "%s/commondir", git_dir);
+    if (n < 0 || n >= (int)sizeof(commondir)) {
+        return false;
+    }
+    struct stat st;
+    return stat(commondir, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 static char *join_root_relative(const char *root, const char *rel) {
     if (!root || !root[0]) {
         return git_strdup(rel);

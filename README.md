@@ -155,6 +155,8 @@ Watcher registration is controlled separately by `auto_watch` (default `true`). 
 
 To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch` — which is consulted per session — `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
+Linked git worktrees are indexed as their own projects by default. Set `config set ignore_worktrees true` to skip them on the automatic paths — useful when short-lived `git worktree add` checkouts would otherwise each leave behind a permanent index of the same repository. An explicit `index_repository` call on a worktree is then refused unless you pass `index_worktree=true`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#ignore_worktrees).
+
 ### Keeping Up to Date
 
 **Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
@@ -735,6 +737,7 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit

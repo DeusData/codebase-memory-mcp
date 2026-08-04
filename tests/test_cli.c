@@ -12263,14 +12263,18 @@ TEST(cli_hook_augment_subagent_tier_router_contract) {
 }
 
 TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only) {
-    const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart");
-    const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart");
+    const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart", false);
+    const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart", false);
+    const char *worktree = cbm_hook_no_project_index_guidance_for_testing("SessionStart", true);
     ASSERT_NOT_NULL(session);
     ASSERT_NOT_NULL(subagent);
+    ASSERT_NOT_NULL(worktree);
     ASSERT(strstr(session, "Run index_repository") != NULL);
     ASSERT(strstr(subagent, "Ask the parent agent to run index_repository") != NULL);
     ASSERT(strstr(subagent, "do not attempt graph mutation") != NULL);
     ASSERT(strstr(subagent, "Run index_repository") == NULL);
+    ASSERT(strstr(worktree, "ignore_worktrees is enabled") != NULL);
+    ASSERT(strstr(worktree, "do not run index_repository") != NULL);
     PASS();
 }
 
@@ -15578,6 +15582,19 @@ TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558) {
     PASS();
 }
 
+TEST(cli_ignore_worktrees_config_key_is_discoverable) {
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        if (key && strcmp(key, CBM_CONFIG_IGNORE_WORKTREES) == 0) {
+            listed = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(listed);
+    PASS();
+}
+
 TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
     const cbm_skill_t *sk = cbm_get_skills();
     ASSERT_NOT_NULL(sk);
@@ -16011,6 +16028,7 @@ SUITE(cli) {
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
     RUN_TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558);
+    RUN_TEST(cli_ignore_worktrees_config_key_is_discoverable);
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);

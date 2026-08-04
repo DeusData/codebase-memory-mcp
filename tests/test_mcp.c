@@ -19278,6 +19278,291 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ *  ignore_worktrees — explicit index_repository on a linked worktree
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* An EXPLICIT index_repository call is refused only when ignore_worktrees is on
+ * AND repo_path is a linked worktree AND no per-call override was passed. The
+ * refusal must never fire for the MAIN checkout — that would break ordinary
+ * indexing for anyone enabling the key — and index_worktree=true must escape it.
+ *
+ * Default-off is the regression class the project guards hardest: with the key
+ * unset, a linked worktree still indexes exactly as today.
+ *
+ * Probe returns a bit set, or a negative fixture-setup code. */
+enum {
+    IGNORE_WT_REFUSED_WORKTREE = 1, /* expected when the key is on */
+    IGNORE_WT_REFUSED_MAIN = 2,     /* BUG if set */
+    IGNORE_WT_REFUSED_OVERRIDE = 4, /* BUG if set */
+};
+
+#ifndef _WIN32
+typedef struct {
+    char cache[256];
+    char main_repo[512];
+    char wt_repo[512];
+} ignore_wt_fixture_t;
+
+static void ignore_wt_fixture_cleanup(ignore_wt_fixture_t *fx) {
+    if (!fx) {
+        return;
+    }
+    if (fx->main_repo[0]) {
+        char prune[1024];
+        snprintf(prune, sizeof(prune), "git -C \"%s\" worktree prune >/dev/null 2>&1", fx->main_repo);
+        (void)system(prune);
+    }
+    if (fx->cache[0]) {
+        th_rmtree(fx->cache);
+    }
+}
+
+/* 0 = ready. -1 tmpdir, -2 mkdir, -3 git worktree fixture unavailable. */
+static int ignore_wt_fixture_setup(ignore_wt_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    char *raw = th_mktempdir("cbm_ignorewt");
+    if (!raw) {
+        return -1;
+    }
+    snprintf(fx->cache, sizeof(fx->cache), "%s", raw);
+    snprintf(fx->main_repo, sizeof(fx->main_repo), "%s/main", fx->cache);
+    snprintf(fx->wt_repo, sizeof(fx->wt_repo), "%s/wt", fx->cache);
+    if (th_mkdir_p(fx->main_repo) != 0) {
+        ignore_wt_fixture_cleanup(fx);
+        return -2;
+    }
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" init -q >/dev/null 2>&1 && "
+             "git -C \"%s\" config user.email t@example.com && "
+             "git -C \"%s\" config user.name T && touch \"%s/.keep\" && "
+             "git -C \"%s\" add .keep && git -C \"%s\" commit -q -m init && "
+             "git -C \"%s\" worktree add -q \"%s\" -b wtb",
+             fx->main_repo, fx->main_repo, fx->main_repo, fx->main_repo, fx->main_repo,
+             fx->main_repo, fx->main_repo, fx->wt_repo);
+    if (system(cmd) != 0) {
+        ignore_wt_fixture_cleanup(fx);
+        return -3;
+    }
+    return 0;
+}
+
+static bool ignore_wt_refused(cbm_mcp_server_t *srv, const char *repo_path, bool override) {
+    char args[2048];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo_path,
+             override ? ",\"index_worktree\":true" : "");
+    char *result = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool refused = result && strstr(result, "ignore_worktrees is enabled") != NULL;
+    free(result);
+    return refused;
+}
+
+static int ignore_worktrees_index_probe(const char *ignore_value) {
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup < 0) {
+        return setup;
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", fx.cache, 1);
+
+    int bits = -4;
+    cbm_config_t *cfg = cbm_config_open(fx.cache);
+    if (cfg) {
+        if (ignore_value) {
+            cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, ignore_value);
+        }
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_config(srv, cfg);
+            bits = 0;
+            if (ignore_wt_refused(srv, fx.wt_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_WORKTREE;
+            }
+            if (ignore_wt_refused(srv, fx.main_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_MAIN;
+            }
+            if (ignore_wt_refused(srv, fx.wt_repo, true)) {
+                bits |= IGNORE_WT_REFUSED_OVERRIDE;
+            }
+            cbm_mcp_server_free(srv);
+        }
+        cbm_config_close(cfg);
+    }
+
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    ignore_wt_fixture_cleanup(&fx);
+    return bits;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void ignore_wt_count_started(void *context) {
+    int *calls = context;
+    (*calls)++;
+}
+
+/* Drive initialize → maybe_auto_index on a linked worktree. ignore_value NULL
+ * leaves the key unset (default-off). The count hook fires only if auto-index
+ * reaches discovery, so a skip for linked_worktree must leave it at 0. */
+static int ignore_wt_autoindex_count_calls(const char *session_root, const char *ignore_value) {
+    char *raw = th_mktempdir("cbm_ignorewt_auto");
+    if (!raw) {
+        return -1;
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", raw);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(session_root) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_cleanup(cache);
+        return -2;
+    }
+
+    int calls = -3;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
+    if (srv) {
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        /* Fail-closed on the actual count so this never launches an index thread. */
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "-1");
+        if (ignore_value) {
+            cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, ignore_value);
+        }
+        cbm_mcp_server_set_config(srv, cfg);
+        calls = 0;
+        cbm_mcp_server_set_auto_index_count_test_hook(srv, ignore_wt_count_started, &calls);
+        char *response = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1430,\"method\":\"initialize\",\"params\":{}}");
+        free(response);
+        cbm_mcp_server_free(srv);
+    }
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    return calls;
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+#endif /* !_WIN32 */
+
+TEST(mcp_ignore_worktrees_gates_explicit_index_repository) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe("true");
+    if (bits == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (bits == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (bits < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    /* RED before the gate existed: nothing is ever refused. */
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) != 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+/* Default-off pin: key unset, linked worktree still indexes. The gate is
+ * opt-in; an unset key must be bit-for-bit today's behaviour. */
+TEST(mcp_ignore_worktrees_default_off_still_indexes_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe(NULL);
+    if (bits == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (bits == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (bits < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+TEST(mcp_ignore_worktrees_skips_auto_index_on_linked_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (setup == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (setup < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    int calls = ignore_wt_autoindex_count_calls(fx.wt_repo, "true");
+    ignore_wt_fixture_cleanup(&fx);
+    if (calls == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (calls < 0) {
+        FAIL("ignore_worktrees auto-index fixture failed");
+    }
+    ASSERT_EQ(calls, 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    ignore_wt_fixture_t fx;
+    int setup = ignore_wt_fixture_setup(&fx);
+    if (setup == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (setup == -2) {
+        FAIL("failed to create ignore_worktrees fixture directory");
+    }
+    if (setup < 0) {
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+    int calls = ignore_wt_autoindex_count_calls(fx.wt_repo, NULL);
+    ignore_wt_fixture_cleanup(&fx);
+    if (calls == -1) {
+        FAIL("th_mktempdir returned NULL");
+    }
+    if (calls < 0) {
+        FAIL("ignore_worktrees auto-index fixture failed");
+    }
+    ASSERT_EQ(calls, 1);
+    PASS();
+#endif /* _WIN32 */
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+
 /* ══════════════════════════════════════════════════════════════════
  *  #1466 / #713 — the auto_index_limit guard
  *
@@ -20766,6 +21051,13 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    /* ignore_worktrees gate */
+    RUN_TEST(mcp_ignore_worktrees_gates_explicit_index_repository);
+    RUN_TEST(mcp_ignore_worktrees_default_off_still_indexes_worktree);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(mcp_ignore_worktrees_skips_auto_index_on_linked_worktree);
+    RUN_TEST(mcp_ignore_worktrees_default_off_auto_index_reaches_count);
+#endif
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
