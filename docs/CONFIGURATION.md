@@ -77,6 +77,7 @@ codebase-memory-mcp config list
 codebase-memory-mcp config get auto_index
 codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
+codebase-memory-mcp config set watcher_enabled false
 codebase-memory-mcp config reset auto_index
 ```
 
@@ -86,6 +87,34 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
+| `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+
+> **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
+> watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
+> narrower: it only controls whether a connecting session registers *its own*
+> project with an already-running watcher. When `watcher_enabled=false`,
+> `auto_watch` has no effect — there is no watcher to register with.
+>
+> They also differ in **when they are read**, which matters because the watcher
+> lives in the background daemon, not in your MCP client:
+>
+> - `auto_watch` is consulted each time a session would register its project, so
+>   a change applies to sessions that connect afterwards.
+> - `watcher_enabled` is read **once, when the daemon starts**, because it decides
+>   whether the watcher is built at all. The daemon is long-lived and outlives
+>   individual MCP sessions, so **reconnecting your client is not enough** — retire
+>   the daemon so the next one picks the new value up:
+>
+> ```bash
+> codebase-memory-mcp config set watcher_enabled false
+> codebase-memory-mcp daemon stop     # next session starts a daemon without the watcher
+> codebase-memory-mcp daemon status   # confirm
+> ```
+>
+> Disabling the watcher does not disable anything else: the daemon still starts,
+> `auto_index` still runs, and `index_repository` stays available for manual
+> reindexing.
 
 ## 3. UI Settings
 

@@ -11379,6 +11379,55 @@ TEST(cli_config_persists) {
     PASS();
 }
 
+TEST(cli_config_watcher_enabled_default_and_persist) {
+    /* #335: the background watcher is on by default and can be disabled via the
+     * persisted `watcher_enabled` key. This pins the config layer only — default
+     * preservation, the accepted spellings, and persistence across reopen. That
+     * the daemon host actually honours the key (watcher never built, thread
+     * never started, no registration) is proven separately by the process-level
+     * regression in tests/test_watcher_disabled.sh, which fails if the gate in
+     * host_state_prepare() is removed. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* A NULL config (store failed to open) defaults to ON — a config failure
+     * must never silently disable the watcher. */
+    ASSERT_TRUE(cbm_config_watcher_enabled(NULL));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    /* Default: absent key → watcher runs. */
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+
+    /* Disable: false / 0 / off all turn the watcher off. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "false");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "0");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "off");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+
+    /* Re-enable: true / 1 / on all turn it back on. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "on");
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "1");
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+
+    /* Persistence: the disabled state survives close + reopen. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "false");
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -12080,6 +12129,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
+    RUN_TEST(cli_config_watcher_enabled_default_and_persist);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32

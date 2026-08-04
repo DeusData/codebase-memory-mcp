@@ -276,6 +276,15 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 
+# Step 5c: watcher_enabled kill-switch process regression (#335). Reuses the
+# prod binary built in Step 5; drives a real daemon against an isolated cache
+# and proves watcher_enabled=false stops the watcher from being built, started
+# or registered, while auto_index and manual index_repository keep working.
+# Every wait is a bounded poll on an asserted state (a closed daemon lifecycle),
+# never a fixed sleep — see the header of the test for why.
+echo "=== Step 5c: watcher_enabled kill-switch regression (#335) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
