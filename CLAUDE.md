@@ -1,5 +1,7 @@
 # codebase-memory-mcp — Developer Notes for Claude
 
+Every commit needs a DCO sign-off: commit with `git commit -s`; CI enforces it via `scripts/check-dco.sh` (see CONTRIBUTING.md).
+
 Before changing capabilities or architecture, map the existing design first: look for
 equivalent tools, config, helpers, metadata, algorithms, and conventions. Prefer extending
 the established path over adding a parallel one. New abstractions should close a named gap
