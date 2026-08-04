@@ -21,7 +21,9 @@
 #include "foundation/constants.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "git/git_context.h"
 #include "mcp/mcp.h"
+#include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
 
@@ -1440,7 +1442,14 @@ static const char *ha_active_tier(yyjson_val *root, const char *event) {
     return "Tier 2 verification";
 }
 
-static const char *ha_no_project_index_guidance(const char *event) {
+static const char *ha_no_project_index_guidance(const char *event, bool worktree_ignored) {
+    /* ignore_worktrees is on and this cwd is a linked worktree: indexing it is
+     * deliberately disabled, so telling the agent to run index_repository would
+     * only produce a refusal. Point at the setting instead. */
+    if (worktree_ignored) {
+        return "This is a linked git worktree and ignore_worktrees is enabled, so it is not "
+               "indexed on purpose; do not run index_repository here.";
+    }
     return event && strcmp(event, "SubagentStart") == 0
                ? "Ask the parent agent to run index_repository before structural exploration; "
                  "do not attempt graph mutation."
@@ -1472,6 +1481,8 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
     }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
     char *project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
+    bool worktree_ignored = !project && srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) &&
+                            cbm_git_is_linked_worktree(cwd);
     cbm_mcp_server_free(owned_server);
 
     char context[2048];
@@ -1505,7 +1516,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  "and file reads for literals, configs, non-code files, and verification.",
                  scope, safe_project, tier);
     } else {
-        const char *index_guidance = ha_no_project_index_guidance(event);
+        const char *index_guidance = ha_no_project_index_guidance(event, worktree_ignored);
         snprintf(context, sizeof(context),
                  "[codebase-memory] %s context: no indexed graph project matched this working "
                  "directory. %s Once indexed, "
@@ -1624,8 +1635,9 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
     return ha_path_contains_mode(root, candidate, case_insensitive);
 }
 
-const char *cbm_hook_no_project_index_guidance_for_testing(const char *event) {
-    return ha_no_project_index_guidance(event);
+const char *cbm_hook_no_project_index_guidance_for_testing(const char *event,
+                                                           bool worktree_ignored) {
+    return ha_no_project_index_guidance(event, worktree_ignored);
 }
 
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz) {
