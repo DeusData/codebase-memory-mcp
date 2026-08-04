@@ -6481,6 +6481,8 @@ int cbm_cmd_config(int argc, char **argv) {
                "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
                "Register background git watcher on session connect");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_IGNORE_WORKTREES, "false",
+               "Skip linked git worktrees when indexing automatically");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
@@ -6510,6 +6512,8 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_IGNORE_WORKTREES,
+               cbm_config_get(cfg, CBM_CONFIG_IGNORE_WORKTREES, "false"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
     } else if (strcmp(argv[0], "get") == 0) {

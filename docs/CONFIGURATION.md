@@ -86,6 +86,36 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) when indexing automatically. |
+
+### `ignore_worktrees`
+
+Every indexed project is registered under its own absolute root path, so each
+linked worktree becomes a separate permanent index. On machines that create many
+short-lived worktrees, the automatic paths (`auto_index`, and the session hook's
+"index this project first" guidance) turn every throwaway checkout into another
+stored index of what is largely the same repository.
+
+Enable the key to keep those checkouts out of the index:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees true
+```
+
+With it enabled:
+
+- automatic indexing skips a session whose root is a linked worktree;
+- the `hook-augment` context says the worktree is unindexed on purpose instead
+  of telling the agent to run `index_repository`;
+- an explicit `index_repository` call on a linked worktree is refused, and names
+  both ways forward — pass `index_worktree=true` for that one call, or turn the
+  key back off.
+
+The main checkout of the same repository is unaffected, as are ordinary clones
+and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
+file pointing at a gitdir that contains a `commondir` entry.
+
+The default is `false`, so indexing behavior is unchanged unless you opt in.
 
 ## 3. UI Settings
 
