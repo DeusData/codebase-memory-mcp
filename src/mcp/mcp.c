@@ -14779,6 +14779,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     int total_lines = end - start + 1;
     bool truncated = false;
     bool signature_mode = mode && strcmp(mode, "signature") == 0;
+    bool stale_span = false;
     char *source = NULL;
     char *source_tail = NULL;
 
@@ -14792,7 +14793,20 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                 : CBM_NOT_FOUND;
         bool path_ok =
             path_len >= 0 && (size_t)path_len < apsz && cbm_path_within_root(root_path, abs_path);
-        if (path_ok) {
+        /* A canonical span sliced from a file that changed after indexing can
+         * hand back another symbol's body under this symbol's metadata
+         * (dogfood D-001). Overlay rows (id == CBM_STORE_NO_NODE_ID) follow
+         * live dirty content; canonical rows must pass the same mtime+size
+         * freshness record check_index_coverage consults before their span is
+         * trusted. Signature mode reads no live bytes, so it needs no gate;
+         * files without a stored hash stay best-effort as before. */
+        if (path_ok && !signature_mode && node->id != CBM_STORE_NO_NODE_ID) {
+            bool outside = false;
+            stale_span = strcmp(coverage_path_freshness(srv->store, node->project, root_path,
+                                                        node->file_path, &outside),
+                                "metadata_changed") == 0;
+        }
+        if (path_ok && !stale_span) {
             if (signature_mode) {
                 /* Source omission is the requested representation, not truncation. */
             } else if (mode && strcmp(mode, "head_tail") == 0 && max_lines > 0 &&
@@ -14871,8 +14885,23 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "source", source);
         }
+    } else if (stale_span) {
+        yyjson_mut_obj_add_str(doc, root_obj, "source",
+                               "(stale span: source withheld because the file changed after "
+                               "this symbol was indexed, so the stored line range may enclose "
+                               "different code; read the file at file_path directly and "
+                               "reindex)");
     } else {
         yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+    }
+
+    if (stale_span) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "stale_span", true);
+        yyjson_mut_val *fresh = ensure_response_freshness(doc, root_obj);
+        if (fresh) {
+            yyjson_mut_obj_add_str(doc, fresh, "source_file", "metadata_changed");
+            yyjson_mut_obj_add_str(doc, fresh, "action", "read_source_and_reindex");
+        }
     }
 
     /* Truncation metadata */

@@ -11026,6 +11026,89 @@ TEST(snippet_source_invalid_utf8) {
     PASS();
 }
 
+/* D-001 regression setup: store the canonical file hash so the snippet path
+ * has an index-time identity to compare the live file against (the same
+ * mtime+size record check_index_coverage consults). */
+static bool snippet_store_live_file_hash(cbm_mcp_server_t *srv, const char *tmp_dir) {
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp_dir);
+    struct stat st;
+    if (cbm_stat(src_path, &st) != 0)
+        return false;
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    return store && cbm_store_upsert_file_hash(store, "test-project", "main.go", "d001-test",
+                                               cbm_stat_mtime_ns(&st),
+                                               (int64_t)st.st_size) == CBM_STORE_OK;
+}
+
+TEST(snippet_fresh_canonical_span_serves_source) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(snippet_store_live_file_hash(srv, tmp));
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "func HandleRequest() error"));
+    ASSERT_NULL(strstr(resp, "\"stale_span\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* D-001 (dogfood note 2026-08-03): get_code returned another symbol's body
+ * when a canonical indexed span was sliced from a file that changed after
+ * indexing, while the response kept the requested symbol's name and metadata.
+ * Contract: the returned source encloses the requested definition, or the
+ * response is a structured stale-span result carrying the coverage action.
+ * It never combines this symbol's metadata with other code's body. */
+TEST(snippet_stale_canonical_span_withholds_wrong_body) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(snippet_store_live_file_hash(srv, tmp));
+
+    /* Rewrite the file so lines 3-5 (HandleRequest's indexed span) now hold
+     * unrelated filler; the stored hash goes stale (size differs). */
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "package main\n"
+                "\n"
+                "// filler-line-a\n"
+                "// filler-line-b\n"
+                "// filler-line-c\n"
+                "\n"
+                "func HandleRequest() error {\n"
+                "\treturn nil\n"
+                "}\n");
+    ASSERT_EQ(fclose(fp), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    /* Never another symbol's body under this symbol's metadata. */
+    ASSERT_NULL(strstr(resp, "filler-line"));
+    /* Structured stale result with the coverage action. */
+    ASSERT_NOT_NULL(strstr(resp, "\"stale_span\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_file\":\"metadata_changed\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"action\":\"read_source_and_reindex\""));
+    /* Metadata for the requested symbol is retained. */
+    ASSERT_NOT_NULL(
+        strstr(resp, "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING — EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -18793,6 +18876,8 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
+    RUN_TEST(snippet_fresh_canonical_span_serves_source);
+    RUN_TEST(snippet_stale_canonical_span_withholds_wrong_body);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
