@@ -2001,6 +2001,14 @@ static bool quarantine_step_allowed(cbm_mcp_server_t *srv, const char *step) {
  * only recoverable generation. */
 static bool quarantine_corrupt_store(cbm_mcp_server_t *srv, const char *project, const char *path,
                                      char *backup_out, size_t backup_out_size) {
+    /* Never quarantine an empty path: SQLite opens "" as an anonymous temp db,
+     * and "%s.corrupt.*" of an empty prefix would land as relative litter in
+     * the process cwd instead of beside the store. */
+    if (!path || path[0] == '\0') {
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", path ? path : "",
+                      "reason", "empty store path");
+        return false;
+    }
     char backup[CBM_SZ_2K];
     char pending[CBM_SZ_2K];
     if (!reserve_unique_corrupt_pending(path, pending, sizeof(pending), backup, sizeof(backup))) {
@@ -2090,10 +2098,18 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     }
 
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
-     * prevent ghost .db file creation for unknown/unindexed projects. */
+     * prevent ghost .db file creation for unknown/unindexed projects.
+     * An invalid project name yields an EMPTY path from project_db_path();
+     * SQLite would open "" as an anonymous temporary database that then fails
+     * the integrity check and gets quarantined as relative .corrupt litter in
+     * the process cwd. Skip the direct open and fall through to the #704
+     * fallback scan: it matches by internal name, so a legacy db can still
+     * resolve, and a genuine typo stays not-found. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path_query(path);
+    if (path[0] != '\0') {
+        srv->store = cbm_store_open_path_query(path);
+    }
     if (srv->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {

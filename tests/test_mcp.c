@@ -5325,6 +5325,75 @@ TEST(tool_cross_repo_honors_source_name_override) {
     PASS();
 }
 
+static int mcp_count_corrupt_named_entries(const char *dir_path) {
+    int count = 0;
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return -1;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strstr(entry->name, ".corrupt")) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+/* #1425: an invalid project name makes project_db_path() return an empty
+ * path; SQLite would open "" as an anonymous temp db, fail integrity, and
+ * quarantine it as relative .corrupt litter in the process cwd. The resolver
+ * must skip the direct open (no recovery lease attempted), return the
+ * ordinary not-found error, and leave no .corrupt artifacts in the cwd or
+ * the cache dir. */
+TEST(tool_query_invalid_project_name_no_corrupt_litter) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-badname-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char scratch[256];
+    snprintf(scratch, sizeof(scratch), "%s/cbm-mcp-badname-cwd-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(scratch));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[CBM_SZ_4K];
+    ASSERT_NOT_NULL(cbm_getcwd(old_cwd, sizeof(old_cwd)));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    ASSERT_EQ(cbm_chdir(scratch), 0);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph",
+                                     "{\"project\":\"bad name\",\"name_pattern\":\".*\"}");
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+    ASSERT_NOT_NULL(resp);
+    bool not_found = strstr(resp, "not found") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    int cwd_litter = mcp_count_corrupt_named_entries(scratch);
+    int cache_litter = mcp_count_corrupt_named_entries(cache);
+
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(scratch);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(not_found);
+    ASSERT_EQ(probe.begin_count, 0);
+    ASSERT_EQ(probe.try_begin_count, 0);
+    ASSERT_TRUE(cwd_litter >= 0);
+    ASSERT_TRUE(cache_litter >= 0);
+    ASSERT_EQ(cwd_litter + cache_litter, 0);
+    PASS();
+}
+
 /* Corrupt-store quarantine renames/unlinks the project DB and sidecars, so it
  * is a mutation even when resolve_store() was reached by a query tool. Generic
  * queries use a blocking guard for that recovery, while manage_adr reads must
@@ -10494,6 +10563,7 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases);
     RUN_TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting);
     RUN_TEST(tool_cross_repo_honors_source_name_override);
+    RUN_TEST(tool_query_invalid_project_name_no_corrupt_litter);
     RUN_TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested);
     RUN_TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal);
     RUN_TEST(tool_manage_adr_corrupt_store_busy_is_retryable);
