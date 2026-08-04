@@ -13613,6 +13613,7 @@ TEST(cli_config_registry_search_previews_use_shared_definitions) {
     const cbm_config_entry_t *snippet = NULL;
     const cbm_config_entry_t *key_functions = NULL;
     const cbm_config_entry_t *context_key_functions = NULL;
+    const cbm_config_entry_t *key_functions_exclude = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         const cbm_config_entry_t *entry = &CBM_CONFIG_REGISTRY[i];
         if (strcmp(entry->key, CBM_CONFIG_SEARCH_LIMIT) == 0) {
@@ -13625,6 +13626,8 @@ TEST(cli_config_registry_search_previews_use_shared_definitions) {
             key_functions = entry;
         } else if (strcmp(entry->key, CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT) == 0) {
             context_key_functions = entry;
+        } else if (strcmp(entry->key, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE) == 0) {
+            key_functions_exclude = entry;
         }
     }
 
@@ -13645,6 +13648,17 @@ TEST(cli_config_registry_search_previews_use_shared_definitions) {
                   CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT_STR);
     ASSERT_EQ(atoi(context_key_functions->default_val),
               CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT);
+    ASSERT_NOT_NULL(key_functions_exclude);
+    ASSERT_STR_EQ(key_functions_exclude->default_val, CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE);
+    /* The default must hide the synthetic sentinel paths ("<python-builtins>",
+     * "<kotlin-builtins>") that otherwise dominate the PageRank preview. */
+    {
+        char *like = cbm_glob_to_like(key_functions_exclude->default_val);
+        ASSERT_NOT_NULL(like);
+        ASSERT_STR_EQ(like, "<%>");
+        free(like);
+    }
+    ASSERT_NOT_NULL(strstr(key_functions_exclude->guidance, "python-builtins"));
     PASS();
 }
 TEST(cli_config_registry_architecture_defaults_use_shared_definitions) {

@@ -13123,11 +13123,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "0-1000000",
      CBM_DEFAULT_SNIPPET_MAX_LINES_STR
      " lines covers most functions. Set 0 for unlimited to get full file contents."},
-    {CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "", "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
+    {CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE,
+     "CBM_KEY_FUNCTIONS_EXCLUDE", "Search",
      "Comma-separated glob patterns to exclude from architecture key functions",
-     "glob patterns, e.g. graph-ui/**,tests/**",
+     "glob patterns, e.g. <*>,graph-ui/**,tests/**",
      "Use to remove UI, generated code, or test helpers from the architecture view. "
-     "Example: 'graph-ui/**,tools/**,scripts/**,tests/**'."},
+     "The default '<*>' hides synthetic definitions with sentinel paths such as "
+     "'<python-builtins>' that no client can open; set to '' to include them. "
+     "Example: '<*>,graph-ui/**,tools/**,scripts/**,tests/**'."},
     {CBM_CONFIG_KEY_FUNCTIONS_COUNT, CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR, NULL, "Search",
      "Max key functions returned in codebase://architecture and search context",
      "1-10000",
