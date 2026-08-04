@@ -5416,9 +5416,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_m
      * to keep the first-response token cost modest. */
     if (db && proj && rank_enabled && !pagerank_stale && ranked_nodes > 0) {
         const char *kf_exclude =
-            srv->config ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE,
-                                         CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE)
-                        : CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE;
+            srv->config ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "") : "";
         int kf_cfg_limit =
             srv->config ? cbm_config_get_int(srv->config, CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT,
                                              CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT)
@@ -11022,9 +11020,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                     doc, root, "key_functions omitted: out of memory preparing exclude patterns");
             } else {
                 const char *excl_csv =
-                    srv->config ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE,
-                                                 CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE)
-                                : CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE;
+                    srv->config ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
+                                : "";
                 int kf_limit = srv->config
                                    ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT,
                                                         CBM_DEFAULT_KEY_FUNCTIONS_COUNT)
@@ -19350,9 +19347,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
     struct sqlite3 *db = cbm_store_get_db(store);
     if (db && proj && !pagerank_stale) {
         const char *excl_csv =
-            srv->config ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE,
-                                         CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE)
-                        : CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE;
+            srv->config ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "") : "";
         int kf_limit = srv->config ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT,
                                                         CBM_DEFAULT_KEY_FUNCTIONS_COUNT)
                                    : CBM_DEFAULT_KEY_FUNCTIONS_COUNT;

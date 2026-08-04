@@ -162,4 +162,24 @@ enum { SKIP_ONE = 1, PAIR_LEN = 2 };
 #define CBM_SQL_CALLABLE_LABELS "'Function','Method'"
 #define CBM_SQL_CALLABLE_OR_TYPE_LABELS CBM_SQL_CALLABLE_LABELS "," CBM_SQL_TYPE_LIKE_LABELS
 
+/* ── Synthetic definition paths ──────────────────────────────────
+ * Language layers mint reference-resolution stubs (Python/Kotlin builtins)
+ * as real graph nodes so LSP-resolved CALLS/USAGE edges have a target. Their
+ * file_path is an angle-bracket sentinel that cannot exist on disk; that
+ * sentinel is the single contract marking a definition as synthetic. Every
+ * minting site must use one of these constants, and every consumer that
+ * needs "real project code only" must use the shared SQL fragment instead
+ * of inventing its own string match.
+ *
+ * Rank computation excludes sentinel-path nodes: they are resolution
+ * artifacts with universal fan-in, so left in they dominate every
+ * rank-ordered surface in every project (flask canary: builtins.list and
+ * builtins.str above Flask itself). Search returns them via LEFT JOIN; a
+ * NULL rank orders after every ranked project symbol under ORDER BY DESC. */
+#define CBM_SYNTHETIC_DEF_PATH_PY_BUILTINS "<python-builtins>"
+#define CBM_SYNTHETIC_DEF_PATH_KT_BUILTINS "<kotlin-builtins>"
+/* NULL file_path (Project/Package/Folder nodes) is not synthetic: only the
+ * angle-bracket sentinel is. Real repository paths never start with '<'. */
+#define CBM_SQL_EXCLUDE_SYNTHETIC_DEFS " AND (file_path IS NULL OR file_path NOT LIKE '<%')"
+
 #endif /* CBM_CONSTANTS_H */

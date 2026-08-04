@@ -439,12 +439,6 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_DEFAULT_KEY_FUNCTIONS_COUNT 25
 #define CBM_DEFAULT_KEY_FUNCTIONS_COUNT_STR "25"
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
-/* Synthetic definitions ("<python-builtins>", "<kotlin-builtins>") carry
- * angle-bracket sentinel file paths no client can open. Left in the preview
- * they dominate PageRank ordering (flask: builtins.list/builtins.str rank
- * above every project symbol), so the default excludes sentinel paths; real
- * repository paths never start with '<'. Set the config to "" to include. */
-#define CBM_DEFAULT_KEY_FUNCTIONS_EXCLUDE "<*>"
 /* Bound the key_functions preview pushed in the automatic first-response
  * context. Non-positive values fall back to this smaller orientation default;
  * get_architecture retains its independently configurable full preview. */

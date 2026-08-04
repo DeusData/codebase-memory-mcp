@@ -11,6 +11,7 @@
 #include "pagerank.h"
 #include <cli/cli.h>
 #include <foundation/compat.h>
+#include <foundation/constants.h>
 #include <foundation/log.h>
 #include <limits.h>
 #include <math.h>
@@ -442,9 +443,13 @@ int cbm_pagerank_compute(cbm_store_t *store, const char *project,
     char **node_projects = NULL; /* owning project per node, parallel to node_ids */
 
     /* ── Step 1: Load node IDs + owning projects ──────────── */
+    /* Synthetic builtin stubs never enter the rank graph: edges targeting
+     * them are skipped by the id-map miss below, so caller out-weight and
+     * degree views count real project flow only, and no rank/degree/linkrank
+     * row is published for a definition no client can navigate to. */
     char sql_buf[512];
-    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, project FROM nodes WHERE %s",
-             scope_where(scope));
+    snprintf(sql_buf, sizeof(sql_buf), "SELECT id, project FROM nodes WHERE %s%s",
+             scope_where(scope), CBM_SQL_EXCLUDE_SYNTHETIC_DEFS);
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql_buf, -1, &stmt, NULL) != SQLITE_OK)

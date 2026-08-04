@@ -151,6 +151,61 @@ TEST(pagerank_two_nodes_one_edge) {
     PASS();
 }
 
+TEST(pagerank_synthetic_builtin_stubs_excluded_from_rank_views) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "syn", "/tmp/syn");
+    int64_t caller = add_node(s, "syn", "caller");
+    int64_t callee = add_node(s, "syn", "callee");
+    /* Mint synthetic builtin stubs exactly as the LSP layers do
+     * (internal/cbm/lsp/py_builtins.c, kotlin_builtins.c). */
+    cbm_node_t py_stub = {0};
+    py_stub.project = "syn";
+    py_stub.label = "Method";
+    py_stub.name = "append";
+    py_stub.qualified_name = "builtins.list.append";
+    py_stub.file_path = CBM_SYNTHETIC_DEF_PATH_PY_BUILTINS;
+    int64_t py_id = cbm_store_upsert_node(s, &py_stub);
+    cbm_node_t kt_stub = {0};
+    kt_stub.project = "syn";
+    kt_stub.label = "Function";
+    kt_stub.name = "println";
+    kt_stub.qualified_name = "kotlin.io.println";
+    kt_stub.file_path = CBM_SYNTHETIC_DEF_PATH_KT_BUILTINS;
+    int64_t kt_id = cbm_store_upsert_node(s, &kt_stub);
+    add_edge(s, "syn", caller, callee, "CALLS");
+    /* Universal fan-in shape: every project function uses the stubs. */
+    add_edge(s, "syn", caller, py_id, "CALLS");
+    add_edge(s, "syn", callee, py_id, "USAGE");
+    add_edge(s, "syn", caller, kt_id, "CALLS");
+    cbm_pagerank_compute_default(s, "syn");
+    /* Stubs publish no rank row (get returns 0.0 only for missing rows; real
+     * ranks carry the teleport floor), and project rank mass sums to 1.0 over
+     * project nodes alone — no mass is parked on definitions no client can
+     * open, so no rank-ordered surface can be dominated by them. */
+    double ra = get_pr(s, caller);
+    double rb = get_pr(s, callee);
+    ASSERT_TRUE(ra > 0.0);
+    ASSERT_TRUE(rb > 0.0);
+    ASSERT_TRUE(get_pr(s, py_id) == 0.0);
+    ASSERT_TRUE(get_pr(s, kt_id) == 0.0);
+    ASSERT_TRUE(fabs(ra + rb - 1.0) < 0.01);
+    /* Degree views follow the same contract: stub rows absent, and the
+     * callers' out-degree counts real project flow only. */
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  db, "SELECT COUNT(*) FROM node_degree WHERE node_id IN (?1, ?2)",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, py_id);
+    sqlite3_bind_int64(stmt, 2, kt_id);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pagerank_cycle) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "cyc", "/tmp/cyc");
@@ -1712,6 +1767,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_empty_graph);
     RUN_TEST(pagerank_single_node);
     RUN_TEST(pagerank_two_nodes_one_edge);
+    RUN_TEST(pagerank_synthetic_builtin_stubs_excluded_from_rank_views);
     RUN_TEST(pagerank_cycle);
     RUN_TEST(pagerank_star_topology);
     RUN_TEST(pagerank_edge_weights);

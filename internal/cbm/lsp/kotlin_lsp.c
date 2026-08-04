@@ -35,6 +35,7 @@
  */
 
 #include "kotlin_lsp.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "../helpers.h"
 #include <ctype.h>

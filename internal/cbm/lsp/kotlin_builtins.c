@@ -64,7 +64,7 @@ static void kt_builtins_inject_defs(CBMFileResult *result, CBMArena *arena) {
         def.name = b->name;
         def.qualified_name = b->qn;
         def.label = b->label;
-        def.file_path = "<kotlin-builtins>";
+        def.file_path = CBM_SYNTHETIC_DEF_PATH_KT_BUILTINS;
         def.start_line = KT_BUILTIN_SYNTHETIC_LINE;
         def.end_line = KT_BUILTIN_SYNTHETIC_LINE;
         cbm_defs_push(&result->defs, arena, def);
