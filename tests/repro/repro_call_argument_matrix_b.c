@@ -752,6 +752,12 @@ static const char TLAPLUS_BOUNDED_QUANTIFICATION[] =
     "Guard(values) == \\A item \\in values : item = item\n"
     "====\n";
 
+/* Pkl access expressions double as plain property reads, so the bare fixture
+ * also proves the un-applied reference is not promoted to a call. */
+static const char PKL_INSIDE[] = "function accept(value: Int): Int = value\n"
+                                 "function run(watched: Int): Int = accept(watched)\n";
+static const char PKL_BARE[] = "function run(watched: Int): Int = watched\n";
+
 static const char APEX_INSIDE[] = "public class Sample {\n"
                                   "  private static Integer accept(Integer value) {\n"
                                   "    return value;\n"
@@ -958,6 +964,9 @@ static const RoutineArgumentCase LLVM_IR_CASE = ROUTINE_ARGUMENT_CASE(
 static const RoutineArgumentCase TLAPLUS_CASE = ROUTINE_ARGUMENT_CASE(
     "TLAPLUS", CBM_LANG_TLAPLUS, "Sample.tla", TLAPLUS_INSIDE, TLAPLUS_BARE, "bound_op", "Guard",
     "Accept", "values", 1, 1, 0, "TLA+ operator application with a value argument");
+static const RoutineArgumentCase PKL_CASE = ROUTINE_ARGUMENT_CASE(
+    "PKL", CBM_LANG_PKL, "sample.pkl", PKL_INSIDE, PKL_BARE, "unqualifiedAccessExpr", "run",
+    "accept", "watched", 1, 1, 0, "native Pkl method application and property-read vocabulary");
 static const RoutineArgumentCase APEX_CASE = ROUTINE_ARGUMENT_CASE(
     "APEX", CBM_LANG_APEX, "Sample.cls", APEX_INSIDE, APEX_BARE, "method_invocation", "run",
     "accept", "watched", 1, 1, 0, "native method application");
@@ -1166,6 +1175,7 @@ DEFINE_ROUTINE_ARGUMENT_TEST(func, FUNC_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(puppet, PUPPET_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(slang, SLANG_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(llvm_ir, LLVM_IR_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(pkl, PKL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(apex, APEX_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(pine, PINE_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(qml, QML_CASE)
@@ -1243,15 +1253,15 @@ TEST(repro_call_argument_matrix_b_domain_bitbake) {
 }
 
 enum {
-    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 36,
+    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 37,
     MODULE_ARGUMENT_LANGUAGE_COUNT = 4,
     DOMAIN_CONTROL_LANGUAGE_COUNT = 6,
     MATRIX_LANGUAGE_COUNT = ROUTINE_ARGUMENT_LANGUAGE_COUNT + MODULE_ARGUMENT_LANGUAGE_COUNT +
                             DOMAIN_CONTROL_LANGUAGE_COUNT,
 };
 
-_Static_assert(MATRIX_LANGUAGE_COUNT == 46,
-               "RACKET..OBJECTSCRIPT_ROUTINE call-capable matrix must contain exactly 46 "
+_Static_assert(MATRIX_LANGUAGE_COUNT == 47,
+               "RACKET..OBJECTSCRIPT_ROUTINE call-capable matrix must contain exactly 47 "
                "language rows");
 
 #define MATRIX_B_LANGUAGE_ROWS(X)                                                               \
@@ -1283,6 +1293,7 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 46,
     X(repro_call_argument_matrix_b_routine_slang, SLANG_CASE.identity.language)                 \
     X(repro_call_argument_matrix_b_routine_llvm_ir, LLVM_IR_CASE.identity.language)             \
     X(repro_call_argument_matrix_b_routine_tlaplus, TLAPLUS_CASE.identity.language)             \
+    X(repro_call_argument_matrix_b_routine_pkl, PKL_CASE.identity.language)                     \
     X(repro_call_argument_matrix_b_routine_apex, APEX_CASE.identity.language)                   \
     X(repro_call_argument_matrix_b_routine_pine, PINE_CASE.identity.language)                   \
     X(repro_call_argument_matrix_b_routine_qml, QML_CASE.identity.language)                     \
