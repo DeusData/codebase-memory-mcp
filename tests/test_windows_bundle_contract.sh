@@ -394,7 +394,12 @@ require(
         needle in read("src/daemon/ipc.c")
         for needle in (
             "win_directory_component_secure",
-            "win_file_security_secure(security, directory, false, mutation)",
+            "win_file_security_secure(security, directory, false, mutation, true)",
+            # The capability allowance is ancestors-only: the final runtime
+            # directory must keep passing false, so a capability ACE can never
+            # satisfy the directory the daemon actually publishes into.
+            "win_private_mutation_rights(), false)",
+            "win_sid_is_app_capability",
             "win_private_mutation_rights()",
             "~((DWORD)FILE_ADD_SUBDIRECTORY)",
             "FILE_ADD_FILE",
