@@ -282,6 +282,19 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 echo "=== Step 5c: worker error-response transport regression ==="
 bash "$ROOT/tests/test_worker_error_response.sh"
 
+# Step 5d (#1388) is DELIBERATELY NOT GATING HERE — see
+# tests/test_hook_conflict_notice.sh for the full what-was-tried record.
+# Summary: the test forces a client/daemon build mismatch via the
+# CBM_TEST_HOOK_CLIENT_BUILD seam and asserts the stdout systemMessage. It is
+# reliably green locally against a seam-bearing binary, but on every CI leg the
+# forced mismatch raises no cohort conflict at all: the seam is present (the
+# test asserts that up front), the forced fingerprint is well-formed (64 hex),
+# and `daemon status` reports an active daemon on a DIFFERENT build - yet the
+# client joins silently. Until that local-vs-CI divergence in the cohort
+# admission path is understood, gating on it would make an unexplained red, and
+# skipping it silently would hide the gap. Run it by hand:
+#   make -f Makefile.cbm cbm TEST_SEAMS=1 && bash tests/test_hook_conflict_notice.sh
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).

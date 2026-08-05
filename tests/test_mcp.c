@@ -2551,6 +2551,53 @@ TEST(tool_trace_call_path_not_found) {
     PASS();
 }
 
+/* Regression for #1425: a project name that fails validation must produce a
+ * clean "not found" error and NOTHING else. project_db_path() yields "" for
+ * such names; SQLite opens "" as an anonymous temp db, its integrity check
+ * fails, and quarantine rendered "".corrupt.<hex> - a RELATIVE path dropped
+ * into the daemon's cwd on every such query. */
+TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/mcp-litter-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char oldcwd[CBM_SZ_1K];
+    if (!cbm_getcwd(oldcwd, sizeof(oldcwd)))
+        FAIL("getcwd failed");
+    if (cbm_chdir(tmpdir) != 0)
+        FAIL("chdir failed");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\","
+                                   "\"arguments\":{\"name_pattern\":\"x\","
+                                   "\"project\":\"bad name\"}}}");
+    bool clean_error = resp && strstr(resp, "not found") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    int litter = 0;
+    cbm_dir_t *dir = cbm_opendir(tmpdir);
+    if (dir) {
+        cbm_dirent_t *entry;
+        while ((entry = cbm_readdir(dir)) != NULL) {
+            if (strstr(entry->name, ".corrupt.")) {
+                litter++;
+            }
+        }
+        cbm_closedir(dir);
+    }
+    if (cbm_chdir(oldcwd) != 0)
+        FAIL("chdir back failed");
+    th_rmtree(tmpdir);
+    if (!clean_error)
+        FAIL("invalid project name must produce a clean not-found error");
+    if (litter != 0)
+        FAIL("invalid project name must not quarantine an anonymous temp db into cwd (#1425)");
+    PASS();
+}
+
 TEST(tool_trace_missing_function_name) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -10352,6 +10399,7 @@ SUITE(mcp) {
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
+    RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);

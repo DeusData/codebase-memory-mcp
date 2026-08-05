@@ -1437,3 +1437,24 @@ int cbm_cmd_hook_augment(int argc, char **argv) {
     free(input);
     return 0;
 }
+
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect) {
+    /* Only Claude Code (the NULL dialect) consumes a bare stdout JSON object;
+     * emitting it into another dialect's channel would corrupt that protocol. */
+    if (hook_dialect) {
+        return NULL;
+    }
+    switch (reason) {
+    case CBM_HOOK_ADMISSION_DAEMON_ABSENT:
+        return "{\"systemMessage\":\"codebase-memory-mcp: no CBM daemon is running, so graph "
+               "augmentation is currently skipped. Run `codebase-memory-mcp daemon start` (or "
+               "open an MCP session) to enable it.\"}";
+    case CBM_HOOK_ADMISSION_BUILD_CONFLICT:
+        return "{\"systemMessage\":\"codebase-memory-mcp: graph augmentation is skipped: the "
+               "active CBM daemon runs a different build than this binary (usually an update was "
+               "installed while the old daemon kept running). Run `codebase-memory-mcp daemon "
+               "stop`, then retry - the next command starts a matching daemon.\"}";
+    default:
+        return NULL;
+    }
+}

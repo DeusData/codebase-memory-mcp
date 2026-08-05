@@ -14,6 +14,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/agent_profiles.h>
+#include <cli/activation_transaction.h>
 #include <cli/cli.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
@@ -643,6 +644,41 @@ TEST(cli_activation_refuses_when_cohort_does_not_drain) {
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_FALSE(fake.mutation_lease_held);
     ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+/* Regression for #1416: when the activation transaction recorded a concrete
+ * refusal (e.g. the Windows ACL safety check), the CLI must attribute the
+ * failure to that check instead of blaming "active CBM sessions" - reporters
+ * rebooted and hunted phantom handles because no sessions existed. The
+ * sessions wording must remain for refusals with no recorded note. */
+TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416) {
+    cbm_activation_transaction_note_refusal_for_testing(
+        "acl-grants-cross-account-mutation to S-1-5-11", 0UL);
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 1);
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "acl-grants-cross-account-mutation"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "not a session problem"));
+    ASSERT_NULL(strstr(fake.diagnostic, "could not be stopped safely"));
+
+    /* No note recorded -> the sessions wording is still the right message. */
+    cbm_activation_transaction_note_refusal_for_testing(NULL, 0UL);
+    cli_activation_fake_t plain = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    ops.context = &plain;
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &plain), 1);
+    ASSERT_NOT_NULL(strstr(plain.diagnostic, "could not be stopped safely"));
     PASS();
 }
 
@@ -4670,6 +4706,32 @@ TEST(cli_agent_reinstall_preserves_foreign_policy_entries) {
     PASS();
 }
 
+/* Regression for #1388: a hook client blocked by a daemon BUILD CONFLICT must
+ * emit a stdout systemMessage. stdout is the only channel a hook caller sees,
+ * so the pre-fix stderr-only reporting was indistinguishable from "no matches"
+ * and produced silent skips for the whole session. The absent-daemon notice
+ * must stay distinct: it points at `daemon start`, which cannot heal a build
+ * conflict. Non-Claude dialects take no bare stdout JSON at all. */
+TEST(cli_hook_conflict_emits_stdout_notice_issue1388) {
+    const char *conflict = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_BUILD_CONFLICT, NULL);
+    ASSERT_NOT_NULL(conflict);
+    ASSERT_NOT_NULL(strstr(conflict, "systemMessage"));
+    ASSERT_NOT_NULL(strstr(conflict, "different build"));
+    /* The actionable step: a conflicted daemon must be STOPPED, not started. */
+    ASSERT_NOT_NULL(strstr(conflict, "daemon stop"));
+
+    const char *absent = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, NULL);
+    ASSERT_NOT_NULL(absent);
+    ASSERT_NOT_NULL(strstr(absent, "daemon start"));
+    /* Distinct diagnoses: the conflict notice must never claim no daemon runs. */
+    ASSERT_TRUE(strcmp(conflict, absent) != 0);
+    ASSERT_NULL(strstr(conflict, "no CBM daemon is running"));
+
+    /* Other dialects do not consume a bare stdout JSON object. */
+    ASSERT_NULL(cbm_hook_admission_notice(CBM_HOOK_ADMISSION_BUILD_CONFLICT, "codex"));
+    ASSERT_NULL(cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, "codex"));
+    PASS();
+}
 #ifndef _WIN32
 /* Regression for #1387: installing over an existing setup whose hook scripts
  * are not byte-owned (manual install with a custom binary location, or a
@@ -11891,6 +11953,7 @@ SUITE(cli) {
     /* Mandatory daemon activation safety */
     RUN_TEST(cli_activation_quiesces_active_cohort_before_mutation);
     RUN_TEST(cli_activation_refuses_when_cohort_does_not_drain);
+    RUN_TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416);
     RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
     RUN_TEST(cli_activation_releases_maintenance_lease_after_success);
     RUN_TEST(cli_activation_releases_maintenance_lease_when_mutation_fails);
@@ -12038,6 +12101,7 @@ SUITE(cli) {
     RUN_TEST(cli_new_agent_install_plans_use_documented_paths);
     RUN_TEST(cli_new_agent_configs_use_documented_schemas);
     RUN_TEST(cli_agent_reinstall_preserves_foreign_policy_entries);
+    RUN_TEST(cli_hook_conflict_emits_stdout_notice_issue1388);
 #ifndef _WIN32
     RUN_TEST(cli_install_preserves_hook_entries_when_scripts_unowned_issue1387);
 #endif

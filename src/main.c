@@ -1483,12 +1483,26 @@ static void main_hook_report_absent_daemon(const char *hook_dialect) {
     (void)fprintf(stderr, "codebase-memory-mcp: no CBM daemon is running, so graph "
                           "augmentation is skipped. Start an MCP session or run "
                           "`codebase-memory-mcp daemon start` to enable it.\n");
-    if (!hook_dialect) {
-        /* Claude hook output: a systemMessage is surfaced to the user. */
-        (void)fputs("{\"systemMessage\":\"codebase-memory-mcp: no CBM daemon is running, so "
-                    "graph augmentation is currently skipped. Run `codebase-memory-mcp daemon "
-                    "start` (or open an MCP session) to enable it.\"}",
-                    stdout);
+    const char *notice = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, hook_dialect);
+    if (notice) {
+        (void)fputs(notice, stdout);
+        (void)fflush(stdout);
+    }
+}
+
+/* #1388: a version-conflicted daemon is an actionable broken state, unlike a
+ * merely absent one - and stdout is the only hook channel Claude Code
+ * surfaces, so stderr-only reporting reads as eternal silence in-session.
+ * Emit a throttled systemMessage with restart guidance (the misleading
+ * "no daemon is running" text pointed at `daemon start`, which cannot heal a
+ * build conflict). */
+static void main_hook_report_conflicted_daemon(const char *hook_dialect) {
+    if (hook_dialect || !main_hook_absent_notice_due()) {
+        return;
+    }
+    const char *notice = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_BUILD_CONFLICT, hook_dialect);
+    if (notice) {
+        (void)fputs(notice, stdout);
         (void)fflush(stdout);
     }
 }
@@ -2148,6 +2162,18 @@ int main(int argc, char **argv) {
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* #1388 test seam: let one binary present a foreign build fingerprint as a
+     * hook client, so the daemon-conflict reporting path is testable without
+     * building a second binary. */
+    static char seam_hook_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    const char *seam_forced_build = cbm_safe_getenv("CBM_TEST_HOOK_CLIENT_BUILD", seam_hook_build,
+                                                    sizeof(seam_hook_build), NULL);
+    if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT && seam_forced_build && seam_forced_build[0]) {
+        identity.build_fingerprint = seam_hook_build;
+    }
+#endif
+
     cbm_version_cohort_manager_t *client_cohort_manager = cbm_version_cohort_manager_new(endpoint);
     cbm_version_cohort_lease_t *client_cohort_lease = NULL;
     cbm_daemon_conflict_t client_cohort_conflict;
@@ -2169,6 +2195,10 @@ int main(int argc, char **argv) {
         }
         (void)fprintf(stderr, "codebase-memory-mcp: %s\n",
                       formatted ? message : "client exact-build admission failed");
+        if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
+            client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
+            main_hook_report_conflicted_daemon(hook_dialect);
+        }
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -2181,7 +2211,16 @@ int main(int argc, char **argv) {
             endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
         cbm_daemon_ipc_endpoint_free(endpoint);
         if (!hook_client) {
-            main_hook_report_absent_daemon(hook_dialect);
+            if (hook_connect.status == CBM_DAEMON_RUNTIME_CONNECT_CONFLICT) {
+                char conflict_detail[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+                if (cbm_daemon_conflict_format(&hook_connect.conflict, conflict_detail,
+                                               sizeof(conflict_detail))) {
+                    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", conflict_detail);
+                }
+                main_hook_report_conflicted_daemon(hook_dialect);
+            } else {
+                main_hook_report_absent_daemon(hook_dialect);
+            }
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_SUCCESS;
         }

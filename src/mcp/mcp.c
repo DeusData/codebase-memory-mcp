@@ -2003,6 +2003,14 @@ static bool quarantine_corrupt_store(cbm_mcp_server_t *srv, const char *project,
                                      char *backup_out, size_t backup_out_size) {
     char backup[CBM_SZ_2K];
     char pending[CBM_SZ_2K];
+    /* #1425 belt-and-braces: an empty store path would render the backup as a
+     * bare relative ".corrupt.<hex>" in the process cwd. There is nothing at
+     * such a path worth quarantining. */
+    if (!path || !path[0]) {
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", "", "reason",
+                      "empty store path");
+        return false;
+    }
     if (!reserve_unique_corrupt_pending(path, pending, sizeof(pending), backup, sizeof(backup))) {
         cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
                       "cannot reserve unique backup");
@@ -2090,10 +2098,16 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     }
 
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
-     * prevent ghost .db file creation for unknown/unindexed projects. */
+     * prevent ghost .db file creation for unknown/unindexed projects.
+     * #1425: an invalid project name yields an empty path. SQLite opens ""
+     * as an anonymous temp db, which then fails the integrity check and
+     * quarantines a db that never existed — as a RELATIVE .corrupt.<hex>
+     * file in the daemon's cwd. Skip the direct open entirely; the fallback
+     * scan below still resolves legacy dbs whose internal name predates
+     * validation. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = cbm_store_open_path_query(path);
+    srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
     if (srv->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {

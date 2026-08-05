@@ -197,6 +197,24 @@ static const char *g_cli_activation_runtime_parent_for_test = NULL;
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
     const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
+    /* #1416: when the transaction recorded a concrete refusal (an ACL or
+     * filesystem safety check), say THAT. The generic text blames "active CBM
+     * sessions" for what is a validation refusal - reporters rebooted, killed
+     * every process, and hunted phantom handles because the message pointed at
+     * sessions that did not exist. The sessions wording remains for genuine
+     * stop/reservation failures, which record no refusal note. */
+    char attributed[CBM_SZ_1K];
+    const char *note = cbm_activation_transaction_refusal_note();
+    if (diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE && note && note[0]) {
+        (void)snprintf(attributed, sizeof(attributed),
+                       "error: activation was refused by a filesystem safety check before any "
+                       "change was made: %s\n"
+                       "error: this is not a session problem. If the flagged directory is one you "
+                       "trust, remove the flagged permission grant (icacls <dir> /remove:g <sid>) "
+                       "or use an owner-private directory for --dir/CBM_CACHE_DIR, then retry.",
+                       note);
+        diagnostic = attributed;
+    }
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);
         return;
