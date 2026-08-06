@@ -379,17 +379,22 @@ jobs:
           prepare: |
             pkg update -f
             pkg install -y gmake sqlite3 pkgconf node22 npm-node22 bash
-          run: |
             which python3 >/dev/null 2>&1 || ln -sf $(which python3.15 python3.14 python3.13 python3.12 python3.11 python3.10 2>/dev/null | head -n 1) /usr/local/bin/python3
-            echo "Python location: $(which python3 2>/dev/null || echo 'not found')"
-            python3 --version 2>&1 || true
-
-            # 1. Build standard binary
-            gmake -f Makefile.cbm cbm
+          run: |
+            # Build standard binary (canonical scripts/build.sh pattern)
+            if [ -n "${{ inputs.version }}" ]; then
+              scripts/build.sh --version "${{ inputs.version }}" CC=clang CXX=clang++
+            else
+              scripts/build.sh CC=clang CXX=clang++
+            fi
             scripts/package-release.sh freebsd ${{ matrix.arch }}-${{ matrix.release }}
 
-            # 2. Build UI binary
-            gmake -f Makefile.cbm cbm-with-ui
+            # Build UI binary
+            if [ -n "${{ inputs.version }}" ]; then
+              scripts/build.sh --version "${{ inputs.version }}" --with-ui CC=clang CXX=clang++
+            else
+              scripts/build.sh --with-ui CC=clang CXX=clang++
+            fi
             scripts/package-release.sh freebsd ${{ matrix.arch }}-${{ matrix.release }} --variant ui
 
       - name: Attest standard binary provenance
