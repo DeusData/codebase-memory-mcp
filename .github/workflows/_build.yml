@@ -367,7 +367,7 @@ jobs:
 
       - name: Build FreeBSD ${{ matrix.release }} (${{ matrix.arch }}) binaries inside VM
         # https://github.com/vmactions/freebsd-vm
-        uses: vmactions/freebsd-vm@v1
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1
         with:
           release: ${{ matrix.release }}
           arch: ${{ matrix.arch }}
