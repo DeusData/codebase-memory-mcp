@@ -41,10 +41,14 @@ void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force) {
 #include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 enum {
@@ -146,7 +150,7 @@ typedef struct {
     HANDLE file;
     BY_HANDLE_FILE_INFORMATION information;
     LARGE_INTEGER size;
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     int fd;
     struct stat status;
 #endif
@@ -501,7 +505,7 @@ static bool runtime_activation_response_decode(
 static uint64_t runtime_current_process_id(void) {
 #ifdef _WIN32
     return (uint64_t)GetCurrentProcessId();
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     return (uint64_t)getpid();
 #else
     return 0;
@@ -515,7 +519,7 @@ static void runtime_process_image_reference_init(runtime_process_image_reference
     memset(reference, 0, sizeof(*reference));
 #ifdef _WIN32
     reference->file = INVALID_HANDLE_VALUE;
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     reference->fd = -1;
 #endif
 }
@@ -529,7 +533,7 @@ static bool runtime_process_image_reference_release(runtime_process_image_refere
     if (reference->file != INVALID_HANDLE_VALUE && !CloseHandle(reference->file)) {
         ok = false;
     }
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if (reference->fd >= 0 && close(reference->fd) != 0) {
         ok = false;
     }
@@ -669,9 +673,9 @@ static bool runtime_mac_process_maps_file_executable(int process_id, const struc
     return false;
 }
 
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
 
-static bool runtime_linux_stat_same_image(const struct stat *first, const struct stat *second) {
+static bool runtime_posix_stat_same_image(const struct stat *first, const struct stat *second) {
     return first && second && S_ISREG(first->st_mode) && S_ISREG(second->st_mode) &&
            first->st_dev == second->st_dev && first->st_ino == second->st_ino &&
            first->st_size == second->st_size && first->st_mtim.tv_sec == second->st_mtim.tv_sec &&
@@ -780,17 +784,44 @@ static bool runtime_process_image_reference_acquire(
               (!fingerprint ||
                cbm_daemon_build_fingerprint_native_file((uintptr_t)image_fd, fingerprint)) &&
               fstat(image_fd, &image_after) == 0 &&
-              runtime_linux_stat_same_image(&image_before, &image_after);
+              runtime_posix_stat_same_image(&image_before, &image_after);
     int verify_fd = ok ? openat(process_fd, "exe", O_RDONLY | O_CLOEXEC) : -1;
     struct stat verify_status;
     ok = ok && verify_fd >= 0 && fstat(verify_fd, &verify_status) == 0 &&
-         runtime_linux_stat_same_image(&image_after, &verify_status);
+         runtime_posix_stat_same_image(&image_after, &verify_status);
     if (verify_fd >= 0 && close(verify_fd) != 0) {
         ok = false;
     }
     if (process_fd >= 0 && close(process_fd) != 0) {
         ok = false;
     }
+    if (ok) {
+        reference->held = true;
+        reference->fd = image_fd;
+        reference->status = image_after;
+    } else if (image_fd >= 0) {
+        (void)close(image_fd);
+    }
+#elif defined(__FreeBSD__)
+    if (process_id > INT_MAX) {
+        return false;
+    }
+    int pid = (int)process_id;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid};
+    char path[PATH_MAX];
+    size_t path_length = sizeof(path);
+    bool ok = sysctl(mib, 4, path, &path_length, NULL, 0) == 0 && path_length > 0;
+    if (ok) {
+        path[path_length < sizeof(path) ? path_length : sizeof(path) - 1] = '\0';
+    }
+    int image_fd = ok ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
+    struct stat image_before;
+    struct stat image_after;
+    ok = image_fd >= 0 && fstat(image_fd, &image_before) == 0 && S_ISREG(image_before.st_mode) &&
+         (!fingerprint ||
+          cbm_daemon_build_fingerprint_native_file((uintptr_t)image_fd, fingerprint)) &&
+         fstat(image_fd, &image_after) == 0 &&
+         runtime_posix_stat_same_image(&image_before, &image_after);
     if (ok) {
         reference->held = true;
         reference->fd = image_fd;
@@ -838,14 +869,14 @@ static bool runtime_process_image_reference_matches_process(
            runtime_mac_stat_same(&active->status, &peer.status);
     bool released = runtime_process_image_reference_release(&peer);
     return same && released;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
     runtime_process_image_reference_t peer;
     runtime_process_image_reference_init(&peer);
     bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
     struct stat active_now;
     same = same && fstat(active->fd, &active_now) == 0 &&
-           runtime_linux_stat_same_image(&active->status, &active_now) &&
-           runtime_linux_stat_same_image(&active->status, &peer.status);
+           runtime_posix_stat_same_image(&active->status, &active_now) &&
+           runtime_posix_stat_same_image(&active->status, &peer.status);
     bool released = runtime_process_image_reference_release(&peer);
     return same && released;
 #else
