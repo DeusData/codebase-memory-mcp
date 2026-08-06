@@ -111,7 +111,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     *out = NULL;
     *out_count = 0;
 
-    if (!cbm_validate_shell_arg(repo_path)) {
+    if (!cbm_validate_shell_path_arg(repo_path)) {
         return CBM_NOT_FOUND;
     }
 

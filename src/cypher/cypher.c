@@ -432,12 +432,35 @@ void cbm_lex_free(cbm_lex_result_t *r) {
  *  PARSER
  * ══════════════════════════════════════════════════════════════════ */
 
+/* The WHERE grammar descends once per nested '(' and once per NOT, so parse
+ * depth follows the query text rather than anything bounded. A few tens of KB of
+ * either exhausts the stack before any semantic limit applies. 256 is far past
+ * any hand-written or generated query while leaving the stack untouched. */
+enum { CYPHER_MAX_PARSE_DEPTH = 256 };
+
 typedef struct {
     const cbm_token_t *tokens;
     int count;
     int pos;
+    int depth; /* current recursive-descent depth; see CYPHER_MAX_PARSE_DEPTH */
     char error[CBM_SZ_512];
 } parser_t;
+
+/* Enter one level of recursive descent. Returns false when the cap is hit, in
+ * which case the caller must return NULL without recursing. */
+static bool parse_depth_enter(parser_t *p) {
+    if (p->depth >= CYPHER_MAX_PARSE_DEPTH) {
+        snprintf(p->error, sizeof(p->error), "expression nested deeper than %d levels",
+                 CYPHER_MAX_PARSE_DEPTH);
+        return false;
+    }
+    p->depth++;
+    return true;
+}
+
+static void parse_depth_leave(parser_t *p) {
+    p->depth--;
+}
 
 static const cbm_token_t *peek(parser_t *p) {
     if (p->pos >= p->count) {
@@ -1203,7 +1226,11 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
 /* Atom: ( expr ) | condition */
 static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
     if (match(p, TOK_LPAREN)) {
+        if (!parse_depth_enter(p)) {
+            return NULL;
+        }
         cbm_expr_t *e = parse_or_expr(p);
+        parse_depth_leave(p);
         expect(p, TOK_RPAREN);
         return e;
     }
@@ -1213,7 +1240,11 @@ static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
 /* NOT: NOT atom | atom */
 static cbm_expr_t *parse_not_expr(parser_t *p) { // NOLINT(misc-no-recursion)
     if (match(p, TOK_NOT)) {
+        if (!parse_depth_enter(p)) {
+            return NULL;
+        }
         cbm_expr_t *child = parse_not_expr(p);
+        parse_depth_leave(p);
         return child ? expr_not(child) : NULL;
     }
     return parse_atom_expr(p);

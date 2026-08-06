@@ -221,17 +221,7 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
  * % ! ^. Callers then use DOUBLE quotes (honored by both POSIX sh and cmd.exe, unlike
  * single quotes on cmd.exe), so a repo path may legitimately contain spaces. */
 bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path) {
-    if (!cbm_validate_shell_arg(repo_path)) {
-        return false;
-    }
-#ifdef _WIN32
-    for (const char *p = repo_path; *p; p++) {
-        if (*p == '%' || *p == '!' || *p == '^') {
-            return false;
-        }
-    }
-#endif
-    return true;
+    return cbm_validate_shell_path_arg(repo_path);
 }
 
 /* Get current git HEAD hash. buf must be >= CBM_SZ_64. Returns false on error. */

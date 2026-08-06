@@ -2940,12 +2940,11 @@ TEST(tool_trace_call_path_prefers_definition) {
 TEST(trace_evidence_strategy_class_vocabulary_is_closed) {
     /* Every strategy string assigned anywhere in src/ + internal/ as of this
      * commit, plus the two literals pass_calls.c writes directly. */
-    static const char *const lsp[] = {"lsp_direct",         "lsp_base_dispatch",
-                                      "lsp_embed_dispatch", "lsp_implicit_this",
-                                      "lsp_inherited_dispatch", "lsp_method_dispatch",
-                                      "lsp_proc_macro",     "lsp_smart_ptr_dispatch",
-                                      "lsp_strategy_cross_file", "lsp_trait_dispatch",
-                                      "lsp_type_dispatch",  "lsp_virtual_dispatch"};
+    static const char *const lsp[] = {
+        "lsp_direct",         "lsp_base_dispatch",      "lsp_embed_dispatch",
+        "lsp_implicit_this",  "lsp_inherited_dispatch", "lsp_method_dispatch",
+        "lsp_proc_macro",     "lsp_smart_ptr_dispatch", "lsp_strategy_cross_file",
+        "lsp_trait_dispatch", "lsp_type_dispatch",      "lsp_virtual_dispatch"};
     for (size_t i = 0; i < sizeof(lsp) / sizeof(lsp[0]); i++) {
         const char *cls = cbm_mcp_edge_strategy_class(lsp[i]);
         ASSERT_NOT_NULL(cls);
@@ -6076,8 +6075,8 @@ TEST(tool_index_repository_unknown_project_name_still_requires_repo_path) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository",
-                                     "{\"project\":\"never-indexed-project\"}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "index_repository", "{\"project\":\"never-indexed-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "repo_path is required"));
     free(resp);
@@ -6609,13 +6608,13 @@ TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
                                  "def bar():\n"
                                  "    y = 2\n"
                                  "    return y\n"),
-             0);
+              0);
 
     /* `git -C` with double quotes, not `cd '<dir>' &&`: single quotes are not
      * quoting characters for cmd.exe, and identity/branch/signing come from -c
      * so the fixture does not depend on the machine's global git config. The
      * assertions below read `base: main`, so pin init.defaultBranch. */
-#define DC1363_GITCFG                                                                              \
+#define DC1363_GITCFG \
     "-c user.name=t -c user.email=t@t.io -c init.defaultBranch=main -c commit.gpgsign=false"
     char cmd[1200];
     const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
@@ -6644,7 +6643,7 @@ TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
                                  "def bar():\n"
                                  "    y = 2\n"
                                  "    return y\n"),
-             0);
+              0);
 
     char *project = cbm_project_name_from_path(repo);
     ASSERT_NOT_NULL(project);
@@ -6691,7 +6690,7 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
                                  "    return 2\n"),
               0);
 
-#define DC1363B_GITCFG                                                                             \
+#define DC1363B_GITCFG \
     "-c user.name=t -c user.email=t@t.io -c init.defaultBranch=main -c commit.gpgsign=false"
     char cmd[1200];
     const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
@@ -10003,6 +10002,38 @@ TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
 #endif
 }
 
+/* With no boundary configured at all, index_repository must still refuse roots
+ * that are too broad or too sensitive to index as a unit. This is the part that
+ * holds out of the box: the paths the advisories actually demonstrate are refused
+ * without anyone setting an environment variable first. */
+TEST(index_repository_refuses_overbroad_roots_by_default) {
+    const char *saved = getenv("CBM_ALLOWED_ROOT");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* A top-level system tree: refused on breadth, with no configuration. */
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/etc\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "too broad") != NULL);
+    free(resp);
+
+    /* The filesystem root is refused outright and is never overridable. */
+    resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "cannot be indexed") != NULL);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_ALLOWED_ROOT", saved_copy, 1);
+        free(saved_copy);
+    }
+    PASS();
+}
+
 /* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
  * must refuse a repo_path that resolves outside it. Unset (the default) imposes
  * no restriction. */
@@ -10292,6 +10323,7 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
+    RUN_TEST(index_repository_refuses_overbroad_roots_by_default);
     RUN_TEST(index_repository_honors_allowed_root);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);

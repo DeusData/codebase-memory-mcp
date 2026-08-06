@@ -512,6 +512,58 @@ static cbm_store_t *setup_cypher_store(void) {
     return s;
 }
 
+/* The query string is caller-supplied and the WHERE grammar recurses once per
+ * nested '(' and once per NOT, with no depth counter between the MCP entry point
+ * and the recursive descent. A few tens of KB of '(' therefore exhausted the
+ * stack at parse time. Parse in a forked child so the crash surfaces as a
+ * killing signal rather than taking the test runner with it; a bounded parser
+ * must reject the query cleanly instead. */
+TEST(cypher_deep_nesting_rejected_not_crash) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the depth cap is platform-agnostic");
+#else
+    enum { NEST = 30000 };
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *q = malloc(NEST * 2 + 64);
+        if (!q) {
+            _exit(2);
+        }
+        int n = snprintf(q, 64, "MATCH (f:Function) WHERE ");
+        for (int i = 0; i < NEST; i++) {
+            q[n++] = '(';
+        }
+        n += snprintf(q + n, 32, "f.name = \"x\"");
+        for (int i = 0; i < NEST; i++) {
+            q[n++] = ')';
+        }
+        q[n] = '\0';
+        cbm_store_t *s = setup_cypher_store();
+        cbm_cypher_result_t r = {0};
+        /* Any clean outcome is acceptable — success or a parse error. Only a
+         * crash is a failure, and that is what the signal check below catches. */
+        (void)cbm_cypher_execute(s, q, "test", 0, &r);
+        cbm_cypher_result_free(&r);
+        cbm_store_close(s);
+        free(q);
+        _exit(0);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "parser killed by signal %d — unbounded recursion depth",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 TEST(cypher_exec_match_all_functions) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3664,6 +3716,7 @@ SUITE(cypher) {
     /* Execution */
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
+    RUN_TEST(cypher_deep_nesting_rejected_not_crash);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
     RUN_TEST(cypher_cross_join_alloc_rejects_overflow);

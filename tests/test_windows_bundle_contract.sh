@@ -537,8 +537,14 @@ require(
 )
 require(
     sync_case is not None
-    and 'remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"'
-    in sync_case.group("body")
+    # Assert the PROPERTY, not one spelling of it: capture the remote HEAD into
+    # a local variable and compare it here. The checkout path became a variable
+    # (per-run isolation), so pinning the literal `/c/cbm` was asserting the
+    # implementation rather than the contract it exists to protect.
+    and re.search(
+        r'remote_head="\$\(vm clangarm64 "cd \S+ && git rev-parse --verify HEAD"\)"',
+        sync_case.group("body"),
+    )
     and 'test \\"\\$(git rev-parse --verify HEAD)\\"' not in sync_case.group("body"),
     "win.sh sync must compare the remote HEAD locally instead of nesting shell quotes through "
     "cmd.exe",

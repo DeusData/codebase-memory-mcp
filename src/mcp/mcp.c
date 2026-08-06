@@ -64,6 +64,7 @@ enum {
 #include "mcp/index_supervisor.h"
 #include "mcp/compact_out.h"
 #include "foundation/str_util.h"
+#include "foundation/workspace.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
@@ -7895,17 +7896,24 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     repo_path = canonicalize_repo_path_if_exists(repo_path);
 
-    /* Optional workspace boundary. Embedded/daemon sessions always use their
-     * explicit policy, including an explicit NULL meaning unrestricted. A
-     * standalone server retains the process-wide CBM_ALLOWED_ROOT fallback. */
+    /* Workspace boundary. Embedded/daemon sessions supply their explicit policy,
+     * including an explicit NULL meaning unrestricted; a standalone server falls
+     * back to the process-wide CBM_ALLOWED_ROOT. The decision itself lives in one
+     * shared function so this handler and the HTTP UI indexing route cannot drift
+     * apart — they had, and the divergence was the defect. */
     const char *allowed_root =
         srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
-    if (allowed_root && allowed_root[0] && repo_path &&
-        !cbm_path_within_root(allowed_root, repo_path)) {
+    /* repo_path is legitimately absent when the caller names an already-known
+     * project instead; the root is resolved downstream. Only a path supplied here
+     * is classified here — the previous check had the same tolerance. */
+    char boundary_err[CBM_SZ_1K];
+    if (repo_path && repo_path[0] &&
+        !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                    allowed_root, boundary_err, sizeof(boundary_err))) {
         free(mode_str);
         free(name_override);
         free(repo_path);
-        return cbm_mcp_text_result("repo_path is outside the allowed root", true);
+        return cbm_mcp_text_result(boundary_err, true);
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {

@@ -6,7 +6,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY="${ROOT}/build/c/codebase-memory-mcp"
+# scripts/test.sh builds into $BUILD_DIR, which is NOT build/c on every leg (the
+# Linux containers use build/linux-arm64 / build/linux-amd64). Honour the binary
+# the caller built, exactly as test_parent_watchdog.sh and test_worker_watchdog.sh
+# do; the build/c default keeps a bare manual invocation working.
+BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
 if [[ ! -x "${BINARY}" && -x "${BINARY}.exe" ]]; then
   BINARY="${BINARY}.exe"
 fi

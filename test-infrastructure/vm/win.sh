@@ -88,6 +88,24 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 [ -f "$CONFIG" ] && . "$CONFIG"
 HOST="${CBM_VM_HOST:?set CBM_VM_HOST in ~/.claude/cbm-vm/config}"
 USER_="${CBM_VM_USER:-test}"
+
+# ── Per-run checkout (the VM's last shared-state hazard) ─────────────────────
+# The VM holds ONE working tree at /c/cbm, and `update`/`sync` REPLACE it
+# (`git reset --hard` + `clean -fdx`). A second session syncing its own branch
+# therefore swaps the code under a running leg — observed 2026-08-06, where a
+# gate run on main compiled another branch's files and died on a header that
+# does not exist on Windows. That is worse than a red: it is a confident wrong
+# answer about the wrong tree.
+#
+# Setting CBM_CI_RUN_ID gives this run its own checkout, cloned from /c/cbm.
+# A local clone hardlinks .git/objects, so it costs seconds and little disk.
+# Unset (the default) keeps the historical single-tree behaviour.
+VM_BASE_REPO="/c/cbm"
+if [ -n "${CBM_CI_RUN_ID:-}" ]; then
+    VM_REPO="/c/cbm-run-${CBM_CI_RUN_ID}"
+else
+    VM_REPO="$VM_BASE_REPO"
+fi
 HOST_KEY="${CBM_VM_HOST_KEY_SHA256:?set CBM_VM_HOST_KEY_SHA256 in ~/.claude/cbm-vm/config}"
 LOCAL_BRANCH="$(git -C "$ROOT" branch --show-current)"
 BRANCH="${CBM_VM_BRANCH:-${LOCAL_BRANCH:-main}}"
@@ -117,6 +135,38 @@ SCP=(scp "${SSH_OPTIONS[@]}")
 
 vm() { local env="$1"; shift
       "${SSH[@]}" "C:\\msys64\\msys2_shell.cmd -defterm -no-start -${env} -c \"set -e -o pipefail; $*\""; }
+
+# Create this run's own checkout if it does not exist yet. A LOCAL clone
+# hardlinks .git/objects, so it is seconds and near-zero disk rather than a
+# fresh network clone. No-op when running in the shared (default) tree.
+vm_ensure_run_checkout() {
+    [ "$VM_REPO" = "$VM_BASE_REPO" ] && return 0
+    # `git clone --local` points origin at the base PATH, so a later
+    # `fetch origin <branch>` would resolve against whatever the base happens
+    # to hold (i.e. another session's state) instead of GitHub. Inherit the
+    # base's real origin URL so the isolated tree fetches independently.
+    # The substitution is single-quoted here so it expands in the REMOTE shell
+    # (same pattern as JOBS above); nested double quotes do not survive the
+    # cmd.exe -> msys2_shell wrapper.
+    local base_url_expr='$(git -C '"$VM_BASE_REPO"' remote get-url origin)'
+    vm clangarm64 "[ -d '$VM_REPO/.git' ] || git clone --local '$VM_BASE_REPO' '$VM_REPO'"
+    vm clangarm64 "git -C '$VM_REPO' remote set-url origin $base_url_expr"
+}
+
+# The VM tree must be the one the caller means. A concurrent session running
+# `update`/`sync` in the SHARED tree swaps it mid-flight, and the leg then
+# reports a confident verdict about someone else's branch. Callers assert the
+# expected HEAD; a mismatch fails loudly instead of producing that verdict.
+vm_assert_head() {
+    local want="$1" got
+    got="$(vm clangarm64 "cd $VM_REPO && git rev-parse --verify HEAD" | tr -d '\r')"
+    if [ "$got" != "$want" ]; then
+        echo "FATAL: VM tree $VM_REPO is at $got, expected $want." >&2
+        echo "       Another session likely re-synced the shared checkout." >&2
+        echo "       Re-run with CBM_CI_RUN_ID set to get an isolated tree." >&2
+        return 1
+    fi
+}
 vm_cmd() { "${SSH[@]}" "$@"; } # plain cmd.exe (CI-shaped environment)
 
 # A GitHub runner is ephemeral: every job starts on a fresh image with a
@@ -157,13 +207,25 @@ esac
 case "$cmd" in
 status)
     "${SSH[@]}" "echo VM_REACHABLE & ver"
-    vm clangarm64 "cd /c/cbm 2>/dev/null && git log --oneline -1 && ls -la build/c/codebase-memory-mcp.exe build/c/test-runner.exe 2>/dev/null || echo 'repo/build missing — run provision-windows.sh'"
+    vm clangarm64 "cd $VM_REPO 2>/dev/null && git log --oneline -1 && ls -la build/c/codebase-memory-mcp.exe build/c/test-runner.exe 2>/dev/null || echo 'repo/build missing — run provision-windows.sh'"
     ;;
 update)
-    vm clangarm64 "cd /c/cbm && git fetch origin ${BRANCH} && git reset --hard FETCH_HEAD && git clean -fdx && git log --oneline -1"
+    vm_ensure_run_checkout
+    vm clangarm64 "cd $VM_REPO && git fetch origin ${BRANCH} && git reset --hard FETCH_HEAD && git clean -fdx && git log --oneline -1"
     exec "$0" build
     ;;
+drop-run-checkout)
+    # Explicit tidy-up of THIS run's checkout (no-op in shared mode). The run
+    # that created it removes it; nothing else may, since another session's
+    # tree must never be deleted out from under it.
+    if [ "$VM_REPO" = "$VM_BASE_REPO" ]; then
+        echo "win.sh: shared checkout ($VM_BASE_REPO) — nothing to drop" >&2
+    else
+        vm clangarm64 "rm -rf '$VM_REPO' && echo dropped $VM_REPO"
+    fi
+    ;;
 sync)
+    vm_ensure_run_checkout
     local_head="$(git -C "$ROOT" rev-parse --verify HEAD)"
     WIN_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-manifest.XXXXXX")"
     WIN_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-worktree.XXXXXX.tar")"
@@ -172,25 +234,25 @@ sync)
     cbm_vm_write_untracked_manifest "$ROOT" "$WIN_MANIFEST"
     COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
         -C "$ROOT" --null -T "$WIN_MANIFEST" -cf "$WIN_ARCHIVE"
-    remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"
+    remote_head="$(vm clangarm64 "cd $VM_REPO && git rev-parse --verify HEAD")"
     remote_head="${remote_head//$'\r'/}"
     if [ "$remote_head" != "$local_head" ]; then
         echo "FATAL: Windows VM is at $remote_head, expected local HEAD $local_head; run win.sh update first." >&2
         exit 1
     fi
     vm clangarm64 \
-        "cd /c/cbm && git reset --hard '$local_head' && git clean -fdx"
+        "cd $VM_REPO && git reset --hard '$local_head' && git clean -fdx"
     if [ -s "$WIN_PATCH" ]; then
         "${SSH[@]}" \
-            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd /c/cbm && git apply --binary --whitespace=nowarn -"' \
+            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd $VM_REPO && git apply --binary --whitespace=nowarn -"' \
             <"$WIN_PATCH"
     fi
     if [ -s "$WIN_MANIFEST" ]; then
         "${SSH[@]}" \
-            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd /c/cbm && tar -xf -"' \
+            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd $VM_REPO && tar -xf -"' \
             <"$WIN_ARCHIVE"
     fi
-    vm clangarm64 "cd /c/cbm && git status --short --branch"
+    vm clangarm64 "cd $VM_REPO && git status --short --branch"
     win_cleanup
     exec "$0" build
     ;;
@@ -201,7 +263,7 @@ build)
     # NOT via CC='ccache clang', which bypassed the verified-cache env layer.
     # The test-runner is no longer built here: the test leg (scripts/test.sh)
     # builds its own runner, same as CI's test jobs.
-    vm clangarm64 "cd /c/cbm && scripts/build.sh CC=clang CXX=clang++ > /tmp/win-build.log 2>&1 && echo BUILD_OK || (echo BUILD_FAIL; tail -20 /tmp/win-build.log; exit 1)"
+    vm clangarm64 "cd $VM_REPO && scripts/build.sh CC=clang CXX=clang++ > /tmp/win-build.log 2>&1 && echo BUILD_OK || (echo BUILD_FAIL; tail -20 /tmp/win-build.log; exit 1)"
     ;;
 test)
     [ $# -ge 1 ] || { echo "usage: win.sh test <suite...>" >&2; exit 2; }
@@ -210,7 +272,12 @@ test)
     # protected per-user temp root via vm-run-tests.sh, which streams FULL
     # output and refuses to report success without the runner's completion
     # summary. A `| tail -40` here once hid 40 real Windows failures.
-    vm clangarm64 "cd /c/cbm && bash test-infrastructure/vm/vm-run-tests.sh $*"
+    # CBM_VM_EXPECT_HEAD=<sha> asserts the tree is the one the caller means
+    # before spending a leg on it — cheap insurance against a concurrent
+    # session having re-synced the shared checkout.
+    [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
+    vm clangarm64 "cd $VM_REPO && bash test-infrastructure/vm/vm-run-tests.sh $*"
+    [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
     ;;
 guards)
     # Match the Windows CI product build: a clean, embedded-UI product binary.
@@ -222,7 +289,7 @@ guards)
     # needs the official MSVC Node.js (/c/node, from provision-windows.sh):
     # MSVC-built npm native modules cannot resolve Node-API symbols against
     # MSYS2's mingw node.
-    vm clangarm64 "export PATH=/c/node:\$PATH && cd /c/cbm && scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= BUILD_DIR=build/guards"
+    vm clangarm64 "export PATH=/c/node:\$PATH && cd $VM_REPO && scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= BUILD_DIR=build/guards"
     # The guards themselves run through plain cmd/PowerShell, exactly like the
     # CI job: under the MSYS2 shell TMP is C:\msys64\tmp, whose ancestry
     # grants mutation rights to Authenticated Users — the daemon's
@@ -238,14 +305,14 @@ smoke-install)
     # build/c (including any test-runner) just as CI's separate jobs imply;
     # ccache keeps the rebuild to minutes — parity was the explicit user call
     # over incremental speed here.
-    vm clangarm64 "cd /c/cbm && scripts/build.sh CC=clang CXX=clang++ && bash test-infrastructure/vm/vm-smoke.sh"
+    vm clangarm64 "cd $VM_REPO && scripts/build.sh CC=clang CXX=clang++ && bash test-infrastructure/vm/vm-smoke.sh"
     ;;
 smoke-artifact)
     # The release-archive flow with local bytes: canonical build → the ONE
     # package-release.sh → extract → vm-smoke.sh in artifact mode — the same
     # sequence _build.yml + _smoke.yml run remotely, so archive-layout bugs
     # surface here instead of in a release dry run.
-    vm clangarm64 "cd /c/cbm && bash scripts/ci/smoke-artifact.sh windows arm64 CC=clang CXX=clang++"
+    vm clangarm64 "cd $VM_REPO && bash scripts/ci/smoke-artifact.sh windows arm64 CC=clang CXX=clang++"
     ;;
 soak)
     duration="${1:-10}"
@@ -256,7 +323,7 @@ soak)
         echo "usage: win.sh soak [positive-minutes]" >&2
         exit 2
     fi
-    vm clangarm64 "cd /c/cbm && CBM_VM_TEST_LOG=/tmp/win-soak.log bash \
+    vm clangarm64 "cd $VM_REPO && CBM_VM_TEST_LOG=/tmp/win-soak.log bash \
         test-infrastructure/vm/vm-run-tests.sh --soak '$duration'"
     ;;
 sh)
@@ -273,11 +340,11 @@ ubsan-build)
     # Validated: UBSan needs no interceptors, so it builds, runs, AND reports
     # correctly under emulation. (ASan does NOT: no aarch64 runtime exists and
     # the x86_64 runtime faults in emulated process-init — ASan stays CI-only.)
-    vm clang64 "cd /c/cbm && make -j${JOBS} -f Makefile.cbm CC=clang CXX=clang++ SANITIZE='-fsanitize=undefined -fno-omit-frame-pointer' build/c/test-runner > /tmp/win-ubsan-build.log 2>&1 && echo UBSAN_BUILD_OK || (echo UBSAN_BUILD_FAIL; tail -20 /tmp/win-ubsan-build.log; exit 1)"
+    vm clang64 "cd $VM_REPO && make -j${JOBS} -f Makefile.cbm CC=clang CXX=clang++ SANITIZE='-fsanitize=undefined -fno-omit-frame-pointer' build/c/test-runner > /tmp/win-ubsan-build.log 2>&1 && echo UBSAN_BUILD_OK || (echo UBSAN_BUILD_FAIL; tail -20 /tmp/win-ubsan-build.log; exit 1)"
     ;;
 ubsan-test)
     [ $# -ge 1 ] || { echo "usage: win.sh ubsan-test <suite...>" >&2; exit 2; }
-    vm clang64 "cd /c/cbm && CBM_VM_TEST_LOG=/tmp/win-ubsan-test.log bash test-infrastructure/vm/vm-run-tests.sh $*"
+    vm clang64 "cd $VM_REPO && CBM_VM_TEST_LOG=/tmp/win-ubsan-test.log bash test-infrastructure/vm/vm-run-tests.sh $*"
     ;;
 trap-ubsan-build)
     # NATIVE ARM64 UBSan via trap mode. -fsanitize-trap=undefined needs NO
@@ -289,13 +356,13 @@ trap-ubsan-build)
     # fired, reproduce under the emulated `win.sh ubsan-build`/`ubsan-test`,
     # which carries the full runtime + message. BUILD_DIR isolated so it never
     # clobbers the plain test-runner.
-    vm clangarm64 "cd /c/cbm && make -j${JOBS} -f Makefile.cbm CC='ccache clang' CXX='ccache clang++' SANITIZE='-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer' BUILD_DIR=build/trap-ubsan build/trap-ubsan/test-runner > /tmp/win-trap-ubsan-build.log 2>&1 && echo TRAP_UBSAN_BUILD_OK || (echo TRAP_UBSAN_BUILD_FAIL; tail -20 /tmp/win-trap-ubsan-build.log; exit 1)"
+    vm clangarm64 "cd $VM_REPO && make -j${JOBS} -f Makefile.cbm CC='ccache clang' CXX='ccache clang++' SANITIZE='-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer' BUILD_DIR=build/trap-ubsan build/trap-ubsan/test-runner > /tmp/win-trap-ubsan-build.log 2>&1 && echo TRAP_UBSAN_BUILD_OK || (echo TRAP_UBSAN_BUILD_FAIL; tail -20 /tmp/win-trap-ubsan-build.log; exit 1)"
     ;;
 trap-ubsan-test)
     [ $# -ge 1 ] || { echo "usage: win.sh trap-ubsan-test <suite...>" >&2; exit 2; }
     # A UB trap crashes the runner with SIGILL (exit 132); the harness reports
     # the failing suite so the emulated diagnosis loop can name the check.
-    vm clangarm64 "cd /c/cbm && CBM_VM_RUNNER=build/trap-ubsan/test-runner CBM_VM_TEST_LOG=/tmp/win-trap-ubsan-test.log bash test-infrastructure/vm/vm-run-tests.sh $*"
+    vm clangarm64 "cd $VM_REPO && CBM_VM_RUNNER=build/trap-ubsan/test-runner CBM_VM_TEST_LOG=/tmp/win-trap-ubsan-test.log bash test-infrastructure/vm/vm-run-tests.sh $*"
     ;;
 pageheap)
     # OS-level heap verification (page-granular overflow/UAF detection) for the
@@ -318,7 +385,7 @@ test-par)
     # under the CI-shaped protected temp root with FULL output (this leg once
     # ran under the MSYS-shared /tmp and piped through `tail -25` — the same
     # truncated-blindness class that hid 40 Windows failures from `test`).
-    vm clangarm64 "cd /c/cbm && CBM_VM_TEST_LOG=/tmp/win-test-par.log bash test-infrastructure/vm/vm-run-tests.sh --par"
+    vm clangarm64 "cd $VM_REPO && CBM_VM_TEST_LOG=/tmp/win-test-par.log bash test-infrastructure/vm/vm-run-tests.sh --par"
     ;;
 help | -h | --help)
     print_help

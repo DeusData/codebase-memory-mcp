@@ -188,6 +188,7 @@ FOUNDATION_SRCS = \
     src/foundation/str_intern.c \
     src/foundation/log.c \
     src/foundation/str_util.c \
+    src/foundation/workspace.c \
     src/foundation/platform.c \
     src/foundation/system_info.c \
     src/foundation/slab_alloc.c \
@@ -453,6 +454,7 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_intern.c \
     tests/test_log.c \
     tests/test_str_util.c \
+    tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
     tests/test_dump_verify.c \

@@ -280,7 +280,7 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 # still exits nonzero for the user-facing tool error, but the supervisor must
 # preserve that response instead of misreporting exit_nonzero as a file crash.
 echo "=== Step 5c: worker error-response transport regression ==="
-bash "$ROOT/tests/test_worker_error_response.sh"
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.sh"
 
 # Step 5d (#1388) is DELIBERATELY NOT GATING HERE — see
 # tests/test_hook_conflict_notice.sh for the full what-was-tried record.

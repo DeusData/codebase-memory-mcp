@@ -603,6 +603,7 @@ extern void suite_dyn_array(void);
 extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
+extern void suite_workspace(void);
 extern void suite_platform(void);
 extern void suite_diagnostics(void);
 extern void suite_subprocess(void);
@@ -848,6 +849,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(str_intern);
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
+    RUN_SELECTED_SUITE(workspace);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(diagnostics);
     RUN_SELECTED_SUITE(subprocess);
