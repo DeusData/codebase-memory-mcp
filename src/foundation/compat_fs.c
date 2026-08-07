@@ -310,8 +310,13 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
         *stage = "cmdline";
         *gle = ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, NULL, &si.StartupInfo, &pi);
+        /* CREATE_NO_WINDOW: the MCP server runs with no attached console, so
+         * without this flag every `cmd.exe /c <git...>` spawn allocates a
+         * fresh console that flashes on screen. Stdio is already redirected
+         * to the pipe/NUL above, so no console window is ever needed. */
+        const DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, creation_flags, NULL, NULL,
+                                 &si.StartupInfo, &pi);
         if (!created) {
             *stage = "spawn";
             *gle = GetLastError();
@@ -685,7 +690,7 @@ int cbm_exec_no_shell(const char *const *argv) {
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         free(cmdline);
         return CBM_NOT_FOUND;
     }
