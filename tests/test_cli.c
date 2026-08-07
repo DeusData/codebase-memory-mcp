@@ -8070,6 +8070,22 @@ TEST(cli_codex_session_hook_issue330) {
     ASSERT_NULL(strstr(d, "hooks.SubagentStart"));
     ASSERT(strstr(d, "[mcp_servers.other]") != NULL); /* still preserved after removal */
 
+    /* #1432: Codex may normalize the owned reminder to an inline assignment
+     * and discard our markers. Reinstall must replace that assignment instead
+     * of appending a duplicate TOML key. */
+    write_test_file(cfg, "[hooks]\n"
+                         "SessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = [{ "
+                         "type = \"command\", command = \"echo \\\"Code discovery: prefer "
+                         "codebase-memory-mcp\\\"\" }] }]\n\n"
+                         "[mcp_servers.codebase-memory-mcp]\n"
+                         "command = \"/Users/me/.local/bin/codebase-memory-mcp\"\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_NULL(strstr(d, "SessionStart = ["));
+    ASSERT_NOT_NULL(strstr(d, "[[hooks.SessionStart]]"));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -8985,30 +9001,100 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
     test_mkdirp(codex_dir);
 
+    char binary_dir[512];
+    char binary_path[640];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(binary_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    write_test_file(binary_path, "installed binary must survive failed cleanup\n");
+
+    char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CODEX_HOME");
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
     char hooks_path[640];
     char config_path[640];
     snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    int first_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *first = read_test_file_alloc(config_path);
+    int repeat_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *repeated = read_test_file_alloc(config_path);
+    int dry_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_dry = read_test_file_alloc(config_path);
+
+    write_test_file(config_path,
+                    "[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", "
+                    "hooks = [{ type = \"command\", command = \"echo \\\"Code discovery: "
+                    "prefer codebase-memory-mcp\\\"\" }] }]\n");
     write_test_file(hooks_path, "{}\n");
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int migration_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
 
     char *toml = read_test_file_alloc(config_path);
     char *hooks = read_test_file_alloc(hooks_path);
-    bool migrated = toml && !strstr(toml, "codebase-memory-mcp SessionStart") && hooks &&
+    bool lifecycle_ok = first_rc == 0 && repeat_rc == 0 && dry_rc == 0 && first && repeated &&
+                        after_dry && strcmp(first, repeated) == 0 && strcmp(first, after_dry) == 0;
+    bool migrated = migration_rc == 0 && toml && !strstr(toml, "SessionStart") && hooks &&
                     strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart");
+    free(first);
+    free(repeated);
+    free(after_dry);
     free(toml);
     free(hooks);
+
+    const char *ambiguous =
+        "[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = ["
+        "{ type = \"command\", command = 'echo \"Code discovery: prefer "
+        "codebase-memory-mcp\"' }, { type = \"command\", command = \"foreign\" }] }]\n";
+    write_test_file(config_path, ambiguous);
+    char *uninstall_argv[] = {"--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(1, uninstall_argv);
+    char skill_path[768];
+    char agent_path[768];
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_dir);
+    snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.toml", codex_dir);
+    struct stat state;
+    hooks = read_test_file_alloc(hooks_path);
+    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) == 0 &&
+                               stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0 &&
+                               hooks && !strstr(hooks, "hook-augment");
+    free(hooks);
+
+    char bad_home[256];
+    snprintf(bad_home, sizeof(bad_home), "/tmp/cli-codex-preflight-XXXXXX");
+    bool no_partial = false;
+    if (cbm_mkdtemp(bad_home)) {
+        char bad_codex[512];
+        char bad_config[640];
+        char bad_agents[640];
+        snprintf(bad_codex, sizeof(bad_codex), "%s/.codex", bad_home);
+        snprintf(bad_config, sizeof(bad_config), "%s/config.toml", bad_codex);
+        snprintf(bad_agents, sizeof(bad_agents), "%s/AGENTS.md", bad_codex);
+        test_mkdirp(bad_codex);
+        write_test_file(bad_config, ambiguous);
+        cbm_setenv("HOME", bad_home, 1);
+        cbm_setenv("PATH", bad_home, 1);
+        int bad_rc = cbm_install_agent_configs(bad_home, binary_path, false, false);
+        char *bad_after = read_test_file_alloc(bad_config);
+        no_partial = bad_rc != 0 && bad_after && strcmp(bad_after, ambiguous) == 0 &&
+                     stat(bad_agents, &state) != 0;
+        free(bad_after);
+        test_rmdir_r(bad_home);
+    }
+    restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!migrated)
-        FAIL("Codex install must leave exactly one lifecycle hook representation");
+    if (!lifecycle_ok || !migrated || !independent_cleanup || !no_partial)
+        FAIL("Codex lifecycle preflight must be idempotent, transactional, and independently "
+             "clean owned side files");
     PASS();
 }
 
