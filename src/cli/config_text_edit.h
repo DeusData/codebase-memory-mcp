@@ -29,6 +29,11 @@ int cbm_text_ensure_owned_document(const char *file_path, const char *owned_cont
 /* Create current content, preserve it when already current, or atomically
  * upgrade only an exact byte-for-byte previously released document. Returns
  * 1 for user-modified/unowned content. */
+/* Read-only: would a migrate succeed? 0 = yes (absent/current/exact released),
+ * 1 = refused (other bytes present), -1 = unsafe. Lets `install --dry-run`
+ * predict a refusal instead of promising an install it cannot deliver. */
+int cbm_text_owned_document_status(const char *file_path, const char *current_content,
+                                   const char *const *released_contents, size_t released_count);
 int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
                                     const char *const *released_contents, size_t released_count);
 /* As above, but publish the owned document with the requested low permission

@@ -1,11 +1,23 @@
 # Manual trigger: test everything before pushing a release.
 # Each step can be skipped for faster iteration.
 #
-# Pipeline:  lint → test → build → smoke/soak   (sequential chain)
-# Security:  security-static + codeql-gate       (independent island)
+# Pipeline:  lint → test → build → smoke/soak → virustotal   (sequential chain)
+# Security:  security-static + codeql-gate                    (independent island)
 #
 # Security does NOT block lint/test/build/smoke/soak. All jobs must pass
 # for the overall workflow to be green.
+#
+# VirusTotal runs LAST and scans the same artifacts the release scans, so a
+# detection surfaces here instead of mid-release. It is the one dry-run job
+# whose verdict does not depend on our code: the same unchanged bytes can come
+# back clean one day and flagged the next, which is precisely why finding out
+# during a dry run is worth the wait.
+#
+# Two independent skips, because they answer different questions:
+#   skip_builds      no artifacts at all — "do lint and tests pass?"
+#   skip_virustotal  build + smoke + soak, no scan — "do the archives pass CI?"
+# The second exists because the scan costs API quota and polls for up to two
+# hours, which is pure noise while iterating on a build or smoke failure.
 name: Dry Run
 
 on:
@@ -20,7 +32,11 @@ on:
         type: boolean
         default: false
       skip_builds:
-        description: 'Skip build + smoke'
+        description: 'Skip build + smoke (also skips VirusTotal — nothing to scan)'
+        type: boolean
+        default: false
+      skip_virustotal:
+        description: 'Skip VirusTotal scan (still builds + smokes the archives)'
         type: boolean
         default: false
       soak_level:
@@ -84,3 +100,55 @@ jobs:
     with:
       duration_minutes: 10
       run_asan: ${{ inputs.soak_level == 'full' }}
+
+  # ── VirusTotal (final step) ────────────────────────────────────
+  # Mirrors the release workflow's scan so a dry run answers the question the
+  # release will ask, before we tag anything. The only difference is where the
+  # archives come from: the release pulls them off a published release, a dry
+  # run has none, so they come from the build job's artifacts — the SAME files,
+  # produced by the same canonical package-release.sh.
+  #
+  # Runs after smoke and soak deliberately. It is the slowest job (polling can
+  # take up to two hours) and the one most likely to be waiting on someone
+  # else's queue, so it must not delay the feedback that is actually about our
+  # code.
+  virustotal:
+    if: ${{ inputs.skip_builds != true && inputs.skip_virustotal != true && !cancelled() && needs.build.result == 'success' && needs.smoke.result != 'failure' && needs.soak.result != 'failure' }}
+    needs: [build, smoke, soak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: assets
+
+      # Same extraction the release verify job performs, so the bytes handed to
+      # VirusTotal here are the bytes a user would download and run.
+      - name: Extract archive artifacts
+        run: scripts/ci/extract-release-archives.sh assets binaries
+
+      - name: VirusTotal scan
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
+        id: virustotal
+        with:
+          vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
+          files: binaries/*
+
+      # Same ZERO-tolerance gate as the release. A detection here is a real
+      # finding even when it is a false positive: it is what the release gate
+      # will do, so the dry run should say so now. Resolve it upstream (vendor
+      # false-positive submission for the exact hashes, then re-run) — never by
+      # loosening this gate.
+      - name: Wait for VirusTotal results
+        env:
+          VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
+          VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
+        run: scripts/ci/check-virustotal.sh

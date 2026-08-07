@@ -75,7 +75,8 @@ endif
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) $(CFLAGS_EXTRA)
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
+              $(GLOBAL_OVERRIDE_DEFINE) $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
@@ -386,9 +387,34 @@ UI_SRCS = \
 # derives it from the MI_OVERRIDE option); MI_OVERRIDE alone is not read by the
 # source — it is kept here only as this project's prod/test marker.
 MIMALLOC_SRC = vendored/mimalloc/src/static.c
+# Linux belongs on this list too (#1360). The "Unix relies on static-link-order
+# override" strategy described above never actually worked: mimalloc defines
+# malloc/free ONLY when MI_MALLOC_OVERRIDE is set (it gates alloc-override.c),
+# so with the define off there were no strong symbols for the link order to
+# prefer. Measured on the shipped v0.9.1-rc.1 artifacts — linux-arm64 glibc AND
+# musl-static both report 0/6 allocator-owned size classes, i.e. ordinary malloc
+# was going to libc and every purge/reclaim option set in cbm_mem_init applied
+# only to the bound sqlite/tree-sitter populations.
+#
+# The macOS objection does not transfer. That abort is specific to the two-level
+# namespace, where this binary's free becomes mi_free while system libraries keep
+# allocating from the system allocator, so a pointer crossing the boundary hits
+# "mi_free: invalid pointer". ELF is a flat namespace: interposition is
+# process-wide and all-or-nothing, which is the configuration mimalloc is
+# normally deployed in. macOS therefore stays off, deliberately and permanently.
+#
+# TWO defines, switched together in ONE place so they cannot drift:
+# MI_MALLOC_OVERRIDE reaches the mimalloc translation unit and turns the
+# override on; CBM_MEM_GLOBAL_OVERRIDE reaches OUR sources and tells the startup
+# audit what to expect. CBM_MEM_GLOBAL_OVERRIDE goes only into CFLAGS_PROD,
+# because MIMALLOC_CFLAGS_TEST compiles mimalloc with -DMI_OVERRIDE=0 and no
+# override define at all — a test binary has no global override BY CONSTRUCTION
+# and must never be told to expect one, or it warns on every run.
 MIMALLOC_OVERRIDE_DEFINE :=
-ifeq ($(IS_MINGW),yes)
+GLOBAL_OVERRIDE_DEFINE :=
+ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
+GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \

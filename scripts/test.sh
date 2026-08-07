@@ -230,6 +230,9 @@ bash "$ROOT/tests/test_parallel_harness_contract.sh"
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
 
+echo "=== Step 0k: spawn console-window contract (#1427) ==="
+bash "$ROOT/tests/test_spawn_no_window_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 

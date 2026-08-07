@@ -589,14 +589,14 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     /* Compress with zstd */
-    size_t bound = cbm_zstd_compress_bound((int)db_size);
+    size_t bound = cbm_zstd_compress_bound(db_size);
     char *compressed = malloc(bound);
     if (!compressed) {
         free(db_data);
         return artifact_export_fail("compress", NULL, "alloc_compressed_buffer", 0);
     }
 
-    int clen = cbm_zstd_compress(db_data, (int)db_size, compressed, (int)bound, compression_level);
+    int64_t clen = cbm_zstd_compress(db_data, db_size, compressed, bound, compression_level);
     free(db_data);
 
     if (clen <= 0) {

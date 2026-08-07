@@ -105,3 +105,52 @@ const char *cbm_workspace_home_dir(void);
 const char *cbm_workspace_cache_dir(void);
 
 #endif /* CBM_FOUNDATION_WORKSPACE_H */
+
+/*
+ * ── Per-project request manifest (.cbmpathwhitelist) ─────────────────────────
+ *
+ * A repository may ship a manifest listing outside roots it would like indexed
+ * alongside it. The file REQUESTS; it never GRANTS. Both attackers in this
+ * project's threat model can write a file inside a repository — a malicious
+ * indexed repo, and an agent with project write access — so a repo-local file
+ * cannot be authoritative without handing them the boundary.
+ *
+ * Approval is recorded user-level and keyed to a SHA-256 of the manifest bytes,
+ * so editing the file (a `git pull` that widens the requests, say) lapses the
+ * approval and asks again. Without the hash, a repo approved once could widen
+ * itself forever. This is direnv's model, and it is the only shape that keeps the
+ * ergonomics of a checked-in file without making the file a permission slip.
+ */
+
+#define CBM_WS_MANIFEST_NAME ".cbmpathwhitelist"
+
+enum { CBM_WS_MANIFEST_MAX_ENTRIES = 64 };
+
+typedef struct {
+    /* Requested roots, verbatim from the file (already control-char screened). */
+    char entries[CBM_WS_MANIFEST_MAX_ENTRIES][1024];
+    int count;
+    /* SHA-256 hex of the raw file bytes; empty when there is no manifest. */
+    char digest[65];
+    bool present;
+} cbm_ws_manifest_t;
+
+/* Read <project_root>/.cbmpathwhitelist. Returns false only on a malformed file
+ * (an entry containing control characters, or more entries than the cap); a
+ * missing file is success with present=false. */
+bool cbm_workspace_manifest_read(const char *project_root, cbm_ws_manifest_t *out);
+
+/* True when this exact manifest content has been approved for this project. A
+ * changed manifest is a different digest and so is not approved. */
+bool cbm_workspace_manifest_is_approved(const char *cache_dir, const char *project_root,
+                                        const cbm_ws_manifest_t *manifest);
+
+/* Record approval for the manifest currently on disk. Refuses when a requested
+ * entry would not be allowable as a root on its own — approving a manifest must
+ * not become a way around the breadth policy. */
+bool cbm_workspace_manifest_approve(const char *cache_dir, const char *home_dir,
+                                    const char *project_root, char *err, size_t err_sz);
+
+/* True when candidate is at or below an APPROVED manifest entry of project_root. */
+bool cbm_workspace_manifest_allows(const char *cache_dir, const char *home_dir,
+                                   const char *project_root, const char *candidate);

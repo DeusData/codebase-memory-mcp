@@ -1093,10 +1093,21 @@ TEST(mcp_text_result) {
     PASS();
 }
 
-TEST(mcp_text_result_wraps_plain_text_as_structured_content) {
+TEST(mcp_text_result_does_not_duplicate_plain_text_into_structured_content) {
+    /* A non-JSON payload used to be repeated verbatim as
+     * structuredContent {"text": <payload>} beside content[0].text — 2.05x the
+     * payload measured on a 20k-node query_graph, i.e. half the transport budget
+     * and double the tokens for every LLM caller (#1375).
+     *
+     * structuredContent carries STRUCTURE; a string rewrapped in a one-key
+     * object has none, so the empty object is the honest answer and still
+     * satisfies the permissive outputSchema. The payload stays in content. */
     char *json = cbm_mcp_text_result("plain text", false);
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"text\":\"plain text\"}"));
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{}"));
+    ASSERT_NULL(strstr(json, "\"structuredContent\":{\"text\""));
+    /* The payload is still delivered — exactly once. */
+    ASSERT_NOT_NULL(strstr(json, "\"text\":\"plain text\""));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":false"));
     free(json);
     PASS();
@@ -1813,6 +1824,84 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     PASS();
 }
 
+/* EVERY tool, not just the one that was reported.
+ *
+ * The duplication was invisible per-tool: each result looked reasonable on its
+ * own, and only measuring the wire showed half of it was redundant. A guard
+ * pinned to query_graph would not have caught it in search_graph, and would not
+ * catch it in whatever tool is added next. So this enumerates the tool table
+ * itself — a new tool is covered the moment it is registered, with no test edit.
+ *
+ * The invariant: for a NON-error result whose payload is not a JSON object,
+ * structuredContent must not carry the payload a second time. Errors are exempt
+ * and deliberately so — bounded, small, and structuredContent.error is the only
+ * machine-readable form of a failure a client gets. */
+TEST(mcp_every_tool_result_is_duplication_free) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    int tools = cbm_mcp_tool_count();
+    ASSERT_TRUE(tools > 0); /* an empty table would assert nothing at all */
+    int checked = 0;
+
+    for (int i = 0; i < tools; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        ASSERT_NOT_NULL(name);
+        /* Minimal args: most tools error out, which is fine — an error envelope
+         * is still an envelope, and the property must hold for it too. */
+        char *envelope = cbm_mcp_handle_tool(srv, name, "{\"project\":\"test-project\"}");
+        if (!envelope) {
+            continue;
+        }
+        yyjson_doc *doc = yyjson_read(envelope, strlen(envelope), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *content = yyjson_obj_get(root, "content");
+        yyjson_val *first = content ? yyjson_arr_get(content, 0) : NULL;
+        yyjson_val *text_val = first ? yyjson_obj_get(first, "text") : NULL;
+        const char *text = text_val ? yyjson_get_str(text_val) : NULL;
+        yyjson_val *structured = yyjson_obj_get(root, "structuredContent");
+
+        /* outputSchema is declared for every tool, so this stays mandatory. */
+        ASSERT_NOT_NULL(structured);
+        ASSERT_TRUE(yyjson_is_obj(structured));
+
+        yyjson_val *is_error = yyjson_obj_get(root, "isError");
+        bool errored = is_error && yyjson_is_true(is_error);
+
+        if (text && text[0] && !errored) {
+            /* If the payload is itself a JSON object, structuredContent is the
+             * PARSED form and legitimately holds the same data — that is the
+             * spec's structured+serialized pattern, not waste. Only the
+             * non-object case is checked here. */
+            yyjson_doc *as_json = yyjson_read(text, strlen(text), 0);
+            bool payload_is_object = as_json && yyjson_is_obj(yyjson_doc_get_root(as_json));
+            if (as_json) {
+                yyjson_doc_free(as_json);
+            }
+            if (!payload_is_object) {
+                yyjson_val *dup = yyjson_obj_get(structured, "text");
+                if (dup && yyjson_is_str(dup)) {
+                    const char *dup_str = yyjson_get_str(dup);
+                    /* The exact defect: same bytes, twice, in one reply. */
+                    ASSERT_TRUE(!(dup_str && strcmp(dup_str, text) == 0));
+                }
+                checked++;
+            }
+        }
+        yyjson_doc_free(doc);
+        free(envelope);
+    }
+
+    /* If no tool produced a non-JSON payload, this test proved nothing — fail
+     * rather than report a green that was never exercised. */
+    ASSERT_TRUE(checked > 0);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(tool_search_graph_includes_node_properties) {
     /* Node properties are OPT-IN columns in the default TOON output: the
      * default row is qn/label/file/lines/degrees only, `fields` adds the
@@ -1830,7 +1919,11 @@ TEST(tool_search_graph_includes_node_properties) {
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
              "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
+    /* TOON is not a JSON object, so structuredContent stays empty rather than
+     * repeating the whole table a second time (#1375). The payload travels once,
+     * in content. */
+    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{}"));
+    ASSERT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
@@ -10358,7 +10451,8 @@ SUITE(mcp) {
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
     RUN_TEST(mcp_text_result);
-    RUN_TEST(mcp_text_result_wraps_plain_text_as_structured_content);
+    RUN_TEST(mcp_text_result_does_not_duplicate_plain_text_into_structured_content);
+    RUN_TEST(mcp_every_tool_result_is_duplication_free);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
 

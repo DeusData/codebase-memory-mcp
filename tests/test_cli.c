@@ -5955,6 +5955,80 @@ TEST(cli_detected_agent_summary_includes_registry_clients) {
 }
 #endif
 
+#ifndef _WIN32
+/* Regression for #1387 (second half): `install --dry-run` printed all three
+ * hook groups as if they would install, even when the on-disk hook script is
+ * NOT ours and the real run would refuse to rewrite it. The dry run is exactly
+ * where that has to be visible - the reporter could not see the loss coming. */
+TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-dryrun-refusal-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    if (!cbm_mkdir_p(hooks_dir, 0755))
+        FAIL("mkdir hooks_dir failed");
+    /* A gate script that is NOT ours: a manual install pointing at another
+     * binary. The real install refuses to rewrite it (TEXT_UNOWNED). */
+    char gate_path[768];
+    snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(gate_path, "#!/usr/bin/env bash\n"
+                               "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+                               "BIN=\"/opt/tools/cbm/codebase-memory-mcp\"\n"
+                               "exec 0\n");
+
+    const char *const env_names[] = {"HOME", "PATH", "CLAUDE_CONFIG_DIR"};
+    char *saved[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    if (redirected) {
+        (void)cbm_install_agent_configs(tmpdir, "/opt/other/codebase-memory-mcp", false, true);
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+
+    /* The dry run must WARN about the script it cannot rewrite, and must not
+     * claim the search-augmentation hook group as installable. */
+    bool warned = strstr(output, "cbm-code-discovery-gate") != NULL &&
+                  (strstr(output, "not ours") != NULL ||
+                   strstr(output, "would be skipped") != NULL || strstr(output, "refuse") != NULL);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!redirected)
+        FAIL("stdout capture failed");
+    if (!warned)
+        FAIL("dry-run must predict a refused hook-script rewrite (#1387)");
+    PASS();
+}
+#endif
+
 TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-agent-registry-XXXXXX");
@@ -12117,6 +12191,9 @@ SUITE(cli) {
     RUN_TEST(cli_hermes_stable_shell_context_contract);
 #ifndef _WIN32
     RUN_TEST(cli_detected_agent_summary_includes_registry_clients);
+#endif
+#ifndef _WIN32
+    RUN_TEST(cli_dry_run_predicts_refused_hook_script_issue1387);
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);

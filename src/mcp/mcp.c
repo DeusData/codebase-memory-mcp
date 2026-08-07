@@ -302,12 +302,34 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
         }
     }
     if (!has_structured_content) {
-        /* Every advertised MCP tool has an object outputSchema, so even compact
-         * TOON/plain-text and error results must carry a conforming structured
-         * object. Keep the text Content block above for model visibility and
-         * backwards compatibility. */
+        /* Every advertised MCP tool declares an object outputSchema, so a
+         * conforming structuredContent object is mandatory even for compact
+         * TOON/plain-text and error results. What is NOT mandatory is putting
+         * the whole payload in it a second time.
+         *
+         * It used to. For any result that is not a JSON object — which is every
+         * TOON answer, i.e. the large ones — structuredContent was
+         * {"text": <the entire payload>} sitting beside an identical
+         * content[0].text. Measured at 2.05x the payload on a 20k-node
+         * query_graph, so half of every reply was redundant bytes: half the
+         * usable transport budget, and double the tokens billed to every LLM
+         * caller (#1375).
+         *
+         * Nothing is lost by dropping it. structuredContent exists to carry
+         * STRUCTURE, and a string re-wrapped in a one-key object has none —
+         * a client parsing structuredContent.text learns exactly what
+         * content[0].text already told it. The empty object still satisfies
+         * outputSchema ({"type":"object","additionalProperties":true}), and the
+         * JSON branch above is untouched: when a tool really does return an
+         * object, callers still get it parsed.
+         *
+         * Errors keep their payload. They are bounded and small, the duplication
+         * costs nothing measurable, and structuredContent.error is the only
+         * machine-readable form of a failure a client has. */
         yyjson_mut_val *structured = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, structured, is_error ? "error" : "text", text ? text : "");
+        if (is_error) {
+            yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
+        }
         yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);

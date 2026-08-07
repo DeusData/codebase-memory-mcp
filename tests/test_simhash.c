@@ -803,6 +803,45 @@ TEST(pass_similarity_short_funcs_skipped) {
     PASS();
 }
 
+TEST(pass_similarity_empty_graph_no_entries) {
+    /* Zero Function/Method nodes → the entry array is never allocated. The
+     * collect phase must not hand that null base to qsort: glibc declares qsort
+     * nonnull, so passing NULL is UB even at count 0 (#1367).
+     *
+     * WHERE THIS BINDS — read before "verifying" it. Remove the count > 1 guard
+     * in collect_fp_entries and this test still PASSES on macOS (Apple libc does
+     * not mark qsort nonnull) and on an ordinary Linux ASan/UBSan build, which
+     * merely prints "null pointer passed as argument 1" and keeps going. It goes
+     * RED only where UBSan TRAPS (-fno-sanitize-recover), where the process
+     * aborts and the runner exits 1. Measured both ways on ubuntu-arm64:
+     * recovering lane = 25 passed with AND without the guard; trapping lane =
+     * exit 1 without it, 25 passed with it.
+     *
+     * The assertions below are therefore the behavioural half (an empty graph
+     * yields rc 0 and no SIMILAR_TO edges); the UB half is caught by the
+     * trap-UBSan leg alone. Do not read a green recovering-lane run as proof
+     * that the null-base guard is still in place. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test",
+        .repo_path = "/tmp",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+
+    int rc = cbm_pipeline_pass_similarity(&ctx);
+    ASSERT_EQ(rc, 0);
+
+    int sim_count = count_similar_to_edges(gb);
+    ASSERT_EQ(sim_count, 0);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite 4: Full Pipeline Integration (generated test project)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1165,6 +1204,7 @@ SUITE(simhash) {
     RUN_TEST(pass_similarity_edge_properties);
     RUN_TEST(pass_similarity_max_edges_cap);
     RUN_TEST(pass_similarity_short_funcs_skipped);
+    RUN_TEST(pass_similarity_empty_graph_no_entries);
 
     /* Suite 4: Full Pipeline Integration */
     RUN_TEST(pipeline_minhash_end_to_end);
