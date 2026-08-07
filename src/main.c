@@ -52,6 +52,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
+#include "foundation/workspace.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -921,6 +922,105 @@ static void print_help(void) {
 
 /* Try to handle a subcommand (cli/install/uninstall/update/config/--version/--help).
  * Returns -1 if no subcommand matched, otherwise the exit code. */
+/* `allow-root [--approve-sensitive] <path>` — record an indexing root.
+ *
+ * Enrollment lives here, in a command a person types, and deliberately nowhere
+ * else: the whole point of the grant store is that neither an indexed repository
+ * nor a tool caller can widen its own boundary. A confirmation delivered through
+ * the MCP surface would be answered by the same agent that may have been
+ * influenced, so it would not be a human decision at all. */
+static int main_run_allow_root(int argc, char **argv) {
+    const char *path = NULL;
+    bool approve_sensitive = false;
+    bool list_only = false;
+    bool approve_manifest = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--approve-sensitive") == 0) {
+            approve_sensitive = true;
+        } else if (strcmp(argv[i], "--list") == 0) {
+            list_only = true;
+        } else if (strcmp(argv[i], "--approve-manifest") == 0) {
+            approve_manifest = true;
+        } else if (argv[i][0] == '-') {
+            (void)fprintf(stderr, "error: unknown option: %s\n", argv[i]);
+            return EXIT_FAILURE;
+        } else if (!path) {
+            path = argv[i];
+        } else {
+            (void)fprintf(stderr, "error: only one path may be given\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    const char *cache_dir = cbm_workspace_cache_dir();
+    if (!cache_dir || !cache_dir[0]) {
+        (void)fprintf(stderr, "error: cache directory could not be resolved\n");
+        return EXIT_FAILURE;
+    }
+
+    if (list_only || !path) {
+        char listing[CBM_SZ_8K];
+        if (cbm_workspace_grant_list(cache_dir, listing, sizeof(listing))) {
+            printf("allowed roots:\n%s", listing);
+        } else {
+            printf("no allowed roots recorded — indexing is unconfined apart from the "
+                   "always-refused roots (see docs/CONFIGURATION.md)\n");
+        }
+        if (!path && !list_only) {
+            (void)fprintf(stderr,
+                          "usage: codebase-memory-mcp allow-root [--approve-sensitive] <path>\n"
+                          "       codebase-memory-mcp allow-root --approve-manifest <project>\n"
+                          "       codebase-memory-mcp allow-root --list\n");
+            return EXIT_FAILURE;
+        }
+        return 0;
+    }
+
+    if (approve_manifest) {
+        /* Approve the manifest a project ships, keyed to its current content. The
+         * file only ever requests; this is the human action that grants. */
+        char canonical_project[CBM_PATH_MAX];
+        if (!cbm_canonical_path(path, canonical_project, sizeof(canonical_project))) {
+            (void)fprintf(stderr, "error: cannot resolve path: %s\n", path);
+            return EXIT_FAILURE;
+        }
+        char merr[CBM_SZ_1K];
+        if (!cbm_workspace_manifest_approve(cache_dir, cbm_workspace_home_dir(), canonical_project,
+                                            merr, sizeof(merr))) {
+            (void)fprintf(stderr, "refused: %s\n", merr[0] ? merr : "manifest not approvable");
+            return EXIT_FAILURE;
+        }
+        printf("manifest approved for %s\n", canonical_project);
+        printf("note: editing %s lapses this approval and it must be granted again.\n",
+               CBM_WS_MANIFEST_NAME);
+        return 0;
+    }
+
+    /* Canonicalize before recording: the policy is defined over resolved paths,
+     * and a grant stored as a symlink would not match the resolved repo path the
+     * indexer later presents. */
+    char canonical[CBM_PATH_MAX];
+    if (!cbm_canonical_path(path, canonical, sizeof(canonical))) {
+        (void)fprintf(stderr, "error: cannot resolve path: %s\n", path);
+        return EXIT_FAILURE;
+    }
+    if (!cbm_is_dir(canonical)) {
+        (void)fprintf(stderr, "error: not a directory: %s\n", canonical);
+        return EXIT_FAILURE;
+    }
+
+    char err[CBM_SZ_1K];
+    if (!cbm_workspace_grant_add(cache_dir, cbm_workspace_home_dir(), canonical, approve_sensitive,
+                                 err, sizeof(err))) {
+        (void)fprintf(stderr, "refused: %s\n", err[0] ? err : "not an allowable root");
+        return EXIT_FAILURE;
+    }
+    printf("allowed root recorded: %s\n", canonical);
+    printf("note: with at least one root recorded, indexing is now confined to the "
+           "recorded roots.\n");
+    return 0;
+}
+
 static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                              main_local_maintenance_context_t *maintenance_context) {
     /* First scan: global flags */
@@ -937,6 +1037,9 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_help();
             return 0;
+        }
+        if (strcmp(argv[i], "allow-root") == 0) {
+            return main_run_allow_root(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "cli") == 0) {
             cbm_mem_init_with_cap(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram),

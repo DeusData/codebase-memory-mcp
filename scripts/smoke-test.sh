@@ -187,6 +187,58 @@ if ! echo "$OUTPUT" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
 fi
 echo "OK"
 
+echo ""
+echo "=== Phase 1b: allocator override matches this platform's contract ==="
+# Asserts the SHIPPED binary's actual allocator wiring, per platform:
+#
+#   Windows, Linux -> ordinary malloc MUST reach mimalloc (all size classes
+#                     owned). If it does not, every purge/reclaim option in
+#                     cbm_mem_init is decoration and freed pages stay committed
+#                     — that is #581, which hid in production for months
+#                     precisely because nothing asserted it on a real artifact.
+#   macOS          -> it MUST NOT. Enabling the override there aborts on the
+#                     first pointer crossing the two-level-namespace boundary
+#                     ("mi_free: invalid pointer"), so "owned" here would mean
+#                     we shipped a binary that crashes on index.
+#
+# Both directions fail. A silent flip either way is a release blocker, which is
+# why this lives in smoke (real artifact, all platforms) and not only in a unit
+# test built from source.
+ALLOC_LOG=$("$BINARY" cli list_projects 2>&1 >/dev/null || true)
+case "$(uname -s)" in
+  Darwin)
+    if echo "$ALLOC_LOG" | grep -q 'mem.allocator.not_owned'; then
+      echo "FAIL: macOS emitted the not_owned WARNING; expected the by-design"
+      echo "      bound-populations INFO line (see #1360)"
+      exit 1
+    fi
+    if echo "$ALLOC_LOG" | grep -q 'mem.allocator.owned'; then
+      echo "FAIL: macOS reports ordinary malloc as allocator-owned. The override"
+      echo "      must stay OFF here: under the two-level namespace it aborts"
+      echo "      with 'mi_free: invalid pointer' on the first crossing pointer."
+      exit 1
+    fi
+    echo "OK: macOS serves ordinary malloc from the system allocator, no warning"
+    ;;
+  MINGW*|MSYS*|CYGWIN*|Linux)
+    if echo "$ALLOC_LOG" | grep -q 'mem.allocator.not_owned'; then
+      echo "FAIL: ordinary malloc does NOT reach mimalloc on $(uname -s)."
+      echo "      Allocator tuning is inert and freed pages will stay committed (#581/#1360)."
+      echo "$ALLOC_LOG" | grep 'mem.allocator' | head -2
+      exit 1
+    fi
+    if echo "$ALLOC_LOG" | grep -q 'mem.allocator.bound_populations_only'; then
+      echo "FAIL: $(uname -s) reports bound-populations-only; the global override"
+      echo "      is expected to be compiled in on this platform (#1360)."
+      exit 1
+    fi
+    echo "OK: ordinary malloc reaches the allocator on $(uname -s)"
+    ;;
+  *)
+    echo "SKIP: no allocator contract defined for $(uname -s)"
+    ;;
+esac
+
 if [ "$SMOKE_MODE" != "--agent-config-only" ]; then
 echo ""
 echo "=== Phase 2: index test project ==="

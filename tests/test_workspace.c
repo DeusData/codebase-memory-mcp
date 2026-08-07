@@ -6,7 +6,11 @@
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "foundation/workspace.h"
+#include "foundation/compat_fs.h"
+#include <stdio.h>
+#include <string.h>
 
 static const char *HOME = "/Users/dev";
 static const char *CACHE = "/Users/dev/.cache/codebase-memory-mcp";
@@ -155,7 +159,114 @@ TEST(ws_every_verdict_has_a_reason) {
     PASS();
 }
 
+/* ── Per-project request manifest ───────────────────────────────────────── */
+
+static void ws_write(const char *path, const char *body) {
+    FILE *f = cbm_fopen(path, "wb");
+    if (f) {
+        (void)fputs(body, f);
+        (void)fclose(f);
+    }
+}
+
+TEST(ws_manifest_absent_is_not_an_error) {
+    char *base = th_mktempdir("cbm_ws_m0");
+    ASSERT(base != NULL);
+    cbm_ws_manifest_t m;
+    ASSERT_TRUE(cbm_workspace_manifest_read(base, &m));
+    ASSERT_FALSE(m.present);
+    ASSERT_EQ(m.count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(ws_manifest_parses_entries_and_skips_comments) {
+    char *base = th_mktempdir("cbm_ws_m1");
+    ASSERT(base != NULL);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", base, CBM_WS_MANIFEST_NAME);
+    ws_write(path, "# a comment\n/opt/sdk\n\n/srv/protos\n");
+    cbm_ws_manifest_t m;
+    ASSERT_TRUE(cbm_workspace_manifest_read(base, &m));
+    ASSERT_TRUE(m.present);
+    ASSERT_EQ(m.count, 2);
+    ASSERT_STR_EQ(m.entries[0], "/opt/sdk");
+    ASSERT_STR_EQ(m.entries[1], "/srv/protos");
+    ASSERT_EQ((int)strlen(m.digest), 64);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A control character is how a crafted entry would smuggle a second value past a
+ * line reader — the same shape as the newline splitting in the scoped file list. */
+TEST(ws_manifest_rejects_control_characters) {
+    char *base = th_mktempdir("cbm_ws_m2");
+    ASSERT(base != NULL);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", base, CBM_WS_MANIFEST_NAME);
+    ws_write(path, "/opt/sdk\t\x01evil\n");
+    cbm_ws_manifest_t m;
+    ASSERT_FALSE(cbm_workspace_manifest_read(base, &m));
+    ASSERT_EQ(m.count, 0);
+    th_cleanup(base);
+    PASS();
+}
+
+/* THE property the design rests on: a manifest grants nothing until a person
+ * approves it, and editing it lapses that approval rather than inheriting it. */
+TEST(ws_manifest_approval_is_keyed_to_content) {
+    char *base = th_mktempdir("cbm_ws_m3");
+    char *cache = th_mktempdir("cbm_ws_m3c");
+    ASSERT(base != NULL);
+    ASSERT(cache != NULL);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", base, CBM_WS_MANIFEST_NAME);
+    ws_write(path, "/opt/sdk\n");
+
+    cbm_ws_manifest_t before;
+    ASSERT_TRUE(cbm_workspace_manifest_read(base, &before));
+    /* Unapproved grants nothing. */
+    ASSERT_FALSE(cbm_workspace_manifest_is_approved(cache, base, &before));
+
+    char err[1024];
+    ASSERT_TRUE(cbm_workspace_manifest_approve(cache, HOME, base, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_manifest_is_approved(cache, base, &before));
+
+    /* Widen the requests, as a `git pull` would. Approval must lapse. */
+    ws_write(path, "/opt/sdk\n/srv/protos\n");
+    cbm_ws_manifest_t after;
+    ASSERT_TRUE(cbm_workspace_manifest_read(base, &after));
+    ASSERT_TRUE(strcmp(before.digest, after.digest) != 0);
+    ASSERT_FALSE(cbm_workspace_manifest_is_approved(cache, base, &after));
+
+    th_cleanup(base);
+    th_cleanup(cache);
+    PASS();
+}
+
+/* Approving a manifest must not become a route around the breadth policy. */
+TEST(ws_manifest_approval_refuses_overbroad_requests) {
+    char *base = th_mktempdir("cbm_ws_m4");
+    char *cache = th_mktempdir("cbm_ws_m4c");
+    ASSERT(base != NULL);
+    ASSERT(cache != NULL);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", base, CBM_WS_MANIFEST_NAME);
+    ws_write(path, "/etc\n");
+    char err[1024];
+    ASSERT_FALSE(cbm_workspace_manifest_approve(cache, HOME, base, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "too broad") != NULL);
+    th_cleanup(base);
+    th_cleanup(cache);
+    PASS();
+}
+
 SUITE(workspace) {
+    RUN_TEST(ws_manifest_absent_is_not_an_error);
+    RUN_TEST(ws_manifest_parses_entries_and_skips_comments);
+    RUN_TEST(ws_manifest_rejects_control_characters);
+    RUN_TEST(ws_manifest_approval_is_keyed_to_content);
+    RUN_TEST(ws_manifest_approval_refuses_overbroad_requests);
     RUN_TEST(ws_depth_counts_components_below_the_volume);
     RUN_TEST(ws_volume_roots_are_absolutely_denied);
     RUN_TEST(ws_non_absolute_paths_are_denied);

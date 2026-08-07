@@ -7,6 +7,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 
 #include <stdlib.h>
 
@@ -511,6 +512,18 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
      * then applies to paths that ARE inside the declared root but are still too
      * broad to index as one unit. */
     bool boundary_declared = grants > 0 || configured;
+    /* No manifest consultation here, deliberately.
+     *
+     * A project's manifest authorizes outside roots FOR THAT PROJECT, so the
+     * question it answers is "may project P pull in tree T", not "may T be indexed
+     * standalone". This function only ever sees one path, so it has no project
+     * context to ask that question with — an earlier draft passed the candidate as
+     * its own project root, which read a manifest that by definition was not the
+     * one that requested it and so never authorized anything.
+     *
+     * The consuming half belongs where the project context exists: discovery
+     * walking a project's approved extra roots. cbm_workspace_manifest_allows is
+     * the query that half will use. */
     if (boundary_declared && !match.contained && !configured_contains) {
         if (err) {
             /* Keep the "outside the allowed root" wording: changing it broke an
@@ -563,4 +576,215 @@ const char *cbm_workspace_home_dir(void) {
 
 const char *cbm_workspace_cache_dir(void) {
     return cbm_resolve_cache_dir();
+}
+
+/* ── Per-project request manifest ─────────────────────────────────────────── */
+
+bool cbm_workspace_manifest_read(const char *project_root, cbm_ws_manifest_t *out) {
+    if (!out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!project_root || !project_root[0]) {
+        return true; /* nothing to read is not a malformed manifest */
+    }
+
+    char path[WS_LINE_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", project_root, CBM_WS_MANIFEST_NAME);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return true;
+    }
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return true;
+    }
+
+    /* Hash the raw bytes, not the parsed entries: a comment or ordering change is
+     * still a change the approver has not seen, and should lapse approval. */
+    char *raw = NULL;
+    size_t raw_len = 0;
+    char chunk[WS_LINE_MAX];
+    size_t got = 0;
+    while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        char *grown = realloc(raw, raw_len + got);
+        if (!grown) {
+            free(raw);
+            (void)fclose(f);
+            return false;
+        }
+        raw = grown;
+        memcpy(raw + raw_len, chunk, got);
+        raw_len += got;
+    }
+    (void)fclose(f);
+    out->present = true;
+    cbm_sha256_hex(raw ? raw : "", raw_len, out->digest);
+
+    /* Parse entries out of the same bytes. */
+    bool ok = true;
+    size_t line_start = 0;
+    for (size_t i = 0; i <= raw_len && ok; i++) {
+        bool eol = (i == raw_len) || raw[i] == '\n';
+        if (!eol) {
+            continue;
+        }
+        size_t len = i - line_start;
+        while (len > 0 && (raw[line_start + len - 1] == '\r' || raw[line_start + len - 1] == ' ')) {
+            len--;
+        }
+        if (len > 0 && raw[line_start] != '#') {
+            if (len >= sizeof(out->entries[0]) || out->count >= CBM_WS_MANIFEST_MAX_ENTRIES) {
+                ok = false;
+                break;
+            }
+            /* A control character in a path is never legitimate and is exactly how
+             * a crafted entry would try to smuggle a second value past a reader. */
+            for (size_t k = 0; k < len; k++) {
+                unsigned char c = (unsigned char)raw[line_start + k];
+                if (c < 0x20) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                break;
+            }
+            memcpy(out->entries[out->count], raw + line_start, len);
+            out->entries[out->count][len] = '\0';
+            out->count++;
+        }
+        line_start = i + 1;
+    }
+    free(raw);
+    if (!ok) {
+        memset(out, 0, sizeof(*out));
+    }
+    return ok;
+}
+
+static bool ws_approval_path(const char *cache_dir, char *out, size_t out_sz) {
+    if (!cache_dir || !cache_dir[0]) {
+        return false;
+    }
+    int n = snprintf(out, out_sz, "%s/approved_manifests", cache_dir);
+    return n > 0 && (size_t)n < out_sz;
+}
+
+bool cbm_workspace_manifest_is_approved(const char *cache_dir, const char *project_root,
+                                        const cbm_ws_manifest_t *manifest) {
+    if (!manifest || !manifest->present || !manifest->digest[0] || !project_root) {
+        return false;
+    }
+    char store[WS_LINE_MAX];
+    if (!ws_approval_path(cache_dir, store, sizeof(store))) {
+        return false;
+    }
+    FILE *f = cbm_fopen(store, "r");
+    if (!f) {
+        return false;
+    }
+    char line[WS_LINE_MAX];
+    bool found = false;
+    while (!found && fgets(line, (int)sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        char *sep = strchr(line, ' ');
+        if (!sep) {
+            continue;
+        }
+        *sep = '\0';
+        /* Both the digest and the project must match: an approval is for this
+         * content in this project, not for the content anywhere. */
+        found = strcmp(line, manifest->digest) == 0 && ws_paths_equal(sep + 1, project_root);
+    }
+    (void)fclose(f);
+    return found;
+}
+
+bool cbm_workspace_manifest_approve(const char *cache_dir, const char *home_dir,
+                                    const char *project_root, char *err, size_t err_sz) {
+    if (err && err_sz) {
+        err[0] = '\0';
+    }
+    cbm_ws_manifest_t m;
+    if (!cbm_workspace_manifest_read(project_root, &m)) {
+        if (err) {
+            snprintf(err, err_sz,
+                     "%s is malformed (control characters, an over-long entry, or "
+                     "more than %d entries)",
+                     CBM_WS_MANIFEST_NAME, CBM_WS_MANIFEST_MAX_ENTRIES);
+        }
+        return false;
+    }
+    if (!m.present) {
+        if (err) {
+            snprintf(err, err_sz, "no %s in %s", CBM_WS_MANIFEST_NAME,
+                     project_root ? project_root : "(none)");
+        }
+        return false;
+    }
+
+    /* Approving a manifest must not become a way around the breadth policy: every
+     * requested entry has to stand on its own as an indexing root. */
+    for (int i = 0; i < m.count; i++) {
+        cbm_ws_verdict_t v = cbm_workspace_classify_root(m.entries[i], home_dir, cache_dir);
+        if (v != CBM_WS_ALLOW) {
+            if (err) {
+                snprintf(err, err_sz, "requested path %s: %s", m.entries[i],
+                         cbm_workspace_verdict_reason(v));
+            }
+            return false;
+        }
+    }
+
+    char store[WS_LINE_MAX];
+    if (!ws_approval_path(cache_dir, store, sizeof(store))) {
+        if (err) {
+            snprintf(err, err_sz, "cache path too long");
+        }
+        return false;
+    }
+    if (cbm_workspace_manifest_is_approved(cache_dir, project_root, &m)) {
+        return true;
+    }
+    FILE *f = cbm_fopen(store, "a");
+    if (!f) {
+        if (err) {
+            snprintf(err, err_sz, "cannot write %s", store);
+        }
+        return false;
+    }
+    (void)fprintf(f, "%s %s\n", m.digest, project_root);
+    bool ok = fclose(f) == 0;
+    if (!ok && err) {
+        snprintf(err, err_sz, "cannot write %s", store);
+    }
+    return ok;
+}
+
+bool cbm_workspace_manifest_allows(const char *cache_dir, const char *home_dir,
+                                   const char *project_root, const char *candidate) {
+    if (!candidate || !candidate[0]) {
+        return false;
+    }
+    cbm_ws_manifest_t m;
+    if (!cbm_workspace_manifest_read(project_root, &m) || !m.present) {
+        return false;
+    }
+    if (!cbm_workspace_manifest_is_approved(cache_dir, project_root, &m)) {
+        return false;
+    }
+    for (int i = 0; i < m.count; i++) {
+        /* Re-classify at use time as well as at approval time: the credential list
+         * may have grown since, and a stored approval must not outrank it. */
+        if (cbm_workspace_classify_root(m.entries[i], home_dir, cache_dir) != CBM_WS_ALLOW) {
+            continue;
+        }
+        if (cbm_path_within_root(m.entries[i], candidate)) {
+            return true;
+        }
+    }
+    return false;
 }
