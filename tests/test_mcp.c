@@ -9730,6 +9730,116 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ *  ignore_worktrees — explicit index_repository on a linked worktree
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* An EXPLICIT index_repository call is refused only when ignore_worktrees is on
+ * AND repo_path is a linked worktree AND no per-call override was passed. The
+ * refusal must never fire for the MAIN checkout — that would break ordinary
+ * indexing for anyone enabling the key — and index_worktree=true must escape it.
+ *
+ * Probe returns a bit set, or a negative fixture-setup code. */
+enum {
+    IGNORE_WT_REFUSED_WORKTREE = 1, /* expected */
+    IGNORE_WT_REFUSED_MAIN = 2,     /* BUG if set */
+    IGNORE_WT_REFUSED_OVERRIDE = 4, /* BUG if set */
+};
+
+#ifndef _WIN32
+static bool ignore_wt_refused(cbm_mcp_server_t *srv, const char *repo_path, bool override) {
+    char args[2048];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", repo_path,
+             override ? ",\"index_worktree\":true" : "");
+    char *result = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool refused = result && strstr(result, "ignore_worktrees is enabled") != NULL;
+    free(result);
+    return refused;
+}
+
+static int ignore_worktrees_index_probe(void) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-ignorewt-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        return -1;
+    }
+
+    char main_repo[512];
+    char wt_repo[512];
+    snprintf(main_repo, sizeof(main_repo), "%s/main", cache);
+    snprintf(wt_repo, sizeof(wt_repo), "%s/wt", cache);
+    if (th_mkdir_p(main_repo) != 0) {
+        th_rmtree(cache);
+        return -2;
+    }
+
+    /* Minimal repo + one linked worktree. Any git failure => skip, not fail. */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" init -q >/dev/null 2>&1 && "
+             "git -C \"%s\" config user.email t@example.com && "
+             "git -C \"%s\" config user.name T && touch \"%s/.keep\" && "
+             "git -C \"%s\" add .keep && git -C \"%s\" commit -q -m init && "
+             "git -C \"%s\" worktree add -q \"%s\" -b wtb",
+             main_repo, main_repo, main_repo, main_repo, main_repo, main_repo, main_repo, wt_repo);
+    if (system(cmd) != 0) {
+        th_rmtree(cache);
+        return -3;
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    int bits = -4;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    if (cfg) {
+        cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, "true");
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_config(srv, cfg);
+            bits = 0;
+            if (ignore_wt_refused(srv, wt_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_WORKTREE;
+            }
+            if (ignore_wt_refused(srv, main_repo, false)) {
+                bits |= IGNORE_WT_REFUSED_MAIN;
+            }
+            if (ignore_wt_refused(srv, wt_repo, true)) {
+                bits |= IGNORE_WT_REFUSED_OVERRIDE;
+            }
+            cbm_mcp_server_free(srv);
+        }
+        cbm_config_close(cfg);
+    }
+
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+
+    char prune[1024];
+    snprintf(prune, sizeof(prune), "git -C \"%s\" worktree prune >/dev/null 2>&1", main_repo);
+    (void)system(prune);
+    th_rmtree(cache);
+    return bits;
+}
+#endif /* !_WIN32 */
+
+TEST(mcp_ignore_worktrees_gates_explicit_index_repository) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree fixture not implemented for Windows");
+#else
+    int bits = ignore_worktrees_index_probe();
+    if (bits < 0) {
+        PASS(); /* git/tmpdir fixture unavailable — skip */
+    }
+    /* RED before the gate existed: nothing is ever refused. */
+    ASSERT((bits & IGNORE_WT_REFUSED_WORKTREE) != 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_MAIN) == 0);
+    ASSERT((bits & IGNORE_WT_REFUSED_OVERRIDE) == 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
@@ -10647,6 +10757,8 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
+    /* ignore_worktrees gate */
+    RUN_TEST(mcp_ignore_worktrees_gates_explicit_index_repository);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
