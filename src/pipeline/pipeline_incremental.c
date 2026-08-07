@@ -68,6 +68,9 @@ void cbm_pipeline_incremental_test_reset_faults(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, false);
     atomic_store(&g_incr_test_force_legacy_partial, false);
     atomic_store(&g_incr_test_last_route, CBM_INCREMENTAL_ROUTE_NONE);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    cbm_store_test_reset_faults();
+#endif
     cbm_pipeline_persist_test_reset_faults();
 }
 

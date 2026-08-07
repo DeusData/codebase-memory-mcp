@@ -3278,7 +3278,6 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     cbm_pipeline_t *mode_change = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(mode_change);
     ASSERT_EQ(cbm_pipeline_run(mode_change), 0);
-    cbm_incremental_route_t mode_change_route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(mode_change);
 
     metadata_store = cbm_store_open_path(db_path);
@@ -3306,7 +3305,6 @@ TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
     ASSERT_EQ(migrated_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(migrated_hashes_complete);
     ASSERT_STR_EQ(migrated_mode, "fast");
-    ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(full_version, CBM_SEMANTIC_INDEX_VERSION);
     ASSERT_TRUE(full_hashes_complete);
     ASSERT_STR_EQ(full_mode, "full");
@@ -10602,6 +10600,74 @@ TEST(incremental_mode_downgrade_preserves_similarity_for_changed_file) {
     PASS();
 }
 
+TEST(incremental_legacy_mode_metadata_preserves_coverage) {
+    char tmpdir[256];
+    char dbpath[512];
+    ASSERT_EQ(setup_mode_upgrade_repo(tmpdir, sizeof(tmpdir), dbpath, sizeof(dbpath)), 0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    int similarity_edges = cbm_store_count_edges_by_type(store, project, "SIMILAR_TO");
+    ASSERT_GT(similarity_edges, 0);
+
+    cbm_node_t project_node = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project, project, &project_node), CBM_STORE_OK);
+    cbm_node_t legacy_project_node = project_node;
+    legacy_project_node.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(store, &legacy_project_node), 0);
+    cbm_node_free_fields(&project_node);
+
+    char sentinel_qn[512];
+    snprintf(sentinel_qn, sizeof(sentinel_qn), "%s.legacy_coverage_sentinel", project);
+    cbm_node_t sentinel = {.project = project,
+                           .label = "Function",
+                           .name = "legacy_coverage_sentinel",
+                           .qualified_name = sentinel_qn,
+                           .file_path = "legacy-coverage.go",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &sentinel), 0);
+    cbm_store_close(store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, project, "SIMILAR_TO"), similarity_edges);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_node_t sentinel_after = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project, sentinel_qn, &sentinel_after),
+              CBM_STORE_NOT_FOUND);
+    cbm_coverage_meta_t migrated_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &migrated_meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(migrated_meta.index_mode, "moderate");
+    cbm_store_coverage_meta_clear(&migrated_meta);
+    cbm_store_close(store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_incremental_route_t next_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(pipeline);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    free(project);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(next_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
 TEST(incremental_mode_downgrade_preserves_full_extraction_for_changed_file) {
     char tmpdir[256];
     char dbpath[512];
@@ -10779,6 +10845,60 @@ TEST(incremental_missing_mode_metadata_forces_reindex) {
     PASS();
 }
 
+TEST(incremental_mode_metadata_read_error_preserves_db) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_read_error_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"hello\") }\n"),
+              0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    char sentinel_qn[512];
+    snprintf(sentinel_qn, sizeof(sentinel_qn), "%s.read_error_sentinel", project);
+    cbm_node_t sentinel = {.project = project,
+                           .label = "Function",
+                           .name = "read_error_sentinel",
+                           .qualified_name = sentinel_qn,
+                           .file_path = "read-error.go",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &sentinel), 0);
+    cbm_store_close(store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_store_test_fail_find_node_by_qn_step_on_call(2);
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t sentinel_after = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project, sentinel_qn, &sentinel_after),
+              CBM_STORE_OK);
+    cbm_node_free_fields(&sentinel_after);
+    ASSERT_TRUE(project_has_index_mode(store, project, "fast"));
+    cbm_store_close(store);
+
+    free(project);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    PASS();
+}
+
 TEST(incremental_escaped_nul_mode_metadata_forces_reindex) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_nul_XXXXXX");
@@ -10790,7 +10910,7 @@ TEST(incremental_escaped_nul_mode_metadata_forces_reindex) {
                             "package main\n\nfunc main() { println(\"hello\") }\n"),
               0);
 
-    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(pipeline);
     ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
     char *project = strdup(cbm_pipeline_project_name(pipeline));
@@ -12262,10 +12382,12 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(incremental_mode_upgrade_reindexes_capabilities);
     RUN_TEST(incremental_mode_downgrade_preserves_similarity_for_changed_file);
+    RUN_TEST(incremental_legacy_mode_metadata_preserves_coverage);
     RUN_TEST(incremental_mode_downgrade_preserves_full_extraction_for_changed_file);
     RUN_TEST(incremental_noop_downgrade_honors_explicit_persistence);
     RUN_TEST(incremental_changed_file_propagates_explicit_persistence_failure);
     RUN_TEST(incremental_missing_mode_metadata_forces_reindex);
+    RUN_TEST(incremental_mode_metadata_read_error_preserves_db);
     RUN_TEST(incremental_escaped_nul_mode_metadata_forces_reindex);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);

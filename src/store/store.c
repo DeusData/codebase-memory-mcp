@@ -148,6 +148,30 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_file_hashes;
 };
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static atomic_int g_store_test_find_node_by_qn_step_failure_call = 0;
+
+void cbm_store_test_fail_find_node_by_qn_step_on_call(int call_number) {
+    atomic_store(&g_store_test_find_node_by_qn_step_failure_call,
+                 call_number > 0 ? call_number : 0);
+}
+
+void cbm_store_test_reset_faults(void) {
+    atomic_store(&g_store_test_find_node_by_qn_step_failure_call, 0);
+}
+
+static bool store_test_take_find_node_by_qn_step_failure(void) {
+    int remaining = atomic_load(&g_store_test_find_node_by_qn_step_failure_call);
+    while (remaining > 0) {
+        if (atomic_compare_exchange_weak(&g_store_test_find_node_by_qn_step_failure_call,
+                                         &remaining, remaining - 1)) {
+            return remaining == 1;
+        }
+    }
+    return false;
+}
+#endif
+
 /* ── Helpers ────────────────────────────────────────────────────── */
 
 static void store_set_error(cbm_store_t *s, const char *msg) {
@@ -1735,11 +1759,28 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
 
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, qn);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    bool injected_step_failure = store_test_take_find_node_by_qn_step_failure();
+    int rc = injected_step_failure ? SQLITE_IOERR : sqlite3_step(stmt);
+#else
     int rc = sqlite3_step(stmt);
+#endif
     if (rc == SQLITE_ROW) {
         scan_node(stmt, out);
         sqlite3_reset(stmt);
         return CBM_STORE_OK;
+    }
+    if (rc != SQLITE_DONE) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        if (injected_step_failure) {
+            store_set_error(s, "find_node_by_qn: injected step failure");
+        } else
+#endif
+        {
+            store_set_error_sqlite(s, "find_node_by_qn step");
+        }
+        sqlite3_reset(stmt);
+        return CBM_STORE_ERR;
     }
     sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;

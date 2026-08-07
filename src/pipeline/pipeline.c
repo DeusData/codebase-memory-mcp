@@ -258,9 +258,45 @@ static const char *pipeline_mode_name(cbm_index_mode_t mode) {
 
 typedef enum {
     INDEX_MODE_METADATA_OK = 0,
-    INDEX_MODE_METADATA_MISSING_OR_INVALID,
+    INDEX_MODE_METADATA_LEGACY,
+    INDEX_MODE_METADATA_MISSING,
+    INDEX_MODE_METADATA_INVALID,
     INDEX_MODE_METADATA_ERROR,
 } index_mode_metadata_status_t;
+
+static const char *index_mode_metadata_reindex_path(index_mode_metadata_status_t status) {
+    switch (status) {
+    case INDEX_MODE_METADATA_OK:
+        return "mode_upgrade_reindex";
+    case INDEX_MODE_METADATA_LEGACY:
+        return "legacy_mode_metadata_migration";
+    case INDEX_MODE_METADATA_MISSING:
+        return "mode_metadata_missing_reindex";
+    case INDEX_MODE_METADATA_INVALID:
+    case INDEX_MODE_METADATA_ERROR:
+        return "mode_metadata_invalid_reindex";
+    }
+    return "mode_metadata_invalid_reindex";
+}
+
+static bool parse_index_mode_name(const char *mode_name, cbm_index_mode_t *out_mode) {
+    if (!mode_name || !out_mode) {
+        return false;
+    }
+    if (strcmp(mode_name, "full") == 0) {
+        *out_mode = CBM_MODE_FULL;
+        return true;
+    }
+    if (strcmp(mode_name, "moderate") == 0) {
+        *out_mode = CBM_MODE_MODERATE;
+        return true;
+    }
+    if (strcmp(mode_name, "fast") == 0) {
+        *out_mode = CBM_MODE_FAST;
+        return true;
+    }
+    return false;
+}
 
 static index_mode_metadata_status_t parse_index_mode(const char *properties_json,
                                                      cbm_index_mode_t *out_mode) {
@@ -268,20 +304,27 @@ static index_mode_metadata_status_t parse_index_mode(const char *properties_json
         return INDEX_MODE_METADATA_ERROR;
     }
     if (!properties_json || !properties_json[0]) {
-        return INDEX_MODE_METADATA_MISSING_OR_INVALID;
+        return INDEX_MODE_METADATA_MISSING;
     }
 
     yyjson_read_err read_error = {0};
     yyjson_doc *doc =
         yyjson_read_opts((char *)properties_json, strlen(properties_json), 0, NULL, &read_error);
     if (!doc) {
-        return read_error.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION
-                   ? INDEX_MODE_METADATA_ERROR
-                   : INDEX_MODE_METADATA_MISSING_OR_INVALID;
+        return read_error.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION ? INDEX_MODE_METADATA_ERROR
+                                                                      : INDEX_MODE_METADATA_INVALID;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *mode_value = yyjson_is_obj(root) ? yyjson_obj_get(root, "index_mode") : NULL;
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return INDEX_MODE_METADATA_INVALID;
+    }
+    yyjson_val *mode_value = yyjson_obj_get(root, "index_mode");
+    if (!mode_value) {
+        yyjson_doc_free(doc);
+        return INDEX_MODE_METADATA_MISSING;
+    }
     index_mode_metadata_status_t status = INDEX_MODE_METADATA_OK;
     if (yyjson_equals_str(mode_value, "full")) {
         *out_mode = CBM_MODE_FULL;
@@ -290,7 +333,7 @@ static index_mode_metadata_status_t parse_index_mode(const char *properties_json
     } else if (yyjson_equals_str(mode_value, "fast")) {
         *out_mode = CBM_MODE_FAST;
     } else {
-        status = INDEX_MODE_METADATA_MISSING_OR_INVALID;
+        status = INDEX_MODE_METADATA_INVALID;
     }
 
     yyjson_doc_free(doc);
@@ -308,7 +351,7 @@ static index_mode_metadata_status_t read_stored_index_mode(cbm_store_t *store, c
     cbm_node_t node = {0};
     int rc = cbm_store_find_node_by_qn(store, project, project, &node);
     if (rc == CBM_STORE_NOT_FOUND) {
-        return INDEX_MODE_METADATA_MISSING_OR_INVALID;
+        return INDEX_MODE_METADATA_INVALID;
     }
     if (rc != CBM_STORE_OK) {
         return INDEX_MODE_METADATA_ERROR;
@@ -316,7 +359,21 @@ static index_mode_metadata_status_t read_stored_index_mode(cbm_store_t *store, c
 
     index_mode_metadata_status_t status = parse_index_mode(node.properties_json, out_mode);
     cbm_node_free_fields(&node);
-    return status;
+    if (status != INDEX_MODE_METADATA_MISSING) {
+        return status;
+    }
+
+    cbm_coverage_meta_t legacy_meta = {0};
+    rc = cbm_store_coverage_meta_get(store, project, &legacy_meta);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return INDEX_MODE_METADATA_MISSING;
+    }
+    if (rc != CBM_STORE_OK) {
+        return INDEX_MODE_METADATA_ERROR;
+    }
+    bool parsed = parse_index_mode_name(legacy_meta.index_mode, out_mode);
+    cbm_store_coverage_meta_clear(&legacy_meta);
+    return parsed ? INDEX_MODE_METADATA_LEGACY : INDEX_MODE_METADATA_INVALID;
 }
 
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
@@ -1438,7 +1495,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     cbm_store_t *check_store = cbm_store_open_path_query(db_path);
     bool valid = check_store && cbm_store_check_integrity(check_store);
     cbm_index_mode_t stored_mode = CBM_MODE_FAST;
-    index_mode_metadata_status_t stored_mode_status = INDEX_MODE_METADATA_MISSING_OR_INVALID;
+    index_mode_metadata_status_t stored_mode_status = INDEX_MODE_METADATA_MISSING;
     if (check_store) {
         stored_mode_status = read_stored_index_mode(check_store, p->project_name, &stored_mode);
         cbm_store_close(check_store);
@@ -1465,9 +1522,10 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, baseline_manifest,
                                           baseline_count, force_full_on_change);
     } else {
-        cbm_log_info("pipeline.route", "path", "mode_upgrade_reindex", "stored_mode",
-                     stored_mode_status == INDEX_MODE_METADATA_OK ? pipeline_mode_name(stored_mode)
-                                                                  : "unknown",
+        bool has_stored_mode = stored_mode_status == INDEX_MODE_METADATA_OK ||
+                               stored_mode_status == INDEX_MODE_METADATA_LEGACY;
+        cbm_log_info("pipeline.route", "path", index_mode_metadata_reindex_path(stored_mode_status),
+                     "stored_mode", has_stored_mode ? pipeline_mode_name(stored_mode) : "unknown",
                      "requested_mode", pipeline_mode_name(p->mode));
     }
     /* Delete the existing generation ONLY when we are about to rebuild it.
@@ -1520,7 +1578,9 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
     }
     bool promoted = false;
     cbm_index_mode_t stored_mode = p->mode;
-    if (read_stored_index_mode(store, p->project_name, &stored_mode) == INDEX_MODE_METADATA_OK &&
+    index_mode_metadata_status_t status =
+        read_stored_index_mode(store, p->project_name, &stored_mode);
+    if ((status == INDEX_MODE_METADATA_OK || status == INDEX_MODE_METADATA_LEGACY) &&
         pipeline_mode_coverage_rank(stored_mode) > pipeline_mode_coverage_rank(p->mode)) {
         cbm_log_info("pipeline.mode", "requested", pipeline_mode_name(p->mode), "effective",
                      pipeline_mode_name(stored_mode), "reason", "preserve_existing_coverage");
