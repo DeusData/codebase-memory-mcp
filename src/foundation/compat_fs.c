@@ -125,7 +125,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
         return CBM_NOT_FOUND;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
