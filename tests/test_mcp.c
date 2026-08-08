@@ -1950,15 +1950,32 @@ TEST(tool_search_graph_includes_node_properties) {
     free(inner);
     free(resp);
 
+    /* List-valued fields are compact JSON in text output, rather than an
+     * empty placeholder. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":431,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"fields\":[\"base_classes\"],"
+             "\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "base_classes"));
+    ASSERT_NOT_NULL(strstr(inner, "HandlerBase"));
+    ASSERT_NOT_NULL(strstr(inner, "Audited"));
+    free(inner);
+    free(resp);
+
     /* format:"json" = json-stringified tree: same grouped model, column-
      * ordered row arrays — never per-row key envelopes or property blobs.
-     * fields adds columns there too. */
+     * fields adds columns there too and preserves compound JSON types. */
     resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\","
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
              "\"name_pattern\":\"HandleRequest\",\"format\":\"json\","
-             "\"fields\":[\"signature\"],\"limit\":5}}}");
+             "\"fields\":[\"signature\",\"base_classes\"],\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -1967,6 +1984,8 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
     ASSERT_NOT_NULL(strstr(inner, "\"signature\""));      /* requested column */
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest")); /* its value */
+    ASSERT_NOT_NULL(strstr(inner, "\"base_classes\""));
+    ASSERT_NOT_NULL(strstr(inner, "[\"HandlerBase\",\"Audited\"]"));
     ASSERT_NULL(strstr(inner, "is_exported"));            /* blob never spills */
     free(inner);
     free(resp);
@@ -7055,7 +7074,8 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_hr.end_line = 5;
     n_hr.properties_json = "{\"signature\":\"func HandleRequest() error\","
                            "\"return_type\":\"error\","
-                           "\"is_exported\":true}";
+                           "\"is_exported\":true,"
+                           "\"base_classes\":[\"HandlerBase\",\"Audited\"]}";
     int64_t id_hr = cbm_store_upsert_node(st, &n_hr);
 
     cbm_node_t n_po = {0};
