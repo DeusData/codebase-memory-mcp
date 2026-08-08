@@ -7198,6 +7198,54 @@ static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 }
 
+/* The pipeline persists the complete current coverage set before this
+ * response is built. Prefer that set over the per-run errors so incremental
+ * runs that do not revisit a flagged file, and artifact bootstraps, do not
+ * make existing gaps appear to have vanished. By-design exclusions have
+ * their own response surface and are not failures. */
+static bool add_persisted_failure_summaries(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            cbm_store_t *store, const char *project,
+                                            const char *logfile) {
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get(store, project, &rows, &row_count) != CBM_STORE_OK) {
+        return false;
+    }
+
+    int failure_count = 0;
+    for (int i = 0; i < row_count; i++) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "not_indexed_dir") != 0 && strcmp(kind, "not_indexed_file") != 0) {
+            failure_count++;
+        }
+    }
+
+    cbm_file_error_t *failures =
+        failure_count > 0 ? calloc((size_t)failure_count, sizeof(*failures)) : NULL;
+    if (failure_count > 0 && !failures) {
+        cbm_store_free_coverage(rows, row_count);
+        return false;
+    }
+
+    int n = 0;
+    for (int i = 0; i < row_count; i++) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "not_indexed_dir") == 0 || strcmp(kind, "not_indexed_file") == 0) {
+            continue;
+        }
+        failures[n].path = (char *)rows[i].rel_path;
+        failures[n].reason = (char *)rows[i].detail;
+        failures[n].phase = (char *)rows[i].kind;
+        n++;
+    }
+
+    add_skipped_summary(doc, root, failures, failure_count, logfile);
+    add_parse_partial_summary(doc, root, failures, failure_count);
+    free(failures);
+    cbm_store_free_coverage(rows, row_count);
+    return true;
+}
+
 /* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
  * was skipped (no logfile on a clean run). Location:
  *   $CBM_INDEX_LOG (override) else <cache_dir>/logs/<project>-<epoch>.log
@@ -7257,8 +7305,6 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                          const cbm_file_error_t *file_errors, int file_error_count,
                                          const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
-    add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
-    add_parse_partial_summary(doc, root, file_errors, file_error_count);
     add_not_indexed_files_summary(doc, root, p);
 
     int exp_nodes = -1;
@@ -7269,6 +7315,10 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
 
     cbm_store_t *store = resolve_store(srv, project_name);
+    if (!store || !add_persisted_failure_summaries(doc, root, store, project_name, logfile)) {
+        add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
+        add_parse_partial_summary(doc, root, file_errors, file_error_count);
+    }
     int nodes = 0;
     int edges = 0;
     bool degraded = false;
