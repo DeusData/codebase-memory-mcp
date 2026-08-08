@@ -4018,6 +4018,250 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+/* Regression guard: search_code full results must preserve valid UTF-8 source. */
+static bool is_valid_json_response(const char *json);
+
+TEST(search_code_full_preserves_utf8_source) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_utf8_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmp) != NULL);
+
+    char project_dir[640];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", tmp);
+    ASSERT_EQ(cbm_mkdir(project_dir), 0);
+    char design_dir[768];
+    snprintf(design_dir, sizeof(design_dir), "%s/design", project_dir);
+    ASSERT_EQ(cbm_mkdir(design_dir), 0);
+
+    char source_path[768];
+    snprintf(source_path, sizeof(source_path), "%s/design.md", design_dir);
+    FILE *fp = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const char source[] = "# accounting-design\nРусский текст: бухгалтерский учет.\n";
+    ASSERT_EQ(fwrite(source, 1, sizeof(source) - SKIP_ONE, fp), sizeof(source) - SKIP_ONE);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "utf8-search";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, project_dir);
+
+    cbm_node_t section = {.project = project,
+                          .label = "Section",
+                          .name = "accounting-design",
+                          .qualified_name = "utf8-search.design.accounting-design",
+                          .file_path = "design/design.md",
+                          .start_line = 1,
+                          .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &section), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"project\":\"utf8-search\",\"pattern\":\"accounting-design\","
+             "\"file_pattern\":\"*.md\",\"path_filter\":\"^design/\","
+             "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+    ASSERT_NOT_NULL(rows);
+    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+    yyjson_val *row = yyjson_arr_get(rows, 0);
+    yyjson_val *source_obj = yyjson_arr_get(row, 7);
+    yyjson_val *source_val = yyjson_obj_get(source_obj, "source");
+    ASSERT_NOT_NULL(source_val);
+    ASSERT_STR_EQ(yyjson_get_str(source_val), source);
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(source_path);
+    cbm_rmdir(design_dir);
+    cbm_rmdir(project_dir);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(search_code_raw_match_preserves_utf8_content) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char raw_path[512];
+    snprintf(raw_path, sizeof(raw_path), "%s/project/raw.md", tmp);
+    const char raw_source[] = "header\nraw-Русский content\n";
+    FILE *fp = cbm_fopen(raw_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fwrite(raw_source, 1, sizeof(raw_source) - SKIP_ONE, fp),
+              sizeof(raw_source) - SKIP_ONE);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_node_t node = {.project = "test-project",
+                       .label = "Section",
+                       .name = "raw",
+                       .qualified_name = "test-project.raw",
+                       .file_path = "raw.md",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"project\":\"test-project\",\"pattern\":\"raw-\","
+             "\"file_pattern\":\"*.md\",\"format\":\"json\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *raw_obj = yyjson_obj_get(yyjson_doc_get_root(doc), "raw_matches");
+    ASSERT_NOT_NULL(raw_obj);
+    yyjson_val *raw_rows = yyjson_obj_get(raw_obj, "rows");
+    ASSERT_NOT_NULL(raw_rows);
+    ASSERT_TRUE(yyjson_arr_size(raw_rows) > 0);
+    yyjson_val *raw_row = yyjson_arr_get(raw_rows, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(raw_row, 2)), "raw-Русский content");
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(search_code_context_preserves_utf8_context) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char context_path[512];
+    snprintf(context_path, sizeof(context_path), "%s/project/context.md", tmp);
+    const char context_source[] = "before-до\ncontext-needle\nпосле-после\n";
+    FILE *fp = cbm_fopen(context_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fwrite(context_source, 1, sizeof(context_source) - SKIP_ONE, fp),
+              sizeof(context_source) - SKIP_ONE);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_node_t node = {.project = "test-project",
+                       .label = "Section",
+                       .name = "context",
+                       .qualified_name = "test-project.context",
+                       .file_path = "context.md",
+                       .start_line = 1,
+                       .end_line = 3};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"project\":\"test-project\",\"pattern\":\"context-needle\","
+             "\"format\":\"json\",\"context\":1,\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *cols = yyjson_obj_get(root, "cols");
+    yyjson_val *rows = yyjson_obj_get(root, "rows");
+    ASSERT_NOT_NULL(cols);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+
+    size_t context_index = SIZE_MAX;
+    size_t col_count = yyjson_arr_size(cols);
+    for (size_t i = 0; i < col_count; i++) {
+        const char *col = yyjson_get_str(yyjson_arr_get(cols, i));
+        if (col && strcmp(col, "context") == 0) {
+            context_index = i;
+            break;
+        }
+    }
+    ASSERT_TRUE(context_index != SIZE_MAX);
+    yyjson_val *context_obj = yyjson_arr_get(yyjson_arr_get(rows, 0), context_index);
+    ASSERT_NOT_NULL(context_obj);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(context_obj, "context")), context_source);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(context_obj, "context_start")), 1);
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(search_code_invalid_utf8_still_returns_valid_json) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char invalid_path[512];
+    snprintf(invalid_path, sizeof(invalid_path), "%s/project/invalid.md", tmp);
+    static const unsigned char invalid_source[] = {
+        'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 'n', 'e', 'e', 'd', 'l', 'e', '\n',
+        'c', 'o', 'n', 't', 'e', 'x', 't', ' ', 0xFF, '\n',
+    };
+    FILE *fp = cbm_fopen(invalid_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fwrite(invalid_source, 1, sizeof(invalid_source), fp), sizeof(invalid_source));
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_node_t node = {.project = "test-project",
+                       .label = "Section",
+                       .name = "invalid",
+                       .qualified_name = "test-project.invalid",
+                       .file_path = "invalid.md",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"project\":\"test-project\",\"pattern\":\"invalid-needle\","
+             "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(is_valid_json_response(inner));
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+    ASSERT_NOT_NULL(rows);
+    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+    yyjson_val *source_obj = yyjson_arr_get(yyjson_arr_get(rows, 0), 7);
+    ASSERT_NOT_NULL(source_obj);
+    const char *safe_source = yyjson_get_str(yyjson_obj_get(source_obj, "source"));
+    ASSERT_NOT_NULL(safe_source);
+    ASSERT_NOT_NULL(strstr(safe_source, "\xEF\xBF\xBD"));
+    ASSERT_NULL(memchr(safe_source, 0xFF, strlen(safe_source)));
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
  * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
  * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
@@ -10554,6 +10798,10 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_full_preserves_utf8_source);
+    RUN_TEST(search_code_raw_match_preserves_utf8_content);
+    RUN_TEST(search_code_context_preserves_utf8_context);
+    RUN_TEST(search_code_invalid_utf8_still_returns_valid_json);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
