@@ -109,6 +109,10 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #include <stdlib.h>
 #include <string.h>   // strtok_r
 #include <sys/stat.h> // mode_t, S_IXUSR
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 #include <wchar.h>
 #include <zlib.h> // MAX_WBITS
@@ -9044,6 +9048,13 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
 #elif defined(__APPLE__)
     uint32_t sp_sz = (uint32_t)buf_sz;
     exact = _NSGetExecutablePath(buf, &sp_sz) == 0;
+    if (!exact) {
+        buf[0] = '\0';
+    }
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t cb = buf_sz;
+    exact = sysctl(mib, 4, buf, &cb, NULL, 0) == 0 && cb > 0;
     if (!exact) {
         buf[0] = '\0';
     }
