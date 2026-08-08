@@ -7,7 +7,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary — this package downloads and runs it automatically.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 159 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 43 automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 159 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. Zero dependencies. Plug and play across 43 automatic/conditional client surfaces.
 
 ## Installation
 
@@ -36,7 +36,7 @@ Restart your agent. Say **"Index this project"** — done.
 - **Lifecycle hooks stay conservative** — Kimi uses `UserPromptSubmit`; on macOS/Linux, GitLab Duo gets a fail-open user `SessionStart`, while Devin gets `UserPromptSubmit`, `PostCompaction`, and a deduplicated `SessionStart` when Claude does not already provide it. Qoder, GitLab Duo, Devin, and Factory hooks are withheld on Windows without a documented shell/executor contract. Cline's auto-activating file hooks are withheld because their context output is not reliably consumed, CodeBuddy beta hooks are not auto-installed, and Cursor context hooks remain withheld.
 - **Subagent access is explicit** — Claude, Gemini, Kiro, Qwen, CodeBuddy, KiloCode, Mistral Vibe, Qoder, Junie, and Factory get documented graph profiles with the narrowest tool/server filters their schemas support. KiloCode and Vibe enumerate read-only query tools rather than using server wildcards. Cursor, Rovo, Pochi, and Cline use explicit parent handoff where child MCP is unavailable or unsafe; IBM Bob receives no invented hook or agent.
 - **Manual, UI, cloud, or repository-managed (not counted)** — Qodo, Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI, Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection remains manual.
-- **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **15 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Supported Platforms
 
