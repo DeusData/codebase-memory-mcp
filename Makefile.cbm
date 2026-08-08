@@ -722,7 +722,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -1099,6 +1099,12 @@ LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 lint-tidy:
 	@echo "=== clang-tidy ==="
 	@$(CLANG_TIDY) --quiet $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
+
+# clang-tidy, scoped to this commit's staged changes only (scripts/lint-tidy-diff.sh).
+# The pre-commit hook runs this instead of the full lint-tidy sweep above, so a
+# clean commit is not blocked by pre-existing findings elsewhere in the tree.
+lint-tidy-diff:
+	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
 # cppcheck: complementary analysis (config in .cppcheck)
 lint-cppcheck:
