@@ -1,3 +1,5 @@
+[![mcpindex](https://mcpindex.ai/api/v1/badge/io-github-deusdata-codebase-memory-mcp)](https://mcpindex.ai/server/io-github-deusdata-codebase-memory-mcp)
+
 # codebase-memory-mcp
 
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
