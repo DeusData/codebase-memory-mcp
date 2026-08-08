@@ -5695,14 +5695,23 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     return NULL;
 }
 
-/* Check if a file path looks like a test file. */
+/* Check if a file path looks like a test file. The substring checks below
+ * only catch a tests/ directory nested under another path component
+ * (".../tests/foo"); a project-root-relative path like "tests/repro/foo.c"
+ * has no leading slash before "tests" and fell through undetected, leaking
+ * whole test subtrees into query_graph/trace_path results with the default
+ * include_tests=false (#1294). */
 static bool is_test_file(const char *path) {
     if (!path) {
         return false;
     }
     return strstr(path, "/test") != NULL || strstr(path, "test_") != NULL ||
            strstr(path, "_test.") != NULL || strstr(path, "/tests/") != NULL ||
-           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
+           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL ||
+           strncmp(path, "tests/", SLEN("tests/")) == 0 ||
+           strncmp(path, "test/", SLEN("test/")) == 0 ||
+           strncmp(path, "spec/", SLEN("spec/")) == 0 ||
+           strncmp(path, "__tests__/", SLEN("__tests__/")) == 0;
 }
 
 /* Convert BFS traversal results into a yyjson_mut array. */

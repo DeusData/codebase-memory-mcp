@@ -295,6 +295,19 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
     }
     const char *base = path_basename(rel_path);
 
+    /* Directory-based, language-agnostic: a file under a conventional test
+     * directory is a test file regardless of its own basename (e.g.
+     * tests/helpers/fixtures.c, which no per-language suffix/prefix rule
+     * below would otherwise catch). Mirrors the directory set cbm_is_test_path
+     * (src/pipeline/pass_tests.c) already uses for TESTS-edge detection, so
+     * the extraction-time is_test_file flag agrees with it (#1294). */
+    if (strstr(rel_path, "__tests__/") || strstr(rel_path, "/tests/") ||
+        strstr(rel_path, "/test/") || strstr(rel_path, "/spec/") ||
+        has_prefix(rel_path, "tests/") || has_prefix(rel_path, "test/") ||
+        has_prefix(rel_path, "spec/") || has_prefix(rel_path, "__tests__/")) {
+        return true;
+    }
+
     switch (lang) {
     case CBM_LANG_GO:
         return has_suffix(base, "_test.go");
