@@ -294,6 +294,25 @@ if [ -f "$DL_INSTALLER" ]; then
     fi
 fi
 
+# Place the integration-template asset beside the installed binary. `install`
+# above already published a verified copy to ~/.cbm/assets/<version>/, but a
+# later `install`/`uninstall` run from INSTALL_DIR resolves the asset next to
+# the binary FIRST — and without this copy that lookup misses, so a re-run or an
+# uninstall would fail closed with "integration assets missing" even though a
+# valid install just completed. Atomic rename, best effort, same rationale as
+# the installer copy above.
+DL_ASSET="$DLDIR/cbm-integrations.json"
+if [ -f "$DL_ASSET" ]; then
+    ASSET_TMP="$INSTALL_DIR/.cbm-integrations.json.$$"
+    if cp "$DL_ASSET" "$ASSET_TMP" 2>/dev/null &&
+        mv -f "$ASSET_TMP" "$INSTALL_DIR/cbm-integrations.json" 2>/dev/null; then
+        :
+    else
+        rm -f "$ASSET_TMP" 2>/dev/null || true
+        echo "note: could not place cbm-integrations.json in $INSTALL_DIR (asset resolves from ~/.cbm/assets)"
+    fi
+fi
+
 # Verify
 VERSION=$("$DEST" --version 2>&1) || {
     echo "error: installed binary failed to run" >&2

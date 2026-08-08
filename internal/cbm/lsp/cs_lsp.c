@@ -73,6 +73,7 @@ static void cs_register_type_decls(CSLSPContext *ctx, CBMTypeRegistry *reg, TSNo
 static char *cs_node_text_cached(CSLSPContext *ctx, TSNode node);
 static const CBMType *cs_unwrap_task(CSLSPContext *ctx, const CBMType *t);
 static const CBMType *cs_unwrap_nullable(const CBMType *t);
+static const char *cs_resolve_callable_value(CSLSPContext *ctx, TSNode node, TSNode *callable_leaf);
 
 /* ── small helpers ──────────────────────────────────────────────── */
 
@@ -497,6 +498,38 @@ const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn
         if (f) return f;
     }
     return NULL;
+}
+
+/* A static import is precise only when every matching directive reaches the
+ * same method. Repeated imports of one type are harmless, but selecting the
+ * first of two distinct targets would make resolution declaration-order
+ * dependent. */
+static const CBMRegisteredFunc *cs_lookup_using_static_method(CSLSPContext *ctx,
+                                                              const char *method_name,
+                                                              bool *ambiguous) {
+    if (ambiguous)
+        *ambiguous = false;
+    if (!ctx || !method_name)
+        return NULL;
+
+    const CBMRegisteredFunc *only = NULL;
+    for (int i = 0; i < ctx->using_count; i++) {
+        const CBMCSUsing *u = &ctx->usings[i];
+        if (u->kind != CBM_CS_USING_STATIC)
+            continue;
+        const char *host = cs_resolve_type_name(ctx, u->target_qn);
+        const CBMRegisteredFunc *candidate =
+            cs_lookup_method(ctx, host ? host : u->target_qn, method_name);
+        if (!candidate || !candidate->qualified_name)
+            continue;
+        if (only && strcmp(only->qualified_name, candidate->qualified_name) != 0) {
+            if (ambiguous)
+                *ambiguous = true;
+            return NULL;
+        }
+        only = candidate;
+    }
+    return only;
 }
 
 /* ── extension methods ──────────────────────────────────────────── */
@@ -1041,15 +1074,13 @@ static const CBMType *cs_eval_invocation_type(CSLSPContext *ctx, TSNode call) {
                 return f->signature->data.func.return_types[0];
             }
         }
-        for (int i = 0; i < ctx->using_count; i++) {
-            const CBMCSUsing *u = &ctx->usings[i];
-            if (u->kind != CBM_CS_USING_STATIC) continue;
-            const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", u->target_qn, bare);
-            const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, qn);
-            if (f && f->signature && f->signature->data.func.return_types &&
-                f->signature->data.func.return_types[0]) {
-                return f->signature->data.func.return_types[0];
-            }
+        bool ambiguous = false;
+        const CBMRegisteredFunc *f = cs_lookup_using_static_method(ctx, bare, &ambiguous);
+        if (ambiguous)
+            return cbm_type_unknown();
+        if (f && f->signature && f->signature->data.func.return_types &&
+            f->signature->data.func.return_types[0]) {
+            return f->signature->data.func.return_types[0];
         }
     }
 
@@ -1255,6 +1286,166 @@ static void cs_bind_parameters(CSLSPContext *ctx, TSNode params_node, bool is_ex
 
 /* ── statement processing ───────────────────────────────────────── */
 
+/* Resolve a source expression only when it denotes one exact callable value.
+ * This deliberately accepts just direct method groups (bare or member access):
+ * conditional/switch/lambda expressions remain ordinary usages because they
+ * do not prove one target at this occurrence. */
+static const char *cs_resolve_callable_name(CSLSPContext *ctx, const char *name) {
+    if (!ctx || !name || !name[0])
+        return NULL;
+
+    /* A lexical binding always wins, including an UNKNOWN ordinary binding:
+     * a nearer non-callable value must suppress a same-named class method. */
+    if (cbm_scope_contains(ctx->current_scope, name)) {
+        return cbm_scope_lookup_callable(ctx->current_scope, name);
+    }
+
+    if (ctx->enclosing_class_qn) {
+        const CBMRegisteredFunc *f = cs_lookup_method(ctx, ctx->enclosing_class_qn, name);
+        if (f && f->qualified_name)
+            return f->qualified_name;
+    }
+    if (ctx->enclosing_base_qn) {
+        const CBMRegisteredFunc *f = cs_lookup_method(ctx, ctx->enclosing_base_qn, name);
+        if (f && f->qualified_name)
+            return f->qualified_name;
+    }
+
+    bool using_static_ambiguous = false;
+    const CBMRegisteredFunc *using_static =
+        cs_lookup_using_static_method(ctx, name, &using_static_ambiguous);
+    if (using_static_ambiguous)
+        return NULL;
+    if (using_static)
+        return using_static->qualified_name;
+
+    const char *ns = cs_namespace_qn(ctx);
+    if (ns && ns[0]) {
+        const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ns, name);
+        const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, qn);
+        if (f && f->qualified_name)
+            return f->qualified_name;
+    }
+
+    /* C# has no true namespace-level functions, but error-tolerant parses and
+     * generated fixtures can register receiverless callables. Only accept a
+     * unique short-name match; ambiguity is intentionally not guessed. */
+    const CBMRegisteredFunc *only = NULL;
+    for (int i = 0; ctx->registry && i < ctx->registry->func_count; i++) {
+        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[i];
+        if (candidate->receiver_type || !candidate->short_name ||
+            strcmp(candidate->short_name, name) != 0) {
+            continue;
+        }
+        if (only && strcmp(only->qualified_name, candidate->qualified_name) != 0) {
+            return NULL;
+        }
+        only = candidate;
+    }
+    return only ? only->qualified_name : NULL;
+}
+
+static TSNode cs_callable_name_leaf(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "generic_name") != 0) {
+        return node;
+    }
+
+    TSNode leaf = ts_node_child_by_field_name(node, "name", 4);
+    if (!ts_node_is_null(leaf))
+        return leaf;
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (!ts_node_is_null(child) && ts_node_is_named(child) &&
+            strcmp(ts_node_type(child), "identifier") == 0) {
+            return child;
+        }
+    }
+    return node;
+}
+
+static const char *cs_resolve_callable_value(CSLSPContext *ctx, TSNode node,
+                                             TSNode *callable_leaf) {
+    if (callable_leaf)
+        memset(callable_leaf, 0, sizeof(*callable_leaf));
+    if (!ctx || ts_node_is_null(node))
+        return NULL;
+    const char *kind = ts_node_type(node);
+
+    if (strcmp(kind, "argument") == 0 || strcmp(kind, "parenthesized_expression") == 0 ||
+        strcmp(kind, "equals_value_clause") == 0) {
+        TSNode inner = ts_node_child_by_field_name(node, "expression", 10);
+        if (ts_node_is_null(inner))
+            inner = ts_node_child_by_field_name(node, "value", 5);
+        if (ts_node_is_null(inner))
+            inner = cs_first_named_child(node);
+        return ts_node_is_null(inner) ? NULL : cs_resolve_callable_value(ctx, inner, callable_leaf);
+    }
+
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "generic_name") == 0) {
+        char *raw = cs_node_text(ctx, node);
+        char *bare = raw ? cs_strip_generic_args(ctx->arena, raw) : NULL;
+        const char *target = bare ? cs_resolve_callable_name(ctx, bare) : NULL;
+        if (target && callable_leaf)
+            *callable_leaf = cs_callable_name_leaf(node);
+        return target;
+    }
+
+    if (strcmp(kind, "member_access_expression") != 0)
+        return NULL;
+    TSNode receiver = ts_node_child_by_field_name(node, "expression", 10);
+    TSNode member = ts_node_child_by_field_name(node, "name", 4);
+    if (ts_node_is_null(receiver))
+        receiver = cs_first_named_child(node);
+    if (ts_node_is_null(member)) {
+        uint32_t nc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_child(node, i);
+            if (ts_node_is_null(child) || !ts_node_is_named(child) || ts_node_eq(child, receiver)) {
+                continue;
+            }
+            const char *child_kind = ts_node_type(child);
+            if (strcmp(child_kind, "identifier") == 0 || strcmp(child_kind, "generic_name") == 0) {
+                member = child;
+            }
+        }
+    }
+    if (ts_node_is_null(receiver) || ts_node_is_null(member))
+        return NULL;
+
+    char *member_raw = cs_node_text(ctx, member);
+    char *member_name = member_raw ? cs_strip_generic_args(ctx->arena, member_raw) : NULL;
+    if (!member_name)
+        return NULL;
+
+    char *receiver_text = cs_node_text(ctx, receiver);
+    if (receiver_text) {
+        const char *type_qn = cs_resolve_type_name(ctx, receiver_text);
+        if (type_qn && cs_lookup_type_qn(ctx, type_qn)) {
+            const CBMRegisteredFunc *f = cs_lookup_method(ctx, type_qn, member_name);
+            if (f && callable_leaf)
+                *callable_leaf = cs_callable_name_leaf(member);
+            return f ? f->qualified_name : NULL;
+        }
+    }
+
+    const CBMType *receiver_type = cs_unwrap_nullable(cs_eval_expr_type(ctx, receiver));
+    const char *type_qn = NULL;
+    if (receiver_type && receiver_type->kind == CBM_TYPE_NAMED) {
+        type_qn = receiver_type->data.named.qualified_name;
+    } else if (receiver_type && receiver_type->kind == CBM_TYPE_TEMPLATE) {
+        type_qn = receiver_type->data.template_type.template_name;
+    }
+    if (!type_qn)
+        return NULL;
+    const CBMRegisteredFunc *f = cs_lookup_method(ctx, type_qn, member_name);
+    if (!f)
+        f = cs_lookup_extension(ctx, type_qn, member_name);
+    if (f && callable_leaf)
+        *callable_leaf = cs_callable_name_leaf(member);
+    return f ? f->qualified_name : NULL;
+}
+
 static void cs_process_local_decl(CSLSPContext *ctx, TSNode node) {
     /* local_declaration_statement -> variable_declaration */
     TSNode vd = cs_child_named_kind(node, "variable_declaration");
@@ -1291,12 +1482,18 @@ static void cs_process_local_decl(CSLSPContext *ctx, TSNode node) {
          * variants. Try the field-name path first, then fall back to
          * walking named children for any expression after the identifier. */
         TSNode init = ts_node_child_by_field_name(c, "value", 5);
+        TSNode rhs_node;
+        memset(&rhs_node, 0, sizeof(rhs_node));
         const CBMType *rhs_t = NULL;
         if (!ts_node_is_null(init)) {
             if (strcmp(ts_node_type(init), "equals_value_clause") == 0) {
                 TSNode rhs = cs_first_named_child(init);
-                if (!ts_node_is_null(rhs)) rhs_t = cs_eval_expr_type(ctx, rhs);
+                if (!ts_node_is_null(rhs)) {
+                    rhs_node = rhs;
+                    rhs_t = cs_eval_expr_type(ctx, rhs);
+                }
             } else {
+                rhs_node = init;
                 rhs_t = cs_eval_expr_type(ctx, init);
             }
         }
@@ -1313,6 +1510,7 @@ static void cs_process_local_decl(CSLSPContext *ctx, TSNode node) {
                 if (strcmp(ck, "equals_value_clause") == 0) {
                     TSNode rhs = cs_first_named_child(cn);
                     if (!ts_node_is_null(rhs)) {
+                        rhs_node = rhs;
                         const CBMType *t = cs_eval_expr_type(ctx, rhs);
                         if (t && t->kind != CBM_TYPE_UNKNOWN) rhs_t = t;
                     }
@@ -1323,6 +1521,7 @@ static void cs_process_local_decl(CSLSPContext *ctx, TSNode node) {
                     continue; /* the identifier name */
                 }
                 if (seen_named >= 1) {
+                    rhs_node = cn;
                     const CBMType *t = cs_eval_expr_type(ctx, cn);
                     if (t && t->kind != CBM_TYPE_UNKNOWN) {
                         rhs_t = t;
@@ -1333,7 +1532,13 @@ static void cs_process_local_decl(CSLSPContext *ctx, TSNode node) {
         }
         const CBMType *bind = is_var ? (rhs_t ? rhs_t : declared_type) : declared_type;
         if (!bind) bind = cbm_type_unknown();
-        cbm_scope_bind(ctx->current_scope, vname, bind);
+        const char *callable_qn =
+            ts_node_is_null(rhs_node) ? NULL : cs_resolve_callable_value(ctx, rhs_node, NULL);
+        if (callable_qn) {
+            cbm_scope_bind_callable(ctx->current_scope, vname, bind, callable_qn);
+        } else {
+            cbm_scope_bind(ctx->current_scope, vname, bind);
+        }
     }
 }
 
@@ -1398,26 +1603,161 @@ static void cs_process_assignment(CSLSPContext *ctx, TSNode node) {
     if (!cs_node_is(lhs, "identifier")) return;
     char *vname = cs_node_text(ctx, lhs);
     if (!vname) return;
-    const CBMType *t = cs_eval_expr_type(ctx, rhs);
-    if (!t || t->kind == CBM_TYPE_UNKNOWN) return;
-    /* Don't override more-specific bindings with weaker ones. */
-    const CBMType *existing = cbm_scope_lookup(ctx->current_scope, vname);
-    if (existing && existing->kind == CBM_TYPE_NAMED && t->kind == CBM_TYPE_UNKNOWN) return;
-    cbm_scope_bind(ctx->current_scope, vname, t);
+    const char *callable_qn = cs_resolve_callable_value(ctx, rhs, NULL);
+    (void)cs_eval_expr_type(ctx, rhs);
+    if (callable_qn) {
+        cbm_scope_update_callable(ctx->current_scope, vname, callable_qn);
+    } else {
+        /* An ordinary or ambiguous reassignment clears stale callable identity
+         * while retaining the best type already known for the variable. */
+        cbm_scope_update_callable(ctx->current_scope, vname, NULL);
+    }
 }
 
 /* ── call resolution + emit ─────────────────────────────────────── */
 
-static void cs_emit_resolved(CSLSPContext *ctx, const char *callee_qn, const char *strategy,
-                              float confidence) {
+static void cs_invalidate_conditionally_assigned_callables(CSLSPContext *ctx, TSNode node) {
+    if (!ctx || ts_node_is_null(node))
+        return;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "method_declaration") == 0 || strcmp(kind, "local_function_statement") == 0 ||
+        strcmp(kind, "lambda_expression") == 0 ||
+        strcmp(kind, "anonymous_method_expression") == 0 ||
+        strcmp(kind, "class_declaration") == 0 || strcmp(kind, "struct_declaration") == 0) {
+        return;
+    }
+    if (strcmp(kind, "assignment_expression") == 0) {
+        TSNode lhs = ts_node_child_by_field_name(node, "left", 4);
+        if (ts_node_is_null(lhs))
+            lhs = cs_first_named_child(node);
+        if (cs_node_is(lhs, "identifier")) {
+            char *name = cs_node_text(ctx, lhs);
+            if (name)
+                cbm_scope_update_callable(ctx->current_scope, name, NULL);
+        }
+        return;
+    }
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (!ts_node_is_null(child) && ts_node_is_named(child)) {
+            cs_invalidate_conditionally_assigned_callables(ctx, child);
+        }
+    }
+}
+
+static void cs_emit_resolved_kind_reason(CSLSPContext *ctx, const char *callee_qn,
+                                         const char *strategy, float confidence,
+                                         CBMResolvedKind kind, const char *reason) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn) return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
-    rc.reason = NULL;
+    rc.reason = reason;
+    rc.kind = kind;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void cs_emit_resolved_kind(CSLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                  float confidence, CBMResolvedKind kind) {
+    cs_emit_resolved_kind_reason(ctx, callee_qn, strategy, confidence, kind, NULL);
+}
+
+static void cs_emit_resolved(CSLSPContext *ctx, const char *callee_qn, const char *strategy,
+                             float confidence) {
+    cs_emit_resolved_kind(ctx, callee_qn, strategy, confidence, CBM_RESOLVED_INVOCATION);
+}
+
+static void cs_emit_resolved_reason(CSLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                    float confidence, const char *reason) {
+    cs_emit_resolved_kind_reason(ctx, callee_qn, strategy, confidence, CBM_RESOLVED_INVOCATION,
+                                 reason);
+}
+
+static void cs_stamp_resolved_site(CSLSPContext *ctx, int first, TSNode site) {
+    if (!ctx->resolved_calls || ts_node_is_null(site) || first < 0)
+        return;
+    for (int i = first; i < ctx->resolved_calls->count; i++) {
+        ctx->resolved_calls->items[i].site_start_byte = ts_node_start_byte(site);
+        ctx->resolved_calls->items[i].site_end_byte = ts_node_end_byte(site);
+    }
+}
+
+static void cs_emit_resolved_kind_reason_at(CSLSPContext *ctx, const char *callee_qn,
+                                            const char *strategy, float confidence,
+                                            CBMResolvedKind kind, const char *reason, TSNode site) {
+    int first = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
+    cs_emit_resolved_kind_reason(ctx, callee_qn, strategy, confidence, kind, reason);
+    cs_stamp_resolved_site(ctx, first, site);
+}
+
+static void cs_retarget_callable_carrier(CSLSPContext *ctx, TSNode site, const char *source_name,
+                                         const char *target_qn) {
+    if (!ctx || !ctx->call_carriers || ts_node_is_null(site) || !source_name || !target_qn ||
+        !ctx->enclosing_func_qn) {
+        return;
+    }
+    const char *target_name = cs_short_name(target_qn);
+    uint32_t start = ts_node_start_byte(site);
+    uint32_t end = ts_node_end_byte(site);
+    for (int i = 0; i < ctx->call_carriers->count; i++) {
+        CBMCall *call = &ctx->call_carriers->items[i];
+        if (!call->callee_name || !call->enclosing_func_qn ||
+            strcmp(call->callee_name, source_name) != 0 ||
+            strcmp(call->enclosing_func_qn, ctx->enclosing_func_qn) != 0 ||
+            call->site_start_byte < start || call->site_end_byte > end) {
+            continue;
+        }
+        call->callee_name = cbm_arena_strdup(ctx->arena, target_name);
+        call->requires_lsp_resolution = true;
+    }
+}
+
+/* Promote only direct argument expressions whose value resolves to one exact
+ * method group. Wrappers are peeled, but conditionals/switches/lambdas are not
+ * traversed, so complex values retain parser-produced USAGE edges. */
+static void cs_resolve_callable_arguments(CSLSPContext *ctx, TSNode call) {
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    if (ts_node_is_null(args))
+        args = cs_child_named_kind(call, "argument_list");
+    if (ts_node_is_null(args))
+        return;
+
+    uint32_t nc = ts_node_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode argument = ts_node_child(args, i);
+        if (ts_node_is_null(argument) || !ts_node_is_named(argument) ||
+            strcmp(ts_node_type(argument), "argument") != 0) {
+            continue;
+        }
+        TSNode value = ts_node_child_by_field_name(argument, "expression", 10);
+        if (ts_node_is_null(value))
+            value = ts_node_child_by_field_name(argument, "value", 5);
+        if (ts_node_is_null(value)) {
+            uint32_t ac = ts_node_child_count(argument);
+            for (uint32_t j = ac; j > 0; j--) {
+                TSNode child = ts_node_child(argument, j - 1);
+                if (!ts_node_is_null(child) && ts_node_is_named(child)) {
+                    value = child;
+                    break;
+                }
+            }
+        }
+        if (ts_node_is_null(value))
+            continue;
+        TSNode callable_leaf;
+        memset(&callable_leaf, 0, sizeof(callable_leaf));
+        const char *target = cs_resolve_callable_value(ctx, value, &callable_leaf);
+        if (!target)
+            continue;
+        if (ts_node_is_null(callable_leaf))
+            continue;
+        char *source_name = cs_node_text(ctx, callable_leaf);
+        cs_emit_resolved_kind_reason_at(ctx, target, "lsp_callable_value_reference", 0.95f,
+                                        CBM_RESOLVED_CALL_REFERENCE, source_name, callable_leaf);
+    }
 }
 
 static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
@@ -1516,6 +1856,18 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
         if (!fname) return;
         char *bare = cs_strip_generic_args(ctx->arena, fname);
 
+        /* Callable-valued locals and parameters shadow class/static methods.
+         * An exact alias carries its real target; an ordinary lexical value
+         * suppresses all same-name fallbacks so we never fabricate a call. */
+        if (cbm_scope_contains(ctx->current_scope, bare)) {
+            const char *target = cbm_scope_lookup_callable(ctx->current_scope, bare);
+            if (target) {
+                cs_emit_resolved_reason(ctx, target, "lsp_callable_alias", 0.98f, bare);
+                cs_retarget_callable_carrier(ctx, call, bare, target);
+            }
+            return;
+        }
+
         /* Try enclosing class member. cs_lookup_method walks the base chain, so
          * a bare call may resolve to an INHERITED method. Distinguish, exactly
          * as the instance-call path does: a method actually declared on the
@@ -1547,15 +1899,14 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
          * the file-stem QN ("proj.Client.MathUtil"); resolve the target through
          * the type-name resolver (its short-name fallback bridges the two)
          * before the method lookup. */
-        for (int i = 0; i < ctx->using_count; i++) {
-            const CBMCSUsing *u = &ctx->usings[i];
-            if (u->kind != CBM_CS_USING_STATIC) continue;
-            const char *host = cs_resolve_type_name(ctx, u->target_qn);
-            const CBMRegisteredFunc *f = cs_lookup_method(ctx, host ? host : u->target_qn, bare);
-            if (f) {
-                cs_emit_resolved(ctx, f->qualified_name, "cs_using_static", 0.90f);
-                return;
-            }
+        bool using_static_ambiguous = false;
+        const CBMRegisteredFunc *using_static =
+            cs_lookup_using_static_method(ctx, bare, &using_static_ambiguous);
+        if (using_static_ambiguous)
+            return;
+        if (using_static) {
+            cs_emit_resolved(ctx, using_static->qualified_name, "cs_using_static", 0.90f);
+            return;
         }
 
         /* Free function in current namespace. */
@@ -1656,9 +2007,14 @@ static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node) {
     } else if (strcmp(kind, "assignment_expression") == 0) {
         cs_process_assignment(ctx, node);
     } else if (strcmp(kind, "invocation_expression") == 0) {
+        int first = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
         cs_resolve_invocation(ctx, node);
+        cs_stamp_resolved_site(ctx, first, node);
+        cs_resolve_callable_arguments(ctx, node);
     } else if (strcmp(kind, "object_creation_expression") == 0) {
+        int first = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
         cs_resolve_object_creation(ctx, node);
+        cs_stamp_resolved_site(ctx, first, node);
     }
 
     /* Recurse into children. We do NOT pre-bind anything that would only be
@@ -1692,6 +2048,13 @@ static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node) {
         cs_resolve_calls_in_node(ctx, c);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+    if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "switch_statement") == 0 ||
+        strcmp(kind, "switch_expression") == 0 || strcmp(kind, "for_statement") == 0 ||
+        strcmp(kind, "for_each_statement") == 0 || strcmp(kind, "foreach_statement") == 0 ||
+        strcmp(kind, "while_statement") == 0 || strcmp(kind, "do_statement") == 0 ||
+        strcmp(kind, "try_statement") == 0) {
+        cs_invalidate_conditionally_assigned_callables(ctx, node);
+    }
 }
 
 /* ── method/constructor processing ──────────────────────────────── */
@@ -2690,6 +3053,34 @@ static void cs_collect_method_return_types(CSLSPContext *ctx, TSNode root,
     }
 }
 
+void cbm_cs_refine_ast_return_types(CSLSPContext *ctx, CBMTypeRegistry *reg, TSNode root) {
+    if (!ctx || !reg || ts_node_is_null(root))
+        return;
+
+    cs_method_rt_table_t mtab = {0};
+    cs_collect_method_return_types(ctx, root, &mtab);
+    for (int i = 0; i < mtab.count; i++) {
+        const char *qn = mtab.items[i].qn;
+        const CBMType *rt = mtab.items[i].rt;
+        bool patched = false;
+        for (int j = 0; j < reg->func_count; j++) {
+            if (strcmp(reg->funcs[j].qualified_name, qn) == 0) {
+                const CBMType **rets =
+                    (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(const CBMType *));
+                if (rets) {
+                    rets[0] = rt;
+                    rets[1] = NULL;
+                    reg->funcs[j].signature =
+                        cbm_type_func_replace_returns(ctx->arena, reg->funcs[j].signature, rets);
+                }
+                patched = true;
+                break;
+            }
+        }
+        (void)patched;
+    }
+}
+
 /* ── parse return type from CBMDefinition.return_type ──────────── */
 
 static const CBMType *cs_parse_return_type_text(CSLSPContext *ctx, const char *text) {
@@ -2707,6 +3098,13 @@ static const CBMType *cs_parse_return_type_text(CSLSPContext *ctx, const char *t
     const char *pre = cs_predefined_alias(resolved);
     if (pre) return cbm_type_named(ctx->arena, pre);
     return cbm_type_named(ctx->arena, resolved);
+}
+
+static const CBMType *cs_signature_param_type_adapter(CBMArena *arena, const char *text,
+                                                      void *parser_ctx) {
+    (void)arena;
+    CSLSPContext *ctx = (CSLSPContext *)parser_ctx;
+    return ctx ? cs_parse_return_type_text(ctx, text) : cbm_type_unknown();
 }
 
 /* ── single-file entry: cbm_run_cs_lsp ──────────────────────────── */
@@ -2785,9 +3183,36 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     /* Phase C: build context for type resolution + run the resolver. */
     CSLSPContext ctx;
     cs_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
+    ctx.call_carriers = &result->calls;
 
     /* Pass 1: collect imports + namespaces (for type-resolution context). */
     cs_collect_imports(&ctx, root);
+
+    /* The counted carrier is authoritative even when count is zero. Install it
+     * only after imports are available so textual types use the same local
+     * resolution context as declared returns. A truly absent carrier keeps the
+     * legacy zero-parameter behavior. */
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *d = &result->defs.items[i];
+        if (!d->qualified_name || !d->label ||
+            (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0) ||
+            (!d->signature_param_types && d->signature_param_count <= 0)) {
+            continue;
+        }
+        const CBMType **param_types = cbm_type_materialize_signature_params(
+            arena, d->signature_param_types, d->signature_param_count,
+            cs_signature_param_type_adapter, &ctx);
+        for (int j = 0; j < reg.func_count; j++) {
+            if (strcmp(reg.funcs[j].qualified_name, d->qualified_name) != 0)
+                continue;
+            const CBMType **return_types = NULL;
+            if (reg.funcs[j].signature && reg.funcs[j].signature->kind == CBM_TYPE_FUNC) {
+                return_types = reg.funcs[j].signature->data.func.return_types;
+            }
+            reg.funcs[j].signature = cbm_type_func(arena, NULL, param_types, return_types);
+            break;
+        }
+    }
 
     /* Now refine return types of registered funcs using ctx (which has using
      * directives). Also refine field types via collect_class_fields. */
@@ -2804,7 +3229,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                 if (rets) {
                     rets[0] = rt;
                     rets[1] = NULL;
-                    reg.funcs[j].signature = cbm_type_func(arena, NULL, NULL, rets);
+                    reg.funcs[j].signature =
+                        cbm_type_func_replace_returns(arena, reg.funcs[j].signature, rets);
                 }
                 break;
             }
@@ -2814,29 +3240,7 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     /* Phase B.1.5: AST-driven return-type patch. The unified extractor
      * leaves CBMDefinition.return_type NULL for C# methods, so we walk the
      * AST ourselves to recover declared return types. */
-    {
-        cs_method_rt_table_t mtab = {0};
-        cs_collect_method_return_types(&ctx, root, &mtab);
-        for (int i = 0; i < mtab.count; i++) {
-            const char *qn = mtab.items[i].qn;
-            const CBMType *rt = mtab.items[i].rt;
-            bool patched = false;
-            for (int j = 0; j < reg.func_count; j++) {
-                if (strcmp(reg.funcs[j].qualified_name, qn) == 0) {
-                    const CBMType **rets =
-                        (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-                    if (rets) {
-                        rets[0] = rt;
-                        rets[1] = NULL;
-                        reg.funcs[j].signature = cbm_type_func(arena, NULL, NULL, rets);
-                    }
-                    patched = true;
-                    break;
-                }
-            }
-            (void)patched;
-        }
-    }
+    cbm_cs_refine_ast_return_types(&ctx, &reg, root);
 
     /* Phase B.1: collect typed properties + fields. */
     {
@@ -2928,13 +3332,22 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg,
             if (strcmp(d->label, "Method") == 0 && d->receiver_type) {
                 rf.receiver_type = d->receiver_type;
             }
+            CSLSPContext parser_ctx = {0};
+            parser_ctx.arena = arena;
+            parser_ctx.registry = reg;
+            parser_ctx.module_qn = d->def_module_qn;
             const CBMType **rets =
                 (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
             if (rets) {
-                rets[0] = cbm_type_unknown();
+                rets[0] = d->return_types && d->return_types[0]
+                              ? cs_parse_return_type_text(&parser_ctx, d->return_types)
+                              : cbm_type_unknown();
                 rets[1] = NULL;
             }
-            rf.signature = cbm_type_func(arena, NULL, NULL, rets);
+            const CBMType **param_types = cbm_type_materialize_signature_params(
+                arena, d->signature_param_types, d->signature_param_count,
+                cs_signature_param_type_adapter, &parser_ctx);
+            rf.signature = cbm_type_func(arena, NULL, param_types, rets);
             cbm_registry_add_func(reg, rf);
         }
     }

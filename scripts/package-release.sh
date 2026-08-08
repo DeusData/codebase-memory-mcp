@@ -37,9 +37,16 @@ Environment:
   BUILD_DIR  build tree to archive from (default build/c).
 
 Archive contents (defined here, canonical) — ONE binary per platform:
-  unix:    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md (.tar.gz)
-  windows: codebase-memory-mcp.exe LICENSE install.ps1
+  unix:    codebase-memory-mcp cbm-integrations.json LICENSE install.sh
+           THIRD_PARTY_NOTICES.md (.tar.gz)
+  windows: codebase-memory-mcp.exe cbm-integrations.json LICENSE install.ps1
            THIRD_PARTY_NOTICES.md (.zip)
+
+cbm-integrations.json is the integration-template data file: the binary
+embeds only its SHA-256 and refuses to install integrations without a
+verified copy, so an archive without it produces a binary that cannot
+install. It ships NEXT TO the binary — the resolution path install.sh /
+install.ps1 rely on when they run `install` from the extracted archive.
 EOF
 }
 
@@ -174,13 +181,13 @@ if [ "$GOOS" = "windows" ]; then
     # a workflow step so the local artifact-flow smoke enforces the same thing.
     bash scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
         "$PACK_DIR/codebase-memory-mcp.exe" || exit 2
-    cp LICENSE install.ps1 "$PACK_DIR/"
+    cp LICENSE install.ps1 assets/cbm-integrations.json "$PACK_DIR/"
     scripts/gen-third-party-notices.sh "$PACK_DIR/THIRD_PARTY_NOTICES.md"
     (
         cd "$PACK_DIR"
         rm -f "$OUT_DIR/$NAME.zip"
         zip -q "$OUT_DIR/$NAME.zip" \
-            codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+            codebase-memory-mcp.exe cbm-integrations.json LICENSE install.ps1 THIRD_PARTY_NOTICES.md
     )
     echo "=== package-release: $OUT_DIR/$NAME.zip ==="
 else
@@ -189,9 +196,9 @@ else
     strip_release_binary "$BUILD_DIR/codebase-memory-mcp" || exit 2
     bash scripts/ci/check-binary-composition.sh --variant="$VARIANT" \
         "$BUILD_DIR/codebase-memory-mcp" || exit 2
-    cp LICENSE install.sh "$BUILD_DIR/"
+    cp LICENSE install.sh assets/cbm-integrations.json "$BUILD_DIR/"
     scripts/gen-third-party-notices.sh "$BUILD_DIR/THIRD_PARTY_NOTICES.md"
     tar -czf "$OUT_DIR/$NAME.tar.gz" -C "$BUILD_DIR" \
-        codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+        codebase-memory-mcp cbm-integrations.json LICENSE install.sh THIRD_PARTY_NOTICES.md
     echo "=== package-release: $OUT_DIR/$NAME.tar.gz ==="
 fi

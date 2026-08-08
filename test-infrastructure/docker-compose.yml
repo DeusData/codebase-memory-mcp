@@ -47,6 +47,28 @@ services:
   # Overrides the default test.sh entrypoint to build + run the widened TSan
   # suite set. /usr/lib/ccache is first on PATH in the image, so CC=gcc is
   # ccache-masqueraded automatically (same as the ASan legs).
+  # MemorySanitizer lane (stage 2): MSan-instrumented libc++/zlib image, full
+  # coverage including the C++ preprocessing paths. See scripts/msan.sh.
+  test-msan:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile.msan
+    platform: linux/arm64
+    init: true
+    volumes:
+      - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    # MSan's shadow layout has the same aarch64 high-entropy-ASLR problem as
+    # TSan (personality() blocked by the default seccomp profile) — same
+    # remedy, same safety argument: the container runs only our own tests.
+    security_opt: ["seccomp=unconfined"]
+    entrypoint: ["setarch", "-R", "bash", "scripts/msan.sh"]
+
   test-tsan:
     build:
       context: ..
@@ -297,5 +319,13 @@ volumes:
   # native filesystem: object writes over the virtiofs bind mount are the
   # container legs' largest avoidable I/O cost, and the fixture cache makes
   # the network clone once-per-volume instead of once-per-container.
+  # The build volume is the ONLY per-run-mutable one: concurrent legs writing
+  # the same build dir clobber each other's objects and test-logs (a scheduler
+  # then fails reading a suite log that another run replaced). run.sh gives each
+  # run its own volume via CBM_CI_BUILD_VOLUME and removes it afterwards; the
+  # default name preserves the single-run fast path. ccache and the fixture
+  # cache stay SHARED on purpose — ccache is concurrency-safe and
+  # content-verified, and sharing them is what keeps isolated runs fast.
   cbm-build:
+    name: ${CBM_CI_BUILD_VOLUME:-cbm-build}
   cbm-fixture-cache:

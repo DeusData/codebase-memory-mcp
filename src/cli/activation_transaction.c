@@ -110,6 +110,18 @@ const char *cbm_activation_transaction_refusal_note(void) {
     return g_activation_refusal_note;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1416 test seam: install a refusal note so the CLI attribution path is
+ * testable without constructing a real Windows ACL refusal. */
+void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
+                                                         unsigned long os_error) {
+    activation_refusal_clear();
+    if (predicate && predicate[0]) {
+        activation_note_refusal(predicate, os_error);
+    }
+}
+#endif
+
 #ifdef _WIN32
 typedef HANDLE activation_native_file_t;
 #define ACTIVATION_INVALID_FILE INVALID_HANDLE_VALUE

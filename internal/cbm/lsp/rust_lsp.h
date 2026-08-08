@@ -55,9 +55,13 @@ typedef struct {
     CBMArena *arena;
     const char *source;
     int source_len;
+    const char *root_source; /* immutable original file buffer */
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+    /* Alias assignments beneath a branch/loop/match/closure cannot establish
+     * one unconditional post-region target, so they clear callable identity. */
+    int callable_control_flow_depth;
 
     /* Negative-lookup memo for the registry-pure resolve cascades (trait
      * method / sole-trait-impl / free-func fallback). Active ONLY when the
@@ -74,6 +78,11 @@ typedef struct {
 
     const char **glob_module_qns;
     int glob_count;
+
+    /* Exact names from top-level out-of-line `mod name;` declarations. A
+     * relative scoped type may be project-qualified only when its head is in
+     * this set; coincidentally same-named indexed modules stay external. */
+    CBMIdxMemo declared_modules;
 
     /* Module-qualified name for this file (e.g. "<project>.<crate>.foo"). */
     const char *module_qn;
@@ -106,6 +115,13 @@ typedef struct {
      * The arrays are doubling-grown out of `arena`. */
     struct RustMacroRule **macro_rules_arr;
     int macro_rules_count;
+
+    /* Original-file occurrence that established the lexical environment for
+     * the current macro expansion. Nested macro invocations are parsed from a
+     * synthetic transcriber buffer, so their tree-sitter offsets cannot be
+     * used to decide which source-level macro_rules! definition is visible. */
+    uint32_t macro_origin_byte;
+    bool macro_origin_valid;
 
     /* Recursion guard for macro expansion. Real macro_rules! can be
      * recursive; we cap at 8 nested expansions to keep the walker
@@ -162,8 +178,9 @@ typedef struct {
      * calls hidden inside macro token-trees (`format!("{}", d.label())`) —
      * never appear in result->calls because the syntactic extractor cannot
      * see them. When this is non-NULL the resolver injects matching synthetic
-     * CBMCall entries so those recovered calls become real edges. NULL in the
-     * cross-file path (no result available). */
+     * CBMCall entries so those recovered calls become real edges. Cross-file
+     * callers provide a separate output array and merge it into the owning
+     * file result with explicit arena-aware copying. */
     CBMCallArray *syn_calls;
 
     /* While >0, rust_emit_resolved_call also injects a matching synthetic
@@ -171,6 +188,19 @@ typedef struct {
      * around the macro-argument re-parse where the syntactic extractor never
      * produced a call node. */
     int inject_syn_calls;
+
+    /* Current invocation occurrence in ORIGINAL-file coordinates. Ordinary
+     * source calls use their tree-sitter node directly. Calls recovered by
+     * reparsing built-in macro arguments use the affine map below to translate
+     * the synthetic wrapper's offsets back to the copied token-tree span.
+     * macro_rules! transcriber text is intentionally left unmapped because
+     * substitution is not position-preserving. */
+    uint32_t emit_site_start_byte;
+    uint32_t emit_site_end_byte;
+    bool site_map_active;
+    uint32_t site_map_synthetic_start_byte;
+    uint32_t site_map_synthetic_end_byte;
+    uint32_t site_map_original_start_byte;
 
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
@@ -235,25 +265,18 @@ void rust_process_statement(RustLSPContext *ctx, TSNode node);
 const CBMRegisteredFunc *rust_lookup_method(RustLSPContext *ctx, const char *type_qn,
                                             const char *member_name);
 
+/* Populate the same per-file registry used by cbm_run_rust_lsp, including
+ * AST-declared return-type refinements. Exposed as a production-used seam for
+ * structural registry regression tests. */
+void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
+                                   const char *module_qn, TSNode root, const char *source);
+
 /* Entry point — called from `cbm_extract_file()` after the unified
  * extractor has filled `result->defs`, `result->imports`, and
  * `result->impl_traits`. Builds a per-file registry, parses the `use`
  * graph, and walks every function body emitting CBMResolvedCall entries. */
 void cbm_run_rust_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root);
-
-/* Synthesize call edges for curated attribute proc-macros.
- *
- * For each `CBMDefinition` whose decorators include a known
- * attribute proc-macro (`#[tokio::main]`, `#[tracing::instrument]`,
- * `#[async_trait]`, …), emit synthetic edges from that definition
- * to the helper functions the macro would have injected (e.g.
- * `tokio::runtime::Runtime::new` + `block_on`). The edges carry
- * strategy `lsp_proc_macro` so consumers can distinguish them from
- * direct call attributions.
- *
- * Called automatically from `cbm_run_rust_lsp_with_manifest`. */
-void cbm_rust_synth_proc_macro_edges(CBMArena *arena, CBMFileResult *result);
 
 /* Same as `cbm_run_rust_lsp`, but accepts an optional Cargo manifest
  * so the resolver can route paths whose head is a workspace member /
@@ -293,8 +316,12 @@ typedef struct {
     const char *embedded_types;   /* "|"-separated embedded type QNs          */
     const char *field_defs;       /* "|"-separated "name:type" pairs          */
     const char *method_names_str; /* "|"-separated method names for traits   */
-    const char *trait_qn;         /* impl Trait for Type → set on Method defs */
+    const char **signature_param_types; /* borrowed ordered parameter texts    */
+    int signature_param_count;          /* positional entries; "?" is unknown */
+    const char *trait_qn;               /* raw impl-trait spelling; uniquely canonicalized */
     bool is_interface;            /* true for traits                          */
+    bool is_rust_impl_relation;   /* independent type-level impl record       */
+    bool is_abstract;             /* required trait declaration (no default)  */
 } CBMRustLSPDef;
 
 /* Run cross-file resolution on a single file. */
@@ -314,7 +341,7 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
  * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
@@ -323,14 +350,16 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
 
 /* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
  * per-file registry build; just parse + resolve. `manifest` = the same Cargo manifest
- * the per-file path uses (cross-crate #56). `result` may be NULL (the cross path does
- * not synthesise proc-macro edges). Mirrors cbm_run_c_lsp_cross_with_registry. */
+ * the per-file path uses (cross-crate #56). `synthetic_calls` is an optional,
+ * arena-owned output for exact carriers recovered from non-call syntax. Attribute
+ * proc-macros are handled by the graph's DECORATES + USAGE semantic passes, not
+ * by this resolver. */
 void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                           const char *module_qn, const CBMTypeRegistry *reg,
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
-                                          CBMResolvedCallArray *out, CBMFileResult *result);
+                                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {

@@ -4870,7 +4870,80 @@ TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained) {
     PASS();
 }
 
+/* #1375: a reply too large to frame must become a JSON-RPC ERROR, not a
+ * transport failure.
+ *
+ * Why this matters more than it looks: the frontend worker cannot tell a
+ * rejected oversized frame from a dead socket, and for a dead socket it
+ * deliberately _Exit()s the process (closing the kernel IPC handle is the only
+ * portable way to cancel daemon session ownership from a thread blocked in
+ * stdio). So passing an oversized reply DOWN to the transport killed the whole
+ * server — every tool gone for the rest of the session, exit=1, empty stderr.
+ * The substitution therefore has to happen here, at the layer that still holds
+ * the request id.
+ *
+ * Reproduced end-to-end before fixing, on a 20k-node fixture: LIMIT 10000 ->
+ * 8,529,990 bytes ok; LIMIT 20000 -> SERVER DIED exit=1. After: the same query
+ * returns this error and a follow-up query on the SAME session succeeds. */
+TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death) {
+    cbm_jsonrpc_request_t request = {0};
+    request.has_id = true;
+    request.id = 42;
+
+    /* A reply that FITS must pass through byte-identical — the guard must not
+     * touch the overwhelming majority of replies. */
+    char *small = strdup("{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{}}");
+    ASSERT_NOT_NULL(small);
+    char *kept = cbm_daemon_application_framable_response_for_test(small, &request);
+    ASSERT_TRUE(kept == small); /* same pointer: untouched */
+    ASSERT_STR_EQ(kept, "{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{}}");
+    free(kept);
+
+    /* A reply that CANNOT be framed must come back as a JSON-RPC error instead.
+     * Passing it on is what killed the server: the frontend worker cannot tell a
+     * rejected oversized frame from a dead socket, and for a dead socket it
+     * deliberately _Exit()s the process — so every tool on that server was gone
+     * for the rest of the session, with exit=1 and an empty stderr (#1375).
+     * Reproduced end-to-end on a 20k-node fixture before fixing: LIMIT 10000 ->
+     * 8,529,990 bytes ok, LIMIT 20000 -> SERVER DIED. After: the same query
+     * returns this error and a follow-up query on the SAME session succeeds. */
+    size_t oversized = (size_t)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX + 1U;
+    char *big = malloc(oversized + 1U);
+    ASSERT_NOT_NULL(big);
+    memset(big, 'x', oversized);
+    big[oversized] = '\0';
+
+    char *replaced = cbm_daemon_application_framable_response_for_test(big, &request);
+    ASSERT_NOT_NULL(replaced);
+    ASSERT_TRUE(replaced != big); /* substituted, not passed through */
+
+    /* The replacement must itself fit, or it reproduces the bug it replaces. */
+    ASSERT_TRUE(strlen(replaced) <= (size_t)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+    /* ...and carry the caller's id, or the client cannot match reply to request. */
+    ASSERT_NOT_NULL(strstr(replaced, "\"error\""));
+    ASSERT_NOT_NULL(strstr(replaced, "\"id\":42"));
+    ASSERT_NOT_NULL(strstr(replaced, "-32603"));
+    /* ...and say what happened and what to do: the failure it replaces was a
+     * SILENT exit, so an opaque "internal error" would be no improvement. */
+    ASSERT_NOT_NULL(strstr(replaced, "response too large"));
+    ASSERT_NOT_NULL(strstr(replaced, "LIMIT"));
+    free(replaced);
+
+    /* An unparseable message has no id to echo, but must still yield an error
+     * rather than NULL — NULL is turned back into a hard failure by the caller. */
+    char *big2 = malloc(oversized + 1U);
+    ASSERT_NOT_NULL(big2);
+    memset(big2, 'y', oversized);
+    big2[oversized] = '\0';
+    char *anonymous = cbm_daemon_application_framable_response_for_test(big2, NULL);
+    ASSERT_NOT_NULL(anonymous);
+    ASSERT_NOT_NULL(strstr(anonymous, "\"error\""));
+    free(anonymous);
+    PASS();
+}
+
 SUITE(daemon_application) {
+    RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
     RUN_TEST(daemon_application_request_cancel_is_scoped_to_exact_token);
     RUN_TEST(daemon_application_requires_immutable_explicit_context);

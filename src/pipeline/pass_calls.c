@@ -303,7 +303,11 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
             n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
                          esc_e);
         }
-        if (n <= 0 || (size_t)n >= cap - pos - PAIR_LEN) {
+        /* Add rather than subtract: pos is unsigned, so `cap - pos - PAIR_LEN`
+         * wraps once pos reaches cap - PAIR_LEN and stops bounding the memcpy
+         * below. The closing write at the end of this function already guards
+         * additively; match it. */
+        if (n <= 0 || pos + (size_t)n + PAIR_LEN >= cap) {
             break; /* not enough room — close the array with what fits */
         }
         memcpy(props + pos, one, (size_t)n);
@@ -345,7 +349,13 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
          * substring coincidence in the resolved QN (e.g. "SalesforceRestClient"
          * matches the "RestClient" HTTP lib). Emit a plain CALLS edge — unless a
          * weak TS/JS member-call match should be suppressed (#592/#606). */
-        if (suppress_plain_calls) {
+        /* !target: the service-pattern call sites pass NULL (the route node is
+         * synthesized below) behind a hand-duplicated copy of the is_url/
+         * is_topic predicate above. While the copies agree this branch is
+         * unreachable for them -- but a drift between the two would turn
+         * target->id into a null dereference (clang-analyzer traced exactly
+         * that), and with no callee node there is nothing to emit anyway. */
+        if (suppress_plain_calls || !target) {
             return;
         }
         char esc_callee[CBM_SZ_256];
@@ -467,10 +477,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
+    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
+        lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
     if (lsp) {
+        bool exact_external_target = call->requires_lsp_resolution &&
+                                     cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
         const cbm_gbuf_node_t *target_node =
-            cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail);
+            exact_external_target ? cbm_pipeline_lsp_target_node_strict(
+                                        ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail)
+                                  : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
+                                                                 lsp->callee_qn, allow_tail);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -483,6 +499,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
         }
+    }
+
+    /* Synthetic semantic candidates (currently implicit C++ operators) are
+     * valid calls only when the language resolver identifies a concrete
+     * invocation target. Textual registry/service fallbacks would bind an
+     * unresolved primitive expression such as `int + int` to an unrelated
+     * project `operator+`, fabricating a CALLS edge. */
+    if (call->requires_lsp_resolution) {
+        return 0;
     }
 
     /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the service

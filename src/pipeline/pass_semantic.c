@@ -400,6 +400,15 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     if (res.qualified_name && res.qualified_name[0] != '\0') {
         dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     }
+    /* A qualified Rust proc-macro path can collide with the decorated
+     * function's own name: resolving `#[tokio::main]` from module `main`
+     * may fall back from `tokio::main` to same-module `main`.  That is not a
+     * local decorator target (and the self-edge is discarded below), so keep
+     * the full external spelling by materialising the synthetic decorator. */
+    if (dec && dec->id == node->id && decorator[0] == '#' && decorator[1] == '[' &&
+        strstr(func_name, "::")) {
+        dec = NULL;
+    }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
          * stdlib annotation / proc-macro derive).  Materialise a synthetic

@@ -18,6 +18,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1383 test seam: force peer-image verification to fail so the rejection
+ * -response path is reachable from the in-process harness — the peer pid is
+ * OS-authenticated socket credentials, so a same-process peer always verifies
+ * against the service's own active image. */
+static atomic_bool runtime_force_peer_image_unverified_seam;
+void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force) {
+    atomic_store(&runtime_force_peer_image_unverified_seam, force);
+}
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1728,9 +1739,29 @@ static void *runtime_connection_worker(void *opaque) {
                               strcmp(peer_fingerprint, requested_build) == 0 &&
                               strcmp(peer_fingerprint, service->identity.build_fingerprint) == 0;
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&runtime_force_peer_image_unverified_seam)) {
+        peer_image_verified = false;
+        peer_image_fingerprinted = false;
+    }
+#endif
     if (!peer_image_verified) {
-        cbm_log_error("daemon.client_image_rejected", "reason",
-                      peer_image_fingerprinted ? "fingerprint_mismatch" : "image_unverifiable");
+        const char *reason =
+            peer_image_fingerprinted ? "fingerprint_mismatch" : "image_unverifiable";
+        cbm_log_error("daemon.client_image_rejected", "reason", reason);
+        /* #1383: answer the peer before closing. An unanswered rejection is
+         * indistinguishable from a slow cold start on the client side — the
+         * caller sat on "pending" indefinitely with the reason visible only in
+         * the daemon log. The version-conflict path above already responds to
+         * unverified peers, so this discloses nothing new to a same-uid local
+         * peer; admission stays rejected either way. */
+        runtime_result_rejected(&hello_result, "CBM daemon rejected this client's binary image");
+        (void)snprintf(hello_result.message, sizeof(hello_result.message),
+                       "CBM daemon rejected this client: %s. The client binary must match the "
+                       "running daemon's build; close CBM sessions (or run 'daemon stop') and "
+                       "retry with one consistent install.",
+                       reason);
+        (void)runtime_send_hello_response(worker->connection, &hello_result);
         runtime_worker_finish(worker);
         return NULL;
     }

@@ -221,17 +221,7 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
  * % ! ^. Callers then use DOUBLE quotes (honored by both POSIX sh and cmd.exe, unlike
  * single quotes on cmd.exe), so a repo path may legitimately contain spaces. */
 bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path) {
-    if (!cbm_validate_shell_arg(repo_path)) {
-        return false;
-    }
-#ifdef _WIN32
-    for (const char *p = repo_path; *p; p++) {
-        if (*p == '%' || *p == '!' || *p == '^') {
-            return false;
-        }
-    }
-#endif
-    return true;
+    return cbm_validate_shell_path_arg(repo_path);
 }
 
 /* Get current git HEAD hash. buf must be >= CBM_SZ_64. Returns false on error. */
@@ -599,14 +589,14 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     /* Compress with zstd */
-    size_t bound = cbm_zstd_compress_bound((int)db_size);
+    size_t bound = cbm_zstd_compress_bound(db_size);
     char *compressed = malloc(bound);
     if (!compressed) {
         free(db_data);
         return artifact_export_fail("compress", NULL, "alloc_compressed_buffer", 0);
     }
 
-    int clen = cbm_zstd_compress(db_data, (int)db_size, compressed, (int)bound, compression_level);
+    int64_t clen = cbm_zstd_compress(db_data, db_size, compressed, bound, compression_level);
     free(db_data);
 
     if (clen <= 0) {
@@ -631,7 +621,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     /* Get node/edge counts for metadata */
     int nodes = 0;
     int edges = 0;
-    cbm_store_t *count_store = cbm_store_open_path(db_path);
+    cbm_store_t *count_store = cbm_store_open_path_query(db_path);
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);

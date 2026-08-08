@@ -46,7 +46,25 @@ case "${1:-}" in
 esac
 
 RUNNER="${CBM_VM_RUNNER:-}"
-LOG="${CBM_VM_TEST_LOG:-/tmp/win-test.log}"
+
+# Per-run identity. The VM holds ONE checkout (/c/cbm), so two concurrent runs
+# shared a FIXED log path and the same build dir: the later run's output
+# replaced the earlier one's, and -PruneStale could delete a live run's temp
+# root out from under it. The run id namespaces the log and the build dir; the
+# protected temp root is already unique per run.
+CALLER_RUN_ID="${CBM_CI_RUN_ID:-}"
+RUN_ID="${CBM_CI_RUN_ID:-$$-$(date +%s)}"
+export CBM_CI_RUN_ID="$RUN_ID"
+LOG="${CBM_VM_TEST_LOG:-/tmp/win-test-${RUN_ID}.log}"
+
+# A caller that sets CBM_CI_RUN_ID is declaring concurrency, so give that run
+# its own BUILD_DIR; the default single-run path keeps the shared one and its
+# incremental reuse (a per-run build dir on the VM costs a full rebuild).
+if [ -n "$CALLER_RUN_ID" ]; then
+    BUILD_ARGS=("BUILD_DIR=build/vm-${RUN_ID}")
+else
+    BUILD_ARGS=()
+fi
 
 [ $# -ge 1 ] || { echo "vm-run-tests: missing arguments. Please consult --help." >&2; exit 2; }
 if [ "$1" = "--soak" ]; then
@@ -130,11 +148,23 @@ if [ -n "$RUNNER" ]; then
         rc="${PIPESTATUS[0]}"
     fi
 elif [ "$1" = "--par" ]; then
-    scripts/test.sh CC=clang CXX=clang++ 2>&1 | tee "$LOG"
+    scripts/test.sh CC=clang CXX=clang++ \
+        ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} 2>&1 | tee "$LOG"
     rc="${PIPESTATUS[0]}"
 else
-    scripts/test.sh --suites "$*" CC=clang CXX=clang++ 2>&1 | tee "$LOG"
+    scripts/test.sh --suites "$*" CC=clang CXX=clang++ \
+        ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} 2>&1 | tee "$LOG"
     rc="${PIPESTATUS[0]}"
+fi
+
+# Tidy this run's own build dir on success; keep it on failure as the
+# post-mortem. Only ever touches a dir this run created (concurrent mode).
+if [ -n "$CALLER_RUN_ID" ] && [ "${CBM_CI_KEEP:-0}" != "1" ]; then
+    if [ "${rc:-1}" -eq 0 ]; then
+        rm -rf "build/vm-${RUN_ID}"
+    else
+        echo "vm-run-tests: kept build/vm-${RUN_ID} and $LOG for post-mortem" >&2
+    fi
 fi
 
 if ! grep -Eq '[0-9]+ passed' "$LOG"; then

@@ -20,12 +20,18 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lsp/rust_lsp.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
 static CBMFileResult *extract_rust(const char *source) {
     return cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUST,
                             "test", "src/main.rs", 0, NULL, NULL);
+}
+
+static CBMTypeRegistry *rustlsp_return_shared_registry(void *ctx) {
+    return (CBMTypeRegistry *)ctx;
 }
 
 static int find_resolved(const CBMFileResult *r, const char *callerSub,
@@ -70,6 +76,41 @@ static int count_resolved(const CBMFileResult *r, const char *callerSub,
     return n;
 }
 
+static bool rustlsp_definition_has_decorator(const CBMFileResult *result,
+                                             const char *definition_name,
+                                             const char *decorator_text) {
+    if (!result || !definition_name || !decorator_text)
+        return false;
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *definition = &result->defs.items[i];
+        if (!definition->name || strcmp(definition->name, definition_name) != 0 ||
+            !definition->decorators) {
+            continue;
+        }
+        for (int d = 0; definition->decorators[d]; d++) {
+            if (strcmp(definition->decorators[d], decorator_text) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static int rustlsp_count_proc_macro_pseudo_calls(const CBMFileResult *result) {
+    int count = 0;
+    if (!result)
+        return 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if ((resolved->strategy && strcmp(resolved->strategy, "lsp_proc_macro") == 0) ||
+            (resolved->callee_qn && (strstr(resolved->callee_qn, "Runtime.new") ||
+                                     strstr(resolved->callee_qn, "Runtime.block_on") ||
+                                     strstr(resolved->callee_qn, "Span.enter")))) {
+            count++;
+        }
+    }
+    return count;
+}
+
 /* Confident = confidence >= the LSP override floor (0.6). */
 static int find_confident(const CBMResolvedCallArray *arr, const char *callerSub,
                           const char *calleeSub) {
@@ -81,6 +122,17 @@ static int find_confident(const CBMResolvedCallArray *arr, const char *callerSub
         }
     }
     return -1;
+}
+
+static int count_confident_strategy(const CBMResolvedCallArray *arr, const char *strategy) {
+    int count = 0;
+    for (int i = 0; arr && i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->confidence >= 0.6f && rc->strategy && strcmp(rc->strategy, strategy) == 0) {
+            count++;
+        }
+    }
+    return count;
 }
 
 /* ── Category 1: Free function calls + module path ─────────────── */
@@ -551,11 +603,767 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     memset(&out, 0, sizeof(out));
     cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
                                          imp_names, imp_qns, 1, NULL, /*manifest=*/NULL, &out,
-                                         /*result=*/NULL);
+                                         /*synthetic_calls=*/NULL);
 
     ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
 
     cbm_arena_destroy(&a);
+    PASS();
+}
+
+static CBMTypeRegistry *rustlsp_default_trait_registry(CBMArena *arena, bool add_ambiguous_type) {
+    CBMLSPDef defs[5];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.contract.Pinger";
+    defs[0].short_name = "Pinger";
+    defs[0].label = "Trait";
+    defs[0].def_module_qn = "test.contract";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.contract.Pinger.ping";
+    defs[1].short_name = "ping";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.contract.Pinger";
+    defs[1].def_module_qn = "test.contract";
+    defs[1].lang = CBM_LANG_RUST;
+    defs[2].qualified_name = "test.contract.S";
+    defs[2].short_name = "S";
+    defs[2].label = "Struct";
+    defs[2].def_module_qn = "test.contract";
+    defs[2].lang = CBM_LANG_RUST;
+    defs[3].qualified_name = "test.contract.S";
+    defs[3].short_name = "S";
+    defs[3].label = "RustImpl";
+    defs[3].receiver_type = "test.contract.S";
+    defs[3].def_module_qn = "test.contract";
+    defs[3].trait_qn = "test.contract.Pinger";
+    defs[3].is_rust_impl_relation = true;
+    defs[3].lang = CBM_LANG_RUST;
+    defs[4].qualified_name = "test.main.contract.S";
+    defs[4].short_name = "S";
+    defs[4].label = "Struct";
+    defs[4].def_module_qn = "test.main.contract";
+    defs[4].lang = CBM_LANG_RUST;
+    return cbm_rust_build_cross_registry(arena, defs, add_ambiguous_type ? 5 : 4);
+}
+
+TEST(rustlsp_relative_type_requires_declared_module) {
+    const char *caller = "fn caller(s: &contract::S) -> i32 { s.ping() }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *registry = rustlsp_default_trait_registry(&arena, false);
+    ASSERT_NOT_NULL(registry);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+    int stolen = count_confident_strategy(&out, "lsp_trait_dispatch");
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(stolen, 0);
+    PASS();
+}
+
+TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed) {
+    const char *caller = "mod contract;\n"
+                         "fn caller(s: &contract::S) -> i32 { s.ping() }\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *registry = rustlsp_default_trait_registry(&arena, true);
+    ASSERT_NOT_NULL(registry);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&arena, caller, (int)strlen(caller), "test.main", registry,
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+    int guessed = count_confident_strategy(&out, "lsp_trait_dispatch");
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(guessed, 0);
+    PASS();
+}
+
+/* A call hidden in a built-in macro's token tree can resolve only after the
+ * project-wide registry is available. The semantic record alone is not enough:
+ * pass_calls iterates CBMCall entries, so the cross resolver must also return a
+ * matching synthetic carrier to the owning CBMFileResult. */
+TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
+    const char *caller = "fn hidden() -> String { format!(\"{}\", lib::render()) }\n";
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.lib.render";
+    defs[0].short_name = "render";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.lib";
+    defs[0].return_types = "str";
+
+    const char *imp_names[] = {"lib"};
+    const char *imp_qns[] = {"test::lib"};
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, 1);
+    ASSERT_NOT_NULL(reg);
+
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         reg, imp_names, imp_qns, 1, NULL, /*manifest=*/NULL,
+                                         &result.resolved_calls, &result.calls);
+
+    int resolved = find_confident(&result.resolved_calls, "hidden", "lib.render");
+    int carriers = 0;
+    const CBMCall *carrier = NULL;
+    for (int i = 0; i < result.calls.count; i++) {
+        const CBMCall *call = &result.calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "hidden") &&
+            call->callee_name && strcmp(call->callee_name, "render") == 0) {
+            carriers++;
+            carrier = call;
+        }
+    }
+
+    const char *site = strstr(caller, "lib::render()");
+    uint32_t expected_start = site ? (uint32_t)(site - caller) : 0;
+    uint32_t expected_end = expected_start + (uint32_t)strlen("lib::render()");
+    bool exact_carrier = carrier && carrier->requires_lsp_resolution &&
+                         carrier->site_start_byte == expected_start &&
+                         carrier->site_end_byte == expected_end;
+    bool exact_semantic = resolved >= 0 &&
+                          result.resolved_calls.items[resolved].site_start_byte == expected_start &&
+                          result.resolved_calls.items[resolved].site_end_byte == expected_end;
+    const CBMResolvedCall *joined =
+        carrier ? cbm_pipeline_find_lsp_resolution(&result.resolved_calls, carrier, false) : NULL;
+    bool joined_target =
+        joined && joined->callee_qn && strcmp(joined->callee_qn, "test.lib.render") == 0;
+
+    cbm_arena_destroy(&result.arena);
+
+    /* Control: semantic cross-file resolution already succeeds today. */
+    ASSERT_GTE(resolved, 0);
+    /* RED: the corresponding exact CBMCall carrier is currently never returned. */
+    ASSERT_EQ(carriers, 1);
+    ASSERT_TRUE(exact_carrier);
+    ASSERT_TRUE(exact_semantic);
+    ASSERT_TRUE(joined_target);
+    PASS();
+}
+
+/* The production shared-registry dispatcher receives a file result that
+ * already contains Tier-1/local semantic records. Rewalking the whole Rust
+ * source against the project registry must merge those exact occurrences,
+ * while adding only the cross-file deficit and its source-exact carrier. */
+TEST(rustlsp_shared_dispatch_merges_existing_exact_occurrence) {
+    const char *source = "fn local() {}\n"
+                         "fn run() { local(); let _ = format!(\"{}\", lib::render()); }\n";
+    const char *local_site = strstr(source, "local();");
+    const char *render_site = strstr(source, "lib::render()");
+    ASSERT_NOT_NULL(local_site);
+    ASSERT_NOT_NULL(render_site);
+    uint32_t local_start = (uint32_t)(local_site - source);
+    uint32_t local_end = local_start + (uint32_t)strlen("local()");
+    uint32_t render_start = (uint32_t)(render_site - source);
+    uint32_t render_end = render_start + (uint32_t)strlen("lib::render()");
+
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(result->module_qn);
+
+    int local_before = 0;
+    const char *local_target = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+        if (rc->confidence >= 0.6f && rc->callee_qn && rc->site_start_byte == local_start &&
+            rc->site_end_byte == local_end) {
+            local_before++;
+            local_target = rc->callee_qn;
+        }
+    }
+    ASSERT_EQ(local_before, 1);
+    ASSERT_NOT_NULL(local_target);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = local_target;
+    defs[0].short_name = "local";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = result->module_qn;
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.lib.render";
+    defs[1].short_name = "render";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "test.lib";
+    defs[1].return_types = "str";
+    defs[1].lang = CBM_LANG_RUST;
+
+    CBMArena shared_arena;
+    cbm_arena_init(&shared_arena);
+    CBMTypeRegistry *shared = cbm_rust_build_cross_registry(&shared_arena, defs, 2);
+    ASSERT_NOT_NULL(shared);
+    const char *imp_names[] = {"lib"};
+    const char *imp_qns[] = {"test::lib"};
+
+    cbm_pxc_dispatch_file(CBM_LANG_RUST, result, source, (int)strlen(source), "src/main.rs",
+                          result->module_qn, NULL, NULL, defs, 2, imp_names, imp_qns, 1,
+                          rustlsp_return_shared_registry, shared);
+
+    int local_after = 0;
+    int render_semantics = 0;
+    int render_carriers = 0;
+    const CBMCall *render_carrier = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+        if (rc->confidence < 0.6f || !rc->callee_qn)
+            continue;
+        if (strcmp(rc->callee_qn, local_target) == 0 && rc->site_start_byte == local_start &&
+            rc->site_end_byte == local_end) {
+            local_after++;
+        }
+        if (strcmp(rc->callee_qn, "test.lib.render") == 0 && rc->site_start_byte == render_start &&
+            rc->site_end_byte == render_end) {
+            render_semantics++;
+        }
+    }
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "render") == 0 &&
+            call->site_start_byte == render_start && call->site_end_byte == render_end) {
+            render_carriers++;
+            render_carrier = call;
+        }
+    }
+    const CBMResolvedCall *joined =
+        render_carrier
+            ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, render_carrier, false)
+            : NULL;
+    bool exact_join = render_carrier && render_carrier->requires_lsp_resolution && joined &&
+                      joined->callee_qn && strcmp(joined->callee_qn, "test.lib.render") == 0;
+
+    cbm_arena_destroy(&shared_arena);
+
+    if (local_after != 1) {
+        for (int i = 0; i < result->resolved_calls.count; i++) {
+            const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+            if (rc->callee_qn && strcmp(rc->callee_qn, local_target) == 0) {
+                fprintf(stderr,
+                        "  [RUST-SHARED-MERGE] kind=%d caller=%s callee=%s site=%u:%u "
+                        "strategy=%s confidence=%.2f\n",
+                        (int)rc->kind, rc->caller_qn ? rc->caller_qn : "(null)", rc->callee_qn,
+                        rc->site_start_byte, rc->site_end_byte,
+                        rc->strategy ? rc->strategy : "(null)", rc->confidence);
+            }
+        }
+    }
+    cbm_free_result(result);
+
+    /* RED today: the shared branch appends directly and emits local() twice. */
+    ASSERT_EQ(local_after, 1);
+    ASSERT_EQ(render_semantics, 1);
+    ASSERT_EQ(render_carriers, 1);
+    ASSERT_TRUE(exact_join);
+    PASS();
+}
+
+/* The sequential small-project path resolves Rust in a scratch arena. A
+ * carrier allocated there must be deep-copied into the file-result arena
+ * before the scratch arena is destroyed. This test dereferences all populated
+ * strings after cbm_pxc_run_one returns, making ownership bugs visible under
+ * ASan as well as exercising the production fallback path. */
+TEST(rustlsp_scratch_cross_macro_carrier_survives_copy) {
+    const char *caller = "fn hidden() -> String { format!(\"{}\", lib::render()) }\n";
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.lib.render";
+    defs[0].short_name = "render";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.lib";
+    defs[0].return_types = "str";
+    defs[0].lang = CBM_LANG_RUST;
+
+    const char *imp_names[] = {"lib"};
+    const char *imp_qns[] = {"test::lib"};
+    cbm_pxc_run_one(CBM_LANG_RUST, &result, caller, (int)strlen(caller), "test.main", defs, 1,
+                    imp_names, imp_qns, 1);
+
+    const CBMCall *carrier = NULL;
+    for (int i = 0; i < result.calls.count; i++) {
+        const CBMCall *call = &result.calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "render") == 0) {
+            carrier = call;
+            break;
+        }
+    }
+    const char *site = strstr(caller, "lib::render()");
+    uint32_t expected_start = site ? (uint32_t)(site - caller) : 0;
+    uint32_t expected_end = expected_start + (uint32_t)strlen("lib::render()");
+    bool copied = carrier && carrier->callee_name && carrier->enclosing_func_qn &&
+                  strcmp(carrier->callee_name, "render") == 0 &&
+                  strstr(carrier->enclosing_func_qn, "hidden") &&
+                  carrier->requires_lsp_resolution && carrier->site_start_byte == expected_start &&
+                  carrier->site_end_byte == expected_end;
+    const CBMResolvedCall *joined =
+        carrier ? cbm_pipeline_find_lsp_resolution(&result.resolved_calls, carrier, false) : NULL;
+    bool joined_target =
+        joined && joined->callee_qn && strcmp(joined->callee_qn, "test.lib.render") == 0;
+
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(copied);
+    ASSERT_TRUE(joined_target);
+    PASS();
+}
+
+/* Two same-leaf calls inside one token tree must not cross-pair through the
+ * legacy (caller, leaf-name) join. Their exact original-source occurrences are
+ * the identity that pins each synthetic carrier to its semantic target. */
+TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact) {
+    const char *caller = "fn hidden() -> String { format!(\"{} {}\", a::render(), b::render()) }\n";
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.a.render";
+    defs[0].short_name = "render";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "test.a";
+    defs[0].return_types = "str";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1] = defs[0];
+    defs[1].qualified_name = "test.b.render";
+    defs[1].def_module_qn = "test.b";
+
+    const char *imp_names[] = {"a", "b"};
+    const char *imp_qns[] = {"test::a", "test::b"};
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&result.arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    cbm_run_rust_lsp_cross_with_registry(&result.arena, caller, (int)strlen(caller), "test.main",
+                                         reg, imp_names, imp_qns, 2, NULL, /*manifest=*/NULL,
+                                         &result.resolved_calls, &result.calls);
+
+    const char *a_site = strstr(caller, "a::render()");
+    const char *b_site = strstr(caller, "b::render()");
+    uint32_t a_start = a_site ? (uint32_t)(a_site - caller) : 0;
+    uint32_t b_start = b_site ? (uint32_t)(b_site - caller) : 0;
+    const CBMCall *a_call = NULL;
+    const CBMCall *b_call = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < result.calls.count; i++) {
+        const CBMCall *call = &result.calls.items[i];
+        if (!call->callee_name || strcmp(call->callee_name, "render") != 0)
+            continue;
+        carrier_count++;
+        if (call->site_start_byte == a_start)
+            a_call = call;
+        if (call->site_start_byte == b_start)
+            b_call = call;
+    }
+    const CBMResolvedCall *a_hit =
+        a_call ? cbm_pipeline_find_lsp_resolution(&result.resolved_calls, a_call, false) : NULL;
+    const CBMResolvedCall *b_hit =
+        b_call ? cbm_pipeline_find_lsp_resolution(&result.resolved_calls, b_call, false) : NULL;
+    bool a_exact = a_call && a_call->requires_lsp_resolution &&
+                   a_call->site_end_byte == a_start + strlen("a::render()") && a_hit &&
+                   a_hit->callee_qn && strcmp(a_hit->callee_qn, "test.a.render") == 0;
+    bool b_exact = b_call && b_call->requires_lsp_resolution &&
+                   b_call->site_end_byte == b_start + strlen("b::render()") && b_hit &&
+                   b_hit->callee_qn && strcmp(b_hit->callee_qn, "test.b.render") == 0;
+
+    cbm_arena_destroy(&result.arena);
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_TRUE(a_exact);
+    ASSERT_TRUE(b_exact);
+    PASS();
+}
+
+/* Rust operator desugaring has the same carrier join hazard. With two `add`
+ * targets in one caller, zero-span carriers both join the first semantic
+ * record. Exact spans must preserve one Alpha edge and one Beta edge. */
+TEST(rustlsp_operator_carriers_are_occurrence_exact) {
+    const char *source =
+        "use std::ops::Add;\n"
+        "struct Alpha;\n"
+        "impl Add for Alpha { type Output = Alpha; fn add(self, _: Alpha) -> Alpha { self } }\n"
+        "struct Beta;\n"
+        "impl Add for Beta { type Output = Beta; fn add(self, _: Beta) -> Beta { self } }\n"
+        "fn run(a: Alpha, b: Alpha, x: Beta, y: Beta) { let _ = a + b; let _ = x + y; }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+
+    const char *alpha_site = strstr(source, "a + b");
+    const char *beta_site = strstr(source, "x + y");
+    uint32_t alpha_start = alpha_site ? (uint32_t)(alpha_site - source) : 0;
+    uint32_t beta_start = beta_site ? (uint32_t)(beta_site - source) : 0;
+    const CBMCall *alpha_call = NULL;
+    const CBMCall *beta_call = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "run") ||
+            !call->callee_name || strcmp(call->callee_name, "add") != 0)
+            continue;
+        carrier_count++;
+        if (call->site_start_byte == alpha_start)
+            alpha_call = call;
+        if (call->site_start_byte == beta_start)
+            beta_call = call;
+    }
+    const CBMResolvedCall *alpha_hit =
+        alpha_call ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, alpha_call, false)
+                   : NULL;
+    const CBMResolvedCall *beta_hit =
+        beta_call ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, beta_call, false)
+                  : NULL;
+    bool alpha_exact = alpha_call && alpha_call->requires_lsp_resolution &&
+                       alpha_call->site_end_byte == alpha_start + strlen("a + b") && alpha_hit &&
+                       alpha_hit->callee_qn && strstr(alpha_hit->callee_qn, "Alpha.add");
+    bool beta_exact = beta_call && beta_call->requires_lsp_resolution &&
+                      beta_call->site_end_byte == beta_start + strlen("x + y") && beta_hit &&
+                      beta_hit->callee_qn && strstr(beta_hit->callee_qn, "Beta.add");
+
+    cbm_free_result(result);
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_TRUE(alpha_exact);
+    ASSERT_TRUE(beta_exact);
+    PASS();
+}
+
+/* Built-in expression macros reparse their token tree, so operator carriers
+ * need the same synthetic-to-original span mapping as ordinary hidden calls.
+ * The injection hook and the explicit operator carrier must also cooperate:
+ * exactly one source-exact carrier may survive for the occurrence. */
+TEST(rustlsp_macro_operator_has_one_exact_carrier) {
+    const char *source =
+        "use std::ops::Add;\n"
+        "struct Alpha;\n"
+        "impl Add for Alpha { type Output = Alpha; fn add(self, _: Alpha) -> Alpha { self } }\n"
+        "fn run(a: Alpha, b: Alpha) { let _ = format!(\"{}\", a + b); }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+
+    const char *site = strstr(source, "a + b");
+    uint32_t start = site ? (uint32_t)(site - source) : 0;
+    const CBMCall *carrier = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "run") ||
+            !call->callee_name || strcmp(call->callee_name, "add") != 0) {
+            continue;
+        }
+        carrier_count++;
+        carrier = call;
+    }
+    const CBMResolvedCall *hit =
+        carrier ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, carrier, false) : NULL;
+    bool exact = carrier && carrier->requires_lsp_resolution && carrier->site_start_byte == start &&
+                 carrier->site_end_byte == start + strlen("a + b") && hit && hit->callee_qn &&
+                 strstr(hit->callee_qn, "Alpha.add");
+
+    cbm_free_result(result);
+    ASSERT_EQ(carrier_count, 1);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+/* Known std-macro semantic records must identify the source occurrence even
+ * before graph joining.  Zero-span records cannot distinguish repetitions. */
+TEST(rustlsp_known_std_macro_resolutions_have_exact_sites) {
+    const char *source = "fn run() {\n"
+                         "    println!(\"a\");\n"
+                         "    println!(\"b\");\n"
+                         "}\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+
+    const char *first_site = strstr(source, "println!(\"a\")");
+    const char *second_site = strstr(source, "println!(\"b\")");
+    const uint32_t first_start = first_site ? (uint32_t)(first_site - source) : 0;
+    const uint32_t first_end = first_start + (uint32_t)strlen("println!(\"a\")");
+    const uint32_t second_start = second_site ? (uint32_t)(second_site - source) : 0;
+    const uint32_t second_end = second_start + (uint32_t)strlen("println!(\"b\")");
+    int semantic_count = 0;
+    bool first_exact = false;
+    bool second_exact = false;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || !resolved->caller_qn ||
+            !strstr(resolved->caller_qn, "run") || !resolved->callee_qn ||
+            strcmp(resolved->callee_qn, "std.macros.println") != 0 || !resolved->strategy ||
+            strcmp(resolved->strategy, "lsp_macro") != 0) {
+            continue;
+        }
+        semantic_count++;
+        if (resolved->site_start_byte == first_start && resolved->site_end_byte == first_end)
+            first_exact = true;
+        if (resolved->site_start_byte == second_start && resolved->site_end_byte == second_end)
+            second_exact = true;
+    }
+    if (semantic_count != 2 || !first_exact || !second_exact) {
+        printf("  Rust macro semantic-site diagnostic: semantics=%d first_exact=%d "
+               "second_exact=%d\n",
+               semantic_count, first_exact, second_exact);
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_TRUE(first_exact);
+    ASSERT_TRUE(second_exact);
+    PASS();
+}
+
+/* Known std macros are declared primary call nodes in the language manifest.
+ * Their parser carriers must exist, demand semantic resolution, and join the
+ * matching occurrence rather than a legacy name-only record. */
+TEST(rustlsp_known_std_macro_carriers_join_exact_sites) {
+    const char *source = "fn run() {\n"
+                         "    println!(\"a\");\n"
+                         "    println!(\"b\");\n"
+                         "}\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+
+    const char *first_site = strstr(source, "println!(\"a\")");
+    const char *second_site = strstr(source, "println!(\"b\")");
+    const uint32_t first_start = first_site ? (uint32_t)(first_site - source) : 0;
+    const uint32_t first_end = first_start + (uint32_t)strlen("println!(\"a\")");
+    const uint32_t second_start = second_site ? (uint32_t)(second_site - source) : 0;
+    const uint32_t second_end = second_start + (uint32_t)strlen("println!(\"b\")");
+    const CBMCall *first_call = NULL;
+    const CBMCall *second_call = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "run") ||
+            !call->callee_name || strcmp(call->callee_name, "println") != 0) {
+            continue;
+        }
+        carrier_count++;
+        if (call->site_start_byte == first_start && call->site_end_byte == first_end)
+            first_call = call;
+        if (call->site_start_byte == second_start && call->site_end_byte == second_end)
+            second_call = call;
+    }
+    int semantic_count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "run") && resolved->callee_qn &&
+            strcmp(resolved->callee_qn, "std.macros.println") == 0 && resolved->strategy &&
+            strcmp(resolved->strategy, "lsp_macro") == 0) {
+            semantic_count++;
+        }
+    }
+    const CBMResolvedCall *first_join =
+        first_call ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, first_call, false)
+                   : NULL;
+    const CBMResolvedCall *second_join =
+        second_call ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, second_call, false)
+                    : NULL;
+    const bool first_exact = first_call && first_call->requires_lsp_resolution && first_join &&
+                             first_join->site_start_byte == first_start &&
+                             first_join->site_end_byte == first_end;
+    const bool second_exact = second_call && second_call->requires_lsp_resolution && second_join &&
+                              second_join->site_start_byte == second_start &&
+                              second_join->site_end_byte == second_end;
+
+    if (carrier_count != 2 || semantic_count != 2 || !first_exact || !second_exact) {
+        printf("  Rust macro occurrence diagnostic: carriers=%d semantics=%d first_exact=%d "
+               "second_exact=%d\n",
+               carrier_count, semantic_count, first_exact, second_exact);
+        for (int i = 0; i < result->calls.count; i++) {
+            const CBMCall *call = &result->calls.items[i];
+            printf("    carrier[%d] %s %u:%u caller=%s\n", i,
+                   call->callee_name ? call->callee_name : "(null)", call->site_start_byte,
+                   call->site_end_byte,
+                   call->enclosing_func_qn ? call->enclosing_func_qn : "(null)");
+        }
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_TRUE(first_exact);
+    ASSERT_TRUE(second_exact);
+    PASS();
+}
+
+/* A local macro_rules! definition has lexical precedence over a prelude macro
+ * with the same name.  Expanding it must reveal the local target and must not
+ * also fabricate the canonical std macro semantic. */
+TEST(rustlsp_local_macro_shadows_known_std_macro) {
+    CBMFileResult *result = extract_rust("macro_rules! println { () => { local_target() } }\n"
+                                         "fn local_target() {}\n"
+                                         "fn run() { println!(); }\n");
+    ASSERT_NOT_NULL(result);
+
+    int local_count = 0;
+    int std_count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (!resolved->caller_qn || !strstr(resolved->caller_qn, "run") || !resolved->callee_qn) {
+            continue;
+        }
+        if (strstr(resolved->callee_qn, "local_target"))
+            local_count++;
+        if (strcmp(resolved->callee_qn, "std.macros.println") == 0)
+            std_count++;
+    }
+    if (local_count == 0 || std_count != 0) {
+        printf("  Rust macro shadow diagnostic: local=%d std=%d\n", local_count, std_count);
+    }
+    cbm_free_result(result);
+    ASSERT_GTE(local_count, 1);
+    ASSERT_EQ(std_count, 0);
+    PASS();
+}
+
+/* macro_rules! is textually scoped. A definition that appears after the
+ * invocation cannot retroactively replace the prelude macro. */
+TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro) {
+    CBMFileResult *result = extract_rust("fn run() { println!(); }\n"
+                                         "macro_rules! println { () => { local_target() } }\n"
+                                         "fn local_target() {}\n");
+    ASSERT_NOT_NULL(result);
+
+    int local_count = 0;
+    int std_count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (!resolved->caller_qn || !strstr(resolved->caller_qn, "run") || !resolved->callee_qn) {
+            continue;
+        }
+        if (strstr(resolved->callee_qn, "local_target"))
+            local_count++;
+        if (strcmp(resolved->callee_qn, "std.macros.println") == 0)
+            std_count++;
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(local_count, 0);
+    ASSERT_EQ(std_count, 1);
+    PASS();
+}
+
+/* A macro defined in a nested module shadows the prelude only inside that
+ * module. Leaving the module restores the outer macro namespace. */
+TEST(rustlsp_nested_macro_scope_does_not_leak) {
+    CBMFileResult *result = extract_rust("mod nested {\n"
+                                         "    macro_rules! println { () => { nested_target() } }\n"
+                                         "    fn nested_target() {}\n"
+                                         "    fn nested_run() { println!(); }\n"
+                                         "}\n"
+                                         "fn outer_run() { println!(); }\n");
+    ASSERT_NOT_NULL(result);
+
+    int nested_local = 0;
+    int nested_std = 0;
+    int outer_local = 0;
+    int outer_std = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (!resolved->caller_qn || !resolved->callee_qn)
+            continue;
+        if (strstr(resolved->caller_qn, "nested_run")) {
+            if (strstr(resolved->callee_qn, "nested_target"))
+                nested_local++;
+            if (strcmp(resolved->callee_qn, "std.macros.println") == 0)
+                nested_std++;
+        }
+        if (strstr(resolved->caller_qn, "outer_run")) {
+            if (strstr(resolved->callee_qn, "nested_target"))
+                outer_local++;
+            if (strcmp(resolved->callee_qn, "std.macros.println") == 0)
+                outer_std++;
+        }
+    }
+    cbm_free_result(result);
+    ASSERT_GTE(nested_local, 1);
+    ASSERT_EQ(nested_std, 0);
+    ASSERT_EQ(outer_local, 0);
+    ASSERT_EQ(outer_std, 1);
+    PASS();
+}
+
+/* A macro_rules! transcriber is generated source, even when its invocation is
+ * discovered while reparsing a built-in macro's real argument tokens. It must
+ * not inherit that outer affine map and fabricate an exact occurrence (or a
+ * graph carrier) for a call that has no one-to-one source span. */
+TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map) {
+    const char *source =
+        "macro_rules! hidden { () => {{ let _pad0 = 0; let _pad1 = 1; hidden_target() }}; }\n"
+        "fn hidden_target() {}\n"
+        "fn run() { let _ = format!(\"........................................................\", "
+        "hidden!()); }\n";
+    CBMFileResult *result = extract_rust(source);
+    ASSERT_NOT_NULL(result);
+
+    int semantic_count = 0;
+    int exact_semantic_count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+        if (!rc->callee_qn || !strstr(rc->callee_qn, "hidden_target"))
+            continue;
+        semantic_count++;
+        if (rc->site_end_byte > rc->site_start_byte)
+            exact_semantic_count++;
+    }
+    int carrier_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->callee_name && strstr(call->callee_name, "hidden_target"))
+            carrier_count++;
+    }
+
+    cbm_free_result(result);
+    ASSERT_GTE(semantic_count, 1);
+    ASSERT_EQ(exact_semantic_count, 0);
+    ASSERT_EQ(carrier_count, 0);
+    PASS();
+}
+
+/* Ordinary parser-backed calls need occurrence spans too. Without them, two
+ * same-leaf method calls in one caller both join the first Rust semantic
+ * record even though tree-sitter produced two distinct CBMCall sites. */
+TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site) {
+    CBMFileResult *result = extract_rust("struct Alpha; impl Alpha { fn render(&self) {} }\n"
+                                         "struct Beta; impl Beta { fn render(&self) {} }\n"
+                                         "fn run(a: Alpha, b: Beta) { a.render(); b.render(); }\n");
+    ASSERT_NOT_NULL(result);
+
+    const CBMCall *calls[2] = {0};
+    int call_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "run") &&
+            call->callee_name && strstr(call->callee_name, "render")) {
+            if (call_count < 2)
+                calls[call_count] = call;
+            call_count++;
+        }
+    }
+    if (calls[0] && calls[1] && calls[0]->site_start_byte > calls[1]->site_start_byte) {
+        const CBMCall *tmp = calls[0];
+        calls[0] = calls[1];
+        calls[1] = tmp;
+    }
+    const CBMResolvedCall *alpha_hit =
+        calls[0] ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[0], false)
+                 : NULL;
+    const CBMResolvedCall *beta_hit =
+        calls[1] ? cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[1], false)
+                 : NULL;
+    bool alpha_exact = alpha_hit && alpha_hit->callee_qn &&
+                       strstr(alpha_hit->callee_qn, "Alpha.render") &&
+                       alpha_hit->site_start_byte == calls[0]->site_start_byte &&
+                       alpha_hit->site_end_byte == calls[0]->site_end_byte;
+    bool beta_exact = beta_hit && beta_hit->callee_qn &&
+                      strstr(beta_hit->callee_qn, "Beta.render") &&
+                      beta_hit->site_start_byte == calls[1]->site_start_byte &&
+                      beta_hit->site_end_byte == calls[1]->site_end_byte;
+
+    cbm_free_result(result);
+    ASSERT_EQ(call_count, 2);
+    ASSERT_TRUE(alpha_exact);
+    ASSERT_TRUE(beta_exact);
     PASS();
 }
 
@@ -5713,21 +6521,15 @@ TEST(rustlsp_extra_cargo_wires_external_dep) {
     PASS();
 }
 
-/* Option B: attribute proc-macro synthesis. */
+/* Proc-macro attributes stay on the definition. The semantic graph passes
+ * consume this field to emit DECORATES + USAGE; Rust LSP must not invent calls
+ * to implementation details that only executing the proc-macro could prove. */
 TEST(rustlsp_extra_proc_macro_tokio_main) {
     CBMFileResult *r = extract_rust(
         "#[tokio::main]\nasync fn main() { let _ = 1; }\n");
     ASSERT_NOT_NULL(r);
-    /* Synthetic edges from `main` to tokio::runtime::Runtime::new/block_on. */
-    bool found_new = false, found_block = false;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall* rc = &r->resolved_calls.items[i];
-        if (!rc->callee_qn) continue;
-        if (strstr(rc->callee_qn, "Runtime.new")) found_new = true;
-        if (strstr(rc->callee_qn, "Runtime.block_on")) found_block = true;
-    }
-    ASSERT_EQ(true, found_new);
-    ASSERT_EQ(true, found_block);
+    ASSERT_TRUE(rustlsp_definition_has_decorator(r, "main", "#[tokio::main]"));
+    ASSERT_EQ(rustlsp_count_proc_macro_pseudo_calls(r), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -5735,14 +6537,8 @@ TEST(rustlsp_extra_proc_macro_tokio_test) {
     CBMFileResult *r = extract_rust(
         "#[tokio::test]\nasync fn my_test() { let _ = 1; }\n");
     ASSERT_NOT_NULL(r);
-    bool found_block = false;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall* rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strstr(rc->callee_qn, "Runtime.block_on")) {
-            found_block = true; break;
-        }
-    }
-    ASSERT_EQ(true, found_block);
+    ASSERT_TRUE(rustlsp_definition_has_decorator(r, "my_test", "#[tokio::test]"));
+    ASSERT_EQ(rustlsp_count_proc_macro_pseudo_calls(r), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -5750,14 +6546,8 @@ TEST(rustlsp_extra_proc_macro_tracing_instrument) {
     CBMFileResult *r = extract_rust(
         "#[tracing::instrument]\nfn work() { let _ = 1; }\n");
     ASSERT_NOT_NULL(r);
-    bool found = false;
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall* rc = &r->resolved_calls.items[i];
-        if (rc->callee_qn && strstr(rc->callee_qn, "Span.enter")) {
-            found = true; break;
-        }
-    }
-    ASSERT_EQ(true, found);
+    ASSERT_TRUE(rustlsp_definition_has_decorator(r, "work", "#[tracing::instrument]"));
+    ASSERT_EQ(rustlsp_count_proc_macro_pseudo_calls(r), 0);
     cbm_free_result(r); PASS();
 }
 
@@ -5766,14 +6556,21 @@ TEST(rustlsp_extra_proc_macro_unknown_attr_no_false_edge) {
     CBMFileResult *r = extract_rust(
         "#[my_weird_macro]\nfn main() { let _ = 1; }\n");
     ASSERT_NOT_NULL(r);
-    for (int i = 0; i < r->resolved_calls.count; i++) {
-        const CBMResolvedCall* rc = &r->resolved_calls.items[i];
-        if (!rc->callee_qn) continue;
-        /* No synthetic Runtime/Span/etc. should appear. */
-        ASSERT_EQ(NULL, strstr(rc->callee_qn, "Runtime"));
-        ASSERT_EQ(NULL, strstr(rc->callee_qn, "Span.enter"));
-    }
+    ASSERT_TRUE(rustlsp_definition_has_decorator(r, "main", "#[my_weird_macro]"));
+    ASSERT_EQ(rustlsp_count_proc_macro_pseudo_calls(r), 0);
     cbm_free_result(r); PASS();
+}
+
+/* Similar-looking paths are retained verbatim as attributes, with no hidden
+ * substring matcher capable of manufacturing runtime calls. */
+TEST(rustlsp_proc_macro_match_requires_exact_attribute_path) {
+    CBMFileResult *r = extract_rust("#[not_tokio::main_wrapper]\nasync fn main() {}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(rustlsp_definition_has_decorator(r, "main", "#[not_tokio::main_wrapper]"));
+    int runtime_records = rustlsp_count_proc_macro_pseudo_calls(r);
+    cbm_free_result(r);
+    ASSERT_EQ(runtime_records, 0);
+    PASS();
 }
 
 /* Option A: rustdoc JSON ingestion. */
@@ -6015,6 +6812,21 @@ void suite_rust_lsp(void) {
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
     RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
+    RUN_TEST(rustlsp_relative_type_requires_declared_module);
+    RUN_TEST(rustlsp_relative_type_ambiguous_graph_paths_fail_closed);
+    RUN_TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier);
+    RUN_TEST(rustlsp_shared_dispatch_merges_existing_exact_occurrence);
+    RUN_TEST(rustlsp_scratch_cross_macro_carrier_survives_copy);
+    RUN_TEST(rustlsp_macro_same_leaf_carriers_are_occurrence_exact);
+    RUN_TEST(rustlsp_operator_carriers_are_occurrence_exact);
+    RUN_TEST(rustlsp_macro_operator_has_one_exact_carrier);
+    RUN_TEST(rustlsp_known_std_macro_resolutions_have_exact_sites);
+    RUN_TEST(rustlsp_known_std_macro_carriers_join_exact_sites);
+    RUN_TEST(rustlsp_local_macro_shadows_known_std_macro);
+    RUN_TEST(rustlsp_later_macro_does_not_shadow_earlier_std_macro);
+    RUN_TEST(rustlsp_nested_macro_scope_does_not_leak);
+    RUN_TEST(rustlsp_nested_macro_rules_call_does_not_inherit_outer_site_map);
+    RUN_TEST(rustlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(rustlsp_crossfile_free_function);
 
     /* Robustness */
@@ -6546,6 +7358,7 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_extra_proc_macro_tokio_test);
     RUN_TEST(rustlsp_extra_proc_macro_tracing_instrument);
     RUN_TEST(rustlsp_extra_proc_macro_unknown_attr_no_false_edge);
+    RUN_TEST(rustlsp_proc_macro_match_requires_exact_attribute_path);
     RUN_TEST(rustlsp_extra_rustdoc_ingest_basic_function);
     RUN_TEST(rustlsp_extra_rustdoc_ingest_struct_and_trait);
     RUN_TEST(rustlsp_extra_rustdoc_handles_malformed);

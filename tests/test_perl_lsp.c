@@ -26,6 +26,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "lsp/perl_lsp.h"
 #include <string.h>
 
@@ -372,6 +373,197 @@ TEST(perllsp_unindexed_receiver_emits_block) {
     PASS();
 }
 
+/* Occurrence identity is independent of the pending public-QN decision. This
+ * deliberately invokes the same Widget method twice, so both sites resolve to
+ * one target under today's flat QNs and would still share one target if that QN
+ * later becomes package-qualified. Each semantic record must nevertheless be
+ * tied to its own full parser occurrence. */
+TEST(perllsp_repeated_target_calls_join_by_exact_site) {
+    static const char source[] = "package Widget;\n"
+                                 "sub render { return 1; }\n"
+                                 "package main;\n"
+                                 "sub occurrence_probe {\n"
+                                 "    Widget->render();\n"
+                                 "    Widget->render();\n"
+                                 "}\n";
+    static const char call_text[] = "Widget->render()";
+
+    const char *first_site = strstr(source, call_text);
+    const char *second_site = first_site ? strstr(first_site + 1, call_text) : NULL;
+    ASSERT_NOT_NULL(first_site);
+    ASSERT_NOT_NULL(second_site);
+    const uint32_t first_start = (uint32_t)(first_site - source);
+    const uint32_t first_end = first_start + (uint32_t)strlen(call_text);
+    const uint32_t second_start = (uint32_t)(second_site - source);
+    const uint32_t second_end = second_start + (uint32_t)strlen(call_text);
+
+    CBMFileResult *r = extract_perl(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *first_call = NULL;
+    const CBMCall *second_call = NULL;
+    int render_carriers = 0;
+    int zero_span_carriers = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "main.occurrence_probe") ||
+            !call->callee_name || !strstr(call->callee_name, "render")) {
+            continue;
+        }
+        render_carriers++;
+        if (call->site_end_byte <= call->site_start_byte)
+            zero_span_carriers++;
+        if (call->site_start_byte == first_start && call->site_end_byte == first_end)
+            first_call = call;
+        if (call->site_start_byte == second_start && call->site_end_byte == second_end)
+            second_call = call;
+    }
+
+    ASSERT_EQ(render_carriers, 2);
+    ASSERT_EQ(zero_span_carriers, 0);
+    ASSERT_NOT_NULL(first_call);
+    ASSERT_NOT_NULL(second_call);
+    ASSERT_TRUE(first_call != second_call);
+
+    const CBMResolvedCall *first_semantic = NULL;
+    const CBMResolvedCall *second_semantic = NULL;
+    int render_semantics = 0;
+    int zero_span_semantics = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || rc->confidence <= 0.0f || !rc->caller_qn ||
+            !strstr(rc->caller_qn, "main.occurrence_probe") || !rc->callee_qn ||
+            !strstr(rc->callee_qn, "render")) {
+            continue;
+        }
+        render_semantics++;
+        if (rc->site_end_byte <= rc->site_start_byte)
+            zero_span_semantics++;
+        if (rc->site_start_byte == first_start && rc->site_end_byte == first_end)
+            first_semantic = rc;
+        if (rc->site_start_byte == second_start && rc->site_end_byte == second_end)
+            second_semantic = rc;
+    }
+
+    ASSERT_EQ(render_semantics, 2);
+    ASSERT_EQ(zero_span_semantics, 0);
+    ASSERT_NOT_NULL(first_semantic);
+    ASSERT_NOT_NULL(second_semantic);
+    ASSERT_TRUE(first_semantic != second_semantic);
+    ASSERT_STR_EQ(first_semantic->callee_qn, second_semantic->callee_qn);
+
+    const CBMResolvedCall *first_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, first_call, false);
+    const CBMResolvedCall *second_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, second_call, false);
+    ASSERT_TRUE(first_joined == first_semantic);
+    ASSERT_TRUE(second_joined == second_semantic);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Keep the other ordinary resolver branches under the same occurrence
+ * contract. The first regression above is a static method-call expression;
+ * this helper also exercises function-call expressions and typed/inherited
+ * method dispatch without coupling the tests to the pending package-QN
+ * decision. */
+static int assert_perl_repeated_exact_join(const char *source, const char *caller_fragment,
+                                           const char *callee_fragment, const char *call_text) {
+    const char *first_site = strstr(source, call_text);
+    const char *second_site = first_site ? strstr(first_site + 1, call_text) : NULL;
+    ASSERT_NOT_NULL(first_site);
+    ASSERT_NOT_NULL(second_site);
+    const uint32_t starts[2] = {(uint32_t)(first_site - source), (uint32_t)(second_site - source)};
+    const uint32_t ends[2] = {starts[0] + (uint32_t)strlen(call_text),
+                              starts[1] + (uint32_t)strlen(call_text)};
+
+    CBMFileResult *r = extract_perl(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *calls[2] = {NULL, NULL};
+    int carrier_count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, caller_fragment) ||
+            !call->callee_name || !strstr(call->callee_name, callee_fragment)) {
+            continue;
+        }
+        carrier_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (call->site_start_byte == starts[occurrence] &&
+                call->site_end_byte == ends[occurrence]) {
+                calls[occurrence] = call;
+            }
+        }
+    }
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_NOT_NULL(calls[0]);
+    ASSERT_NOT_NULL(calls[1]);
+
+    const CBMResolvedCall *semantics[2] = {NULL, NULL};
+    int semantic_count = 0;
+    int zero_span_semantics = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            !resolved->caller_qn || !strstr(resolved->caller_qn, caller_fragment) ||
+            !resolved->callee_qn || !strstr(resolved->callee_qn, callee_fragment)) {
+            continue;
+        }
+        semantic_count++;
+        if (resolved->site_end_byte <= resolved->site_start_byte) {
+            zero_span_semantics++;
+        }
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (resolved->site_start_byte == starts[occurrence] &&
+                resolved->site_end_byte == ends[occurrence]) {
+                semantics[occurrence] = resolved;
+            }
+        }
+    }
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_EQ(zero_span_semantics, 0);
+    ASSERT_NOT_NULL(semantics[0]);
+    ASSERT_NOT_NULL(semantics[1]);
+    ASSERT_STR_EQ(semantics[0]->callee_qn, semantics[1]->callee_qn);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&r->resolved_calls, calls[0], false) ==
+                semantics[0]);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&r->resolved_calls, calls[1], false) ==
+                semantics[1]);
+
+    cbm_free_result(r);
+    return 0;
+}
+
+TEST(perllsp_repeated_static_function_calls_join_by_exact_site) {
+    static const char source[] = "package Helper;\n"
+                                 "sub work { return 1; }\n"
+                                 "package main;\n"
+                                 "sub function_occurrence_probe {\n"
+                                 "    Helper::work();\n"
+                                 "    Helper::work();\n"
+                                 "}\n";
+    return assert_perl_repeated_exact_join(source, "main.function_occurrence_probe", "work",
+                                           "Helper::work()");
+}
+
+TEST(perllsp_repeated_inherited_method_calls_join_by_exact_site) {
+    static const char source[] = "package Base;\n"
+                                 "sub greet { return 1; }\n"
+                                 "package Child;\n"
+                                 "our @ISA = ('Base');\n"
+                                 "sub new { my $class = shift; return bless {}, $class; }\n"
+                                 "package main;\n"
+                                 "sub inherited_occurrence_probe {\n"
+                                 "    my $child = Child->new();\n"
+                                 "    $child->greet();\n"
+                                 "    $child->greet();\n"
+                                 "}\n";
+    return assert_perl_repeated_exact_join(source, "main.inherited_occurrence_probe", "greet",
+                                           "$child->greet()");
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -389,4 +581,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_super_dispatch);
     RUN_TEST(perllsp_super_no_parent_no_edge);
     RUN_TEST(perllsp_unindexed_receiver_emits_block);
+    RUN_TEST(perllsp_repeated_target_calls_join_by_exact_site);
+    RUN_TEST(perllsp_repeated_static_function_calls_join_by_exact_site);
+    RUN_TEST(perllsp_repeated_inherited_method_calls_join_by_exact_site);
 }

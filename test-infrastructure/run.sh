@@ -56,6 +56,46 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ── Per-run isolation (concurrent agents / multiple worktrees) ───────────────
+# Container names are already unique per `compose run --rm`, but the BUILD
+# volume was not: two legs running at once wrote the same /src/build, so one
+# run's objects and test-logs replaced the other's — after which the parallel
+# scheduler dies reading a suite log that another run had removed. Each run now
+# gets its own build volume, keyed by a unique run id. ccache and the fixture
+# cache stay SHARED on purpose: ccache is concurrency-safe and content-verified,
+# and sharing them is what keeps an isolated run fast rather than cold.
+#
+#   CBM_CI_RUN_ID=<id>       name/reuse a run (default: pid + epoch, unique)
+#   CBM_CI_SHARED_BUILD=1    opt back into the single shared `cbm-build` volume
+#   CBM_CI_KEEP=1            keep this run's build volume even on success
+RUN_ID="${CBM_CI_RUN_ID:-$$-$(date +%s)}"
+if [ "${CBM_CI_SHARED_BUILD:-0}" = "1" ]; then
+    CBM_CI_BUILD_VOLUME="cbm-build"
+else
+    CBM_CI_BUILD_VOLUME="cbm-build-${RUN_ID}"
+fi
+export CBM_CI_BUILD_VOLUME
+
+# Tidy what this run generated. A FAILED run KEEPS its volume — those artifacts
+# are the post-mortem — and prints how to inspect and drop it. Successful runs
+# leave nothing behind. Shared-volume mode never removes anything.
+ci_cleanup() {
+    local rc=$?
+    if [ "${CBM_CI_BUILD_VOLUME}" = "cbm-build" ] || [ "${CBM_CI_KEEP:-0}" = "1" ]; then
+        return $rc
+    fi
+    if [ $rc -eq 0 ]; then
+        docker volume rm -f "${CBM_CI_BUILD_VOLUME}" >/dev/null 2>&1 || true
+    else
+        echo "run.sh: kept ${CBM_CI_BUILD_VOLUME} for post-mortem (run failed)" >&2
+        echo "        inspect: docker run --rm -v ${CBM_CI_BUILD_VOLUME}:/b alpine ls -R /b" >&2
+        echo "        drop:    docker volume rm ${CBM_CI_BUILD_VOLUME}" >&2
+    fi
+    return $rc
+}
+trap ci_cleanup EXIT
+
 COMPOSE="docker compose -f $ROOT/test-infrastructure/docker-compose.yml"
 
 usage() {
@@ -72,7 +112,7 @@ Legs:
   full (default)  arm64: test + build + TSan + smoke + portable smoke
                   + Windows mingw cross-compile check
   all             full + amd64 legs + Windows cross-compile/Wine check
-  test|build|smoke|tsan          single arm64 legs
+  test|build|smoke|tsan|msan     single arm64 legs
   amd64|test-amd64|tsan-amd64    amd64 legs (tsan-amd64 needs real amd64 HW)
   perf            arm64 incremental-perf leg (CBM_SKIP_PERF unset)
   shell|shell-alpine             interactive debug shell inside the image
@@ -162,6 +202,22 @@ case "${1:-full}" in
         echo "=== Linux arm64: ThreadSanitizer (data-race gate) ==="
         $COMPOSE run --rm test-tsan
         ;;
+    msan)
+        # MemorySanitizer: uninitialized-read detection. Needs every linked
+        # library instrumented, which is what Dockerfile.msan's libc++/zlib
+        # build provides — hence its own image rather than a flag on the
+        # normal one. First run builds that image (slow); later runs hit the
+        # layer cache.
+        #
+        # arm64 note: MSan's shadow mapping is unreliable on aarch64 and the
+        # grammar suites stack-overflow there regardless of toolchain version
+        # (reproduced on clang 18 and clang 22). The GitHub leg runs x86-64,
+        # where the mapping is the well-trodden one, so a local arm64 failure
+        # in that specific shape is a platform artifact — check the CI leg
+        # before treating it as a code defect.
+        echo "=== Linux: MemorySanitizer (uninitialized-read gate) ==="
+        $COMPOSE run --rm test-msan
+        ;;
     tsan-amd64)
         # NOTE: TSan's shadow memory is incompatible with x86_64-on-ARM
         # translation (Rosetta/QEMU), so this FATALs ("unexpected memory
@@ -213,7 +269,9 @@ case "${1:-full}" in
         echo "=== Windows: binary version check (cross-compile + Wine) ==="
         $COMPOSE run --rm smoke-windows
         ;;
-    amd64)
+    amd64 | test-amd64)
+        # `--help` advertises `amd64|test-amd64`, but only `amd64` dispatched:
+        # the documented spelling died with "unknown leg 'test-amd64'".
         echo "=== Linux amd64: test + build ==="
         $COMPOSE run --rm -e CBM_SKIP_PERF=1 test-amd64
         $COMPOSE run --rm build-amd64

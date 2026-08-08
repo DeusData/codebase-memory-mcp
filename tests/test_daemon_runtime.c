@@ -48,7 +48,10 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <spawn.h>
 #include <unistd.h>
+
+extern char **environ;
 #endif
 
 enum {
@@ -401,21 +404,35 @@ static pid_t runtime_test_spawn_blocked_executable(const char *path, int *releas
         (void)close(input[1]);
         return -1;
     }
-    pid_t child = fork();
-    if (child == 0) {
+    /* posix_spawn rather than fork+exec: this process can carry a sanitizer's
+     * very large shadow mapping, and fork() duplicates the parent address
+     * space. On macOS that duplicate trips the per-process memory limit and
+     * jetsam SIGKILLs the child before exec ever replaces the image, so the
+     * fixture fails under TSan for reasons unrelated to the code under test.
+     * posix_spawn never copies the parent's address space. Exec failure is
+     * reported by posix_spawn itself, so the child no longer needs to signal
+     * it over the ready pipe; the pipe's FD_CLOEXEC close still marks a
+     * successful exec with EOF exactly as before. */
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
         (void)close(ready[0]);
+        (void)close(ready[1]);
+        (void)close(input[0]);
         (void)close(input[1]);
-        if (dup2(input[0], STDIN_FILENO) < 0) {
-            _exit(126);
-        }
-        if (input[0] != STDIN_FILENO) {
-            (void)close(input[0]);
-        }
-        execl(path, path, (char *)NULL);
-        const char failed = 'x';
-        (void)write(ready[1], &failed, 1);
-        _exit(127);
+        return -1;
     }
+    (void)posix_spawn_file_actions_addclose(&actions, ready[0]);
+    (void)posix_spawn_file_actions_addclose(&actions, input[1]);
+    (void)posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
+    if (input[0] != STDIN_FILENO) {
+        (void)posix_spawn_file_actions_addclose(&actions, input[0]);
+    }
+    char *const child_argv[] = {(char *)path, NULL};
+    pid_t child = -1;
+    if (posix_spawn(&child, path, &actions, NULL, child_argv, environ) != 0) {
+        child = -1;
+    }
+    (void)posix_spawn_file_actions_destroy(&actions);
     (void)close(ready[1]);
     (void)close(input[0]);
     char unexpected = '\0';
@@ -1829,6 +1846,39 @@ TEST(daemon_runtime_exact_hello_issues_connection_bound_identity) {
     PASS();
 }
 
+/* Regression for #1383: an image-verification rejection must be ANSWERED, not
+ * silently dropped. The old path logged daemon.client_image_rejected and
+ * finished the worker without sending a hello response, so the client sat on
+ * "pending" indefinitely - indistinguishable from a slow cold start - with the
+ * reason visible only in the daemon log. */
+TEST(daemon_runtime_image_rejection_reaches_client_issue1383) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "image-reject", &identity);
+    cbm_daemon_runtime_connect_result_t result = {0};
+    cbm_daemon_runtime_client_t *client = NULL;
+
+    cbm_daemon_runtime_force_peer_image_unverified_for_testing(true);
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &result);
+    }
+    cbm_daemon_runtime_force_peer_image_unverified_for_testing(false);
+
+    bool rejected_with_reason = client == NULL &&
+                                result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
+                                strstr(result.message, "image_unverifiable") != NULL;
+    if (client) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(rejected_with_reason);
+    PASS();
+}
+
 TEST(daemon_runtime_unexpected_frame_payload_is_freed_once) {
     static const uint8_t unexpected_payload[] = {0xde, 0xad, 0xbe, 0xef};
     cbm_daemon_build_identity_t identity =
@@ -2649,6 +2699,7 @@ TEST(daemon_runtime_rejects_forged_identity_extension) {
     uint64_t forged_client_id = UINT64_MAX - 1;
     uint64_t forged_process_id = UINT64_MAX;
     bool encoded = false;
+    bool connected = false;
     bool sent = false;
     bool rejected = false;
     cbm_daemon_frame_t response_frame = {0};
@@ -2662,12 +2713,27 @@ TEST(daemon_runtime_rejects_forged_identity_extension) {
                &forged_process_id, sizeof(forged_process_id));
         raw = cbm_daemon_ipc_connect(fixture.endpoint, RUNTIME_TEST_TIMEOUT_MS);
     }
+    connected = raw != NULL;
     if (raw && encoded) {
+        /* The forged HELLO is 149 bytes against the 137-byte first-frame
+         * envelope cap, so the worker rejects it from the HEADER and closes
+         * without ever reading the payload -- deliberately, so that no
+         * attacker-controlled bytes are read (cbm_daemon_ipc_receive_frame_bounded).
+         * send_frame writes the header and the payload as two separate writes,
+         * so whether the payload write lands before that close is pure
+         * scheduling: it wins on an idle host and loses on a loaded one. Both
+         * outcomes ARE the rejection, so the transmit result is recorded and
+         * NOT asserted -- asserting it made the verdict a coin flip. */
         sent = cbm_daemon_ipc_send_frame(raw, CBM_DAEMON_FRAME_REQUEST, CBM_DAEMON_RUNTIME_OP_HELLO,
                                          forged, (uint32_t)sizeof(forged));
-        int received = cbm_daemon_ipc_receive_frame(raw, RUNTIME_TEST_TIMEOUT_MS, &response_frame,
-                                                    &response_payload);
-        rejected = received != 1 && cbm_daemon_runtime_service_active_clients(fixture.service) == 0;
+        int received = sent ? cbm_daemon_ipc_receive_frame(raw, RUNTIME_TEST_TIMEOUT_MS,
+                                                           &response_frame, &response_payload)
+                            : 0;
+        /* Wait for the state actually asserted instead of sampling it once: the
+         * forged peer is the only client, so the count is monotonic here and the
+         * bound is a liveness backstop, never the verdict. */
+        rejected = received != 1 && cbm_daemon_runtime_service_wait_for_clients(
+                                        fixture.service, 0, RUNTIME_TEST_TIMEOUT_MS);
     }
     free(response_payload);
     cbm_daemon_ipc_connection_close(raw);
@@ -2698,7 +2764,7 @@ TEST(daemon_runtime_rejects_forged_identity_extension) {
 
     ASSERT_TRUE(started);
     ASSERT_TRUE(encoded);
-    ASSERT_TRUE(sent);
+    ASSERT_TRUE(connected);
     ASSERT_TRUE(rejected);
     ASSERT_TRUE(valid_after_rejection);
     ASSERT_TRUE(exited);
@@ -4354,7 +4420,6 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
 }
 #endif
 
-
 TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
     static const uint8_t request[] = {'b', 'l', 'o', 'c', 'k'};
     cbm_daemon_build_identity_t identity =
@@ -4403,9 +4468,8 @@ TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
     /* The parity contract: after close_begin alone — before the handle
      * closes — the daemon has released this client's admission. POSIX learns
      * through shutdown()/EOF; Windows through the CLOSE_INTENT frame. */
-    admission_released_at_begin =
-        close_begun &&
-        cbm_daemon_runtime_service_wait_for_clients(fixture.service, 0, RUNTIME_TEST_TIMEOUT_MS);
+    admission_released_at_begin = close_begun && cbm_daemon_runtime_service_wait_for_clients(
+                                                     fixture.service, 0, RUNTIME_TEST_TIMEOUT_MS);
     if (request_thread_started) {
         request_thread_joined = cbm_thread_join(&request_thread) == 0;
         request_thread_started = false;
@@ -4416,9 +4480,8 @@ TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
          call.status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) &&
         call.response == NULL && call.response_length == 0;
     if (client) {
-        (void)(close_begun
-                   ? cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS)
-                   : cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS));
+        (void)(close_begun ? cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS)
+                           : cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS));
         client = NULL;
     }
     if (started) {
@@ -4551,6 +4614,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
+    RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);
     RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);

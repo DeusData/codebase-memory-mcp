@@ -93,6 +93,21 @@ UI_HTTP_NEEDLES=(
     '[c]odebase-memory-mcp'
 )
 
+# The binary used to embed nine complete shebang'd shell scripts, their
+# PowerShell/.cmd twins and two node:child_process client modules — script
+# bodies written to disk at 0755, which is precisely the text surface
+# Defender's ML scored Trojan:Script/Wacatac.B!ml. They now ship in
+# cbm-integrations.json (the binary embeds only its SHA-256); these needles
+# prove the removal stayed removed. Source-level enforcement lives in
+# tests/test_no_embedded_scripts_contract.sh; this is the shipped-artifact
+# half of the same property.
+SCRIPT_NEEDLES=(
+    '#!/usr/bin/env bash'
+    '#!/bin/bash'
+    '#!/bin/sh'
+    'node:child_process'
+)
+
 # Canary: proves the needle scan can actually see this file's strings. Without
 # it, handing the gate a gzip, a stub or a 0-byte file would pass every
 # absence assertion. 168+ occurrences in a real artifact, 0 in anything else.
@@ -366,6 +381,29 @@ check_file() {
         done
         printf 'INFO %-22s %s: %d/%d UI/HTTP needles present (no-UI split pending; set CBM_CHECK_UI_ABSENT=1 to enforce)\n' \
             A5-no-ui-http "$token" "$ui_hits" "${#UI_HTTP_NEEDLES[@]}"
+    fi
+
+    # A6 — embedded integration-script text. Enforced on standard artifacts:
+    # every C-source template moved into cbm-integrations.json, so a hit means
+    # one crept back in. The ui artifact additionally embeds the RAW frontend
+    # bundle (scripts/embed-frontend.sh stores plain bytes), whose minified JS
+    # may legitimately contain e.g. "#!" sequences we do not control — so ui
+    # reports rather than fails until that is measured on a real ui build,
+    # mirroring A5's honest-INFO pattern. Flip CBM_CHECK_UI_SCRIPTS_ABSENT=1
+    # to enforce there too.
+    if [ "$is_ui" -eq 1 ] && [ "${CBM_CHECK_UI_SCRIPTS_ABSENT:-0}" != "1" ]; then
+        script_hits=0
+        for needle in "${SCRIPT_NEEDLES[@]}"; do
+            if LC_ALL=C grep -a -q -F -e "$needle" "$file"; then
+                script_hits=$((script_hits + 1))
+            fi
+        done
+        printf 'INFO %-22s %s: %d/%d script needles present (raw frontend bundle; set CBM_CHECK_UI_SCRIPTS_ABSENT=1 to enforce)\n' \
+            A6-no-embedded-scripts "$token" "$script_hits" "${#SCRIPT_NEEDLES[@]}"
+    else
+        for needle in "${SCRIPT_NEEDLES[@]}"; do
+            assert_absent "$file" "$token" A6-no-embedded-scripts "$needle"
+        done
     fi
 }
 
