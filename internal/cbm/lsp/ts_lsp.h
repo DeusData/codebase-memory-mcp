@@ -40,6 +40,10 @@ typedef struct {
 
     // Output: resolved calls accumulate here.
     CBMResolvedCallArray *resolved_calls;
+    // Optional raw usages owned by the per-file extraction result. The scope
+    // pass marks occurrence-exact module/import shadows without emitting a
+    // semantic reference record for them.
+    CBMUsageArray *usages;
 
     // Type-parameter scope (innermost generic function/class).
     // type_param_constraints may be NULL or shorter — entries default to "any".
@@ -51,6 +55,7 @@ typedef struct {
     bool js_mode;
     bool jsx_mode;
     bool dts_mode;
+    bool cross_file_mode; // project-wide registry is available for exact reference proof
     bool strict; // tsconfig "strict": true → fewer implicit-any fallbacks
     bool debug;  // CBM_LSP_DEBUG env
 

@@ -827,6 +827,13 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Check index coverage\""));
     ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
     ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
+    /* search_graph's compact degree columns intentionally count the graph
+     * relationships used for call/reference/type centrality, not every edge
+     * family (for example DEFINES or CONTAINS_FILE). Keep the public contract
+     * aligned with the store query. */
+    ASSERT_NOT_NULL(strstr(json, "in/out = selected degree across CALLS, USAGE, CALL_REFERENCE, "
+                                 "INHERITS, and IMPLEMENTS"));
+    ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
     free(json);
     PASS();
 }
@@ -1086,10 +1093,21 @@ TEST(mcp_text_result) {
     PASS();
 }
 
-TEST(mcp_text_result_wraps_plain_text_as_structured_content) {
+TEST(mcp_text_result_does_not_duplicate_plain_text_into_structured_content) {
+    /* A non-JSON payload used to be repeated verbatim as
+     * structuredContent {"text": <payload>} beside content[0].text — 2.05x the
+     * payload measured on a 20k-node query_graph, i.e. half the transport budget
+     * and double the tokens for every LLM caller (#1375).
+     *
+     * structuredContent carries STRUCTURE; a string rewrapped in a one-key
+     * object has none, so the empty object is the honest answer and still
+     * satisfies the permissive outputSchema. The payload stays in content. */
     char *json = cbm_mcp_text_result("plain text", false);
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"text\":\"plain text\"}"));
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{}"));
+    ASSERT_NULL(strstr(json, "\"structuredContent\":{\"text\""));
+    /* The payload is still delivered — exactly once. */
+    ASSERT_NOT_NULL(strstr(json, "\"text\":\"plain text\""));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":false"));
     free(json);
     PASS();
@@ -1806,6 +1824,84 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     PASS();
 }
 
+/* EVERY tool, not just the one that was reported.
+ *
+ * The duplication was invisible per-tool: each result looked reasonable on its
+ * own, and only measuring the wire showed half of it was redundant. A guard
+ * pinned to query_graph would not have caught it in search_graph, and would not
+ * catch it in whatever tool is added next. So this enumerates the tool table
+ * itself — a new tool is covered the moment it is registered, with no test edit.
+ *
+ * The invariant: for a NON-error result whose payload is not a JSON object,
+ * structuredContent must not carry the payload a second time. Errors are exempt
+ * and deliberately so — bounded, small, and structuredContent.error is the only
+ * machine-readable form of a failure a client gets. */
+TEST(mcp_every_tool_result_is_duplication_free) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    int tools = cbm_mcp_tool_count();
+    ASSERT_TRUE(tools > 0); /* an empty table would assert nothing at all */
+    int checked = 0;
+
+    for (int i = 0; i < tools; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        ASSERT_NOT_NULL(name);
+        /* Minimal args: most tools error out, which is fine — an error envelope
+         * is still an envelope, and the property must hold for it too. */
+        char *envelope = cbm_mcp_handle_tool(srv, name, "{\"project\":\"test-project\"}");
+        if (!envelope) {
+            continue;
+        }
+        yyjson_doc *doc = yyjson_read(envelope, strlen(envelope), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        yyjson_val *content = yyjson_obj_get(root, "content");
+        yyjson_val *first = content ? yyjson_arr_get(content, 0) : NULL;
+        yyjson_val *text_val = first ? yyjson_obj_get(first, "text") : NULL;
+        const char *text = text_val ? yyjson_get_str(text_val) : NULL;
+        yyjson_val *structured = yyjson_obj_get(root, "structuredContent");
+
+        /* outputSchema is declared for every tool, so this stays mandatory. */
+        ASSERT_NOT_NULL(structured);
+        ASSERT_TRUE(yyjson_is_obj(structured));
+
+        yyjson_val *is_error = yyjson_obj_get(root, "isError");
+        bool errored = is_error && yyjson_is_true(is_error);
+
+        if (text && text[0] && !errored) {
+            /* If the payload is itself a JSON object, structuredContent is the
+             * PARSED form and legitimately holds the same data — that is the
+             * spec's structured+serialized pattern, not waste. Only the
+             * non-object case is checked here. */
+            yyjson_doc *as_json = yyjson_read(text, strlen(text), 0);
+            bool payload_is_object = as_json && yyjson_is_obj(yyjson_doc_get_root(as_json));
+            if (as_json) {
+                yyjson_doc_free(as_json);
+            }
+            if (!payload_is_object) {
+                yyjson_val *dup = yyjson_obj_get(structured, "text");
+                if (dup && yyjson_is_str(dup)) {
+                    const char *dup_str = yyjson_get_str(dup);
+                    /* The exact defect: same bytes, twice, in one reply. */
+                    ASSERT_TRUE(!(dup_str && strcmp(dup_str, text) == 0));
+                }
+                checked++;
+            }
+        }
+        yyjson_doc_free(doc);
+        free(envelope);
+    }
+
+    /* If no tool produced a non-JSON payload, this test proved nothing — fail
+     * rather than report a green that was never exercised. */
+    ASSERT_TRUE(checked > 0);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(tool_search_graph_includes_node_properties) {
     /* Node properties are OPT-IN columns in the default TOON output: the
      * default row is qn/label/file/lines/degrees only, `fields` adds the
@@ -1823,7 +1919,11 @@ TEST(tool_search_graph_includes_node_properties) {
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
              "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
+    /* TOON is not a JSON object, so structuredContent stays empty rather than
+     * repeating the whole table a second time (#1375). The payload travels once,
+     * in content. */
+    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{}"));
+    ASSERT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
@@ -2544,6 +2644,53 @@ TEST(tool_trace_call_path_not_found) {
     PASS();
 }
 
+/* Regression for #1425: a project name that fails validation must produce a
+ * clean "not found" error and NOTHING else. project_db_path() yields "" for
+ * such names; SQLite opens "" as an anonymous temp db, its integrity check
+ * fails, and quarantine rendered "".corrupt.<hex> - a RELATIVE path dropped
+ * into the daemon's cwd on every such query. */
+TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/mcp-litter-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char oldcwd[CBM_SZ_1K];
+    if (!cbm_getcwd(oldcwd, sizeof(oldcwd)))
+        FAIL("getcwd failed");
+    if (cbm_chdir(tmpdir) != 0)
+        FAIL("chdir failed");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\","
+                                   "\"arguments\":{\"name_pattern\":\"x\","
+                                   "\"project\":\"bad name\"}}}");
+    bool clean_error = resp && strstr(resp, "not found") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    int litter = 0;
+    cbm_dir_t *dir = cbm_opendir(tmpdir);
+    if (dir) {
+        cbm_dirent_t *entry;
+        while ((entry = cbm_readdir(dir)) != NULL) {
+            if (strstr(entry->name, ".corrupt.")) {
+                litter++;
+            }
+        }
+        cbm_closedir(dir);
+    }
+    if (cbm_chdir(oldcwd) != 0)
+        FAIL("chdir back failed");
+    th_rmtree(tmpdir);
+    if (!clean_error)
+        FAIL("invalid project name must produce a clean not-found error");
+    if (litter != 0)
+        FAIL("invalid project name must not quarantine an anonymous temp db into cwd (#1425)");
+    PASS();
+}
+
 TEST(tool_trace_missing_function_name) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -2886,12 +3033,11 @@ TEST(tool_trace_call_path_prefers_definition) {
 TEST(trace_evidence_strategy_class_vocabulary_is_closed) {
     /* Every strategy string assigned anywhere in src/ + internal/ as of this
      * commit, plus the two literals pass_calls.c writes directly. */
-    static const char *const lsp[] = {"lsp_direct",         "lsp_base_dispatch",
-                                      "lsp_embed_dispatch", "lsp_implicit_this",
-                                      "lsp_inherited_dispatch", "lsp_method_dispatch",
-                                      "lsp_proc_macro",     "lsp_smart_ptr_dispatch",
-                                      "lsp_strategy_cross_file", "lsp_trait_dispatch",
-                                      "lsp_type_dispatch",  "lsp_virtual_dispatch"};
+    static const char *const lsp[] = {
+        "lsp_direct",         "lsp_base_dispatch",      "lsp_embed_dispatch",
+        "lsp_implicit_this",  "lsp_inherited_dispatch", "lsp_method_dispatch",
+        "lsp_proc_macro",     "lsp_smart_ptr_dispatch", "lsp_strategy_cross_file",
+        "lsp_trait_dispatch", "lsp_type_dispatch",      "lsp_virtual_dispatch"};
     for (size_t i = 0; i < sizeof(lsp) / sizeof(lsp[0]); i++) {
         const char *cls = cbm_mcp_edge_strategy_class(lsp[i]);
         ASSERT_NOT_NULL(cls);
@@ -6022,8 +6168,8 @@ TEST(tool_index_repository_unknown_project_name_still_requires_repo_path) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository",
-                                     "{\"project\":\"never-indexed-project\"}");
+    char *resp =
+        cbm_mcp_handle_tool(srv, "index_repository", "{\"project\":\"never-indexed-project\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "repo_path is required"));
     free(resp);
@@ -6555,13 +6701,13 @@ TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
                                  "def bar():\n"
                                  "    y = 2\n"
                                  "    return y\n"),
-             0);
+              0);
 
     /* `git -C` with double quotes, not `cd '<dir>' &&`: single quotes are not
      * quoting characters for cmd.exe, and identity/branch/signing come from -c
      * so the fixture does not depend on the machine's global git config. The
      * assertions below read `base: main`, so pin init.defaultBranch. */
-#define DC1363_GITCFG                                                                              \
+#define DC1363_GITCFG \
     "-c user.name=t -c user.email=t@t.io -c init.defaultBranch=main -c commit.gpgsign=false"
     char cmd[1200];
     const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
@@ -6590,7 +6736,7 @@ TEST(detect_changes_seeds_only_touched_symbol_issue1363) {
                                  "def bar():\n"
                                  "    y = 2\n"
                                  "    return y\n"),
-             0);
+              0);
 
     char *project = cbm_project_name_from_path(repo);
     ASSERT_NOT_NULL(project);
@@ -6637,7 +6783,7 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
                                  "    return 2\n"),
               0);
 
-#define DC1363B_GITCFG                                                                             \
+#define DC1363B_GITCFG \
     "-c user.name=t -c user.email=t@t.io -c init.defaultBranch=main -c commit.gpgsign=false"
     char cmd[1200];
     const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
@@ -9949,6 +10095,38 @@ TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
 #endif
 }
 
+/* With no boundary configured at all, index_repository must still refuse roots
+ * that are too broad or too sensitive to index as a unit. This is the part that
+ * holds out of the box: the paths the advisories actually demonstrate are refused
+ * without anyone setting an environment variable first. */
+TEST(index_repository_refuses_overbroad_roots_by_default) {
+    const char *saved = getenv("CBM_ALLOWED_ROOT");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* A top-level system tree: refused on breadth, with no configuration. */
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/etc\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "too broad") != NULL);
+    free(resp);
+
+    /* The filesystem root is refused outright and is never overridable. */
+    resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "cannot be indexed") != NULL);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_ALLOWED_ROOT", saved_copy, 1);
+        free(saved_copy);
+    }
+    PASS();
+}
+
 /* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
  * must refuse a repo_path that resolves outside it. Unset (the default) imposes
  * no restriction. */
@@ -10238,6 +10416,7 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
     RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
+    RUN_TEST(index_repository_refuses_overbroad_roots_by_default);
     RUN_TEST(index_repository_honors_allowed_root);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
@@ -10272,7 +10451,8 @@ SUITE(mcp) {
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
     RUN_TEST(mcp_text_result);
-    RUN_TEST(mcp_text_result_wraps_plain_text_as_structured_content);
+    RUN_TEST(mcp_text_result_does_not_duplicate_plain_text_into_structured_content);
+    RUN_TEST(mcp_every_tool_result_is_duplication_free);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
 
@@ -10345,6 +10525,7 @@ SUITE(mcp) {
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
+    RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);

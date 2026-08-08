@@ -168,7 +168,19 @@ shard_filter() {
 # deadlines into deterministic failures while an idle machine passes 6/6.
 # They also all rendezvous through the shared per-account runtime namespace,
 # which the quiet tail keeps free of cross-suite admission traffic.
+# extraction carries the wide-flat SCALING-RATIO guard, which grows the input
+# 20x and asserts the time grows ~20x (linear) rather than ~128x (quadratic),
+# with a bound of 40x between them. Contention does not cancel out of that
+# ratio: the 400k-node measurement loses far more to memory pressure and
+# scheduling than the 20k one, so oversubscription inflates the ratio itself.
+# Measured on the Windows arm64 VM: 18.5x alone (passes) vs 53.8x and 55x in
+# the 18-job wave (fails) — reproducible, 3 of 3. The bound is deliberately NOT
+# widened; see the calibration note in tests/test_extraction.c, which records
+# that 40 sits >=2x from both the linear and quadratic signals, so inflating it
+# would move the test toward the very thing it exists to catch. Quiet is the
+# fix, and at ~22s the suite is cheap to run alone.
 SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
+    extraction \
     stack_overflow_a stack_overflow_b stack_overflow_c \
     index_supervisor daemon_application daemon_runtime daemon_frontend \
     daemon_bootstrap daemon_ipc"
@@ -245,8 +257,13 @@ run_wave "$PAR_FILE" "$JOBS"
 # time on an idle machine. The EXCL group (daemon-family plus the suites
 # that drive daemon one-shots or supervisor rendezvous) then runs strictly
 # sequentially on a machine exactly as quiet as the old tail gave it.
+# extraction is in this group for a DIFFERENT reason than the rest: it does not
+# rendezvous through the daemon namespace, it measures a scaling ratio, and even
+# the FLEX group's small fixed overlap is load the measurement would absorb.
+# Strictly sequential is what makes its verdict a function of the code instead
+# of the scheduler.
 TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
-    daemon_frontend daemon_bootstrap daemon_ipc"
+    daemon_frontend daemon_bootstrap daemon_ipc extraction"
 is_tail_excl() {
     case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }

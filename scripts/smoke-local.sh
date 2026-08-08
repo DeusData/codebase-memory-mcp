@@ -72,7 +72,7 @@ esac
 ARTIFACT_DIR="${CBM_SMOKE_ARTIFACT_DIR:-}"
 if [ -n "$ARTIFACT_DIR" ]; then
     ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
-    for required in LICENSE install.sh THIRD_PARTY_NOTICES.md; do
+    for required in cbm-integrations.json LICENSE install.sh THIRD_PARTY_NOTICES.md; do
         [ -s "$ARTIFACT_DIR/$required" ] || {
             echo "smoke-local: release artifact is missing $required" >&2
             exit 2
@@ -123,16 +123,20 @@ mkdir -p "$FIXTURE_DIR" "$SMOKE_TEMP_DIR" "$SMOKE_HOME" "$SMOKE_XDG_CONFIG" \
     "$SMOKE_APPDATA" "$SMOKE_LOCALAPPDATA"
 cp "$BINARY" "$FIXTURE_DIR/codebase-memory-mcp"
 if [ -n "$ARTIFACT_DIR" ]; then
-    cp "$ARTIFACT_DIR/LICENSE" "$ARTIFACT_DIR/install.sh" \
-        "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
+    cp "$ARTIFACT_DIR/cbm-integrations.json" "$ARTIFACT_DIR/LICENSE" \
+        "$ARTIFACT_DIR/install.sh" "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
 else
-    cp "$ROOT/LICENSE" "$ROOT/install.sh" "$FIXTURE_DIR/"
+    cp "$ROOT/assets/cbm-integrations.json" "$ROOT/LICENSE" "$ROOT/install.sh" "$FIXTURE_DIR/"
     "$ROOT/scripts/gen-third-party-notices.sh" "$FIXTURE_DIR/THIRD_PARTY_NOTICES.md"
 fi
 
+# The archive must carry cbm-integrations.json — install verifies it against the
+# binary's embedded SHA-256 and fails closed without it. Member set and ORDER
+# mirror scripts/package-release.sh (the Windows single-binary contract locks
+# that order); a fixture that omits it would smoke a release layout we never ship.
 EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz"
 tar -czf "$FIXTURE_DIR/$EXPECTED_ARTIFACT" -C "$FIXTURE_DIR" \
-    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+    codebase-memory-mcp cbm-integrations.json LICENSE install.sh THIRD_PARTY_NOTICES.md
 if [ -n "$SUFFIX" ]; then
     cp "$FIXTURE_DIR/$EXPECTED_ARTIFACT" \
         "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"

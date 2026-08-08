@@ -7,7 +7,8 @@
  * same two invariants per (lang,strategy) — (a) inv_count_calls_by_source
  * module_sourced == 0 and a callable-sourced CALLS edge exists, and (b)
  * inv_edge_has_strategy(store, project, "<strategy>"). One TEST per
- * (lang,strategy); SUITE(repro_lsp_kt_php_rust) at the bottom.
+ * (lang,strategy), plus two Rust dispatch-provenance guards;
+ * SUITE(repro_lsp_kt_php_rust) is at the bottom.
  *
  * WHAT THIS ASSERTS — the LSP RESOLUTION CONTRACT, one invariant per strategy.
  *   Each hybrid LSP resolves a call via a specific STRATEGY and tags the
@@ -36,16 +37,14 @@
  *     - RED   = the strategy is dropped, lands Module-sourced, or never reaches
  *               the graph. The TEST documents the exact gap for the fixer.
  *
- * RUST CROSS-LSP IS NOT WIRED (documented gap). src/pipeline/pass_lsp_cross.c
- *   has NO CBM_LANG_RUST case in either cbm_pxc_has_cross_lsp (lines 282-298)
- *   or the cbm_pxc_run_one dispatch (lines 372-407). Go/C/C++/Python/PHP/Java/
- *   Kotlin are wired; Rust is absent. So rust_lsp.c can EMIT every strategy
- *   below, but those resolved calls never reach pass_lsp_cross → never become
- *   tagged CALLS edges in the graph. Every Rust strategy test is therefore
- *   expected RED until rust_lsp.c is wired into the pipeline. We assert the
- *   CORRECT (resolved) outcome anyway, per the reproduce-first contract: the
- *   red test is the durable record of the gap and turns GREEN the moment Rust
- *   is wired and resolving correctly.
+ * RUST CROSS-LSP CONTRACT. src/pipeline/pass_lsp_cross.c dispatches
+ *   CBM_LANG_RUST through the project-wide Rust registry, including exact
+ *   impl-block provenance and independent `impl Trait for Type` relations for
+ *   default-only impls. The Rust cases below are intended GREEN regression
+ *   guards. Dispatch follows Rust precedence: an inherent method wins over a
+ *   same-named trait method; otherwise an exact trait override or unambiguous
+ *   trait default may resolve. Missing or conflicting provenance fails closed:
+ *   the resolver must not guess a trait or method from a shared leaf name.
  *
  * SKIPPED STRATEGIES (documented, not tested):
  *   Kotlin:
@@ -64,14 +63,15 @@
  *                       synthetic module scope (a `mod foo;` declaration has no
  *                       enclosing callable). It would violate invariant (a)
  *                       (module_sourced == 0) by construction, so the shared
- *                       runner cannot express it. Also blocked by the unwired-
- *                       Rust gap above.
+ *                       runner cannot express it.
  *     - lsp_deref_dispatch / lsp_bound_dispatch / lsp_prelude_trait /
- *       lsp_short_name_unique / lsp_trait_ufcs_amb — emitted on harder-to-
- *       fixture paths (Deref chains, type-param bounds, prelude best-effort,
- *       crate-prefix short-name scan, multi-impl ambiguity). They are all also
- *       blocked by the unwired-Rust gap, so adding fragile fixtures for them
- *       buys nothing over the representative dispatch tests below; skipped.
+ *       lsp_short_name_unique — emitted on harder-to-fixture paths (Deref
+ *       chains, type-param bounds, prelude best-effort, crate-prefix short-name
+ *       scan). Representative exact-provenance dispatch is covered below;
+ *       these specialized strategies remain skipped. Multi-trait ambiguity is
+ *       deliberately not a resolved strategy: without exact qualification,
+ *       competing trait methods/defaults fail closed instead of emitting a
+ *       guessed CALLS edge.
  *
  * STRATEGY INVENTORIES — every strategy literal grepped from each source:
  *   Kotlin (kotlin_lsp.c, grep '"lsp_kt_'):
@@ -113,7 +113,7 @@
  *     lsp_operator_trait   (2443)  a + b where T : Add (operator overload)
  *     lsp_macro            (3832)  known std macro (println!/vec!/panic!)
  *     lsp_deref_dispatch / lsp_bound_dispatch / lsp_prelude_trait /
- *     lsp_short_name_unique / lsp_trait_ufcs_amb / lsp_mod_decl  (skipped, see above)
+ *     lsp_short_name_unique / lsp_mod_decl  (skipped, see above)
  *     lsp_unresolved       (3393)  fallback marker
  *
  * NOTE: line comments only inside this header (no nested block comments, per
@@ -184,6 +184,92 @@ static int assert_lsp_strategy(const char *filename, const char *src,
         rc = 1;
     }
 
+    rh_cleanup(&lp, store);
+    return rc;
+}
+
+/* Assert required/forbidden strategy provenance on the SAME Rust CALLS edge.
+ * Restricting by caller and callee avoids a false green from an unrelated edge
+ * elsewhere in a multi-file fixture (for example `mod contract;`). */
+static int assert_rust_dispatch_files(const RFile *files, int nfiles, const char *caller_substr,
+                                      const char *callee_suffix, const char *required_strategy,
+                                      const char *forbidden_strategy) {
+    RProj lp;
+    cbm_store_t *store = rh_index_files(&lp, files, nfiles);
+    if (!store) {
+        printf("  %sFAIL%s %s:%d: index failed for Rust %s -> %s dispatch\n", tf_red(), tf_reset(),
+               __FILE__, __LINE__, caller_substr, callee_suffix);
+        rh_cleanup(&lp, store);
+        return 1;
+    }
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        printf("  %sFAIL%s %s:%d: CALLS query failed for Rust %s -> %s dispatch\n", tf_red(),
+               tf_reset(), __FILE__, __LINE__, caller_substr, callee_suffix);
+        rh_cleanup(&lp, store);
+        return 1;
+    }
+
+    int matching_edges = 0;
+    int required_edges = 0;
+    int forbidden_edges = 0;
+    const char *observed_properties = NULL;
+    size_t suffix_len = strlen(callee_suffix);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source;
+        cbm_node_t target;
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &source) != CBM_STORE_OK ||
+            cbm_store_find_node_by_id(store, edges[i].target_id, &target) != CBM_STORE_OK) {
+            continue;
+        }
+        const char *source_label = source.label ? source.label : "";
+        if (strcmp(source_label, "Function") != 0 && strcmp(source_label, "Method") != 0) {
+            continue;
+        }
+        if (!source.qualified_name || !strstr(source.qualified_name, caller_substr) ||
+            !target.qualified_name) {
+            continue;
+        }
+        size_t target_len = strlen(target.qualified_name);
+        if (target_len < suffix_len ||
+            strcmp(target.qualified_name + target_len - suffix_len, callee_suffix) != 0) {
+            continue;
+        }
+
+        matching_edges++;
+        const char *properties = edges[i].properties_json ? edges[i].properties_json : "{}";
+        if (!observed_properties) {
+            observed_properties = properties;
+        }
+        if (strstr(properties, required_strategy)) {
+            required_edges++;
+        }
+        if (forbidden_strategy && strstr(properties, forbidden_strategy)) {
+            forbidden_edges++;
+        }
+    }
+
+    int rc = 0;
+    if (matching_edges == 0 || required_edges == 0) {
+        printf("  %sFAIL%s %s:%d: Rust %s -> *%s has %d matching CALLS edges, "
+               "but none with required strategy %s (observed %s)\n",
+               tf_red(), tf_reset(), __FILE__, __LINE__, caller_substr, callee_suffix,
+               matching_edges, required_strategy,
+               observed_properties ? observed_properties : "<none>");
+        rc = 1;
+    }
+    if (forbidden_edges != 0) {
+        printf("  %sFAIL%s %s:%d: Rust %s -> *%s has %d CALLS edges with "
+               "forbidden strategy %s\n",
+               tf_red(), tf_reset(), __FILE__, __LINE__, caller_substr, callee_suffix,
+               forbidden_edges, forbidden_strategy);
+        rc = 1;
+    }
+
+    cbm_store_free_edges(edges, edge_count);
     rh_cleanup(&lp, store);
     return rc;
 }
@@ -399,10 +485,9 @@ static const char kPhpSelfStatic[] =
     "}\n";
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  RUST FIXTURES (main.rs) — Rust cross-LSP is NOT wired into pass_lsp_cross
- *  (see header), so ALL of these are expected RED until rust_lsp.c is wired.
- *  Each fixture still exercises exactly the keyed construct so the test turns
- *  GREEN the moment Rust resolution reaches the graph.
+ *  RUST FIXTURES (main.rs) — Rust cross-LSP is wired through pass_lsp_cross.
+ *  These are intended GREEN guards for callable attribution, strategy tags,
+ *  exact inherent/trait provenance, and default-only cross-file trait impls.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* lsp_direct — plain free-function call (rust_lsp.c:3580: path resolves to a
@@ -438,6 +523,35 @@ static const char kRustTraitDispatch[] =
     "    let d = Dog;\n"
     "    d.speak(2)\n"
     "}\n";
+
+/* Inherent methods take precedence over same-named trait methods. The shared
+ * Rust registry must preserve that distinction even though both concrete
+ * definitions have receiver S and the type also implements Pinger. */
+static const char kRustInherentTraitCollision[] = "trait Pinger {\n"
+                                                  "    fn ping(&self) -> i32;\n"
+                                                  "}\n"
+                                                  "struct S;\n"
+                                                  "impl Pinger for S {\n"
+                                                  "    fn ping(&self) -> i32 { 2 }\n"
+                                                  "}\n"
+                                                  "impl S {\n"
+                                                  "    fn ping(&self) -> i32 { 1 }\n"
+                                                  "}\n"
+                                                  "fn caller(s: &S) -> i32 { s.ping() }\n";
+
+/* Cross-file default-only trait dispatch. S has no concrete `ping` Method def;
+ * the project-wide registry must therefore carry `impl Pinger for S` itself,
+ * rather than relying on provenance attached to an overriding method. */
+static const RFile kRustDefaultTraitDispatch[] = {
+    {"contract.rs", "pub trait Pinger {\n"
+                    "    fn ping(&self) -> i32 { 7 }\n"
+                    "}\n"
+                    "pub struct S;\n"
+                    "impl Pinger for S {}\n"},
+    {"main.rs", "mod contract;\n"
+                "use contract::Pinger;\n"
+                "fn caller(s: &contract::S) -> i32 { s.ping() }\n"},
+};
 
 /* lsp_constructor — Type::new() UFCS constructor (rust_lsp.c:3607: UFCS head is
  * a type, short_name == "new"). */
@@ -594,7 +708,7 @@ TEST(repro_lsp_php_self_static) {
     return assert_lsp_strategy("main.php", kPhpSelfStatic, "php_self_static");
 }
 
-/* Rust — all expected RED (cross-LSP not wired; see header). */
+/* Rust — intended GREEN, including exact dispatch-provenance guards. */
 TEST(repro_lsp_rust_direct) {
     return assert_lsp_strategy("main.rs", kRustDirect, "lsp_direct");
 }
@@ -605,6 +719,17 @@ TEST(repro_lsp_rust_method_dispatch) {
 TEST(repro_lsp_rust_trait_dispatch) {
     return assert_lsp_strategy("main.rs", kRustTraitDispatch,
                                "lsp_trait_dispatch");
+}
+TEST(repro_lsp_rust_inherent_trait_collision) {
+    RFile file = {"main.rs", kRustInherentTraitCollision};
+    return assert_rust_dispatch_files(&file, 1, "caller", ".ping", "lsp_method_dispatch",
+                                      "lsp_trait_dispatch");
+}
+TEST(repro_lsp_rust_default_trait_dispatch_cross_file) {
+    return assert_rust_dispatch_files(
+        kRustDefaultTraitDispatch,
+        (int)(sizeof(kRustDefaultTraitDispatch) / sizeof(kRustDefaultTraitDispatch[0])), "caller",
+        ".ping", "lsp_trait_dispatch", "lsp_method_dispatch");
 }
 TEST(repro_lsp_rust_constructor) {
     return assert_lsp_strategy("main.rs", kRustConstructor, "lsp_constructor");
@@ -673,10 +798,12 @@ SUITE(repro_lsp_kt_php_rust) {
     RUN_TEST(repro_lsp_php_static_resolved);
     RUN_TEST(repro_lsp_php_self_static);
 
-    /* Rust — expected RED (cross-LSP not wired). */
+    /* Rust — eight strategy inventories plus two dispatch-provenance guards. */
     RUN_TEST(repro_lsp_rust_direct);
     RUN_TEST(repro_lsp_rust_method_dispatch);
     RUN_TEST(repro_lsp_rust_trait_dispatch);
+    RUN_TEST(repro_lsp_rust_inherent_trait_collision);
+    RUN_TEST(repro_lsp_rust_default_trait_dispatch_cross_file);
     RUN_TEST(repro_lsp_rust_constructor);
     RUN_TEST(repro_lsp_rust_ufcs);
     RUN_TEST(repro_lsp_rust_trait_ufcs);

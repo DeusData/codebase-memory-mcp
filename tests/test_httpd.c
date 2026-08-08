@@ -2030,10 +2030,168 @@ TEST(ui_server_browse_wide_dir_no_overflow) {
 #endif
 }
 
+/* The log endpoint serialises the ring into one heap buffer budgeted at
+ * LOG_LINE_MAX + 10 bytes per line. JSON escaping doubles every '"' and '\\',
+ * so an escape-dense line needs ~2x LOG_LINE_MAX. The inner escape loop stops
+ * at buf_size - 10, but the per-line framing writes (separator comma, opening
+ * quote, closing quote) were raw indexes, so every line past saturation wrote
+ * three bytes beyond the allocation. Fill the ring with escape-dense lines and
+ * read it back in a forked child, so the overflow surfaces as a killing signal
+ * (ASan abort) instead of silent heap corruption. */
+TEST(ui_server_logs_escape_dense_no_overflow) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Worst case the ring can hold: every byte escapes to two bytes. */
+        char dense[512];
+        for (size_t i = 0; i < sizeof(dense) - 1; i++) {
+            dense[i] = (i % 2 == 0) ? '"' : '\\';
+        }
+        dense[sizeof(dense) - 1] = '\0';
+        for (int i = 0; i < 500; i++) { /* fills the whole 500-entry ring */
+            cbm_ui_log_append(dense);
+        }
+        th_server_t ts;
+        if (th_server_start(&ts) != 0) {
+            _exit(2);
+        }
+        char req[256];
+        int port = cbm_http_server_port(ts.srv);
+        snprintf(req, sizeof(req),
+                 "GET /api/logs?lines=500 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+        size_t cap = 4u * 1024u * 1024u;
+        char *resp = malloc(cap);
+        int n = resp ? th_http(port, req, resp, (int)cap) : 0;
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        free(resp);
+        th_server_stop(&ts);
+        _exit(ok ? 0 : 3);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "logs killed by signal %d — response buffer overflow",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
+/* The index-status endpoint renders every active job into a fixed 2 KB stack
+ * buffer. http_appendf clamps its own writes, but the separator and the closing
+ * bracket were raw indexes, so two jobs holding ~1 KB root paths (the field is
+ * 1024 bytes and the value comes straight from POST /api/index) pushed pos to
+ * the clamp and the close then wrote past the buffer. Drive it through the real
+ * endpoint with the index executor stubbed out, in a forked child so the
+ * overflow surfaces as a killing signal. */
+#define MAX_TEST_INDEX_JOBS 4
+TEST(ui_server_index_status_long_paths_no_overflow) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
+#else
+    char *base = th_mktempdir("cbm_status");
+    if (!base) {
+        FAIL("mktempdir");
+    }
+    /* Two real directories whose paths are long enough that two rendered job
+     * entries exceed the 2 KB response buffer. */
+    /* Four slots x ~520 chars overflows the 2 KB buffer while every path stays
+     * well inside PATH_MAX — a single pair of ~1 KB paths would reach the
+     * buffer too, but mkdir refuses them once the temp-dir prefix is added. */
+    char comp[200];
+    memset(comp, 'd', sizeof(comp) - 1);
+    comp[sizeof(comp) - 1] = '\0';
+    char deep[MAX_TEST_INDEX_JOBS][800];
+    for (int j = 0; j < MAX_TEST_INDEX_JOBS; j++) {
+        int n = snprintf(deep[j], sizeof(deep[j]), "%s/%d", base, j);
+        while (n < 520) {
+            n += snprintf(deep[j] + n, sizeof(deep[j]) - (size_t)n, "/%s", comp);
+        }
+        th_mkdir_p(deep[j]);
+    }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* The blocking executor holds every job open so all four slots are
+         * occupied at once. With the non-blocking stub each job finishes
+         * immediately and handle_index_start recycles the same slot, leaving a
+         * single entry to render — far short of the buffer. */
+        th_ui_blocking_index_executor_t executor = {0};
+        atomic_init(&executor.calls, 0);
+        atomic_init(&executor.release, 0);
+        th_server_t ts;
+        ts.srv = cbm_http_server_new(0);
+        if (!ts.srv) {
+            _exit(2);
+        }
+        cbm_http_server_set_index_executor(ts.srv, th_ui_blocking_index_executor, &executor);
+        if (th_server_thread_start(&ts.tid, ts.srv) != 0) {
+            _exit(2);
+        }
+        int port = cbm_http_server_port(ts.srv);
+        for (int j = 0; j < MAX_TEST_INDEX_JOBS; j++) {
+            char body[1200];
+            snprintf(body, sizeof(body), "{\"root_path\":\"%s\",\"project_name\":\"p%d\"}", deep[j],
+                     j);
+            char request[1500];
+            snprintf(request, sizeof(request),
+                     "POST /api/index HTTP/1.1\r\nContent-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n\r\n%s",
+                     strlen(body), body);
+            char response[4096];
+            int rn = th_http(port, request, response, sizeof(response));
+            /* A rejected POST would leave the slot empty and the endpoint would
+             * render nothing — a vacuous pass. Fail loudly instead. */
+            if (rn <= 0 || th_status(response) != 202) {
+                _exit(4);
+            }
+        }
+        /* Wait for the state the assertion depends on — all four jobs actually
+         * running — rather than for a duration. */
+        if (!th_wait_atomic_int(&executor.calls, MAX_TEST_INDEX_JOBS, 5000)) {
+            atomic_store(&executor.release, 1);
+            _exit(5);
+        }
+        char req[256];
+        snprintf(req, sizeof(req), "GET /api/index-status HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+                 port);
+        char resp[8192];
+        int n = th_http(port, req, resp, sizeof(resp));
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        atomic_store(&executor.release, 1);
+        th_server_stop(&ts);
+        _exit(ok ? 0 : 3);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    th_cleanup(base);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "index-status killed by signal %d — response buffer overflow",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
     RUN_TEST(ui_server_browse_wide_dir_no_overflow);
+    RUN_TEST(ui_server_logs_escape_dense_no_overflow);
+    RUN_TEST(ui_server_index_status_long_paths_no_overflow);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_security_headers_and_rejects_duplicates);

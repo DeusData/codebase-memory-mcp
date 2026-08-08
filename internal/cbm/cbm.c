@@ -653,10 +653,23 @@ static void cbm_quarantine_load(void) {
          * never freed: the set lives for the whole (short-lived worker) process.
          * The value stores the phase so cbm_index_quarantine_phase() can report
          * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
-        char *key = cbm_strdup(line);
         char *pval = cbm_strdup(phase);
-        if (key && pval) {
-            cbm_ht_set(set, key, (void *)pval);
+        if (!pval) {
+            continue;
+        }
+        if (cbm_ht_has(set, line)) {
+            /* Duplicate path line: reuse the stored key (the table borrows key
+             * pointers, so a fresh copy would leak on replace) and free the
+             * value it displaces. */
+            free(cbm_ht_set(set, line, (void *)pval));
+        } else {
+            char *key = cbm_strdup(line);
+            if (key) {
+                cbm_ht_set(set, key, (void *)pval);
+            } else {
+                /* Partial failure: don't leak the value copy. */
+                free(pval);
+            }
         }
     }
     (void)fclose(f);
@@ -1255,7 +1268,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
+            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C,
+                          CBM_SOURCE_ORIGIN_RAW);
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
@@ -1315,8 +1329,11 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (preprocessed && preprocessed->source) {
             char *expanded = preprocessed->source;
             int expanded_len = (int)strlen(expanded);
-            // Record calls count before second pass
+            // Record every site-bearing array boundary before the second pass.
+            // Numeric byte spans in `expanded` are not raw-source coordinates.
             int calls_before = result->calls.count;
+            int usages_before = result->usages.count;
+            int resolved_before = result->resolved_calls.count;
 
             // Parse expanded source with fresh tree
             TSParser *pp_parser = get_thread_parser(ts_lang, language);
@@ -1352,11 +1369,30 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                     // harmless (pipeline deduplicates by caller+callee).
                     cbm_extract_unified(&pp_ctx);
 
+                    /* Stamp parser carriers before C-LSP performs any
+                     * origin-sensitive rewrite. Numeric spans in the expanded
+                     * buffer may collide with unrelated raw-source spans. */
+                    for (int i = calls_before; i < result->calls.count; i++) {
+                        result->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = usages_before; i < result->usages.count; i++) {
+                        result->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
                     cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C);
+                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+
+                    /* All C-LSP emitters stamp origin directly so rewrite-time
+                     * comparisons are already safe. Keep this boundary sweep as
+                     * a defensive invariant for any future emitter added to the
+                     * C resolver. */
+                    for (int i = resolved_before; i < result->resolved_calls.count; i++) {
+                        result->resolved_calls.items[i].source_origin =
+                            CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
 
                     /* #961: a def whose body braces are split across
                      * #ifdef/#else branches parses as an ERROR region on the
@@ -1563,6 +1599,12 @@ void cbm_free_result(CBMFileResult *result) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
     }
+    for (int i = 0; i < result->owned_result_count; i++) {
+        cbm_free_result(result->owned_results[i]);
+    }
+    free(result->owned_results);
+    result->owned_results = NULL;
+    result->owned_result_count = 0;
     cbm_arena_destroy(&result->arena);
     free(result);
 }

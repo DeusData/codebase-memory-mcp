@@ -59,7 +59,7 @@ ARTIFACT_DIR="${CBM_SMOKE_ARTIFACT_DIR:-}"
 if [ -n "$ARTIFACT_DIR" ]; then
     ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
     for required in codebase-memory-mcp.exe \
-        LICENSE install.ps1 THIRD_PARTY_NOTICES.md; do
+        cbm-integrations.json LICENSE install.ps1 THIRD_PARTY_NOTICES.md; do
         [ -s "$ARTIFACT_DIR/$required" ] ||
             { echo "vm-smoke: release artifact is missing $required" >&2; exit 2; }
     done
@@ -146,22 +146,37 @@ MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -ExecutionPolicy Bypass \
     -SmokeRoot "$(cygpath -w "$SMOKE_DIR")"
 cp "$BINARY_SRC" "$SMOKE_DIR/codebase-memory-mcp.exe"
 cp "$SMOKE_DIR/codebase-memory-mcp.exe" "$FIXTURE_DIR/"
+# The integration asset must sit next to the smoke binary in $SMOKE_DIR: phases
+# that invoke it directly (Phase 14 stages it by hand and drives an uninstall)
+# resolve the asset next to the binary, and without it those render-template
+# operations fail closed. Its own copy lands in the served archive below.
+if [ -n "$ARTIFACT_DIR" ]; then
+    ASSET_SRC="$ARTIFACT_DIR/cbm-integrations.json"
+else
+    ASSET_SRC="$(dirname "$BINARY_SRC")/cbm-integrations.json"
+fi
+cp "$ASSET_SRC" "$SMOKE_DIR/cbm-integrations.json"
 # The install/update phases fetch these out of the served archive, so they must
 # be the artifact's own copies whenever one was supplied — regenerating them
 # here would smoke a sidecar the release never ships.
 if [ -n "$ARTIFACT_DIR" ]; then
-    cp "$ARTIFACT_DIR/LICENSE" "$ARTIFACT_DIR/install.ps1" \
-        "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
+    cp "$ARTIFACT_DIR/cbm-integrations.json" "$ARTIFACT_DIR/LICENSE" \
+        "$ARTIFACT_DIR/install.ps1" "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
 else
-    cp LICENSE install.ps1 "$FIXTURE_DIR/"
+    # build.sh stages cbm-integrations.json next to the binary; ship it in the
+    # archive so the installed binary can verify and render its templates.
+    cp "$(dirname "$BINARY_SRC")/cbm-integrations.json" LICENSE install.ps1 "$FIXTURE_DIR/"
     scripts/gen-third-party-notices.sh "$FIXTURE_DIR/THIRD_PARTY_NOTICES.md"
 fi
 
+# Member set + ORDER mirror scripts/package-release.sh (Windows): the install
+# verifies cbm-integrations.json against the binary's embedded SHA-256 and fails
+# closed without it.
 EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-windows-${SMOKE_ARCH}.zip"
 (
     cd "$FIXTURE_DIR"
     zip -q "$EXPECTED_ARTIFACT" \
-        codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+        codebase-memory-mcp.exe cbm-integrations.json LICENSE install.ps1 THIRD_PARTY_NOTICES.md
     if [ -n "$SUFFIX" ]; then
         cp "$EXPECTED_ARTIFACT" "codebase-memory-mcp-windows-${SMOKE_ARCH}.zip"
     fi

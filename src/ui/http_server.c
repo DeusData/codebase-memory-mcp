@@ -35,6 +35,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
 #include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
+#include "foundation/workspace.h"
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -482,8 +483,18 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     int start = (g_log_head - count + LOG_RING_SIZE) % LOG_RING_SIZE;
     int total = g_log_count;
 
-    /* Copy lines under lock */
-    size_t buf_size = (size_t)count * (LOG_LINE_MAX + 10) + 64;
+    /* Copy lines under lock.
+     *
+     * JSON escaping expands '"', '\\' and '\n' to two bytes each, so an
+     * line made mostly of those serialises to roughly twice its stored length.
+     * The previous budget of LOG_LINE_MAX + 10 per line under-counted that by
+     * half. Ring contents come from indexer stderr, which is not escaped on
+     * ingest and can legitimately contain both doubling characters — a POSIX
+     * filename may.
+     *
+     * Budget the escaped worst case, and clamp the framing writes below anyway
+     * so the size calculation is not the only thing keeping pos in range. */
+    size_t buf_size = (size_t)count * (2 * LOG_LINE_MAX + 8) + 64;
     char *buf = malloc(buf_size);
     if (!buf) {
         cbm_mutex_unlock(&g_log_mutex);
@@ -496,9 +507,9 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % LOG_RING_SIZE;
         if (i > 0)
-            buf[pos++] = ',';
+            http_appendf(buf, buf_size, &pos, ",");
         /* Escape quotes in log lines */
-        buf[pos++] = '"';
+        http_appendf(buf, buf_size, &pos, "\"");
         for (int j = 0; g_log_ring[idx][j] && (size_t)pos < buf_size - 10; j++) {
             char ch = g_log_ring[idx][j];
             if (ch == '"') {
@@ -514,10 +525,18 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                 buf[pos++] = ch;
             }
         }
-        buf[pos++] = '"';
+        http_appendf(buf, buf_size, &pos, "\"");
     }
     cbm_mutex_unlock(&g_log_mutex);
     http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
+
+    /* http_appendf pins pos to buf_size on truncation and then writes nothing,
+     * so a saturated buffer would reach the "%s" reply with no terminator in
+     * range. Terminate explicitly. */
+    if ((size_t)pos >= buf_size) {
+        pos = (int)buf_size - 1;
+    }
+    buf[pos] = '\0';
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
     free(buf);
@@ -627,7 +646,9 @@ static void append_roots_json(char *buf, size_t bufsz, int *pos) {
             continue;
         }
         if (count++ > 0) {
-            buf[(*pos)++] = ',';
+            /* Once a wide listing saturates buf, http_appendf has already
+             * pinned *pos to bufsz, so this separator goes through it too. */
+            http_appendf(buf, bufsz, pos, ",");
         }
         http_appendf(buf, bufsz, pos, "\"%c:/\"", 'A' + i);
     }
@@ -1032,6 +1053,28 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
         return;
     }
 
+    /* Same workspace boundary the MCP indexing tool applies, through the same
+     * function. This route used to check only that the path was a directory, so
+     * it accepted roots the MCP path refused — an operator's boundary held on one
+     * entry point and not the other. Canonicalize first: the policy is defined
+     * over resolved paths, and a symlink would otherwise launder the verdict. */
+    char canonical_root[4096];
+    char boundary_err[1024];
+    if (!cbm_canonical_path(rpath, canonical_root, sizeof(canonical_root))) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"cannot resolve root_path\"}");
+        return;
+    }
+    if (!cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
+                                    cbm_workspace_cache_dir(), getenv("CBM_ALLOWED_ROOT"),
+                                    boundary_err, sizeof(boundary_err))) {
+        yyjson_doc_free(doc);
+        char escaped[1024];
+        cbm_json_escape(escaped, (int)sizeof(escaped), boundary_err);
+        cbm_http_replyf(c, 403, g_cors_json, "{\"error\":\"%s\"}", escaped);
+        return;
+    }
+
     /* Find free job slot */
     int slot = -1;
     for (int i = 0; i < MAX_INDEX_JOBS; i++) {
@@ -1089,14 +1132,28 @@ static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
         if (st == 0)
             continue;
         if (pos > 1)
-            buf[pos++] = ',';
+            http_appendf(buf, sizeof(buf), &pos, ",");
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
+        /* root_path comes from POST /api/index and is up to 1023 bytes, so four
+         * occupied slots exceed this buffer. http_appendf pins pos to
+         * sizeof(buf) on truncation, so the separator and the close have to go
+         * through it as well rather than indexing raw. Both fields are free-form,
+         * so escape them — a quote in a path would otherwise end its JSON string
+         * early. */
+        /* Escaping can double each byte: root_path is 1024, error_msg 256. */
+        char esc_path[2048];
+        char esc_error[512];
+        cbm_json_escape(esc_path, (int)sizeof(esc_path), server->index_jobs[i].root_path);
+        cbm_json_escape(esc_error, (int)sizeof(esc_error),
+                        st == 3 ? server->index_jobs[i].error_msg : "");
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                     server->index_jobs[i].root_path,
-                     st == 3 ? server->index_jobs[i].error_msg : "");
+                     esc_path, esc_error);
     }
-    buf[pos++] = ']';
+    http_appendf(buf, sizeof(buf), &pos, "]");
+    if ((size_t)pos >= sizeof(buf)) {
+        pos = (int)sizeof(buf) - 1;
+    }
     buf[pos] = '\0';
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }

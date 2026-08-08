@@ -363,7 +363,26 @@ TEST(incr_full_index) {
         rss_limit_mb = 2816;
     }
 #endif
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define CBM_TEST_RSS_BUDGET_UNMEASURABLE 1
+#endif
+#endif
+#if defined(CBM_TEST_RSS_BUDGET_UNMEASURABLE)
+    /* MSan maps shadow (and with origins, a second) mapping for every
+     * allocation, inflating RSS by construction: this index measured 3054MB
+     * against the 2304MB budget on the x86-64 lane. The budget exists to catch
+     * a REAL leak (GBs over) in a normal build; under MSan it cannot separate a
+     * leak from shadow, so the number is not evidence either way. Skipped here
+     * rather than inflated, so the guard keeps its teeth on every other
+     * platform -- inflating it would blind the check where it does work. The
+     * rest of this test (node/edge correctness) still runs under MSan, which is
+     * the uninitialized-read coverage the lane exists for. */
+    (void)rss_delta_mb;
+    (void)rss_limit_mb;
+#else
     ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
+#endif
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",

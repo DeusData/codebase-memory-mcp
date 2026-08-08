@@ -139,6 +139,9 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
 /* Cross-file LSP: build registry from defs + stdlib, re-parse if needed,
  * walk and resolve. defs include both local + cross-file definitions. */
+void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                int def_count);
+
 void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,

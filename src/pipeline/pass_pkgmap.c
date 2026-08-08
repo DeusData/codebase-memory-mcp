@@ -1987,7 +1987,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *as2 = '\0';
         }
         /* Convert "::" → "/" (drop the doubled colon cleanly). */
-        char clean[1024];
+        char clean[1024] = ""; /* first byte defined even on the zero-write path */
         size_t ci = 0;
         for (const char *p = mp; *p && ci + 1 < sizeof(clean); p++) {
             if (*p == ':') {

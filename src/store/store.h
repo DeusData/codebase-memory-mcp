@@ -61,6 +61,21 @@ typedef struct {
     int64_t size;
 } cbm_file_hash_t;
 
+/* One file's persisted LSP surface: the serialized cross-file definition set
+ * (exactly what pass_lsp_cross registration consumes) plus the metadata the
+ * closure-repair incremental route needs to decide and bound its work. The
+ * store treats defs_json/ref_bloom as opaque; the codec lives with
+ * pass_lsp_cross, which is the only writer and reader of their contents. */
+typedef struct {
+    const char *project;
+    const char *rel_path;
+    const char *surface_sha; /* sha256 hex of defs_json (the early-cutoff key) */
+    const char *defs_json;   /* canonical JSON array of the file's LSP defs */
+    const void *ref_bloom;   /* referenced-identifier bloom blob (may be NULL) */
+    int ref_bloom_len;
+    const char *config_ctx; /* governing-config context hash ("" = none) */
+} cbm_lsp_surface_row_t;
+
 /* Find nodes overlapping a line range in a file (excludes Module/Package). */
 int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, const char *file_path,
                                          int start_line, int end_line, cbm_node_t **out,
@@ -92,6 +107,31 @@ int cbm_store_batch_count_degrees(cbm_store_t *s, const int64_t *node_ids, int i
 
 /* Upsert file hashes in batch. */
 int cbm_store_upsert_file_hash_batch(cbm_store_t *s, const cbm_file_hash_t *hashes, int count);
+
+/* ── LSP surface rows (closure-repair incremental) ───────────────
+ * Upsert/get/delete are whole-row, keyed (project, rel_path). get returns
+ * heap rows released with cbm_store_free_lsp_surfaces. A project with no
+ * rows returns OK with *count == 0 — callers treat that as "no surface
+ * data" and route to a full rebuild, which is also the upgrade path for
+ * databases written before this table existed. */
+int cbm_store_upsert_lsp_surface_batch(cbm_store_t *s, const cbm_lsp_surface_row_t *rows,
+                                       int count);
+int cbm_store_get_lsp_surfaces(cbm_store_t *s, const char *project, cbm_lsp_surface_row_t **out,
+                               int *count);
+int cbm_store_delete_lsp_surfaces(cbm_store_t *s, const char *project);
+void cbm_store_free_lsp_surfaces(cbm_lsp_surface_row_t *rows, int count);
+
+/* Reverse-dependency lookup for closure-repair routing: the DISTINCT
+ * file_paths of nodes with at least one edge INTO a node of any file in
+ * target_files, excluding the target files themselves. This is "who consumed
+ * these files' definitions" as recorded by the previous generation — served
+ * by idx_edges_target + idx_nodes_file, so cost tracks the result size, not
+ * the graph size. out gets a malloc'd array of malloc'd strings; free with
+ * cbm_store_free_dependent_files. */
+int cbm_store_get_dependent_files(cbm_store_t *s, const char *project,
+                                  const char *const *target_files, int target_count, char ***out,
+                                  int *out_count);
+void cbm_store_free_dependent_files(char **files, int count);
 
 /* Find edges whose properties contain a url_path matching the keyword. */
 int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const char *keyword,
@@ -224,6 +264,12 @@ cbm_store_t *cbm_store_open_path_existing(const char *db_path);
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+/* Validate and seal an existing DB for atomic replacement without creating or
+ * migrating its schema. Returns OK when sealed, NOT_FOUND when the bytes are
+ * definitely corrupt/incompatible and should be quarantined, or ERR when the
+ * file is busy/unavailable and must be left in place. */
+int cbm_store_seal_existing_path_for_replace(const char *db_path);
+
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);
@@ -287,6 +333,14 @@ int64_t cbm_store_journal_size_limit(cbm_store_t *s);
  * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
  * bumps on every index run. "legacy" for DBs predating store_meta. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
+
+/* Seal a fully-written staging database before atomic publication.
+ * Raises synchronous to FULL, requires an exclusive TRUNCATE checkpoint to
+ * complete, then leaves the database in verified DELETE journal mode so the
+ * main file is self-contained (no required -wal/-shm sidecars). This is a
+ * fail-closed operation: SQLITE_BUSY and an unconfirmed mode transition are
+ * errors. The caller must own the staging database exclusively. */
+int cbm_store_seal_for_atomic_publish(cbm_store_t *s);
 
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)
