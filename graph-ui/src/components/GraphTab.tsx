@@ -257,21 +257,6 @@ export function GraphTab({ project }: GraphTabProps) {
     };
   }, [project]);
 
-  const handleSelectPath = useCallback(
-    (path: string, nodeIds: Set<number>) => {
-      if (!filteredData || !path || nodeIds.size === 0) {
-        setHighlightedIds(null);
-        setSelectedPath(null);
-        setCameraTarget(null);
-        return;
-      }
-      setSelectedPath(path);
-      setHighlightedIds(nodeIds);
-      setCameraTarget(computeCameraTarget(filteredData.nodes, nodeIds));
-    },
-    [filteredData],
-  );
-
   const handleNodeClick = useCallback(
     (node: GraphNode) => {
       if (!filteredData) return;
@@ -308,6 +293,29 @@ export function GraphTab({ project }: GraphTabProps) {
       handleNodeClick(node);
     },
     [handleNodeClick],
+  );
+
+  const handleSelectPath = useCallback(
+    (path: string, nodeIds: Set<number>, node?: GraphNode) => {
+      if (node) {
+        handleNodeClick(node);
+        return;
+      }
+
+      if (!filteredData || !path || nodeIds.size === 0) {
+        setHighlightedIds(null);
+        setSelectedPath(null);
+        setSelectedNode(null);
+        setCameraTarget(null);
+        return;
+      }
+
+      setSelectedNode(null);
+      setSelectedPath(path);
+      setHighlightedIds(nodeIds);
+      setCameraTarget(computeCameraTarget(filteredData.nodes, nodeIds));
+    },
+    [filteredData, handleNodeClick],
   );
 
   const toggleLabel = useCallback((label: string) => {
