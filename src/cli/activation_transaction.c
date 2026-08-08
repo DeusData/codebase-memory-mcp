@@ -1707,6 +1707,7 @@ static activation_publish_status_t activation_publish_absent_link_fallback(
 }
 #endif
 
+#if defined(_WIN32) || defined(__APPLE__) || (defined(__linux__) && defined(SYS_renameat2))
 static activation_publish_status_t activation_finish_absent_publish(
     cbm_activation_transaction_t *transaction) {
     transaction->staged_exists = false;
@@ -1717,6 +1718,7 @@ static activation_publish_status_t activation_finish_absent_publish(
                ? ACTIVATION_PUBLISH_OK
                : ACTIVATION_PUBLISH_CHANGED_ERROR;
 }
+#endif
 
 static activation_publish_status_t activation_publish_absent_replacement(
     cbm_activation_transaction_t *transaction) {
