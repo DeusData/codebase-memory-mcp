@@ -2,7 +2,7 @@
 pkgname=codebase-memory-mcp
 pkgver=0.8.1
 pkgrel=1
-pkgdesc="Fast code intelligence engine for AI coding agents — single static binary MCP server"
+pkgdesc="Fast code intelligence engine — native executable with verified integration asset"
 arch=('x86_64' 'aarch64')
 url="https://github.com/DeusData/codebase-memory-mcp"
 license=('MIT')
@@ -18,6 +18,8 @@ sha256sums_aarch64=('d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d
 package() {
     install -Dm755 "${srcdir}/codebase-memory-mcp" \
         "${pkgdir}/usr/bin/codebase-memory-mcp"
+    install -Dm644 "${srcdir}/cbm-integrations.json" \
+        "${pkgdir}/usr/share/codebase-memory-mcp/cbm-integrations.json"
     install -Dm644 "${srcdir}/LICENSE" \
         "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
     # Third-party attribution bundle (present in archives since v0.8.1)

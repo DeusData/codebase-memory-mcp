@@ -21,14 +21,15 @@ destination override neutralized.
 
 Arguments:
   <binary>     Product binary to smoke (e.g. build/c/codebase-memory-mcp).
-  ui           Mirror the -ui asset naming AND require the embedded UI:
+  ui           Mirror the -ui asset naming AND require the external UI pack:
                Phase 15's "no assets" outcome becomes a FAILURE
                (SMOKE_REQUIRE_UI=1), so a standard binary cannot pass a ui run.
 
 Environment:
   CBM_SMOKE_ARTIFACT_DIR   Release mode: an EXTRACTED release artifact
-               directory. Sidecars (LICENSE, install.sh, THIRD_PARTY_NOTICES.md)
-               are validated and served from THERE instead of regenerated, so
+               directory. Sidecars (LICENSE, install.sh, THIRD_PARTY_NOTICES.md,
+               and the UI pack when selected) are validated and served from
+               THERE instead of regenerated, so
                the release venue smokes exactly the bytes it publishes; an
                incomplete archive fails the smoke. Unset (default): sidecars
                come from this checkout (local/PR mode).
@@ -56,9 +57,9 @@ if [ ! -x "$BINARY" ]; then
     echo "smoke-local: binary is not executable: $BINARY" >&2
     exit 2
 fi
-# A ui run must be handed a binary that actually carries the embedded assets;
-# the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase 15's
-# documented "no embedded assets" SKIP into a failure, so asking for ui and
+# A ui run must be handed a binary with exactly one external asset pack beside
+# it; the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase
+# 15's documented "no UI assets" SKIP into a failure, so asking for ui and
 # supplying a standard binary can no longer pass quietly.
 case "$VARIANT" in
 standard) SUFFIX="" ; REQUIRE_UI=0 ;;
@@ -78,6 +79,37 @@ if [ -n "$ARTIFACT_DIR" ]; then
             exit 2
         }
     done
+fi
+
+UI_PACK_NAME=""
+UI_PACK_SOURCE=""
+UI_PACK_COUNT=0
+if [ -n "$ARTIFACT_DIR" ]; then
+    UI_PACK_SOURCE_DIR="$ARTIFACT_DIR"
+else
+    UI_PACK_SOURCE_DIR="$(dirname "$BINARY")"
+fi
+shopt -s nullglob
+UI_PACK_CANDIDATES=("$UI_PACK_SOURCE_DIR"/cbm-ui-*.pack)
+shopt -u nullglob
+for candidate in "${UI_PACK_CANDIDATES[@]+"${UI_PACK_CANDIDATES[@]}"}"; do
+    UI_PACK_COUNT=$((UI_PACK_COUNT + 1))
+    UI_PACK_SOURCE="$candidate"
+    candidate_name="$(basename "$candidate")"
+    if ! [[ "$candidate_name" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
+        echo "smoke-local: invalid UI pack name beside artifact: $candidate_name" >&2
+        exit 2
+    fi
+done
+if [ "$VARIANT" = "ui" ]; then
+    if [ "$UI_PACK_COUNT" -ne 1 ] || [ ! -s "$UI_PACK_SOURCE" ]; then
+        echo "smoke-local: ui fixture requires exactly one content-addressed UI pack" >&2
+        exit 2
+    fi
+    UI_PACK_NAME="$(basename "$UI_PACK_SOURCE")"
+elif [ "$UI_PACK_COUNT" -ne 0 ]; then
+    echo "smoke-local: standard fixture must not contain a UI asset pack" >&2
+    exit 2
 fi
 
 case "$(uname -s)" in
@@ -129,28 +161,28 @@ else
     cp "$ROOT/assets/cbm-integrations.json" "$ROOT/LICENSE" "$ROOT/install.sh" "$FIXTURE_DIR/"
     "$ROOT/scripts/gen-third-party-notices.sh" "$FIXTURE_DIR/THIRD_PARTY_NOTICES.md"
 fi
+if [ -n "$UI_PACK_SOURCE" ]; then
+    cp "$UI_PACK_SOURCE" "$FIXTURE_DIR/$UI_PACK_NAME"
+fi
 
 # The archive must carry cbm-integrations.json — install verifies it against the
 # binary's embedded SHA-256 and fails closed without it. Member set and ORDER
-# mirror scripts/package-release.sh (the Windows single-binary contract locks
-# that order); a fixture that omits it would smoke a release layout we never ship.
+# mirror scripts/package-release.sh (the Windows one-executable runtime-set
+# contract locks that order); a fixture that omits it would smoke a release
+# layout we never ship.
 EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz"
-tar -czf "$FIXTURE_DIR/$EXPECTED_ARTIFACT" -C "$FIXTURE_DIR" \
-    codebase-memory-mcp cbm-integrations.json LICENSE install.sh THIRD_PARTY_NOTICES.md
-if [ -n "$SUFFIX" ]; then
-    cp "$FIXTURE_DIR/$EXPECTED_ARTIFACT" \
-        "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
-fi
+ARCHIVE_MEMBERS=(
+    codebase-memory-mcp cbm-integrations.json LICENSE install.sh
+    THIRD_PARTY_NOTICES.md
+)
+[ -n "$UI_PACK_NAME" ] && ARCHIVE_MEMBERS+=("$UI_PACK_NAME")
+tar -czf "$FIXTURE_DIR/$EXPECTED_ARTIFACT" -C "$FIXTURE_DIR" "${ARCHIVE_MEMBERS[@]}"
 
 # Linux install/update resolves the portable release asset even when this local
 # smoke started from the dynamic production binary.
 if [ "$OS" = "linux" ]; then
     cp "$FIXTURE_DIR/$EXPECTED_ARTIFACT" \
         "$FIXTURE_DIR/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz"
-    if [ -n "$SUFFIX" ]; then
-        cp "$FIXTURE_DIR/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz" \
-            "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz"
-    fi
 fi
 (cd "$FIXTURE_DIR" && { sha256sum *.tar.gz > checksums.txt 2>/dev/null ||
     shasum -a 256 *.tar.gz > checksums.txt; })

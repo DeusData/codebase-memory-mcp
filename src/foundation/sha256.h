@@ -27,4 +27,10 @@ void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]);
  * CBM_SHA256_HEX_LEN + 1 bytes (hex chars + NUL). */
 void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 1]);
 
+/* RFC 2104 HMAC-SHA-256. The output is always CBM_SHA256_DIGEST_LEN bytes.
+ * A NULL key/data pointer is accepted only when its corresponding length is
+ * zero. */
+void cbm_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
+                     uint8_t out[CBM_SHA256_DIGEST_LEN]);
+
 #endif /* CBM_SHA256_H */

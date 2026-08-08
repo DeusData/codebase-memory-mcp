@@ -5,8 +5,10 @@
  * complete shebang'd shell scripts, their PowerShell/.cmd twins, and the
  * generated JS/TS client modules — as C string literals, written to client
  * config dirs at 0755. That block of script-shaped bytes inside an unsigned
- * executable is exactly the surface AV classifiers score (Wacatac.B!ml), so
- * the bodies now live in ONE shipped data file, assets/cbm-integrations.json,
+ * executable overlaps script-bearing installer/launcher feature families used
+ * by static malware classifiers. That does not identify the cause of any
+ * opaque vendor verdict. The unnecessary bodies now live in ONE independently
+ * inspectable data file, assets/cbm-integrations.json,
  * and the binary embeds exactly ONE constant about them: the file's SHA-256
  * (generated at build time into cbm_integrations_hash.h).
  *
@@ -19,16 +21,18 @@
  * override fails, it never falls back), else next to the running binary (the
  * flat release-archive layout install.sh/install.ps1 execute from), else the
  * source-tree layout <bindir>/../../assets (build/c/ builds and test-runner),
- * else the stored copy under <home>/.cbm/assets/<version>/.
+ * else the stored copy under <home>/.cbm/assets/<sha256>/.
  *
  * The stored copy is the OWNERSHIP REFERENCE: `install` persists the verified
- * bytes to <home>/.cbm/assets/<version>/ — a SIBLING of the disposable cache
+ * bytes to <home>/.cbm/assets/<sha256>/ — a SIBLING of the disposable cache
  * (~/.cache/codebase-memory-mcp), never inside it — so uninstall can decide
  * "is this deployed file ours?" by materializing templates from it long after
  * the release archive is gone. Deciding ownership by materialize-and-compare
  * against these templates REPLACES the old exact-match against embedded
  * literals; released[] carries the historical bodies older versions wrote, so
- * upgrades and uninstalls keep recognising them. Foreign or user-modified
+ * upgrades and uninstalls keep recognising them. Content addressing prevents
+ * same-version rebuilds from overwriting another build's ownership reference.
+ * Foreign or user-modified
  * files are preserved exactly as before.
  *
  * Single-threaded by design: only the CLI install/uninstall paths touch this,
@@ -39,6 +43,8 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+
+#include "cli/activation_transaction.h"
 
 #define CBM_INTEGRATIONS_ASSET_NAME "cbm-integrations.json"
 
@@ -69,11 +75,46 @@ typedef struct {
  * actionable message. */
 bool cbm_integration_assets_require(const char *home, char *err, size_t err_sz);
 
-/* Install-time step: verify (as above) and persist the verified bytes to
- * <home>/.cbm/assets/<version>/cbm-integrations.json. Verification failure or
- * an unwritable store is an error — the caller must not partially install.
- * dry_run verifies only and writes nothing. */
-bool cbm_integration_assets_install(const char *home, bool dry_run, char *err, size_t err_sz);
+/* Verify one explicit file against this binary's compiled digest. This does
+ * not consult fallbacks or populate the template cache. */
+bool cbm_integration_assets_verify_file(const char *path);
+
+/* Content-addressed ownership reference used by install/uninstall. */
+bool cbm_integration_assets_ownership_path(const char *home, char *out, size_t out_sz);
+
+/* Stage both runtime copies from the verified immutable snapshot: the fixed
+ * sidecar beside the target executable and the content-addressed ownership reference.
+ * No target is changed until the caller commits both transactions. The caller
+ * must hold the native activation guard from this call through rollback or
+ * finalize. A failure closes every partial stage and leaves both outputs NULL. */
+bool cbm_integration_assets_stage_install(const char *home, const char *install_dir,
+                                          cbm_activation_transaction_t **adjacent_transaction_out,
+                                          cbm_activation_transaction_t **ownership_transaction_out,
+                                          char *err, size_t err_sz);
+
+/* Publish one staged integration copy and validate the exact post-rename
+ * target against this binary's compiled digest before it can be finalized.
+ * If the staged inode was rewritten after staging, commit rolls the previous
+ * target back and returns VALIDATION_FAILED. */
+cbm_activation_transaction_status_t cbm_integration_assets_commit_install(
+    cbm_activation_transaction_t *transaction);
+
+/* Stage removal of exact, hash-owned adjacent and ownership copies. Missing
+ * files are successful no-ops. Foreign or modified files are preserved and
+ * reported through foreign_preserved_out. The caller owns any returned
+ * transactions and must commit/rollback/finalize them under the activation
+ * guard. */
+bool cbm_integration_assets_stage_remove(const char *home, const char *install_dir,
+                                         cbm_activation_transaction_t **adjacent_transaction_out,
+                                         cbm_activation_transaction_t **ownership_transaction_out,
+                                         bool *foreign_preserved_out, char *err, size_t err_sz);
+
+/* Move the snapshotted target to the transaction's private retained path,
+ * then hash that exact retained object before permitting final deletion. An
+ * in-place rewrite after stage_remove is restored and reported as
+ * VALIDATION_FAILED instead of being deleted. */
+cbm_activation_transaction_status_t cbm_integration_assets_commit_removal(
+    cbm_activation_transaction_t *transaction);
 
 /* Template lookup for this platform. Returns NULL when the assets are
  * unavailable or the id/variant is unknown. The returned pointers stay valid
@@ -81,6 +122,10 @@ bool cbm_integration_assets_install(const char *home, bool dry_run, char *err, s
 const cbm_integration_template_t *cbm_integration_template(const char *id);
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+/* Focused lifecycle probe for the ownership-copy publisher. Production uses
+ * cbm_integration_assets_stage_install as part of the guarded runtime set. */
+bool cbm_integration_assets_install(const char *home, bool dry_run, char *err, size_t err_sz);
+
 /* Drop the cached document so a test can steer resolution via CBM_ASSETS_DIR
  * (set = authoritative) and observe verification failures deterministically. */
 void cbm_integration_assets_reset_for_testing(void);

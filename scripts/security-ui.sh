@@ -4,7 +4,7 @@ set -euo pipefail
 # Layer 6: Graph UI security audit.
 #
 # Audits:
-#   A. Frontend asset scan (embedded JS/CSS/HTML or graph-ui/dist/)
+#   A. Frontend asset scan (source and external packed JS/CSS/HTML inputs)
 #   B. HTTP server binding (must be 127.0.0.1 only)
 #   C. RPC proxy scope (no system()/popen() in HTTP handler path)
 #   D. CORS check (no wildcard Access-Control-Allow-Origin)
@@ -25,7 +25,7 @@ echo "=== Layer 6: Graph UI Security Audit ==="
 echo ""
 echo "--- A. Frontend asset scan ---"
 
-# Check both built dist and embedded asset source
+# Check both source and the built files packed into the release sidecar.
 UI_DIRS=()
 [[ -d "$ROOT/graph-ui/dist" ]] && UI_DIRS+=("$ROOT/graph-ui/dist")
 [[ -d "$ROOT/graph-ui/src" ]] && UI_DIRS+=("$ROOT/graph-ui/src")

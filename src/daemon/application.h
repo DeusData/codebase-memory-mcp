@@ -79,6 +79,11 @@ typedef struct {
      * process-local manager; the daemon job registry reserves index projects
      * in-process and must not hold the worker's OS lease. */
     cbm_project_lock_manager_t *project_locks;
+    /* Copied at construction. A production host supplies one fresh 32-byte
+     * secret per daemon generation; tests may omit it when readiness is not
+     * under test. */
+    const uint8_t *ui_readiness_secret;
+    size_t ui_readiness_secret_length;
 } cbm_daemon_application_config_t;
 
 typedef enum {
@@ -87,6 +92,7 @@ typedef enum {
     CBM_DAEMON_APPLICATION_REQUEST_TOOL = 3,
     CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT = 4,
     CBM_DAEMON_APPLICATION_REQUEST_SET_UI_CONFIG = 5,
+    CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF = 6,
 } cbm_daemon_application_request_kind_t;
 
 typedef enum {
@@ -130,6 +136,13 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_contex
  * transport. */
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_ui_config(
     cbm_daemon_runtime_client_t *client, uint8_t update_mask, bool ui_enabled, int ui_port,
+    uint32_t timeout_ms);
+
+/* Ask the authenticated daemon generation to prove possession of its private
+ * readiness secret for this caller-supplied challenge. The secret itself never
+ * crosses IPC. Both challenge and proof are exactly one SHA-256 digest. */
+cbm_daemon_runtime_application_status_t cbm_daemon_application_client_ui_readiness_proof(
+    cbm_daemon_runtime_client_t *client, const uint8_t challenge[32], uint8_t proof_out[32],
     uint32_t timeout_ms);
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(

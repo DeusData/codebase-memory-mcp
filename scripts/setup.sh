@@ -144,6 +144,18 @@ fetch() {
     fi
 }
 
+install_integration_asset() {
+    local source_dir="$1"
+    local source_path="${source_dir}/cbm-integrations.json"
+
+    if [ ! -f "$source_path" ]; then
+        die "Runtime asset missing from build or release: cbm-integrations.json"
+    fi
+
+    cp "$source_path" "${INSTALL_DIR}/cbm-integrations.json"
+    chmod 644 "${INSTALL_DIR}/cbm-integrations.json"
+}
+
 download_binary() {
     local platform="$1" tool="$2"
 
@@ -171,6 +183,7 @@ download_binary() {
     mkdir -p "$INSTALL_DIR"
     mv "${tmpdir}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
     chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    install_integration_asset "$tmpdir"
 
     ok "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
 }
@@ -199,7 +212,10 @@ build_from_source() {
     echo "${BOLD}Building binary (this may take a minute)...${RESET}"
     mkdir -p "$INSTALL_DIR"
 
-    (cd "$SOURCE_DIR" && scripts/build.sh && cp build/c/codebase-memory-mcp "${INSTALL_DIR}/${BINARY_NAME}")
+    (cd "$SOURCE_DIR" && scripts/build.sh)
+    cp "${SOURCE_DIR}/build/c/codebase-memory-mcp" "${INSTALL_DIR}/${BINARY_NAME}"
+    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    install_integration_asset "${SOURCE_DIR}/build/c"
 
     ok "Built and installed to ${INSTALL_DIR}/${BINARY_NAME}"
 }
@@ -331,5 +347,6 @@ ok "Done! Restart Claude Code and verify with /mcp"
 echo ""
 info "To uninstall:"
 info "  rm ${INSTALL_DIR}/${BINARY_NAME}"
+info "  rm ${INSTALL_DIR}/cbm-integrations.json"
 info "  rm -rf ${SOURCE_DIR}  # if built from source"
 info "  rm -rf ~/.cache/codebase-memory-mcp/  # graph database"

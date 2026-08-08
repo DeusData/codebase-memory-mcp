@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Layer 8: Vendored dependency integrity — verifies vendored C sources match
-# checked-in checksums. Detects supply chain tampering of vendored libraries.
+# Layer 8: Vendored dependency integrity — verifies every vendored input matches
+# checked-in checksums. Detects supply-chain tampering of source, generated
+# parsers, assembly loaders, opaque data blobs, notices, and licenses.
 #
-# Libraries covered: mimalloc, nomic, sqlite3, tre, xxhash, yyjson
+# Scope: every regular file under vendored/ and internal/cbm/vendored/.
 #
 # Usage: scripts/security-vendored.sh [--update]
 
@@ -17,6 +18,8 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 CHECKSUMS="$ROOT/scripts/vendored-checksums.txt"
 VENDORED_ROOT="$ROOT/vendored"
+INTERNAL_VENDORED_ROOT="$ROOT/internal/cbm/vendored"
+VENDORED_ROOTS=("$VENDORED_ROOT")
 
 if [[ ! -f "$CHECKSUMS" || -L "$CHECKSUMS" ]]; then
     echo "FAIL: checksum manifest must be a regular, non-symlink file: $CHECKSUMS"
@@ -25,6 +28,13 @@ fi
 if [[ ! -d "$VENDORED_ROOT" || -L "$VENDORED_ROOT" ]]; then
     echo "FAIL: vendored root must be a regular, non-symlink directory: $VENDORED_ROOT"
     exit 1
+fi
+if [[ -e "$INTERNAL_VENDORED_ROOT" ]]; then
+    if [[ ! -d "$INTERNAL_VENDORED_ROOT" || -L "$INTERNAL_VENDORED_ROOT" ]]; then
+        echo "FAIL: internal vendored root must be a regular, non-symlink directory: $INTERNAL_VENDORED_ROOT"
+        exit 1
+    fi
+    VENDORED_ROOTS+=("$INTERNAL_VENDORED_ROOT")
 fi
 
 echo "=== Layer 8: Vendored Dependency Integrity ==="
@@ -73,8 +83,7 @@ DISCOVERED=0
 
 valid_vendored_path() {
     local path="$1"
-    [[ "$path" == vendored/* ]] || return 1
-    [[ "$path" == *.c || "$path" == *.h ]] || return 1
+    [[ "$path" == vendored/* || "$path" == internal/cbm/vendored/* ]] || return 1
     [[ "$path" != *'\\'* ]] || return 1
     [[ "$path" != *'//'* ]] || return 1
     [[ "$path" != *'/./'* && "$path" != */. ]] || return 1
@@ -94,14 +103,17 @@ hash_file() {
     printf '%s\n' "$hash"
 }
 
-# Inventory with NUL delimiters first. This makes path validation independent
-# of whitespace and ensures find/read failures are structural, not silent skips.
-if ! find "$VENDORED_ROOT" -type f \( -name '*.c' -o -name '*.h' \) -print0 \
+# Inventory every regular vendored file with NUL delimiters first. Opaque data
+# and assembly are as security-relevant as C headers: code_vectors.bin is
+# linked verbatim through .incbin, while all generated grammar sources enter
+# the product link. This makes path validation independent of whitespace and
+# ensures find/read failures are structural, not silent skips.
+if ! find "${VENDORED_ROOTS[@]}" -type f -print0 \
     > "$VENDORED_FILES"; then
-    echo "BLOCKED: cannot inventory vendored source files"
+    echo "BLOCKED: cannot inventory vendored files"
     STRUCTURAL_FAIL=1
 fi
-if ! find "$VENDORED_ROOT" -type l -print0 > "$VENDORED_SYMLINKS"; then
+if ! find "${VENDORED_ROOTS[@]}" -type l -print0 > "$VENDORED_SYMLINKS"; then
     echo "BLOCKED: cannot inspect vendored symlinks"
     STRUCTURAL_FAIL=1
 fi
@@ -207,7 +219,7 @@ if [[ $CHECKED -eq 0 ]]; then
     STRUCTURAL_FAIL=1
 fi
 if [[ $DISCOVERED -eq 0 ]]; then
-    echo "BLOCKED: vendored inventory contains zero C/header files"
+    echo "BLOCKED: vendored inventory contains zero files"
     STRUCTURAL_FAIL=1
 fi
 

@@ -231,6 +231,71 @@ if [ "$EXPECTED" != "$ACTUAL" ]; then
 fi
 echo "Checksum verified."
 
+# Validate the complete archive namespace before extraction. Standard releases
+# are the canonical five files; UI releases add exactly one root-level,
+# content-addressed pack. Anything else is a release-integrity failure, not a
+# sidecar to ignore.
+if [ "$OS" = "windows" ]; then
+    ARCHIVE_BINARY="codebase-memory-mcp.exe"
+    ARCHIVE_INSTALLER="install.ps1"
+else
+    ARCHIVE_BINARY="codebase-memory-mcp"
+    ARCHIVE_INSTALLER="install.sh"
+fi
+ARCHIVE_MEMBERS_FILE="$DLDIR/archive-members.txt"
+if [ "$EXT" = "zip" ]; then
+    if ! unzip -Z1 "$DLDIR/$ARCHIVE" > "$ARCHIVE_MEMBERS_FILE"; then
+        echo "error: could not enumerate release archive" >&2
+        exit 1
+    fi
+else
+    if ! tar -tzf "$DLDIR/$ARCHIVE" > "$ARCHIVE_MEMBERS_FILE"; then
+        echo "error: could not enumerate release archive" >&2
+        exit 1
+    fi
+fi
+
+BINARY_MEMBERS=0
+INTEGRATION_MEMBERS=0
+LICENSE_MEMBERS=0
+INSTALLER_MEMBERS=0
+NOTICE_MEMBERS=0
+UI_PACK_MEMBERS=0
+ARCHIVE_MEMBER_COUNT=0
+UI_PACK_NAME=""
+while IFS= read -r member || [ -n "$member" ]; do
+    ARCHIVE_MEMBER_COUNT=$((ARCHIVE_MEMBER_COUNT + 1))
+    case "$member" in
+        "$ARCHIVE_BINARY") BINARY_MEMBERS=$((BINARY_MEMBERS + 1)) ;;
+        cbm-integrations.json) INTEGRATION_MEMBERS=$((INTEGRATION_MEMBERS + 1)) ;;
+        LICENSE) LICENSE_MEMBERS=$((LICENSE_MEMBERS + 1)) ;;
+        "$ARCHIVE_INSTALLER") INSTALLER_MEMBERS=$((INSTALLER_MEMBERS + 1)) ;;
+        THIRD_PARTY_NOTICES.md) NOTICE_MEMBERS=$((NOTICE_MEMBERS + 1)) ;;
+        *)
+            if [ "$VARIANT" = "ui" ] &&
+                [[ "$member" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
+                UI_PACK_MEMBERS=$((UI_PACK_MEMBERS + 1))
+                UI_PACK_NAME="$member"
+            else
+                echo "error: release archive contains unexpected member: $member" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done < "$ARCHIVE_MEMBERS_FILE"
+
+EXPECTED_MEMBER_COUNT=5
+if [ "$VARIANT" = "ui" ]; then
+    EXPECTED_MEMBER_COUNT=6
+fi
+if [ "$BINARY_MEMBERS" -ne 1 ] || [ "$INTEGRATION_MEMBERS" -ne 1 ] ||
+    [ "$LICENSE_MEMBERS" -ne 1 ] || [ "$INSTALLER_MEMBERS" -ne 1 ] ||
+    [ "$NOTICE_MEMBERS" -ne 1 ] || [ "$UI_PACK_MEMBERS" -ne $((EXPECTED_MEMBER_COUNT - 5)) ] ||
+    [ "$ARCHIVE_MEMBER_COUNT" -ne "$EXPECTED_MEMBER_COUNT" ]; then
+    echo "error: release archive does not match the exact $VARIANT member set" >&2
+    exit 1
+fi
+
 # Extract
 echo "Extracting..."
 if [ "$EXT" = "zip" ]; then
@@ -239,10 +304,39 @@ else
     tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
 fi
 
-DLBIN="$DLDIR/codebase-memory-mcp"
-if [ ! -f "$DLBIN" ]; then
+for extracted_member in "$ARCHIVE_BINARY" cbm-integrations.json LICENSE \
+    "$ARCHIVE_INSTALLER" THIRD_PARTY_NOTICES.md; do
+    if [ ! -f "$DLDIR/$extracted_member" ] || [ -L "$DLDIR/$extracted_member" ]; then
+        echo "error: release member is not a regular file: $extracted_member" >&2
+        exit 1
+    fi
+done
+
+DLBIN="$DLDIR/$ARCHIVE_BINARY"
+if [ ! -f "$DLBIN" ] || [ -L "$DLBIN" ]; then
     echo "error: binary not found after extraction" >&2
     exit 1
+fi
+
+DL_UI_PACK=""
+if [ "$VARIANT" = "ui" ]; then
+    DL_UI_PACK="$DLDIR/$UI_PACK_NAME"
+    if [ ! -f "$DL_UI_PACK" ] || [ -L "$DL_UI_PACK" ]; then
+        echo "error: UI asset pack not found after extraction" >&2
+        exit 1
+    fi
+    PACK_EXPECTED="${UI_PACK_NAME#cbm-ui-}"
+    PACK_EXPECTED="${PACK_EXPECTED%.pack}"
+    if command -v sha256sum &>/dev/null; then
+        PACK_ACTUAL=$(sha256sum "$DL_UI_PACK" | awk '{print $1}')
+    else
+        PACK_ACTUAL=$(shasum -a 256 "$DL_UI_PACK" | awk '{print $1}')
+    fi
+    PACK_ACTUAL=$(printf '%s' "$PACK_ACTUAL" | tr 'A-F' 'a-f')
+    if [ "$PACK_EXPECTED" != "$PACK_ACTUAL" ]; then
+        echo "error: UI asset pack digest does not match its filename" >&2
+        exit 1
+    fi
 fi
 
 # macOS: fix signing
@@ -261,7 +355,20 @@ if ! CANDIDATE_VERSION=$("$DLBIN" --version 2>&1); then
 fi
 echo "Verified candidate: $CANDIDATE_VERSION"
 
+# The candidate publishes the runtime set under one native activation guard,
+# with sidecars before the executable and retained per-file backups for
+# cooperative rollback. The set is intentionally recoverable/fail-closed, not
+# claimed to be a crash-atomic multi-file filesystem transaction.
+new_exclusive_sibling_temp() {
+    local destination="$1"
+    local directory basename
+    directory="$(dirname "$destination")"
+    basename="$(basename "$destination")"
+    mktemp "$directory/.${basename}.tmp.XXXXXX"
+}
+
 DEST="$INSTALL_DIR/codebase-memory-mcp"
+[ "$OS" = "windows" ] && DEST="$INSTALL_DIR/codebase-memory-mcp.exe"
 INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
 if [ "$SKIP_CONFIG" = true ]; then
     INSTALL_ARGS+=(--skip-config)
@@ -283,33 +390,17 @@ fi
 # working install, and `update` falls back to explaining where to find it.
 DL_INSTALLER="$DLDIR/install.sh"
 if [ -f "$DL_INSTALLER" ]; then
-    INSTALLER_TMP="$INSTALL_DIR/.install.sh.$$"
-    if cp "$DL_INSTALLER" "$INSTALLER_TMP" 2>/dev/null &&
+    INSTALLER_TMP=""
+    if INSTALLER_TMP="$(new_exclusive_sibling_temp "$INSTALL_DIR/install.sh" 2>/dev/null)" &&
+        cp "$DL_INSTALLER" "$INSTALLER_TMP" 2>/dev/null &&
         chmod 755 "$INSTALLER_TMP" 2>/dev/null &&
         mv -f "$INSTALLER_TMP" "$INSTALL_DIR/install.sh" 2>/dev/null; then
         echo "Installed updater -> $INSTALL_DIR/install.sh"
     else
-        rm -f "$INSTALLER_TMP" 2>/dev/null || true
+        # A non-empty path was exclusively created by mktemp above. If
+        # reservation failed, leave every pre-existing sibling untouched.
+        [ -z "$INSTALLER_TMP" ] || rm -f "$INSTALLER_TMP" 2>/dev/null || true
         echo "note: could not place install.sh in $INSTALL_DIR (update will explain where to find it)"
-    fi
-fi
-
-# Place the integration-template asset beside the installed binary. `install`
-# above already published a verified copy to ~/.cbm/assets/<version>/, but a
-# later `install`/`uninstall` run from INSTALL_DIR resolves the asset next to
-# the binary FIRST — and without this copy that lookup misses, so a re-run or an
-# uninstall would fail closed with "integration assets missing" even though a
-# valid install just completed. Atomic rename, best effort, same rationale as
-# the installer copy above.
-DL_ASSET="$DLDIR/cbm-integrations.json"
-if [ -f "$DL_ASSET" ]; then
-    ASSET_TMP="$INSTALL_DIR/.cbm-integrations.json.$$"
-    if cp "$DL_ASSET" "$ASSET_TMP" 2>/dev/null &&
-        mv -f "$ASSET_TMP" "$INSTALL_DIR/cbm-integrations.json" 2>/dev/null; then
-        :
-    else
-        rm -f "$ASSET_TMP" 2>/dev/null || true
-        echo "note: could not place cbm-integrations.json in $INSTALL_DIR (asset resolves from ~/.cbm/assets)"
     fi
 fi
 

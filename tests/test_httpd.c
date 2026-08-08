@@ -778,6 +778,69 @@ static bool ui_adr_equals(const ui_delete_fixture_t *fx, const char *project,
     return equal;
 }
 
+TEST(ui_server_readiness_proof_is_exact_and_generation_bound) {
+    static const char challenge[] =
+        "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+    static const char expected[] =
+        "62215de7bddcea7e2c4047ff6bb94f8d18262fc8b3f3648134bb7d44158ff84d";
+    uint8_t secret[CBM_SHA256_DIGEST_LEN];
+    for (size_t index = 0; index < sizeof(secret); index++) {
+        secret[index] = (uint8_t)index;
+    }
+
+    th_server_t without_secret;
+    ASSERT_EQ(th_server_start(&without_secret), 0);
+    char request[512];
+    ASSERT_GT(snprintf(request, sizeof(request),
+                       "GET /__cbm/ui-readiness?challenge=%s HTTP/1.1\r\n\r\n", challenge),
+              0);
+    char response[4096];
+    int response_length =
+        th_http(cbm_http_server_port(without_secret.srv), request, response, sizeof(response));
+    int missing_secret_status = response_length > 0 ? th_status(response) : -1;
+    th_server_stop(&without_secret);
+
+    th_server_t server = {0};
+    server.srv = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(server.srv);
+    cbm_http_server_set_readiness_secret(server.srv, secret);
+    ASSERT_EQ(th_server_thread_start(&server.tid, server.srv), 0);
+    int port = cbm_http_server_port(server.srv);
+    response_length = th_http(port, request, response, sizeof(response));
+    char *body = response_length > 0 ? strstr(response, "\r\n\r\n") : NULL;
+    body = body ? body + 4 : NULL;
+    bool exact_proof = response_length > 0 && th_status(response) == 200 && body &&
+                       strcmp(body, expected) == 0 &&
+                       strstr(response, "Content-Type: text/plain; charset=utf-8") != NULL &&
+                       strstr(response, "Cache-Control: no-store") != NULL;
+
+    ASSERT_GT(snprintf(request, sizeof(request),
+                       "GET /__cbm/ui-readiness?challenge="
+                       "202122232425262728292A2b2c2d2e2f303132333435363738393a3b3c3d3e3f "
+                       "HTTP/1.1\r\n\r\n"),
+              0);
+    response_length = th_http(port, request, response, sizeof(response));
+    int uppercase_status = response_length > 0 ? th_status(response) : -1;
+
+    ASSERT_GT(snprintf(request, sizeof(request),
+                       "GET /__cbm/ui-readiness?challenge=%s&extra=1 HTTP/1.1\r\n\r\n", challenge),
+              0);
+    response_length = th_http(port, request, response, sizeof(response));
+    int extra_parameter_status = response_length > 0 ? th_status(response) : -1;
+
+    response_length =
+        th_http(port, "GET /__cbm/ui-readiness HTTP/1.1\r\n\r\n", response, sizeof(response));
+    int missing_challenge_status = response_length > 0 ? th_status(response) : -1;
+    th_server_stop(&server);
+
+    ASSERT_EQ(missing_secret_status, 503);
+    ASSERT_TRUE(exact_proof);
+    ASSERT_EQ(uppercase_status, 400);
+    ASSERT_EQ(extra_parameter_status, 400);
+    ASSERT_EQ(missing_challenge_status, 400);
+    PASS();
+}
+
 TEST(ui_server_unknown_path_404) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -899,15 +962,17 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     PASS();
 }
 
-TEST(ui_server_root_serves_stub_404) {
-    /* Test binary links embedded_stub.c → no frontend → 404 with marker */
+TEST(ui_server_root_without_ready_assets_is_retryable) {
+    /* A listener should normally be gated on READY by the daemon. Direct
+     * constructor tests still receive a truthful retryable response. */
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
     int n = th_http(cbm_http_server_port(ts.srv), "GET / HTTP/1.1\r\n\r\n", resp, sizeof(resp));
     ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 404);
-    ASSERT_NOT_NULL(strstr(resp, "no frontend embedded"));
+    ASSERT_EQ(th_status(resp), 503);
+    ASSERT_NOT_NULL(strstr(resp, "frontend assets are not ready"));
+    ASSERT_NOT_NULL(strstr(resp, "Retry-After: 1"));
     th_server_stop(&ts);
     PASS();
 }
@@ -2060,8 +2125,8 @@ TEST(ui_server_logs_escape_dense_no_overflow) {
         }
         char req[256];
         int port = cbm_http_server_port(ts.srv);
-        snprintf(req, sizeof(req),
-                 "GET /api/logs?lines=500 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+        snprintf(req, sizeof(req), "GET /api/logs?lines=500 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+                 port);
         size_t cap = 4u * 1024u * 1024u;
         char *resp = malloc(cap);
         int n = resp ? th_http(port, req, resp, (int)cap) : 0;
@@ -2219,12 +2284,13 @@ SUITE(httpd) {
     RUN_TEST(httpd_close_refuses_while_connection_owns_listener);
 
     /* Full UI server */
+    RUN_TEST(ui_server_readiness_proof_is_exact_and_generation_bound);
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
-    RUN_TEST(ui_server_root_serves_stub_404);
+    RUN_TEST(ui_server_root_without_ready_assets_is_retryable);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);
     RUN_TEST(ui_server_mutations_require_json_content_type);

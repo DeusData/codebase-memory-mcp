@@ -149,22 +149,40 @@ jobs:
       # Same extraction the release verify job performs, so the bytes handed to
       # VirusTotal here are the bytes a user would download and run.
       - name: Extract archive artifacts
-        run: scripts/ci/extract-release-archives.sh assets binaries
+        run: |
+          scripts/ci/extract-release-archives.sh assets binaries \
+            --expect-archives=16 \
+            --expect-binaries=16 \
+            --expect-packs=8 \
+            --expect-runtime-files=64
 
       - name: VirusTotal scan
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
         with:
           vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
-          files: binaries/*
+          files: binaries/objects/*
+          request_rate: 4
 
-      # Same ZERO-tolerance gate as the release. A detection here is a real
-      # finding even when it is a false positive: it is what the release gate
-      # will do, so the dry run should say so now. Resolve it upstream (vendor
-      # false-positive submission for the exact hashes, then re-run) — never by
-      # loosening this gate.
+      # Same ZERO-tolerance gate as the release. Every artifact must arrive
+      # naturally clean; any malicious or suspicious verdict fails this run.
       - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
+          VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
+          VT_ASSOCIATIONS: binaries/associations.tsv
+          VT_RESULTS_PATH: binaries/vt-results.tsv
+          MIN_ENGINES: 50
         run: scripts/ci/check-virustotal.sh
+
+      - name: Preserve VirusTotal scope and result evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: virustotal-evidence-dry-run-${{ github.run_id }}
+          path: |
+            binaries/associations.tsv
+            binaries/scan-set.tsv
+            binaries/vt-results.tsv
+          if-no-files-found: warn

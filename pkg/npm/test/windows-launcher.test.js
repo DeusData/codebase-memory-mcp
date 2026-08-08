@@ -1,10 +1,14 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
+
+const UI_PACK_BYTES = Buffer.from('authenticated UI pack');
+const UI_PACK_NAME = `cbm-ui-${crypto.createHash('sha256').update(UI_PACK_BYTES).digest('hex')}.pack`;
 
 class ExitSignal extends Error {
   constructor(code) {
@@ -13,26 +17,77 @@ class ExitSignal extends Error {
   }
 }
 
-function runShim(targetPlatform, arguments_, childStatus) {
+function runShim(targetPlatform, arguments_, childStatus, options = {}) {
   const shimPath = path.join(__dirname, '..', 'bin.js');
   const source = fs.readFileSync(shimPath, 'utf8').replace(/^#![^\n]*\n/, '');
   const calls = [];
+  const lockEvents = [];
   let stderr = '';
+  let installed = false;
 
   const fakeProcess = {
     platform: targetPlatform,
+    env: {
+      CBM_VARIANT: options.variant || '',
+      LOCALAPPDATA: 'C:\\Users\\test\\AppData\\Local',
+    },
     argv: ['node.exe', shimPath, ...arguments_],
     execPath: 'node.exe',
     stderr: { write: (text) => { stderr += String(text); } },
     exit: (code) => { throw new ExitSignal(code); },
   };
   const fakeFs = {
-    existsSync: () => true,
+    lstatSync: (candidate) => {
+      if (options.missingSidecar && !installed &&
+          path.basename(candidate) === 'cbm-integrations.json') {
+        const error = new Error('missing sidecar');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return { isFile: () => true, isSymbolicLink: () => false, nlink: 1 };
+    },
+    readFileSync: () => options.corruptPack && !installed
+      ? Buffer.from('corrupt UI pack')
+      : UI_PACK_BYTES,
+    readdirSync: () => options.variant === 'ui'
+      ? [UI_PACK_NAME]
+      : [],
   };
   const fakeChildProcess = {
+    spawn: (executable, args, options) => {
+      calls.push({ executable, args, options });
+      return {
+        on: (event, callback) => {
+          if (event === 'close') callback(childStatus);
+          return this;
+        },
+      };
+    },
     spawnSync: (executable, args, options) => {
       calls.push({ executable, args, options });
-      return { status: calls.length === 1 ? 0 : childStatus };
+      if (executable === fakeProcess.execPath) {
+        installed = true;
+        return { status: 0 };
+      }
+      if (args[0] === '--verify-runtime-assets') return { status: 0 };
+      return { status: childStatus };
+    },
+  };
+  const fakeLifecycle = {
+    acquireRuntimeLock: () => {
+      lockEvents.push('acquire');
+      return { lockPath: 'lock', token: 'token', fd: 1 };
+    },
+    refreshRuntimeLock: () => { lockEvents.push('refresh'); },
+    releaseRuntimeLock: () => { lockEvents.push('release'); },
+    runtimeSetReady: () => true,
+    runtimeSetReadyLocked: (directory, binaryName) => {
+      const structurallyReady = installed || (!options.missingSidecar && !options.corruptPack);
+      if (!structurallyReady) return false;
+      const probe = fakeChildProcess.spawnSync(
+        path.join(directory, binaryName), ['--verify-runtime-assets'], { stdio: 'ignore' },
+      );
+      return probe.status === 0;
     },
   };
   const sandbox = {
@@ -47,8 +102,11 @@ function runShim(targetPlatform, arguments_, childStatus) {
     require: (specifier) => {
       if (specifier === 'fs') return fakeFs;
       if (specifier === 'child_process') return fakeChildProcess;
+      if (specifier === './install.js') return fakeLifecycle;
       return require(specifier);
     },
+    clearInterval: () => {},
+    setInterval: () => 1,
     setTimeout,
   };
 
@@ -59,10 +117,10 @@ function runShim(targetPlatform, arguments_, childStatus) {
     if (!(error instanceof ExitSignal)) throw error;
     exitCode = error.code;
   }
-  return { calls, exitCode, stderr };
+  return { calls, exitCode, lockEvents, stderr };
 }
 
-test('Windows npm shim probes and executes the cached launcher', () => {
+test('Windows npm shim authenticates assets and executes the cached binary', () => {
   const observed = runShim('win32', ['--version'], 0);
 
   assert.equal(observed.exitCode, 0);
@@ -74,25 +132,82 @@ test('Windows npm shim probes and executes the cached launcher', () => {
       'codebase-memory-mcp.payload.exe',
     );
   }
+  assert.deepEqual(Array.from(observed.calls[0].args), ['--verify-runtime-assets']);
   assert.deepEqual(Array.from(observed.calls[1].args), ['--version']);
   assert.equal(observed.calls[1].options.stdio, 'inherit');
 });
 
-test('Windows npm shim keeps package-manager guidance after launcher refusal', () => {
+test('npm update is routed to the package manager without invoking absent install.sh', () => {
   const observed = runShim('win32', ['update'], 1);
 
-  assert.equal(observed.exitCode, 1);
-  assert.equal(path.basename(observed.calls[1].executable), 'codebase-memory-mcp.exe');
+  assert.equal(observed.exitCode, 2);
+  assert.equal(observed.calls.length, 0, 'update guidance must not launch cached code');
   assert.match(observed.stderr, /npm install codebase-memory-mcp@latest/);
-  assert.match(observed.stderr, /install --yes/);
+  assert.match(observed.stderr, /codebase-memory-mcp install --yes/);
+  assert.doesNotMatch(observed.stderr, /install\.sh/);
 });
 
-test('non-Windows npm shim keeps its native payload execution path', () => {
+test('nested update token is forwarded instead of treated as package update', () => {
+  const observed = runShim('win32', ['daemon', 'update'], 0);
+
+  assert.equal(observed.exitCode, 0);
+  assert.equal(observed.calls.length, 2);
+  assert.deepEqual(Array.from(observed.calls[1].args), ['daemon', 'update']);
+  assert.doesNotMatch(observed.stderr, /npm install codebase-memory-mcp@latest/);
+});
+
+test('non-Windows npm shim executes its cached binary directly', () => {
   const observed = runShim('darwin', ['--version'], 0);
 
   assert.equal(observed.exitCode, 0);
-  assert.equal(observed.calls.length, 1);
-  assert.equal(path.basename(observed.calls[0].executable), 'codebase-memory-mcp');
+  assert.equal(observed.calls.length, 2);
+  assert.deepEqual(Array.from(observed.calls[0].args), ['--verify-runtime-assets']);
+  assert.equal(path.basename(observed.calls[1].executable), 'codebase-memory-mcp');
+});
+
+test('npm shim selects a separate UI runtime set', () => {
+  const observed = runShim('darwin', ['--version'], 0, { variant: 'ui' });
+
+  assert.equal(observed.exitCode, 0);
+  assert.equal(path.basename(path.dirname(observed.calls[1].executable)), 'ui');
+});
+
+test('npm shim repairs a cache whose integrations sidecar is missing', () => {
+  const observed = runShim(
+    'darwin', ['--version'], 0, { missingSidecar: true },
+  );
+
+  assert.equal(observed.exitCode, 0);
+  assert.equal(observed.calls[0].executable, 'node.exe');
+  assert.equal(path.basename(observed.calls[0].args[0]), 'install.js');
+  assert.deepEqual(Array.from(observed.calls[1].args), ['--verify-runtime-assets']);
+  assert.equal(path.basename(observed.calls[2].executable), 'codebase-memory-mcp');
+});
+
+test('npm shim repairs a UI cache whose pack digest does not match its name', () => {
+  const observed = runShim(
+    'darwin', ['--version'], 0, { variant: 'ui', corruptPack: true },
+  );
+
+  assert.equal(observed.exitCode, 0);
+  assert.equal(observed.calls[0].executable, 'node.exe');
+  assert.equal(path.basename(observed.calls[0].args[0]), 'install.js');
+  assert.deepEqual(Array.from(observed.calls[1].args), ['--verify-runtime-assets']);
+  assert.equal(path.basename(observed.calls[2].executable), 'codebase-memory-mcp');
+});
+
+test('wrapper uninstall locks the cache and targets the managed install by default', () => {
+  const observed = runShim('win32', ['uninstall', '--yes'], 0);
+
+  assert.equal(observed.exitCode, 0);
+  assert.deepEqual(observed.lockEvents, ['acquire', 'refresh', 'release']);
+  assert.deepEqual(
+    Array.from(observed.calls[1].args),
+    [
+      'uninstall', '--yes', '--dir',
+      'C:\\Users\\test\\AppData\\Local/Programs/codebase-memory-mcp',
+    ],
+  );
 });
 
 test('PowerShell install mutation runs through the downloaded binary', () => {
@@ -111,8 +226,12 @@ test('PowerShell install mutation runs through the downloaded binary', () => {
   );
   // One binary ships per platform — no launcher/payload pair to resolve.
   assert.doesNotMatch(installer, /payload/i);
-  // A running .exe cannot be overwritten, so an in-place update has to retire
-  // the existing binary by renaming it aside first. This script IS the Windows
-  // update path, so losing that step would silently break every update.
-  assert.match(installer, /Move-Item[\s\S]{0,80}\$Dest[\s\S]{0,40}\$retired/);
+  // The candidate owns activation and rollback under the native guard. The
+  // script must not mutate the installed binary before handing it the request.
+  const handoff = installer.indexOf('& $DownloadedBinary @InstallArgs');
+  assert.ok(handoff > 0, 'downloaded candidate handoff is missing');
+  assert.doesNotMatch(
+    installer.slice(0, handoff),
+    /(?:Move-Item|Copy-Item|Remove-Item)[^\n]*(?:\$Dest|\$InstallDir[^\n]*\$BinName)/,
+  );
 });

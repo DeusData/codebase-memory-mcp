@@ -13,6 +13,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/subprocess.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -512,6 +513,145 @@ TEST(daemon_application_ui_config_rejects_noncanonical_frames) {
     ASSERT_FALSE(unchanged.ui_enabled);
     ASSERT_EQ(unchanged.ui_port, 9749);
     ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context) {
+    uint8_t first_secret[CBM_SHA256_DIGEST_LEN];
+    uint8_t second_secret[CBM_SHA256_DIGEST_LEN];
+    uint8_t request[1U + CBM_SHA256_DIGEST_LEN];
+    for (size_t index = 0; index < CBM_SHA256_DIGEST_LEN; index++) {
+        first_secret[index] = (uint8_t)index;
+        second_secret[index] = (uint8_t)(index + 1U);
+        request[index + 1U] = (uint8_t)(index + 32U);
+    }
+    request[0] = CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF;
+    static const uint8_t expected_first[CBM_SHA256_DIGEST_LEN] = {
+        0x62, 0x21, 0x5d, 0xe7, 0xbd, 0xdc, 0xea, 0x7e, 0x2c, 0x40, 0x47,
+        0xff, 0x6b, 0xb9, 0x4f, 0x8d, 0x18, 0x26, 0x2f, 0xc8, 0xb3, 0xf3,
+        0x64, 0x81, 0x34, 0xbb, 0x7d, 0x44, 0x15, 0x8f, 0xf8, 0x4d,
+    };
+    static const uint8_t expected_second[CBM_SHA256_DIGEST_LEN] = {
+        0xe3, 0xb0, 0x69, 0x53, 0x9c, 0x19, 0xc2, 0x2d, 0x3f, 0x6d, 0x34,
+        0x60, 0x67, 0x86, 0x15, 0x78, 0xbe, 0xa9, 0xc4, 0xb9, 0xe4, 0x61,
+        0xcb, 0xf9, 0xb8, 0x06, 0xad, 0x1b, 0xcd, 0x64, 0xa4, 0x81,
+    };
+
+    cbm_daemon_application_config_t first_config = {
+        .ui_readiness_secret = first_secret,
+        .ui_readiness_secret_length = sizeof(first_secret),
+    };
+    cbm_daemon_application_config_t second_config = {
+        .ui_readiness_secret = second_secret,
+        .ui_readiness_secret_length = sizeof(second_secret),
+    };
+    cbm_daemon_application_t *first = cbm_daemon_application_new(&first_config);
+    cbm_daemon_application_t *second = cbm_daemon_application_new(&second_config);
+    cbm_daemon_application_t *without_secret = cbm_daemon_application_new(NULL);
+    cbm_daemon_application_config_t malformed_config = {
+        .ui_readiness_secret = first_secret,
+        .ui_readiness_secret_length = sizeof(first_secret) - 1U,
+    };
+    cbm_daemon_application_t *malformed = cbm_daemon_application_new(&malformed_config);
+
+    cbm_daemon_runtime_application_callbacks_t first_callbacks =
+        cbm_daemon_application_runtime_callbacks(first);
+    cbm_daemon_runtime_application_callbacks_t second_callbacks =
+        cbm_daemon_application_runtime_callbacks(second);
+    cbm_daemon_runtime_application_callbacks_t no_secret_callbacks =
+        cbm_daemon_application_runtime_callbacks(without_secret);
+    cbm_daemon_runtime_application_session_t *first_session =
+        first ? app_test_open(&first_callbacks, 304) : NULL;
+    cbm_daemon_runtime_application_session_t *second_session =
+        second ? app_test_open(&second_callbacks, 305) : NULL;
+    cbm_daemon_runtime_application_session_t *no_secret_session =
+        without_secret ? app_test_open(&no_secret_callbacks, 306) : NULL;
+
+    uint8_t *first_response = NULL;
+    uint32_t first_length = 0;
+    cbm_daemon_runtime_application_status_t first_status =
+        first_session ? app_test_request(&first_callbacks, first_session, request, sizeof(request),
+                                         &first_response, &first_length)
+                      : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    uint8_t *second_response = NULL;
+    uint32_t second_length = 0;
+    cbm_daemon_runtime_application_status_t second_status =
+        second_session ? app_test_request(&second_callbacks, second_session, request,
+                                          sizeof(request), &second_response, &second_length)
+                       : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    uint8_t *malformed_response = NULL;
+    uint32_t malformed_length = 0;
+    cbm_daemon_runtime_application_status_t short_status =
+        first_session
+            ? app_test_request(&first_callbacks, first_session, request, sizeof(request) - 1U,
+                               &malformed_response, &malformed_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(malformed_response);
+    malformed_response = NULL;
+    malformed_length = 0;
+    uint8_t long_request[2U + CBM_SHA256_DIGEST_LEN];
+    memcpy(long_request, request, sizeof(request));
+    long_request[sizeof(long_request) - 1U] = 0;
+    cbm_daemon_runtime_application_status_t long_status =
+        first_session
+            ? app_test_request(&first_callbacks, first_session, long_request, sizeof(long_request),
+                               &malformed_response, &malformed_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(malformed_response);
+    malformed_response = NULL;
+    malformed_length = 0;
+    cbm_daemon_runtime_application_status_t no_secret_status =
+        no_secret_session
+            ? app_test_request(&no_secret_callbacks, no_secret_session, request, sizeof(request),
+                               &malformed_response, &malformed_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    free(malformed_response);
+
+    if (first_session) {
+        first_callbacks.session_close(first_callbacks.context, first_session);
+    }
+    if (second_session) {
+        second_callbacks.session_close(second_callbacks.context, second_session);
+    }
+    if (no_secret_session) {
+        no_secret_callbacks.session_close(no_secret_callbacks.context, no_secret_session);
+    }
+    bool first_stopped = first && cbm_daemon_application_shutdown(first, APP_TEST_TIMEOUT_MS);
+    bool second_stopped = second && cbm_daemon_application_shutdown(second, APP_TEST_TIMEOUT_MS);
+    bool no_secret_stopped =
+        without_secret && cbm_daemon_application_shutdown(without_secret, APP_TEST_TIMEOUT_MS);
+    bool malformed_rejected = malformed == NULL;
+    bool first_exact = first_response && first_length == sizeof(expected_first) &&
+                       memcmp(first_response, expected_first, sizeof(expected_first)) == 0;
+    bool second_exact = second_response && second_length == sizeof(expected_second) &&
+                        memcmp(second_response, expected_second, sizeof(expected_second)) == 0;
+    bool generations_differ = first_response && second_response &&
+                              memcmp(first_response, second_response, CBM_SHA256_DIGEST_LEN) != 0;
+    cbm_daemon_application_free(first);
+    cbm_daemon_application_free(second);
+    cbm_daemon_application_free(without_secret);
+    cbm_daemon_application_free(malformed);
+    free(first_response);
+    free(second_response);
+
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_NOT_NULL(without_secret);
+    ASSERT_TRUE(malformed_rejected);
+    ASSERT_NOT_NULL(first_session);
+    ASSERT_NOT_NULL(second_session);
+    ASSERT_NOT_NULL(no_secret_session);
+    ASSERT_EQ(first_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(first_exact);
+    ASSERT_EQ(second_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(second_exact);
+    ASSERT_TRUE(generations_differ);
+    ASSERT_EQ(short_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_EQ(long_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_EQ(no_secret_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_TRUE(first_stopped);
+    ASSERT_TRUE(second_stopped);
+    ASSERT_TRUE(no_secret_stopped);
     PASS();
 }
 
@@ -4949,6 +5089,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_requires_immutable_explicit_context);
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
     RUN_TEST(daemon_application_ui_config_rejects_noncanonical_frames);
+    RUN_TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context);
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);

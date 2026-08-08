@@ -4,7 +4,7 @@
 
 codebase-memory-mcp interacts deeply with your filesystem. It reads source files across your entire codebase, writes to agent configuration files, and spawns background processes. This is inherent to what it does — not a bug.
 
-**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release binaries produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below).
+**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each archive contains a native executable and its authenticated release-owned runtime assets.
 
 We are humans and can make mistakes. We take security seriously — it is Priority #1 for this project — but we cannot guarantee perfection. By using this software you accept responsibility for evaluating whether it meets your own security requirements.
 
@@ -95,7 +95,7 @@ disclosure. Research conducted under this policy is considered authorised.
 
 ## Security Measures
 
-This project implements multiple layers of security verification. Every release binary must pass all checks before users can download it (draft → verify → publish flow).
+This project implements multiple layers of security verification. Every release archive and its extracted runtime objects must pass all checks before users can download it (draft → verify → publish flow).
 
 ### Build-Time (CI — every commit)
 
@@ -122,11 +122,11 @@ This project implements multiple layers of security verification. Every release 
 
 Releases are created as **drafts** (invisible to users) and only published after all verification passes:
 
-1. **SLSA Build Level 3 provenance for release binaries** — cryptographic attestation generated inside the trusted GitHub Actions build workflow immediately after each release archive is produced
+1. **SLSA Build Level 3 provenance for release archives** — cryptographic attestation generated inside the trusted GitHub Actions build workflow immediately after each release archive is produced
 2. **Sigstore cosign signing** — keyless digital signatures verifiable by anyone
 3. **SBOM** — Software Bill of Materials (SPDX) listing all vendored dependencies
 4. **SHA-256 checksums** — published with every release
-5. **VirusTotal scanning** — all binaries scanned by 70+ antivirus engines (zero-tolerance: any detection blocks the release)
+5. **VirusTotal scanning** — every distinct shipped archive, member, and UI-asset byte object is scanned. Each completed analysis must contain at least 50 decisive engine results, zero malicious verdicts, and zero suspicious verdicts. Release notes summarize archive results and link durable public association, exact-scan-set, per-object-result, and evidence-checksum assets.
 6. **OpenSSF Scorecard** — repository security health score
 
 Scope of the SLSA claim: this is a build provenance claim for release
@@ -137,7 +137,9 @@ not mean the source code is vulnerability-free or that maintainers cannot change
 source. Consumers should verify the signer workflow, not only repository
 ownership.
 
-If ANY antivirus engine flags ANY binary, the release stays as a draft and is not published until the issue is investigated and resolved.
+If any antivirus engine flags any scanned release object, the release stays as a
+draft and is not published until the issue is investigated and resolved. There
+is no exception path in this release gate.
 
 ### Code-Level Defenses
 
@@ -146,14 +148,16 @@ If ANY antivirus engine flags ANY binary, the release stays as a draft and is no
 - **CORS locked to localhost** — graph UI only accessible from localhost origins
 - **Path containment** — `realpath()` check prevents reading files outside project root
 - **Process-kill restriction** — only server-spawned PIDs can be terminated
-- **SHA-256 checksum verification** — update command verifies downloaded binary before installing
+- **Release-set verification** — installers verify downloaded archives, then the
+  candidate executable authenticates its adjacent runtime assets before
+  activation
 
 ### Verification
 
-Users can independently verify any release binary:
+Users can independently verify any release archive and the runtime set it contains:
 
 ```bash
-# SLSA Build Level 3 provenance for release binaries
+# SLSA Build Level 3 provenance for release archives
 gh attestation verify <downloaded-file> \
   --repo DeusData/codebase-memory-mcp \
   --signer-workflow DeusData/codebase-memory-mcp/.github/workflows/_build.yml
@@ -164,7 +168,7 @@ cosign verify-blob --bundle <file>.bundle <file>
 # SHA-256 checksum
 sha256sum -c checksums.txt
 
-# VirusTotal (upload binary or check the report links in the release notes)
+# VirusTotal (follow the durable per-object results link in the release notes)
 # https://www.virustotal.com/
 ```
 

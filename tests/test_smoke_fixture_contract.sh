@@ -8,10 +8,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
 from __future__ import annotations
 
+import hashlib
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -44,9 +47,29 @@ local_ci = read("test-infrastructure/run.sh")
 windows_vm = read("test-infrastructure/vm/win.sh")
 windows_vm_runner = read("test-infrastructure/vm/vm-run-tests.sh")
 pr_workflow = read(".github/workflows/pr.yml")
+release_workflow = read(".github/workflows/release.yml")
+release_extractor = read("scripts/ci/extract-release-archives.sh")
 test_driver = read("scripts/test.sh")
 cli_source = read("src/cli/cli.c")
 helper_source = read(helper_relative)
+unix_installer = read("install.sh")
+windows_installer = read("install.ps1")
+
+# Keep the security-boundary archive checks runnable as a focused, network-free
+# contract while still making them part of the canonical smoke-fixture gate.
+release_archive_contract = subprocess.run(
+    ["bash", str(root / "tests/test_release_archive_extractor_contract.sh")],
+    cwd=root,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    check=False,
+)
+require(
+    release_archive_contract.returncode == 0,
+    "release archive extractor contract failed: "
+    + release_archive_contract.stdout.strip(),
+)
 
 # The server owns the ephemeral bind. A parent-side socket probe followed by
 # python -m http.server would reintroduce the close/rebind race this guards.
@@ -134,18 +157,23 @@ for relative, source in (
             f"{relative} must pin isolated {variable}",
         )
 
-# Unix fixtures mirror the release archive surface and Linux update aliases.
+# Unix fixtures mirror the exact release variant surface.
 for name in ("LICENSE", "install.sh", "THIRD_PARTY_NOTICES.md"):
     require(name in smoke_local, f"smoke-local.sh archive must include {name}")
 require(
     "codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" in smoke_local
-    and "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local,
-    "smoke-local.sh must create the selected variant and standard alias",
+    and "UI_PACK_NAME" in smoke_local
+    and "^cbm-ui-[0-9a-f]{64}\\.pack$" in smoke_local,
+    "smoke-local.sh must create the selected exact variant with a hash-shaped UI pack",
 )
 require(
     "codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz" in smoke_local
-    and "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
-    "smoke-local.sh must create Linux portable selected-variant and standard aliases",
+    and 'ARCHIVE_MEMBERS+=("$UI_PACK_NAME")' in smoke_local,
+    "smoke-local.sh must create the Linux portable selected variant with the same member set",
+)
+require(
+    '"$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"' not in smoke_local,
+    "smoke-local.sh must not disguise a six-member UI archive under a standard name",
 )
 require(
     'CBM_CACHE_DIR="$WORK_DIR/cache"' in smoke_local
@@ -163,9 +191,9 @@ require(
     "fixture checksums must name exact artifact basenames, never ./-prefixed paths",
 )
 
-# Native Windows packages and serves the exact four-file release bundle (ONE
-# binary, like every other platform), then runs the full smoke from a protected
-# profile-rooted directory/cache.
+# Native Windows packages and serves the exact five-file standard bundle or
+# six-file UI bundle (one native binary), then runs the full smoke from a
+# protected profile-rooted directory/cache.
 for name in (
     "codebase-memory-mcp.exe",
     "LICENSE",
@@ -178,6 +206,16 @@ require(
     "vm-smoke.sh must not stage a Windows launcher/payload pair",
 )
 require("checksums.txt" in vm_smoke, "vm-smoke.sh must generate checksums.txt")
+require(
+    "UI_PACK_NAME" in vm_smoke
+    and "^cbm-ui-[0-9a-f]{64}\\.pack$" in vm_smoke
+    and 'ARCHIVE_MEMBERS+=("$UI_PACK_NAME")' in vm_smoke,
+    "vm-smoke.sh must stage exactly one content-addressed pack only for UI",
+)
+require(
+    '"codebase-memory-mcp-windows-${SMOKE_ARCH}.zip"' not in vm_smoke,
+    "vm-smoke.sh must not disguise a six-member UI zip under a standard name",
+)
 require(
     "SMOKE_DOWNLOAD_URL=" in vm_smoke
     and "SMOKE_UPDATE_FIXTURE_DIR=" in vm_smoke
@@ -262,7 +300,7 @@ for service in ("smoke-windows:",):
 require(
     "wine64 ./build/win-cross/codebase-memory-mcp.exe --version" in compose
     and "wine64 cmd /c build/win-cross/codebase-memory-mcp.exe --version" in compose,
-    "docker-compose Windows cross-smoke must execute the single binary through Wine and through a "
+    "docker-compose Windows cross-smoke must execute the runtime set's one executable through Wine and through a "
     "Wine Windows parent",
 )
 require(
@@ -305,6 +343,92 @@ require(
     "PR Windows smoke must call vm-smoke.sh with SMOKE_ARCH=amd64",
 )
 smoke_test = read("scripts/smoke-test.sh")
+require(
+    "SMOKE_UI_PACK_CANDIDATES" in smoke_test
+    and 'cp "$SMOKE_UI_PACK" "$(dirname "$destination")/$(basename "$SMOKE_UI_PACK")"'
+    in smoke_test,
+    "smoke-test.sh must stage the UI sidecar with every hand-copied binary",
+)
+require(
+    'UNINSTALL_BINARY="$SELF_PATH"' in smoke_test
+    and '"$CLEAN_UNINSTALLER" uninstall -y -n' in smoke_test
+    and '"$DBL_UNINSTALLER" uninstall -y -n' in smoke_test
+    and '"$DBL_RETRY_UNINSTALLER" uninstall -y -n' in smoke_test,
+    "smoke uninstall cases must run disposable fixture executables, never delete the "
+    "build input needed by later phases",
+)
+require(
+    'exec 9< <(sleep 300)' in smoke_test
+    and 'UI_STDIN_PID=$!' in smoke_test
+    and smoke_test.count("stop_ui_probe") >= 4
+    and 'sleep 300 | "$BINARY"' not in smoke_test,
+    "the UI readiness probe must own and reap its stdin keeper instead of waiting on a "
+    "background pipeline",
+)
+require(
+    '"$REPO_ROOT/install.sh" "$DL_VARIANT_ARG"' in smoke_test
+    and '"$WIN_SCRIPT" "$DL_VARIANT_ARG"' in smoke_test
+    and "install.ps1 did not publish exactly one UI asset pack" in smoke_test,
+    "Phase 13 must call each direct installer with the downloaded variant and verify its pack",
+)
+require(
+    all(
+        needle in unix_installer
+        for needle in (
+            "ARCHIVE_MEMBER_COUNT",
+            "EXPECTED_MEMBER_COUNT=5",
+            "EXPECTED_MEMBER_COUNT=6",
+            "^cbm-ui-[0-9a-f]{64}\\.pack$",
+            "release archive contains unexpected member",
+        )
+    ),
+    "install.sh must validate the exact five-member standard or six-member UI archive",
+)
+unix_binary_publish = unix_installer.find('"$DLBIN" install "${INSTALL_ARGS[@]}"')
+require(
+    unix_binary_publish >= 0
+    and "publish_required_sidecar" not in unix_installer
+    and 'for stale_pack in "$INSTALL_DIR"/cbm-ui-*.pack' not in unix_installer,
+    "install.sh must delegate sidecar publication and stale-pack GC to the candidate's "
+    "guarded native install",
+)
+require(
+    "GetRandomFileName" in windows_installer
+    and "[System.IO.FileMode]::CreateNew" in windows_installer
+    and windows_installer.count("New-CbmExclusiveSiblingTemp") == 2
+    and '$Destination.new-$PID' not in windows_installer
+    and '$InstallerDest.new' not in windows_installer,
+    "install.ps1 must reserve an unpredictable sibling temp exclusively for the updater only",
+)
+
+cli_source = read("src/cli/cli.c")
+install_start = cli_source.find("static int cli_install_activate(void *opaque)")
+install_end = cli_source.find("int cbm_cmd_install(", install_start)
+install_body = cli_source[install_start:install_end] if 0 <= install_start < install_end else ""
+runtime_stage = install_body.find("cbm_integration_assets_stage_install")
+binary_commit = install_body.find("cli_activation_transaction_commit_validated")
+runtime_gc = install_body.find("cli_gc_stale_ui_asset_packs")
+runtime_finalize = install_body.find("cli_install_runtime_finalize")
+require(
+    0 <= runtime_stage < binary_commit < runtime_gc < runtime_finalize,
+    "native install must stage sidecars, activate the binary, GC verified stale packs, and "
+    "finalize while the activation callback still owns the guard",
+)
+require(
+    "scripts/ci/extract-release-archives.sh assets binaries" in release_workflow,
+    "release verification must use the canonical archive extractor",
+)
+require(
+    "cbm-release-scan-associations-v2" in release_extractor
+    and "cbm-release-scan-set-v1" in release_extractor
+    and "files_equal(candidate, existing.path)" in release_extractor
+    and "parse_pack_assets" in release_extractor
+    and "PACK_NAME.fullmatch" in release_extractor
+    and "non-regular archive member" in release_extractor
+    and "duplicate archive member" in release_extractor,
+    "release extraction must validate every exact archive/member/UI-asset association "
+    "and retain one exact-compared scan object per distinct byte sequence",
+)
 require(
     "MSYS2_ARG_CONV_EXCL='*'" in smoke_test
     and 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File' in smoke_test
@@ -522,6 +646,218 @@ if helper.is_file():
             except subprocess.TimeoutExpired:
                 dns_process.kill()
                 dns_process.wait(timeout=3)
+
+# POSIX installer lifecycle injection. Preserve the wrapper's PID across exec,
+# precreate the two formerly predictable temp paths as foreign symlinks, then
+# run the real checksum-authenticated installer. The script no longer publishes
+# runtime sidecars at all, and its updater publisher never touches the foreign
+# predictable sibling.
+if os.name != "nt" and helper.is_file():
+    with tempfile.TemporaryDirectory(prefix="cbm-installer-temp-contract-") as install_temp:
+        install_root = pathlib.Path(install_temp)
+        fixture = install_root / "fixture"
+        stage = install_root / "stage"
+        fake_bin = install_root / "fake-bin"
+        install_dir = install_root / "installed"
+        fake_home = install_root / "home"
+        fixture.mkdir()
+        stage.mkdir()
+        fake_bin.mkdir()
+        install_dir.mkdir()
+        fake_home.mkdir()
+
+        candidate = stage / "codebase-memory-mcp"
+        candidate.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "case \"${1:-}\" in\n"
+            "  --version) echo 'codebase-memory-mcp fixture';;\n"
+            "  install)\n"
+            "    install_dir=''\n"
+            "    for arg in \"$@\"; do\n"
+            "      case \"$arg\" in --dir=*) install_dir=${arg#--dir=};; esac\n"
+            "    done\n"
+            "    test -n \"$install_dir\"\n"
+            "    cp \"$0\" \"$install_dir/codebase-memory-mcp\"\n"
+            "    chmod 755 \"$install_dir/codebase-memory-mcp\";;\n"
+            "  *) exit 2;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        candidate.chmod(0o755)
+        (stage / "cbm-integrations.json").write_bytes(b"{}\n")
+        (stage / "LICENSE").write_bytes(b"fixture license\n")
+        (stage / "THIRD_PARTY_NOTICES.md").write_bytes(b"fixture notices\n")
+
+        archive_name = "codebase-memory-mcp-linux-amd64-portable.tar.gz"
+        archive_path = fixture / archive_name
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for name in (
+                "codebase-memory-mcp",
+                "cbm-integrations.json",
+                "LICENSE",
+                "THIRD_PARTY_NOTICES.md",
+            ):
+                archive.add(stage / name, arcname=name)
+            archive.add(root / "install.sh", arcname="install.sh")
+        archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        (fixture / "checksums.txt").write_text(
+            f"{archive_digest}  {archive_name}\n", encoding="ascii"
+        )
+
+        fake_uname = fake_bin / "uname"
+        fake_uname.write_text(
+            "#!/bin/sh\n"
+            "case \"${1:-}\" in\n"
+            "  -s) echo Linux;;\n"
+            "  -m) echo x86_64;;\n"
+            "  *) echo Linux;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_uname.chmod(0o755)
+
+        foreign_sidecar = install_root / "foreign-sidecar"
+        foreign_updater = install_root / "foreign-updater"
+        foreign_sidecar.write_bytes(b"foreign sidecar sentinel\n")
+        foreign_updater.write_bytes(b"foreign updater sentinel\n")
+        wrapper_pid_file = install_root / "wrapper-pid"
+        wrapper = install_root / "run-installer.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "install_dir=$1\n"
+            "foreign_sidecar=$2\n"
+            "foreign_updater=$3\n"
+            "pid_file=$4\n"
+            "installer=$5\n"
+            "ln -s \"$foreign_sidecar\" \"$install_dir/.cbm-integrations.json.$$\"\n"
+            "ln -s \"$foreign_updater\" \"$install_dir/.install.sh.$$\"\n"
+            "printf '%s\\n' \"$$\" > \"$pid_file\"\n"
+            "exec bash \"$installer\" --standard \"--dir=$install_dir\" --skip-config\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+        port_file = install_root / "port"
+        server_log = install_root / "server.log"
+        with server_log.open("wb") as log_handle:
+            fixture_server = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(helper),
+                    "--directory",
+                    str(fixture),
+                    "--port-file",
+                    str(port_file),
+                ],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                port = 0
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if port_file.is_file():
+                        try:
+                            port_text = port_file.read_text(encoding="ascii").strip()
+                        except OSError:
+                            port_text = ""
+                        if port_text:
+                            port = int(port_text)
+                            break
+                    if fixture_server.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                require(port > 0, "installer temp-path fixture server did not publish a port")
+                if port > 0:
+                    environment = os.environ.copy()
+                    environment["HOME"] = str(fake_home)
+                    environment["PATH"] = (
+                        str(fake_bin) + os.pathsep + environment.get("PATH", "")
+                    )
+                    environment["CBM_DOWNLOAD_URL"] = f"http://127.0.0.1:{port}"
+                    installed = subprocess.run(
+                        [
+                            str(wrapper),
+                            str(install_dir),
+                            str(foreign_sidecar),
+                            str(foreign_updater),
+                            str(wrapper_pid_file),
+                            str(root / "install.sh"),
+                        ],
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=60,
+                        check=False,
+                    )
+                    require(
+                        installed.returncode == 0,
+                        f"installer temp-path fixture failed to install: {installed.stdout.strip()}",
+                    )
+                    if wrapper_pid_file.is_file():
+                        wrapper_pid = wrapper_pid_file.read_text(encoding="ascii").strip()
+                        predictable_sidecar = (
+                            install_dir / f".cbm-integrations.json.{wrapper_pid}"
+                        )
+                        predictable_updater = install_dir / f".install.sh.{wrapper_pid}"
+                        require(
+                            predictable_sidecar.is_symlink()
+                            and foreign_sidecar.read_bytes()
+                            == b"foreign sidecar sentinel\n",
+                            "install.sh deleted or followed a foreign predictable sidecar temp",
+                        )
+                        require(
+                            predictable_updater.is_symlink()
+                            and foreign_updater.read_bytes()
+                            == b"foreign updater sentinel\n",
+                            "install.sh deleted or followed a foreign predictable updater temp",
+                        )
+                    else:
+                        failures.append("installer temp-path wrapper did not publish its PID")
+            finally:
+                fixture_server.terminate()
+                try:
+                    fixture_server.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    fixture_server.kill()
+                    fixture_server.wait(timeout=3)
+
+# The complete canonical-matrix extraction, pack parsing, association retention,
+# byte-exact deduplication and fail-closed malformed-pack cases run above via
+# test_release_archive_extractor_contract.sh. Keep the packaging-side digest
+# check here because it is a separate boundary before an archive exists.
+with tempfile.TemporaryDirectory(prefix="cbm-release-extract-") as extract_temp:
+    extract_root = pathlib.Path(extract_temp)
+    bad_pack_name = f"cbm-ui-{'0' * 64}.pack"
+    bad_pack_bytes = b"content does not match the zero digest\n"
+    # Packaging checks the content address before it touches the product binary.
+    # No binary is staged deliberately: the digest error must win over the
+    # later missing-binary guard or this test would accept an incidental red.
+    package_build = extract_root / "package-build"
+    package_output = extract_root / "package-output"
+    package_build.mkdir()
+    package_output.mkdir()
+    (package_build / bad_pack_name).write_bytes(bad_pack_bytes)
+    package_environment = os.environ.copy()
+    package_environment["BUILD_DIR"] = str(package_build)
+    packaged = subprocess.run(
+        ["bash", str(root / "scripts/package-release.sh"), "linux", "amd64",
+         "--variant", "ui", "--out-dir", str(package_output)],
+        cwd=root,
+        env=package_environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    require(
+        packaged.returncode != 0
+        and "UI pack digest does not match its filename" in packaged.stdout,
+        "release packager accepted a UI pack whose content did not match its filename",
+    )
 
 if failures:
     print("smoke fixture contract: FAIL", file=sys.stderr)

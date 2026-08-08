@@ -108,9 +108,9 @@ scancode --license --quiet --processes 2 --json-pp "$STAGE/scan.json" "$STAGE/tr
 python3 scripts/license-gate-check.py "$STAGE/scan.json" scripts/license-policy.json
 
 echo "=== License gate 3/3: UI npm production tree ==="
-# The -ui binaries embed the compiled frontend bundle; its production
-# dependency tree must be allow-listed too. --ignore-scripts: no dependency
-# postinstall code runs inside the security job.
+# The -ui archives ship the compiled frontend in an external asset pack; its
+# production dependency tree must be allow-listed too. --ignore-scripts: no
+# dependency postinstall code runs inside the security job.
 if command -v npm &>/dev/null && [ -f graph-ui/package-lock.json ]; then
     if [ ! -d graph-ui/node_modules ]; then
         (cd graph-ui && npm ci --ignore-scripts --silent)

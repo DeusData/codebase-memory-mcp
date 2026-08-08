@@ -206,8 +206,8 @@ jobs:
           mkdir -p "$ARTIFACT_DIR"
           unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
           test -s "$ARTIFACT_DIR/codebase-memory-mcp.exe"
-          # ONE binary per platform: a payload sibling would mean the
-          # AV-flagged launcher stub came back.
+          # ONE executable per runtime set: a payload sibling would mean the
+          # removed launcher split came back.
           test ! -e "$ARTIFACT_DIR/codebase-memory-mcp.payload.exe"
           # Pre-flight the image from a profile-rooted directory: the shared
           # runner workspace is deliberately not a valid install root.

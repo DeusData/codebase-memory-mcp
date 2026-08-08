@@ -3,12 +3,15 @@
 # shipped artifact.
 #
 # Microsoft Defender's ML classifier flagged the v0.9.1-rc.1 binaries. The
-# hardening pass that followed *removed capability* — an executable stack, an
-# in-process updater, test-only environment seams, the embedded HTTP/UI server
-# and its process enumerator in the standard build. Each of those regresses
-# invisibly: one restored #include, one Makefile source list edit, one revived
-# call site, and nothing else in CI notices — the binary just quietly gets its
-# malware-shaped surface back and the next release gets flagged again.
+# hardening pass that followed removed capability or opaque asset bytes — an
+# executable stack, an in-process updater, test-only environment seams,
+# embedded integration programs, and the in-image frontend bundle. Each of
+# those regresses invisibly: one restored #include, one Makefile source-list
+# edit, one revived call site, and nothing else in CI notices — the binary just
+# quietly restores capability or opaque bytes that this hardening boundary is
+# intended to exclude. Their removal reduces attack surface and makes release
+# contents independently inspectable; it does not establish which feature, if
+# any, caused an opaque third-party ML verdict.
 #
 # This script is the proof that each removal stayed removed. It asserts only
 # NEGATIVE properties (needle absent), plus one canary string we know ships,
@@ -39,16 +42,18 @@ esac
 
 # S6: worker/Windows test seams read these env vars. A release binary that
 # still honours them lets any process on the box steer the indexer's child
-# processes and file placement — and CBM_TEST_* in a shipped binary is exactly
-# the "debug/injection hooks" shape AV heuristics score on.
+# processes and file placement. Their absence is a release-security boundary;
+# no claim is made about whether a third-party classifier weighs them.
 SEAM_NEEDLES=(
     'CBM_TEST_WORKER_DESCENDANT_PID_FILE'
-    'CBM_TEST_WINDOWS_USER_PATH_RUN_ID'
+    'CBM_TEST_CRASH_ON'
+    'CBM_TEST_HANG_ON'
 )
 
-# The in-process updater (download-and-replace-own-binary) is the single most
-# malware-shaped behaviour we ever shipped; updates now run from install.sh
-# out-of-process. These four needles cover both halves of what was removed:
+# The in-process updater combined network download with replacement of its own
+# executable. That dual-use behavior is no longer needed in the daemon; updates
+# now run from install.sh out-of-process. These four needles cover both halves
+# of what was removed:
 # the download base URL, the checksum URL built on top of it, the GitHub API
 # release query of the daemon's background version check, and that request's
 # Accept header (which survives even if the URL is ever assembled at runtime).
@@ -72,8 +77,8 @@ SQLITE_LOADEXT_NEEDLES=(
 )
 
 # The standard artifact must not contain the UI's HTTP server at all: an
-# unauthenticated localhost listener plus a process enumerator is precisely the
-# behaviour pair a classifier reads as a backdoor. Needles are split across
+# unauthenticated localhost listener plus a process enumerator is unnecessary
+# capability in the standard composition. Needles are split across
 # both UI translation units and are independent of each other, so a refactor of
 # any single one cannot silently disarm the assertion:
 #   'HTTP/1.1 %d %s'                  httpd.c response-status writer
@@ -95,8 +100,9 @@ UI_HTTP_NEEDLES=(
 
 # The binary used to embed nine complete shebang'd shell scripts, their
 # PowerShell/.cmd twins and two node:child_process client modules — script
-# bodies written to disk at 0755, which is precisely the text surface
-# Defender's ML scored Trojan:Script/Wacatac.B!ml. They now ship in
+# bodies written to disk at 0755. Keeping those programs outside the native
+# image narrows executable surface and lets each component be inspected and
+# scanned independently. They now ship in
 # cbm-integrations.json (the binary embeds only its SHA-256); these needles
 # prove the removal stayed removed. Source-level enforcement lives in
 # tests/test_no_embedded_scripts_contract.sh; this is the shipped-artifact
@@ -106,6 +112,17 @@ SCRIPT_NEEDLES=(
     '#!/bin/bash'
     '#!/bin/sh'
     'node:child_process'
+)
+
+# UI frontend bytes belong exclusively in the independently scannable pack.
+# These are structural bytes from the pack header and Vite's emitted index,
+# selected to avoid generic HTML grammar strings that legitimately occur in the
+# language parsers linked into every binary.
+UI_ASSET_BYTE_NEEDLES=(
+    'CBMUIPK'
+    '<!doctype html>'
+    '<html lang="en" class="dark">'
+    '<script type="module" crossorigin'
 )
 
 # Canary: proves the needle scan can actually see this file's strings. Without
@@ -268,8 +285,8 @@ check_file() {
         'this is not one of our artifacts, or its strings are unreadable (packed/compressed/truncated) — every absence assertion below would pass vacuously'
 
     # A1 — executable stack (ELF only). Every Linux artifact of v0.9.1-rc.1
-    # shipped GNU_STACK RWE: a writable+executable stack, which no modern
-    # binary has and which any classifier weighs heavily.
+    # shipped GNU_STACK RWE. A writable+executable stack is unnecessary here
+    # and weakens exploit mitigations, independently of any scanner verdict.
     if [ "$fmt" = elf ]; then
         if ! resolve_elf_reader; then
             echo "FAIL: no readelf/llvm-readelf/objdump available; cannot assert" \
@@ -301,16 +318,11 @@ check_file() {
     done
     # Sweep for seams nobody thought to pin: a new CBM_TEST_* env var added to
     # production code lands here on its first release, not on the next audit.
-    # Two seams remain in release artifacts BY DECISION, so the wildcard is an
-    # allowlist rather than a blanket ban: scripts/smoke-test.sh runs against the
-    # real release artifact, and these are what let it do so honestly —
-    # CRASH_ON/HANG_ON inject the faults that prove supervisor recovery, and
-    # WINDOWS_USER_PATH_RUN_ID is what stops the PATH smoke from writing the
-    # tester's actual PATH. Deleting them would trade genuine release-artifact
-    # coverage for a cosmetic win. Anything NOT on this list is a novel seam and
-    # fails, which is the property that matters: the list can only shrink by
-    # decision, never grow by accident.
-    seam_allowed='CBM_TEST_CRASH_ON CBM_TEST_HANG_ON CBM_TEST_WINDOWS_USER_PATH_RUN_ID'
+    # One narrowly validated seam remains in Windows release artifacts by
+    # decision: WINDOWS_USER_PATH_RUN_ID redirects the artifact smoke away from
+    # the tester's actual user PATH. Crash/hang injectors are test-build-only and
+    # are explicitly forbidden above. Anything else is novel and fails.
+    seam_allowed='CBM_TEST_WINDOWS_USER_PATH_RUN_ID'
     seam_unexpected=''
     for found in $(LC_ALL=C grep -a -o -E 'CBM_TEST_[A-Za-z0-9_]+' "$file" 2>/dev/null |
         sort -u || true); do
@@ -352,19 +364,12 @@ check_file() {
 
     # A5 — UI/HTTP subsystem, standard artifacts only.
     #
-    # NOT YET ENFORCED. src/ui/{config,http_server,layout3d,httpd,embedded_stub}.c
-    # are still in PROD_SRCS, and the standard build merely substitutes empty
-    # embedded assets — so the HTTP server and its popen("ps … | grep") process
-    # enumerator are linked into artifacts that can never serve a UI. Excluding
-    # them is a real refactor: four files outside src/ui (src/main.c,
-    # src/daemon/host.c, src/daemon/application.c, src/mcp/index_supervisor.c)
-    # reference UI symbols, including the daemon that serves the UI.
-    #
-    # Until that lands, this assertion reports rather than fails. A gate everyone
-    # knows is red teaches people to ignore gates, and a known-failing check has
-    # no more enforcement value than this note — but the needles are kept live and
-    # exercised so that the day the split lands, flipping CBM_CHECK_UI_ABSENT=1
-    # (then making it the default) is a one-line change and not a rewrite.
+    # The temporary standard variant still links the UI control/HTTP code but
+    # substitutes the no-I/O asset-pack stub, so it cannot publish a UI. That
+    # variant remains only for before/after VirusTotal verification and is then
+    # deprecated in favor of one UI-capable product composition. Until that
+    # evidence gate is complete, this assertion remains an explicit diagnostic;
+    # CBM_CHECK_UI_ABSENT=1 is available for any future true no-UI composition.
     if [ "$is_ui" -eq 1 ]; then
         printf 'n/a  %-22s %s: UI artifact, HTTP server ships here by design\n' \
             A5-no-ui-http "$token"
@@ -379,32 +384,24 @@ check_file() {
                 ui_hits=$((ui_hits + 1))
             fi
         done
-        printf 'INFO %-22s %s: %d/%d UI/HTTP needles present (no-UI split pending; set CBM_CHECK_UI_ABSENT=1 to enforce)\n' \
+        printf 'INFO %-22s %s: %d/%d UI/HTTP needles present (temporary standard variant; set CBM_CHECK_UI_ABSENT=1 to enforce a true no-UI composition)\n' \
             A5-no-ui-http "$token" "$ui_hits" "${#UI_HTTP_NEEDLES[@]}"
     fi
 
-    # A6 — embedded integration-script text. Enforced on standard artifacts:
-    # every C-source template moved into cbm-integrations.json, so a hit means
-    # one crept back in. The ui artifact additionally embeds the RAW frontend
-    # bundle (scripts/embed-frontend.sh stores plain bytes), whose minified JS
-    # may legitimately contain e.g. "#!" sequences we do not control — so ui
-    # reports rather than fails until that is measured on a real ui build,
-    # mirroring A5's honest-INFO pattern. Flip CBM_CHECK_UI_SCRIPTS_ABSENT=1
-    # to enforce there too.
-    if [ "$is_ui" -eq 1 ] && [ "${CBM_CHECK_UI_SCRIPTS_ABSENT:-0}" != "1" ]; then
-        script_hits=0
-        for needle in "${SCRIPT_NEEDLES[@]}"; do
-            if LC_ALL=C grep -a -q -F -e "$needle" "$file"; then
-                script_hits=$((script_hits + 1))
-            fi
-        done
-        printf 'INFO %-22s %s: %d/%d script needles present (raw frontend bundle; set CBM_CHECK_UI_SCRIPTS_ABSENT=1 to enforce)\n' \
-            A6-no-embedded-scripts "$token" "$script_hits" "${#SCRIPT_NEEDLES[@]}"
-    else
-        for needle in "${SCRIPT_NEEDLES[@]}"; do
-            assert_absent "$file" "$token" A6-no-embedded-scripts "$needle"
-        done
-    fi
+    # A6 — embedded integration-script text. Every variant is now subject to
+    # the same hard gate: the UI frontend is external, so it can no longer mask
+    # a returned shebang or node:child_process body in the native image.
+    for needle in "${SCRIPT_NEEDLES[@]}"; do
+        assert_absent "$file" "$token" A6-no-embedded-scripts "$needle"
+    done
+
+    # A7 — UI pack/header and frontend HTML/script bytes. The pack is scanned as
+    # its own release file; none of its raw frontend bytes belongs in any
+    # ELF/Mach-O/PE variant. Applying this to standard too makes the boundary a
+    # product-wide invariant rather than relying on path classification.
+    for needle in "${UI_ASSET_BYTE_NEEDLES[@]}"; do
+        assert_absent "$file" "$token" A7-no-ui-asset-bytes "$needle"
+    done
 }
 
 # ── Walk the targets ────────────────────────────────────────────────

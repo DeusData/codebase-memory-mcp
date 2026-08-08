@@ -63,44 +63,17 @@ done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 # The graph-UI HTTP server (src/ui/httpd.c) is the one component that owns a
 # listening socket. It is first-party, binds 127.0.0.1 only, and is audited
 # separately by scripts/security-ui.sh (binding + CORS checks), so it is
-# exempt from this scan. The coordination transport may use only explicitly
-# count-bounded AF_UNIX calls recorded in the security allow-list.
+# exempt from this scan. Coordination and authenticated UI readiness may use
+# only explicitly count-bounded, helper-scoped AF_UNIX or loopback-v4 calls.
 
 echo ""
 echo "--- Scanning for raw network calls ---"
 
 NETWORK_OK=true
-while IFS= read -r file; do
-    relfile="${file#"$ROOT/"}"
-    [[ "$relfile" == "src/ui/httpd.c" ]] && continue
-    for func in socket connect sendto; do
-        matches=$(grep -n -E "[^a-z_]${func}\\(" "$file" 2>/dev/null \
-            | grep -v '^\s*//' | grep -v '^\s*\*' || true)
-        [[ -z "$matches" ]] && continue
-        actual_count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
-        allowance=$(grep -E "^NETWORK:${relfile}:${func}:[0-9]+:" \
-            "$ALLOWLIST" 2>/dev/null || true)
-        allowance_count=$(printf '%s\n' "$allowance" | grep -c . || true)
-        expected_count=$(printf '%s\n' "$allowance" | cut -d: -f4)
-        semantic_ok=true
-        if [[ "$func" == "socket" ]] &&
-           printf '%s\n' "$matches" | grep -v 'socket(AF_UNIX' >/dev/null; then
-            semantic_ok=false
-        fi
-        if [[ "$allowance_count" != "1" ||
-              "$actual_count" != "$expected_count" ||
-              "$semantic_ok" != "true" ]]; then
-            echo "BLOCKED: ${relfile}: unexpected raw ${func}() surface"
-            echo "  expected=${expected_count:-none} actual=${actual_count} semantic_ok=${semantic_ok}"
-            printf '%s\n' "$matches" | sed 's/^/  /'
-            fail
-            NETWORK_OK=false
-        else
-            echo "REVIEWED: ${relfile}: ${actual_count} count-bounded ${func}() call(s)"
-        fi
-    done
-done < <(find "$ROOT/src" -name '*.c' -type f | sort)
-
+if ! python3 "$ROOT/scripts/security-network-source-audit.py" "$ROOT" "$ALLOWLIST"; then
+    fail
+    NETWORK_OK=false
+fi
 if $NETWORK_OK; then
     echo "OK: Raw network calls are absent or explicitly count-bounded."
 fi

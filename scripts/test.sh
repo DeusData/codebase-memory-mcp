@@ -14,7 +14,7 @@ Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
-(Step 0a-0j), a CLEAN sanitizer build, every suite via the parallel harness,
+(Step 0a-0r), a CLEAN sanitizer build, every suite via the parallel harness,
 then the prod-binary regression guards (Steps 4-6).
 
 Modes:
@@ -198,7 +198,7 @@ if [ -n "$SUITES" ]; then
 fi
 
 # Step 0: fast build/security harness regressions run before the compiler-heavy
-# suite. The Windows package surface is static here; native launcher behavior is
+# suite. The Windows package surface is static here; native runtime behavior is
 # exercised by scripts/test-windows.ps1.
 echo "=== Step 0a: build directory safety contract ==="
 bash "$ROOT/tests/test_build_dir_safety.sh"
@@ -212,7 +212,7 @@ bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
 echo "=== Step 0d: daemon soak recovery contract ==="
 bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
 
-echo "=== Step 0e: Windows launcher bundle contract ==="
+echo "=== Step 0e: Windows runtime bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
@@ -235,6 +235,24 @@ bash "$ROOT/tests/test_spawn_no_window_contract.sh"
 
 echo "=== Step 0l: no embedded integration-script text (AV surface) ==="
 bash "$ROOT/tests/test_no_embedded_scripts_contract.sh"
+
+echo "=== Step 0m: external UI asset-pack contract ==="
+bash "$ROOT/tests/test_ui_asset_pack_contract.sh"
+
+echo "=== Step 0n: complete vendored-integrity contract ==="
+bash "$ROOT/tests/test_vendored_integrity_contract.sh"
+
+echo "=== Step 0o: package runtime-asset retention contract ==="
+bash "$ROOT/tests/test_package_runtime_assets_contract.sh"
+
+echo "=== Step 0p: exact release archive extraction contract ==="
+bash "$ROOT/tests/test_release_archive_extractor_contract.sh"
+
+echo "=== Step 0q: exact-set VirusTotal gate contract ==="
+bash "$ROOT/tests/test_vt_gate_zero_tolerance_contract.sh"
+
+echo "=== Step 0r: VirusTotal release-note evidence contract ==="
+bash "$ROOT/tests/test_vt_release_notes_contract.sh"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
@@ -300,6 +318,20 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 # admission path is understood, gating on it would make an unexplained red, and
 # skipping it silently would hide the gap. Run it by hand:
 #   make -f Makefile.cbm cbm TEST_SEAMS=1 && bash tests/test_hook_conflict_notice.sh
+
+# Step 5e: `daemon start --open` is the only UI startup operation that waits
+# synchronously. Build the real product against a tiny deterministic external
+# pack (no npm/network dependency) and prove it waits for the CBM HTTP root,
+# rejects a foreign occupied port, and fails closed when the pack is missing.
+# This runs here, after the other seam-bearing product guards, so every native
+# local-CI leg exercises the exact executable behavior without lengthening the
+# daemon's asynchronous startup critical path.
+echo "=== Step 5e: daemon UI --open readiness ==="
+make -j"$NPROC" -f Makefile.cbm cbm-with-ui TEST_SEAMS=1 \
+    UI_ASSET_PREBUILT=1 UI_ASSET_DIST="$ROOT/tests/fixtures/ui-readiness" \
+    UI_ASSET_MANIFEST="$BUILD_DIR/generated/ui_asset_readiness_manifest.c" \
+    ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+python3 "$ROOT/tests/test_daemon_open_readiness.py" "$ROOT/$BUILD_DIR/codebase-memory-mcp"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

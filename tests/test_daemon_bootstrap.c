@@ -284,11 +284,13 @@ TEST(daemon_bootstrap_classifies_stateless_commands_without_client) {
     char *install[] = {"codebase-memory-mcp", "install", "--dry-run", NULL};
     char *uninstall[] = {"codebase-memory-mcp", "uninstall", NULL};
     char *update[] = {"codebase-memory-mcp", "update", "-n", NULL};
+    char *verify_runtime_assets[] = {"codebase-memory-mcp", "--verify-runtime-assets", NULL};
     ASSERT_EQ(classify(2, version), CBM_DAEMON_PROCESS_STATELESS);
     ASSERT_EQ(classify(3, help), CBM_DAEMON_PROCESS_STATELESS);
     ASSERT_EQ(classify(3, install), CBM_DAEMON_PROCESS_STATELESS);
     ASSERT_EQ(classify(2, uninstall), CBM_DAEMON_PROCESS_STATELESS);
     ASSERT_EQ(classify(3, update), CBM_DAEMON_PROCESS_STATELESS);
+    ASSERT_EQ(classify(2, verify_runtime_assets), CBM_DAEMON_PROCESS_STATELESS);
     ASSERT_FALSE(cbm_daemon_process_role_requires_client(CBM_DAEMON_PROCESS_STATELESS));
     PASS();
 }

@@ -19,7 +19,7 @@ Usage: [env] bash test-infrastructure/vm/vm-smoke.sh
 
 The canonical WINDOWS smoke entry: identical in local CI (win.sh
 smoke-install), PR CI (pr.yml) and the release venues (_smoke.yml). Stages a
-complete single-binary release fixture under a disposable profile root,
+complete one-executable runtime-set fixture under a disposable profile root,
 serves it on a kernel-assigned port, prepares/verifies/cleans the user-PATH
 registry via windows-user-path-guard.ps1, neutralizes every agent-config
 destination override, then runs scripts/smoke-test.sh (all phases).
@@ -28,14 +28,15 @@ Run inside the VM's CLANGARM64 shell (or a CI msys2 shell) from the repo root.
 
 Environment:
   SMOKE_ARCH      arm64 (default) | amd64 — selects the served artifact name.
-  SMOKE_VARIANT   standard (default) | ui. ui requires the embedded UI:
+  SMOKE_VARIANT   standard (default) | ui. ui requires the external UI pack:
                   Phase 15's "no assets" SKIP becomes a FAILURE, so a standard
                   binary cannot pass a ui run.
   CBM_SMOKE_ARTIFACT_DIR
                   Release mode: an EXTRACTED windows release artifact
-                  (codebase-memory-mcp.exe + LICENSE + install.ps1 +
-                  THIRD_PARTY_NOTICES.md). All four are required and served
-                  verbatim — an incomplete archive fails the smoke.
+                  (codebase-memory-mcp.exe + cbm-integrations.json + LICENSE +
+                  install.ps1 + THIRD_PARTY_NOTICES.md + the UI pack when selected). The
+                  exact variant set is served verbatim; an incomplete archive
+                  fails the smoke.
                   Unset (default): stages the freshly built binary out of
                   build/c and synthesizes the sidecars (local/PR mode).
 
@@ -75,15 +76,46 @@ case "$SMOKE_ARCH" in
 arm64 | amd64) ;;
 *) echo "vm-smoke: SMOKE_ARCH must be arm64 or amd64. Please consult --help." >&2; exit 2 ;;
 esac
-# A ui run must be handed a binary that actually carries the embedded assets;
-# the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase 15's
-# documented "no embedded assets" SKIP into a failure, so asking for ui and
+# A ui run must be handed a binary with exactly one external asset pack beside
+# it; the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase
+# 15's documented "no UI assets" SKIP into a failure, so asking for ui and
 # supplying a standard binary can no longer pass quietly.
 case "$SMOKE_VARIANT" in
 standard) SUFFIX="" ; REQUIRE_UI=0 ;;
 ui) SUFFIX="-ui" ; REQUIRE_UI=1 ;;
 *) echo "vm-smoke: SMOKE_VARIANT must be standard or ui. Please consult --help." >&2; exit 2 ;;
 esac
+
+if [ -n "$ARTIFACT_DIR" ]; then
+    UI_PACK_SOURCE_DIR="$ARTIFACT_DIR"
+else
+    UI_PACK_SOURCE_DIR="$(dirname "$BINARY_SRC")"
+fi
+shopt -s nullglob
+UI_PACK_CANDIDATES=("$UI_PACK_SOURCE_DIR"/cbm-ui-*.pack)
+shopt -u nullglob
+UI_PACK_COUNT=0
+UI_PACK_NAME=""
+UI_PACK_SOURCE=""
+for candidate in "${UI_PACK_CANDIDATES[@]+"${UI_PACK_CANDIDATES[@]}"}"; do
+    UI_PACK_COUNT=$((UI_PACK_COUNT + 1))
+    UI_PACK_SOURCE="$candidate"
+    candidate_name="$(basename "$candidate")"
+    if ! [[ "$candidate_name" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
+        echo "vm-smoke: invalid UI pack name beside artifact: $candidate_name" >&2
+        exit 2
+    fi
+done
+if [ "$SMOKE_VARIANT" = "ui" ]; then
+    if [ "$UI_PACK_COUNT" -ne 1 ] || [ ! -s "$UI_PACK_SOURCE" ]; then
+        echo "vm-smoke: ui fixture requires exactly one content-addressed UI pack" >&2
+        exit 2
+    fi
+    UI_PACK_NAME="$(basename "$UI_PACK_SOURCE")"
+elif [ "$UI_PACK_COUNT" -ne 0 ]; then
+    echo "vm-smoke: standard fixture must not contain a UI asset pack" >&2
+    exit 2
+fi
 
 PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
 SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-vm-smoke.XXXXXX")"
@@ -146,6 +178,10 @@ MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -ExecutionPolicy Bypass \
     -SmokeRoot "$(cygpath -w "$SMOKE_DIR")"
 cp "$BINARY_SRC" "$SMOKE_DIR/codebase-memory-mcp.exe"
 cp "$SMOKE_DIR/codebase-memory-mcp.exe" "$FIXTURE_DIR/"
+if [ -n "$UI_PACK_SOURCE" ]; then
+    cp "$UI_PACK_SOURCE" "$SMOKE_DIR/$UI_PACK_NAME"
+    cp "$UI_PACK_SOURCE" "$FIXTURE_DIR/$UI_PACK_NAME"
+fi
 # The integration asset must sit next to the smoke binary in $SMOKE_DIR: phases
 # that invoke it directly (Phase 14 stages it by hand and drives an uninstall)
 # resolve the asset next to the binary, and without it those render-template
@@ -175,11 +211,12 @@ fi
 EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-windows-${SMOKE_ARCH}.zip"
 (
     cd "$FIXTURE_DIR"
-    zip -q "$EXPECTED_ARTIFACT" \
-        codebase-memory-mcp.exe cbm-integrations.json LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-    if [ -n "$SUFFIX" ]; then
-        cp "$EXPECTED_ARTIFACT" "codebase-memory-mcp-windows-${SMOKE_ARCH}.zip"
-    fi
+    ARCHIVE_MEMBERS=(
+        codebase-memory-mcp.exe cbm-integrations.json LICENSE install.ps1
+        THIRD_PARTY_NOTICES.md
+    )
+    [ -n "$UI_PACK_NAME" ] && ARCHIVE_MEMBERS+=("$UI_PACK_NAME")
+    zip -q "$EXPECTED_ARTIFACT" "${ARCHIVE_MEMBERS[@]}"
     sha256sum *.zip > checksums.txt
 )
 

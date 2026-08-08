@@ -11,6 +11,7 @@
 #include "foundation/macos_acl.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
+#include "foundation/secure_random.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -4644,21 +4645,8 @@ static win_rendezvous_status_t win_endpoint_refresh_rendezvous(
     return result;
 }
 
-typedef LONG(WINAPI *bcrypt_gen_random_fn)(void *, unsigned char *, ULONG, ULONG);
-
 static bool win_generation_nonce(uint8_t nonce[CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE]) {
-    enum { WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002 };
-    HMODULE bcrypt = LoadLibraryW(L"bcrypt.dll");
-    bcrypt_gen_random_fn generate =
-        bcrypt ? (bcrypt_gen_random_fn)(void (*)(void))GetProcAddress(bcrypt, "BCryptGenRandom")
-               : NULL;
-    LONG status = generate ? generate(NULL, nonce, CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE,
-                                      WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-                           : (LONG)-1;
-    if (bcrypt) {
-        (void)FreeLibrary(bcrypt);
-    }
-    return status >= 0;
+    return cbm_secure_random(nonce, CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE);
 }
 
 static int win_private_lock_probe(cbm_private_lock_directory_t *directory, const char *base_name) {

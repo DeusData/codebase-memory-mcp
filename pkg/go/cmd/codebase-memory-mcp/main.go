@@ -17,6 +17,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,16 +28,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 )
 
 const (
-	repo                = "DeusData/codebase-memory-mcp"
-	version             = "0.8.1"
-	windowsLauncherName = "codebase-memory-mcp.exe"
-	windowsPayloadName  = "codebase-memory-mcp.payload.exe"
+	repo                 = "DeusData/codebase-memory-mcp"
+	version              = "0.8.1"
+	windowsBinaryName    = "codebase-memory-mcp.exe"
+	integrationsFileName = "cbm-integrations.json"
 
 	maxRedirects            = 5
 	requestTimeout          = 2 * time.Minute
@@ -43,30 +46,101 @@ const (
 	responseHeaderTimeout   = 30 * time.Second
 	candidateTimeout        = 15 * time.Second
 	maxChecksumManifestSize = 1024 * 1024
+	maxReleaseArchiveSize   = int64(256 * 1024 * 1024)
+	maxArchiveMembers       = 64
+	maxArchiveMemberSize    = int64(256 * 1024 * 1024)
+	maxArchiveExpandedSize  = int64(512 * 1024 * 1024)
 
-	windowsPairLockName           = ".codebase-memory-mcp-pair.lock"
-	windowsPairLockWait           = 45 * time.Second
-	windowsPairOwnerlessStale     = 30 * time.Second
-	windowsPairLockPoll           = 25 * time.Millisecond
-	windowsPairLockOwnerFile      = "owner"
-	windowsPairTransactionTagSize = 16
+	runtimeSetLockName               = ".codebase-memory-mcp-runtime.lock"
+	runtimeSetLockWait               = 45 * time.Second
+	runtimeSetOwnerlessStale         = 30 * time.Second
+	runtimeSetLockLease              = 5 * time.Minute
+	runtimeSetLockHeartbeat          = 20 * time.Second
+	runtimeSetLegacyStale            = time.Hour
+	runtimeSetLockPoll               = 25 * time.Millisecond
+	runtimeSetLockOwnerFile          = "owner.json"
+	runtimeSetLockTokenSize          = 16
+	runtimeBackupPrefix              = ".cbm-runtime-backup-"
+	runtimeBackupRetired             = ".retirement-complete"
+	runtimeBackupCleanupOnly         = ".cleanup-only"
+	runtimeBackupBeforeMarkerEvent   = "before-retirement-marker"
+	runtimeBackupCleanupRemovedEvent = "cleanup-member-removed"
 )
 
-type windowsPairLock struct {
-	path  string
-	token string
+type archiveResourceLimits struct {
+	compressedBytes int64
+	members         int
+	memberBytes     int64
+	expandedBytes   int64
 }
 
+var defaultArchiveResourceLimits = archiveResourceLimits{
+	compressedBytes: maxReleaseArchiveSize,
+	members:         maxArchiveMembers,
+	memberBytes:     maxArchiveMemberSize,
+	expandedBytes:   maxArchiveExpandedSize,
+}
+
+type runtimeSetLock struct {
+	path  string
+	token string
+	file  *os.File
+}
+
+type runtimeSetLockOwnerRecord struct {
+	PID          int    `json:"pid"`
+	Token        string `json:"token"`
+	LeaseExpires int64  `json:"lease_expires_ms,omitempty"`
+}
+
+type runtimeBackupFile struct {
+	path   string
+	digest [sha256.Size]byte
+}
+
+type runtimeBackupTransaction struct {
+	path        string
+	retired     bool
+	cleanupOnly bool
+	files       map[string]runtimeBackupFile
+}
+
+// Tests use this observer to distinguish a publisher waiting on the runtime
+// lock from one entering the shared publication sequence. Production leaves
+// it nil.
+var (
+	runtimeSetLockWaitObserver     func()
+	runtimeSetLockClaimObserver    func() error
+	runtimeBackupCrashObserver     func(string, string) error
+	runtimeSetProcessAlive         = platformRuntimeSetLockProcessAlive
+	runtimeMutationSnapshotCleanup = os.RemoveAll
+)
+
 func main() {
+	mutation := runtimeMutationAction(os.Args[1:])
+	if mutation == "update" {
+		fmt.Fprintln(
+			os.Stderr,
+			"This Go wrapper is maintained by Go. Update it with \"go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest\".",
+		)
+		os.Exit(2)
+	}
 	executable, err := ensureBinary()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "codebase-memory-mcp: %v\n", err)
 		os.Exit(1)
 	}
-	if err := execBinary(executable, os.Args[1:]); err != nil {
+	args := nativeArgs(os.Args[1:])
+	if mutation == "install" || mutation == "uninstall" {
+		err = execBinaryWithRuntimeLock(executable, args)
+	} else {
+		err = execBinary(executable, args)
+	}
+	if err != nil {
 		if runtime.GOOS == "windows" {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				printPortableMutationGuidance(os.Args[1:])
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				printPortableMutationGuidance(args)
 				os.Exit(exitErr.ExitCode())
 			}
 		}
@@ -76,76 +150,159 @@ func main() {
 }
 
 func ensureBinary() (string, error) {
-	payload := binPath()
-	ready := regularFileExists(payload)
-	if runtime.GOOS == "windows" {
-		ready = ready && regularFileExists(windowsLauncherPath())
-		if ready {
-			ready = verifyCandidate(windowsLauncherPath()) == nil
-		}
-	}
-	if ready {
-		return executionPathForOS(payload, runtime.GOOS), nil
-	}
-	if err := download(payload); err != nil {
+	binary := binPath()
+	ready, err := runtimeSetReadyLocked(
+		filepath.Dir(binary), filepath.Base(binary), runtimeVariant(), verifyCandidate,
+	)
+	if err != nil {
 		return "", err
 	}
-	return executionPathForOS(payload, runtime.GOOS), nil
+	if ready {
+		return executionPathForOS(binary, runtime.GOOS), nil
+	}
+	if err := download(binary); err != nil {
+		return "", err
+	}
+	return executionPathForOS(binary, runtime.GOOS), nil
 }
 
 func binPath() string {
-	name := "codebase-memory-mcp"
-	if runtime.GOOS == "windows" {
-		// The payload remains the immutable exact-version pair's readiness
-		// signal. executionPathForOS selects its adjacent permanent launcher.
-		name = windowsPayloadName
-	}
-	return filepath.Join(cacheDir(), version, name)
+	return filepath.Join(
+		cacheDir(), version, runtimeVariant(), binaryNameForOS(runtime.GOOS),
+	)
 }
 
-func executionPathForOS(payload, targetOS string) string {
+func binaryNameForOS(targetOS string) string {
 	if targetOS == "windows" {
-		return filepath.Join(filepath.Dir(payload), windowsLauncherName)
+		return windowsBinaryName
 	}
-	return payload
+	return "codebase-memory-mcp"
 }
 
-func windowsLauncherPath() string {
-	return filepath.Join(filepath.Dir(binPath()), windowsLauncherName)
+func executionPathForOS(binary, targetOS string) string {
+	return binary
 }
 
-func regularFileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
+func runtimeVariant() string {
+	if strings.EqualFold(os.Getenv("CBM_VARIANT"), "ui") {
+		return "ui"
+	}
+	return "standard"
 }
 
 func printPortableMutationGuidance(args []string) {
-	action := portableMutationAction(args)
-	if action == "" {
+	action := runtimeMutationAction(args)
+	if action != "uninstall" {
 		return
 	}
-	packageCommand := "go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest"
-	if action == "uninstall" {
-		packageCommand = "Remove-Item (Get-Command codebase-memory-mcp).Source"
-	}
+	packageCommand := "Remove-Item (Get-Command codebase-memory-mcp).Source"
 	fmt.Fprintf(
 		os.Stderr,
-		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed launcher with coordinated self-update/uninstall.\n",
+		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed installation with coordinated self-update/uninstall.\n",
 		packageCommand,
 		"codebase-memory-mcp install --yes",
 	)
 }
 
-func portableMutationAction(args []string) string {
+func runtimeMutationAction(args []string) string {
 	for _, argument := range args {
 		switch argument {
-		case "cli", "hook-augment", "config", "install", "--help", "-h", "--version":
+		case "--help", "-h", "--version":
 			return ""
-		case "update", "uninstall":
+		case "cli", "hook-augment", "config":
+			return ""
+		case "install", "update", "uninstall":
 			return argument
 		}
+		if strings.HasPrefix(argument, "-") {
+			continue
+		}
+		return ""
 	}
 	return ""
+}
+
+func defaultManagedInstallDir() string {
+	if runtime.GOOS == "windows" {
+		base := os.Getenv("LOCALAPPDATA")
+		if base == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				base = filepath.Join(home, "AppData", "Local")
+			}
+		}
+		return filepath.Join(base, "Programs", "codebase-memory-mcp")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "bin")
+	}
+	return filepath.Join(os.TempDir(), "codebase-memory-mcp-managed")
+}
+
+func nativeArgs(args []string) []string {
+	result := append([]string(nil), args...)
+	if runtimeMutationAction(result) != "uninstall" {
+		return result
+	}
+	for _, argument := range result {
+		if argument == "--dir" || strings.HasPrefix(argument, "--dir=") {
+			return result
+		}
+	}
+	return append(result, "--dir", defaultManagedInstallDir())
+}
+
+func mutationTargetDirectory(args []string) (string, bool) {
+	for index, argument := range args {
+		if strings.HasPrefix(argument, "--dir=") {
+			return strings.TrimPrefix(argument, "--dir="), true
+		}
+		if argument == "--dir" && index+1 < len(args) {
+			return args[index+1], true
+		}
+	}
+	return "", false
+}
+
+func pathsReferToSameDirectory(left, right string) bool {
+	leftAbsolute, leftErr := filepath.Abs(left)
+	rightAbsolute, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftAbsolute = filepath.Clean(leftAbsolute)
+	rightAbsolute = filepath.Clean(rightAbsolute)
+	if leftAbsolute == rightAbsolute ||
+		(runtime.GOOS == "windows" && strings.EqualFold(leftAbsolute, rightAbsolute)) {
+		return true
+	}
+	leftStatus, leftErr := os.Stat(leftAbsolute)
+	rightStatus, rightErr := os.Stat(rightAbsolute)
+	return leftErr == nil && rightErr == nil &&
+		leftStatus.IsDir() && rightStatus.IsDir() &&
+		os.SameFile(leftStatus, rightStatus)
+}
+
+func mutationSnapshotEnvironment() []string {
+	blocked := []string{"CBM_ASSETS_DIR", "CBM_UI_ASSETS_DIR"}
+	result := make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		separator := strings.IndexByte(entry, '=')
+		name := entry
+		if separator >= 0 {
+			name = entry[:separator]
+		}
+		drop := false
+		for _, blockedName := range blocked {
+			if strings.EqualFold(name, blockedName) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 func cacheDir() string {
@@ -195,9 +352,24 @@ func goarch() string {
 	}
 }
 
+func archiveNamesForOS(platform, binaryName string) []string {
+	installer := "install.sh"
+	if platform == "windows" {
+		installer = "install.ps1"
+	}
+	return []string{
+		binaryName,
+		integrationsFileName,
+		"LICENSE",
+		installer,
+		"THIRD_PARTY_NOTICES.md",
+	}
+}
+
 func download(dest string) error {
 	platform := goos()
 	arch := goarch()
+	selectedVariant := runtimeVariant()
 	ext := "tar.gz"
 	if platform == "windows" {
 		ext = "zip"
@@ -207,7 +379,14 @@ func download(dest string) error {
 	if platform == "linux" {
 		portable = "-portable"
 	}
-	archive := fmt.Sprintf("codebase-memory-mcp-%s-%s%s.%s", platform, arch, portable, ext)
+	uiPrefix := ""
+	if selectedVariant == "ui" {
+		uiPrefix = "ui-"
+	}
+	archive := fmt.Sprintf(
+		"codebase-memory-mcp-%s%s-%s%s.%s",
+		uiPrefix, platform, arch, portable, ext,
+	)
 	url := fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", repo, version, archive)
 	checksumURL := fmt.Sprintf("https://github.com/%s/releases/download/v%s/checksums.txt", repo, version)
 
@@ -238,43 +417,37 @@ func download(dest string) error {
 		return err
 	}
 
-	binName := "codebase-memory-mcp"
-	requiredNames := []string{binName}
-	archiveNames := requiredNames
-	if platform == "windows" {
-		binName = windowsPayloadName
-		requiredNames = []string{windowsLauncherName, windowsPayloadName}
-		archiveNames = []string{
-			windowsLauncherName,
-			windowsPayloadName,
-			"LICENSE",
-			"install.ps1",
-			"THIRD_PARTY_NOTICES.md",
-		}
-	}
+	binName := binaryNameForOS(platform)
+	archiveNames := archiveNamesForOS(platform, binName)
+	extractNames := []string{binName, integrationsFileName}
+	var runtimeNames []string
 
 	if ext == "tar.gz" {
-		if err := extractTarGz(archivePath, tmp, binName); err != nil {
+		runtimeNames, err = extractTarGz(
+			archivePath, tmp, archiveNames, extractNames, selectedVariant,
+		)
+		if err != nil {
 			return fmt.Errorf("extraction failed: %w", err)
 		}
 	} else {
-		if err := extractZip(archivePath, tmp, archiveNames, requiredNames); err != nil {
+		runtimeNames, err = extractZip(
+			archivePath, tmp, archiveNames, extractNames, selectedVariant,
+		)
+		if err != nil {
 			return fmt.Errorf("extraction failed: %w", err)
 		}
 	}
-	for _, name := range requiredNames {
+	for _, name := range runtimeNames {
 		extracted := filepath.Join(tmp, name)
-		if err := os.Chmod(extracted, 0755); err != nil {
+		mode := os.FileMode(0644)
+		if name == binName {
+			mode = 0755
+		}
+		if err := os.Chmod(extracted, mode); err != nil {
 			return fmt.Errorf("could not set candidate permissions for %s: %w", name, err)
 		}
 	}
-	if platform == "windows" {
-		// In portable mode the canonical launcher must successfully resolve the
-		// adjacent payload before the pair is cached.
-		if err := verifyCandidate(filepath.Join(tmp, windowsLauncherName)); err != nil {
-			return fmt.Errorf("downloaded launcher failed verification: %w", err)
-		}
-	} else if err := verifyCandidate(filepath.Join(tmp, binName)); err != nil {
+	if err := verifyCandidate(filepath.Join(tmp, binName)); err != nil {
 		return err
 	}
 
@@ -282,12 +455,10 @@ func download(dest string) error {
 		return fmt.Errorf("could not create cache dir: %w", err)
 	}
 
-	if platform == "windows" {
-		if err := installWindowsPairAtomically(tmp, filepath.Dir(dest)); err != nil {
-			return fmt.Errorf("could not install Windows release pair: %w", err)
-		}
-	} else if err := installCandidateAtomically(filepath.Join(tmp, binName), dest); err != nil {
-		return fmt.Errorf("could not install binary: %w", err)
+	if err := publishRuntimeSetWithRecovery(
+		tmp, filepath.Dir(dest), binName, selectedVariant, verifyCandidate,
+	); err != nil {
+		return fmt.Errorf("could not install runtime set: %w", err)
 	}
 
 	return nil
@@ -325,8 +496,15 @@ var httpsOnlyClient = &http.Client{
 }
 
 func httpGet(rawURL, dest string) error {
+	return httpGetWithLimit(rawURL, dest, maxReleaseArchiveSize)
+}
+
+func httpGetWithLimit(rawURL, dest string, maxBytes int64) error {
 	if err := validateURLScheme(rawURL); err != nil {
 		return err
+	}
+	if maxBytes <= 0 {
+		return fmt.Errorf("invalid compressed archive safety limit")
 	}
 	resp, err := httpsOnlyClient.Get(rawURL) //nolint:gosec
 	if err != nil {
@@ -336,14 +514,30 @@ func httpGet(rawURL, dest string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d for %s", resp.StatusCode, rawURL)
 	}
+	if resp.ContentLength > maxBytes {
+		return fmt.Errorf(
+			"release archive exceeds the %d-byte compressed safety limit",
+			maxBytes,
+		)
+	}
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(f, resp.Body)
+	written, copyErr := io.Copy(f, io.LimitReader(resp.Body, maxBytes+1))
 	closeErr := f.Close()
+	if copyErr == nil && written > maxBytes {
+		copyErr = fmt.Errorf(
+			"release archive exceeds the %d-byte compressed safety limit",
+			maxBytes,
+		)
+	}
 	if copyErr != nil {
+		_ = os.Remove(dest)
 		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(dest)
 	}
 	return closeErr
 }
@@ -415,137 +609,478 @@ func verifyChecksum(path, expected string) error {
 	return nil
 }
 
-func extractTarGz(archivePath, destDir, targetFile string) error {
-	f, err := os.Open(archivePath)
+func isUIPackName(name string) bool {
+	const prefix = "cbm-ui-"
+	const suffix = ".pack"
+	if len(name) != len(prefix)+sha256.Size*2+len(suffix) ||
+		!strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	digest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	if digest != strings.ToLower(digest) {
+		return false
+	}
+	decoded, err := hex.DecodeString(digest)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func validateArchiveMemberNames(
+	names, archiveNames []string, variant string, caseInsensitive bool,
+) (string, error) {
+	required := make(map[string]struct{}, len(archiveNames))
+	for _, name := range archiveNames {
+		required[name] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(names))
+	found := make(map[string]struct{}, len(archiveNames))
+	uiPack := ""
+	for _, name := range names {
+		key := name
+		if caseInsensitive {
+			key = strings.ToLower(name)
+		}
+		if _, exists := seen[key]; exists {
+			return "", fmt.Errorf(
+				"duplicate or case-conflicting archive entry: %q", name,
+			)
+		}
+		seen[key] = struct{}{}
+		_, isRequired := required[name]
+		isPack := variant == "ui" && isUIPackName(name)
+		if !isRequired && !isPack {
+			return "", fmt.Errorf(
+				"archive must contain only the exact root files: %s",
+				strings.Join(archiveNames, ", "),
+			)
+		}
+		if isPack {
+			if uiPack != "" {
+				return "", fmt.Errorf(
+					"archive must contain exactly one content-addressed UI pack",
+				)
+			}
+			uiPack = name
+		} else {
+			found[name] = struct{}{}
+		}
+	}
+	expectedCount := len(archiveNames)
+	if variant == "ui" {
+		expectedCount++
+	}
+	if len(seen) != expectedCount || len(found) != len(required) ||
+		(variant == "ui" && uiPack == "") {
+		return "", fmt.Errorf(
+			"archive must contain exactly one of each required root file: %s",
+			strings.Join(archiveNames, ", "),
+		)
+	}
+	return uiPack, nil
+}
+
+func runtimeArchiveNames(extractNames []string, uiPack string) []string {
+	result := append([]string(nil), extractNames...)
+	if uiPack != "" {
+		result = append(result, uiPack)
+	}
+	return result
+}
+
+func validateArchiveResourceLimits(limits archiveResourceLimits) error {
+	if limits.compressedBytes <= 0 || limits.members <= 0 ||
+		limits.memberBytes <= 0 || limits.expandedBytes <= 0 {
+		return fmt.Errorf("invalid archive resource safety limits")
+	}
+	return nil
+}
+
+func requireCompressedArchiveWithinLimit(
+	archivePath string, limits archiveResourceLimits,
+) error {
+	status, err := os.Stat(archivePath)
 	if err != nil {
 		return err
+	}
+	if !status.Mode().IsRegular() {
+		return fmt.Errorf("release archive is not a regular file")
+	}
+	if status.Size() > limits.compressedBytes {
+		return fmt.Errorf(
+			"release archive exceeds the %d-byte compressed safety limit",
+			limits.compressedBytes,
+		)
+	}
+	return nil
+}
+
+func accountDeclaredArchiveMember(
+	name string, size int64, expanded *int64, limits archiveResourceLimits,
+) error {
+	if size < 0 {
+		return fmt.Errorf("archive member has a negative declared size: %q", name)
+	}
+	if size > limits.memberBytes {
+		return fmt.Errorf(
+			"archive member %q exceeds the %d-byte expanded safety limit",
+			name, limits.memberBytes,
+		)
+	}
+	if *expanded > limits.expandedBytes-size {
+		return fmt.Errorf(
+			"archive exceeds the %d-byte aggregate expanded safety limit",
+			limits.expandedBytes,
+		)
+	}
+	*expanded += size
+	return nil
+}
+
+func copyArchiveMemberWithLimits(
+	destination io.Writer,
+	source io.Reader,
+	name string,
+	declaredSize int64,
+	actualExpanded *int64,
+	limits archiveResourceLimits,
+) error {
+	remaining := limits.expandedBytes - *actualExpanded
+	copyLimit := limits.memberBytes
+	if remaining < copyLimit {
+		copyLimit = remaining
+	}
+	copied, err := io.Copy(
+		destination, io.LimitReader(source, copyLimit+1),
+	)
+	if err != nil {
+		return err
+	}
+	if copied > limits.memberBytes {
+		return fmt.Errorf(
+			"archive member %q exceeds the %d-byte actual expanded safety limit",
+			name, limits.memberBytes,
+		)
+	}
+	if copied > remaining {
+		return fmt.Errorf(
+			"archive exceeds the %d-byte aggregate actual expanded safety limit",
+			limits.expandedBytes,
+		)
+	}
+	if copied != declaredSize {
+		return fmt.Errorf(
+			"archive member %q actual size %d does not match declared size %d",
+			name, copied, declaredSize,
+		)
+	}
+	*actualExpanded += copied
+	return nil
+}
+
+func tarGzMemberNames(archivePath string) ([]string, error) {
+	return tarGzMemberNamesWithLimits(
+		archivePath, defaultArchiveResourceLimits,
+	)
+}
+
+func tarGzMemberNamesWithLimits(
+	archivePath string, limits archiveResourceLimits,
+) ([]string, error) {
+	if err := validateArchiveResourceLimits(limits); err != nil {
+		return nil, err
+	}
+	if err := requireCompressedArchiveWithinLimit(archivePath, limits); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
-	found := false
+	var names []string
+	var declaredExpanded int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		name := strings.ReplaceAll(hdr.Name, "\\", "/")
-		if name == targetFile {
-			if found {
-				os.Remove(filepath.Join(destDir, targetFile))
-				return fmt.Errorf("duplicate %s in archive", targetFile)
-			}
-			found = true
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return nil, fmt.Errorf(
+				"archive member is not a regular root file: %q", hdr.Name,
+			)
+		}
+		if len(names) >= limits.members {
+			return nil, fmt.Errorf(
+				"archive exceeds the %d-member safety limit", limits.members,
+			)
+		}
+		if err := accountDeclaredArchiveMember(
+			hdr.Name, hdr.Size, &declaredExpanded, limits,
+		); err != nil {
+			return nil, err
+		}
+		names = append(names, hdr.Name)
+	}
+	return names, nil
+}
+
+func extractTarGz(
+	archivePath, destDir string,
+	archiveNames, extractNames []string,
+	variant string,
+) ([]string, error) {
+	return extractTarGzWithLimits(
+		archivePath,
+		destDir,
+		archiveNames,
+		extractNames,
+		variant,
+		defaultArchiveResourceLimits,
+	)
+}
+
+func extractTarGzWithLimits(
+	archivePath, destDir string,
+	archiveNames, extractNames []string,
+	variant string,
+	limits archiveResourceLimits,
+) ([]string, error) {
+	names, err := tarGzMemberNamesWithLimits(archivePath, limits)
+	if err != nil {
+		return nil, err
+	}
+	uiPack, err := validateArchiveMemberNames(
+		names, archiveNames, variant, false,
+	)
+	if err != nil {
+		return nil, err
+	}
+	runtimeNames := runtimeArchiveNames(extractNames, uiPack)
+	targets := make(map[string]struct{}, len(runtimeNames))
+	for _, name := range runtimeNames {
+		targets[name] = struct{}{}
+	}
+
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	extracted := make(map[string]struct{}, len(runtimeNames))
+	memberCount := 0
+	var declaredExpanded int64
+	var actualExpanded int64
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		memberCount++
+		if memberCount > limits.members {
+			return nil, fmt.Errorf(
+				"archive exceeds the %d-member safety limit", limits.members,
+			)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return nil, fmt.Errorf(
+				"archive member is not a regular root file: %q", hdr.Name,
+			)
+		}
+		if err := accountDeclaredArchiveMember(
+			hdr.Name, hdr.Size, &declaredExpanded, limits,
+		); err != nil {
+			return nil, err
+		}
+		if _, wanted := targets[hdr.Name]; wanted {
+			outputPath := filepath.Join(destDir, hdr.Name)
 			out, err := os.OpenFile(
-				filepath.Join(destDir, targetFile),
+				outputPath,
 				os.O_WRONLY|os.O_CREATE|os.O_EXCL,
 				0600,
 			)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			_, copyErr := io.Copy(out, tr) //nolint:gosec
+			copyErr := copyArchiveMemberWithLimits(
+				out, tr, hdr.Name, hdr.Size, &actualExpanded, limits,
+			)
 			closeErr := out.Close()
 			if copyErr != nil {
-				os.Remove(filepath.Join(destDir, targetFile))
-				return copyErr
+				_ = os.Remove(outputPath)
+				return nil, copyErr
 			}
 			if closeErr != nil {
-				os.Remove(filepath.Join(destDir, targetFile))
-				return closeErr
+				_ = os.Remove(outputPath)
+				return nil, closeErr
 			}
+			extracted[hdr.Name] = struct{}{}
+		} else if err := copyArchiveMemberWithLimits(
+			io.Discard, tr, hdr.Name, hdr.Size, &actualExpanded, limits,
+		); err != nil {
+			return nil, err
 		}
 	}
-	if !found {
-		return fmt.Errorf("%s not found in archive", targetFile)
+	if len(extracted) != len(runtimeNames) {
+		return nil, fmt.Errorf("archive runtime set extraction was incomplete")
 	}
-	return nil
+	return runtimeNames, nil
 }
 
 func extractZip(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-) error {
+	variant string,
+) ([]string, error) {
+	return extractZipWithLimits(
+		archivePath,
+		destDir,
+		archiveNames,
+		extractNames,
+		variant,
+		defaultArchiveResourceLimits,
+	)
+}
+
+func extractZipWithLimits(
+	archivePath, destDir string,
+	archiveNames, extractNames []string,
+	variant string,
+	limits archiveResourceLimits,
+) ([]string, error) {
+	if err := validateArchiveResourceLimits(limits); err != nil {
+		return nil, err
+	}
+	if err := requireCompressedArchiveWithinLimit(archivePath, limits); err != nil {
+		return nil, err
+	}
 	r, err := zip.OpenReader(archivePath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer r.Close()
-	seen := make(map[string]struct{}, len(r.File))
-	required := make(map[string]struct{}, len(archiveNames))
-	targets := make(map[string]*zip.File, len(extractNames))
-	for _, name := range archiveNames {
-		required[name] = struct{}{}
+	if len(r.File) > limits.members {
+		return nil, fmt.Errorf(
+			"archive exceeds the %d-member safety limit", limits.members,
+		)
 	}
+	names := make([]string, 0, len(r.File))
+	declaredSizes := make(map[string]int64, len(r.File))
+	var declaredExpanded int64
 	for _, f := range r.File {
 		name, err := validateWindowsZipMember(f.Name)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		key := strings.ToLower(strings.TrimSuffix(name, "/"))
-		if _, ok := seen[key]; ok {
-			return fmt.Errorf("duplicate or case-conflicting zip entry: %q", f.Name)
-		}
-		seen[key] = struct{}{}
-		if _, ok := required[name]; !ok || f.FileInfo().IsDir() {
-			return fmt.Errorf(
-				"archive must contain only the exact root files: %s",
-				strings.Join(archiveNames, ", "),
+		if !f.FileInfo().Mode().IsRegular() {
+			return nil, fmt.Errorf(
+				"archive member is not a regular root file: %q", f.Name,
 			)
 		}
-		for _, extractName := range extractNames {
-			if name == extractName {
-				targets[name] = f
-			}
+		if f.UncompressedSize64 > uint64(limits.memberBytes) {
+			return nil, fmt.Errorf(
+				"archive member %q exceeds the %d-byte expanded safety limit",
+				name, limits.memberBytes,
+			)
 		}
+		declaredSize := int64(f.UncompressedSize64)
+		if err := accountDeclaredArchiveMember(
+			name, declaredSize, &declaredExpanded, limits,
+		); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		declaredSizes[name] = declaredSize
 	}
-	if len(seen) != len(archiveNames) || len(targets) != len(extractNames) {
-		return fmt.Errorf(
-			"archive must contain exactly one of each required root file: %s",
-			strings.Join(archiveNames, ", "),
-		)
+	uiPack, err := validateArchiveMemberNames(
+		names, archiveNames, variant, true,
+	)
+	if err != nil {
+		return nil, err
 	}
+	runtimeNames := runtimeArchiveNames(extractNames, uiPack)
+	targetNames := make(map[string]struct{}, len(runtimeNames))
+	for _, name := range runtimeNames {
+		targetNames[name] = struct{}{}
+	}
+	extracted := make(map[string]struct{}, len(runtimeNames))
+	var actualExpanded int64
 
-	for _, name := range extractNames {
-		target := targets[name]
+	for index, target := range r.File {
+		name := names[index]
 		rc, err := target.Open()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		outputPath := filepath.Join(destDir, name)
-		out, err := os.OpenFile(
-			outputPath,
-			os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-			0600,
+		var destination io.Writer = io.Discard
+		var out *os.File
+		outputPath := ""
+		if _, wanted := targetNames[name]; wanted {
+			outputPath = filepath.Join(destDir, name)
+			out, err = os.OpenFile(
+				outputPath,
+				os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+				0600,
+			)
+			if err != nil {
+				_ = rc.Close()
+				return nil, err
+			}
+			destination = out
+		}
+		copyErr := copyArchiveMemberWithLimits(
+			destination,
+			rc,
+			name,
+			declaredSizes[name],
+			&actualExpanded,
+			limits,
 		)
-		if err != nil {
-			rc.Close()
-			return err
+		var closeOutErr error
+		if out != nil {
+			closeOutErr = out.Close()
 		}
-		_, copyErr := io.Copy(out, rc) //nolint:gosec
-		closeOutErr := out.Close()
 		closeReadErr := rc.Close()
 		if copyErr != nil {
-			os.Remove(outputPath)
-			return copyErr
+			if outputPath != "" {
+				_ = os.Remove(outputPath)
+			}
+			return nil, copyErr
 		}
 		if closeOutErr != nil {
-			os.Remove(outputPath)
-			return closeOutErr
+			_ = os.Remove(outputPath)
+			return nil, closeOutErr
 		}
 		if closeReadErr != nil {
-			os.Remove(outputPath)
-			return closeReadErr
+			if outputPath != "" {
+				_ = os.Remove(outputPath)
+			}
+			return nil, closeReadErr
+		}
+		if outputPath != "" {
+			extracted[name] = struct{}{}
 		}
 	}
-	return nil
+	if len(extracted) != len(runtimeNames) {
+		return nil, fmt.Errorf("archive runtime set extraction was incomplete")
+	}
+	return runtimeNames, nil
 }
 
 func validateWindowsZipMember(raw string) (string, error) {
@@ -566,7 +1101,7 @@ func validateWindowsZipMember(raw string) (string, error) {
 func verifyCandidate(path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), candidateTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd := exec.CommandContext(ctx, path, "--verify-runtime-assets")
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
@@ -595,15 +1130,17 @@ func fileSHA256(path string) ([sha256.Size]byte, error) {
 }
 
 func filesEqualSHA256(left, right string) (bool, error) {
-	leftInfo, err := os.Stat(left)
+	leftInfo, err := os.Lstat(left)
 	if err != nil {
 		return false, err
 	}
-	rightInfo, err := os.Stat(right)
+	rightInfo, err := os.Lstat(right)
 	if err != nil {
 		return false, err
 	}
 	if !leftInfo.Mode().IsRegular() || !rightInfo.Mode().IsRegular() ||
+		!platformRuntimeSetFileLinkCountOne(left, leftInfo) ||
+		!platformRuntimeSetFileLinkCountOne(right, rightInfo) ||
 		leftInfo.Size() != rightInfo.Size() {
 		return false, nil
 	}
@@ -618,171 +1155,627 @@ func filesEqualSHA256(left, right string) (bool, error) {
 	return leftDigest == rightDigest, nil
 }
 
-func installCandidateAtomically(src, dst string) error {
-	in, err := os.Open(src)
+func regularRuntimeFile(path string) bool {
+	status, err := os.Lstat(path)
+	return err == nil && status.Mode().IsRegular() &&
+		platformRuntimeSetFileLinkCountOne(path, status)
+}
+
+func uiPackMatchesDigest(directory, name string) bool {
+	digest, err := fileSHA256(filepath.Join(directory, name))
+	if err != nil {
+		return false
+	}
+	expected := strings.TrimSuffix(strings.TrimPrefix(name, "cbm-ui-"), ".pack")
+	return hex.EncodeToString(digest[:]) == expected
+}
+
+func runtimeSetNames(
+	directory, binaryName, variant string,
+) ([]string, bool) {
+	if !regularRuntimeFile(filepath.Join(directory, binaryName)) ||
+		!regularRuntimeFile(filepath.Join(directory, integrationsFileName)) {
+		return nil, false
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, false
+	}
+	var packLike []string
+	var validPacks []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "cbm-ui-") && strings.HasSuffix(name, ".pack") {
+			packLike = append(packLike, name)
+			if isUIPackName(name) &&
+				regularRuntimeFile(filepath.Join(directory, name)) &&
+				uiPackMatchesDigest(directory, name) {
+				validPacks = append(validPacks, name)
+			}
+		}
+	}
+	if variant == "ui" {
+		if len(packLike) != 1 || len(validPacks) != 1 {
+			return nil, false
+		}
+	} else if len(packLike) != 0 {
+		return nil, false
+	}
+	names := []string{integrationsFileName}
+	if variant == "ui" {
+		names = append(names, validPacks[0])
+	}
+	names = append(names, binaryName)
+	return names, true
+}
+
+func runtimeSetReady(
+	directory, binaryName, variant string, verifier func(string) error,
+) bool {
+	if _, ok := runtimeSetNames(directory, binaryName, variant); !ok {
+		return false
+	}
+	return verifier == nil || verifier(filepath.Join(directory, binaryName)) == nil
+}
+
+func requireSafeRuntimeDirectory(directory string) error {
+	status, err := os.Lstat(directory)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	pattern := "." + filepath.Base(dst) + ".*.tmp"
-	if runtime.GOOS == "windows" {
+	if !status.IsDir() || status.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing unsafe package-cache directory: %s", directory)
+	}
+	return nil
+}
+
+func runtimeSetReadyLocked(
+	directory, binaryName, variant string, verifier func(string) error,
+) (ready bool, result error) {
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		return false, err
+	}
+	if err := requireSafeRuntimeDirectory(directory); err != nil {
+		return false, err
+	}
+	lock, err := acquireRuntimeSetLock(directory)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		attachRuntimeLockReleaseError(&result, releaseRuntimeSetLock(lock))
+	}()
+	if err := refreshRuntimeSetLock(lock); err != nil {
+		return false, err
+	}
+	if err := reconcileRuntimeBackups(
+		directory, binaryName, variant, verifier, lock,
+	); err != nil {
+		return false, err
+	}
+	return runtimeSetReady(directory, binaryName, variant, verifier), nil
+}
+
+func copyRuntimeStage(
+	sourcePath, destinationDirectory string, executable bool,
+	maintainLease func() error,
+) (string, error) {
+	input, err := os.Open(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer input.Close()
+	pattern := ".cbm-runtime-stage-*"
+	if executable && runtime.GOOS == "windows" {
 		pattern += ".exe"
 	}
-	out, err := os.CreateTemp(filepath.Dir(dst), pattern)
+	output, err := os.CreateTemp(destinationDirectory, pattern)
+	if err != nil {
+		return "", err
+	}
+	stagedPath := output.Name()
+	mode := os.FileMode(0644)
+	if executable {
+		mode = 0755
+	}
+	buffer := make([]byte, 1024*1024)
+	lastRefresh := time.Now()
+	var copyErr error
+	for {
+		count, readErr := input.Read(buffer)
+		if count > 0 {
+			written := 0
+			for written < count {
+				amount, writeErr := output.Write(buffer[written:count])
+				if writeErr != nil {
+					copyErr = writeErr
+					break
+				}
+				written += amount
+			}
+		}
+		if copyErr != nil || readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			copyErr = readErr
+			break
+		}
+		if maintainLease != nil && time.Since(lastRefresh) >= runtimeSetLockHeartbeat {
+			if err := maintainLease(); err != nil {
+				copyErr = err
+				break
+			}
+			lastRefresh = time.Now()
+		}
+	}
+	chmodErr := output.Chmod(mode)
+	syncErr := output.Sync()
+	closeErr := output.Close()
+	for _, candidate := range []error{copyErr, chmodErr, syncErr, closeErr} {
+		if candidate != nil {
+			_ = os.Remove(stagedPath)
+			return "", candidate
+		}
+	}
+	return stagedPath, nil
+}
+
+// A grouped backup is a small process-crash journal. runtimeBackupRetired
+// separates a partial retirement from partial publication;
+// runtimeBackupCleanupOnly makes deletion retryable after the destination has
+// been accepted or restored.
+func runtimeBackupDirectoryName(name string) bool {
+	if !strings.HasPrefix(name, runtimeBackupPrefix) {
+		return false
+	}
+	token := strings.TrimPrefix(name, runtimeBackupPrefix)
+	decoded, err := hex.DecodeString(token)
+	return err == nil && token == strings.ToLower(token) &&
+		len(decoded) == runtimeSetLockTokenSize
+}
+
+func runtimeBackupTargetName(name, binaryName string) bool {
+	return name == binaryName || name == integrationsFileName ||
+		(strings.HasPrefix(name, "cbm-ui-") && strings.HasSuffix(name, ".pack"))
+}
+
+func createRuntimeBackupDirectory(directory string) (string, error) {
+	for attempt := 0; attempt < 128; attempt++ {
+		token, err := runtimeSetLockToken()
+		if err != nil {
+			return "", err
+		}
+		backupDirectory := filepath.Join(directory, runtimeBackupPrefix+token)
+		if err := os.Mkdir(backupDirectory, 0700); err == nil {
+			return backupDirectory, nil
+		} else if !os.IsExist(err) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not reserve a package-cache backup transaction")
+}
+
+func createRuntimeBackupMarker(backupDirectory, name string) error {
+	marker, err := os.OpenFile(
+		filepath.Join(backupDirectory, name),
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		0600,
+	)
 	if err != nil {
 		return err
 	}
-	staged := out.Name()
-	defer os.Remove(staged)
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
+	syncErr := marker.Sync()
+	closeErr := marker.Close()
+	if syncErr != nil {
+		return syncErr
 	}
-	if err := out.Chmod(0755); err != nil {
-		out.Close()
-		return err
+	return closeErr
+}
+
+func inspectRuntimeBackupDirectory(
+	directory, entryName, binaryName string,
+) (*runtimeBackupTransaction, error) {
+	backupDirectory := filepath.Join(directory, entryName)
+	directoryStatus, err := os.Lstat(backupDirectory)
+	if err != nil || !directoryStatus.IsDir() ||
+		directoryStatus.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf(
+			"refusing unsafe package-cache backup: %s", backupDirectory,
+		)
 	}
-	if err := out.Sync(); err != nil {
-		out.Close()
-		return err
+	backup := &runtimeBackupTransaction{
+		path: backupDirectory, files: make(map[string]runtimeBackupFile),
 	}
-	if err := out.Close(); err != nil {
-		return err
+	entries, err := os.ReadDir(backupDirectory)
+	if err != nil {
+		return nil, err
 	}
-	if err := verifyCandidate(staged); err != nil {
-		return err
-	}
-	if err := os.Rename(staged, dst); err != nil {
-		identical, compareErr := filesEqualSHA256(staged, dst)
-		if compareErr == nil && identical {
-			return verifyCandidate(dst)
+	for _, entry := range entries {
+		name := entry.Name()
+		candidate := filepath.Join(backupDirectory, name)
+		status, err := os.Lstat(candidate)
+		if err != nil {
+			return nil, err
 		}
+		if name == runtimeBackupRetired || name == runtimeBackupCleanupOnly {
+			if !status.Mode().IsRegular() ||
+				!platformRuntimeSetFileLinkCountOne(candidate, status) ||
+				status.Size() != 0 {
+				return nil, fmt.Errorf(
+					"refusing unsafe package-cache backup marker: %s", candidate,
+				)
+			}
+			if name == runtimeBackupRetired {
+				backup.retired = true
+			} else {
+				backup.cleanupOnly = true
+			}
+			continue
+		}
+		if !runtimeBackupTargetName(name, binaryName) ||
+			!status.Mode().IsRegular() ||
+			!platformRuntimeSetFileLinkCountOne(candidate, status) {
+			return nil, fmt.Errorf(
+				"refusing unsafe package-cache backup member: %s", candidate,
+			)
+		}
+		digest, err := fileSHA256(candidate)
+		if err != nil {
+			return nil, err
+		}
+		backup.files[name] = runtimeBackupFile{path: candidate, digest: digest}
+	}
+	return backup, nil
+}
+
+func listRuntimeBackupDirectories(
+	directory, binaryName string,
+) ([]*runtimeBackupTransaction, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, entry := range entries {
+		if runtimeBackupDirectoryName(entry.Name()) {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	backups := make([]*runtimeBackupTransaction, 0, len(names))
+	for _, name := range names {
+		backup, err := inspectRuntimeBackupDirectory(directory, name, binaryName)
+		if err != nil {
+			return nil, err
+		}
+		backups = append(backups, backup)
+	}
+	return backups, nil
+}
+
+func currentRuntimeTargets(
+	directory, binaryName string,
+) (map[string]string, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	targets := make(map[string]string)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !runtimeBackupTargetName(name, binaryName) {
+			continue
+		}
+		target := filepath.Join(directory, name)
+		status, err := os.Lstat(target)
+		if err != nil || !status.Mode().IsRegular() ||
+			!platformRuntimeSetFileLinkCountOne(target, status) {
+			return nil, fmt.Errorf("refusing unsafe package-cache target: %s", target)
+		}
+		targets[name] = target
+	}
+	return targets, nil
+}
+
+func cleanupRuntimeBackup(
+	backup *runtimeBackupTransaction, lock *runtimeSetLock,
+) error {
+	if err := assertRuntimeSetLockOwner(lock); err != nil {
+		return err
+	}
+	if !backup.cleanupOnly {
+		if err := createRuntimeBackupMarker(
+			backup.path, runtimeBackupCleanupOnly,
+		); err != nil {
+			return err
+		}
+		backup.cleanupOnly = true
+	}
+	names := make([]string, 0, len(backup.files))
+	for name := range backup.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := assertRuntimeSetLockOwner(lock); err != nil {
+			return err
+		}
+		member := backup.files[name]
+		if !pathMatchesSHA256(member.path, member.digest) {
+			return fmt.Errorf(
+				"package-cache backup member changed during cleanup: %s", name,
+			)
+		}
+		if err := assertRuntimeSetLockOwner(lock); err != nil {
+			return err
+		}
+		if err := os.Remove(member.path); err != nil {
+			return err
+		}
+		if runtimeBackupCrashObserver != nil {
+			if err := runtimeBackupCrashObserver(
+				runtimeBackupCleanupRemovedEvent, member.path,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	if backup.retired {
+		if err := assertRuntimeSetLockOwner(lock); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(backup.path, runtimeBackupRetired)); err != nil {
+			return err
+		}
+	}
+	if err := assertRuntimeSetLockOwner(lock); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(backup.path, runtimeBackupCleanupOnly)); err != nil {
+		return err
+	}
+	return os.Remove(backup.path)
+}
+
+func copyRuntimeBackupFile(
+	member runtimeBackupFile, target string, executable bool, lock *runtimeSetLock,
+) error {
+	staged, err := copyRuntimeStage(
+		member.path,
+		filepath.Dir(target),
+		executable,
+		func() error { return refreshRuntimeSetLock(lock) },
+	)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staged)
+	stagedDigest, err := fileSHA256(staged)
+	if err != nil {
+		return err
+	}
+	if stagedDigest != member.digest {
+		return fmt.Errorf("package-cache backup changed while it was being restored")
+	}
+	if err := assertRuntimeSetLockOwner(lock); err != nil {
+		return err
+	}
+	return os.Rename(staged, target)
+}
+
+func reconcileRuntimeBackups(
+	directory, binaryName, variant string,
+	verifier func(string) error,
+	lock *runtimeSetLock,
+) error {
+	if err := refreshRuntimeSetLock(lock); err != nil {
+		return err
+	}
+	backups, err := listRuntimeBackupDirectories(directory, binaryName)
+	if err != nil {
+		return err
+	}
+	remaining := make([]*runtimeBackupTransaction, 0, len(backups))
+	for _, backup := range backups {
+		if backup.cleanupOnly {
+			if err := cleanupRuntimeBackup(backup, lock); err != nil {
+				return err
+			}
+		} else {
+			remaining = append(remaining, backup)
+		}
+	}
+	backups = remaining
+	if len(backups) == 0 {
+		return nil
+	}
+	if runtimeSetReady(directory, binaryName, variant, verifier) {
+		for _, backup := range backups {
+			if err := cleanupRuntimeBackup(backup, lock); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(backups) == 0 {
+		return nil
+	}
+	remaining = remaining[:0]
+	for _, backup := range backups {
+		if !backup.retired && len(backup.files) == 0 {
+			if err := cleanupRuntimeBackup(backup, lock); err != nil {
+				return err
+			}
+		} else {
+			remaining = append(remaining, backup)
+		}
+	}
+	backups = remaining
+	if len(backups) == 0 {
+		return nil
+	}
+	if len(backups) != 1 {
+		return fmt.Errorf(
+			"multiple package-cache backup transactions require manual recovery",
+		)
+	}
+	backup := backups[0]
+	targets, err := currentRuntimeTargets(directory, binaryName)
+	if err != nil {
+		return err
+	}
+	if !backup.retired {
+		for name, member := range backup.files {
+			if target, exists := targets[name]; exists &&
+				!pathMatchesSHA256(target, member.digest) {
+				return fmt.Errorf(
+					"package-cache backup conflicts with current target: %s", name,
+				)
+			}
+		}
+	} else {
+		if target, exists := targets[binaryName]; exists {
+			if err := assertRuntimeSetLockOwner(lock); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+			delete(targets, binaryName)
+		}
+		names := make([]string, 0, len(targets))
+		for name := range targets {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if err := assertRuntimeSetLockOwner(lock); err != nil {
+				return err
+			}
+			if err := os.Remove(targets[name]); err != nil {
+				return err
+			}
+		}
+	}
+	restoreNames := make([]string, 0, len(backup.files))
+	for name := range backup.files {
+		if name != binaryName {
+			restoreNames = append(restoreNames, name)
+		}
+	}
+	sort.Strings(restoreNames)
+	if _, exists := backup.files[binaryName]; exists {
+		restoreNames = append(restoreNames, binaryName)
+	}
+	for _, name := range restoreNames {
+		member := backup.files[name]
+		target := filepath.Join(directory, name)
+		if !pathMatchesSHA256(target, member.digest) {
+			if err := copyRuntimeBackupFile(
+				member, target, name == binaryName, lock,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	for name, member := range backup.files {
+		if !pathMatchesSHA256(filepath.Join(directory, name), member.digest) {
+			return fmt.Errorf("package-cache backup restoration failed: %s", name)
+		}
+	}
+	if err := cleanupRuntimeBackup(backup, lock); err != nil {
 		return err
 	}
 	return nil
 }
 
-func windowsPairToken() (string, error) {
-	raw := make([]byte, windowsPairTransactionTagSize)
+func pathMatchesSHA256(path string, expected [sha256.Size]byte) bool {
+	if !regularRuntimeFile(path) {
+		return false
+	}
+	actual, err := fileSHA256(path)
+	return err == nil && actual == expected
+}
+
+func runtimeSetLockToken() (string, error) {
+	raw := make([]byte, runtimeSetLockTokenSize)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(raw), nil
 }
 
-func windowsPairLockOwner(lockPath string) (int, string, bool) {
-	data, err := os.ReadFile(filepath.Join(lockPath, windowsPairLockOwnerFile))
+func runtimeSetLockOwner(lockPath string) (runtimeSetLockOwnerRecord, bool) {
+	var empty runtimeSetLockOwnerRecord
+	status, err := os.Lstat(lockPath)
+	if err != nil || status.Mode()&os.ModeSymlink != 0 ||
+		(!status.Mode().IsRegular() && !status.IsDir()) {
+		return empty, false
+	}
+	ownerPath := lockPath
+	if status.IsDir() {
+		ownerPath = filepath.Join(lockPath, runtimeSetLockOwnerFile)
+	}
+	ownerStatus, err := os.Lstat(ownerPath)
+	if err != nil || !ownerStatus.Mode().IsRegular() {
+		return empty, false
+	}
+	data, err := os.ReadFile(ownerPath)
 	if err != nil {
-		return 0, "", false
+		return empty, false
 	}
-	var pid int
-	var token string
-	var extra string
-	count, _ := fmt.Sscanf(string(data), "%d %s %s", &pid, &token, &extra)
-	decoded, decodeErr := hex.DecodeString(token)
-	if count != 2 || pid <= 0 || decodeErr != nil ||
-		len(decoded) != windowsPairTransactionTagSize {
-		return 0, "", false
+	var record runtimeSetLockOwnerRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return empty, false
 	}
-	return pid, token, true
+	decoded, decodeErr := hex.DecodeString(record.Token)
+	if record.PID <= 0 || record.Token != strings.ToLower(record.Token) ||
+		decodeErr != nil || len(decoded) != runtimeSetLockTokenSize {
+		return empty, false
+	}
+	return record, true
 }
 
-func windowsPairTryReclaimLock(lockPath, contenderToken string) bool {
-	pid, _, ownerOK := windowsPairLockOwner(lockPath)
-	reclaim := ownerOK && !cbmWindowsLockProcessAlive(pid)
-	if !ownerOK {
-		status, err := os.Stat(lockPath)
-		if os.IsNotExist(err) {
-			return true
-		}
-		if err != nil {
-			return false
-		}
-		reclaim = time.Since(status.ModTime()) >= windowsPairOwnerlessStale
-	}
-	if !reclaim {
-		return false
-	}
-	reclaimed := lockPath + ".reclaimed-" + contenderToken
-	if err := os.Rename(lockPath, reclaimed); err != nil {
-		return os.IsNotExist(err)
-	}
-	_ = os.RemoveAll(reclaimed)
-	return true
+func runtimeSetSameLockObject(left, right os.FileInfo) bool {
+	return left != nil && right != nil && os.SameFile(left, right) &&
+		left.Mode().Type() == right.Mode().Type()
 }
 
-func acquireWindowsPairLock(dstDir string) (*windowsPairLock, error) {
-	token, err := windowsPairToken()
-	if err != nil {
-		return nil, err
-	}
-	lockPath := filepath.Join(dstDir, windowsPairLockName)
-	deadline := time.Now().Add(windowsPairLockWait)
-	for {
-		if err := os.Mkdir(lockPath, 0700); err == nil {
-			owner := []byte(fmt.Sprintf("%d %s\n", os.Getpid(), token))
-			ownerPath := filepath.Join(lockPath, windowsPairLockOwnerFile)
-			if err := os.WriteFile(ownerPath, owner, 0600); err != nil {
-				_ = os.RemoveAll(lockPath)
-				return nil, err
-			}
-			return &windowsPairLock{path: lockPath, token: token}, nil
-		} else if !os.IsExist(err) {
-			return nil, err
-		}
-		if windowsPairTryReclaimLock(lockPath, token) {
-			continue
-		}
-		if !time.Now().Before(deadline) {
-			return nil, fmt.Errorf(
-				"timed out waiting for Windows package-cache publication lock")
-		}
-		time.Sleep(windowsPairLockPoll)
-	}
-}
-
-func releaseWindowsPairLock(lock *windowsPairLock) error {
-	if lock == nil {
-		return fmt.Errorf("missing Windows package-cache publication lock")
-	}
-	pid, token, ok := windowsPairLockOwner(lock.path)
-	if !ok || pid != os.Getpid() || token != lock.token {
-		return fmt.Errorf("Windows package-cache publication lock ownership changed")
-	}
-	if err := os.Remove(filepath.Join(lock.path, windowsPairLockOwnerFile)); err != nil {
+func writeRuntimeSetLockRecord(owner *os.File, token string) error {
+	if err := owner.Truncate(0); err != nil {
 		return err
 	}
-	return os.Remove(lock.path)
+	if _, err := owner.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := json.NewEncoder(owner).Encode(runtimeSetLockOwnerRecord{
+		PID:          os.Getpid(),
+		Token:        token,
+		LeaseExpires: time.Now().Add(runtimeSetLockLease).UnixMilli(),
+	}); err != nil {
+		return err
+	}
+	return owner.Sync()
 }
 
-func windowsPairReady(dstDir string, verifier func(string) error) bool {
-	launcher := filepath.Join(dstDir, windowsLauncherName)
-	payload := filepath.Join(dstDir, windowsPayloadName)
-	launcherStatus, launcherErr := os.Lstat(launcher)
-	payloadStatus, payloadErr := os.Lstat(payload)
-	return launcherErr == nil && payloadErr == nil &&
-		launcherStatus.Mode().IsRegular() && payloadStatus.Mode().IsRegular() &&
-		verifier(launcher) == nil
-}
-
-func copyWindowsPairStage(src, dst string) error {
-	input, err := os.Open(src)
+// writeRuntimeSetLockOwner creates the legacy directory-owner shape used by
+// migration tests and previous wrapper releases.
+func writeRuntimeSetLockOwner(lockPath, token string) error {
+	owner, err := os.OpenFile(
+		filepath.Join(lockPath, runtimeSetLockOwnerFile),
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		0600,
+	)
 	if err != nil {
 		return err
 	}
-	output, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		_ = input.Close()
-		return err
-	}
-	_, copyErr := io.Copy(output, input)
-	closeInputErr := input.Close()
-	chmodErr := output.Chmod(0755)
-	syncErr := output.Sync()
-	closeOutputErr := output.Close()
-	for _, candidate := range []error{
-		copyErr, closeInputErr, chmodErr, syncErr, closeOutputErr,
-	} {
+	writeErr := json.NewEncoder(owner).Encode(runtimeSetLockOwnerRecord{
+		PID: os.Getpid(), Token: token,
+	})
+	syncErr := owner.Sync()
+	closeErr := owner.Close()
+	for _, candidate := range []error{writeErr, syncErr, closeErr} {
 		if candidate != nil {
 			return candidate
 		}
@@ -790,47 +1783,239 @@ func copyWindowsPairStage(src, dst string) error {
 	return nil
 }
 
-func pathMatchesSHA256(path string, expected [sha256.Size]byte) bool {
-	status, err := os.Lstat(path)
-	if err != nil || !status.Mode().IsRegular() {
-		return false
+func runtimeSetOwnerReclaimable(
+	status os.FileInfo, owner runtimeSetLockOwnerRecord, ownerOK bool,
+) bool {
+	if ownerOK {
+		// Lease expiry and age are not evidence that a syntactically valid
+		// owner is dead. A paused live publisher can resume between lock-owner
+		// assertions, so reclaim only when the platform proves its PID is gone.
+		return !runtimeSetProcessAlive(owner.PID)
 	}
-	actual, err := fileSHA256(path)
-	return err == nil && actual == expected
+	return time.Since(status.ModTime()) >= runtimeSetOwnerlessStale
 }
 
-func installWindowsPairAtomicallyWithVerifier(
-	srcDir, dstDir string, verifier func(string) error,
-) (result error) {
-	names := []string{windowsLauncherName, windowsPayloadName}
-	if err := verifier(filepath.Join(srcDir, windowsLauncherName)); err != nil {
-		return fmt.Errorf("source Windows release pair failed verification: %w", err)
+func restoreDisplacedRuntimeSetLock(reclaimed, lockPath string, status os.FileInfo) {
+	if status == nil || !status.Mode().IsRegular() {
+		return
 	}
-	lock, err := acquireWindowsPairLock(dstDir)
+	if err := os.Link(reclaimed, lockPath); err == nil {
+		_ = os.Remove(reclaimed)
+	}
+}
+
+func runtimeSetTryReclaimLock(lockPath, contenderToken string) bool {
+	observedStatus, err := os.Lstat(lockPath)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil || observedStatus.Mode()&os.ModeSymlink != 0 ||
+		(!observedStatus.Mode().IsRegular() && !observedStatus.IsDir()) {
+		return false
+	}
+	owner, ownerOK := runtimeSetLockOwner(lockPath)
+	if !runtimeSetOwnerReclaimable(observedStatus, owner, ownerOK) {
+		return false
+	}
+	reclaimed := lockPath + ".reclaimed-" + contenderToken
+	if err := os.Rename(lockPath, reclaimed); err != nil {
+		return os.IsNotExist(err)
+	}
+	movedStatus, movedErr := os.Lstat(reclaimed)
+	if movedErr != nil || !runtimeSetSameLockObject(observedStatus, movedStatus) {
+		restoreDisplacedRuntimeSetLock(reclaimed, lockPath, movedStatus)
+		return false
+	}
+	movedOwner, movedOwnerOK := runtimeSetLockOwner(reclaimed)
+	if !runtimeSetOwnerReclaimable(movedStatus, movedOwner, movedOwnerOK) {
+		restoreDisplacedRuntimeSetLock(reclaimed, lockPath, movedStatus)
+		return false
+	}
+	if movedStatus.IsDir() {
+		_ = os.RemoveAll(reclaimed)
+	} else {
+		_ = os.Remove(reclaimed)
+	}
+	return true
+}
+
+func assertRuntimeSetLockOwner(lock *runtimeSetLock) error {
+	if lock == nil || lock.file == nil {
+		return fmt.Errorf("missing package-cache runtime-set publication lock")
+	}
+	descriptorStatus, descriptorErr := lock.file.Stat()
+	canonicalStatus, canonicalErr := os.Lstat(lock.path)
+	owner, ownerOK := runtimeSetLockOwner(lock.path)
+	if descriptorErr != nil || canonicalErr != nil ||
+		!runtimeSetSameLockObject(descriptorStatus, canonicalStatus) ||
+		!ownerOK || owner.PID != os.Getpid() || owner.Token != lock.token {
+		return fmt.Errorf(
+			"package-cache runtime-set publication lock ownership changed",
+		)
+	}
+	return nil
+}
+
+func refreshRuntimeSetLock(lock *runtimeSetLock) error {
+	if err := assertRuntimeSetLockOwner(lock); err != nil {
+		return err
+	}
+	if err := writeRuntimeSetLockRecord(lock.file, lock.token); err != nil {
+		return err
+	}
+	return assertRuntimeSetLockOwner(lock)
+}
+
+func acquireRuntimeSetLock(destinationDirectory string) (*runtimeSetLock, error) {
+	token, err := runtimeSetLockToken()
+	if err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(destinationDirectory, runtimeSetLockName)
+	claimPath := lockPath + ".claim-" + token
+	deadline := time.Now().Add(runtimeSetLockWait)
+	for {
+		owner, claimErr := os.OpenFile(
+			claimPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600,
+		)
+		if claimErr != nil {
+			return nil, claimErr
+		}
+		if err := writeRuntimeSetLockRecord(owner, token); err != nil {
+			_ = owner.Close()
+			_ = os.Remove(claimPath)
+			return nil, err
+		}
+		if runtimeSetLockClaimObserver != nil {
+			if err := runtimeSetLockClaimObserver(); err != nil {
+				_ = owner.Close()
+				_ = os.Remove(claimPath)
+				return nil, err
+			}
+		}
+		linkErr := os.Link(claimPath, lockPath)
+		if linkErr == nil {
+			if err := os.Remove(claimPath); err != nil {
+				_ = owner.Close()
+				return nil, err
+			}
+			descriptorStatus, descriptorErr := owner.Stat()
+			canonicalStatus, canonicalErr := os.Lstat(lockPath)
+			if descriptorErr != nil || canonicalErr != nil ||
+				!runtimeSetSameLockObject(descriptorStatus, canonicalStatus) {
+				_ = owner.Close()
+				return nil, fmt.Errorf(
+					"package-cache runtime-set publication lock ownership changed",
+				)
+			}
+			return &runtimeSetLock{path: lockPath, token: token, file: owner}, nil
+		}
+		_ = owner.Close()
+		_ = os.Remove(claimPath)
+		if !os.IsExist(linkErr) {
+			return nil, linkErr
+		}
+		if runtimeSetTryReclaimLock(lockPath, token) {
+			continue
+		}
+		if runtimeSetLockWaitObserver != nil {
+			runtimeSetLockWaitObserver()
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf(
+				"timed out waiting for package-cache runtime-set publication lock",
+			)
+		}
+		time.Sleep(runtimeSetLockPoll)
+	}
+}
+
+func releaseRuntimeSetLock(lock *runtimeSetLock) error {
+	if err := assertRuntimeSetLockOwner(lock); err != nil {
+		if lock != nil && lock.file != nil {
+			_ = lock.file.Close()
+		}
+		return err
+	}
+	released := lock.path + ".released-" + lock.token
+	if err := os.Rename(lock.path, released); err != nil {
+		_ = lock.file.Close()
+		return err
+	}
+	descriptorStatus, descriptorErr := lock.file.Stat()
+	releasedStatus, releasedErr := os.Lstat(released)
+	owner, ownerOK := runtimeSetLockOwner(released)
+	if descriptorErr != nil || releasedErr != nil ||
+		!runtimeSetSameLockObject(descriptorStatus, releasedStatus) ||
+		!ownerOK || owner.PID != os.Getpid() || owner.Token != lock.token {
+		restoreDisplacedRuntimeSetLock(released, lock.path, releasedStatus)
+		_ = lock.file.Close()
+		return fmt.Errorf(
+			"package-cache runtime-set publication lock ownership changed",
+		)
+	}
+	removeErr := os.Remove(released)
+	closeErr := lock.file.Close()
+	if removeErr != nil {
+		return removeErr
+	}
+	return closeErr
+}
+
+func attachRuntimeLockReleaseError(result *error, releaseErr error) {
+	if releaseErr == nil {
+		return
+	}
+	if *result == nil {
+		*result = releaseErr
+		return
+	}
+	*result = fmt.Errorf("%v; runtime lock release failed: %w", *result, releaseErr)
+}
+
+func publishRuntimeSetWithRecoveryAndRenamer(
+	sourceDirectory, destinationDirectory, binaryName, variant string,
+	verifier func(string) error,
+	renameFile func(string, string) error,
+) (result error) {
+	sourceNames, ok := runtimeSetNames(sourceDirectory, binaryName, variant)
+	if !ok {
+		return fmt.Errorf("source release does not contain a complete runtime set")
+	}
+	if verifier != nil {
+		if err := verifier(filepath.Join(sourceDirectory, binaryName)); err != nil {
+			return fmt.Errorf("source runtime binary failed verification: %w", err)
+		}
+	}
+	if err := os.MkdirAll(destinationDirectory, 0755); err != nil {
+		return err
+	}
+	if err := requireSafeRuntimeDirectory(destinationDirectory); err != nil {
+		return err
+	}
+	lock, err := acquireRuntimeSetLock(destinationDirectory)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if releaseErr := releaseWindowsPairLock(lock); result == nil && releaseErr != nil {
-			result = releaseErr
-		}
+		attachRuntimeLockReleaseError(&result, releaseRuntimeSetLock(lock))
 	}()
-
-	// A contender may have committed while this process waited. Preserve that
-	// complete pair regardless of whether its authenticated release variant is
-	// byte-identical to this contender.
-	if windowsPairReady(dstDir, verifier) {
+	if err := refreshRuntimeSetLock(lock); err != nil {
+		return err
+	}
+	if err := reconcileRuntimeBackups(
+		destinationDirectory, binaryName, variant, verifier, lock,
+	); err != nil {
+		return err
+	}
+	// A contender may have committed while this process waited. Its complete
+	// runtime set wins and is never retired or mixed with this contender.
+	if runtimeSetReady(destinationDirectory, binaryName, variant, verifier) {
 		return nil
 	}
 
-	transaction, err := windowsPairToken()
-	if err != nil {
-		return err
-	}
-	staged := make(map[string]string, len(names))
-	stagedDigests := make(map[string][sha256.Size]byte, len(names))
-	backups := make(map[string]string, len(names))
-	publishedDigests := make(map[string][sha256.Size]byte, len(names))
+	staged := make(map[string]string, len(sourceNames))
+	backupDirectory := ""
 	defer func() {
 		for _, stagedPath := range staged {
 			_ = os.Remove(stagedPath)
@@ -838,23 +2023,49 @@ func installWindowsPairAtomicallyWithVerifier(
 	}()
 
 	operationErr := func() error {
-		for _, name := range names {
-			stagePath := filepath.Join(
-				dstDir, ".cbm-pair-stage-"+transaction+"-"+name)
-			if err := copyWindowsPairStage(
-				filepath.Join(srcDir, name), stagePath); err != nil {
-				return err
-			}
-			staged[name] = stagePath
-			digest, err := fileSHA256(stagePath)
+		for _, name := range sourceNames {
+			stagedPath, err := copyRuntimeStage(
+				filepath.Join(sourceDirectory, name),
+				destinationDirectory,
+				name == binaryName,
+				func() error { return refreshRuntimeSetLock(lock) },
+			)
 			if err != nil {
 				return err
 			}
-			stagedDigests[name] = digest
+			staged[name] = stagedPath
+		}
+		if err := refreshRuntimeSetLock(lock); err != nil {
+			return err
+		}
+		var err error
+		backupDirectory, err = createRuntimeBackupDirectory(destinationDirectory)
+		if err != nil {
+			return err
 		}
 
-		for _, name := range names {
-			target := filepath.Join(dstDir, name)
+		entries, err := os.ReadDir(destinationDirectory)
+		if err != nil {
+			return err
+		}
+		retireNames := []string{binaryName, integrationsFileName}
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasPrefix(name, "cbm-ui-") && strings.HasSuffix(name, ".pack") {
+				retireNames = append(retireNames, name)
+			}
+		}
+		retired := make(map[string]struct{}, len(retireNames))
+		// Retire the executable first so a partial publication is never ready.
+		for _, name := range retireNames {
+			if err := assertRuntimeSetLockOwner(lock); err != nil {
+				return err
+			}
+			if _, duplicate := retired[name]; duplicate {
+				continue
+			}
+			retired[name] = struct{}{}
+			target := filepath.Join(destinationDirectory, name)
 			status, err := os.Lstat(target)
 			if os.IsNotExist(err) {
 				continue
@@ -862,65 +2073,102 @@ func installWindowsPairAtomicallyWithVerifier(
 			if err != nil {
 				return err
 			}
-			if !status.Mode().IsRegular() {
-				return fmt.Errorf(
-					"refusing unsafe Windows package-cache target: %s", target)
+			if !status.Mode().IsRegular() ||
+				!platformRuntimeSetFileLinkCountOne(target, status) {
+				return fmt.Errorf("refusing unsafe package-cache target: %s", target)
 			}
-			backup := filepath.Join(
-				dstDir, ".cbm-pair-backup-"+transaction+"-"+name)
-			if err := os.Rename(target, backup); err != nil {
+			backup := filepath.Join(backupDirectory, name)
+			if err := renameFile(target, backup); err != nil {
 				return err
 			}
-			backups[name] = backup
+		}
+		if err := assertRuntimeSetLockOwner(lock); err != nil {
+			return err
+		}
+		if runtimeBackupCrashObserver != nil {
+			if err := runtimeBackupCrashObserver(
+				runtimeBackupBeforeMarkerEvent, backupDirectory,
+			); err != nil {
+				return err
+			}
+		}
+		if err := createRuntimeBackupMarker(
+			backupDirectory, runtimeBackupRetired,
+		); err != nil {
+			return err
 		}
 
-		// Payload is the readiness signal and is deliberately published last.
-		for _, name := range names {
-			target := filepath.Join(dstDir, name)
-			if err := os.Rename(staged[name], target); err != nil {
+		// runtimeSetNames orders every sidecar before the binary readiness signal.
+		for _, name := range sourceNames {
+			if err := assertRuntimeSetLockOwner(lock); err != nil {
 				return err
 			}
+			target := filepath.Join(destinationDirectory, name)
+			if err := renameFile(staged[name], target); err != nil {
+				identical, compareErr := filesEqualSHA256(staged[name], target)
+				if compareErr != nil || !identical {
+					return err
+				}
+				_ = os.Remove(staged[name])
+			}
 			delete(staged, name)
-			publishedDigests[name] = stagedDigests[name]
 		}
-		if !windowsPairReady(dstDir, verifier) {
-			return fmt.Errorf("published Windows package-cache pair failed verification")
+		if !runtimeSetReady(destinationDirectory, binaryName, variant, verifier) {
+			return fmt.Errorf("published package-cache runtime set failed verification")
+		}
+		if err := assertRuntimeSetLockOwner(lock); err != nil {
+			return err
 		}
 		return nil
 	}()
 
-	if operationErr == nil || windowsPairReady(dstDir, verifier) {
-		for _, backup := range backups {
-			_ = os.Remove(backup)
+	if operationErr != nil {
+		if lockErr := assertRuntimeSetLockOwner(lock); lockErr != nil {
+			return fmt.Errorf("publication failed and lock ownership changed: %v: %w", operationErr, lockErr)
+		}
+	}
+	if operationErr == nil {
+		backup, err := inspectRuntimeBackupDirectory(
+			destinationDirectory, filepath.Base(backupDirectory), binaryName,
+		)
+		if err != nil {
+			return err
+		}
+		if err := cleanupRuntimeBackup(backup, lock); err != nil {
+			return err
 		}
 		return nil
 	}
-
-	// Roll back only files whose digest proves this transaction published them.
-	for index := len(names) - 1; index >= 0; index-- {
-		name := names[index]
-		digest, ok := publishedDigests[name]
-		target := filepath.Join(dstDir, name)
-		if ok && pathMatchesSHA256(target, digest) {
-			_ = os.Remove(target)
+	preserveWinner := runtimeSetReady(
+		destinationDirectory, binaryName, variant, verifier,
+	)
+	if backupDirectory != "" {
+		if recoveryErr := reconcileRuntimeBackups(
+			destinationDirectory, binaryName, variant, verifier, lock,
+		); recoveryErr != nil {
+			return fmt.Errorf(
+				"%v; package-cache recovery failed: %w", operationErr, recoveryErr,
+			)
 		}
 	}
-	for _, name := range names {
-		backup, ok := backups[name]
-		if !ok {
-			continue
-		}
-		target := filepath.Join(dstDir, name)
-		if _, err := os.Lstat(target); os.IsNotExist(err) {
-			_ = os.Rename(backup, target)
-		}
+	if preserveWinner {
+		return nil
 	}
 	return operationErr
 }
 
-func installWindowsPairAtomically(srcDir, dstDir string) error {
-	return installWindowsPairAtomicallyWithVerifier(
-		srcDir, dstDir, verifyCandidate)
+func publishRuntimeSetWithRecovery(
+	sourceDirectory, destinationDirectory, binaryName, variant string,
+	verifier func(string) error,
+) error {
+	return publishRuntimeSetWithRecoveryAndRenamer(
+		sourceDirectory,
+		destinationDirectory,
+		binaryName,
+		variant,
+		verifier,
+		os.Rename,
+	)
 }
 
 func execBinary(executable string, args []string) error {
@@ -932,4 +2180,165 @@ func execBinary(executable string, args []string) error {
 		return cmd.Run()
 	}
 	return syscall.Exec(executable, append([]string{executable}, args...), os.Environ())
+}
+
+func createMutationRuntimeSnapshot(
+	executable, variant string,
+	verifier func(string) error,
+	maintainLease func() error,
+) (snapshotDirectory, snapshotExecutable string, result error) {
+	sourceDirectory := filepath.Dir(executable)
+	binaryName := filepath.Base(executable)
+	names, ok := runtimeSetNames(sourceDirectory, binaryName, variant)
+	if !ok {
+		return "", "", fmt.Errorf(
+			"cached runtime assets changed before mutation snapshot",
+		)
+	}
+
+	snapshotDirectory, err := platformCreatePrivateMutationRuntimeDirectory()
+	if err != nil {
+		return "", "", err
+	}
+	createdDirectory := snapshotDirectory
+	defer func() {
+		if result != nil {
+			_ = os.RemoveAll(createdDirectory)
+		}
+	}()
+	if err := requireSafeRuntimeDirectory(snapshotDirectory); err != nil {
+		return "", "", fmt.Errorf(
+			"owner-private mutation runtime snapshot is unsafe: %w", err,
+		)
+	}
+
+	for _, name := range names {
+		sourcePath := filepath.Join(sourceDirectory, name)
+		expectedDigest, err := fileSHA256(sourcePath)
+		if err != nil {
+			return "", "", err
+		}
+		stagedPath, err := copyRuntimeStage(
+			sourcePath,
+			snapshotDirectory,
+			name == binaryName,
+			maintainLease,
+		)
+		if err != nil {
+			return "", "", err
+		}
+		stagedDigest, digestErr := fileSHA256(stagedPath)
+		if digestErr != nil || stagedDigest != expectedDigest ||
+			!pathMatchesSHA256(sourcePath, expectedDigest) {
+			_ = os.Remove(stagedPath)
+			return "", "", fmt.Errorf(
+				"cached runtime asset changed while mutation snapshot was copied: %s",
+				name,
+			)
+		}
+		if err := os.Rename(
+			stagedPath, filepath.Join(snapshotDirectory, name),
+		); err != nil {
+			_ = os.Remove(stagedPath)
+			return "", "", err
+		}
+	}
+
+	snapshotExecutable = filepath.Join(snapshotDirectory, binaryName)
+	if !runtimeSetReady(
+		snapshotDirectory, binaryName, variant, verifier,
+	) {
+		return "", "", fmt.Errorf(
+			"private mutation runtime snapshot failed verification",
+		)
+	}
+	return snapshotDirectory, snapshotExecutable, nil
+}
+
+func runMutationBinary(executable string, args []string) error {
+	cmd := exec.Command(executable, args...)
+	cmd.Env = mutationSnapshotEnvironment()
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func execBinaryWithRuntimeLockAndRunner(
+	executable string,
+	args []string,
+	variant string,
+	verifier func(string) error,
+	runner func(string, []string) error,
+) (result error) {
+	if runner == nil {
+		return fmt.Errorf("missing mutation runtime runner")
+	}
+	directory := filepath.Dir(executable)
+	if target, ok := mutationTargetDirectory(args); ok &&
+		pathsReferToSameDirectory(target, directory) {
+		return fmt.Errorf(
+			"refusing mutation target that overlaps the shared package cache: %s",
+			target,
+		)
+	}
+	if err := requireSafeRuntimeDirectory(directory); err != nil {
+		return err
+	}
+	lock, err := acquireRuntimeSetLock(directory)
+	if err != nil {
+		return err
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			attachRuntimeLockReleaseError(&result, releaseRuntimeSetLock(lock))
+		}
+	}()
+	if err := refreshRuntimeSetLock(lock); err != nil {
+		return err
+	}
+	if !runtimeSetReady(
+		directory, filepath.Base(executable), variant, verifier,
+	) {
+		return fmt.Errorf("cached runtime assets changed before mutation launch")
+	}
+	snapshotDirectory, snapshotExecutable, err := createMutationRuntimeSnapshot(
+		executable,
+		variant,
+		verifier,
+		func() error { return refreshRuntimeSetLock(lock) },
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// A hard-killed wrapper can bypass this cleanup while its native child
+		// still consumes adjacent snapshot assets. Do not scavenge such a
+		// directory by PID or age, and never replace the native command result
+		// merely because best-effort cleanup leaked an isolated private copy.
+		if cleanupErr := runtimeMutationSnapshotCleanup(snapshotDirectory); cleanupErr != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"codebase-memory-mcp: warning: private mutation snapshot cleanup failed: %v\n",
+				cleanupErr,
+			)
+		}
+	}()
+	releaseErr := releaseRuntimeSetLock(lock)
+	lockHeld = false
+	if releaseErr != nil {
+		return releaseErr
+	}
+	return runner(snapshotExecutable, args)
+}
+
+func execBinaryWithRuntimeLock(executable string, args []string) error {
+	return execBinaryWithRuntimeLockAndRunner(
+		executable,
+		args,
+		runtimeVariant(),
+		verifyCandidate,
+		runMutationBinary,
+	)
 }

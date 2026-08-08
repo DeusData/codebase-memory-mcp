@@ -11,6 +11,7 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "foundation/win_utf8.h"
 
 #include <limits.h>
 #include <stdatomic.h>
@@ -711,10 +712,17 @@ static bool runtime_process_image_reference_acquire(
     LARGE_INTEGER size_before;
     LARGE_INTEGER size_after;
     bool ok = runtime_windows_process_image_snapshot(process, &process_before);
-    HANDLE file = ok ? CreateFileW(process_before.path, GENERIC_READ,
-                                   FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                                   FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL)
-                     : INVALID_HANDLE_VALUE;
+    /* QueryFullProcessImageNameW returns a stable identity spelling for the
+     * before/after comparison, but its Win32/DOS form may exceed MAX_PATH.
+     * Keep that snapshot byte-for-byte and use an owned extended spelling only
+     * at the file-API boundary. */
+    wchar_t *open_path = ok ? cbm_wide_path_to_extended(process_before.path) : NULL;
+    HANDLE file = open_path
+                      ? CreateFileW(open_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                    NULL, OPEN_EXISTING,
+                                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL)
+                      : INVALID_HANDLE_VALUE;
+    free(open_path);
     ok = ok && runtime_windows_file_snapshot(file, &file_before, &size_before) &&
          (!fingerprint || cbm_daemon_build_fingerprint_native_file((uintptr_t)file, fingerprint)) &&
          runtime_windows_file_snapshot(file, &file_after, &size_after) &&

@@ -26,7 +26,7 @@ artifact through the canonical wrapper, exactly like the release venue:
   windows: test-infrastructure/vm/vm-smoke.sh with CBM_SMOKE_ARTIFACT_DIR
            (run inside the VM/CI msys2 shell)
 
-  --variant ui builds --with-ui and smokes the ui archive (Phase 15 embedded
+  --variant ui builds --with-ui and smokes the ui archive (Phase 15 external
   assets become mandatory — a standard binary cannot pass a ui run).
 
 Make passthrough (VAR=VAL): CC= CXX= STATIC=1 ... forwarded to build steps.
@@ -104,8 +104,8 @@ mkdir -p "$EXTRACT_DIR"
 if [ "$GOOS" = "windows" ]; then
     unzip -q -o "$WORK_DIR/$NAME.zip" -d "$EXTRACT_DIR"
     test -s "$EXTRACT_DIR/codebase-memory-mcp.exe"
-    # ONE binary per platform: a payload sibling means the AV-flagged launcher
-    # stub came back.
+    # ONE executable per runtime set: a payload sibling means the removed
+    # launcher split came back.
     test ! -e "$EXTRACT_DIR/codebase-memory-mcp.payload.exe"
     echo "=== smoke-artifact: smoking EXTRACTED $NAME.zip via vm-smoke.sh ==="
     SMOKE_ARCH="$GOARCH" SMOKE_VARIANT="$VARIANT" \

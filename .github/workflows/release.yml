@@ -214,29 +214,21 @@ jobs:
         run: |
           mkdir -p assets binaries
           gh release download "$VERSION" --dir assets --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip'
-          for f in assets/*.tar.gz; do
-            NAME=$(basename "$f" .tar.gz)
-            tar -xzf "$f" -C binaries/ 2>/dev/null || true
-            [ -f binaries/codebase-memory-mcp ] && mv binaries/codebase-memory-mcp "binaries/${NAME}"
-          done
-          for f in assets/*.zip; do
-            NAME=$(basename "$f" .zip)
-            unzip -o "$f" -d binaries/ 2>/dev/null || true
-            [ -f binaries/codebase-memory-mcp.exe ] && mv binaries/codebase-memory-mcp.exe "binaries/${NAME}.exe"
-          done
-          cp install.sh binaries/ 2>/dev/null || true
-          cp install.ps1 binaries/ 2>/dev/null || true
-          ls -la binaries/
+          scripts/ci/extract-release-archives.sh assets binaries \
+            --expect-archives=16 \
+            --expect-binaries=16 \
+            --expect-packs=8 \
+            --expect-runtime-files=64
 
-      - name: Security audits on all release files
+      - name: Security audits on all unique release objects
         run: |
-          # Audit every file that ships in the release archives — binaries,
-          # install scripts, LICENSE, and any future companion files.
+          # Audit every distinct archive/member/UI-asset byte sequence. The
+          # associations manifest preserves every shipped archive location.
           # security-strings.sh detects file type and applies binary-only
           # rules (URL allowlist, dangerous-command detection) only to real
           # binaries; for shell scripts it still runs credential and base64
           # pattern audits.
-          for f in binaries/*; do
+          for f in binaries/objects/*; do
             [ -f "$f" ] || continue
             echo "--- Auditing: $(basename "$f") ---"
             scripts/security-strings.sh "$f"
@@ -247,24 +239,50 @@ jobs:
         id: virustotal
         with:
           vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
-          files: binaries/*
+          files: binaries/objects/*
+          request_rate: 4
 
-      # ZERO tolerance: any detection on any artifact blocks the release.
-      # False positives are resolved upstream (Microsoft false-positive
-      # submission for the exact hashes, then re-run this job — no rebuild),
-      # never by loosening this gate.
+      # ZERO tolerance: every artifact must arrive naturally clean. Any
+      # malicious or suspicious verdict blocks the release with no exception.
       - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
           VT_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
+          VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
+          VT_ASSOCIATIONS: binaries/associations.tsv
+          VT_RESULTS_PATH: binaries/vt-results.tsv
+          MIN_ENGINES: 50
         run: scripts/ci/check-virustotal.sh
 
-      # Renders per-binary sha256 + VT links into the notes; only reachable
-      # after the zero-tolerance gate passed, so "0 detections" is verified.
+      - name: Preserve VirusTotal scope and result evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: virustotal-evidence-release-${{ github.run_id }}
+          path: |
+            binaries/associations.tsv
+            binaries/scan-set.tsv
+            binaries/vt-results.tsv
+          if-no-files-found: warn
+
+      - name: Publish durable public VirusTotal evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
+          VT_ASSOCIATIONS: binaries/associations.tsv
+          VT_RESULTS_PATH: binaries/vt-results.tsv
+        run: bash scripts/ci/publish-vt-evidence.sh
+
+      # Renders the exact scan scope plus archive SHA-256/engine evidence. It
+      # runs only after the exact-set zero-tolerance gate passed.
       - name: Append VirusTotal scan links to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
+          VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
+          VT_ASSOCIATIONS: binaries/associations.tsv
+          VT_RESULTS_PATH: binaries/vt-results.tsv
         run: bash scripts/ci/append-vt-notes.sh
 
   # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
