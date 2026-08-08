@@ -302,6 +302,45 @@ TEST(pattern_dts_full) {
 
 /* ── File discovery (integration) — cross-platform via test_helpers.h ── */
 
+/* A custom CBM_CACHE_DIR may legitimately sit inside a repository — tests do it
+ * routinely. Walking into it would pull every other project's graph database into
+ * this project's file list, so the walk prunes it by absolute path. */
+TEST(discover_prunes_the_cache_tree) {
+    char *base = th_mktempdir("cbm_disc_cache");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    /* Source-looking files inside the cache must not be discovered. */
+    th_write_file(TH_PATH(base, "cache/other_project/leaked.go"), "package leaked\n");
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", base);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT(strstr(files[i].rel_path, "leaked.go") == NULL);
+    }
+    ASSERT_EQ(count, 1); /* only src/main.go */
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_simple) {
     char *base = th_mktempdir("cbm_disc_simple");
     ASSERT(base != NULL);
@@ -1411,6 +1450,7 @@ TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership) {
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
+    RUN_TEST(discover_prunes_the_cache_tree);
     /* Directory skip — always */
     RUN_TEST(skip_git);
     RUN_TEST(skip_node_modules);

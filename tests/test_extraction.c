@@ -13,9 +13,16 @@
 #include "macro_table.h"
 #include "iris_export_xml.h"
 #include "lang_specs.h"
+#include "extract_unified.h"
 #include <semantic/ast_profile.h>
 
 /* ── Helpers ───────────────────────────────────────────────────── */
+
+TEST(extract_unified_null_context_is_noop) {
+    cbm_extract_unified(NULL);
+    cbm_extract_unified_calls_only(NULL);
+    PASS();
+}
 
 /* Check if any definition with the given label has the given name. */
 static int has_def(CBMFileResult *r, const char *label, const char *name) {
@@ -47,8 +54,7 @@ static int has_call(CBMFileResult *r, const char *callee) {
 /* Check if any call exactly matches the given callee. */
 static int has_call_exact(CBMFileResult *r, const char *callee) {
     for (int i = 0; i < r->calls.count; i++) {
-        if (r->calls.items[i].callee_name &&
-            strcmp(r->calls.items[i].callee_name, callee) == 0)
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0)
             return 1;
     }
     return 0;
@@ -92,8 +98,7 @@ static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *
                               const char *must_not_contain) {
     for (int i = 0; i < r->calls.count; i++) {
         const CBMCall *c = &r->calls.items[i];
-        if (!c->callee_name || !c->enclosing_func_qn ||
-            strstr(c->callee_name, callee) == NULL) {
+        if (!c->callee_name || !c->enclosing_func_qn || strstr(c->callee_name, callee) == NULL) {
             continue;
         }
         if (must_contain && strstr(c->enclosing_func_qn, must_contain) == NULL) {
@@ -154,6 +159,51 @@ static CBMFileResult *extract_with_macros(const char *src, CBMLanguage lang, con
     return r;
 }
 
+TEST(extract_crash_journal_balances_one_start_one_done) {
+    char marker[CBM_PATH_MAX];
+    int written = snprintf(marker, sizeof(marker), "%s/cbm-extract-journal-XXXXXX", cbm_tmpdir());
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(marker));
+
+    int marker_fd = cbm_mkstemp_s(marker, sizeof(marker));
+    ASSERT_TRUE(marker_fd >= 0);
+    ASSERT_EQ(cbm_close_fd(marker_fd), 0);
+
+    const char *old_marker = getenv("CBM_INDEX_MARKER_FILE");
+    char *saved_marker = old_marker ? cbm_strdup(old_marker) : NULL;
+    bool env_set = cbm_setenv("CBM_INDEX_MARKER_FILE", marker, 1) == 0;
+
+    CBMFileResult *r = env_set ? extract("def journal():\n    return 1\n", CBM_LANG_PYTHON,
+                                         "journal", "journal.py")
+                               : NULL;
+
+    char journal[CBM_SZ_256] = {0};
+    size_t journal_len = 0;
+    FILE *stream = cbm_fopen(marker, "rb");
+    if (stream) {
+        journal_len = fread(journal, SKIP_ONE, sizeof(journal) - SKIP_ONE, stream);
+        (void)fclose(stream);
+    }
+
+    if (saved_marker) {
+        (void)cbm_setenv("CBM_INDEX_MARKER_FILE", saved_marker, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_INDEX_MARKER_FILE");
+    }
+    free(saved_marker);
+    (void)cbm_unlink(marker);
+
+    bool extraction_ok = r && !r->has_error;
+    cbm_free_result(r);
+
+    ASSERT_TRUE(env_set);
+    ASSERT_TRUE(stream != NULL);
+    ASSERT_TRUE(extraction_ok);
+    ASSERT_EQ(journal_len, strlen("S journal.py\nD journal.py\n"));
+    ASSERT_STR_EQ(journal, "S journal.py\nD journal.py\n");
+    PASS();
+}
+
 TEST(extract_javascript_channel_identifier_after_former_constant_limit) {
     enum { CHANNEL_TEST_BINDINGS = CBM_SZ_256 + CBM_SZ_64 };
     char *source = calloc(CBM_SZ_32K, SKIP_ONE);
@@ -166,8 +216,8 @@ TEST(extract_javascript_channel_identifier_after_former_constant_limit) {
         ASSERT_LT((size_t)n, CBM_SZ_32K - used);
         used += (size_t)n;
     }
-    int n = snprintf(source + used, CBM_SZ_32K - used,
-                     "socket.emit(CHANNEL_%03d, payload);\n", CHANNEL_TEST_BINDINGS - SKIP_ONE);
+    int n = snprintf(source + used, CBM_SZ_32K - used, "socket.emit(CHANNEL_%03d, payload);\n",
+                     CHANNEL_TEST_BINDINGS - SKIP_ONE);
     ASSERT_GT(n, 0);
     ASSERT_LT((size_t)n, CBM_SZ_32K - used);
 
@@ -186,14 +236,14 @@ TEST(extract_python_channel_identifier_after_former_constant_limit) {
     ASSERT_NOT_NULL(source);
     size_t used = 0;
     for (int i = 0; i < CHANNEL_TEST_BINDINGS; i++) {
-        int n = snprintf(source + used, CBM_SZ_32K - used,
-                         "CHANNEL_%03d = \"channel-%03d\"\n", i, i);
+        int n =
+            snprintf(source + used, CBM_SZ_32K - used, "CHANNEL_%03d = \"channel-%03d\"\n", i, i);
         ASSERT_GT(n, 0);
         ASSERT_LT((size_t)n, CBM_SZ_32K - used);
         used += (size_t)n;
     }
-    int n = snprintf(source + used, CBM_SZ_32K - used,
-                     "sio.emit(CHANNEL_%03d, payload)\n", CHANNEL_TEST_BINDINGS - SKIP_ONE);
+    int n = snprintf(source + used, CBM_SZ_32K - used, "sio.emit(CHANNEL_%03d, payload)\n",
+                     CHANNEL_TEST_BINDINGS - SKIP_ONE);
     ASSERT_GT(n, 0);
     ASSERT_LT((size_t)n, CBM_SZ_32K - used);
 
@@ -299,16 +349,16 @@ TEST(extract_c_macro_option_is_per_call) {
                       "int main(void) { return FAST_SKIP_ME; }\n";
 
     cbm_set_macro_extraction(1);
-    CBMFileResult *full = cbm_extract_file_with_options(
-        src, (int)strlen(src), CBM_LANG_C, "p", "macro_option.c", 0, NULL, NULL, true);
+    CBMFileResult *full = cbm_extract_file_with_options(src, (int)strlen(src), CBM_LANG_C, "p",
+                                                        "macro_option.c", 0, NULL, NULL, true);
     ASSERT_NOT_NULL(full);
     ASSERT_FALSE(full->has_error);
     ASSERT(has_def(full, "Macro", "FAST_SKIP_ME"));
     ASSERT(has_def(full, "Function", "main"));
     cbm_free_result(full);
 
-    CBMFileResult *fast = cbm_extract_file_with_options(
-        src, (int)strlen(src), CBM_LANG_C, "p", "macro_option.c", 0, NULL, NULL, false);
+    CBMFileResult *fast = cbm_extract_file_with_options(src, (int)strlen(src), CBM_LANG_C, "p",
+                                                        "macro_option.c", 0, NULL, NULL, false);
     ASSERT_NOT_NULL(fast);
     ASSERT_FALSE(fast->has_error);
     ASSERT_FALSE(has_def(fast, "Macro", "FAST_SKIP_ME"));
@@ -321,8 +371,8 @@ TEST(extract_c_macro_option_is_per_call) {
 TEST(extract_c_macro_expanded_pass_is_calls_only) {
     const char *src = "#define FILTER_ENV() getenv(\"CBM_ONLY_TEST\")\n"
                       "int main(void) { return FILTER_ENV() != 0; }\n";
-    CBMFileResult *r = cbm_extract_file_with_options(
-        src, (int)strlen(src), CBM_LANG_C, "p", "macro_env.c", 0, NULL, NULL, true);
+    CBMFileResult *r = cbm_extract_file_with_options(src, (int)strlen(src), CBM_LANG_C, "p",
+                                                     "macro_env.c", 0, NULL, NULL, true);
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call(r, "getenv"));
@@ -536,7 +586,7 @@ TEST(java_interface) {
     PASS();
 }
 
-TEST(java_method_reference_emits_call_site) {
+TEST(java_method_reference_is_not_call_site) {
     CBMFileResult *r = extract("import java.util.*;\n"
                                "class App {\n"
                                "  void run(List<String> xs) { xs.stream().map(String::trim); }\n"
@@ -544,7 +594,55 @@ TEST(java_method_reference_emits_call_site) {
                                CBM_LANG_JAVA, "t", "App.java");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT(has_call_exact(r, "trim"));
+    ASSERT_FALSE(has_call_exact(r, "trim"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Regression for #1234: Java interface/enum methods were emitted as both a
+ * Method node (correct, via extract_class_methods) and a duplicate Function
+ * node (incorrect, via walk_defs). Prevention in push_class_body_children
+ * (gated to Java) recognizes interface_body and enum_body as class body
+ * containers, stopping the fallback path from re-walking method_declaration
+ * children as top-level functions. */
+TEST(java_interface_no_duplicate_function_issue1234) {
+    CBMFileResult *r =
+        extract("public interface MarketplaceService {\n"
+                "    ReservationDTO createReservation(Authentication auth, RequestDTO req);\n"
+                "    void cancelReservation(long id);\n"
+                "}\n",
+                CBM_LANG_JAVA, "t", "MarketplaceService.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_def(r, "Interface", "MarketplaceService"));
+    ASSERT(has_def(r, "Method", "createReservation"));
+    ASSERT(has_def(r, "Method", "cancelReservation"));
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(java_enum_dedup_preserves_calls_issue1234) {
+    CBMFileResult *r =
+        extract("package app;\n\nenum Day {\n"
+                "    MON, TUE, WED, THU, FRI, SAT, SUN;\n\n"
+                "    public boolean isWeekend() { return this == SAT || this == SUN; }\n"
+                "    public String label() { return name().toLowerCase(); }\n}\n\n"
+                "class DayUtil {\n"
+                "    static String describe(Day d) {\n"
+                "        return d.label() + (d.isWeekend() ? \"(rest)\" : \"(work)\");\n    }\n}\n",
+                CBM_LANG_JAVA, "t", "Day.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_def(r, "Enum", "Day"));
+    ASSERT(has_def(r, "Method", "isWeekend"));
+    ASSERT(has_def(r, "Method", "label"));
+    ASSERT(has_def(r, "Class", "DayUtil"));
+    ASSERT(has_def(r, "Method", "describe"));
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -997,11 +1095,10 @@ TEST(c_function) {
 }
 
 TEST(c_function_return_type_preserves_pointer_and_qualifier) {
-    CBMFileResult *r =
-        extract("static const char *text_end(const char *text) { return text; }\n"
-                "char **table(void) { return 0; }\n"
-                "int scalar(void) { return 0; }\n",
-                CBM_LANG_C, "t", "returns.c");
+    CBMFileResult *r = extract("static const char *text_end(const char *text) { return text; }\n"
+                               "char **table(void) { return 0; }\n"
+                               "int scalar(void) { return 0; }\n",
+                               CBM_LANG_C, "t", "returns.c");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
@@ -1055,13 +1152,12 @@ TEST(cpp_class) {
 }
 
 TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
-    CBMFileResult *r =
-        extract("class Text {\n"
-                "public:\n"
-                "    const char *end() { return nullptr; }\n"
-                "    char **table() { return nullptr; }\n"
-                "};\n",
-                CBM_LANG_CPP, "t", "text.cpp");
+    CBMFileResult *r = extract("class Text {\n"
+                               "public:\n"
+                               "    const char *end() { return nullptr; }\n"
+                               "    char **table() { return nullptr; }\n"
+                               "};\n",
+                               CBM_LANG_CPP, "t", "text.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
@@ -1503,8 +1599,8 @@ TEST(julia_function) {
 }
 
 TEST(julia_short_form_assignment_function) {
-    CBMFileResult *r = extract("helper(x) = x + 1\nrun(y) = helper(y)\nvalue = 5\n",
-                               CBM_LANG_JULIA, "t", "math.jl");
+    CBMFileResult *r = extract("helper(x) = x + 1\nrun(y) = helper(y)\nvalue = 5\n", CBM_LANG_JULIA,
+                               "t", "math.jl");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "helper"));
@@ -1542,9 +1638,8 @@ TEST(nix_function) {
 }
 
 TEST(jsonnet_function_call_edge) {
-    CBMFileResult *r =
-        extract("local helper(x) = x + 1;\n{ value: helper(41) }\n", CBM_LANG_JSONNET, "t",
-                "lib.jsonnet");
+    CBMFileResult *r = extract("local helper(x) = x + 1;\n{ value: helper(41) }\n",
+                               CBM_LANG_JSONNET, "t", "lib.jsonnet");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_exact(r, "helper"));
@@ -1553,8 +1648,8 @@ TEST(jsonnet_function_call_edge) {
 }
 
 TEST(typst_function_call_edge) {
-    CBMFileResult *r = extract("#let greet(name) = name\n#greet(\"Ada\")\n", CBM_LANG_TYPST,
-                               "t", "doc.typ");
+    CBMFileResult *r =
+        extract("#let greet(name) = name\n#greet(\"Ada\")\n", CBM_LANG_TYPST, "t", "doc.typ");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_exact(r, "greet"));
@@ -1599,22 +1694,21 @@ TEST(func_function_application_edge) {
 }
 
 TEST(vhdl_function_call_edge) {
-    CBMFileResult *r =
-        extract("entity test is\n"
-                "end entity;\n"
-                "architecture rtl of test is\n"
-                "  function add(x : integer; y : integer) return integer is\n"
-                "  begin\n"
-                "    return x + y;\n"
-                "  end function;\n"
-                "begin\n"
-                "  process\n"
-                "    variable z : integer;\n"
-                "  begin\n"
-                "    z := add(1, 2);\n"
-                "  end process;\n"
-                "end rtl;\n",
-                CBM_LANG_VHDL, "t", "adder.vhd");
+    CBMFileResult *r = extract("entity test is\n"
+                               "end entity;\n"
+                               "architecture rtl of test is\n"
+                               "  function add(x : integer; y : integer) return integer is\n"
+                               "  begin\n"
+                               "    return x + y;\n"
+                               "  end function;\n"
+                               "begin\n"
+                               "  process\n"
+                               "    variable z : integer;\n"
+                               "  begin\n"
+                               "    z := add(1, 2);\n"
+                               "  end process;\n"
+                               "end rtl;\n",
+                               CBM_LANG_VHDL, "t", "adder.vhd");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_exact(r, "add"));
@@ -1637,6 +1731,7 @@ TEST(verilog_function_call_edge) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_exact(r, "foo"));
+    ASSERT_EQ(r->calls.count, 1);
     cbm_free_result(r);
     PASS();
 }
@@ -2116,7 +2211,7 @@ TEST(cpp_operator_and_implicit_calls_emit_call_sites) {
     ASSERT(has_call_exact(r, "Vec"));
     ASSERT(has_call_exact(r, "operator+"));
     ASSERT(has_call_exact(r, "operator bool"));
-    ASSERT(has_call_exact(r, "p"));
+    ASSERT(has_call_exact(r, "~"));
     cbm_free_result(r);
     PASS();
 }
@@ -2125,14 +2220,13 @@ TEST(cpp_operator_and_implicit_calls_emit_call_sites) {
  * node when multiple tests share a file. Each must mint a distinct Function
  * node whose name encodes the suite and case arguments. */
 TEST(cpp_gtest_same_name_collision_issue1266) {
-    CBMFileResult *r = extract(
-        "namespace demo { int assembleWidget(int s) { return s * 2; } }\n"
-        "TEST(WidgetSuite, DoublesSmallSize) { demo::assembleWidget(1); }\n"
-        "TEST(WidgetSuite, DoublesZero) { demo::assembleWidget(0); }\n"
-        "TEST(WidgetSuite, DoublesLargeSize) {\n"
-        "  demo::assembleWidget(1000);\n"
-        "}\n",
-        CBM_LANG_CPP, "t", "direct_test.cpp");
+    CBMFileResult *r = extract("namespace demo { int assembleWidget(int s) { return s * 2; } }\n"
+                               "TEST(WidgetSuite, DoublesSmallSize) { demo::assembleWidget(1); }\n"
+                               "TEST(WidgetSuite, DoublesZero) { demo::assembleWidget(0); }\n"
+                               "TEST(WidgetSuite, DoublesLargeSize) {\n"
+                               "  demo::assembleWidget(1000);\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "direct_test.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesSmallSize"));
     ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesZero"));
@@ -2144,10 +2238,9 @@ TEST(cpp_gtest_same_name_collision_issue1266) {
 
 /* #1266: TEST_F fixture macro also produces unique names. */
 TEST(cpp_gtest_f_unique_name_issue1266) {
-    CBMFileResult *r = extract(
-        "TEST_F(MyFixture, FirstTest) { doStuff(); }\n"
-        "TEST_F(MyFixture, SecondTest) { doOtherStuff(); }\n",
-        CBM_LANG_CPP, "t", "fixture_test.cpp");
+    CBMFileResult *r = extract("TEST_F(MyFixture, FirstTest) { doStuff(); }\n"
+                               "TEST_F(MyFixture, SecondTest) { doOtherStuff(); }\n",
+                               CBM_LANG_CPP, "t", "fixture_test.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Function", "TEST_F_MyFixture_FirstTest"));
     ASSERT(has_def(r, "Function", "TEST_F_MyFixture_SecondTest"));
@@ -2439,10 +2532,9 @@ TEST(scss_rules) {
 }
 
 TEST(scss_function_call_edge) {
-    CBMFileResult *r =
-        extract("@function double($x) { @return $x * 2; }\n"
-                "@function use-double($x) { @return double($x); }\n",
-                CBM_LANG_SCSS, "t", "styles.scss");
+    CBMFileResult *r = extract("@function double($x) { @return $x * 2; }\n"
+                               "@function use-double($x) { @return double($x); }\n",
+                               CBM_LANG_SCSS, "t", "styles.scss");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_enclosing(r, "double", "use-double", NULL));
@@ -3943,9 +4035,9 @@ TEST(extract_ts_decorators_survive_interleaved_comment) {
     ASSERT_FALSE(r->has_error);
     const CBMDefinition *m = find_def_by_name(r, "login");
     ASSERT_NOT_NULL(m);
-    ASSERT(decorators_contain(m, "Throttle"));  /* below the comment — always worked */
-    ASSERT(decorators_contain(m, "HttpCode"));  /* above the comment — was dropped */
-    ASSERT(decorators_contain(m, "Post"));      /* above the comment — was dropped */
+    ASSERT(decorators_contain(m, "Throttle")); /* below the comment — always worked */
+    ASSERT(decorators_contain(m, "HttpCode")); /* above the comment — was dropped */
+    ASSERT(decorators_contain(m, "Post"));     /* above the comment — was dropped */
     cbm_free_result(r);
     PASS();
 }
@@ -3989,7 +4081,6 @@ TEST(extract_ts_template_string_url_issue1006) {
     cbm_free_result(r);
     PASS();
 }
-
 
 /* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
  * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
@@ -4356,6 +4447,30 @@ TEST(complexity_linear_scan_in_loop) {
     const CBMDefinition *d = find_def(r, "scanInLoop");
     ASSERT_NOT_NULL(d);
     ASSERT_GT(d->linear_scan_in_loop, 0); /* contains() called inside the for-loop */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Nested definitions overlap by source range. The call belongs only to the
+ * smallest enclosing callable, exercising the interval-heap attribution path. */
+TEST(complexity_nested_call_metrics_use_innermost_definition) {
+    CBMFileResult *r = extract("function outer(xs) {\n"
+                               "    function inner() {\n"
+                               "        for (const item of xs) {\n"
+                               "            contains(xs, item);\n"
+                               "        }\n"
+                               "    }\n"
+                               "    return inner();\n"
+                               "}\n",
+                               CBM_LANG_JAVASCRIPT, "t", "nested_metrics.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *outer = find_def(r, "outer");
+    const CBMDefinition *inner = find_def(r, "inner");
+    ASSERT_NOT_NULL(outer);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_EQ(outer->linear_scan_in_loop, 0);
+    ASSERT_GT(inner->linear_scan_in_loop, 0);
     cbm_free_result(r);
     PASS();
 }
@@ -5287,6 +5402,87 @@ TEST(extract_wide_flat_file_is_linear) {
     PASS();
 }
 
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+/* A flat block of value-reference statements exercises occurrence-role
+ * classification for every identifier. The old parent/child field lookup
+ * restarts at the block's first child for each statement, so 8x more source
+ * produces about 64x more lookup work. Count work instead of wall time: this
+ * RED is deterministic, sanitizer-independent, and finishes quickly even on
+ * the known-quadratic implementation. */
+static uint64_t extract_wide_reference_field_work(int statement_count, int *out_usages,
+                                                  uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "function target() {}\nfunction wide() {\n";
+    static const char statement[] = "  target;\n";
+    static const char suffix[] = "}\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement) + sizeof(suffix);
+    char *source = malloc(capacity);
+    if (!source) {
+        return UINT64_MAX;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    memcpy(source + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix) - 1U;
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result = cbm_extract_file(source, (int)offset, CBM_LANG_JAVASCRIPT, "proj",
+                                             "wide-references.js", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return UINT64_MAX;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "target") == 0) {
+            usages++;
+        }
+    }
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return work;
+}
+
+TEST(extract_wide_flat_reference_fields_are_linear) {
+    enum { SMALL = 128, BIG = 1024, INPUT_GROWTH = 8, WORK_RATIO_MAX = 12 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_slow_parent_fallbacks = 0;
+    uint64_t big_slow_parent_fallbacks = 0;
+    uint64_t small_work =
+        extract_wide_reference_field_work(SMALL, &small_usages, &small_slow_parent_fallbacks);
+    uint64_t big_work =
+        extract_wide_reference_field_work(BIG, &big_usages, &big_slow_parent_fallbacks);
+    ASSERT_TRUE(small_work != UINT64_MAX);
+    ASSERT_TRUE(big_work != UINT64_MAX);
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    ASSERT_EQ(small_slow_parent_fallbacks, 0);
+    ASSERT_EQ(big_slow_parent_fallbacks, 0);
+    ASSERT_GTE(small_work, (uint64_t)SMALL);
+    fprintf(stderr, "  [wide-reference-fields] work(%d)=%llu work(%d)=%llu input_growth=%dx\n",
+            SMALL, (unsigned long long)small_work, BIG, (unsigned long long)big_work, INPUT_GROWTH);
+    uint64_t maximum = small_work * WORK_RATIO_MAX + 256U;
+    if (big_work > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "wide-reference field lookup grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- quadratic sibling scan",
+                 (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
+                 WORK_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+#endif
+
 /* ===================================================================
  * Group H3: ObjectScript return type extraction
  * =================================================================== */
@@ -6109,6 +6305,9 @@ SUITE(extraction) {
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+    RUN_TEST(extract_wide_flat_reference_fields_are_linear);
+#endif
 
     /* Perl call-graph noise (#459 follow-up) */
     RUN_TEST(extract_perl_config_string_not_a_callee);
@@ -6175,7 +6374,9 @@ SUITE(extraction) {
     RUN_TEST(java_class);
     RUN_TEST(java_method);
     RUN_TEST(java_interface);
-    RUN_TEST(java_method_reference_emits_call_site);
+    RUN_TEST(java_method_reference_is_not_call_site);
+    RUN_TEST(java_interface_no_duplicate_function_issue1234);
+    RUN_TEST(java_enum_dedup_preserves_calls_issue1234);
     RUN_TEST(java_class_extends_and_implements);
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
@@ -6376,6 +6577,7 @@ SUITE(extraction) {
     RUN_TEST(julia_function_with_args);
 
     /* Cross-cutting */
+    RUN_TEST(extract_unified_null_context_is_noop);
     RUN_TEST(python_calls);
     RUN_TEST(python_resolvable_builtin_calls);
     RUN_TEST(python_iris_classMethodValue);
@@ -6430,6 +6632,7 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     /* restored from merge base */
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_crash_journal_balances_one_start_one_done);
     RUN_TEST(extract_javascript_channel_identifier_after_former_constant_limit);
     RUN_TEST(extract_python_channel_identifier_after_former_constant_limit);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
@@ -6449,6 +6652,7 @@ SUITE(extraction) {
     RUN_TEST(complexity_loop_with_branch);
     RUN_TEST(complexity_flat_no_loops);
     RUN_TEST(complexity_linear_scan_in_loop);
+    RUN_TEST(complexity_nested_call_metrics_use_innermost_definition);
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
     RUN_TEST(complexity_super_only_not_recursive);

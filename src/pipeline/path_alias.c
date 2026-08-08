@@ -463,6 +463,7 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
     }
     for (int i = 0; i < coll->count; i++) {
         free(coll->scopes[i].dir_prefix);
+        free(coll->scopes[i].source_rel_path);
         path_alias_map_free(coll->scopes[i].map);
     }
     free(coll->scopes);
@@ -894,11 +895,28 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         if (!map) {
             continue;
         }
-        coll->scopes[coll->count].dir_prefix =
-            path_alias_test_allocation_should_fail(PATH_ALIAS_ALLOC_SCOPE_PREFIX)
-                ? NULL
-                : cbm_strdup(hits.items[i].rel);
-        if (!coll->scopes[coll->count].dir_prefix) {
+        const char *base = strrchr(hits.items[i].abs, '/');
+        base = base ? base + 1 : hits.items[i].abs;
+        size_t selected_size = strlen(base) + 1U;
+        if (hits.items[i].rel[0] &&
+            (!path_alias_size_add(&selected_size, strlen(hits.items[i].rel)) ||
+             !path_alias_size_add(&selected_size, 1U))) {
+            path_alias_map_free(map);
+            alias_config_hits_free(&hits);
+            cbm_path_alias_collection_free(coll);
+            return NULL;
+        }
+        char *dir_prefix = path_alias_test_allocation_should_fail(PATH_ALIAS_ALLOC_SCOPE_PREFIX)
+                               ? NULL
+                               : cbm_strdup(hits.items[i].rel);
+        char *source_rel_path = malloc(selected_size);
+        if (source_rel_path) {
+            snprintf(source_rel_path, selected_size, "%s%s%s", hits.items[i].rel,
+                     hits.items[i].rel[0] ? "/" : "", base);
+        }
+        if (!dir_prefix || !source_rel_path) {
+            free(dir_prefix);
+            free(source_rel_path);
             path_alias_map_free(map);
             cbm_log_warn("path_alias.collection_failed", "path", hits.items[i].abs, "reason",
                          "scope_allocation_failed");
@@ -906,6 +924,8 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
             cbm_path_alias_collection_free(coll);
             return NULL;
         }
+        coll->scopes[coll->count].dir_prefix = dir_prefix;
+        coll->scopes[coll->count].source_rel_path = source_rel_path;
         coll->scopes[coll->count].map = map;
         coll->count++;
     }

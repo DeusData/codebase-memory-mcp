@@ -18,7 +18,6 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
-#include <stdatomic.h>
 
 #include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
 #include "foundation/constants.h" /* CBM_SZ_512 */
@@ -87,8 +86,16 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * background indexing threads have been joined.  Safe to call multiple times. */
 void cbm_pipeline_global_cleanup(void);
 
-/* Run the full indexing pipeline. Returns 0 on success, -1 on error.
- * Discovers files, extracts, resolves, and dumps to SQLite. */
+/* Run the full indexing pipeline. Discovers files, extracts, resolves, and
+ * dumps to SQLite. Returns 0 on success and non-zero on failure.
+ *
+ * Treating any non-zero as "the run failed" is always correct. Callers that
+ * need to know whether the PREVIOUS generation survived can distinguish the
+ * failures by value: the run publishes by renaming a fully validated staging
+ * database over the destination, so every abort before that rename leaves the
+ * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
+ * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
+ * stages that raise them. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */

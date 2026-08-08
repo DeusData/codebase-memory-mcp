@@ -592,6 +592,20 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
 void cbm_hook_augment_arm_deadline(void);
 char *cbm_hook_augment_read_stdin(void);
 
+/* Why a hook client is not augmenting. The hook caller only ever sees stdout,
+ * so each reason that is actionable by the user must have a stdout notice
+ * (#1388: a build-conflicted daemon used to report on stderr alone, which is
+ * invisible in-session and reads as silent skips). */
+typedef enum {
+    CBM_HOOK_ADMISSION_DAEMON_ABSENT = 0, /* no daemon running: `daemon start` heals it */
+    CBM_HOOK_ADMISSION_BUILD_CONFLICT     /* daemon runs another build: needs `daemon stop` */
+} cbm_hook_admission_t;
+
+/* The JSON systemMessage a hook client must print on stdout for `reason`, or
+ * NULL when nothing should be printed. hook_dialect NULL = Claude Code, the
+ * only dialect that surfaces a stdout systemMessage to the user. */
+const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *hook_dialect);
+
 /* Process one already-read hook payload using a caller-owned MCP session.
  * Returns a malloc-owned hook output JSON string, or NULL for fail-open/no
  * augmentation. This is the daemon entry; it never arms a process-global

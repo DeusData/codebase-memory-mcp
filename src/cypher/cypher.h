@@ -302,6 +302,11 @@ typedef struct {
     int arg_count;
 } cbm_return_item_t;
 
+/* Upper bound on ORDER BY sort keys. Queries with more keys are rejected at
+ * parse time: an unmodeled key must be a loud error, never a silently dropped
+ * remainder (#1334 - the unconsumed tail swallowed the LIMIT clause). */
+#define CBM_CYPHER_ORDER_KEYS_MAX 8
+
 typedef struct {
     const char *expression; /* projected name, variable.property, or aggregate */
     const char *direction;  /* "ASC" or "DESC"; NULL means ascending */

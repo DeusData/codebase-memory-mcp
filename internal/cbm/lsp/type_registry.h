@@ -5,18 +5,24 @@
 #include "../arena.h"
 #include <stdbool.h>
 
-// Decorator-derived flags (Python). Added at struct tail so existing
+// Language-specific function metadata. Added at struct tail so existing
 // callers that memset to zero before populating other fields keep working.
 typedef enum {
     CBM_FUNC_FLAG_NONE = 0,
-    CBM_FUNC_FLAG_PROPERTY = 1 << 0,       // @property -> obj.attr returns getter return
-    CBM_FUNC_FLAG_CLASSMETHOD = 1 << 1,    // @classmethod -> first arg is cls (the class)
-    CBM_FUNC_FLAG_STATICMETHOD = 1 << 2,   // @staticmethod -> no implicit self/cls
-    CBM_FUNC_FLAG_ABSTRACTMETHOD = 1 << 3, // @abstractmethod -> still callable for resolution
-    CBM_FUNC_FLAG_OVERLOAD = 1 << 4,       // @overload entry — non-implementation stub
-    CBM_FUNC_FLAG_ASYNC = 1 << 5,          // async def — return is Coroutine[..., T]
-    CBM_FUNC_FLAG_GENERATOR = 1 << 6,      // contains yield — return is Generator[T, ...]
-    CBM_FUNC_FLAG_FINAL = 1 << 7,          // @final — overrides not allowed
+    CBM_FUNC_FLAG_PROPERTY = 1 << 0,        // @property -> obj.attr returns getter return
+    CBM_FUNC_FLAG_CLASSMETHOD = 1 << 1,     // @classmethod -> first arg is cls (the class)
+    CBM_FUNC_FLAG_STATICMETHOD = 1 << 2,    // @staticmethod -> no implicit self/cls
+    CBM_FUNC_FLAG_ABSTRACTMETHOD = 1 << 3,  // @abstractmethod -> still callable for resolution
+    CBM_FUNC_FLAG_OVERLOAD = 1 << 4,        // @overload entry — non-implementation stub
+    CBM_FUNC_FLAG_ASYNC = 1 << 5,           // async def — return is Coroutine[..., T]
+    CBM_FUNC_FLAG_GENERATOR = 1 << 6,       // contains yield — return is Generator[T, ...]
+    CBM_FUNC_FLAG_FINAL = 1 << 7,           // @final — overrides not allowed
+    CBM_FUNC_FLAG_RUST_TRAIT_IMPL = 1 << 8, // exact method from impl Trait for Type
+    CBM_FUNC_FLAG_RUST_ABSTRACT = 1 << 9,   // required trait method without a default body
+    /* Python only: more than one registered definition has this exact QN.
+     * Ordinary call resolution keeps its historical language-specific choice,
+     * but a function value cannot name one materialized definition exactly. */
+    CBM_FUNC_FLAG_AMBIGUOUS_BINDING = 1 << 10,
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.
@@ -27,9 +33,13 @@ typedef struct {
     const CBMType *signature;      // FUNC type with param/return types
     const char **type_param_names; // NULL-terminated, e.g., ["T", "R", NULL] for generics
     int min_params;                // Minimum required params (excluding defaulted). -1 = unknown.
-    int flags;                     // CBM_FUNC_FLAG_* bitfield (Python decorator info; 0 elsewhere)
+    int flags;                     // CBM_FUNC_FLAG_* bitfield
     const char **decorator_qns;    // NULL-terminated decorator QNs (Python only); used for
                                    // user-decorator return-type substitution.
+    /* Rust only: canonical trait QN for a concrete trait-impl method. It may
+     * remain NULL when raw cross-file provenance is ambiguous; the Rust trait
+     * flag still prevents that method from being mistaken for inherent. */
+    const char *impl_trait_qn;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.
@@ -241,6 +251,24 @@ typedef struct {
 void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
                                            CBMFreeFuncIter *out);
 int cbm_free_func_iter_next(CBMFreeFuncIter *it);
+
+// Iterate function indices for one exact (receiver QN, method name) key.  This
+// exposes the existing finalized method bucket without making Rust scan the
+// project-wide func array merely to distinguish inherent and trait-impl
+// entries that intentionally share the same source-level QN.  The caller may
+// filter on language-specific flags. Read-only and allocation-free.
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const char *receiver_qn;
+    const char *method_name;
+    uint64_t hash;
+    int chain_idx;
+    int tail_i;
+    int tail_end;
+} CBMMethodIter;
+void cbm_registry_methods(const CBMTypeRegistry *reg, const char *receiver_qn,
+                          const char *method_name, CBMMethodIter *out);
+int cbm_method_iter_next(CBMMethodIter *it);
 
 // --- TS-specific helpers (return NULL for types without these signatures) ---
 

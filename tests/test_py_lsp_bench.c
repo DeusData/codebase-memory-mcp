@@ -245,8 +245,10 @@ TEST(pylsp_bench_resolution_ratio) {
     }
     double ratio = calls > 0 ? (double)resolved / (double)calls : 0.0;
 
-    printf("    bench: %d lines, %d calls, %d resolved (%.0f%%), %.2f ms\n",
-           loc, calls, resolved, ratio * 100.0, ms);
+    printf("    bench: %d lines, %d defs, %d calls, %d resolved (%.0f%%), "
+           "%d usages, %d type_refs, %d rw, %.2f ms\n",
+           loc, r->defs.count, calls, resolved, ratio * 100.0, r->usages.count,
+           r->type_refs.count, r->rw.count, ms);
 
     /* Free the result BEFORE asserting so a budget miss doesn't leak. */
     cbm_free_result(r);

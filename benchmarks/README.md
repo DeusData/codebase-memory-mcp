@@ -38,6 +38,40 @@ multi-candidate, repeated-run entry point; automatic modes store durable ignored
 state under `.worktrees/benchmark-campaign/`. Explicit runs should use an ignored
 `benchmark-results/` root or another durable path outside the checkout.
 
+For a merge or hot-path change that needs an in-process extraction comparison,
+build each candidate's production-native runner and measure the executables in a
+rotated order:
+
+```sh
+make -f Makefile.cbm native-extraction-benchmark
+
+uv run python benchmarks/run_native_extraction_comparison.py \
+  --candidate merged=/absolute/path/to/merged/build/c/native-extraction-benchmark \
+  --candidate first-parent=/absolute/path/to/first-parent-runner \
+  --candidate second-parent=/absolute/path/to/second-parent-runner \
+  --warmups 2 --repetitions 21 \
+  --output-dir /durable/ignored/path/native-extraction-comparison
+```
+
+The runner profiles a repeated shared JSON parse fixture, fixed C# and Python
+fixtures, and a Python scale fixture. The shared fixture establishes an
+output-parity cohort for parser and extraction-orchestration work; the language
+fixtures retain capability differences instead of hiding them. A no-work startup
+cohort runs in the same rotated schedule. Its resource counters are subtracted from
+each candidate's matching workload repetition to report
+`incremental_max_rss_bytes` and `incremental_peak_footprint_bytes` without charging
+the workload for different executable mappings.
+
+The runner records output counts, extraction-phase latency, and host resource
+counters in `native-extraction-results.json`, with command output retained in
+`native-extraction-raw.txt`. The JSON includes every ordered candidate comparison,
+output-parity differences, and paired median percentage changes. Candidate order
+rotates for every repetition. Compare absolute latency only when output counts
+establish a parity cohort; otherwise report the result as a capability delta under
+`docs/BENCHMARK_TERMINOLOGY.md`. On macOS, peak memory footprint is the physical
+working-set signal, while maximum RSS also includes executable mappings. Linux
+records maximum RSS through `/usr/bin/time -v`.
+
 The automatic `--quick` and `--full` matrices default to MCP transport. Cross-build
 CLI matrices require a dedicated OS account/runtime or a quiescent account-wide CBM
 daemon: current one-shot CLI commands enforce the same exact-build cohort as MCP and

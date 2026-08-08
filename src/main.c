@@ -58,6 +58,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
+#include "foundation/workspace.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -893,11 +894,13 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
          * response file before printing (parent reads it back on a clean exit). */
         CBM_PROF_START(prof_cli_response_file);
         const char *ro = cbm_index_worker_response_out();
+        bool worker_response_written = false;
         if (ro) {
             FILE *rf = cbm_fopen(ro, "wb");
             if (rf) {
-                (void)fputs(result, rf);
-                (void)fclose(rf);
+                int write_rc = fputs(result, rf);
+                int close_rc = fclose(rf);
+                worker_response_written = write_rc >= 0 && close_rc == 0;
             }
         }
         CBM_PROF_END("cli_worker", "response_file", prof_cli_response_file);
@@ -914,11 +917,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         CBM_PROF_END("cli_worker", "response_print", prof_cli_response_print);
         exit_code = cbm_cli_exit_status_after_maintenance(exit_code, maintenance_cancelled);
         if (cbm_index_worker_active()) {
-            /* Supervised worker: the response is delivered (file + stdout).
-             * Skip the multi-GB teardown (server/store frees) — the process
-             * dies now and the OS reclaims everything wholesale; piecemeal
-             * free() of a kernel-scale graph costs minutes. _Exit skips
-             * atexit/LSan by design for this prod worker path. */
+            /* The supervisor protocol classifies the PROCESS, not the tool
+             * result: a valid MCP error response is a healthy worker outcome.
+             * Propagating cli_print_mcp_result's isError exit code made the
+             * parent discard that response and falsely report exit_nonzero as
+             * "crashed on a file". Fail only when the response transport itself
+             * failed. Skip multi-GB teardown; the OS reclaims it at exit. */
             cbm_log_info("index.worker.fast_exit", "action", "_Exit");
             if (cbm_profile_active) {
                 CBM_PROF_START(prof_cli_flush);
@@ -926,7 +930,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
                 CBM_PROF_END("cli_worker", "flush", prof_cli_flush);
             }
             fflush(NULL);
-            _Exit(exit_code);
+            _Exit(worker_response_written ? 0 : SKIP_ONE);
         }
         CBM_PROF_START(prof_cli_result_free);
         free(result);
@@ -965,6 +969,105 @@ static void print_help(void) {
 
 /* Try to handle a subcommand (cli/install/uninstall/update/config/--version/--help).
  * Returns -1 if no subcommand matched, otherwise the exit code. */
+/* `allow-root [--approve-sensitive] <path>` — record an indexing root.
+ *
+ * Enrollment lives here, in a command a person types, and deliberately nowhere
+ * else: the whole point of the grant store is that neither an indexed repository
+ * nor a tool caller can widen its own boundary. A confirmation delivered through
+ * the MCP surface would be answered by the same agent that may have been
+ * influenced, so it would not be a human decision at all. */
+static int main_run_allow_root(int argc, char **argv) {
+    const char *path = NULL;
+    bool approve_sensitive = false;
+    bool list_only = false;
+    bool approve_manifest = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--approve-sensitive") == 0) {
+            approve_sensitive = true;
+        } else if (strcmp(argv[i], "--list") == 0) {
+            list_only = true;
+        } else if (strcmp(argv[i], "--approve-manifest") == 0) {
+            approve_manifest = true;
+        } else if (argv[i][0] == '-') {
+            (void)fprintf(stderr, "error: unknown option: %s\n", argv[i]);
+            return EXIT_FAILURE;
+        } else if (!path) {
+            path = argv[i];
+        } else {
+            (void)fprintf(stderr, "error: only one path may be given\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    const char *cache_dir = cbm_workspace_cache_dir();
+    if (!cache_dir || !cache_dir[0]) {
+        (void)fprintf(stderr, "error: cache directory could not be resolved\n");
+        return EXIT_FAILURE;
+    }
+
+    if (list_only || !path) {
+        char listing[CBM_SZ_8K];
+        if (cbm_workspace_grant_list(cache_dir, listing, sizeof(listing))) {
+            printf("allowed roots:\n%s", listing);
+        } else {
+            printf("no allowed roots recorded — indexing is unconfined apart from the "
+                   "always-refused roots (see docs/CONFIGURATION.md)\n");
+        }
+        if (!path && !list_only) {
+            (void)fprintf(stderr,
+                          "usage: codebase-memory-mcp allow-root [--approve-sensitive] <path>\n"
+                          "       codebase-memory-mcp allow-root --approve-manifest <project>\n"
+                          "       codebase-memory-mcp allow-root --list\n");
+            return EXIT_FAILURE;
+        }
+        return 0;
+    }
+
+    if (approve_manifest) {
+        /* Approve the manifest a project ships, keyed to its current content. The
+         * file only ever requests; this is the human action that grants. */
+        char canonical_project[CBM_PATH_MAX];
+        if (!cbm_canonical_path(path, canonical_project, sizeof(canonical_project))) {
+            (void)fprintf(stderr, "error: cannot resolve path: %s\n", path);
+            return EXIT_FAILURE;
+        }
+        char merr[CBM_SZ_1K];
+        if (!cbm_workspace_manifest_approve(cache_dir, cbm_workspace_home_dir(), canonical_project,
+                                            merr, sizeof(merr))) {
+            (void)fprintf(stderr, "refused: %s\n", merr[0] ? merr : "manifest not approvable");
+            return EXIT_FAILURE;
+        }
+        printf("manifest approved for %s\n", canonical_project);
+        printf("note: editing %s lapses this approval and it must be granted again.\n",
+               CBM_WS_MANIFEST_NAME);
+        return 0;
+    }
+
+    /* Canonicalize before recording: the policy is defined over resolved paths,
+     * and a grant stored as a symlink would not match the resolved repo path the
+     * indexer later presents. */
+    char canonical[CBM_PATH_MAX];
+    if (!cbm_canonical_path(path, canonical, sizeof(canonical))) {
+        (void)fprintf(stderr, "error: cannot resolve path: %s\n", path);
+        return EXIT_FAILURE;
+    }
+    if (!cbm_is_dir(canonical)) {
+        (void)fprintf(stderr, "error: not a directory: %s\n", canonical);
+        return EXIT_FAILURE;
+    }
+
+    char err[CBM_SZ_1K];
+    if (!cbm_workspace_grant_add(cache_dir, cbm_workspace_home_dir(), canonical, approve_sensitive,
+                                 err, sizeof(err))) {
+        (void)fprintf(stderr, "refused: %s\n", err[0] ? err : "not an allowable root");
+        return EXIT_FAILURE;
+    }
+    printf("allowed root recorded: %s\n", canonical);
+    printf("note: with at least one root recorded, indexing is now confined to the "
+           "recorded roots.\n");
+    return 0;
+}
+
 static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                              main_local_maintenance_context_t *maintenance_context) {
     /* First scan: global flags */
@@ -981,6 +1084,9 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_help();
             return 0;
+        }
+        if (strcmp(argv[i], "allow-root") == 0) {
+            return main_run_allow_root(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "cli") == 0) {
             int cli_argc = argc - i - SKIP_ONE;
@@ -1607,12 +1713,26 @@ static void main_hook_report_absent_daemon(const char *hook_dialect) {
     (void)fprintf(stderr, "codebase-memory-mcp: no CBM daemon is running, so graph "
                           "augmentation is skipped. Start an MCP session or run "
                           "`codebase-memory-mcp daemon start` to enable it.\n");
-    if (!hook_dialect) {
-        /* Claude hook output: a systemMessage is surfaced to the user. */
-        (void)fputs("{\"systemMessage\":\"codebase-memory-mcp: no CBM daemon is running, so "
-                    "graph augmentation is currently skipped. Run `codebase-memory-mcp daemon "
-                    "start` (or open an MCP session) to enable it.\"}",
-                    stdout);
+    const char *notice = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, hook_dialect);
+    if (notice) {
+        (void)fputs(notice, stdout);
+        (void)fflush(stdout);
+    }
+}
+
+/* #1388: a version-conflicted daemon is an actionable broken state, unlike a
+ * merely absent one - and stdout is the only hook channel Claude Code
+ * surfaces, so stderr-only reporting reads as eternal silence in-session.
+ * Emit a throttled systemMessage with restart guidance (the misleading
+ * "no daemon is running" text pointed at `daemon start`, which cannot heal a
+ * build conflict). */
+static void main_hook_report_conflicted_daemon(const char *hook_dialect) {
+    if (hook_dialect || !main_hook_absent_notice_due()) {
+        return;
+    }
+    const char *notice = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_BUILD_CONFLICT, hook_dialect);
+    if (notice) {
+        (void)fputs(notice, stdout);
         (void)fflush(stdout);
     }
 }
@@ -2287,6 +2407,18 @@ int main(int argc, char **argv) {
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* #1388 test seam: let one binary present a foreign build fingerprint as a
+     * hook client, so the daemon-conflict reporting path is testable without
+     * building a second binary. */
+    static char seam_hook_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    const char *seam_forced_build = cbm_safe_getenv("CBM_TEST_HOOK_CLIENT_BUILD", seam_hook_build,
+                                                    sizeof(seam_hook_build), NULL);
+    if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT && seam_forced_build && seam_forced_build[0]) {
+        identity.build_fingerprint = seam_hook_build;
+    }
+#endif
+
     cbm_version_cohort_manager_t *client_cohort_manager = cbm_version_cohort_manager_new(endpoint);
     cbm_version_cohort_lease_t *client_cohort_lease = NULL;
     cbm_daemon_conflict_t client_cohort_conflict;
@@ -2308,6 +2440,10 @@ int main(int argc, char **argv) {
         }
         (void)fprintf(stderr, "codebase-memory-mcp: %s\n",
                       formatted ? message : "client exact-build admission failed");
+        if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
+            client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
+            main_hook_report_conflicted_daemon(hook_dialect);
+        }
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -2320,7 +2456,16 @@ int main(int argc, char **argv) {
             endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
         cbm_daemon_ipc_endpoint_free(endpoint);
         if (!hook_client) {
-            main_hook_report_absent_daemon(hook_dialect);
+            if (hook_connect.status == CBM_DAEMON_RUNTIME_CONNECT_CONFLICT) {
+                char conflict_detail[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+                if (cbm_daemon_conflict_format(&hook_connect.conflict, conflict_detail,
+                                               sizeof(conflict_detail))) {
+                    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", conflict_detail);
+                }
+                main_hook_report_conflicted_daemon(hook_dialect);
+            } else {
+                main_hook_report_absent_daemon(hook_dialect);
+            }
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_SUCCESS;
         }

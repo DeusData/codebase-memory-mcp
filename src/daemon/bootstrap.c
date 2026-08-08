@@ -162,6 +162,10 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
         "install",
         "uninstall",
         "update",
+        /* allow-root writes one line of user-level config and reads nothing from a
+         * project, so it needs no daemon. Listed here rather than routed through
+         * the daemon so enrolling a root cannot depend on daemon state. */
+        "allow-root",
     };
     /* Stop at the first top-level mode token. Tool names, flag values, and JSON
      * following `cli` are opaque user input: a search query named "install"

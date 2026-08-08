@@ -22,6 +22,38 @@
  * which is too small for deep pipeline passes (configlink, etc.). */
 #define CBM_DEFAULT_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
 
+/* Thread stacks are sized in code (explicitly by most callers, by the default
+ * above otherwise), so RLIMIT_STACK does NOT reach them and a sanitizer lane
+ * cannot size them with ulimit. MemorySanitizer's origin tracking inflates
+ * every frame enough that deep parser recursion overflows the normal worker
+ * stack, and without this hook that lane cannot run the parsing suites at all.
+ *
+ * The floor applies to EVERY thread — an earlier version only replaced the
+ * DEFAULT, which silently did nothing for worker_pool/runtime/main, i.e. for
+ * exactly the threads that overflow. Diagnostic builds only: the shipping
+ * binary keeps its fixed, predictable stack sizes. */
+static size_t cbm_thread_stack_floor(size_t requested) {
+#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+    char env_buf[CBM_SZ_64];
+    const char *env = cbm_safe_getenv("CBM_THREAD_STACK_MB", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long mb = strtoul(env, &end, 10);
+        if (end && *end == '\0' && mb > 0 && mb <= 1024) {
+            size_t floor_bytes = (size_t)mb * CBM_SZ_1K * CBM_SZ_1K;
+            if (floor_bytes > requested) {
+                return floor_bytes;
+            }
+        }
+    }
+#endif
+    return requested;
+}
+
+static size_t cbm_thread_default_stack_size(void) {
+    return cbm_thread_stack_floor(CBM_DEFAULT_STACK_SIZE);
+}
+
 /* ── Thread ───────────────────────────────────────────────────── */
 
 #ifdef _WIN32
@@ -89,7 +121,9 @@ static DWORD WINAPI win_thread_wrapper(LPVOID lpParam) {
 
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg) {
     if (stack_size == 0) {
-        stack_size = CBM_DEFAULT_STACK_SIZE;
+        stack_size = cbm_thread_default_stack_size();
+    } else {
+        stack_size = cbm_thread_stack_floor(stack_size);
     }
     win_thread_arg_t *a = (win_thread_arg_t *)malloc(sizeof(win_thread_arg_t));
     if (!a) {
@@ -126,7 +160,9 @@ int cbm_thread_detach(cbm_thread_t *t) {
 
 int cbm_thread_create(cbm_thread_t *t, size_t stack_size, void *(*fn)(void *), void *arg) {
     if (stack_size == 0) {
-        stack_size = CBM_DEFAULT_STACK_SIZE;
+        stack_size = cbm_thread_default_stack_size();
+    } else {
+        stack_size = cbm_thread_stack_floor(stack_size);
     }
     pthread_attr_t attr;
     pthread_attr_init(&attr);

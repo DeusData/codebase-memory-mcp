@@ -7,6 +7,10 @@
 #include "test_framework.h"
 #include "discover/discover.h"
 #include <string.h> /* strdup (test seam) */
+#ifndef _WIN32
+#include <sys/wait.h> /* fork/waitpid crash-isolation for the backtracking budget */
+#include <unistd.h>   /* alarm() as the liveness backstop */
+#endif
 
 /* ── Basic pattern matching ────────────────────────────────────── */
 
@@ -274,9 +278,64 @@ TEST(gi_merge_atomic_on_alloc_failure) {
     PASS();
 }
 
+/* `**` retries the remainder at every position, so consecutive literal + `**`
+ * groups multiply and cost is exponential in the number of groups. Patterns come
+ * from a committed .gitignore and every discovered path is tested against every
+ * pattern, so a small ignore file can make discovery take unbounded time. The
+ * matcher must give up on its step budget.
+ *
+ * Run in a forked child under an alarm: the alarm is only a liveness backstop —
+ * the assertion is that matching TERMINATES, and the unbounded matcher never
+ * reaches the exit. */
+TEST(gi_doublestar_backtracking_terminates) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork/alarm crash-isolation is POSIX-only; the budget is platform-agnostic");
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* 20 "a**" groups then a literal that cannot match, against a run of
+         * 'a' — the classic catastrophic-backtracking shape. */
+        char pattern[256];
+        int n = 0;
+        for (int i = 0; i < 20; i++) {
+            n += snprintf(pattern + n, sizeof(pattern) - (size_t)n, "a**");
+        }
+        (void)snprintf(pattern + n, sizeof(pattern) - (size_t)n, "X\n");
+        char path[64];
+        memset(path, 'a', sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+
+        alarm(20);
+        cbm_gitignore_t *gi = cbm_gitignore_parse(pattern);
+        if (!gi) {
+            _exit(2);
+        }
+        /* The pattern cannot match; the only question is whether we come back. */
+        (void)cbm_gitignore_matches(gi, path, false);
+        cbm_gitignore_free(gi);
+        _exit(0);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[112];
+        snprintf(m, sizeof(m),
+                 "glob matching did not terminate (signal %d) — no backtracking budget",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(gitignore) {
+    RUN_TEST(gi_doublestar_backtracking_terminates);
     RUN_TEST(gi_empty_pattern);
     RUN_TEST(gi_exact_file);
     RUN_TEST(gi_wildcard_star);

@@ -14,6 +14,7 @@
 #include "foundation/constants.h"
 #include "foundation/platform.h" /* cbm_safe_getenv */
 #include "foundation/compat_fs.h"
+#include "foundation/sha256.h"
 
 enum { MAX_CONFIG_SIZE = 65536 };
 #include "foundation/log.h"
@@ -28,6 +29,26 @@ enum { MAX_CONFIG_SIZE = 65536 };
 /* ── Process-global user config pointer ──────────────────────────── */
 
 static const cbm_userconfig_t *g_userconfig = NULL;
+
+static void userconfig_source_digest(const char *state, const void *bytes, size_t len,
+                                     char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char domain[] = "cbm-userconfig-source-v1";
+    cbm_sha256_ctx sha;
+    cbm_sha256_init(&sha);
+    cbm_sha256_update(&sha, domain, sizeof(domain));
+    cbm_sha256_update(&sha, state, strlen(state) + 1);
+    if (bytes && len > 0) {
+        cbm_sha256_update(&sha, bytes, len);
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&sha, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
 
 void cbm_set_user_lang_config(const cbm_userconfig_t *cfg) {
     g_userconfig = cfg;
@@ -232,7 +253,9 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
  * Silently ignores missing files. Logs warnings for corrupt JSON.
  * Returns 0 on success (or absent file), -1 on alloc failure.
  */
-static int load_config_file(const char *path, cbm_userext_t **entries, int *count) {
+static int load_config_file(const char *path, cbm_userext_t **entries, int *count,
+                            char source_sha256[CBM_SHA256_HEX_LEN + 1]) {
+    userconfig_source_digest("missing-or-unreadable", NULL, 0, source_sha256);
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return 0; /* file absent — silently ignore */
@@ -240,11 +263,13 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
 
     if (fseek(f, 0, SEEK_END) != 0) {
         (void)fclose(f);
+        userconfig_source_digest("seek-error", NULL, 0, source_sha256);
         return 0;
     }
     long len = ftell(f);
     if (fseek(f, 0, SEEK_SET) != 0) {
         (void)fclose(f);
+        userconfig_source_digest("seek-error", NULL, 0, source_sha256);
         return 0;
     }
 
@@ -252,6 +277,9 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
         (void)fclose(f);
         if (len > MAX_CONFIG_SIZE) {
             cbm_log_warn("userconfig.file_too_large", "path", path);
+            userconfig_source_digest("oversized", NULL, 0, source_sha256);
+        } else {
+            userconfig_source_digest("empty", NULL, 0, source_sha256);
         }
         return 0;
     }
@@ -268,6 +296,7 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
         nread = (size_t)len;
     }
     buf[nread] = '\0';
+    userconfig_source_digest("present", buf, nread, source_sha256);
 
     yyjson_doc *doc = yyjson_read(buf, nread, 0);
     free(buf);
@@ -301,7 +330,7 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     char global_path[PATH_BUF_SZ];
     snprintf(global_path, sizeof(global_path), "%s/codebase-memory-mcp/config.json", cfg_fallback);
 
-    if (load_config_file(global_path, &entries, &count) != 0) {
+    if (load_config_file(global_path, &entries, &count, cfg->global_source_sha256) != 0) {
         for (int i = 0; i < count; i++) {
             free(entries[i].ext);
         }
@@ -313,11 +342,12 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     int global_count = count; /* entries[0..global_count) are from global */
 
     /* ── Step 2: Load project config ── */
+    userconfig_source_digest("not-applicable", NULL, 0, cfg->project_source_sha256);
     if (repo_path && repo_path[0]) {
         char project_path[PATH_BUF_SZ];
         snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
 
-        if (load_config_file(project_path, &entries, &count) != 0) {
+        if (load_config_file(project_path, &entries, &count, cfg->project_source_sha256) != 0) {
             /* Free already-allocated entries */
             for (int i = 0; i < count; i++) {
                 free(entries[i].ext);

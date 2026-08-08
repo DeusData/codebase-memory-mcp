@@ -469,6 +469,19 @@ bool cbm_kind_in_set(TSNode node, const char **types) {
     return kind_in_set_strcmp(node, (const char *const *)types);
 }
 
+bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
+    if (!kind) {
+        return false;
+    }
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        return strcmp(kind, "namespace_definition") == 0;
+    }
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        return strcmp(kind, "internal_module") == 0;
+    }
+    return false;
+}
+
 /* Free the calling thread's node-type bitset cache (the calloc'd `bits` arrays
  * that cbm_kind_in_set builds lazily). The cache is thread-local, so each worker
  * thread and the main thread must call this at teardown (worker exit / process
@@ -499,27 +512,26 @@ bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth) {
     return false;
 }
 
-// Recursive branching count
-#define BRANCHING_STACK_CAP 4096
 static int count_branching_iter(TSNode root, const char **types) {
-    TSNode stack[BRANCHING_STACK_CAP];
-    int top = 0;
     int count = 0;
-    stack[top++] = root;
-    while (top > 0) {
-        TSNode node = stack[--top];
-        const char *kind = ts_node_type(node);
-        for (const char **t = types; *t; t++) {
-            if (strcmp(kind, *t) == 0) {
-                count++;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool complete = false;
+    while (!complete) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (cbm_kind_in_set(node, types)) {
+            count++;
+        }
+        if (ts_node_child_count(node) > 0 && ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                complete = true;
                 break;
             }
         }
-        uint32_t n = ts_node_child_count(node);
-        for (int i = (int)n - SKIP_ONE; i >= 0 && top < BRANCHING_STACK_CAP; i--) {
-            stack[top++] = ts_node_child(node, (uint32_t)i);
-        }
     }
+    ts_tree_cursor_delete(&cursor);
     return count;
 }
 
@@ -532,35 +544,34 @@ int cbm_count_branching(TSNode node, const char **branching_types) {
 
 // Loop node-type names across tree-sitter grammars, for loop-nesting depth.
 bool cbm_is_loop_node_type(const char *kind) {
-    static const char *const loops[] = {"for_statement",
-                                        "while_statement",
-                                        "do_statement",
-                                        "do_while_statement",
-                                        "for_in_statement",
-                                        "for_of_statement",
-                                        "for_each_statement",
-                                        "foreach_statement",
-                                        "enhanced_for_statement",
-                                        "for_range_loop",
-                                        "c_style_for_statement",
-                                        "for_expression",
-                                        "while_expression",
-                                        "loop_expression",
-                                        "while_let_expression",
-                                        "repeat_statement",
-                                        "repeat_while_statement",
-                                        "until",
-                                        "while_modifier",
-                                        "until_modifier",
-                                        "for",
-                                        "while",
-                                        NULL};
-    for (const char *const *l = loops; *l; l++) {
-        if (strcmp(kind, *l) == 0) {
-            return true;
-        }
+    if (!kind || !kind[0]) {
+        return false;
     }
-    return false;
+    switch (kind[0]) {
+    case 'c':
+        return strcmp(kind, "c_style_for_statement") == 0;
+    case 'd':
+        return strcmp(kind, "do_statement") == 0 || strcmp(kind, "do_while_statement") == 0;
+    case 'e':
+        return strcmp(kind, "enhanced_for_statement") == 0;
+    case 'f':
+        return strcmp(kind, "for") == 0 || strcmp(kind, "for_statement") == 0 ||
+               strcmp(kind, "for_in_statement") == 0 || strcmp(kind, "for_of_statement") == 0 ||
+               strcmp(kind, "for_each_statement") == 0 || strcmp(kind, "foreach_statement") == 0 ||
+               strcmp(kind, "for_range_loop") == 0 || strcmp(kind, "for_expression") == 0;
+    case 'l':
+        return strcmp(kind, "loop_expression") == 0;
+    case 'r':
+        return strcmp(kind, "repeat_statement") == 0 || strcmp(kind, "repeat_while_statement") == 0;
+    case 'u':
+        return strcmp(kind, "until") == 0 || strcmp(kind, "until_modifier") == 0;
+    case 'w':
+        return strcmp(kind, "while") == 0 || strcmp(kind, "while_statement") == 0 ||
+               strcmp(kind, "while_expression") == 0 || strcmp(kind, "while_let_expression") == 0 ||
+               strcmp(kind, "while_modifier") == 0;
+    default:
+        return false;
+    }
 }
 
 TSNode cbm_c_family_declarator_name(TSNode node) {
@@ -574,78 +585,80 @@ TSNode cbm_c_family_declarator_name(TSNode node) {
 // set covering the common grammars; used only for the structural "access depth"
 // smell, so unmatched grammars simply report 0 (never wrong, just silent).
 static bool is_member_access_node(const char *kind) {
-    static const char *const access[] = {"member_expression",
-                                         "field_expression",
-                                         "selector_expression",
-                                         "field_access",
-                                         "member_access_expression",
-                                         "navigation_expression",
-                                         "attribute",
-                                         "subscript_expression",
-                                         "subscript",
-                                         "index_expression",
-                                         "element_access_expression",
-                                         "scoped_identifier",
-                                         NULL};
-    for (const char *const *a = access; *a; a++) {
-        if (strcmp(kind, *a) == 0) {
-            return true;
-        }
+    if (!kind || !kind[0]) {
+        return false;
     }
-    return false;
+    switch (kind[0]) {
+    case 'a':
+        return strcmp(kind, "attribute") == 0;
+    case 'e':
+        return strcmp(kind, "element_access_expression") == 0;
+    case 'f':
+        return strcmp(kind, "field_expression") == 0 || strcmp(kind, "field_access") == 0;
+    case 'i':
+        return strcmp(kind, "index_expression") == 0;
+    case 'm':
+        return strcmp(kind, "member_expression") == 0 ||
+               strcmp(kind, "member_access_expression") == 0;
+    case 'n':
+        return strcmp(kind, "navigation_expression") == 0;
+    case 's':
+        return strcmp(kind, "selector_expression") == 0 || strcmp(kind, "subscript") == 0 ||
+               strcmp(kind, "subscript_expression") == 0 || strcmp(kind, "scoped_identifier") == 0;
+    default:
+        return false;
+    }
 }
 
 typedef struct {
-    TSNode node;
     int bdepth;
     int ldepth;
     int adepth;
-} complexity_frame_t;
+} complexity_depth_t;
 
 typedef struct {
-    complexity_frame_t inline_items[CBM_SZ_64];
-    complexity_frame_t *items;
-    int count;
+    complexity_depth_t inline_items[CBM_SZ_64];
+    complexity_depth_t *items;
     int capacity;
-} complexity_stack_t;
+} complexity_depth_stack_t;
 
-static void complexity_stack_init(complexity_stack_t *stack) {
+static void complexity_depth_stack_init(complexity_depth_stack_t *stack) {
     stack->items = stack->inline_items;
-    stack->count = 0;
     stack->capacity = CBM_SZ_64;
 }
 
-static void complexity_stack_destroy(complexity_stack_t *stack) {
+static void complexity_depth_stack_destroy(complexity_depth_stack_t *stack) {
     if (stack->items != stack->inline_items) {
         free(stack->items);
     }
 }
 
-/*
- * The inline working set keeps ordinary functions allocation-free. Wider
- * sibling sets grow geometrically, so a function with F AST nodes takes O(F)
- * traversal time, amortized O(1) pushes, and O(W) peak scratch memory for the
- * maximum pending frontier W. Spill storage is freed before this function
- * returns rather than extending the extracted result's lifetime.
- */
-static bool complexity_stack_push(complexity_stack_t *stack, complexity_frame_t frame) {
-    if (stack->count >= stack->capacity) {
+/* Ensure an entry exists for a cursor depth. Ordinary syntax stays entirely in
+ * the compact inline array; unusually deep trees grow geometrically. */
+static bool complexity_depth_stack_ensure(complexity_depth_stack_t *stack, int required) {
+    if (required > stack->capacity) {
         if (stack->capacity > INT_MAX / PAIR_LEN) {
             return false;
         }
-        int next_capacity = stack->capacity * PAIR_LEN;
+        int next_capacity = stack->capacity;
+        while (next_capacity < required) {
+            if (next_capacity > INT_MAX / PAIR_LEN) {
+                return false;
+            }
+            next_capacity *= PAIR_LEN;
+        }
         if ((size_t)next_capacity > SIZE_MAX / sizeof(*stack->items)) {
             return false;
         }
         size_t bytes = (size_t)next_capacity * sizeof(*stack->items);
-        complexity_frame_t *grown = NULL;
+        complexity_depth_t *grown = NULL;
         if (stack->items == stack->inline_items) {
-            grown = (complexity_frame_t *)malloc(bytes);
+            grown = (complexity_depth_t *)malloc(bytes);
             if (grown) {
-                memcpy(grown, stack->inline_items, (size_t)stack->count * sizeof(*stack->items));
+                memcpy(grown, stack->inline_items, (size_t)stack->capacity * sizeof(*stack->items));
             }
         } else {
-            grown = (complexity_frame_t *)realloc(stack->items, bytes);
+            grown = (complexity_depth_t *)realloc(stack->items, bytes);
         }
         if (!grown) {
             return false;
@@ -653,14 +666,12 @@ static bool complexity_stack_push(complexity_stack_t *stack, complexity_frame_t 
         stack->items = grown;
         stack->capacity = next_capacity;
     }
-    stack->items[stack->count++] = frame;
     return true;
 }
 
-// One traversal computing cyclomatic + cognitive + loop-nesting + access-depth
-// metrics. Each frame carries its branch-, loop- and access-nesting depth so
-// every metric (cognitive Campbell penalty, loop_depth polynomial-degree proxy,
-// max chained access depth) is produced in a single walk.
+// One cap-free cursor traversal computes all complexity metrics. Runtime is
+// O(N) for N AST nodes; explicit scratch is O(D) for syntax depth D rather than
+// O(N), and tree-sitter's cursor carries the matching traversal path.
 bool cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out) {
     out->cyclomatic = 0;
     out->cognitive = 0;
@@ -670,67 +681,68 @@ bool cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
     if (!branching_types) {
         return true;
     }
-    complexity_stack_t stack;
-    complexity_stack_init(&stack);
-    if (!complexity_stack_push(
-            &stack, (complexity_frame_t){.node = node, .bdepth = 0, .ldepth = 0, .adepth = 0})) {
-        complexity_stack_destroy(&stack);
-        return false;
-    }
-    while (stack.count > 0) {
-        complexity_frame_t f = stack.items[--stack.count];
-        const char *kind = ts_node_type(f.node);
-        bool is_branch = false;
-        for (const char **t = branching_types; *t; t++) {
-            if (strcmp(kind, *t) == 0) {
-                is_branch = true;
+    complexity_depth_stack_t stack;
+    complexity_depth_stack_init(&stack);
+    stack.items[0] = (complexity_depth_t){0};
+    int depth = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool complete = false;
+    bool success = true;
+    while (!complete) {
+        TSNode current = ts_tree_cursor_current_node(&cursor);
+        complexity_depth_t child = stack.items[depth];
+        const char *kind = ts_node_type(current);
+        bool named = ts_node_is_named(current);
+
+        child.adepth = 0;
+        if (named && is_member_access_node(kind)) {
+            child.adepth = stack.items[depth].adepth + SKIP_ONE;
+            if (child.adepth > out->max_access_depth) {
+                out->max_access_depth = child.adepth;
+            }
+        }
+        if (cbm_kind_in_set(current, branching_types)) {
+            out->cyclomatic++;
+            out->cognitive += SKIP_ONE + stack.items[depth].bdepth;
+            child.bdepth = stack.items[depth].bdepth + SKIP_ONE;
+        }
+        if (named && cbm_is_loop_node_type(kind)) {
+            out->loop_count++;
+            child.ldepth = stack.items[depth].ldepth + SKIP_ONE;
+            if (child.ldepth > out->loop_depth) {
+                out->loop_depth = child.ldepth;
+            }
+        }
+
+        if (ts_node_child_count(current) > 0 && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            if (!complexity_depth_stack_ensure(&stack, depth + SKIP_ONE)) {
+                success = false;
+                break;
+            }
+            stack.items[depth] = child;
+            continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            continue;
+        }
+        bool found = false;
+        while (ts_tree_cursor_goto_parent(&cursor)) {
+            depth--;
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                found = true;
                 break;
             }
         }
-        int child_b = f.bdepth;
-        int child_l = f.ldepth;
-        /* Chained member/subscript access: a.b.c.d nests as access(access(access(a))),
-         * so each consecutive access node deepens the chain; non-access nodes reset it. */
-        int child_a = 0;
-        if (ts_node_is_named(f.node) && is_member_access_node(kind)) {
-            child_a = f.adepth + 1;
-            if (child_a > out->max_access_depth) {
-                out->max_access_depth = child_a;
-            }
-        }
-        if (is_branch) {
-            out->cyclomatic++;
-            out->cognitive += 1 + f.bdepth; /* +1 plus nesting penalty (Campbell) */
-            child_b = f.bdepth + 1;
-        }
-        /* Only *named* nodes count as loops. In many grammars (Go, C, …) the
-         * loop's `for`/`while` keyword is an anonymous child token whose node
-         * type literally equals "for"/"while"; without this guard each loop is
-         * counted twice and nesting depth is inflated by one. Named loop nodes
-         * (e.g. Ruby's `while`/`until`/`for`) still match correctly. */
-        if (ts_node_is_named(f.node) && cbm_is_loop_node_type(kind)) {
-            out->loop_count++;
-            int d = f.ldepth + 1;
-            if (d > out->loop_depth) {
-                out->loop_depth = d;
-            }
-            child_l = d;
-        }
-        uint32_t n = ts_node_child_count(f.node);
-        for (int i = (int)n - SKIP_ONE; i >= 0; i--) {
-            complexity_frame_t child = {
-                .node = ts_node_child(f.node, (uint32_t)i),
-                .bdepth = child_b,
-                .ldepth = child_l,
-                .adepth = child_a,
-            };
-            if (!complexity_stack_push(&stack, child)) {
-                complexity_stack_destroy(&stack);
-                return false;
-            }
+        if (!found) {
+            complete = true;
         }
     }
-    complexity_stack_destroy(&stack);
+    ts_tree_cursor_delete(&cursor);
+    complexity_depth_stack_destroy(&stack);
+    if (!success) {
+        return false;
+    }
     return true;
 }
 
@@ -1230,7 +1242,8 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         const char *class_chain = NULL;
         for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
              cur = ts_node_parent(cur)) {
-            if (!cbm_kind_in_set(cur, spec->class_node_types)) {
+            if (!cbm_kind_in_set(cur, spec->class_node_types) &&
+                !cbm_is_namespace_scope_kind(lang, ts_node_type(cur))) {
                 continue;
             }
             TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));

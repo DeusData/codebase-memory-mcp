@@ -35,8 +35,9 @@
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
 #include "foundation/win_utf8.h" /* cbm_utf8_to_wide, cbm_wide_to_utf8 — Windows path resolution */
-#include "foundation/subprocess.h"  /* cbm_subprocess_run — supervised index spawn */
-#include "mcp/index_supervisor.h"   /* cbm_index_worker_quiet_timeout_ms — shared knob */
+#include "foundation/subprocess.h" /* supervised spawn and Windows command-line quoting */
+#include "mcp/index_supervisor.h"  /* cbm_index_worker_quiet_timeout_ms — shared knob */
+#include "foundation/workspace.h"
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -508,8 +509,18 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     int start = (g_log_head - count + LOG_RING_SIZE) % LOG_RING_SIZE;
     int total = g_log_count;
 
-    /* Copy lines under lock */
-    size_t buf_size = (size_t)count * (LOG_LINE_MAX + 10) + 64;
+    /* Copy lines under lock.
+     *
+     * JSON escaping expands '"', '\\' and '\n' to two bytes each, so an
+     * line made mostly of those serialises to roughly twice its stored length.
+     * The previous budget of LOG_LINE_MAX + 10 per line under-counted that by
+     * half. Ring contents come from indexer stderr, which is not escaped on
+     * ingest and can legitimately contain both doubling characters — a POSIX
+     * filename may.
+     *
+     * Budget the escaped worst case, and clamp the framing writes below anyway
+     * so the size calculation is not the only thing keeping pos in range. */
+    size_t buf_size = (size_t)count * (2 * LOG_LINE_MAX + 8) + 64;
     char *buf = malloc(buf_size);
     if (!buf) {
         cbm_mutex_unlock(&g_log_mutex);
@@ -522,9 +533,9 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % LOG_RING_SIZE;
         if (i > 0)
-            buf[pos++] = ',';
+            http_appendf(buf, buf_size, &pos, ",");
         /* Escape quotes in log lines */
-        buf[pos++] = '"';
+        http_appendf(buf, buf_size, &pos, "\"");
         for (int j = 0; g_log_ring[idx][j] && (size_t)pos < buf_size - 10; j++) {
             char ch = g_log_ring[idx][j];
             if (ch == '"') {
@@ -540,10 +551,18 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                 buf[pos++] = ch;
             }
         }
-        buf[pos++] = '"';
+        http_appendf(buf, buf_size, &pos, "\"");
     }
     cbm_mutex_unlock(&g_log_mutex);
     http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
+
+    /* http_appendf pins pos to buf_size on truncation and then writes nothing,
+     * so a saturated buffer would reach the "%s" reply with no terminator in
+     * range. Terminate explicitly. */
+    if ((size_t)pos >= buf_size) {
+        pos = (int)buf_size - 1;
+    }
+    buf[pos] = '\0';
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
     free(buf);
@@ -653,7 +672,9 @@ static void append_roots_json(char *buf, size_t bufsz, int *pos) {
             continue;
         }
         if (count++ > 0) {
-            buf[(*pos)++] = ',';
+            /* Once a wide listing saturates buf, http_appendf has already
+             * pinned *pos to bufsz, so this separator goes through it too. */
+            http_appendf(buf, bufsz, pos, ",");
         }
         http_appendf(buf, bufsz, pos, "\"%c:/\"", 'A' + i);
     }
@@ -1027,7 +1048,6 @@ static void *index_thread_fn(void *arg) {
     return NULL;
 }
 
-
 /* POST /api/index — body: {"root_path": "/abs/path", "project_name": "..."} */
 static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
                                const cbm_http_req_t *req) {
@@ -1061,6 +1081,31 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
     if (!cbm_is_dir(rpath)) {
         yyjson_doc_free(doc);
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"directory not found\"}");
+        return;
+    }
+
+    /* Same workspace boundary the MCP indexing tool applies, through the same
+     * function. This route used to check only that the path was a directory, so
+     * it accepted roots the MCP path refused — an operator's boundary held on one
+     * entry point and not the other. Canonicalize first: the policy is defined
+     * over resolved paths, and a symlink would otherwise launder the verdict. */
+    char canonical_root[4096];
+    char boundary_err[1024];
+    char configured_allowed_root[CBM_PATH_MAX];
+    if (!cbm_canonical_path(rpath, canonical_root, sizeof(canonical_root))) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"cannot resolve root_path\"}");
+        return;
+    }
+    const char *allowed_root = cbm_safe_getenv("CBM_ALLOWED_ROOT", configured_allowed_root,
+                                               sizeof(configured_allowed_root), NULL);
+    if (!cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
+                                    cbm_workspace_cache_dir(), allowed_root, boundary_err,
+                                    sizeof(boundary_err))) {
+        yyjson_doc_free(doc);
+        char escaped[1024];
+        cbm_json_escape(escaped, (int)sizeof(escaped), boundary_err);
+        cbm_http_replyf(c, 403, g_cors_json, "{\"error\":\"%s\"}", escaped);
         return;
     }
 
@@ -1123,22 +1168,24 @@ static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
         if (st == 0)
             continue;
         if (pos > 1)
-            buf[pos++] = ',';
+            http_appendf(buf, sizeof(buf), &pos, ",");
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
         /* Both fields are free-form (a filesystem path and an error message) and are
          * interpolated into JSON strings, so both must be escaped. Unescaped, a
          * Windows path or an error message quoting a path breaks the response. */
         char esc_job_path[JSON_ESC_CAP(server->index_jobs[i].root_path)];
         char esc_job_error[JSON_ESC_CAP(server->index_jobs[i].error_msg)];
-        cbm_json_escape(esc_job_path, (int)sizeof(esc_job_path),
-                        server->index_jobs[i].root_path);
+        cbm_json_escape(esc_job_path, (int)sizeof(esc_job_path), server->index_jobs[i].root_path);
         cbm_json_escape(esc_job_error, (int)sizeof(esc_job_error),
                         st == 3 ? server->index_jobs[i].error_msg : "");
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
                      esc_job_path, esc_job_error);
     }
-    buf[pos++] = ']';
+    http_appendf(buf, sizeof(buf), &pos, "]");
+    if ((size_t)pos >= sizeof(buf)) {
+        pos = (int)sizeof(buf) - 1;
+    }
     buf[pos] = '\0';
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -1236,11 +1283,10 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     char base_json[256];
     snprintf(base_json, sizeof(base_json),
-             "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}",
-             node_count, edge_count, (long long)size);
-    char *fresh_json =
-        cbm_mcp_add_dirty_file_freshness_to_json(base_json, store, name,
-                                                 UI_PROJECT_HEALTH_DIRTY_WARNING);
+             "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}", node_count,
+             edge_count, (long long)size);
+    char *fresh_json = cbm_mcp_add_dirty_file_freshness_to_json(base_json, store, name,
+                                                                UI_PROJECT_HEALTH_DIRTY_WARNING);
     cbm_store_close(store);
     cbm_http_replyf(c, 200, g_cors_json, "%s", fresh_json ? fresh_json : base_json);
     free(fresh_json);
@@ -1439,9 +1485,8 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     /* A missed-graph request already is the miss graph; with no satellites,
      * only freshness metadata remains to decorate before returning. */
     if (linked_count == 0 && missed_graph) {
-        char *fresh_json =
-            cbm_mcp_add_dirty_file_freshness_to_json(primary_json, store, project,
-                                                     UI_LAYOUT_DIRTY_WARNING);
+        char *fresh_json = cbm_mcp_add_dirty_file_freshness_to_json(primary_json, store, project,
+                                                                    UI_LAYOUT_DIRTY_WARNING);
         cbm_store_close(store);
         cbm_http_replyf(c, 200, g_cors_json, "%s", fresh_json ? fresh_json : primary_json);
         free(fresh_json);

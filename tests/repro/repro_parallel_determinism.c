@@ -189,9 +189,9 @@ TEST(repro_seq_parallel_equivalence) {
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/cbm_rpd_seq_par.db", cbm_tmpdir());
 
-    setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
     char *fp_st = rpd_index_and_fingerprint(corpus, dbpath);
-    unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     ASSERT_NOT_NULL(fp_st);
 
     char *fp_mt = rpd_index_and_fingerprint(corpus, dbpath);

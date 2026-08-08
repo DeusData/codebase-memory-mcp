@@ -624,6 +624,44 @@ TEST(cypher_parse_preserves_query_sized_case_value_reference) {
     PASS();
 }
 
+/* #1334: every ORDER BY key is parsed (per-key direction) and the LIMIT that
+ * follows the key list is consumed instead of silently dropped. */
+TEST(cypher_parse_multikey_order_by_issue1334) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(
+        "MATCH (f:Function) RETURN f.name, f.complexity "
+        "ORDER BY f.complexity DESC, f.name ASC LIMIT 5",
+        &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(q->ret->order_count, 2);
+    ASSERT_STR_EQ(q->ret->order_items[0].expression, "f.complexity");
+    ASSERT_STR_EQ(q->ret->order_items[0].direction, "DESC");
+    ASSERT_STR_EQ(q->ret->order_items[1].expression, "f.name");
+    ASSERT_STR_EQ(q->ret->order_items[1].direction, "ASC");
+    ASSERT_EQ(q->ret->limit, 5);
+
+    cbm_query_free(q);
+    PASS();
+}
+
+/* #1334: the dynamic ORDER BY model preserves keys beyond the former fixed
+ * cap and still consumes the following LIMIT. */
+TEST(cypher_parse_order_by_beyond_legacy_cap_issue1334) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN * ORDER BY "
+                              "f.a, f.b, f.c, f.d, f.e, f.f, f.g, f.h, f.i LIMIT 5",
+                              &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(err);
+    ASSERT_EQ(q->ret->order_count, 9);
+    ASSERT_STR_EQ(q->ret->order_items[8].expression, "f.i");
+    ASSERT_EQ(q->ret->limit, 5);
+    cbm_query_free(q);
+    PASS();
+}
+
 TEST(cypher_parse_return_distinct) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -1044,6 +1082,58 @@ TEST(cypher_exec_output_cap_does_not_limit_predicate_scan) {
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
+}
+
+/* The query string is caller-supplied and the WHERE grammar recurses once per
+ * nested '(' and once per NOT, with no depth counter between the MCP entry point
+ * and the recursive descent. A few tens of KB of '(' therefore exhausted the
+ * stack at parse time. Parse in a forked child so the crash surfaces as a
+ * killing signal rather than taking the test runner with it; a bounded parser
+ * must reject the query cleanly instead. */
+TEST(cypher_deep_nesting_rejected_not_crash) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the depth cap is platform-agnostic");
+#else
+    enum { NEST = 30000 };
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *q = malloc(NEST * 2 + 64);
+        if (!q) {
+            _exit(2);
+        }
+        int n = snprintf(q, 64, "MATCH (f:Function) WHERE ");
+        for (int i = 0; i < NEST; i++) {
+            q[n++] = '(';
+        }
+        n += snprintf(q + n, 32, "f.name = \"x\"");
+        for (int i = 0; i < NEST; i++) {
+            q[n++] = ')';
+        }
+        q[n] = '\0';
+        cbm_store_t *s = setup_cypher_store();
+        cbm_cypher_result_t r = {0};
+        /* Any clean outcome is acceptable — success or a parse error. Only a
+         * crash is a failure, and that is what the signal check below catches. */
+        (void)cbm_cypher_execute(s, q, "test", 0, &r);
+        cbm_cypher_result_free(&r);
+        cbm_store_close(s);
+        free(q);
+        _exit(0);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "parser killed by signal %d — unbounded recursion depth",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
 }
 
 TEST(cypher_exec_match_all_functions) {
@@ -4380,6 +4470,65 @@ TEST(cypher_exec_skip_limit) {
     PASS();
 }
 
+/* Regression for #1334: a LIMIT must survive a multi-key ORDER BY. The parser
+ * used to stop at the first sort key, leaving ", key2 ... LIMIT n" unconsumed —
+ * the whole result set came back (6326 rows instead of 5 on the reporter's
+ * graph: a token-flood into agent context). */
+TEST(cypher_exec_multikey_order_by_keeps_limit_issue1334) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    /* start_lines: HandleOrder=10, ValidateOrder=5, SubmitOrder=0, LogError=0 */
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) RETURN f.name, f.start_line "
+        "ORDER BY f.start_line DESC, f.name ASC LIMIT 2",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[1][0], "ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1334: the secondary key must actually break ties, per-key direction. */
+TEST(cypher_exec_multikey_order_by_tiebreak_issue1334) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    /* start_line ASC puts the two 0-line functions first; name DESC breaks the
+     * tie: SubmitOrder before LogError. */
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) RETURN f.name, f.start_line "
+        "ORDER BY f.start_line ASC, f.name DESC LIMIT 2",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "SubmitOrder");
+    ASSERT_STR_EQ(r.rows[1][0], "LogError");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1334: the WITH-clause pipeline has the same multi-key ORDER BY contract. */
+TEST(cypher_exec_with_multikey_order_by_keeps_limit_issue1334) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WITH f.name AS n, f.start_line AS sl "
+                                "ORDER BY sl DESC, n ASC LIMIT 2 RETURN n",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[1][0], "ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_sum) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -6831,6 +6980,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_return_order_limit);
     RUN_TEST(cypher_parse_preserves_query_sized_label);
     RUN_TEST(cypher_parse_preserves_query_sized_case_value_reference);
+    RUN_TEST(cypher_parse_multikey_order_by_issue1334);
+    RUN_TEST(cypher_parse_order_by_beyond_legacy_cap_issue1334);
     RUN_TEST(cypher_parse_return_distinct);
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
@@ -6848,6 +6999,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_aggregate_value_lists_grow_geometrically);
     RUN_TEST(cypher_exec_file_contains_pushes_down_beyond_seed_window);
     RUN_TEST(cypher_exec_output_cap_does_not_limit_predicate_scan);
+    RUN_TEST(cypher_deep_nesting_rejected_not_crash);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
     RUN_TEST(cypher_cross_join_alloc_rejects_overflow);
@@ -6988,6 +7140,9 @@ SUITE(cypher) {
     /* Phase 4: SKIP + aggregation */
     RUN_TEST(cypher_exec_skip);
     RUN_TEST(cypher_exec_skip_limit);
+    RUN_TEST(cypher_exec_multikey_order_by_keeps_limit_issue1334);
+    RUN_TEST(cypher_exec_multikey_order_by_tiebreak_issue1334);
+    RUN_TEST(cypher_exec_with_multikey_order_by_keeps_limit_issue1334);
     RUN_TEST(cypher_exec_sum);
     RUN_TEST(cypher_exec_avg);
     RUN_TEST(cypher_exec_min);

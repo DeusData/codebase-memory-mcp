@@ -667,10 +667,23 @@ static void cbm_quarantine_load(void) {
          * never freed: the set lives for the whole (short-lived worker) process.
          * The value stores the phase so cbm_index_quarantine_phase() can report
          * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
-        char *key = cbm_strdup(line);
         char *pval = cbm_strdup(phase);
-        if (key && pval) {
-            cbm_ht_set(set, key, (void *)pval);
+        if (!pval) {
+            continue;
+        }
+        if (cbm_ht_has(set, line)) {
+            /* Duplicate path line: reuse the stored key (the table borrows key
+             * pointers, so a fresh copy would leak on replace) and free the
+             * value it displaces. */
+            free(cbm_ht_set(set, line, (void *)pval));
+        } else {
+            char *key = cbm_strdup(line);
+            if (key) {
+                cbm_ht_set(set, key, (void *)pval);
+            } else {
+                /* Partial failure: don't leak the value copy. */
+                free(pval);
+            }
         }
     }
     (void)fclose(f);
@@ -1164,6 +1177,92 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
     return buf;
 }
 
+typedef struct {
+    int def_index;
+    uint32_t start_line;
+} cbm_callable_interval_t;
+
+static bool cbm_is_callable_definition(const CBMDefinition *def) {
+    return def && def->name && def->label &&
+           (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
+}
+
+static int cbm_callable_interval_start_compare(const void *lhs, const void *rhs) {
+    const cbm_callable_interval_t *a = lhs;
+    const cbm_callable_interval_t *b = rhs;
+    if (a->start_line != b->start_line) {
+        return (a->start_line > b->start_line) - (a->start_line < b->start_line);
+    }
+    return (a->def_index > b->def_index) - (a->def_index < b->def_index);
+}
+
+static int64_t cbm_callable_span(const CBMDefinition *def) {
+    return (int64_t)def->end_line - (int64_t)def->start_line;
+}
+
+static bool cbm_callable_heap_precedes(const CBMDefinition *defs, int lhs, int rhs) {
+    int64_t lhs_span = cbm_callable_span(&defs[lhs]);
+    int64_t rhs_span = cbm_callable_span(&defs[rhs]);
+    return lhs_span < rhs_span || (lhs_span == rhs_span && lhs < rhs);
+}
+
+static void cbm_callable_heap_push(int *heap, int *count, const CBMDefinition *defs,
+                                   int def_index) {
+    int pos = (*count)++;
+    while (pos > 0) {
+        int parent = (pos - SKIP_ONE) / CBM_SZ_2;
+        if (!cbm_callable_heap_precedes(defs, def_index, heap[parent])) {
+            break;
+        }
+        heap[pos] = heap[parent];
+        pos = parent;
+    }
+    heap[pos] = def_index;
+}
+
+static void cbm_callable_heap_pop(int *heap, int *count, const CBMDefinition *defs) {
+    int replacement = heap[--(*count)];
+    if (*count == 0) {
+        return;
+    }
+    int pos = 0;
+    while (true) {
+        int left = pos * CBM_SZ_2 + SKIP_ONE;
+        if (left >= *count) {
+            break;
+        }
+        int right = left + SKIP_ONE;
+        int child = right < *count && cbm_callable_heap_precedes(defs, heap[right], heap[left])
+                        ? right
+                        : left;
+        if (!cbm_callable_heap_precedes(defs, heap[child], replacement)) {
+            break;
+        }
+        heap[pos] = heap[child];
+        pos = child;
+    }
+    heap[pos] = replacement;
+}
+
+static int cbm_find_innermost_callable_linear(const CBMDefinition *defs, int def_count,
+                                              int call_line) {
+    int best = -1;
+    int64_t best_span = -1;
+    for (int di = 0; di < def_count; di++) {
+        const CBMDefinition *def = &defs[di];
+        if (!cbm_is_callable_definition(def) || (int64_t)def->start_line > call_line ||
+            call_line > (int64_t)def->end_line) {
+            continue;
+        }
+        int64_t span = cbm_callable_span(def);
+        if (best < 0 || span < best_span) {
+            best_span = span;
+            best = di;
+        }
+    }
+    return best;
+}
+
 /* Public entry: run the extraction and journal completion. The DONE mark on
  * every ordinary return (including error/timeout results) tells the crash
  * supervisor this file did NOT kill the worker — only a file whose S has no
@@ -1196,7 +1295,6 @@ CBMFileResult *cbm_extract_file_with_options_ex(const char *source, int source_l
     CBMFileResult *r = cbm_extract_file_impl(source, source_len, language, project, rel_path,
                                              timeout_micros, extra_defines, include_paths,
                                              extract_macros, macro_table, return_type_table);
-    cbm_index_mark_done(rel_path);
     return r;
 }
 
@@ -1359,7 +1457,8 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
+            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C,
+                          CBM_SOURCE_ORIGIN_RAW);
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
@@ -1419,8 +1518,11 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         if (preprocessed && preprocessed->source) {
             char *expanded = preprocessed->source;
             int expanded_len = (int)strlen(expanded);
-            // Record calls count before second pass
+            // Record every site-bearing array boundary before the second pass.
+            // Numeric byte spans in `expanded` are not raw-source coordinates.
             int calls_before = result->calls.count;
+            int usages_before = result->usages.count;
+            int resolved_before = result->resolved_calls.count;
 
             // Parse expanded source with fresh tree
             TSParser *pp_parser = get_thread_parser(ts_lang, language);
@@ -1460,11 +1562,30 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     // caller+callee).
                     cbm_extract_unified_calls_only(&pp_ctx);
 
+                    /* Stamp parser carriers before C-LSP performs any
+                     * origin-sensitive rewrite. Numeric spans in the expanded
+                     * buffer may collide with unrelated raw-source spans. */
+                    for (int i = calls_before; i < result->calls.count; i++) {
+                        result->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = usages_before; i < result->usages.count; i++) {
+                        result->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
                     cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C);
+                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+
+                    /* All C-LSP emitters stamp origin directly so rewrite-time
+                     * comparisons are already safe. Keep this boundary sweep as
+                     * a defensive invariant for any future emitter added to the
+                     * C resolver. */
+                    for (int i = resolved_before; i < result->resolved_calls.count; i++) {
+                        result->resolved_calls.items[i].source_origin =
+                            CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
 
                     /* #961: a def whose body braces are split across
                      * #ifdef/#else branches parses as an ERROR region on the
@@ -1533,13 +1654,92 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     // Bottleneck call-context metrics. Each call is attributed to the INNERMOST
     // enclosing Function/Method def by source-line range (defs and calls in one
     // CBMFileResult share the same file). Range matching is used instead of
-    // enclosing_func_qn string matching because some grammars (notably C, whose
-    // function_definition has no "name" field) attribute the call's scope to the
-    // module rather than the function — line ranges are unambiguous and
-    // language-agnostic. Bounded per file (defs x calls), not a repo-scale scan.
+    // enclosing_func_qn string matching because some grammars attribute the
+    // call's scope to the module rather than the function.
     int def_count = result->defs.count;
-    bool *has_self = def_count > 0 ? calloc((size_t)def_count, sizeof(bool)) : NULL;
-    bool *has_guarded = def_count > 0 ? calloc((size_t)def_count, sizeof(bool)) : NULL;
+
+    /* The unified raw-source walk normally emits source-ordered calls and defs.
+     * Disjoint callable intervals use a zero-scratch O(C+D) sweep. Nested
+     * intervals use a span-ordered min-heap in O((C+D) log D) time and O(D)
+     * memory; unordered definitions are sorted once. Every path preserves the
+     * former "smallest span, first def on ties" rule. If ordering or allocation
+     * assumptions fail, retain the exact O(C*D), O(D) parent bound. */
+    bool calls_source_ordered = true;
+    int previous_call_line = -1;
+    for (int ci = 0; ci < orig_calls_count; ci++) {
+        int line = result->calls.items[ci].start_line;
+        if (line <= 0) {
+            continue;
+        }
+        if (previous_call_line > line) {
+            calls_source_ordered = false;
+            break;
+        }
+        previous_call_line = line;
+    }
+
+    bool callable_starts_ordered = true;
+    bool callable_intervals_overlap = false;
+    int callable_count = 0;
+    uint32_t previous_callable_start = 0;
+    uint32_t callable_max_end = 0;
+    for (int di = 0; di < def_count; di++) {
+        const CBMDefinition *def = &result->defs.items[di];
+        if (!cbm_is_callable_definition(def)) {
+            continue;
+        }
+        if (callable_count > 0) {
+            if (def->start_line < previous_callable_start) {
+                callable_starts_ordered = false;
+            }
+            if (def->start_line <= callable_max_end) {
+                callable_intervals_overlap = true;
+            }
+        }
+        if (def->end_line > callable_max_end) {
+            callable_max_end = def->end_line;
+        }
+        previous_callable_start = def->start_line;
+        callable_count++;
+    }
+
+    bool use_direct_nonoverlap =
+        calls_source_ordered && callable_starts_ordered && !callable_intervals_overlap;
+    bool use_heap_sweep = calls_source_ordered && !use_direct_nonoverlap;
+    cbm_callable_interval_t *callable_intervals = NULL;
+    int *callable_heap = NULL;
+    if (use_heap_sweep && callable_count > 0 &&
+        (size_t)callable_count <= SIZE_MAX / sizeof(*callable_heap)) {
+        callable_heap = malloc((size_t)callable_count * sizeof(*callable_heap));
+    }
+    if (use_heap_sweep && !callable_starts_ordered && callable_count > 0 &&
+        (size_t)callable_count <= SIZE_MAX / sizeof(*callable_intervals)) {
+        callable_intervals = malloc((size_t)callable_count * sizeof(*callable_intervals));
+        if (callable_intervals) {
+            int interval_count = 0;
+            for (int di = 0; di < def_count; di++) {
+                if (cbm_is_callable_definition(&result->defs.items[di])) {
+                    callable_intervals[interval_count++] = (cbm_callable_interval_t){
+                        .def_index = di,
+                        .start_line = result->defs.items[di].start_line,
+                    };
+                }
+            }
+            qsort(callable_intervals, (size_t)callable_count, sizeof(*callable_intervals),
+                  cbm_callable_interval_start_compare);
+        }
+    }
+    if (use_heap_sweep && (!callable_heap || (!callable_starts_ordered && !callable_intervals))) {
+        free(callable_intervals);
+        free(callable_heap);
+        callable_intervals = NULL;
+        callable_heap = NULL;
+        use_heap_sweep = false;
+    }
+    int next_callable = 0;
+    int next_callable_def = 0;
+    int active_nonoverlap_def = -1;
+    int callable_heap_count = 0;
 
     // param_count is a standalone structural smell (independent of calls). Prefer
     // the parsed param_names array; fall back to counting from the signature text
@@ -1563,22 +1763,59 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         if (!c->callee_name || c->start_line <= 0) {
             continue;
         }
-        // Innermost enclosing Function/Method def by line range (smallest span).
         int best = -1;
-        int best_span = -1;
-        for (int di = 0; di < def_count; di++) {
-            const CBMDefinition *d = &result->defs.items[di];
-            if (!d->name || !d->label ||
-                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)) {
-                continue;
+        if (use_direct_nonoverlap) {
+            while (next_callable_def < def_count) {
+                const CBMDefinition *next_def = &result->defs.items[next_callable_def];
+                if (!cbm_is_callable_definition(next_def)) {
+                    next_callable_def++;
+                    continue;
+                }
+                if (next_def->start_line > (uint32_t)c->start_line) {
+                    break;
+                }
+                active_nonoverlap_def = next_callable_def++;
             }
-            if ((int)d->start_line <= c->start_line && c->start_line <= (int)d->end_line) {
-                int span = (int)d->end_line - (int)d->start_line;
-                if (best < 0 || span < best_span) {
-                    best_span = span;
-                    best = di;
+            if (active_nonoverlap_def >= 0 &&
+                result->defs.items[active_nonoverlap_def].end_line >= (uint32_t)c->start_line) {
+                best = active_nonoverlap_def;
+            }
+        } else if (use_heap_sweep) {
+            while (next_callable < callable_count) {
+                int next_def_index = -1;
+                uint32_t next_start = 0;
+                if (callable_intervals) {
+                    next_def_index = callable_intervals[next_callable].def_index;
+                    next_start = callable_intervals[next_callable].start_line;
+                } else {
+                    while (next_callable_def < def_count &&
+                           !cbm_is_callable_definition(&result->defs.items[next_callable_def])) {
+                        next_callable_def++;
+                    }
+                    if (next_callable_def < def_count) {
+                        next_def_index = next_callable_def;
+                        next_start = result->defs.items[next_callable_def].start_line;
+                    }
+                }
+                if (next_def_index < 0 || next_start > (uint32_t)c->start_line) {
+                    break;
+                }
+                cbm_callable_heap_push(callable_heap, &callable_heap_count, result->defs.items,
+                                       next_def_index);
+                next_callable++;
+                if (!callable_intervals) {
+                    next_callable_def++;
                 }
             }
+            while (callable_heap_count > 0 &&
+                   result->defs.items[callable_heap[0]].end_line < (uint32_t)c->start_line) {
+                cbm_callable_heap_pop(callable_heap, &callable_heap_count, result->defs.items);
+            }
+            if (callable_heap_count > 0) {
+                best = callable_heap[0];
+            }
+        } else {
+            best = cbm_find_innermost_callable_linear(result->defs.items, def_count, c->start_line);
         }
         if (best < 0) {
             continue;
@@ -1597,14 +1834,13 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             // Direct self-recursion. The call graph omits self-edges (pass_calls
             // skips source==target), so detect it here; seeds "recursive".
             d->is_recursive = true;
-            if (has_self) {
-                has_self[best] = true;
-            }
             if (in_loop) {
                 d->recursion_in_loop = true; // recursion compounded by a loop
             }
-            if (c->branch_depth > 0 && has_guarded) {
-                has_guarded[best] = true; // a self-call guarded by some conditional
+            if (c->branch_depth > 0) {
+                /* Temporary during this loop: a guarded self-call was seen.
+                 * Materialized to the public inverse meaning below. */
+                d->unguarded_recursion = true;
             }
         }
         if (in_loop && is_linear_scan_name(callee_short)) {
@@ -1614,16 +1850,17 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
             d->alloc_in_loop++; // repeated allocation/append inside a loop
         }
     }
+    free(callable_intervals);
+    free(callable_heap);
 
     // Recursive with no self-call guarded by any conditional → no obvious base
     // case on the recursive path: a stronger "potentially unbounded" signal.
     for (int di = 0; di < def_count; di++) {
-        if (has_self && has_self[di] && !(has_guarded && has_guarded[di])) {
-            result->defs.items[di].unguarded_recursion = true;
+        CBMDefinition *def = &result->defs.items[di];
+        if (def->is_recursive) {
+            def->unguarded_recursion = !def->unguarded_recursion;
         }
     }
-    free(has_self);
-    free(has_guarded);
 
     uint64_t t2 = now_ns();
 
@@ -1678,6 +1915,12 @@ void cbm_free_result(CBMFileResult *result) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
     }
+    for (int i = 0; i < result->owned_result_count; i++) {
+        cbm_free_result(result->owned_results[i]);
+    }
+    free(result->owned_results);
+    result->owned_results = NULL;
+    result->owned_result_count = 0;
     cbm_arena_destroy(&result->arena);
     free(result);
 }

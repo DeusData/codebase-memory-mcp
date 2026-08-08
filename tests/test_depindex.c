@@ -13,6 +13,7 @@
 #include "test_framework.h"
 #include <cli/cli.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline_internal.h>
 #include <store/store.h>
 #include <depindex/depindex.h>
 #include <yyjson/yyjson.h>
@@ -955,7 +956,19 @@ TEST(test_auto_index_deps_refreshes_nodes_fts) {
     int hash_count = 0;
     ASSERT_EQ(cbm_store_get_file_hashes(store, "dep-fts-test.dep.requests", &hashes, &hash_count),
               CBM_STORE_OK);
-    ASSERT_EQ(hash_count, 1);
+    int source_hash_count = 0;
+    int semantic_hash_count = 0;
+    for (int i = 0; i < hash_count; i++) {
+        if (hashes[i].rel_path &&
+            strncmp(hashes[i].rel_path, CBM_SEMANTIC_INPUT_PREFIX,
+                    strlen(CBM_SEMANTIC_INPUT_PREFIX)) == 0) {
+            semantic_hash_count++;
+        } else {
+            source_hash_count++;
+        }
+    }
+    ASSERT_EQ(source_hash_count, 1);
+    ASSERT_EQ(semantic_hash_count, 4);
     cbm_store_free_file_hashes(hashes, hash_count);
 
     cbm_file_state_t state = {0};

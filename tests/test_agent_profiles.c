@@ -251,6 +251,40 @@ TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path) {
     PASS();
 }
 
+TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path) {
+    const char *binary = "C:\\cbm bin\\codebase-memory-mcp.exe";
+    char *scout = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_SCOUT,
+                                           CBM_GRAPH_ACCESS_DIRECT, binary);
+    char *verify = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_VERIFY,
+                                            CBM_GRAPH_ACCESS_DIRECT, binary);
+    ASSERT_NOT_NULL(scout);
+    ASSERT_NOT_NULL(verify);
+    int valid = strstr(scout, "[mcp_servers.codebase-memory-mcp]\n"
+                              "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp.exe\"\n"
+                              "args = [\"--tool-profile\", \"scout\"]\n"
+                              "enabled_tools = [") != NULL &&
+                strstr(verify, "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp.exe\"\n"
+                               "args = [\"--tool-profile\", \"analysis\"]\n") != NULL;
+    free(scout);
+    free(verify);
+    ASSERT_TRUE(valid);
+    ASSERT_NULL(cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_VERIFY,
+                                         CBM_GRAPH_ACCESS_DIRECT, NULL));
+    ASSERT_NULL(cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_VERIFY,
+                                         CBM_GRAPH_ACCESS_DIRECT, ""));
+    char *handoff = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_VERIFY,
+                                             CBM_GRAPH_ACCESS_HANDOFF, NULL);
+    ASSERT_NOT_NULL(handoff);
+    ASSERT_TRUE(strstr(handoff, "[mcp_servers.") == NULL);
+    free(handoff);
+    char *rc1 = cbm_render_graph_profile_codex_rc1(CBM_GRAPH_TIER_VERIFY);
+    ASSERT_NOT_NULL(rc1);
+    ASSERT_TRUE(strstr(rc1, "[mcp_servers.codebase-memory-mcp]\nenabled_tools = [") != NULL);
+    ASSERT_TRUE(strstr(rc1, "command = ") == NULL);
+    free(rc1);
+    PASS();
+}
+
 TEST(agent_profiles_vibe_uses_matching_prompt_identifier_and_contract) {
     for (int tier = 0; tier < (int)CBM_GRAPH_TIER_COUNT; tier++) {
         const char *slug = cbm_graph_tier_slug((cbm_graph_tier_t)tier);
@@ -301,6 +335,7 @@ SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_handoff_only_dialects_fail_closed_for_direct_access);
     RUN_TEST(agent_profiles_server_level_dialects_hard_enforce_read_only_tools);
     RUN_TEST(agent_profiles_kiro_is_valid_json_and_escapes_binary_path);
+    RUN_TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path);
     RUN_TEST(agent_profiles_vibe_uses_matching_prompt_identifier_and_contract);
     RUN_TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs);
 }

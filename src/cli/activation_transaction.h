@@ -97,4 +97,9 @@ const char *cbm_activation_transaction_status_message(cbm_activation_transaction
  * entry; single-threaded like the rest of the transaction API. */
 const char *cbm_activation_transaction_refusal_note(void);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
+                                                         unsigned long os_error);
+#endif
+
 #endif /* CBM_ACTIVATION_TRANSACTION_H */

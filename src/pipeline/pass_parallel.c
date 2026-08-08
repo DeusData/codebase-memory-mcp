@@ -83,7 +83,6 @@ enum {
 #include "cbm.h"
 #include "arena.h"
 #include "macro_table.h"
-#include "iris_export_xml.h"
 #include "simhash/minhash.h"
 
 #include "semantic/ast_profile.h"
@@ -102,6 +101,7 @@ enum {
  * not re-pay the full nap tax on every file pull when napping cannot reclaim
  * memory (the resident floor, not in-flight transients, holds the budget). */
 static _Atomic long g_bp_nap_cycles = 0;
+static _Atomic uint64_t g_lsp_linear_fallback_rows = 0;
 
 long cbm_pp_bp_nap_cycles(void) {
     return atomic_load_explicit(&g_bp_nap_cycles, memory_order_relaxed);
@@ -109,6 +109,14 @@ long cbm_pp_bp_nap_cycles(void) {
 
 void cbm_pp_bp_nap_cycles_reset(void) {
     atomic_store_explicit(&g_bp_nap_cycles, 0, memory_order_relaxed);
+}
+
+uint64_t cbm_pp_lsp_linear_fallback_rows(void) {
+    return atomic_load_explicit(&g_lsp_linear_fallback_rows, memory_order_relaxed);
+}
+
+void cbm_pp_lsp_linear_fallback_rows_reset(void) {
+    atomic_store_explicit(&g_lsp_linear_fallback_rows, 0, memory_order_relaxed);
 }
 
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
@@ -549,11 +557,14 @@ static void extract_decorator_func(const char *dec, char *out, size_t outsz) {
         return;
     }
     const char *start = dec;
-    if (*start == '@') {
+    while (*start == '@' || *start == '#' || *start == '[' || *start == ' ') {
         start++;
     }
-    const char *paren = strchr(start, '(');
-    size_t len = paren ? (size_t)(paren - start) : strlen(start);
+    size_t len = 0;
+    while (start[len] && start[len] != '(' && start[len] != '[' && start[len] != ']' &&
+           start[len] != ' ' && start[len] != ',') {
+        len++;
+    }
     if (len == 0 || len >= outsz) {
         return;
     }
@@ -821,10 +832,19 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result = cbm_extract_file_with_options_ex(
-            source, source_len, fi->language, ec->project_name, fi->rel_path,
-            ec->extract_timeout_micros, NULL, NULL, ec->extract_macros, ec->macro_table,
-            ec->return_type_table);
+        /* Export XML uses the same cache slot as every physical file, so its
+         * generated classes are composed before entering the common registry
+         * and resolution lifecycle. */
+        CBMFileResult *result =
+            fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT
+                ? cbm_pipeline_extract_objectscript_export(source, source_len, ec->project_name,
+                                                           fi->rel_path, ec->extract_timeout_micros,
+                                                           ec->extract_macros, ec->macro_table,
+                                                           ec->return_type_table)
+                : cbm_extract_file_with_options_ex(
+                      source, source_len, fi->language, ec->project_name, fi->rel_path,
+                      ec->extract_timeout_micros, NULL, NULL, ec->extract_macros, ec->macro_table,
+                      ec->return_type_table);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -1863,13 +1883,219 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
     return src;
 }
 
+/* Free a strdup'd key stored in the per-file lsp_idx hash table. */
+static void lsp_idx_free_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    free((char *)key);
+}
+
+/* A hash key may have multiple semantic rows. Keep a permanent tombstone for
+ * distinct targets so O(1) lookup cannot turn ambiguity into a confidence
+ * contest; duplicate rows for the same target may still keep the best score. */
+static CBMResolvedCall *const LSP_IDX_AMBIGUOUS = (CBMResolvedCall *)(uintptr_t)1;
+
+static bool lsp_idx_keep_best(CBMHashTable *index, const char *key, CBMResolvedCall *candidate,
+                              const cbm_gbuf_t *gbuf, const char *project_name,
+                              bool allow_tail_match) {
+    if (!index || !key || !candidate) {
+        return false;
+    }
+    CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(index, key);
+    if (!existing) {
+        char *owned_key = cbm_strdup(key);
+        if (owned_key) {
+            cbm_ht_set(index, owned_key, candidate);
+            if (cbm_ht_get(index, key) == candidate) {
+                return true;
+            }
+            free(owned_key);
+        }
+        return false;
+    }
+    if (existing == LSP_IDX_AMBIGUOUS) {
+        return true;
+    }
+    if (!cbm_pipeline_invocation_targets_equal(existing->callee_qn, candidate->callee_qn, gbuf,
+                                               project_name, allow_tail_match)) {
+        const char *stored_key = cbm_ht_get_key(index, key);
+        if (stored_key) {
+            cbm_ht_set(index, stored_key, LSP_IDX_AMBIGUOUS);
+        }
+        return cbm_ht_get(index, key) != NULL;
+    }
+    if (candidate->confidence > existing->confidence) {
+        const char *stored_key = cbm_ht_get_key(index, key);
+        if (stored_key) {
+            cbm_ht_set(index, stored_key, candidate);
+        }
+    }
+    return cbm_ht_get(index, key) != NULL;
+}
+
+/* Caller QNs are user-controlled graph identifiers and can legitimately exceed
+ * the old 1 KiB stack buffer. Build occurrence keys at their exact length so an
+ * exact semantic row can never disappear merely because its caller is long. */
+static char *lsp_idx_key(const char *caller_qn, const char *leaf, bool exact_site,
+                         uint32_t site_start_byte, uint32_t site_end_byte,
+                         CBMSourceOrigin source_origin) {
+    if (!caller_qn || !leaf) {
+        return NULL;
+    }
+    size_t caller_len = strlen(caller_qn);
+    size_t leaf_len = strlen(leaf);
+    size_t suffix_len = exact_site ? 48U : 16U;
+    if (caller_len > SIZE_MAX - leaf_len - suffix_len - 2U) {
+        return NULL;
+    }
+    size_t cap = caller_len + 1U + leaf_len + suffix_len + 1U;
+    char *key = (char *)malloc(cap);
+    if (!key) {
+        return NULL;
+    }
+    int written = exact_site
+                      ? snprintf(key, cap, "%s|%s|%u:%u|%u", caller_qn, leaf, site_start_byte,
+                                 site_end_byte, (unsigned)source_origin)
+                      : snprintf(key, cap, "%s|%s|%u", caller_qn, leaf, (unsigned)source_origin);
+    if (written <= 0 || (size_t)written >= cap) {
+        free(key);
+        return NULL;
+    }
+    return key;
+}
+
+static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate, const char *leaf,
+                                bool exact_site, const cbm_gbuf_t *gbuf, const char *project_name,
+                                bool allow_tail_match) {
+    if (!index || !candidate || !candidate->caller_qn || !leaf || !leaf[0]) {
+        return false;
+    }
+    char *key = lsp_idx_key(candidate->caller_qn, leaf, exact_site, candidate->site_start_byte,
+                            candidate->site_end_byte, candidate->source_origin);
+    if (!key) {
+        return false;
+    }
+    bool inserted = lsp_idx_keep_best(index, key, candidate, gbuf, project_name, allow_tail_match);
+    free(key);
+    return inserted;
+}
+
+static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CBMCall *call,
+                                             bool exact_site, double confidence_floor,
+                                             bool *key_built, bool *ambiguous) {
+    if (key_built) {
+        *key_built = false;
+    }
+    if (ambiguous) {
+        *ambiguous = false;
+    }
+    if (!index || !call || !call->enclosing_func_qn || !call->callee_name) {
+        return NULL;
+    }
+    const char *leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
+    if (!leaf || !leaf[0]) {
+        return NULL;
+    }
+    char *key = lsp_idx_key(call->enclosing_func_qn, leaf, exact_site, call->site_start_byte,
+                            call->site_end_byte, call->source_origin);
+    if (!key) {
+        return NULL;
+    }
+    if (key_built) {
+        *key_built = true;
+    }
+    const CBMResolvedCall *candidate = (const CBMResolvedCall *)cbm_ht_get(index, key);
+    free(key);
+    if (candidate == LSP_IDX_AMBIGUOUS) {
+        if (ambiguous) {
+            *ambiguous = true;
+        }
+        return NULL;
+    }
+    if (!candidate || candidate->kind != CBM_RESOLVED_INVOCATION || !candidate->caller_qn ||
+        strcmp(candidate->caller_qn, call->enclosing_func_qn) != 0 ||
+        candidate->confidence < confidence_floor) {
+        return NULL;
+    }
+    int site_rank = cbm_pipeline_invocation_site_rank(candidate, call);
+    int expected_rank = exact_site ? 2 : 1;
+    return site_rank == expected_rank &&
+                   cbm_pipeline_invocation_leaf_matches(candidate, call, site_rank)
+               ? candidate
+               : NULL;
+}
+
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
-    cbm_lsp_resolution_index_t lsp_idx;
-    cbm_lsp_resolution_index_build(&lsp_idx, &result->resolved_calls, result->calls.count,
-                                   rc->lsp_confidence_floor);
+    /* Two occurrence-aware indexes preserve the authoritative matcher's
+     * primary ordering without restoring its O(calls × resolutions) scan:
+     * exact caller+leaf+span first, then the legacy caller+leaf fallback.
+     * Repeated same-leaf calls therefore remain O(1), and a high-confidence
+     * 0:0 record can never hide an exact source occurrence. */
+    CBMHashTable *lsp_exact_idx = NULL;
+    CBMHashTable *lsp_legacy_idx = NULL;
+    bool lsp_exact_idx_complete = true;
+    bool lsp_legacy_idx_complete = true;
+    bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
+    double confidence_floor = rc->lsp_confidence_floor > 0.0 ? rc->lsp_confidence_floor
+                                                             : (double)CBM_LSP_CONFIDENCE_FLOOR;
+    if (result->calls.count > 0 && result->resolved_calls.count > 0) {
+        uint32_t capacity = (uint32_t)result->resolved_calls.count * 2u + 16u;
+        lsp_exact_idx = cbm_ht_create(capacity);
+        lsp_legacy_idx = cbm_ht_create(capacity);
+        if (!lsp_exact_idx) {
+            lsp_exact_idx_complete = false;
+        }
+        if (!lsp_legacy_idx) {
+            lsp_legacy_idx_complete = false;
+        }
+        if (lsp_exact_idx || lsp_legacy_idx) {
+            for (int i = 0; i < result->resolved_calls.count; i++) {
+                CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
+                if (rc_e->kind != CBM_RESOLVED_INVOCATION || !rc_e->caller_qn || !rc_e->callee_qn ||
+                    rc_e->confidence < confidence_floor) {
+                    continue;
+                }
+                bool exact_site =
+                    cbm_pipeline_source_site_present(rc_e->site_start_byte, rc_e->site_end_byte);
+                bool legacy_site =
+                    cbm_pipeline_source_site_legacy(rc_e->site_start_byte, rc_e->site_end_byte);
+                if (!exact_site && !legacy_site) {
+                    continue;
+                }
+                CBMHashTable *index = exact_site ? lsp_exact_idx : lsp_legacy_idx;
+                bool inserted =
+                    lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->callee_qn),
+                                        exact_site, rc->main_gbuf, rc->project_name, allow_tail);
+                if (!inserted) {
+                    if (exact_site) {
+                        lsp_exact_idx_complete = false;
+                    } else {
+                        lsp_legacy_idx_complete = false;
+                    }
+                }
+                if (rc_e->reason && cbm_pipeline_invocation_reason_join_strategy(rc_e->strategy)) {
+                    inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->reason),
+                                                   exact_site, rc->main_gbuf, rc->project_name,
+                                                   allow_tail);
+                    if (!inserted) {
+                        if (exact_site) {
+                            lsp_exact_idx_complete = false;
+                        } else {
+                            lsp_legacy_idx_complete = false;
+                        }
+                    }
+                }
+                if (exact_site && rc_e->strategy && strcmp(rc_e->strategy, "lsp_destructor") == 0 &&
+                    !lsp_idx_insert_leaf(index, rc_e, "~", true, rc->main_gbuf, rc->project_name,
+                                         allow_tail)) {
+                    lsp_exact_idx_complete = false;
+                }
+            }
+        }
+    }
 
     for (int c = 0; c < result->calls.count; c++) {
         CBMCall *call = &result->calls.items[c];
@@ -1886,15 +2112,44 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         /* LSP-resolved calls take precedence over registry textual matching.
-         * The shared indexed helper preserves the configured confidence floor,
-         * caller/callee rule, and highest-confidence tie-break used by the
-         * sequential path. Exact matches remain O(1); ambiguity-safe tail
-         * fallbacks are JVM-only. */
-        bool allow_tail_match = cbm_pipeline_lsp_allow_tail_match(lang);
+         * Exact occurrence spans are indexed first; legacy rows and JVM tail
+         * reconciliation retain the authoritative linear fallback. */
         cbm_resolution_t res = {0};
+        const CBMResolvedCall *lsp = NULL;
+        bool exact_key_built = true;
+        bool exact_key_ambiguous = false;
+        bool legacy_key_built = true;
         _rc_t0 = extract_now_ns();
-        const CBMResolvedCall *lsp = cbm_lsp_resolution_index_find(
-            &lsp_idx, &result->resolved_calls, call, rc->lsp_confidence_floor, allow_tail_match);
+        if (cbm_pipeline_source_site_present(call->site_start_byte, call->site_end_byte)) {
+            lsp = lsp_idx_lookup(lsp_exact_idx, call, true, confidence_floor, &exact_key_built,
+                                 &exact_key_ambiguous);
+        }
+        bool exact_index_authoritative = lsp_exact_idx_complete && exact_key_built;
+        if (!lsp && !exact_index_authoritative) {
+            /* An incomplete exact index must fail closed: consult the
+             * authoritative matcher before a legacy row can win. */
+            atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows,
+                                      (uint64_t)result->resolved_calls.count, memory_order_relaxed);
+            lsp = cbm_pipeline_find_lsp_resolution_with_floor_in_graph(
+                &result->resolved_calls, call, confidence_floor, allow_tail, rc->main_gbuf,
+                rc->project_name);
+        }
+        if (!lsp && !call->requires_lsp_resolution && exact_index_authoritative &&
+            !exact_key_ambiguous) {
+            lsp = lsp_idx_lookup(lsp_legacy_idx, call, false, confidence_floor, &legacy_key_built,
+                                 NULL);
+        }
+        if (!lsp && (!lsp_legacy_idx_complete || !legacy_key_built || allow_tail ||
+                     call->requires_lsp_resolution)) {
+            /* Fallback to the linear scan for edge cases the index may
+             * miss (e.g. callee_name that wasn't the registered short
+             * name). Keeps semantics identical. */
+            atomic_fetch_add_explicit(&g_lsp_linear_fallback_rows,
+                                      (uint64_t)result->resolved_calls.count, memory_order_relaxed);
+            lsp = cbm_pipeline_find_lsp_resolution_with_floor_in_graph(
+                &result->resolved_calls, call, confidence_floor, allow_tail, rc->main_gbuf,
+                rc->project_name);
+        }
         atomic_fetch_add_explicit(&rc->time_ns_rc_lsp_lookup, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         _rc_t0 = extract_now_ns();
@@ -1907,8 +2162,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * or an internal declaration QN whose canonical definition has a
              * different QN, so the shared registry fallback and containment
              * guard below must classify it exactly as the sequential route. */
-            lsp_target = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
-                                                      lsp->callee_qn, allow_tail_match);
+            bool exact_external_target = call->requires_lsp_resolution &&
+                                         cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
+            lsp_target = exact_external_target
+                             ? cbm_pipeline_lsp_target_node_strict(rc->main_gbuf, rc->project_name,
+                                                                   lsp->callee_qn, allow_tail)
+                             : cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
+                                                            lsp->callee_qn, allow_tail);
             if (lsp_target) {
                 res.qualified_name = lsp_target->qualified_name;
                 res.strategy = lsp->strategy ? lsp->strategy : "lsp_override";
@@ -1919,12 +2179,33 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 lsp_target_unindexed = true;
             }
         }
-        if (!lsp || lsp_target_unindexed) {
+        /* #1085: fall back to the registry resolver whenever the LSP did not
+         * yield a gbuf-resolvable target — whether no LSP resolution existed,
+         * OR the LSP was confident but its callee_qn isn't a node in the gbuf
+         * (the JSX-via-tsconfig-alias case: the TS LSP resolves the element
+         * ref to an alias-path QN that never matches a def node, so lsp_target
+         * is NULL). The old `else` ran the registry ONLY when lsp was null, so
+         * an LSP-with-unresolvable-target dropped the edge outright — silently
+         * losing every alias-imported JSX component edge on the parallel path
+         * (~21% of a Next.js call graph) while the sequential pass, which falls
+         * THROUGH to the registry here, kept them. This restores seq/parallel
+         * parity via the import_map / unique_name resolution. Synthetic
+         * semantic candidates are deliberately excluded: they require an
+         * exact LSP target and must fail closed rather than accepting a textual
+         * registry match. */
+        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+
+        /* A synthetic semantic candidate is an invocation only when the LSP
+         * resolved it to a concrete graph node. Never let registry, field-name,
+         * route, or service heuristics manufacture a target for it. */
+        if (call->requires_lsp_resolution && !lsp_target) {
+            continue;
+        }
 
         _rc_t0 = extract_now_ns();
         cbm_pipeline_try_field_type_hint(rc->registry, rc->main_gbuf, &res, call->callee_name,
@@ -2065,41 +2346,24 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         ws->calls_resolved++;
     }
-    cbm_lsp_resolution_index_free(&lsp_idx);
-}
-
-static bool result_lsp_covers_all_calls(const CBMFileResult *result, double confidence_floor,
-                                        bool allow_tail_match) {
-    if (!result || result->calls.count <= 0) {
-        return true;
+    if (lsp_exact_idx) {
+        cbm_ht_foreach(lsp_exact_idx, lsp_idx_free_key, NULL);
+        cbm_ht_free(lsp_exact_idx);
     }
-    if (result->resolved_calls.count <= 0) {
-        return false;
+    if (lsp_legacy_idx) {
+        cbm_ht_foreach(lsp_legacy_idx, lsp_idx_free_key, NULL);
+        cbm_ht_free(lsp_legacy_idx);
     }
-
-    cbm_lsp_resolution_index_t lsp_idx;
-    cbm_lsp_resolution_index_build(&lsp_idx, &result->resolved_calls, result->calls.count,
-                                   confidence_floor);
-    bool all_covered = true;
-    for (int i = 0; i < result->calls.count; i++) {
-        const CBMCall *call = &result->calls.items[i];
-        if (!call->callee_name) {
-            continue;
-        }
-        if (!cbm_lsp_resolution_index_find(&lsp_idx, &result->resolved_calls, call,
-                                           confidence_floor, allow_tail_match)) {
-            all_covered = false;
-            break;
-        }
-    }
-    cbm_lsp_resolution_index_free(&lsp_idx);
-    return all_covered;
 }
 
 /* Resolve usages for one file. */
 static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
-                                const char **imp_keys, const char **imp_vals, int imp_count) {
+                                const char **imp_keys, const char **imp_vals, int imp_count,
+                                CBMLanguage lang) {
+    cbm_pipeline_lsp_reference_index_t reference_index = {0};
+    bool reference_index_ready =
+        cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -2110,22 +2374,63 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!src) {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, usage->ref_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
-        if (!res.qualified_name || res.qualified_name[0] == '\0') {
-            continue;
+        const cbm_gbuf_node_t *tgt = NULL;
+        bool precise_call_reference = false;
+        const CBMResolvedCall *semantic_reference = NULL;
+        if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
+            bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
+            semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
+                &result->resolved_calls, reference_index_ready ? &reference_index : NULL, usage,
+                allow_tail, rc->main_gbuf, rc->project_name);
+            if (semantic_reference &&
+                !cbm_pipeline_usage_allows_semantic_reference(usage, semantic_reference)) {
+                semantic_reference = NULL;
+            }
+            if (semantic_reference) {
+                tgt = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
+                                                   semantic_reference->callee_qn, allow_tail);
+                precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
+            }
         }
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+        if (!tgt) {
+            /* Exact semantic ownership beats textual name fallback even when
+             * the semantic target is not materialized in this graph. */
+            if (semantic_reference) {
+                continue;
+            }
+            cbm_resolution_t res = cbm_registry_resolve(rc->registry, usage->ref_name, module_qn,
+                                                        imp_keys, imp_vals, imp_count);
+            if (!res.qualified_name || res.qualified_name[0] == '\0') {
+                continue;
+            }
+            if (!cbm_pipeline_reference_candidate_fallback_allowed(lang, usage, res.strategy,
+                                                                   imp_keys, imp_count)) {
+                continue;
+            }
+            tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
+                                                      cbm_pipeline_node_is_callable_target(tgt))) {
+                continue;
+            }
+        }
         if (!tgt || src->id == tgt->id) {
             continue;
         }
-        char uprops[CBM_SZ_256];
+        /* 512, matching the sequential twin in pass_usages.c. esc_ref holds up
+         * to 255 bytes and the {"callee":"..."} wrapper adds 13, so a 256-byte
+         * uprops truncates a long callable identifier mid-string -- cutting the
+         * closing quote-brace and persisting MALFORMED JSON. The two paths must
+         * also agree: the same repo indexed in parallel and sequentially has to
+         * produce byte-identical edge properties. */
+        char uprops[CBM_SZ_512];
         char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
         cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
         snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
-        cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, "USAGE", uprops);
+        const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
+        cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, uprops);
         ws->usages_resolved++;
     }
+    cbm_pipeline_lsp_reference_index_free(&reference_index);
 }
 
 /* Resolve throws/raises for one file. */
@@ -2234,6 +2539,14 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             dn = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
         }
+        /* Qualified Rust proc-macro paths must not degrade to the decorated
+         * function itself through the registry's same-module suffix fallback
+         * (`#[tokio::main]` on local `main`).  Preserve the full external path
+         * through the synthetic Decorator node instead. */
+        if (dn && dn->id == node->id && def->decorators[dc][0] == '#' &&
+            def->decorators[dc][1] == '[' && strstr(fn, "::")) {
+            dn = NULL;
+        }
         int64_t dn_id = 0;
         if (dn) {
             dn_id = dn->id;
@@ -2340,6 +2653,103 @@ static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
     return pp_rust_shared_registry((resolve_ctx_t *)ctx);
 }
 
+static int pp_call_reference_site_count(const CBMFileResult *result, CBMLanguage lang) {
+    int count = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (cbm_pipeline_usage_semantic_reference_candidate(&result->usages.items[i])) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static char *pp_lsp_site_key(CBMArena *arena, CBMResolvedKind kind, const char *caller,
+                             uint32_t start, uint32_t end, CBMSourceOrigin origin) {
+    return caller && cbm_pipeline_source_site_present(start, end)
+               ? cbm_arena_sprintf(arena, "%u\x1f%s\x1f%u:%u\x1f%u", (unsigned)kind, caller, start,
+                                   end, (unsigned)origin)
+               : NULL;
+}
+
+static int pp_qualified_lsp_site_count(const CBMFileResult *result, double confidence_floor) {
+    CBMArena keys;
+    cbm_arena_init(&keys);
+    uint32_t capacity = (uint32_t)(result->calls.count + result->usages.count +
+                                   result->resolved_calls.count + CBM_SZ_16);
+    CBMHashTable *sites = cbm_ht_create(capacity);
+    CBMHashTable *counted = cbm_ht_create(capacity);
+    if (!sites || !counted) {
+        cbm_ht_free(sites);
+        cbm_ht_free(counted);
+        cbm_arena_destroy(&keys);
+        return 0;
+    }
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        char *key =
+            pp_lsp_site_key(&keys, CBM_RESOLVED_INVOCATION, call->enclosing_func_qn,
+                            call->site_start_byte, call->site_end_byte, call->source_origin);
+        if (key) {
+            cbm_ht_set(sites, key, key);
+        }
+    }
+    for (int i = 0; i < result->usages.count; i++) {
+        const CBMUsage *usage = &result->usages.items[i];
+        if (!cbm_pipeline_usage_semantic_reference_candidate(usage)) {
+            continue;
+        }
+        char *key =
+            pp_lsp_site_key(&keys, CBM_RESOLVED_CALL_REFERENCE, usage->enclosing_func_qn,
+                            usage->site_start_byte, usage->site_end_byte, usage->source_origin);
+        if (key) {
+            cbm_ht_set(sites, key, key);
+        }
+    }
+    int count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (!resolved->callee_qn || resolved->confidence < confidence_floor) {
+            continue;
+        }
+        char *key =
+            pp_lsp_site_key(&keys, resolved->kind, resolved->caller_qn, resolved->site_start_byte,
+                            resolved->site_end_byte, resolved->source_origin);
+        if (key && cbm_ht_has(sites, key) && !cbm_ht_has(counted, key)) {
+            cbm_ht_set(counted, key, key);
+            count++;
+        }
+    }
+    cbm_ht_free(sites);
+    cbm_ht_free(counted);
+    cbm_arena_destroy(&keys);
+    return count;
+}
+
+/* A per-file semantic walk can discover a faithful source occurrence that the
+ * syntax extractor cannot represent as a CBMCall yet: Python operators and
+ * calls hidden in Rust built-in macro token trees are the canonical examples.
+ * An exact unresolved/low-confidence record is therefore an explicit request
+ * for the project-registry pass, even when the parser-backed site count is
+ * zero or already fully qualified. Zero-span generated semantics are excluded:
+ * without source provenance they cannot safely join a graph carrier. */
+static bool pp_has_pending_lsp_site(const CBMFileResult *result, double confidence_floor) {
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION &&
+            resolved->kind != CBM_RESOLVED_CALL_REFERENCE) {
+            continue;
+        }
+        if (!resolved->caller_qn || !resolved->callee_qn ||
+            resolved->site_end_byte <= resolved->site_start_byte) {
+            continue;
+        }
+        if (resolved->reason || resolved->confidence < confidence_floor) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
@@ -2406,17 +2816,25 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         }
 
         /* Cross-file LSP is a per-file tree-sitter re-parse + AST walk +
-         * registry lookups — ~50-150ms per file. It can only find calls that
-         * exist in the AST, so files with zero calls are skipped. For non-empty
-         * files, prune only when every textual call has a matching resolved
-         * LSP row. A raw count check is insufficient: one unrelated resolved row
-         * can make resolved_calls.count >= calls.count while a receiver call
-         * such as self.add_api_route still needs cross-LSP refinement. */
-        bool allow_tail_match = cbm_pipeline_lsp_allow_tail_match(lang);
+         * registry lookups — ~50-150ms per file. It can only resolve semantic
+         * sites present in that AST: invocations plus explicit callable
+         * references. A file containing only a callable reference still needs
+         * this pass. For non-JVM languages, skip when per-file LSP already
+         * produced at least as many qualifying typed resolutions as sites.
+         * Java/Kotlin per-file LSP can fill the count with same-file sites while
+         * a mixed-source-root Java↔Kotlin site remains unresolved, so JVM
+         * callers run whenever either kind of site exists. */
+        bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
+        double confidence_floor = rc->lsp_confidence_floor > 0.0 ? rc->lsp_confidence_floor
+                                                                 : (double)CBM_LSP_CONFIDENCE_FLOOR;
+        int call_reference_sites = pp_call_reference_site_count(result, lang);
+        int semantic_sites = result->calls.count + call_reference_sites;
+        int qualified_lsp_sites = pp_qualified_lsp_site_count(result, confidence_floor);
+        bool pending_lsp_site = pp_has_pending_lsp_site(result, confidence_floor);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
-             result->calls.count > 0 &&
-             !result_lsp_covers_all_calls(result, rc->lsp_confidence_floor, allow_tail_match) &&
+             (semantic_sites > 0 || pending_lsp_site) &&
+             (jvm_cross_lsp || pending_lsp_site || qualified_lsp_sites < semantic_sites) &&
              !is_generated);
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
@@ -2433,8 +2851,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        int import_map_rc = cbm_pipeline_build_import_map_from_edges(
-            rc->main_gbuf, rc->project_name, rel, &imp_keys, &imp_vals, &imp_count);
+        int import_map_rc = cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang,
+                                                     result, &imp_keys, &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
         if (import_map_rc != 0) {
@@ -2469,7 +2887,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             cbm_registry_reach_cache_end();
             cbm_registry_import_map_cache_end();
             cbm_registry_resolve_cache_end();
-            cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
+            cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
             atomic_store_explicit(&rc->worker_failed, 1, memory_order_relaxed);
             break;
         }
@@ -2510,10 +2928,11 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 int import_refine_def_count = rc->def_count;
                 if (rc->module_def_index && imp_count > 0) {
                     int filtered_count = 0;
+                    bool filter_succeeded = false;
                     import_refine_defs = cbm_pxc_filter_defs_for_file(
                         rc->module_def_index, rc->all_defs, lang, result->namespace_name,
-                        def_module, imp_vals, imp_count, &filtered_count);
-                    if (import_refine_defs) {
+                        def_module, imp_vals, imp_count, &filtered_count, &filter_succeeded);
+                    if (filter_succeeded) {
                         import_refine_def_count = filtered_count;
                     }
                 }
@@ -2581,7 +3000,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── USAGE resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
         atomic_fetch_add_explicit(&rc->time_ns_usages, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
@@ -2607,7 +3026,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_resolve_cache_end();
 
         free(module_qn);
-        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                   memory_order_relaxed);

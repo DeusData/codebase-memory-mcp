@@ -446,4 +446,10 @@ bool cbm_daemon_runtime_client_close_finish(cbm_daemon_runtime_client_t *client,
  * and join that worker before close_finish. */
 bool cbm_daemon_runtime_client_close(cbm_daemon_runtime_client_t *client, uint32_t timeout_ms);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1383 test seam: force peer-image verification to fail so tests can exercise
+ * the rejection-response path from the in-process harness. */
+void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force);
+#endif
+
 #endif /* CBM_DAEMON_RUNTIME_H */

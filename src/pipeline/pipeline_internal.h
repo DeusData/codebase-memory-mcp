@@ -13,6 +13,8 @@
 #include "graph_buffer/graph_buffer.h"
 #include "store/store.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
+#include "git/git_context.h"
 #include "foundation/hash_table.h"
 #include "foundation/str_util.h"
 #include "foundation/platform.h"
@@ -43,6 +45,8 @@
  * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
  * "no incremental route; continue with a full index" sentinel. */
 #define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
+#define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
+#define CBM_PIPELINE_PERSIST_FAILED (-4)
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
@@ -461,13 +465,11 @@ typedef struct {
                                      * (Stage 2 / Track B). May be NULL on paths that
                                      * don't record; cbm_pipeline_add_file_error is
                                      * NULL-safe. */
-    int mode;                       /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=dep) */
     double similarity_threshold;    /* Jaccard threshold for SIMILAR edges; <=0 means
                                      * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
     double httplink_min_confidence; /* <=0 uses httplink pass default 0.25 */
     double semantic_threshold;      /* <=0 uses semantic default 0.75 */
     double githistory_min_coupling; /* <=0 uses git-history default 0.3 */
-    int githistory_max_couplings;   /* bounded FILE_CHANGES_WITH output budget */
     double lsp_confidence_floor;    /* <=0 uses LSP default 0.6 */
     int64_t extract_timeout_micros; /* bounded tree-sitter parse deadline */
 
@@ -482,42 +484,44 @@ typedef struct {
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
 
-    /* True when the caller already installed a repo-wide package map and
-     * retains ownership of that exact pointer. Parallel extraction must not
-     * replace it: caller cleanup compares and frees the preseeded map. */
-    bool pkgmap_preseeded;
-
-    /* Exact-delta scratch optimization: when set on the single-threaded exact
-     * upsert route, resolvers may materialize referenced unchanged nodes from
-     * the store on demand instead of preloading every stored symbol node. The
-     * changed-path list prevents stale stored nodes for files being reparsed
-     * from re-entering the scratch graph. The all-file list plus positive LSP
-     * scope cap opt into bounded persisted cross-LSP defs; leave cap 0 unless a
-     * caller has a fresh-equivalence proof for the route using it. Leave NULL/0
-     * on full, containment, dependency, and parallel worker paths. */
+    /* Scoped incremental optimization: resolvers may materialize referenced
+     * unchanged nodes from the store on demand. */
     cbm_store_t *store_backed_node_lookup;
     const char *const *store_backed_changed_paths;
-    int store_backed_changed_path_count;
     const cbm_file_info_t *store_backed_all_files;
-    int store_backed_all_file_count;
-    int store_backed_lsp_scope_cap;
-
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
-    int excluded_count;
+    /* Sequential lsp_cross only: per-file module-QN strings the collected
+     * defs (and through them the shared cross registries in seq_cross_arena)
+     * borrow. The registries outlive the pass so pass_calls can read borrowed
+     * strings -- these must too. Ownership transfers here at the end of the
+     * pass; released beside the arena. Freeing them at pass end was a
+     * use-after-free first observable on the real-repo corpus tier. */
+    char **seq_cross_def_modules;
+    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
+     * no ObjectScript include files were found). Owned by pipeline.c. */
+    const CBMMacroTable *macro_table;
+    /* ObjectScript method-return-type table built from extracted definitions
+     * (NULL until pass_calls builds it). Owned by pipeline.c. */
+    const CBMReturnTypeTable *return_type_table;
 
     /* Sequential cross-LSP registry arena. Resolved calls may borrow strings
      * from it until all sequential passes finish. */
     CBMArena seq_cross_arena;
+
+    int mode;                     /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=dep) */
+    int githistory_max_couplings; /* bounded FILE_CHANGES_WITH output budget */
+    /* Scoped incremental optimization scalar companions. The path arrays above
+     * prevent stale stored nodes from re-entering the scratch graph. A positive
+     * LSP scope cap requires a fresh-equivalence proof; leave these zero on
+     * full, dependency, and parallel worker paths. */
+    int store_backed_changed_path_count;
+    int store_backed_all_file_count;
+    int store_backed_lsp_scope_cap;
+    int excluded_count;             /* directory subtrees excluded during discovery */
+    int seq_cross_def_module_count; /* owned entries in seq_cross_def_modules */
+    bool pkgmap_preseeded;          /* caller owns the installed repo-wide package map */
     bool seq_cross_arena_live;
-
-    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
-     * no ObjectScript include files were found). Owned by pipeline.c. */
-    const CBMMacroTable *macro_table;
-
-    /* ObjectScript method-return-type table built from extracted definitions
-     * (NULL until pass_calls builds it). Owned by pipeline.c. */
-    const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
 static inline int64_t cbm_pipeline_ctx_extract_timeout(const cbm_pipeline_ctx_t *ctx) {
@@ -531,6 +535,7 @@ int64_t cbm_pipeline_extract_timeout_micros(const cbm_pipeline_t *p);
  * shared by full and incremental routes so every exit path uses one ownership
  * authority. NULL fields are accepted and cleared. */
 void cbm_pipeline_release_objectscript_tables(cbm_pipeline_ctx_t *ctx);
+void cbm_pipeline_release_seq_cross_state(cbm_pipeline_ctx_t *ctx);
 
 static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
     return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;
@@ -631,6 +636,19 @@ enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_32 };
  * same-batch parity coverage for deletes, renames, folders, and derived views. */
 enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS = CBM_SZ_2 };
 
+/* Transcode an ObjectScript Studio Export XML file and compose every generated
+ * UDL class into one cacheable result. The returned result owns all child
+ * extraction arenas and is released with the ordinary cbm_free_result(). */
+CBMFileResult *cbm_pipeline_extract_objectscript_export(
+    const char *source, int source_len, const char *project_name, const char *rel_path,
+    int64_t timeout_micros, bool extract_macros, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table);
+
+/* Materialize CONFIGURES edges from one extracted file's env-access carriers.
+ * Shared by sequential definition processing and the parallel cache registry. */
+int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel);
+
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
     if (!rel_path || rel_path[0] == '\0' || !excluded_dirs || excluded_count <= 0) {
@@ -689,8 +707,6 @@ int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
  * resolver order, JSON properties, and self-edge filtering cannot drift. */
 int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                               const char *rel_path, CBMHashTable *namespace_map);
-int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
-                                                const CBMFileResult *result, const char *rel_path);
 
 /* Extract IMPORTS edge local_name from the canonical edge JSON. Caller frees. */
 char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);
@@ -746,6 +762,11 @@ int cbm_pipeline_coverage_replace_with_meta(const cbm_pipeline_t *p, cbm_store_t
                                             const char *project, const cbm_coverage_row_t *rows,
                                             int count, bool rows_available,
                                             bool hash_records_complete);
+bool cbm_pipeline_store_coverage_readable(cbm_store_t *store, const char *project);
+/* True when stored coverage is at least as comprehensive as the requested
+ * mode. This keeps a full graph eligible for a cheaper fast refresh without
+ * allowing a fast graph to masquerade as full. */
+bool cbm_pipeline_coverage_mode_satisfies(const char *stored_mode, cbm_index_mode_t requested_mode);
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
@@ -1352,6 +1373,39 @@ void cbm_envscan_free_patterns(void);
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
 
+/* Exact semantic inputs used to reject a mixed source/config generation at
+ * the destination writer's atomic publication boundary. */
+#define CBM_SEMANTIC_INPUT_PREFIX ".codebase-memory/.semantic-input/"
+#define CBM_SEMANTIC_INPUT_GIT_CONTEXT CBM_SEMANTIC_INPUT_PREFIX "git-context-v1"
+#define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
+#define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
+#define CBM_SEMANTIC_INPUT_CONTROLS CBM_SEMANTIC_INPUT_PREFIX "controls-v1"
+
+int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
+                                         const cbm_file_info_t *files, int file_count,
+                                         char **excluded_dirs, int excluded_count,
+                                         const cbm_git_context_t *git_ctx,
+                                         const cbm_userconfig_t *userconfig, cbm_file_hash_t **out,
+                                         int *out_count);
+void cbm_pipeline_free_semantic_manifest(cbm_file_hash_t *manifest, int count);
+bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left_count,
+                                           const cbm_file_hash_t *right, int right_count);
+int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+                                               cbm_file_hash_t **out, int *out_count);
+int cbm_pipeline_prepare_semantic_inputs(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                         int file_count);
+const char *cbm_pipeline_semantic_controls_digest(const cbm_pipeline_t *p);
+int cbm_pipeline_persist_semantic_control_hashes(cbm_pipeline_t *p, cbm_store_t *store,
+                                                 const cbm_file_info_t *files, int file_count);
+
+/* Hand the pipeline the per-file LSP-surface rows serialized at the
+ * collect_all_defs seam (the only moment the result cache is alive).
+ * Takes ownership; dump_and_persist_hashes writes them into the staging
+ * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
+void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+void cbm_pipeline_get_lsp_surfaces(const cbm_pipeline_t *p, const cbm_lsp_surface_row_t **rows,
+                                   int *count);
+
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
@@ -1402,5 +1456,47 @@ bool extract_grpc_service_method(const char *callee, char *service, size_t srv_s
  * (futile: the resident floor, not transients, holds the memory). */
 long cbm_pp_bp_nap_cycles(void);
 void cbm_pp_bp_nap_cycles_reset(void);
+
+/* Number of resolved-call rows handed to the parallel resolver's linear LSP
+ * fallback since the last reset. Test observability for occurrence-index
+ * coverage; deterministic and independent of wall-clock timing. */
+uint64_t cbm_pp_lsp_linear_fallback_rows(void);
+void cbm_pp_lsp_linear_fallback_rows_reset(void);
+
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+/* Deterministic test-only operation count for the shared semantic-reference
+ * matcher used by both sequential and fused-parallel usage materialization. */
+void cbm_pipeline_lsp_reference_lookup_test_reset(void);
+uint64_t cbm_pipeline_lsp_reference_lookup_test_rows_examined(void);
+#endif
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+typedef enum {
+    CBM_INCREMENTAL_ROUTE_NONE = 0,
+    CBM_INCREMENTAL_ROUTE_NOOP,
+    CBM_INCREMENTAL_ROUTE_FORCED_FULL,
+    CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR,
+} cbm_incremental_route_t;
+
+void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
+void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
+void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void);
+void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
+void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
+bool cbm_pipeline_incremental_test_take_result_cache_alloc_failure(void);
+typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
+void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
+                                                              void *userdata);
+cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
+void cbm_pipeline_incremental_test_reset_faults(void);
+
+/* Shared persistence-hook plumbing. Tests use the incremental facade above so
+ * one reset covers route, extraction, and publication faults. */
+bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void);
+bool cbm_pipeline_persist_test_take_cancel_after_predump(void);
+bool cbm_pipeline_persist_test_take_cancel_after_destination_prepare(void);
+void cbm_pipeline_persist_test_run_before_final_manifest(void);
+void cbm_pipeline_persist_test_reset_faults(void);
+#endif
 
 #endif /* CBM_PIPELINE_INTERNAL_H */

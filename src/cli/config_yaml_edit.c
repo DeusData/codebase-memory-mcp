@@ -2609,8 +2609,11 @@ static int yaml_sequence_parse_block(const yaml_doc_t *doc, size_t begin_line, s
                                      const char *identity_value,
                                      yaml_mapping_sequence_target_t *target) {
     size_t range_len = end_line - begin_line;
-    size_t *starts = range_len ? (size_t *)calloc(range_len, sizeof(*starts)) : NULL;
-    if (range_len && !starts) {
+    /* Minimum one element: a NULL-for-empty-range starts is only safe through
+     * the loop-bound == alloc-bound invariant, which a path-sensitive
+     * analyzer (rightly) refuses to assume across expressions. */
+    size_t *starts = (size_t *)calloc(range_len ? range_len : 1, sizeof(*starts));
+    if (!starts) {
         return YAML_ERROR;
     }
     size_t start_count = 0U;

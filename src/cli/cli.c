@@ -22,6 +22,7 @@
 #include "foundation/log.h"
 #include "foundation/sha256.h"
 #include "depindex/depindex.h"
+#include "cli/client_adapter.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 #include "mcp/index_supervisor.h"
 #include "pagerank/pagerank.h"
@@ -219,6 +220,24 @@ static const char *g_cli_activation_runtime_parent_for_test = NULL;
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
     const char *diagnostic = message ? message : CLI_ACTIVATION_SAFETY_MESSAGE;
+    /* #1416: when the transaction recorded a concrete refusal (an ACL or
+     * filesystem safety check), say THAT. The generic text blames "active CBM
+     * sessions" for what is a validation refusal - reporters rebooted, killed
+     * every process, and hunted phantom handles because the message pointed at
+     * sessions that did not exist. The sessions wording remains for genuine
+     * stop/reservation failures, which record no refusal note. */
+    char attributed[CBM_SZ_1K];
+    const char *note = cbm_activation_transaction_refusal_note();
+    if (note && note[0]) {
+        (void)snprintf(attributed, sizeof(attributed),
+                       "error: activation was refused by a filesystem safety check before any "
+                       "change was made: %s\n"
+                       "error: this is not a session problem. If the flagged directory is one you "
+                       "trust, remove the flagged permission grant (icacls <dir> /remove:g <sid>) "
+                       "or use an owner-private directory for --dir/CBM_CACHE_DIR, then retry.",
+                       note);
+        diagnostic = attributed;
+    }
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);
         return;
@@ -1328,7 +1347,7 @@ static const char skill_content[] =
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
-    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CONFIGURES, FILE_CHANGES_WITH,\n"
+    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, FILE_CHANGES_WITH,\n"
     "SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
     "CONTAINS_PACKAGE\n"
     "\n"
@@ -5446,6 +5465,53 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
+/* #1387 dry-run predicate: would writing this hook script succeed, or would
+ * the owned-document migration refuse it because the file on disk is not ours?
+ * Read-only — it must never touch the filesystem, since a dry run promises
+ * exactly that. An unreadable/unsafe state counts as "would not succeed": the
+ * preview should warn rather than promise. */
+static bool cbm_hook_script_write_would_succeed(const char *home, const char *binary_path,
+                                                const char *script_name) {
+    if (!home || !binary_path || !script_name) {
+        return false;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return false;
+    }
+    char script_path[CLI_BUF_1K];
+    int written =
+        snprintf(script_path, sizeof(script_path), "%s/hooks/%s", config_dir, script_name);
+    if (written <= 0 || (size_t)written >= sizeof(script_path)) {
+        return false;
+    }
+    const char *prefix = cmm_gate_script_prefix;
+    if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        prefix = cmm_session_script_prefix;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        prefix = cmm_subagent_script_prefix;
+    }
+    char script[CLI_BUF_8K];
+    if (cbm_build_current_hook_script(prefix, binary_path, script, sizeof(script)) != CLI_OK) {
+        return false;
+    }
+    /* Released shapes are accepted by the real write, so they must be accepted
+     * here too or the preview would warn about a script that upgrades fine. */
+    char released[CLI_BUF_8K];
+    const char *candidates[2];
+    size_t candidate_count = 0U;
+    if (strcmp(script_name, CMM_HOOK_GATE_SCRIPT) == 0 &&
+        cbm_build_released_gate_script(binary_path, released, sizeof(released)) == CLI_OK) {
+        candidates[candidate_count++] = released;
+    } else if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_session_script;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_subagent_script;
+    }
+    return cbm_text_owned_document_status(script_path, script, candidates, candidate_count) == 0;
+}
+
 int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
@@ -7306,7 +7372,10 @@ static int cbm_config_describe(const char *key) {
 }
 
 int cbm_cmd_config(int argc, char **argv) {
-    if (argc == 0 || (argv && (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0))) {
+    /* NULL argv with a nonzero argc previously slipped past this guard (the
+     * inner `argv &&` shielded only the help comparison) and dereferenced
+     * argv[0] below -- caught by the clang-analyzer lane. */
+    if (argc == 0 || !argv || strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
         printf("Commands:\n");
         printf("  list             Show common effective config values\n");
@@ -8062,13 +8131,29 @@ static void install_claude_code_config(const char *home, const char *binary_path
     bool gate_ok = dry_run;
     bool session_ok = dry_run;
     bool subagent_ok = dry_run;
+    if (dry_run) {
+        /* #1387 (second half): the dry run claimed EVERY hook group as
+         * installable because these flags were simply `true`. When the on-disk
+         * script is not ours the real install refuses to rewrite it, so the
+         * preview promised what the run could not deliver and the reporter had
+         * no way to see the loss coming. Predict each refusal read-only. */
+        gate_ok = cbm_hook_script_write_would_succeed(home, binary_path, CMM_HOOK_GATE_SCRIPT);
+        session_ok =
+            cbm_hook_script_write_would_succeed(home, binary_path, CMM_SESSION_REMINDER_SCRIPT);
+        subagent_ok =
+            cbm_hook_script_write_would_succeed(home, binary_path, CMM_SUBAGENT_REMINDER_SCRIPT);
+    }
     if (!dry_run) {
         char hook_path[CLI_BUF_1K];
         gate_ok = cbm_install_hook_gate_script(home, binary_path);
         snprintf(hook_path, sizeof(hook_path), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
+        /* #1387: a failed script (re)write must never remove existing hook
+         * entries. The common failure is TEXT_UNOWNED - a script the user
+         * modified or a manual install wrote with another binary path - and
+         * that script still works; deleting the registration turns a skipped
+         * update into config loss. Entry removal belongs to uninstall only. */
         if (!gate_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-            (void)cbm_remove_claude_hooks(settings_path);
         } else if (cbm_upsert_claude_hooks(settings_path) != CLI_OK) {
             gate_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
@@ -8079,7 +8164,6 @@ static void install_claude_code_config(const char *home, const char *binary_path
                  CMM_SESSION_REMINDER_SCRIPT);
         if (!session_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-            (void)cbm_remove_session_hooks(settings_path);
         } else if (cbm_upsert_session_hooks(settings_path) != CLI_OK) {
             session_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
@@ -8090,7 +8174,6 @@ static void install_claude_code_config(const char *home, const char *binary_path
                  CMM_SUBAGENT_REMINDER_SCRIPT);
         if (!subagent_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-            (void)cbm_remove_claude_subagent_hooks(settings_path);
         } else if (cbm_upsert_claude_subagent_hooks(settings_path) != CLI_OK) {
             subagent_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
@@ -8105,6 +8188,22 @@ static void install_claude_code_config(const char *home, const char *binary_path
     }
     if (subagent_ok) {
         printf("  hooks: SubagentStart (MCP usage reminder for subagents)\n");
+    }
+    if (dry_run) {
+        /* Name every script the real run would refuse. Silence is what made
+         * #1387 invisible in advance: the group simply went unmentioned, which
+         * reads as "nothing to do" rather than "this will be skipped". */
+        static const char *const preview_scripts[] = {
+            CMM_HOOK_GATE_SCRIPT, CMM_SESSION_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT};
+        const bool preview_ok[] = {gate_ok, session_ok, subagent_ok};
+        for (size_t i = 0U; i < sizeof(preview_scripts) / sizeof(preview_scripts[0]); i++) {
+            if (!preview_ok[i]) {
+                printf("  hooks: %s/hooks/%s would be skipped — the file there is not ours "
+                       "(modified, or written by another install), so the rewrite is refused "
+                       "and existing hook entries are left untouched\n",
+                       config_dir, preview_scripts[i]);
+            }
+        }
     }
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
@@ -8737,13 +8836,69 @@ static void install_devin_durable_context(const cbm_agent_registry_context_t *re
     }
 }
 
-static void install_pi_durable_context(const char *home, bool force, bool dry_run) {
+/* Write a generated client extension module into `path` as a managed block.
+ *
+ * The module is generated from the tool registry rather than shipped (see
+ * src/cli/client_adapter.h), and it goes in as a MARKED BLOCK rather than a
+ * whole-file write: the directory is auto-loaded by the client, so a user may
+ * legitimately keep their own module there, and clobbering it would be the
+ * install routine destroying user content.
+ *
+ * `generate` returns heap-allocated text or NULL; NULL is a hard error rather
+ * than a skip, because a silently absent extension is exactly the failure mode
+ * that left #616 a no-op for six weeks. */
+static void install_generated_client_extension(const char *label, const char *path,
+                                               const char *binary_path,
+                                               char *(*generate)(const char *), bool dry_run) {
+    if (g_install_plan) {
+        plan_record(label, "extension", path);
+        return;
+    }
+    char *content = generate(binary_path);
+    if (!content) {
+        record_agent_config_error(false, label, "extension_generate", path);
+        return;
+    }
+    bool installed = true;
+    if (!dry_run && (!prepare_config_parent(path) ||
+                     cbm_text_upsert_managed_block(path, CBM_ADAPTER_MARKER_START,
+                                                   CBM_ADAPTER_MARKER_END, content) != 0)) {
+        installed = false;
+        record_agent_config_error(false, label, "extension_install", path);
+    }
+    free(content);
+    if (installed) {
+        printf("  extension: %s\n", path);
+    }
+}
+
+/* Remove only OUR marked block, never the file: a user's own module may share
+ * it, and owned removal is the convention every other uninstall path here
+ * follows. */
+static void uninstall_generated_client_extension(const char *label, const char *path,
+                                                 bool dry_run) {
+    if (!dry_run && cbm_file_exists(path) &&
+        cbm_text_remove_managed_block(path, CBM_ADAPTER_MARKER_START, CBM_ADAPTER_MARKER_END) !=
+            0) {
+        record_agent_config_error(true, label, "extension_uninstall", path);
+        return;
+    }
+    printf("  extension: removed managed block\n");
+}
+
+static void install_pi_durable_context(const char *home, const char *binary_path, bool force,
+                                       bool dry_run) {
     char instructions_path[CLI_BUF_1K];
     char skills_dir[CLI_BUF_1K];
+    char extension_path[CLI_BUF_1K];
     snprintf(instructions_path, sizeof(instructions_path), "%s/.pi/agent/AGENTS.md", home);
     snprintf(skills_dir, sizeof(skills_dir), "%s/.pi/agent/skills", home);
+    snprintf(extension_path, sizeof(extension_path), "%s/.pi/agent/extensions/cbmem.ts", home);
     install_managed_agent_instructions("Pi", instructions_path, dry_run);
     install_agent_skill("Pi", skills_dir, force, dry_run);
+    /* pi has no MCP client, so this bridge is its ONLY route to the graph. */
+    install_generated_client_extension("Pi", extension_path, binary_path, cbm_client_adapter_pi,
+                                       dry_run);
 }
 
 static void install_kimi_durable_context(const cbm_agent_registry_context_t *registry,
@@ -8921,7 +9076,7 @@ static void install_agent_client_registry(const char *home, const char *binary_p
         } else if (profile->id == CBM_AGENT_CLIENT_POCHI) {
             install_pochi_durable_context(home, force, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_PI) {
-            install_pi_durable_context(home, force, dry_run);
+            install_pi_durable_context(home, binary_path, force, dry_run);
         }
     }
 }
@@ -9073,6 +9228,16 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                 .dialect = CBM_GRAPH_DIALECT_OPENCODE,
             },
             dry_run);
+        /* OpenCode already reaches every tool over MCP (installed just above),
+         * so this adds no tools -- only the automatic graph lookup before a
+         * grep/glob that other clients get from their own hook configuration.
+         * OpenCode has no such configuration; a plugin module is its only
+         * extension point (verified against their plugin documentation). */
+        char plugin_path[CLI_BUF_1K];
+        snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+                 home);
+        install_generated_client_extension("OpenCode", plugin_path, binary_path,
+                                           cbm_client_adapter_opencode, dry_run);
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];
@@ -10741,6 +10906,9 @@ static void uninstall_pi_durable_context(const char *home, bool dry_run) {
     }
     printf("  instructions: removed managed context\n");
     uninstall_agent_skill("Pi", skills_dir, dry_run);
+    char extension_path[CLI_BUF_1K];
+    snprintf(extension_path, sizeof(extension_path), "%s/.pi/agent/extensions/cbmem.ts", home);
+    uninstall_generated_client_extension("Pi", extension_path, dry_run);
 }
 
 static void uninstall_managed_agent_instructions(const char *label, const char *instructions_path,
@@ -11054,6 +11222,10 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                 .dialect = CBM_GRAPH_DIALECT_OPENCODE,
             },
             dry_run);
+        char plugin_path[CLI_BUF_1K];
+        snprintf(plugin_path, sizeof(plugin_path), "%s/.config/opencode/plugins/cbm-augment.ts",
+                 home);
+        uninstall_generated_client_extension("OpenCode", plugin_path, dry_run);
     }
     if (agents->antigravity) {
         char cp[CLI_BUF_1K];

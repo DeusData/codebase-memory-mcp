@@ -74,6 +74,7 @@ enum {
 #include "mcp/index_supervisor.h"
 #include "mcp/compact_out.h"
 #include "foundation/str_util.h"
+#include "foundation/workspace.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include <sqlite3.h>
@@ -968,7 +969,9 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
         /* All tools advertise an object outputSchema. Preserve text content for
          * model clients while providing a schema-conforming structured object. */
         yyjson_mut_val *structured = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, structured, is_error ? "error" : "text", text ? text : "");
+        if (is_error) {
+            yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
+        }
         yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
@@ -1091,7 +1094,9 @@ static const tool_def_t TOOLS[] = {
      "Search the code knowledge graph for functions, classes, routes, and variables. Prefer this "
      "over grep/glob for code definitions, implementations, or relationships. Auto-indexes "
      "the server CWD or an explicit directory project on first use when enabled. "
-     "Returns structured results in one call. "
+     "Returns structured results in one call. Compact rows use in/out = selected degree across "
+     "CALLS, USAGE, CALL_REFERENCE, INHERITS, and IMPLEMENTS; use trace_path for caller/callee "
+     "counts. "
      "When has_more=true, use offset+limit to paginate. "
      "Use mode=summary for quick codebase overview without individual results.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
@@ -4402,6 +4407,14 @@ static bool quarantine_corrupt_store(cbm_mcp_server_t *srv, const char *project,
 
     char backup[CBM_SZ_2K];
     char pending[CBM_SZ_2K];
+    /* #1425 belt-and-braces: an empty store path would render the backup as a
+     * bare relative ".corrupt.<hex>" in the process cwd. There is nothing at
+     * such a path worth quarantining. */
+    if (!path || !path[0]) {
+        cbm_log_error("store.auto_clean_failed", "project", project, "path", "", "reason",
+                      "empty store path");
+        return false;
+    }
     if (!reserve_unique_corrupt_pending(path, pending, sizeof(pending), backup, sizeof(backup))) {
         cbm_log_error("store.auto_clean_failed", "project", project, "path", path, "reason",
                       "cannot reserve unique backup");
@@ -4568,7 +4581,13 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     }
 
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
-     * prevent ghost .db file creation for unknown/unindexed projects. */
+     * prevent ghost .db file creation for unknown/unindexed projects.
+     * #1425: an invalid project name yields an empty path. SQLite opens ""
+     * as an anonymous temp db, which then fails the integrity check and
+     * quarantines a db that never existed — as a RELATIVE .corrupt.<hex>
+     * file in the daemon's cwd. Skip the direct open entirely; the fallback
+     * scan below still resolves legacy dbs whose internal name predates
+     * validation. */
     char path[CBM_SZ_1K];
     project_db_path(db_project, path, sizeof(path));
     if (!path[0]) {
@@ -10033,9 +10052,17 @@ static bool scc_build(const int64_t *src, const int64_t *tgt, int ecount, scc_gr
         memset(g, 0, sizeof(*g));
         return false;
     }
-    /* two-pass CSR fill */
+    /* two-pass CSR fill. Every endpoint is in ids[] by construction (ids is
+     * built from these same edge arrays), so a negative lookup is unreachable
+     * -- but that invariant is invisible to path-sensitive analysis, and a
+     * guard keeps a future collection bug from becoming an OOB write. Both
+     * passes must skip identically or the cursors desync. */
     for (int i = 0; i < ecount; i++) {
         int u = scc_id_index(g->ids, nv, src[i]);
+        int v = scc_id_index(g->ids, nv, tgt[i]);
+        if (u < 0 || v < 0) {
+            continue;
+        }
         g->adj_head[u + 1]++;
     }
     for (int i = 0; i < nv; i++) {
@@ -10052,13 +10079,18 @@ static bool scc_build(const int64_t *src, const int64_t *tgt, int ecount, scc_gr
     for (int i = 0; i < nv; i++) {
         cursor[i] = g->adj_head[i];
     }
+    int filled = 0;
     for (int i = 0; i < ecount; i++) {
         int u = scc_id_index(g->ids, nv, src[i]);
         int v = scc_id_index(g->ids, nv, tgt[i]);
+        if (u < 0 || v < 0) {
+            continue;
+        }
         g->adj[cursor[u]++] = v;
+        filled++;
     }
     free(cursor);
-    g->nedges = ecount;
+    g->nedges = filled;
     return true;
 }
 
@@ -10348,6 +10380,14 @@ static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t 
         scc_free(&g);
         return CBM_STORE_ERR;
     }
+    /* Tarjan assigns every vertex a component, so ncomp >= 1 whenever
+     * nverts >= 1 -- state it, so the zero-size-allocation path below is
+     * provably confined to the empty graph. */
+    if (g.nverts > 0 && ncomp <= 0) {
+        free(comp);
+        scc_free(&g);
+        return CBM_STORE_ERR;
+    }
     /* size per component */
     int *csize = calloc((size_t)ncomp, sizeof(int));
     if (!csize) {
@@ -10407,10 +10447,15 @@ static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t 
         scc_free(&g);
         return CBM_STORE_ERR;
     }
-    for (int v = 0; v < g.nverts; v++) {
-        int sl = slot[comp[v]];
-        if (sl >= 0) {
-            members[sl][fill[sl]++] = g.ids[v];
+    /* With ncyc == 0 no slot is ever >= 0 (the slot loop can't assign one),
+     * so members -- NULL in that case -- is never indexed; make that
+     * invariant local instead of cross-loop so it is checkable. */
+    if (ncyc > 0) {
+        for (int v = 0; v < g.nverts; v++) {
+            int sl = slot[comp[v]];
+            if (sl >= 0) {
+                members[sl][fill[sl]++] = g.ids[v];
+            }
         }
     }
     free(fill);
@@ -14027,17 +14072,24 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     repo_path = canonicalize_repo_path_if_exists(repo_path);
 
-    /* Optional workspace boundary. Embedded/daemon sessions always use their
-     * explicit policy, including an explicit NULL meaning unrestricted. A
-     * standalone server retains the process-wide CBM_ALLOWED_ROOT fallback. */
+    /* Workspace boundary. Embedded/daemon sessions supply their explicit policy,
+     * including an explicit NULL meaning unrestricted; a standalone server falls
+     * back to the process-wide CBM_ALLOWED_ROOT. The decision itself lives in one
+     * shared function so this handler and the HTTP UI indexing route cannot drift
+     * apart — they had, and the divergence was the defect. */
     const char *allowed_root =
         srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
-    if (allowed_root && allowed_root[0] && repo_path &&
-        !cbm_path_within_root(allowed_root, repo_path)) {
+    /* repo_path is legitimately absent when the caller names an already-known
+     * project instead; the root is resolved downstream. Only a path supplied here
+     * is classified here — the previous check had the same tolerance. */
+    char boundary_err[CBM_SZ_1K];
+    if (repo_path && repo_path[0] &&
+        !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                    allowed_root, boundary_err, sizeof(boundary_err))) {
         free(mode_str);
         free(name_override);
         free(repo_path);
-        return cbm_mcp_text_result("repo_path is outside the allowed root", true);
+        return cbm_mcp_text_result(boundary_err, true);
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
@@ -19900,6 +19952,11 @@ static int read_bounded_line(FILE *in, char **line, size_t *cap, size_t max_byte
             if (!grown) {
                 return CBM_NOT_FOUND;
             }
+            /* Zero the tail: every byte of the buffer is then defined in any
+             * caller's model (parse_content_length reads up to one byte past
+             * the matched prefix), and a future over-read degrades to reading
+             * NULs instead of undefined memory. One memset per growth step. */
+            memset(grown + len, 0, new_cap - len);
             *line = grown;
             *cap = new_cap;
         }
@@ -20114,6 +20171,13 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     /* No line buffer here: cbm_mcp_read_message() owns its own bounded buffer,
      * which is what enforces MCP_MAX_HEADER_SIZE / MCP_MAX_MESSAGE_SIZE. */
     int fd = cbm_fileno(in);
+
+#ifdef _WIN32
+    /* Ensure stdio is in binary mode to prevent CRLF translation from corrupting
+     * Content-Length byte counts and causing fread() to hang. */
+    _setmode(cbm_fileno(in), _O_BINARY);
+    _setmode(cbm_fileno(out), _O_BINARY);
+#endif
 
     for (;;) {
         if (atomic_load(&srv->stop_requested)) {

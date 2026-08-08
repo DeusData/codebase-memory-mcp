@@ -3,7 +3,7 @@
  *
  * For each discovered file:
  *   1. Re-extract calls (cbm_extract_file)
- *   2. Build per-file import map from IMPORTS edges in graph buffer
+ *   2. Build per-file import map from graph edges plus extraction metadata
  *   3. Resolve each call via registry (import_map → same_module → unique → suffix)
  *   4. Create CALLS edges in graph buffer with confidence/strategy properties
  *
@@ -28,6 +28,7 @@ static const double PC_SVC_PATTERN_CONFIDENCE = 0.5;
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -185,13 +186,13 @@ static bool emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
          * substring coincidence in the resolved QN (e.g. "SalesforceRestClient"
          * matches the "RestClient" HTTP lib). Emit a plain CALLS edge — unless a
          * weak TS/JS member-call match should be suppressed (#592/#606). */
-        if (suppress_plain_calls) {
-            return false;
-        }
-        /* External service-pattern fallbacks have no project target. If their
-         * apparent URL was rejected as a non-route literal, there is no valid
-         * plain CALLS edge to emit and dereferencing target would crash. */
-        if (!target) {
+        /* !target: the service-pattern call sites pass NULL (the route node is
+         * synthesized below) behind a hand-duplicated copy of the is_url/
+         * is_topic predicate above. While the copies agree this branch is
+         * unreachable for them -- but a drift between the two would turn
+         * target->id into a null dereference (clang-analyzer traced exactly
+         * that), and with no callee node there is nothing to emit anyway. */
+        if (suppress_plain_calls || !target) {
             return false;
         }
         char esc_callee[CBM_SZ_256];
@@ -379,23 +380,24 @@ static cbm_resolution_t calls_refresh_reexport_resolution(
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang,
-                               const cbm_lsp_resolution_index_t *lsp_idx) {
+                               int imp_count, CBMLanguage lang) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
         return 0;
     }
 
     /* LSP-resolved calls take precedence over registry-textual matching.
-     * Unique-tail fallbacks are JVM-only. Retain the O(1) exact index and the
-     * configured confidence floor; only an allowed indexed miss scans tails. */
+     * Unique-tail fallbacks are JVM-only. Exact occurrence spans distinguish
+     * same-name calls in one function; legacy rows remain ambiguity-safe. */
     bool allow_tail_match = cbm_pipeline_lsp_allow_tail_match(lang);
-    const CBMResolvedCall *lsp = cbm_lsp_resolution_index_find(
-        lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor, allow_tail_match);
+    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_with_floor_in_graph(
+        lsp_calls, call, ctx->lsp_confidence_floor, allow_tail_match, ctx->gbuf, ctx->project_name);
     bool lsp_target_unindexed = false;
     if (lsp) {
-        const cbm_gbuf_node_t *target_node =
-            calls_lsp_target_node(ctx, lsp->callee_qn, allow_tail_match);
+        bool exact_external_target = call->requires_lsp_resolution &&
+                                     cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
+        const cbm_gbuf_node_t *target_node = calls_lsp_target_node(
+            ctx, lsp->callee_qn, exact_external_target ? false : allow_tail_match);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -452,6 +454,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  false);
             return SKIP_ONE;
         }
+    }
+
+    /* Synthetic semantic candidates (currently implicit C++ operators) are
+     * valid calls only when the language resolver identifies a concrete
+     * invocation target. */
+    if (call->requires_lsp_resolution) {
+        return 0;
     }
 
     /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the signal
@@ -757,8 +766,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
-                                                 &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel, files[i].language, result,
+                                 &imp_keys, &imp_vals, &imp_count);
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
@@ -768,10 +777,6 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_registry_reach_cache_begin(result->calls.count + CBM_SZ_64);
         cbm_registry_import_map_cache_begin(imp_keys, imp_vals, imp_count);
         cbm_registry_resolve_cache_begin(result->calls.count + CBM_SZ_64);
-        cbm_lsp_resolution_index_t lsp_idx;
-        cbm_lsp_resolution_index_build(&lsp_idx, &result->resolved_calls, result->calls.count,
-                                       ctx->lsp_confidence_floor);
-
         /* Resolve each call */
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
@@ -783,20 +788,19 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             /* Resolve + emit edge: source-node lookup, indexed LSP override,
              * then registry-textual fallback. */
             if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language, &lsp_idx)) {
+                                    imp_vals, imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;
             }
         }
 
-        cbm_lsp_resolution_index_free(&lsp_idx);
         cbm_registry_reach_cache_end();
         cbm_registry_import_map_cache_end();
         cbm_registry_resolve_cache_end();
 
         free(module_qn);
-        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -932,8 +936,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, files[i].rel_path,
-                                                 &imp_keys, &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, files[i].language,
+                                 result, &imp_keys, &imp_vals, &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -952,7 +956,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 

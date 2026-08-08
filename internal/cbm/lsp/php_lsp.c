@@ -825,6 +825,33 @@ static char *fetch_leading_phpdoc(PHPLSPContext *ctx, TSNode node) {
     return NULL;
 }
 
+/* PHP 8.1 first-class callable syntax reuses call-expression nodes but its
+ * argument list contains only a `variadic_placeholder`: `target(...)`,
+ * `$obj->method(...)`, or `Type::method(...)`. It creates a Closure; it does
+ * not invoke the target. */
+static bool php_is_first_class_callable(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+    if (ts_node_is_null(args))
+        return false;
+
+    bool saw_placeholder = false;
+    int semantic_children = 0;
+    uint32_t child_count = ts_node_child_count(args);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode child = ts_node_child(args, i);
+        if (ts_node_is_null(child) || !ts_node_is_named(child))
+            continue;
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "comment") == 0)
+            continue;
+        semantic_children++;
+        if (strcmp(kind, "variadic_placeholder") != 0)
+            return false;
+        saw_placeholder = true;
+    }
+    return saw_placeholder && semantic_children == 1;
+}
+
 /* ── expression evaluation ──────────────────────────────────────── */
 
 /* Returns the type of a tree-sitter PHP expression node.
@@ -868,6 +895,12 @@ const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node) {
         }
     } else if (strcmp(kind, "object_creation_expression") == 0) {
         result = eval_object_creation_type(ctx, node);
+    } else if ((strcmp(kind, "function_call_expression") == 0 ||
+                strcmp(kind, "member_call_expression") == 0 ||
+                strcmp(kind, "nullsafe_member_call_expression") == 0 ||
+                strcmp(kind, "scoped_call_expression") == 0) &&
+               php_is_first_class_callable(node)) {
+        result = cbm_type_named(ctx->arena, "Closure");
     } else if (strcmp(kind, "member_call_expression") == 0 ||
                strcmp(kind, "nullsafe_member_call_expression") == 0 ||
                strcmp(kind, "scoped_call_expression") == 0) {
@@ -1250,28 +1283,137 @@ static const CBMType *eval_member_call_type(PHPLSPContext *ctx, TSNode call_node
 
 /* ── emit ───────────────────────────────────────────────────────── */
 
-static void emit_resolved_reason(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
-                                 float confidence, const char *reason) {
+static void emit_resolved_reason_kind(PHPLSPContext *ctx, const char *callee_qn,
+                                      const char *strategy, float confidence, const char *reason,
+                                      CBMResolvedKind kind) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
     rc.reason = reason;
+    rc.kind = kind;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
-static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
-                          float confidence) {
-    emit_resolved_reason(ctx, callee_qn, strategy, confidence, NULL);
+static void emit_resolved_kind(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
+                               float confidence, CBMResolvedKind kind) {
+    emit_resolved_reason_kind(ctx, callee_qn, strategy, confidence, NULL, kind);
+}
+
+static bool php_dynamic_reference_expr(PHPLSPContext *ctx, TSNode expr) {
+    if (ts_node_is_null(expr)) {
+        return false;
+    }
+    const char *kind = ts_node_type(expr);
+    if (strstr(kind, "subscript") || strstr(kind, "element_access") ||
+        strstr(kind, "index_expression") || strstr(kind, "computed")) {
+        return true;
+    }
+
+    static const char *const terminal_fields[] = {"property", "field",  "attribute",
+                                                  "name",     "method", NULL};
+    for (int i = 0; terminal_fields[i]; i++) {
+        TSNode terminal = ts_node_child_by_field_name(expr, terminal_fields[i],
+                                                      (uint32_t)strlen(terminal_fields[i]));
+        if (ts_node_is_null(terminal)) {
+            continue;
+        }
+        uint32_t start = ts_node_start_byte(terminal);
+        uint32_t expr_start = ts_node_start_byte(expr);
+        while (start > expr_start && isspace((unsigned char)ctx->source[start - 1])) {
+            start--;
+        }
+        return start > expr_start && ctx->source[start - 1] == '[';
+    }
+    return false;
+}
+
+static bool php_callable_reference_has_dynamic_member_name(PHPLSPContext *ctx, TSNode call) {
+    const char *call_kind = ts_node_type(call);
+    if (strcmp(call_kind, "member_call_expression") != 0 &&
+        strcmp(call_kind, "nullsafe_member_call_expression") != 0 &&
+        strcmp(call_kind, "scoped_call_expression") != 0) {
+        return false;
+    }
+
+    TSNode name = ts_node_child_by_field_name(call, "name", 4);
+    if (ts_node_is_null(name)) {
+        return false;
+    }
+    const char *name_kind = ts_node_type(name);
+    return strcmp(name_kind, "variable_name") == 0 ||
+           strcmp(name_kind, "dynamic_variable_name") == 0 || php_dynamic_reference_expr(ctx, name);
+}
+
+/* Mirror extract_calls.c's terminal_callee_leaf policy so the PHP LSP and
+ * USAGE passes attach the same exact token occurrence to a first-class
+ * callable, including qualified free-function references. */
+static TSNode php_reference_callee_leaf(PHPLSPContext *ctx, TSNode expr) {
+    if (ts_node_is_null(expr) || php_dynamic_reference_expr(ctx, expr)) {
+        return (TSNode){0};
+    }
+
+    static const char *const terminal_fields[] = {"property", "field", "attribute",
+                                                  "method",   "name",  NULL};
+    for (int i = 0; terminal_fields[i]; i++) {
+        TSNode terminal = ts_node_child_by_field_name(expr, terminal_fields[i],
+                                                      (uint32_t)strlen(terminal_fields[i]));
+        if (!ts_node_is_null(terminal)) {
+            return php_reference_callee_leaf(ctx, terminal);
+        }
+    }
+
+    const char *kind = ts_node_type(expr);
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
+        strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
+        strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
+        strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
+        strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
+        strcmp(kind, "user_symbol") == 0) {
+        return expr;
+    }
+
+    uint32_t count = ts_node_named_child_count(expr);
+    if (count == 0) {
+        return (TSNode){0};
+    }
+    bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
+                            strstr(kind, "member") || strstr(kind, "selector") ||
+                            strstr(kind, "navigation") || strstr(kind, "field_expression");
+    return php_reference_callee_leaf(ctx,
+                                     ts_node_named_child(expr, terminal_is_last ? count - 1 : 0));
+}
+
+static TSNode php_callable_reference_leaf(PHPLSPContext *ctx, TSNode call, const char *kind) {
+    if (php_callable_reference_has_dynamic_member_name(ctx, call)) {
+        return (TSNode){0};
+    }
+    TSNode expr = {0};
+    if (strcmp(kind, "function_call_expression") == 0) {
+        expr = ts_node_child_by_field_name(call, "function", 8);
+    } else {
+        expr = ts_node_child_by_field_name(call, "name", 4);
+    }
+    return php_reference_callee_leaf(ctx, expr);
+}
+
+static void php_stamp_resolved_site(PHPLSPContext *ctx, int first, TSNode site) {
+    if (!ctx->resolved_calls || ts_node_is_null(site) || first < 0) {
+        return;
+    }
+    for (int i = first; i < ctx->resolved_calls->count; i++) {
+        ctx->resolved_calls->items[i].site_start_byte = ts_node_start_byte(site);
+        ctx->resolved_calls->items[i].site_end_byte = ts_node_end_byte(site);
+    }
 }
 
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = expr_text ? expr_text : "?";
     rc.strategy = "lsp_unresolved";
@@ -1449,7 +1591,7 @@ static void process_catch(PHPLSPContext *ctx, TSNode node) {
 
 /* ── call resolution ────────────────────────────────────────────── */
 
-static void resolve_function_call(PHPLSPContext *ctx, TSNode call) {
+static void resolve_function_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind kind) {
     TSNode fn = ts_node_child_by_field_name(call, "function", 8);
     if (ts_node_is_null(fn))
         return;
@@ -1457,12 +1599,34 @@ static void resolve_function_call(PHPLSPContext *ctx, TSNode call) {
     if (!name)
         return;
 
+    /* In PHP, `$handler(...)` is syntactically a function-call expression but
+     * a typed object value dispatches to its materialized `__invoke` method.
+     * This is precise only for a first-class callable and a receiver type whose
+     * exact method exists in the registry; otherwise leave it unresolved so
+     * the usage pipeline can retain ordinary value semantics. */
+    if (kind == CBM_RESOLVED_CALL_REFERENCE && strcmp(ts_node_type(fn), "variable_name") == 0) {
+        const CBMType *receiver = php_eval_expr_type(ctx, fn);
+        const char *class_qn = NULL;
+        if (receiver && receiver->kind == CBM_TYPE_NAMED) {
+            class_qn = receiver->data.named.qualified_name;
+        } else if (receiver && receiver->kind == CBM_TYPE_TEMPLATE) {
+            class_qn = receiver->data.template_type.template_name;
+        }
+        const CBMRegisteredFunc *invoke =
+            class_qn ? php_lookup_method(ctx, class_qn, "__invoke") : NULL;
+        if (invoke && invoke->qualified_name) {
+            emit_resolved_reason_kind(ctx, invoke->qualified_name, "php_invokable_reference", 0.95f,
+                                      name, kind);
+        }
+        return;
+    }
+
     /* `use function Foo\\bar;` mapping. */
     const char *target = find_use(ctx, name, CBM_PHP_USE_FUNCTION);
     if (target) {
         const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, target);
         if (f) {
-            emit_resolved(ctx, f->qualified_name, "php_function_namespaced", 0.95f);
+            emit_resolved_kind(ctx, f->qualified_name, "php_function_namespaced", 0.95f, kind);
             return;
         }
     }
@@ -1472,7 +1636,7 @@ static void resolve_function_call(PHPLSPContext *ctx, TSNode call) {
         const char *ns_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->current_namespace_qn, name);
         const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, ns_qn);
         if (f) {
-            emit_resolved(ctx, f->qualified_name, "php_function_namespaced", 0.95f);
+            emit_resolved_kind(ctx, f->qualified_name, "php_function_namespaced", 0.95f, kind);
             return;
         }
     }
@@ -1504,7 +1668,7 @@ static void resolve_function_call(PHPLSPContext *ctx, TSNode call) {
         }
     }
     if (best) {
-        emit_resolved(ctx, best->qualified_name, "php_function_global_fallback", 0.70f);
+        emit_resolved_kind(ctx, best->qualified_name, "php_function_global_fallback", 0.70f, kind);
         return;
     }
     /* Unresolved — but DO NOT emit unresolved noise here; the unified
@@ -1513,11 +1677,15 @@ static void resolve_function_call(PHPLSPContext *ctx, TSNode call) {
     (void)emit_unresolved;
 }
 
-static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
+static void resolve_member_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind kind) {
     TSNode obj = ts_node_child_by_field_name(call, "object", 6);
     TSNode name_node = ts_node_child_by_field_name(call, "name", 4);
     if (ts_node_is_null(name_node))
         return;
+    if (kind == CBM_RESOLVED_CALL_REFERENCE &&
+        php_callable_reference_has_dynamic_member_name(ctx, call)) {
+        return;
+    }
     char *method_name = php_node_text(ctx, name_node);
     if (!method_name)
         return;
@@ -1541,7 +1709,7 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
         const char *strategy = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                    ? "php_method_typed"
                                    : "php_method_inherited";
-        emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+        emit_resolved_kind(ctx, f->qualified_name, strategy, 0.95f, kind);
         return;
     }
     /* Receiver known but method missing — magic __call? The call dispatches to
@@ -1550,8 +1718,8 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
      * so stash it in reason for the join (lsp_resolve.h, php_method_dynamic).
      * Emit above the join's confidence floor — dispatch to __call is certain. */
     if (class_has_magic_call(ctx, class_qn, false)) {
-        emit_resolved_reason(ctx, cbm_arena_sprintf(ctx->arena, "%s.__call", class_qn),
-                             "php_method_dynamic", 0.85f, method_name);
+        emit_resolved_reason_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.__call", class_qn),
+                                  "php_method_dynamic", 0.85f, method_name, kind);
         return;
     }
     /* Receiver known but class not in registry (e.g. vendor type not indexed,
@@ -1559,15 +1727,19 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
      * at "<class_qn>.<method>" so the pipeline bridge can BLOCK the unified
      * extractor's likely-incorrect short-name fallback. The bridge filters
      * unknown targets and yields no edge — better than a wrong edge. */
-    emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                  "php_method_typed_unindexed", 0.55f);
+    emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
+                       "php_method_typed_unindexed", 0.55f, kind);
 }
 
-static void resolve_static_call(PHPLSPContext *ctx, TSNode call) {
+static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind kind) {
     TSNode scope = ts_node_child_by_field_name(call, "scope", 5);
     TSNode name_node = ts_node_child_by_field_name(call, "name", 4);
     if (ts_node_is_null(name_node))
         return;
+    if (kind == CBM_RESOLVED_CALL_REFERENCE &&
+        php_callable_reference_has_dynamic_member_name(ctx, call)) {
+        return;
+    }
     char *method_name = php_node_text(ctx, name_node);
     if (!method_name)
         return;
@@ -1593,20 +1765,30 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call) {
 
     const CBMRegisteredFunc *f = php_lookup_method(ctx, class_qn, method_name);
     if (f) {
-        emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+        emit_resolved_kind(ctx, f->qualified_name, strategy, 0.95f, kind);
+        return;
+    }
+    /* A first-class reference to an absent static method has an exact target
+     * only when a materialized `__callStatic` exists. Preserve the source name
+     * as the occurrence-join reason, but point at the real method node. Normal
+     * facade invocations retain their existing low-confidence behavior. */
+    const CBMRegisteredFunc *magic_static = php_lookup_method(ctx, class_qn, "__callStatic");
+    if (magic_static && kind == CBM_RESOLVED_CALL_REFERENCE) {
+        emit_resolved_reason_kind(ctx, magic_static->qualified_name, "php_static_magic_reference",
+                                  0.95f, method_name, kind);
         return;
     }
     /* Facade detection: class has __callStatic in its chain. */
-    if (class_has_magic_call(ctx, class_qn, true)) {
-        emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                      "php_dynamic_unresolved", 0.10f);
+    if (magic_static) {
+        emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
+                           "php_dynamic_unresolved", 0.10f, kind);
         return;
     }
     /* Class resolved (e.g., from a `use` clause), method unknown — emit
      * synthetic resolved call so the pipeline bridge can suppress the
      * unified extractor's name-fallback misroute. */
-    emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                  "php_static_unindexed", 0.55f);
+    emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
+                       "php_static_unindexed", 0.55f, kind);
 }
 
 /* ── type narrowing ─────────────────────────────────────────────────
@@ -2158,14 +2340,32 @@ static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node) {
         return; /* process_if_statement already walked body under narrowing */
     }
 
-    /* Call-resolution dispatch. */
+    /* Call-resolution dispatch. A first-class callable has the same outer AST
+     * node as an invocation, so carry the semantic kind alongside resolution
+     * and skip invocation-only narrowing/binding effects. */
+    bool is_callable_reference = php_is_first_class_callable(node);
+    CBMResolvedKind resolved_kind =
+        is_callable_reference ? CBM_RESOLVED_CALL_REFERENCE : CBM_RESOLVED_INVOCATION;
     if (strcmp(kind, "function_call_expression") == 0) {
-        resolve_function_call(ctx, node);
+        int first = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
+        resolve_function_call(ctx, node, resolved_kind);
+        if (is_callable_reference) {
+            php_stamp_resolved_site(ctx, first, php_callable_reference_leaf(ctx, node, kind));
+        } else {
+            php_stamp_resolved_site(ctx, first, node);
+        }
         /* assert(...) in current scope narrows sequentially. */
-        apply_assert_narrowing(ctx, node);
+        if (!is_callable_reference)
+            apply_assert_narrowing(ctx, node);
     } else if (strcmp(kind, "member_call_expression") == 0 ||
                strcmp(kind, "nullsafe_member_call_expression") == 0) {
-        resolve_member_call(ctx, node);
+        int first = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
+        resolve_member_call(ctx, node, resolved_kind);
+        if (is_callable_reference) {
+            php_stamp_resolved_site(ctx, first, php_callable_reference_leaf(ctx, node, kind));
+        } else {
+            php_stamp_resolved_site(ctx, first, node);
+        }
         /* Closure binding via $f->bindTo($obj). When $f is an inline
          * closure literal AND the bindTo call's first arg is a typed
          * variable, walk the closure body with $this rebound. We only
@@ -2174,7 +2374,7 @@ static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node) {
          * value-typing is Phase 6+ infrastructure). */
         TSNode obj = ts_node_child_by_field_name(node, "object", 6);
         TSNode mname = ts_node_child_by_field_name(node, "name", 4);
-        if (!ts_node_is_null(obj) && !ts_node_is_null(mname)) {
+        if (!is_callable_reference && !ts_node_is_null(obj) && !ts_node_is_null(mname)) {
             char *mn = php_node_text(ctx, mname);
             const char *ok = ts_node_type(obj);
             if (mn && strcmp(mn, "bindTo") == 0 &&
@@ -2212,13 +2412,19 @@ static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node) {
             }
         }
     } else if (strcmp(kind, "scoped_call_expression") == 0) {
-        resolve_static_call(ctx, node);
+        int first = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
+        resolve_static_call(ctx, node, resolved_kind);
+        if (is_callable_reference) {
+            php_stamp_resolved_site(ctx, first, php_callable_reference_leaf(ctx, node, kind));
+        } else {
+            php_stamp_resolved_site(ctx, first, node);
+        }
         /* Closure binding via Closure::bind($f, $obj). Same shape as
          * bindTo: rebind $this when the first arg is a closure literal
          * and the second arg has a known class. */
         TSNode scope = ts_node_child_by_field_name(node, "scope", 5);
         TSNode mname2 = ts_node_child_by_field_name(node, "name", 4);
-        if (!ts_node_is_null(scope) && !ts_node_is_null(mname2)) {
+        if (!is_callable_reference && !ts_node_is_null(scope) && !ts_node_is_null(mname2)) {
             char *cls = php_node_text(ctx, scope);
             char *mn = php_node_text(ctx, mname2);
             bool is_closure_bind = mn && strcmp(mn, "bind") == 0 && cls &&
@@ -2780,6 +2986,22 @@ static const CBMType *parse_return_type_text(CBMArena *arena, const char *text,
             arena, cbm_arena_sprintf(arena, "%s.%s", module_qn, php_ns_to_dot(arena, first)));
     }
     return cbm_type_named(arena, php_ns_to_dot(arena, first));
+}
+
+typedef struct {
+    const char *module_qn;
+    const char *namespace_qn;
+    const char **use_local_names;
+    const char **use_target_qns;
+    int use_count;
+} PHPSignatureParseContext;
+
+static const CBMType *php_signature_parse_type(CBMArena *arena, const char *text,
+                                               void *parser_ctx) {
+    const PHPSignatureParseContext *ctx = (const PHPSignatureParseContext *)parser_ctx;
+    return parse_return_type_text(arena, text, ctx ? ctx->module_qn : NULL,
+                                  ctx ? ctx->namespace_qn : NULL, ctx ? ctx->use_local_names : NULL,
+                                  ctx ? ctx->use_target_qns : NULL, ctx ? ctx->use_count : 0);
 }
 
 /* ── property type extraction ───────────────────────────────────────
@@ -3514,7 +3736,7 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
                 if (rets) {
                     rets[0] = cbm_type_named(ctx->arena, class_qn);
                     rets[1] = NULL;
-                    new_sig = cbm_type_func(ctx->arena, NULL, NULL, rets);
+                    new_sig = cbm_type_func_replace_returns(ctx->arena, src->signature, rets);
                 }
             }
         }
@@ -3815,7 +4037,8 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                         if (rets) {
                             rets[0] = parsed;
                             rets[1] = NULL;
-                            rf->signature = cbm_type_func(ctx->arena, NULL, NULL, rets);
+                            rf->signature =
+                                cbm_type_func_replace_returns(ctx->arena, rf->signature, rets);
                         }
                         break;
                     }
@@ -3892,7 +4115,8 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
                                 if (rets) {
                                     rets[0] = ret_t;
                                     rets[1] = NULL;
-                                    rf->signature = cbm_type_func(ctx->arena, NULL, NULL, rets);
+                                    rf->signature = cbm_type_func_replace_returns(
+                                        ctx->arena, rf->signature, rets);
                                 }
                                 break;
                             }
@@ -3939,6 +4163,26 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
                 TSNode c = ts_node_child(n, i);
                 if (!ts_node_is_null(c) && ts_node_is_named(c))
                     stack[top++] = c;
+            }
+        }
+    }
+}
+
+void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root) {
+    if (!ctx || !reg || ts_node_is_null(root))
+        return;
+
+    php_class_field_table_t tab = {0};
+    php_lsp_collect_class_fields(ctx, reg, root, &tab);
+    for (int i = 0; i < tab.count; i++) {
+        php_class_fields_t *fields = &tab.items[i];
+        if (fields->count == 0)
+            continue;
+        for (int t = 0; t < reg->type_count; t++) {
+            if (strcmp(reg->types[t].qualified_name, fields->class_qn) == 0) {
+                reg->types[t].field_names = fields->field_names;
+                reg->types[t].field_types = fields->field_types;
+                break;
             }
         }
     }
@@ -4015,7 +4259,29 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
             if (strcmp(d->label, "Method") == 0 && d->parent_class) {
                 rf.receiver_type = d->parent_class;
             }
-            /* Build a minimal signature with just the return type. */
+            PHPSignatureParseContext parse_ctx = {
+                .module_qn = module_qn,
+                .namespace_qn = NULL,
+                .use_local_names = NULL,
+                .use_target_qns = NULL,
+                .use_count = 0,
+            };
+            const CBMType **param_types = NULL;
+            if (d->signature_param_types || d->signature_param_count > 0) {
+                param_types = cbm_type_materialize_signature_params(
+                    arena, d->signature_param_types, d->signature_param_count,
+                    php_signature_parse_type, &parse_ctx);
+            } else if (!d->signature_param_types && d->signature_param_count == 0 &&
+                       d->param_types) {
+                /* Legacy CBMDefinition callers have no counted carrier. Keep
+                 * their historical projection as a local-only fallback. */
+                int legacy_count = 0;
+                while (d->param_types[legacy_count])
+                    legacy_count++;
+                param_types = cbm_type_materialize_signature_params(
+                    arena, d->param_types, legacy_count, php_signature_parse_type, &parse_ctx);
+            }
+            /* Build a signature carrying ordered params plus the return type. */
             const CBMType *ret_t =
                 d->return_type
                     ? parse_return_type_text(arena, d->return_type, module_qn, NULL, NULL, NULL, 0)
@@ -4026,7 +4292,7 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
                 rets[0] = ret_t;
                 rets[1] = NULL;
             }
-            rf.signature = cbm_type_func(arena, NULL, NULL, rets);
+            rf.signature = cbm_type_func(arena, NULL, param_types, rets);
             cbm_registry_add_func(&reg, rf);
         }
     }
@@ -4040,7 +4306,6 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
      * file defs are registered but before the call walk so eval_expr_type
      * for $this->prop and $obj->prop sees the field types. */
     {
-        php_class_field_table_t tab = {0};
         /* First pass to populate the use map (so type names in property
          * declarations resolve correctly). */
         /* Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²). */
@@ -4055,25 +4320,10 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
                 collect_use_declaration(&ctx, c);
             }
         }
-        php_lsp_collect_class_fields(&ctx, &reg, root, &tab);
+        cbm_php_refine_lsp_registry(&ctx, &reg, root);
         /* Reset namespace/use state — process_file will re-collect. */
         ctx.current_namespace_qn = "";
         ctx.use_count = 0;
-
-        for (int i = 0; i < tab.count; i++) {
-            php_class_fields_t *f = &tab.items[i];
-            if (f->count == 0)
-                continue;
-            /* Mutate the existing entry — registered types are stored by
-             * value in reg.types[], find the index and update it. */
-            for (int t = 0; t < reg.type_count; t++) {
-                if (strcmp(reg.types[t].qualified_name, f->class_qn) == 0) {
-                    reg.types[t].field_names = f->field_names;
-                    reg.types[t].field_types = f->field_types;
-                    break;
-                }
-            }
-        }
     }
 
     php_lsp_process_file(&ctx, root);
@@ -4131,8 +4381,8 @@ static const char **php_split_pipe(CBMArena *arena, const char *text) {
  * functions. Return type strings are parsed via parse_return_type_text using
  * each def's def_module_qn so bare type names qualify against the module
  * where the def lives, not the importer's module. */
-static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
-                                  CBMLSPDef *defs, int def_count) {
+void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
+                               const CBMLSPDef *defs, int def_count) {
     /* Pass 1: types only. The method pass below probes the registry per
      * Method def (receiver auto-registration); doing that against an
      * unfinalized registry is a LINEAR scan over the growing type table —
@@ -4141,7 +4391,7 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
      * the hash, then register funcs/methods with O(1) lookups (post-finalize
      * stub additions stay visible via the registry's tail-scan). */
     for (int i = 0; i < def_count; i++) {
-        CBMLSPDef *d = &defs[i];
+        const CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
@@ -4168,7 +4418,7 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
 
     /* Pass 2: functions and methods. */
     for (int i = 0; i < def_count; i++) {
-        CBMLSPDef *d = &defs[i];
+        const CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
@@ -4177,6 +4427,18 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name; /* borrowed */
             rf.short_name = d->short_name;
+
+            const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
+            PHPSignatureParseContext parse_ctx = {
+                .module_qn = def_mod,
+                .namespace_qn = d->namespace_name,
+                .use_local_names = NULL,
+                .use_target_qns = NULL,
+                .use_count = 0,
+            };
+            const CBMType **param_types = cbm_type_materialize_signature_params(
+                arena, d->signature_param_types, d->signature_param_count, php_signature_parse_type,
+                &parse_ctx);
 
             /* Build FUNC type from "|"-separated return-type texts. Each piece
              * is the unqualified return-type expression as it appears in the
@@ -4192,7 +4454,6 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
                     ret_types = (const CBMType **)cbm_arena_alloc(
                         arena, (size_t)(n + 1) * sizeof(const CBMType *));
                     if (ret_types) {
-                        const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
                         for (int j = 0; j < n; j++) {
                             ret_types[j] = parse_return_type_text(arena, ret_strs[j], def_mod, NULL,
                                                                   NULL, NULL, 0);
@@ -4201,7 +4462,7 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
                     }
                 }
             }
-            rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
+            rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
                 rf.receiver_type = d->receiver_type; /* borrowed */
@@ -4254,7 +4515,7 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
      * accumulate GBs across a large repo. The scratch dies with this call. */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
-    php_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count);
+    cbm_php_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count);
 
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
      * comment for the rationale. */
@@ -4275,7 +4536,6 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
      * to populate typed-property field maps so $this->prop and $obj->prop
      * resolve to the right type during the call walk. */
     {
-        php_class_field_table_t tab = {0};
         /* Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²). */
         uint32_t pkn = 0;
         TSNode *pkids = cbm_lsp_collect_children(ctx.arena, root, &pkn);
@@ -4288,22 +4548,10 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                 collect_use_declaration(&ctx, c);
             }
         }
-        php_lsp_collect_class_fields(&ctx, &reg, root, &tab);
+        cbm_php_refine_lsp_registry(&ctx, &reg, root);
         ctx.current_namespace_qn = "";
         /* Reset to caller-supplied uses only — process_file re-adds AST uses. */
         ctx.use_count = import_count;
-        for (int i = 0; i < tab.count; i++) {
-            php_class_fields_t *f = &tab.items[i];
-            if (f->count == 0)
-                continue;
-            for (int t = 0; t < reg.type_count; t++) {
-                if (strcmp(reg.types[t].qualified_name, f->class_qn) == 0) {
-                    reg.types[t].field_names = f->field_names;
-                    reg.types[t].field_types = f->field_types;
-                    break;
-                }
-            }
-        }
     }
 
     php_lsp_process_file(&ctx, root);
@@ -4344,6 +4592,7 @@ void cbm_batch_php_lsp_cross(CBMArena *arena, CBMBatchPHPLSPFile *files, int fil
                 for (int j = 0; j < file_out.count; j++) {
                     CBMResolvedCall *src = &file_out.items[j];
                     CBMResolvedCall *dst = &out[f].items[j];
+                    memset(dst, 0, sizeof(*dst));
                     dst->caller_qn =
                         src->caller_qn ? cbm_arena_strdup(arena, src->caller_qn) : NULL;
                     dst->callee_qn =
@@ -4351,6 +4600,9 @@ void cbm_batch_php_lsp_cross(CBMArena *arena, CBMBatchPHPLSPFile *files, int fil
                     dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
                     dst->confidence = src->confidence;
                     dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
+                    dst->kind = src->kind;
+                    dst->site_start_byte = src->site_start_byte;
+                    dst->site_end_byte = src->site_end_byte;
                 }
             } else {
                 out[f].count = 0;

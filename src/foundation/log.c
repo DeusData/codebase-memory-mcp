@@ -12,11 +12,26 @@
 #include <stdlib.h>
 #include <string.h>
 
-static CBMLogLevel g_log_level = CBM_LOG_INFO;
-static CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
-static cbm_log_sink_fn g_log_sink = NULL;
+/* These four are written by whatever thread configures logging and read by
+ * every thread that logs — daemon connection workers, pipeline workers, the
+ * watcher. They were plain globals, which is a data race on the SINK in the
+ * strict sense that matters: emit_line reads the pointer and CALLS it, so a
+ * torn or stale read is a jump through a partially-written pointer, not just
+ * a stale value. Found by running the daemon_runtime suite under TSan (that
+ * suite had been excluded from the TSan set, which is why it went unseen).
+ *
+ * Relaxed ordering is the right level: each is an independent scalar with no
+ * happens-before relationship to publish alongside it, and the log path must
+ * stay cheap enough that nobody is tempted to route around it. */
+static _Atomic CBMLogLevel g_log_level = CBM_LOG_INFO;
+static _Atomic CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
+/* Cast, not bare NULL: NULL is ((void*)0) and the implicit void*-to-
+ * function-pointer conversion is not a compile-time constant, which
+ * older Apple clang (Xcode 15.4, the macOS CI image) rejects outright
+ * in a static initializer. The cast makes it an address constant. */
+static _Atomic cbm_log_sink_fn g_log_sink = (cbm_log_sink_fn)NULL;
+static _Atomic CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
 static atomic_bool g_profile_stderr_mirror = false;
-static CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
@@ -78,8 +93,10 @@ void cbm_log_set_sink(cbm_log_sink_fn fn) {
 }
 
 void cbm_log_set_sink_ex(cbm_log_sink_fn fn, CBMLogSinkMode mode) {
-    g_log_sink = fn;
-    g_log_sink_mode = mode;
+    /* Mode first: a reader that observes the new sink then reads the mode can
+     * never see the mode belonging to the PREVIOUS sink. */
+    atomic_store_explicit(&g_log_sink_mode, mode, memory_order_relaxed);
+    atomic_store_explicit(&g_log_sink, fn, memory_order_relaxed);
 }
 
 void cbm_log_set_profile_stderr_mirror(bool enabled) {
@@ -87,19 +104,19 @@ void cbm_log_set_profile_stderr_mirror(bool enabled) {
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
-    g_log_level = level;
+    atomic_store_explicit(&g_log_level, level, memory_order_relaxed);
 }
 
 CBMLogLevel cbm_log_get_level(void) {
-    return g_log_level;
+    return atomic_load_explicit(&g_log_level, memory_order_relaxed);
 }
 
 void cbm_log_set_format(CBMLogFormat format) {
-    g_log_format = format;
+    atomic_store_explicit(&g_log_format, format, memory_order_relaxed);
 }
 
 CBMLogFormat cbm_log_get_format(void) {
-    return g_log_format;
+    return atomic_load_explicit(&g_log_format, memory_order_relaxed);
 }
 
 static const char *level_str(CBMLogLevel level) {
@@ -202,9 +219,13 @@ static void finish_line(char *buf, size_t bufsz, size_t pos) {
 }
 
 static void emit_line(const char *line) {
-    if (g_log_sink) {
-        g_log_sink(line);
-        if (g_log_sink_mode == CBM_LOG_SINK_REPLACE) {
+    /* Load ONCE: re-reading the global between the test and the call would
+     * let a concurrent cbm_log_set_sink turn a checked pointer into a NULL
+     * call. */
+    cbm_log_sink_fn sink = atomic_load_explicit(&g_log_sink, memory_order_relaxed);
+    if (sink) {
+        sink(line);
+        if (atomic_load_explicit(&g_log_sink_mode, memory_order_relaxed) == CBM_LOG_SINK_REPLACE) {
             return;
         }
     }
@@ -212,7 +233,7 @@ static void emit_line(const char *line) {
 }
 
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
-    if (level < g_log_level) {
+    if (level < atomic_load_explicit(&g_log_level, memory_order_relaxed)) {
         return;
     }
 
@@ -221,7 +242,7 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     va_list args;
     va_start(args, msg);
 
-    if (g_log_format == CBM_LOG_FORMAT_JSON) {
+    if (atomic_load_explicit(&g_log_format, memory_order_relaxed) == CBM_LOG_FORMAT_JSON) {
         append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
         append_json_string(line_buf, sizeof(line_buf), &pos, level_str(level));
         append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
@@ -259,7 +280,9 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     finish_line(line_buf, sizeof(line_buf), pos);
     emit_line(line_buf);
-    if (g_log_sink && g_log_sink_mode == CBM_LOG_SINK_REPLACE && msg && strcmp(msg, "prof") == 0 &&
+    cbm_log_sink_fn sink = atomic_load_explicit(&g_log_sink, memory_order_relaxed);
+    CBMLogSinkMode sink_mode = atomic_load_explicit(&g_log_sink_mode, memory_order_relaxed);
+    if (sink && sink_mode == CBM_LOG_SINK_REPLACE && msg && strcmp(msg, "prof") == 0 &&
         atomic_load_explicit(&g_profile_stderr_mirror, memory_order_relaxed)) {
         (void)fprintf(stderr, "%s\n", line_buf);
     }

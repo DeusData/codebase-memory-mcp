@@ -27,6 +27,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <spawn.h>
+extern char **environ;
+#endif
 #include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -34,8 +38,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #ifdef __APPLE__
-#include <spawn.h>
-extern char **environ;
 #ifdef CBM_ENABLE_TEST_SEAMS
 static cbm_subprocess_darwin_post_spawn_test_hook_t darwin_post_spawn_test_hook;
 
@@ -797,7 +799,8 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
 
     PROCESS_INFORMATION child;
     ZeroMemory(&child, sizeof(child));
-    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
+    DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
+                  CREATE_NO_WINDOW;
     BOOL created = CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, NULL, NULL,
                                   &startup.StartupInfo, &child);
     cbm_win_close_spawn_handles(nul, log, attrs, attrs_init);
@@ -945,6 +948,9 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
 
 #else /* POSIX */
 
+/* Used by the fork+exec child. posix_spawn performs the same reset
+ * declaratively via SETSIGDEF + SETSIGMASK, but Apple still forks for the
+ * exec-failure fallback below, so this stays compiled everywhere. */
 static void cbm_posix_reset_child_signals(void) {
     struct sigaction action = {0};
     action.sa_handler = SIG_DFL;

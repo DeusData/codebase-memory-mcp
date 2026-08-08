@@ -12,6 +12,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lsp/go_lsp.h"
+#include "pipeline/lsp_resolve.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -764,7 +765,269 @@ TEST(golsp_interface_method_field_chain) {
     PASS();
 }
 
+/* Parser-backed calls already carry their full call-expression spans. The Go
+ * semantic resolver must preserve the same occurrence identity; otherwise two
+ * same-leaf calls in one caller both join whichever Render record appears
+ * first in resolved_calls. Use concrete and ambiguous-interface dispatch so
+ * the targets are distinct under Go's existing flat concrete-method QN model. */
+TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
+    const char *source = "package main\n\n"
+                         "type Renderer interface { Render(label string) }\n\n"
+                         "type A struct{}\n"
+                         "func (A) Render(label string) {}\n\n"
+                         "type B struct{}\n"
+                         "func (B) Render(label string) {}\n\n"
+                         "func run(a A, r Renderer) {\n"
+                         "\ta.Render(\"alpha\")\n"
+                         "\tr.Render(\"beta\")\n"
+                         "}\n";
+    static const char a_text[] = "a.Render(\"alpha\")";
+    static const char b_text[] = "r.Render(\"beta\")";
+
+    const char *a_site = strstr(source, a_text);
+    const char *b_site = strstr(source, b_text);
+    ASSERT_NOT_NULL(a_site);
+    ASSERT_NOT_NULL(b_site);
+    uint32_t a_start = (uint32_t)(a_site - source);
+    uint32_t a_end = a_start + (uint32_t)strlen(a_text);
+    uint32_t b_start = (uint32_t)(b_site - source);
+    uint32_t b_end = b_start + (uint32_t)strlen(b_text);
+
+    CBMFileResult *r = extract_go(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *a_call = NULL;
+    const CBMCall *b_call = NULL;
+    int render_carriers = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "run") ||
+            !call->callee_name || !strstr(call->callee_name, "Render")) {
+            continue;
+        }
+        render_carriers++;
+        if (strstr(call->callee_name, "a.Render"))
+            a_call = call;
+        if (strstr(call->callee_name, "r.Render"))
+            b_call = call;
+    }
+
+    ASSERT_EQ(render_carriers, 2);
+    ASSERT_NOT_NULL(a_call);
+    ASSERT_NOT_NULL(b_call);
+    ASSERT_EQ(a_call->site_start_byte, a_start);
+    ASSERT_EQ(a_call->site_end_byte, a_end);
+    ASSERT_EQ(b_call->site_start_byte, b_start);
+    ASSERT_EQ(b_call->site_end_byte, b_end);
+    ASSERT_NEQ(a_call->site_start_byte, b_call->site_start_byte);
+
+    const CBMResolvedCall *a_semantic = NULL;
+    const CBMResolvedCall *b_semantic = NULL;
+    int render_semantics = 0;
+    int zero_span_hijackers = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || rc->confidence <= 0.0f || !rc->caller_qn ||
+            !strstr(rc->caller_qn, "run") || !rc->callee_qn || !strstr(rc->callee_qn, ".Render")) {
+            continue;
+        }
+        render_semantics++;
+        if (rc->site_end_byte <= rc->site_start_byte)
+            zero_span_hijackers++;
+        if (rc->site_start_byte == a_start && rc->site_end_byte == a_end && rc->strategy &&
+            strcmp(rc->strategy, "lsp_type_dispatch") == 0) {
+            a_semantic = rc;
+        }
+        if (rc->site_start_byte == b_start && rc->site_end_byte == b_end && rc->strategy &&
+            strcmp(rc->strategy, "lsp_interface_dispatch") == 0 &&
+            strstr(rc->callee_qn, ".Renderer.Render")) {
+            b_semantic = rc;
+        }
+    }
+
+    ASSERT_EQ(render_semantics, 2);
+    ASSERT_EQ(zero_span_hijackers, 0);
+    ASSERT_NOT_NULL(a_semantic);
+    ASSERT_NOT_NULL(b_semantic);
+    ASSERT_TRUE(a_semantic != b_semantic);
+    ASSERT_NEQ(a_semantic->site_start_byte, b_semantic->site_start_byte);
+
+    const CBMResolvedCall *a_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, a_call, false);
+    const CBMResolvedCall *b_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, b_call, false);
+    ASSERT_NOT_NULL(a_joined);
+    ASSERT_NOT_NULL(b_joined);
+    ASSERT_TRUE(a_joined == a_semantic);
+    ASSERT_TRUE(b_joined == b_semantic);
+    ASSERT_TRUE(strcmp(a_joined->callee_qn, b_joined->callee_qn) != 0);
+    ASSERT_EQ(a_joined->site_start_byte, a_start);
+    ASSERT_EQ(a_joined->site_end_byte, a_end);
+    ASSERT_EQ(b_joined->site_start_byte, b_start);
+    ASSERT_EQ(b_joined->site_end_byte, b_end);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Cross-file tests (use cbm_run_go_lsp_cross directly) ──────── */
+
+/* The production Go Tier-3 path promotes per-file unresolved records through
+ * registry lookups without another AST walk. That promotion must copy the
+ * original occurrence span: with the shared Render leaf, a zero-span promoted
+ * record is otherwise eligible for both textual carriers and hijacks one edge. */
+TEST(golsp_fast_crossfile_same_leaf_calls_preserve_exact_sites) {
+    const char *source = "package main\n\n"
+                         "type A struct{}\n"
+                         "type B struct{}\n\n"
+                         "func run(a A, b B) {\n"
+                         "\ta.Render(\"alpha\")\n"
+                         "\tb.Render(\"beta\")\n"
+                         "}\n";
+    static const char a_text[] = "a.Render(\"alpha\")";
+    static const char b_text[] = "b.Render(\"beta\")";
+
+    const char *a_site = strstr(source, a_text);
+    const char *b_site = strstr(source, b_text);
+    ASSERT_NOT_NULL(a_site);
+    ASSERT_NOT_NULL(b_site);
+    uint32_t a_start = (uint32_t)(a_site - source);
+    uint32_t a_end = a_start + (uint32_t)strlen(a_text);
+    uint32_t b_start = (uint32_t)(b_site - source);
+    uint32_t b_end = b_start + (uint32_t)strlen(b_text);
+
+    CBMFileResult *r = extract_go(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *a_call = NULL;
+    const CBMCall *b_call = NULL;
+    int render_carriers = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "run") ||
+            !call->callee_name || !strstr(call->callee_name, "Render")) {
+            continue;
+        }
+        render_carriers++;
+        if (strstr(call->callee_name, "a.Render"))
+            a_call = call;
+        if (strstr(call->callee_name, "b.Render"))
+            b_call = call;
+    }
+
+    ASSERT_EQ(render_carriers, 2);
+    ASSERT_NOT_NULL(a_call);
+    ASSERT_NOT_NULL(b_call);
+    ASSERT_EQ(a_call->site_start_byte, a_start);
+    ASSERT_EQ(a_call->site_end_byte, a_end);
+    ASSERT_EQ(b_call->site_start_byte, b_start);
+    ASSERT_EQ(b_call->site_end_byte, b_end);
+    ASSERT_NEQ(a_call->site_start_byte, b_call->site_start_byte);
+
+    int unresolved_render_semantics = 0;
+    const char *a_unresolved_qn = NULL;
+    const char *b_unresolved_qn = NULL;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->strategy && strcmp(rc->strategy, "lsp_unresolved") == 0 && rc->reason &&
+            strcmp(rc->reason, "method_not_found") == 0 && rc->caller_qn &&
+            strstr(rc->caller_qn, "run") && rc->callee_qn && strstr(rc->callee_qn, ".Render")) {
+            unresolved_render_semantics++;
+            if (strstr(rc->callee_qn, ".A.Render"))
+                a_unresolved_qn = rc->callee_qn;
+            if (strstr(rc->callee_qn, ".B.Render"))
+                b_unresolved_qn = rc->callee_qn;
+        }
+    }
+    ASSERT_EQ(unresolved_render_semantics, 2);
+    ASSERT_NOT_NULL(a_unresolved_qn);
+    ASSERT_NOT_NULL(b_unresolved_qn);
+
+    const char *a_leaf = strrchr(a_unresolved_qn, '.');
+    const char *b_leaf = strrchr(b_unresolved_qn, '.');
+    ASSERT_NOT_NULL(a_leaf);
+    ASSERT_NOT_NULL(b_leaf);
+    const char *a_receiver =
+        cbm_arena_strndup(&r->arena, a_unresolved_qn, (size_t)(a_leaf - a_unresolved_qn));
+    const char *b_receiver =
+        cbm_arena_strndup(&r->arena, b_unresolved_qn, (size_t)(b_leaf - b_unresolved_qn));
+    ASSERT_NOT_NULL(a_receiver);
+    ASSERT_NOT_NULL(b_receiver);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = a_unresolved_qn;
+    defs[0].short_name = "Render";
+    defs[0].label = "Method";
+    defs[0].receiver_type = a_receiver;
+    defs[0].def_module_qn = r->module_qn;
+    defs[0].lang = CBM_LANG_GO;
+    defs[1] = defs[0];
+    defs[1].qualified_name = b_unresolved_qn;
+    defs[1].receiver_type = b_receiver;
+
+    CBMTypeRegistry *reg = cbm_go_build_cross_registry(&r->arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_EQ(cbm_go_fast_resolve_qualified_calls(r, reg, NULL, NULL, 0), 0);
+
+    const CBMResolvedCall *a_semantic = NULL;
+    const CBMResolvedCall *b_semantic = NULL;
+    int promoted_render_semantics = 0;
+    int zero_span_hijackers = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (!rc->strategy || strcmp(rc->strategy, "lsp_strategy_cross_file") != 0 ||
+            rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn ||
+            !strstr(rc->caller_qn, "run") || !rc->callee_qn || !strstr(rc->callee_qn, ".Render")) {
+            continue;
+        }
+        promoted_render_semantics++;
+        if (rc->site_end_byte <= rc->site_start_byte)
+            zero_span_hijackers++;
+        if (strcmp(rc->callee_qn, a_unresolved_qn) == 0 && rc->site_start_byte == a_start &&
+            rc->site_end_byte == a_end) {
+            a_semantic = rc;
+        }
+        if (strcmp(rc->callee_qn, b_unresolved_qn) == 0 && rc->site_start_byte == b_start &&
+            rc->site_end_byte == b_end) {
+            b_semantic = rc;
+        }
+    }
+
+    if (promoted_render_semantics != 2) {
+        printf("  fast-cross Render diagnostics (%d records):\n", r->resolved_calls.count);
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+            printf("    %s -> %s [%s reason=%s site=%u:%u]\n",
+                   rc->caller_qn ? rc->caller_qn : "(null)",
+                   rc->callee_qn ? rc->callee_qn : "(null)", rc->strategy ? rc->strategy : "(null)",
+                   rc->reason ? rc->reason : "(null)", rc->site_start_byte, rc->site_end_byte);
+        }
+    }
+
+    ASSERT_EQ(promoted_render_semantics, 2);
+    ASSERT_EQ(zero_span_hijackers, 0);
+    ASSERT_NOT_NULL(a_semantic);
+    ASSERT_NOT_NULL(b_semantic);
+    ASSERT_TRUE(a_semantic != b_semantic);
+    ASSERT_NEQ(a_semantic->site_start_byte, b_semantic->site_start_byte);
+
+    const CBMResolvedCall *a_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, a_call, false);
+    const CBMResolvedCall *b_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, b_call, false);
+    ASSERT_NOT_NULL(a_joined);
+    ASSERT_NOT_NULL(b_joined);
+    ASSERT_STR_EQ(a_joined->callee_qn, a_unresolved_qn);
+    ASSERT_STR_EQ(b_joined->callee_qn, b_unresolved_qn);
+    ASSERT_EQ(a_joined->site_start_byte, a_start);
+    ASSERT_EQ(a_joined->site_end_byte, a_end);
+    ASSERT_EQ(b_joined->site_start_byte, b_start);
+    ASSERT_EQ(b_joined->site_end_byte, b_end);
+
+    cbm_free_result(r);
+    PASS();
+}
 
 TEST(golsp_crossfile_method_dispatch) {
     const char *source = "package main\n\n"
@@ -1177,8 +1440,10 @@ SUITE(go_lsp) {
     /* Interface method dispatch variants */
     RUN_TEST(golsp_interface_method_single_file);
     RUN_TEST(golsp_interface_method_field_chain);
+    RUN_TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site);
 
     /* Cross-file */
+    RUN_TEST(golsp_fast_crossfile_same_leaf_calls_preserve_exact_sites);
     RUN_TEST(golsp_crossfile_method_dispatch);
     RUN_TEST(golsp_crossfile_return_type_chain);
     RUN_TEST(golsp_crossfile_interface_dispatch);

@@ -16,6 +16,7 @@
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -308,6 +309,15 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     if (res.qualified_name && res.qualified_name[0] != '\0') {
         dec = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
     }
+    /* A qualified Rust proc-macro path can collide with the decorated
+     * function's own name: resolving `#[tokio::main]` from module `main`
+     * may fall back from `tokio::main` to same-module `main`.  That is not a
+     * local decorator target (and the self-edge is discarded below), so keep
+     * the full external spelling by materialising the synthetic decorator. */
+    if (dec && dec->id == node->id && decorator[0] == '#' && decorator[1] == '[' &&
+        strstr(func_name, "::")) {
+        dec = NULL;
+    }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
          * stdlib annotation / proc-macro derive).  Materialise a synthetic
@@ -461,8 +471,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
-                                                 &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel, files[i].language, result,
+                                 &imp_keys, &imp_vals, &imp_count);
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       ps_module_is_dir(files[i].language));
@@ -478,7 +488,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
 
         free(module_qn);
-        cbm_pipeline_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }

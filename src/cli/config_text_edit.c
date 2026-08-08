@@ -1222,6 +1222,58 @@ static int text_matches_candidate(const char *data, size_t data_len, const char 
     return TEXT_OK;
 }
 
+/* Read-only classification: WOULD a migrate of this document succeed?
+ * Returns TEXT_OK when the path is absent or already byte-identical to the
+ * current or an exact released document (a write would proceed), TEXT_UNOWNED
+ * when it holds other bytes (a write would be refused), TEXT_ERROR on unsafe
+ * state. Mirrors text_migrate_owned_document's decision WITHOUT writing, so
+ * `install --dry-run` can predict a refusal instead of promising an install it
+ * cannot deliver (#1387). */
+int cbm_text_owned_document_status(const char *file_path, const char *current_content,
+                                   const char *const *released_contents, size_t released_count) {
+    size_t current_len = 0U;
+    if (!text_valid_path(file_path) ||
+        text_bounded_strlen(current_content, TEXT_MAX_BYTES, &current_len) != TEXT_OK ||
+        text_validate_bytes(current_content, current_len, 1) != TEXT_OK ||
+        (released_count > 0U && !released_contents)) {
+        return TEXT_ERROR;
+    }
+
+    char *old_data = NULL;
+    size_t old_len = 0U;
+    text_file_snapshot_t snapshot;
+    if (text_read_file(file_path, &old_data, &old_len, &snapshot) != TEXT_OK ||
+        text_validate_bytes(old_data, old_len, 1) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (!snapshot.exists) {
+        free(old_data);
+        return TEXT_OK; /* absent -> the write creates it */
+    }
+    bool matches = false;
+    if (text_matches_candidate(old_data, old_len, current_content, &matches) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (matches) {
+        free(old_data);
+        return TEXT_OK;
+    }
+    for (size_t i = 0U; i < released_count; i++) {
+        if (text_matches_candidate(old_data, old_len, released_contents[i], &matches) != TEXT_OK) {
+            free(old_data);
+            return TEXT_ERROR;
+        }
+        if (matches) {
+            free(old_data);
+            return TEXT_OK; /* an exact released doc upgrades */
+        }
+    }
+    free(old_data);
+    return TEXT_UNOWNED;
+}
+
 static int text_migrate_owned_document(const char *file_path, const char *current_content,
                                        const char *const *released_contents, size_t released_count,
                                        int override_mode, unsigned int requested_mode) {

@@ -287,6 +287,18 @@ static int get_edge_count_by_type(const char *type) {
     return c;
 }
 
+static int get_lsp_surface_count(void) {
+    cbm_store_t *s = open_store();
+    if (!s)
+        return -1;
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = 0;
+    int rc = cbm_store_get_lsp_surfaces(s, g_project, &rows, &count);
+    cbm_store_free_lsp_surfaces(rows, count);
+    cbm_store_close(s);
+    return rc == CBM_STORE_OK ? count : -1;
+}
+
 static const char *const k_accuracy_edge_types[] = {
     "CALLS",
     "IMPORTS",
@@ -821,6 +833,7 @@ TEST(incr_formatter_run) {
     int nodes_before = get_node_count();
     int edges_before = get_edge_count();
     int calls_before = get_edge_count_by_type("CALLS");
+    int surfaces_before = get_lsp_surface_count();
 
     /* Simulate a semantics-preserving formatter batch. */
     ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
@@ -839,6 +852,7 @@ TEST(incr_formatter_run) {
     int node_diff = abs(get_node_count() - nodes_before);
     int edge_diff = abs(get_edge_count() - edges_before);
     int calls_diff = abs(get_edge_count_by_type("CALLS") - calls_before);
+    int surfaces_after_incremental = get_lsp_surface_count();
 
     char incremental_snapshot_path[CBM_SZ_512];
     int snapshot_path_len = snprintf(incremental_snapshot_path, sizeof(incremental_snapshot_path),
@@ -860,6 +874,7 @@ TEST(incr_formatter_run) {
         full_response_ok = resp != NULL && strstr(resp, "indexed") != NULL;
         free(resp);
     }
+    int surfaces_after_full = full_response_ok ? get_lsp_surface_count() : -1;
     if (full_response_ok) {
         canonical_graph_diff_rc = cbm_test_compare_canonical_graphs(
             incremental_snapshot_path, g_dbpath, g_project, canonical_graph_diff_error,
@@ -883,6 +898,9 @@ TEST(incr_formatter_run) {
     ASSERT(snapshot_path_ok);
     ASSERT_EQ(snapshot_rc, CBM_STORE_OK);
     ASSERT(full_response_ok);
+    ASSERT_GT(surfaces_before, 0);
+    ASSERT_EQ(surfaces_after_incremental, surfaces_before);
+    ASSERT_EQ(surfaces_after_full, surfaces_before);
     ASSERT_EQ(restore_config_rc, 0);
     ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();

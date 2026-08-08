@@ -8,7 +8,6 @@
 #include "cli/agent_profiles.h"
 
 #include "cli/config_toml_edit.h"
-
 #include "yyjson/yyjson.h"
 
 #include <stdbool.h>
@@ -675,4 +674,8 @@ char *cbm_render_legacy_codex_graph_profile(cbm_graph_tier_t tier) {
         return NULL;
     }
     return profile_buffer_finish(&buffer);
+}
+
+char *cbm_render_graph_profile_codex_rc1(cbm_graph_tier_t tier) {
+    return cbm_render_legacy_codex_graph_profile(tier);
 }

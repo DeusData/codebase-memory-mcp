@@ -1,0 +1,32 @@
+# clang-analyzer memory gate — argued false positives
+#
+# The gate (make -f Makefile.cbm lint-mem-ci) fails on any finding it cannot
+# account for. A finding is accounted for by being FIXED, or — only when the
+# analyzer is genuinely wrong — by an entry here.
+#
+# An entry is an argument about one specific function, so it is pinned to the
+# sha256 of that function's text. Change the function and the entry stops
+# counting: the finding returns and must be argued again against the code as
+# it now stands. That is deliberate. A suppression that outlives the reasoning
+# behind it is worse than no suppression, because it reads as "reviewed".
+#
+# Rules:
+#   * Argue from the code. "False positive" is not an argument; "the analyzer
+#     does not model that cbm_arena_alloc never returns NULL because it aborts
+#     on exhaustion, so the NULL branch it walks is unreachable" is.
+#   * Record what was tried first. A finding that could have been designed
+#     away should be designed away, not whitelisted.
+#   * Never NOLINT. The repo bans it and the gate does not honour it.
+#
+# Format — one block per (file, function, check):
+#
+#   ## src/foundation/example.c :: cbm_example_fn :: clang-analyzer-unix.Malloc
+#   segment-sha256: <64 hex chars, from scripts/lint-mem-gate.py --hash FILE FN>
+#   why: |
+#     Argument grounded in the code.
+#   tried: |
+#     What was attempted before concluding the analyzer is wrong.
+#
+# ── entries ──────────────────────────────────────────────────────
+#
+# (none — the gate is clean. The first genuine false positive goes here.)

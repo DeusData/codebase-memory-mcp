@@ -37,6 +37,11 @@ enum { TRIGRAM_WINDOW = 2 };
  * K/2 = 32 ensures most MinHash slots get populated from distinct features. */
 enum { MIN_UNIQUE_TRIGRAMS = 32 };
 
+/* Fewer leaves cannot produce MIN_UNIQUE_TRIGRAMS distinct trigrams. Keep
+ * their normalized node types only long enough to prove that no fingerprint
+ * is possible, then avoid all seeded hash work. */
+enum { MINHASH_HASH_START_TOKENS = MIN_UNIQUE_TRIGRAMS + TRIGRAM_WINDOW };
+
 /* Maximum structural weight per trigram (3 tokens × 1 each). */
 enum { MAX_STRUCTURAL_WEIGHT = 3 };
 
@@ -209,34 +214,48 @@ bool cbm_minhash_compute(TSNode func_body, const char *source, int language, cbm
     uniq_trig_set_t uniq;
     uniq_trig_init(&uniq);
 
-    /* Stream the full leaf sequence through a tree cursor. Only the preceding
-     * two normalized node types are retained, so complete-function hashing is
-     * O(leaves * CBM_MINHASH_K) time and O(UNIQ_SET_SIZE + AST depth) memory
-     * instead of silently fingerprinting fixed AST/token prefixes. */
+    /* Stream the complete leaf sequence with tree-sitter's cursor. Cursor
+     * child/sibling/parent moves preserve the same left-to-right DFS order
+     * without repeatedly reconstructing a child path. Runtime is
+     * O(nodes + leaves * CBM_MINHASH_K); cursor state is O(AST depth), and the
+     * trigram state remains fixed-size. */
+    const char *initial_tokens[MINHASH_HASH_START_TOKENS];
     const char *previous[TRIGRAM_WINDOW] = {NULL, NULL};
     size_t token_count = 0;
     TSTreeCursor cursor = ts_tree_cursor_new(func_body);
-    bool done = false;
-    while (!done) {
+    bool complete = false;
+    while (!complete) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (ts_node_child_count(node) == 0) {
+        uint32_t child_count = ts_node_child_count(node);
+        if (child_count == 0) {
             const char *kind = ts_node_type(node);
             if (kind[0] != '\0') {
                 const char *token = normalise_node_type(kind);
-                if (token_count >= TRIGRAM_WINDOW) {
+                if (token_count < MINHASH_HASH_START_TOKENS) {
+                    initial_tokens[token_count++] = token;
+                    if (token_count == MINHASH_HASH_START_TOKENS) {
+                        for (size_t index = 0; index + TRIGRAM_WINDOW < token_count; index++) {
+                            hash_trigram(initial_tokens[index], initial_tokens[index + SKIP_ONE],
+                                         initial_tokens[index + TRIGRAM_WINDOW], out, &uniq);
+                        }
+                        previous[0] = initial_tokens[token_count - TRIGRAM_WINDOW];
+                        previous[SKIP_ONE] = initial_tokens[token_count - SKIP_ONE];
+                    }
+                } else {
                     hash_trigram(previous[0], previous[SKIP_ONE], token, out, &uniq);
+                    previous[0] = previous[SKIP_ONE];
+                    previous[SKIP_ONE] = token;
+                    token_count++;
                 }
-                previous[0] = previous[SKIP_ONE];
-                previous[SKIP_ONE] = token;
-                token_count++;
             }
         }
-        if (ts_tree_cursor_goto_first_child(&cursor)) {
+
+        if (child_count > 0 && ts_tree_cursor_goto_first_child(&cursor)) {
             continue;
         }
         while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
             if (!ts_tree_cursor_goto_parent(&cursor)) {
-                done = true;
+                complete = true;
                 break;
             }
         }

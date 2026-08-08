@@ -2353,6 +2353,70 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     return CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
+/* Build the JSON-RPC error that replaces a reply too large to frame.
+ *
+ * Says the two numbers a caller needs to act — what the reply measured and what
+ * fits — because the alternative the reporter lived through was a silent exit
+ * with nothing to go on. The advice is concrete for the same reason: "narrow the
+ * projection or add LIMIT" is actionable, "internal error" is not.
+ *
+ * `request` may be NULL when the message did not parse; the response then omits
+ * the id, which is what JSON-RPC requires for an unidentifiable request. */
+static char *application_oversized_response_error(const cbm_jsonrpc_request_t *request,
+                                                  size_t response_length) {
+    char message[CBM_SZ_256];
+    (void)snprintf(message, sizeof(message),
+                   "response too large: %zu bytes exceeds the %u byte transport limit; "
+                   "narrow the projection, add LIMIT, or paginate",
+                   response_length, (unsigned)CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *err = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, err);
+    /* -32603 (internal error) is the closest standard code: the request was
+     * well-formed and the failure is server-side. */
+    yyjson_mut_obj_add_int(doc, err, "code", -32603);
+    yyjson_mut_obj_add_str(doc, err, "message", message);
+    char *error_json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!error_json) {
+        return NULL;
+    }
+
+    cbm_jsonrpc_response_t response = {
+        .id = request && request->has_id ? request->id : 0,
+        .id_str = request ? request->id_str : NULL,
+        .error_json = error_json,
+        .error_code = -32603,
+    };
+    char *encoded = cbm_jsonrpc_format_response(&response);
+    free(error_json);
+    return encoded;
+}
+
+/* Decide whether `response` can be framed, substituting the error when it
+ * cannot. Owns `response` either way and returns the reply to send, or NULL
+ * only on allocation failure. This is ONE function on purpose: the bug was the
+ * DECISION (an oversized reply travelling on as if it were fine), so the
+ * decision and the substitution have to be testable together — a test that
+ * only builds the error passes even with the size check removed. */
+static char *application_framable_response(char *response, const cbm_jsonrpc_request_t *request) {
+    if (!response || strlen(response) <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX) {
+        return response;
+    }
+    char *replacement = application_oversized_response_error(request, strlen(response));
+    free(response);
+    return replacement;
+}
+
+char *cbm_daemon_application_framable_response_for_test(char *response,
+                                                        const cbm_jsonrpc_request_t *request) {
+    return application_framable_response(response, request);
+}
+
 static cbm_daemon_runtime_application_status_t application_mcp_request(
     cbm_daemon_application_session_t *session, const uint8_t *request, uint32_t request_length,
     uint8_t **response_out, uint32_t *response_length_out) {
@@ -2378,19 +2442,38 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
     } else if (tool_request && response) {
         application_update_notice_inject(session, &response);
     }
-    if (parsed_ok) {
-        cbm_jsonrpc_request_free(&parsed);
-    }
     if (response) {
         size_t response_length = strlen(response);
         if (response_length > UINT32_MAX) {
+            if (parsed_ok) {
+                cbm_jsonrpc_request_free(&parsed);
+            }
             free(response);
             return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
         }
+        /* A reply larger than one frame has to become a JSON-RPC error HERE,
+         * while the request id is still in hand. Handing it to the transport
+         * instead is indistinguishable from a dead socket at the frontend
+         * worker, which responds by _Exit()ing the process — right for a broken
+         * transport, a fatal over-reaction to a large answer. Under an MCP host
+         * that does not respawn the server, that took every tool on it out for
+         * the rest of the session, leaving exit=1 and an empty stderr to debug
+         * from (#1375). */
+        response = application_framable_response(response, parsed_ok ? &parsed : NULL);
+        if (!response) {
+            if (parsed_ok) {
+                cbm_jsonrpc_request_free(&parsed);
+            }
+            return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        }
+        response_length = strlen(response);
         *response_out = (uint8_t *)response;
         *response_length_out = (uint32_t)response_length;
     }
     bool tools_list_changed = response && cbm_mcp_server_tools_list_changed_pending(session->mcp);
+    if (parsed_ok) {
+        cbm_jsonrpc_request_free(&parsed);
+    }
     application_refresh_watch(session);
     return tools_list_changed ? CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED
                               : CBM_DAEMON_RUNTIME_APPLICATION_OK;

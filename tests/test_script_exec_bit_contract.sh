@@ -26,6 +26,7 @@ cd "$ROOT"
 
 python3 - "$ROOT" <<'PY'
 import pathlib
+import os
 import re
 import subprocess
 import sys
@@ -41,6 +42,16 @@ non_exec = set()
 for line in git("ls-files", "-s", "*.sh").splitlines():
     mode, _, _, path = line.split(maxsplit=3)
     if mode == "100644":
+        non_exec.add(path)
+
+# ...and NOT-YET-TRACKED ones, by their filesystem mode. A brand-new script is
+# invisible to `ls-files` until it is committed, so without this the contract
+# passes on the very run where the defect is introduced and only starts failing
+# after the commit that ships it -- which is how scripts/ci/lint-mem.sh reached
+# CI at mode 100644 and died with "Permission denied" (exit 126). The window
+# where the check is most useful is exactly the window it could not see.
+for path in git("ls-files", "--others", "--exclude-standard", "*.sh").splitlines():
+    if path and not os.access(root / path, os.X_OK):
         non_exec.add(path)
 
 # Places that actually execute things.

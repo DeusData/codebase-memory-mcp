@@ -1421,6 +1421,178 @@ TEST(store_file_hash_crud) {
     PASS();
 }
 
+TEST(store_lsp_surface_round_trip) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Empty project: OK + zero rows — the "no surface data, route to full
+     * rebuild" signal, and the upgrade path for pre-table databases. */
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = CBM_NOT_FOUND;
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Batch with the field shapes the codec will produce: a real defs array,
+     * an empty surface, a binary bloom (with embedded NUL), and no bloom. */
+    const unsigned char bloom[] = {0x01, 0x00, 0xfe, 0x7f, 0x00, 0xab};
+    cbm_lsp_surface_row_t in[] = {
+        {.project = "test",
+         .rel_path = "pkg/a.go",
+         .surface_sha = "sha-a",
+         .defs_json = "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]",
+         .ref_bloom = bloom,
+         .ref_bloom_len = (int)sizeof(bloom),
+         .config_ctx = "cfg-1"},
+        {.project = "test",
+         .rel_path = "pkg/b.go",
+         .surface_sha = "sha-b",
+         .defs_json = "[]",
+         .ref_bloom = NULL,
+         .ref_bloom_len = 0,
+         .config_ctx = ""},
+    };
+    ASSERT_EQ(cbm_store_upsert_lsp_surface_batch(s, in, 2), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    /* ORDER BY rel_path: a.go before b.go. */
+    ASSERT_STR_EQ(rows[0].rel_path, "pkg/a.go");
+    ASSERT_STR_EQ(rows[0].surface_sha, "sha-a");
+    ASSERT_STR_EQ(rows[0].defs_json, "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]");
+    ASSERT_STR_EQ(rows[0].config_ctx, "cfg-1");
+    ASSERT_EQ(rows[0].ref_bloom_len, (int)sizeof(bloom));
+    ASSERT_TRUE(rows[0].ref_bloom != NULL &&
+                memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
+    ASSERT_STR_EQ(rows[1].rel_path, "pkg/b.go");
+    ASSERT_STR_EQ(rows[1].defs_json, "[]");
+    ASSERT_EQ(rows[1].ref_bloom_len, 0);
+    ASSERT_TRUE(rows[1].ref_bloom == NULL);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    const char *selected_paths[] = {"pkg/b.go", "pkg/missing.go", "pkg/a.go"};
+    ASSERT_EQ(cbm_store_get_lsp_surfaces_by_paths(s, "test", selected_paths, 3, &rows, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].rel_path, "pkg/b.go");
+    ASSERT_STR_EQ(rows[1].rel_path, "pkg/a.go");
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Upsert-on-conflict replaces the whole row, including dropping a bloom. */
+    cbm_lsp_surface_row_t update = {.project = "test",
+                                    .rel_path = "pkg/a.go",
+                                    .surface_sha = "sha-a2",
+                                    .defs_json = "[]",
+                                    .ref_bloom = NULL,
+                                    .ref_bloom_len = 0,
+                                    .config_ctx = ""};
+    ASSERT_EQ(cbm_store_upsert_lsp_surface_batch(s, &update, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].surface_sha, "sha-a2");
+    ASSERT_EQ(rows[0].ref_bloom_len, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Project-scoped delete removes everything. */
+    ASSERT_EQ(cbm_store_delete_lsp_surfaces(s, "test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_dependent_files_lookup) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* a.py and c.py each call into b.py; b.py also references itself, and
+     * d.py sits apart. Dependents of {b.py} must be exactly {a.py, c.py}:
+     * the self-reference is not a dependent, d.py is unrelated. */
+    const char *files[] = {"a.py", "b.py", "c.py", "d.py"};
+    int64_t ids[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "test.%s.fn", files[i]);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = "fn",
+                        .qualified_name = qn,
+                        .file_path = files[i],
+                        .start_line = 1,
+                        .end_line = 2,
+                        .properties_json = "{}"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_TRUE(ids[i] > 0);
+    }
+    const int64_t edge_pairs[][2] = {{ids[0], ids[1]}, {ids[2], ids[1]}, {ids[1], ids[1]}};
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "test",
+                        .source_id = edge_pairs[i][0],
+                        .target_id = edge_pairs[i][1],
+                        .type = "CALLS",
+                        .properties_json = "{}"};
+        ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    }
+
+    /* Structural container noise: a Folder node (placeholder file_path)
+     * with a CONTAINS_FILE edge into b.py must never surface as a
+     * dependent — it is not a source file and cannot be re-resolved. */
+    cbm_node_t folder = {.project = "test",
+                         .label = "Folder",
+                         .name = "pkg",
+                         .qualified_name = "test.pkg",
+                         .file_path = "{}",
+                         .start_line = 0,
+                         .end_line = 0,
+                         .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder);
+    ASSERT_TRUE(folder_id > 0);
+    cbm_edge_t contains = {.project = "test",
+                           .source_id = folder_id,
+                           .target_id = ids[1],
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    ASSERT_TRUE(cbm_store_insert_edge(s, &contains) > 0);
+
+    const char *targets[] = {"b.py"};
+    char **deps = NULL;
+    int dep_count = 0;
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets, 1, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 2);
+    bool saw_a = false;
+    bool saw_c = false;
+    for (int i = 0; i < dep_count; i++) {
+        saw_a = saw_a || strcmp(deps[i], "a.py") == 0;
+        saw_c = saw_c || strcmp(deps[i], "c.py") == 0;
+    }
+    ASSERT_TRUE(saw_a && saw_c);
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    /* No inbound edges: an isolated target has no dependents. */
+    const char *targets_d[] = {"d.py"};
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets_d, 1, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 0);
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    /* A target list already containing the dependent excludes it: asking for
+     * dependents of {a.py, b.py} returns only c.py. */
+    const char *targets_ab[] = {"a.py", "b.py"};
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets_ab, 2, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 1);
+    ASSERT_STR_EQ(deps[0], "c.py");
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_file_hash_upsert_rejects_null_required_fields) {
     /* Pins the API contract that `cbm_store_upsert_file_hash` returns
      * CBM_STORE_ERR (not silent OK) when a NOT NULL column would receive
@@ -7239,6 +7411,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_batch_in_transaction_bulk_rollback);
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
+    RUN_TEST(store_lsp_surface_round_trip);
+    RUN_TEST(store_dependent_files_lookup);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_file_state_crud);
     RUN_TEST(store_file_state_get_resets_cached_statement);

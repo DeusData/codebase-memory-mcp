@@ -366,9 +366,7 @@ TEST(mkc_c2_cpp_operator_plus) {
     PASS();
 }
 
-/* C2-B: C++ — operator[] subscript overload.
- * red=bug: `arr[0]` on a custom array type is a subscript_expression;
- * same root cause as C2-A — no desugaring to CALLS for subscript operators. */
+/* C2-B: C++ — operator[] subscript overload. */
 TEST(mkc_c2_cpp_operator_subscript_does_not_count_data_target) {
     static const MKC_File f[] = {{"arr.cpp", "struct IntArr {\n    int data[8];\n"
                                              "    int& operator[](int i) { return data[i]; }\n"
@@ -376,16 +374,31 @@ TEST(mkc_c2_cpp_operator_subscript_does_not_count_data_target) {
                                              "int run(IntArr &a) {\n"
                                              "    return a[2];\n"
                                              "}\n"}};
-    /* REAL BUG: a[2] should CALLS run->IntArr::operator[].  The subscript
-     * operator desugaring is not modeled — C++ call extraction does not emit a
-     * call for subscript_expression on an overloaded-operator type. Before
-     * weak non-callable targets were filtered, this fixture passed by counting
-     * a false CALLS edge to the data field. Keep the known operator-resolution
-     * gap explicit without accepting that semantically invalid edge. */
+    /* The semantic operator carrier must resolve to IntArr::operator[] without
+     * reviving the old weak-name CALLS edge to the data field. */
     MKC_Proj lp;
     cbm_store_t *store = mkc_index(&lp, f, 1);
     ASSERT_NOT_NULL(store);
-    ASSERT_EQ(cbm_store_count_edges_by_type(store, lp.project, "CALLS"), 0);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int operator_targets = 0;
+    int data_targets = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t target;
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) != CBM_STORE_OK)
+            continue;
+        if (target.name && strcmp(target.name, "operator[]") == 0)
+            operator_targets++;
+        if (target.name && strcmp(target.name, "data") == 0)
+            data_targets++;
+        cbm_node_free_fields(&target);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(operator_targets, 1);
+    ASSERT_EQ(data_targets, 0);
     ASSERT_GTE(cbm_store_count_edges_by_type(store, lp.project, "USAGE"), 1);
     mkc_cleanup(&lp, store);
     PASS();
