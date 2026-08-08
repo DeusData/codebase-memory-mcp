@@ -163,7 +163,11 @@ endif
 # shipped artifact. ELF-only: Apple's ld rejects -z noexecstack outright and it
 # is meaningless for PE, so it is gated rather than made "common".
 ELF_HARDENING_FLAGS :=
-ifeq ($(IS_LINUX),yes)
+# IS_LINUX comes from uname, i.e. the HOST. Cross-compiling to Windows from a
+# Linux container satisfies it while emitting PE, and lld then rejects the
+# unknown -z argument. Gate on the TARGET too: IS_MINGW is derived from the
+# compiler's own _WIN32 define, so it names what is actually being produced.
+ifeq ($(IS_LINUX)$(IS_MINGW),yesno)
 ELF_HARDENING_FLAGS := -Wl,-z,noexecstack
 endif
 
