@@ -96,6 +96,10 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/sysctl.h> // KERN_PROC_PATHNAME — /proc-free self-path detection
+#include <sys/types.h>
+#endif
 #include "foundation/compat_fs.h"
 
 #ifndef CBM_VERSION
@@ -9047,6 +9051,15 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     if (!exact) {
         buf[0] = '\0';
     }
+#elif defined(__FreeBSD__)
+    /* FreeBSD has no /proc by default; sysctl KERN_PROC_PATHNAME returns the
+     * running executable's path without it. */
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t sp_sz = buf_sz;
+    exact = sysctl(mib, 4, buf, &sp_sz, NULL, 0) == 0 && sp_sz > 0 && sp_sz <= buf_sz;
+    if (!exact) {
+        buf[0] = '\0';
+    }
 #else
     ssize_t sp_len = readlink("/proc/self/exe", buf, buf_sz - SKIP_ONE);
     exact = sp_len > 0 && (size_t)sp_len < buf_sz - SKIP_ONE;
@@ -9408,12 +9421,28 @@ int cbm_cmd_install(int argc, char **argv) {
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
     char self_path[CLI_BUF_1K] = {0};
-    (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
+    bool self_path_exact = cbm_detect_self_path(self_path, sizeof(self_path), home);
+
+#ifdef CBM_PACKAGE_MANAGED
+    /* A package manager (FreeBSD ports, Homebrew, distro pkg) already placed the
+     * binary on PATH under its own prefix and owns that file. Install must not
+     * copy it into ~/.local/bin (a duplicate, unmanaged binary in $HOME), and
+     * agent configs must reference the real binary the manager installed, not
+     * the ~/.local/bin path. Point bin_target at the running executable. */
+    if (self_path_exact && self_path[0]) {
+        snprintf(bin_target, sizeof(bin_target), "%s", self_path);
+    }
+#else
+    (void)self_path_exact;
+#endif
 
     struct stat target_status;
     bool target_exists = (stat(bin_target, &target_status) == 0);
     bool same_binary = cbm_same_file(self_path, bin_target);
     bool do_copy = !same_binary && (!target_exists || force);
+#ifdef CBM_PACKAGE_MANAGED
+    do_copy = false;
+#endif
 
     /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
      * the old prompt-and-delete behaviour. The helper returns 0 only when the
@@ -9574,7 +9603,10 @@ int cbm_cmd_install(int argc, char **argv) {
         }
     }
     char shell_rc[CLI_BUF_1K] = {0};
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(CBM_PACKAGE_MANAGED)
+    /* Leave shell_rc empty under CBM_PACKAGE_MANAGED: the package manager owns
+     * PATH via its prefix, so install must not append `export PATH=...` to the
+     * user's shell rc. cli_install_activate() skips the PATH step on empty rc. */
     snprintf(shell_rc, sizeof(shell_rc), "%s", cbm_detect_shell_rc(home));
 #endif
     cli_install_activation_t activation = {
@@ -9628,7 +9660,9 @@ int cbm_cmd_install(int argc, char **argv) {
     printf("\nInstall complete. Please restart your coding-agent sessions to "
            "properly take this into account.\n");
 #ifndef _WIN32
-    printf("Restart your shell or run:\n  source %s\n", shell_rc);
+    if (shell_rc[0]) {
+        printf("Restart your shell or run:\n  source %s\n", shell_rc);
+    }
 #endif
     if (dry_run) {
         printf("\n(dry-run — no files were modified)\n");
