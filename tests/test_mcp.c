@@ -1627,6 +1627,50 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
 static char *extract_text_content(const char *mcp_result);
 
+TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "semantic-only";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/semantic-only");
+
+    cbm_node_t unrelated = {.project = proj,
+                            .label = "Function",
+                            .name = "unrelated_node",
+                            .qualified_name = "semantic-only.unrelated_node",
+                            .file_path = "unrelated.c",
+                            .start_line = 1,
+                            .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &unrelated), 0);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"semantic-only\",\"semantic_query\":[\"publish\"],\"limit\":5}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "unrelated_node"));
+    free(inner);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"semantic-only\",\"semantic_query\":[\"publish\"],"
+                               "\"format\":\"json\",\"limit\":5}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"groups\":[]"));
+    ASSERT_NULL(strstr(inner, "unrelated_node"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* callers_total/callees_total must count what the caller can enumerate: with
  * include_tests=false (default) test-file rows are hidden from the table, so
  * the totals must apply the same filter — a raw visited_count overstated the
@@ -10503,6 +10547,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
