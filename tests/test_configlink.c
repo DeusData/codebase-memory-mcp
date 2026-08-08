@@ -290,6 +290,110 @@ TEST(configlink_file_ref_no_false_positive) {
     PASS();
 }
 
+/* ── Determinism: candidate truncation must not depend on insert order ── */
+
+static int cl_cmp_row(const void *pa, const void *pb) {
+    return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+}
+
+/* Collect the CONFIGURES edge set as a sorted, newline-joined
+ * "src_qn|tgt_qn" fingerprint. Caller frees. */
+static char *configures_fingerprint(cbm_gbuf_t *gb) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+
+    char **rows = calloc((size_t)(count > 0 ? count : 1), sizeof(*rows));
+    if (!rows) {
+        return NULL;
+    }
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *s = cbm_gbuf_find_by_id(gb, edges[i]->source_id);
+        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(gb, edges[i]->target_id);
+        if (!s || !t || !s->qualified_name || !t->qualified_name) {
+            continue;
+        }
+        size_t len = strlen(s->qualified_name) + strlen(t->qualified_name) + 2;
+        rows[n] = malloc(len);
+        if (!rows[n]) {
+            break;
+        }
+        snprintf(rows[n], len, "%s|%s", s->qualified_name, t->qualified_name);
+        n++;
+    }
+    qsort(rows, (size_t)n, sizeof(*rows), cl_cmp_row);
+
+    size_t total = 1;
+    for (int i = 0; i < n; i++) {
+        total += strlen(rows[i]) + 1;
+    }
+    char *out = calloc(total, 1);
+    if (out) {
+        for (int i = 0; i < n; i++) {
+            strcat(out, rows[i]);
+            strcat(out, "\n");
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        free(rows[i]);
+    }
+    free(rows);
+    return out;
+}
+
+/* Build a gbuf whose code-candidate count exceeds the collector's internal
+ * cap, inserting the candidates either forwards or backwards. */
+enum { CL_DET_CANDIDATES = 9000 }; /* > the 8192 code-entry cap */
+
+static cbm_gbuf_t *build_oversized_corpus(bool reverse) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+
+    /* One config key every candidate can match on: "max_connections". */
+    cbm_gbuf_upsert_node(gb, "Variable", "max_connections", "test.config.max_connections",
+                         "config.toml", 0, 0, NULL);
+
+    for (int k = 0; k < CL_DET_CANDIDATES; k++) {
+        int i = reverse ? (CL_DET_CANDIDATES - 1 - k) : k;
+        char name[CBM_SZ_64];
+        char qn[CBM_SZ_128];
+        char path[CBM_SZ_64];
+        snprintf(name, sizeof(name), "getMaxConnections%04d", i);
+        snprintf(qn, sizeof(qn), "test.mod%04d.%s", i, name);
+        snprintf(path, sizeof(path), "mod%04d.go", i);
+        cbm_gbuf_upsert_node(gb, "Function", name, qn, path, 0, 0, NULL);
+    }
+    return gb;
+}
+
+/* REGRESSION: collect_config_entries/collect_code_entries fill fixed-capacity
+ * arrays and stop at the cap, walking gbuf label indexes in insertion order —
+ * which under parallel extraction is worker-merge order and varies run to run.
+ * Sorting candidates canonically before the cap is what keeps the surviving
+ * set, and therefore the emitted CONFIGURES edges, a pure function of the
+ * inputs. This test stands in for the scheduling variance by feeding the same
+ * corpus in two insertion orders: the emitted edge set must be identical. */
+TEST(configlink_candidate_truncation_is_order_independent) {
+    cbm_gbuf_t *fwd = build_oversized_corpus(false);
+    run_configlink(fwd, "test", NULL);
+    char *fp_fwd = configures_fingerprint(fwd);
+
+    cbm_gbuf_t *rev = build_oversized_corpus(true);
+    run_configlink(rev, "test", NULL);
+    char *fp_rev = configures_fingerprint(rev);
+
+    ASSERT_TRUE(fp_fwd != NULL);
+    ASSERT_TRUE(fp_rev != NULL);
+    ASSERT_TRUE(fp_fwd[0] != '\0'); /* the cap must actually have been exercised */
+    ASSERT_STR_EQ(fp_fwd, fp_rev);
+
+    free(fp_fwd);
+    free(fp_rev);
+    cbm_gbuf_free(fwd);
+    cbm_gbuf_free(rev);
+    PASS();
+}
+
 /* ── Suite ───────────────────────────────────────────────────────── */
 
 SUITE(configlink) {
@@ -305,4 +409,7 @@ SUITE(configlink) {
 
     /* Strategy 3: File Path → Reference */
     RUN_TEST(configlink_file_ref_no_false_positive);
+
+    /* Determinism */
+    RUN_TEST(configlink_candidate_truncation_is_order_independent);
 }
