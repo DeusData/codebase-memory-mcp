@@ -843,6 +843,154 @@ TEST(cypher_exec_optional_rel_leaf_fallback_survives) {
     PASS();
 }
 
+/* Sibling of the leaf-fallback test, but for the BOUND-TERMINAL expansion path
+ * (expand_from_bound_terminal): the OPTIONAL start var is unbound and the
+ * terminal is bound, e.g. `MATCH (f) OPTIONAL MATCH (c)-[:CALLS]->(f)`. That
+ * function sized its hop buffer bind_count*10 + 1 and gated the OPTIONAL
+ * fallback on `new_count < max_new`, so once one terminal's expansion saturated
+ * the buffer, every LATER terminal's no-match row was silently dropped — the
+ * rows `WHERE c IS NULL` is meant to surface. Not an overflow (the guard kept
+ * the write in bounds) but real data loss. Lossless sizing (bind_count*10 +
+ * bind_count, fallback ungated) preserves them. */
+TEST(cypher_exec_bound_terminal_optional_fallback_survives) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* 2 Function nodes (hub + leaf) → bind_count = 2, max_new = 20. The hub has
+     * 21 incoming CALLS edges (> max_new), so its expansion saturates the write
+     * buffer; the leaf has none, so it must still yield its OPTIONAL no-match
+     * row. Under the original "+ SKIP_ONE" sizing that row was dropped once the
+     * buffer filled; the lossless sizing preserves it regardless of the order in
+     * which the (unordered) label scan visits the two terminals. */
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    cbm_node_t leaf = {
+        .project = "test", .label = "Function", .name = "leaf", .qualified_name = "test.leaf"};
+    cbm_store_upsert_node(s, &leaf);
+
+    /* Callers are non-Function so they do not inflate bind_count. Each CALLS the
+     * hub (source = caller, target = hub), so from the bound terminal `hub` the
+     * expansion binds the unbound start `c` to each caller. */
+    for (int i = 0; i < 21; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "caller%02d", i);
+        snprintf(qn, sizeof(qn), "test.caller%02d", i);
+        cbm_node_t caller = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &caller);
+        cbm_edge_t e = {.project = "test", .source_id = cid, .target_id = hub_id, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* max_rows 0 → the 100000 result ceiling, so the output LIMIT does not hide
+     * the leaf row; we are testing the hop buffer, not the output cap. */
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) RETURN f.name, c.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    /* The leaf terminal has no incoming CALLS edge, so it must yield one row with
+     * the start var `c` unbound (""). Before the fix this row was dropped once the
+     * hub saturated the buffer. Also confirm the hub still expanded to bound rows. */
+    bool leaf_fallback = false;
+    bool hub_expanded = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *f = r.rows[i][0];
+        const char *c = r.rows[i][1];
+        if (strcmp(f, "leaf") == 0 && c[0] == '\0') {
+            leaf_fallback = true;
+        }
+        if (strcmp(f, "hub") == 0 && c[0] != '\0') {
+            hub_expanded = true;
+        }
+    }
+    ASSERT_TRUE(leaf_fallback); /* the bound-terminal OPTIONAL no-match row survived */
+    ASSERT_TRUE(hub_expanded);  /* the expansion still produced bound rows */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Discriminating companion to the test above: preserving OPTIONAL no-match rows
+ * under saturation must NOT be bought by fabricating them. If match detection is
+ * gated on the same ceiling as the write, then once one terminal fills the
+ * buffer, another terminal that genuinely HAS callers is never scanned, its
+ * match_count stays 0, and the fallback invents an unbound "dead code" row for it
+ * — reporting live code as dead, which is worse than dropping a row.
+ *
+ * The construction is deliberately order-independent: BOTH hubs have enough
+ * callers to saturate the buffer on their own, so whichever the scan visits
+ * second is guaranteed to be processed after saturation. Under the gated variant
+ * that second hub is fabricated as dead; the assertion "no hub with callers is
+ * dead" then fails no matter which order `find_nodes_by_label` returns (its query
+ * has no ORDER BY, so the test must not depend on one). The fix makes it pass. */
+TEST(cypher_exec_bound_terminal_saturation_no_false_deadcode) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* 3 Function terminals → bind_count = 3, max_new = 30. */
+    cbm_node_t hubA = {
+        .project = "test", .label = "Function", .name = "hubA", .qualified_name = "test.hubA"};
+    int64_t hubA_id = cbm_store_upsert_node(s, &hubA);
+    cbm_node_t hubB = {
+        .project = "test", .label = "Function", .name = "hubB", .qualified_name = "test.hubB"};
+    int64_t hubB_id = cbm_store_upsert_node(s, &hubB);
+    cbm_node_t leaf = {
+        .project = "test", .label = "Function", .name = "leaf", .qualified_name = "test.leaf"};
+    cbm_store_upsert_node(s, &leaf);
+
+    /* BOTH hubs get 35 callers (> max_new = 30), so either one saturates the write
+     * buffer by itself; leaf gets none. Callers are non-Function so they don't
+     * inflate bind_count. */
+    for (int i = 0; i < 70; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "caller%02d", i);
+        snprintf(qn, sizeof(qn), "test.caller%02d", i);
+        cbm_node_t caller = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &caller);
+        int64_t tgt = i < 35 ? hubA_id : hubB_id; /* 35 -> hubA, 35 -> hubB */
+        cbm_edge_t e = {.project = "test", .source_id = cid, .target_id = tgt, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) RETURN f.name, c.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    bool hub_expanded = false;      /* sanity: the buffer really did fill from a hub */
+    bool hub_false_deadcode = false; /* the bug: a hub with callers invented as dead */
+    bool leaf_deadcode = false;     /* the lossless property: genuine dead code kept */
+    for (int i = 0; i < r.row_count; i++) {
+        const char *f = r.rows[i][0];
+        const char *c = r.rows[i][1];
+        bool is_hub = strcmp(f, "hubA") == 0 || strcmp(f, "hubB") == 0;
+        if (is_hub && c[0] != '\0') {
+            hub_expanded = true;
+        }
+        if (is_hub && c[0] == '\0') {
+            hub_false_deadcode = true;
+        }
+        if (strcmp(f, "leaf") == 0 && c[0] == '\0') {
+            leaf_deadcode = true;
+        }
+    }
+    ASSERT_TRUE(hub_expanded);
+    ASSERT_FALSE(hub_false_deadcode); /* live code with callers must never appear as dead */
+    ASSERT_TRUE(leaf_deadcode);       /* genuine no-match row still survives saturation */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3723,6 +3871,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_optional_rel_saturated_no_overflow);
     RUN_TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match);
     RUN_TEST(cypher_exec_optional_rel_leaf_fallback_survives);
+    RUN_TEST(cypher_exec_bound_terminal_optional_fallback_survives);
+    RUN_TEST(cypher_exec_bound_terminal_saturation_no_false_deadcode);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
     RUN_TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit);
