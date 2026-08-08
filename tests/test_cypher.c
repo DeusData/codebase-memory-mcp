@@ -857,6 +857,46 @@ TEST(cypher_exec_where_eq) {
     PASS();
 }
 
+/* #1196: max_rows limits projected results, not the source-node candidates
+ * considered before WHERE. The old unlabeled scan searched only
+ * 10 * max_rows nodes, so a valid match later in search order disappeared. */
+TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    for (int i = 0; i < 11; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "early_%02d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t distractor = {.project = "test",
+                                 .label = "Function",
+                                 .name = name,
+                                 .qualified_name = qn,
+                                 .file_path = "early.py"};
+        ASSERT_GT(cbm_store_upsert_node(s, &distractor), 0);
+    }
+
+    cbm_node_t late = {.project = "test",
+                       .label = "Function",
+                       .name = "zz_late_match",
+                       .qualified_name = "test.zz_late_match",
+                       .file_path = "late.py"};
+    ASSERT_GT(cbm_store_upsert_node(s, &late), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n) WHERE n.name = \"zz_late_match\" RETURN n.name", "test", 1, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "zz_late_match");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #874: coalesce(var.prop, literal) in WHERE — null-safe numeric filters
  * for audit queries over OPTIONAL graph properties. The parser rejected the
  * call outright ("unexpected operator"); RETURN-side coalesce already
@@ -3731,6 +3771,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
+    RUN_TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
     RUN_TEST(cypher_exec_where_coalesce_issue874);
     RUN_TEST(cypher_exec_where_regex);

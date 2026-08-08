@@ -381,6 +381,9 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
 /* Find node by qualified_name only (no project filter — QNs are globally unique). */
 int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *out);
 
+/* Find all nodes in a project. Returns allocated array, caller frees. */
+int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, int *count);
+
 /* Find nodes by name (exact match). Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count);
