@@ -1,3 +1,7 @@
+# Shell scripts must stay LF: with git's Windows default (core.autocrlf=true)
+# they check out as CRLF and bash inside the build containers rejects them.
+*.sh text eol=lf
+
 # Vendored tree-sitter grammars — machine-generated, hide from stats and diffs
 internal/cbm/vendored/grammars/**/parser.c  linguist-generated=true diff=false
 internal/cbm/vendored/grammars/**/scanner.c linguist-generated=true diff=false
