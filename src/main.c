@@ -2239,7 +2239,10 @@ int main(int argc, char **argv) {
 
     cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
     if (!endpoint) {
-        (void)fprintf(stderr, "codebase-memory-mcp: secure daemon endpoint could not be created\n");
+        const char *validation_detail = cbm_daemon_ipc_validation_detail();
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp: secure daemon endpoint could not be created%s%s\n",
+                      validation_detail[0] ? " - " : "", validation_detail);
         return EXIT_FAILURE;
     }
 
