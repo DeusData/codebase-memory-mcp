@@ -10792,7 +10792,7 @@ TEST(incremental_changed_file_propagates_explicit_persistence_failure) {
 
 TEST(incremental_missing_mode_metadata_forces_reindex) {
     char tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_legacy_XXXXXX");
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_missing_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
 
     char dbpath[512];
@@ -10815,6 +10815,18 @@ TEST(incremental_missing_mode_metadata_forces_reindex) {
     legacy_project_node.properties_json = "{}";
     ASSERT_GT(cbm_store_upsert_node(store, &legacy_project_node), 0);
     cbm_node_free_fields(&project_node);
+
+    /* Drop the legacy coverage_meta fallback row as well: only with no
+     * index_mode in the Project node AND no coverage_meta row does the route
+     * reach genuinely missing mode metadata (pre-coverage-meta databases). */
+    sqlite3_stmt *delete_meta = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "DELETE FROM index_coverage_meta WHERE project = ?1;", -1,
+                                 &delete_meta, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(delete_meta, 1, project, -1, SQLITE_TRANSIENT), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(delete_meta), SQLITE_DONE);
+    sqlite3_finalize(delete_meta);
 
     char sentinel_qn[512];
     snprintf(sentinel_qn, sizeof(sentinel_qn), "%s.legacy_sentinel", project);
