@@ -75,9 +75,15 @@ def yaml_run_blocks(text: str) -> list[str]:
 
 binary = "codebase-memory-mcp.exe"
 payload = "codebase-memory-mcp.payload.exe"
-windows_archive_names = (binary, "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.md")
+# cbm-integrations.json: the integration templates the binary verifies by its
+# embedded SHA-256 before installing anything. install.ps1 runs `install` from
+# the extract dir, so the file must sit NEXT TO the .exe or every install
+# fails closed with "integration assets missing or modified".
+windows_archive_names = (
+    binary, "cbm-integrations.json", "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.md",
+)
 
-# ── 1. The archive is exactly four files, defined in ONE place ───────────────
+# ── 1. The archive is exactly five files, defined in ONE place ───────────────
 # Every venue (release build, local artifact-flow smoke) produces archives
 # through scripts/package-release.sh, so the layout is asserted where it is
 # defined and cannot fork per venue.
@@ -759,8 +765,19 @@ update_windows_block = (
 require(
     update_start >= 0
     and "install.ps1" in update_windows_block
-    and "powershell -ExecutionPolicy Bypass -File" in update_windows_block,
+    and "powershell -File" in update_windows_block,
     "cbm_cmd_update must print the install.ps1 command on Windows",
+)
+# The printed command must NOT carry an execution-policy override. That is a
+# canonical malicious-loader pattern, and emitting it as a string literal put
+# the signature inside every Windows artifact we ship — to save the user one
+# documented step. The hand-off above is the property this contract cares
+# about; the bypass flag was only ever the literal form it happened to take.
+# Unblock-File covers the common case and the README covers the rest.
+require(
+    "ExecutionPolicy" not in update_windows_block,
+    "cbm_cmd_update must not print an execution-policy override "
+    "(document it instead of shipping the pattern in the binary)",
 )
 require(
     "cbm_windows_launcher" not in cli_source

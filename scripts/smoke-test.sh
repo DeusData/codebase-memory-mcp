@@ -3115,16 +3115,24 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   fi
   UPDATE_HOME=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
+  # This phase stages the binary by hand into a fresh HOME — it does NOT go
+  # through install.sh or `install`, so nothing populates ~/.cbm/assets. The
+  # integration asset ships next to the binary in every real layout (archive,
+  # build tree, installed dir), so stage it next to each staged copy here too;
+  # otherwise the uninstall this phase drives fails closed rendering templates.
+  BINARY_ASSET="$(dirname "$BINARY")/cbm-integrations.json"
   if [[ "$BINARY" == *.exe ]]; then
     cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
     mkdir -p "$UPDATE_HOME/retired-install"
     cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp.exe"
+    [ -f "$BINARY_ASSET" ] && cp "$BINARY_ASSET" "$UPDATE_HOME/.local/bin/cbm-integrations.json"
   else
     cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
     chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
     mkdir -p "$UPDATE_HOME/retired-install"
     cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp"
     chmod 755 "$UPDATE_HOME/retired-install/codebase-memory-mcp"
+    [ -f "$BINARY_ASSET" ] && cp "$BINARY_ASSET" "$UPDATE_HOME/.local/bin/cbm-integrations.json"
     if [ "$(uname -s)" = "Darwin" ]; then
       codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp" 2>/dev/null || true
       codesign --sign - --force "$UPDATE_HOME/retired-install/codebase-memory-mcp" \

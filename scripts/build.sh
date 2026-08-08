@@ -157,4 +157,14 @@ else
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
+# Stage the integration-template asset next to the binary so the dev/CI build
+# mirrors the release archive layout. The binary resolves cbm-integrations.json
+# next to itself, in $CBM_ASSETS_DIR, or under ~/.cbm/assets/<version>/; a plain
+# build/c binary has none of those, so install/uninstall (which render the
+# templates to verify hash and ownership) would fail closed exactly as they do
+# for a user who deleted the file. Copying it here keeps `install` working
+# straight out of a build tree — smoke, local dev, and the release packaging all
+# then see the same adjacency.
+cp "$ROOT/assets/cbm-integrations.json" "$BUILD_DIR/cbm-integrations.json"
+
 echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="

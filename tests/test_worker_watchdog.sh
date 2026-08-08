@@ -29,6 +29,8 @@ case "$(uname -s)" in
     echo "skipping worker watchdog test on Windows"
     exit 0
     ;;
+  Darwin*) runtime_root="/private/tmp" ;;
+  *) runtime_root="/tmp" ;;
 esac
 
 if [[ ! -x "${BINARY}" ]]; then
@@ -66,6 +68,9 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 tmpdir="$(mktemp -d)"
+runtime_parent="$(mktemp -d "${runtime_root}/cbm-worker-watchdog.XXXXXX")"
+mkdir "${runtime_parent}/cbm-daemon-$(id -u)"
+chmod 700 "${runtime_parent}/cbm-daemon-$(id -u)"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -80,6 +85,7 @@ cleanup() {
   fi
   [[ -n "${wrapper_pid}" ]] && kill -9 "${wrapper_pid}" 2>/dev/null || true
   rm -rf "${tmpdir}"
+  rm -rf "${runtime_parent}"
 }
 trap cleanup EXIT
 
@@ -108,6 +114,7 @@ chmod +x "${tmpdir}/wrapper.sh"
 CBM_BINARY="${BINARY}" BUILD_FINGERPRINT="${BUILD_FINGERPRINT}" TMPDIR_PATH="${tmpdir}" \
   ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\"}" \
   CBM_TEST_HANG_ON=hang_me \
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   CBM_TEST_WORKER_DESCENDANT_PID_FILE="${tmpdir}/descendant.pid" \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!

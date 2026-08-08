@@ -16,6 +16,7 @@
 #include <cli/agent_profiles.h>
 #include <cli/activation_transaction.h>
 #include <cli/cli.h>
+#include <cli/integration_assets.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
 #include <daemon/runtime.h>
@@ -9670,6 +9671,43 @@ static const char test_released_session_hook_script[] =
     "3. If a project is not indexed yet, run index_repository FIRST.\n"
     "REMINDER\n";
 
+static const char test_released_streamlined_session_hook_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
+    "cat << 'REMINDER'\n"
+    "Code Discovery Protocol:\n"
+    "1. Prefer codebase-memory-mcp tools first for structural code exploration:\n"
+    "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
+    "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
+    "   - get_code(qualified_name) for exact symbol source in streamlined mode\n"
+    "   - query_graph(query) for complex Cypher patterns\n"
+    "   - search_code(pattern) for text/regex source search in an indexed project\n"
+    "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
+    "   always Read a file before editing it.\n"
+    "3. Graph-backed tools auto-index the server CWD or explicit repo paths when\n"
+    "   auto_index=true and under auto_index_limit. search_code needs an\n"
+    "   indexed project. Use _hidden_tools\n"
+    "   to reveal index_repository or get_architecture when explicit control is needed.\n"
+    "REMINDER\n";
+
+TEST(cli_integration_assets_retain_destination_session_history) {
+    const cbm_integration_template_t *tpl = cbm_integration_template("claude_session");
+    ASSERT_NOT_NULL(tpl);
+    bool found_original = false;
+    bool found_streamlined = false;
+    for (size_t i = 0U; i < tpl->released_count; i++) {
+        found_original =
+            found_original || strcmp(tpl->released[i].text, test_released_session_hook_script) == 0;
+        found_streamlined = found_streamlined ||
+                            strcmp(tpl->released[i].text,
+                                   test_released_streamlined_session_hook_script) == 0;
+    }
+    ASSERT_TRUE(found_original);
+    ASSERT_TRUE(found_streamlined);
+    PASS();
+}
+
 static const char test_released_subagent_hook_script[] =
     "#!/usr/bin/env bash\n"
     "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
@@ -9809,6 +9847,162 @@ TEST(cli_upgrade_preserves_near_legacy_claude_hook_script) {
     test_rmdir_r(tmpdir);
     if (!preserved)
         FAIL("near-legacy Claude hook bytes are foreign and must stay untouched/unregistered");
+    PASS();
+}
+
+/* The script bodies now ship in cbm-integrations.json, guarded only by the
+ * SHA-256 the binary embeds. Verification failing CLOSED is the property
+ * that replaces "the bytes are inside the binary": a tampered or missing
+ * asset must refuse to materialize anything, with the one actionable
+ * message, and must never partially install. */
+TEST(cli_integration_assets_tampered_or_missing_fail_closed) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-assets-tamper-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char assets_dir[512];
+    char asset_path[640];
+    char hooks_dir[512];
+    char gate_path[640];
+    snprintf(assets_dir, sizeof(assets_dir), "%s/assets", tmpdir);
+    snprintf(asset_path, sizeof(asset_path), "%s/cbm-integrations.json", assets_dir);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    test_mkdirp(assets_dir);
+    test_mkdirp(hooks_dir);
+    /* Well-formed JSON with the wrong hash: exactly what an attacker editing
+     * the shipped file would produce. */
+    write_test_file(asset_path, "{\"format\":1,\"templates\":{}}");
+
+    char *saved_assets = save_test_env("CBM_ASSETS_DIR");
+    char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
+    cbm_setenv("CBM_ASSETS_DIR", assets_dir, 1);
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    cbm_integration_assets_reset_for_testing();
+
+    char err[512];
+    err[0] = '\0';
+    bool tampered_refused = !cbm_integration_assets_require(tmpdir, err, sizeof(err));
+    bool message_actionable = strstr(err, "reinstall from the release archive") != NULL;
+    bool install_gate_refused = !cbm_integration_assets_install(tmpdir, false, err, sizeof(err));
+    bool gate_write_refused = !cbm_install_hook_gate_script(tmpdir, "/opt/codebase-memory-mcp");
+    char *gate_file = read_test_file_alloc(gate_path);
+    bool nothing_materialized = gate_file == NULL;
+    free(gate_file);
+
+    /* Missing is refused exactly like modified — CBM_ASSETS_DIR set means
+     * authoritative, never a silent fallback to another copy. */
+    remove(asset_path);
+    cbm_integration_assets_reset_for_testing();
+    bool missing_refused = !cbm_integration_assets_require(tmpdir, err, sizeof(err));
+
+    restore_test_env("CBM_ASSETS_DIR", saved_assets);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_claude);
+    cbm_integration_assets_reset_for_testing();
+    test_rmdir_r(tmpdir);
+    if (!tampered_refused)
+        FAIL("a hash-mismatched asset file must fail verification");
+    if (!message_actionable)
+        FAIL("the failure must carry the reinstall-from-archive message");
+    if (!install_gate_refused)
+        FAIL("install must fail closed on unverifiable assets");
+    if (!gate_write_refused || !nothing_materialized)
+        FAIL("no template may materialize from an unverified asset file");
+    if (!missing_refused)
+        FAIL("a missing asset under an explicit CBM_ASSETS_DIR must refuse, not fall back");
+    PASS();
+}
+
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
+
+/* `install` persists the verified bytes to <home>/.cbm/assets/<version>/ —
+ * a sibling of the disposable cache, never inside it. That stored copy is
+ * the OWNERSHIP REFERENCE uninstall materializes templates from after the
+ * release archive is gone, so it must exist, re-verify, and never be
+ * written by a dry run. */
+TEST(cli_integration_assets_install_stores_versioned_ownership_copy) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-assets-store-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char stored_dir[512];
+    char stored_path[640];
+    snprintf(stored_dir, sizeof(stored_dir), "%s/.cbm/assets/%s", tmpdir, CBM_VERSION);
+    snprintf(stored_path, sizeof(stored_path), "%s/cbm-integrations.json", stored_dir);
+
+    char *saved_assets = save_test_env("CBM_ASSETS_DIR");
+    cbm_unsetenv("CBM_ASSETS_DIR");
+    cbm_integration_assets_reset_for_testing();
+
+    char err[512];
+    err[0] = '\0';
+    bool dry_ok = cbm_integration_assets_install(tmpdir, true, err, sizeof(err));
+    char *dry_file = read_test_file_alloc(stored_path);
+    bool dry_wrote_nothing = dry_file == NULL;
+    free(dry_file);
+
+    bool install_ok = cbm_integration_assets_install(tmpdir, false, err, sizeof(err));
+    char *stored = read_test_file_alloc(stored_path);
+    bool stored_exists = stored != NULL;
+    free(stored);
+
+    /* The stored copy must itself pass verification when it is the ONLY
+     * candidate — that is what makes it usable as the ownership reference. */
+    cbm_setenv("CBM_ASSETS_DIR", stored_dir, 1);
+    cbm_integration_assets_reset_for_testing();
+    bool stored_verifies = cbm_integration_assets_require(NULL, err, sizeof(err));
+
+    restore_test_env("CBM_ASSETS_DIR", saved_assets);
+    cbm_integration_assets_reset_for_testing();
+    test_rmdir_r(tmpdir);
+    if (!dry_ok || !dry_wrote_nothing)
+        FAIL("a dry-run install must verify but write no stored copy");
+    if (!install_ok || !stored_exists)
+        FAIL("install must persist the verified asset copy under ~/.cbm/assets/<version>/");
+    if (!stored_verifies)
+        FAIL("the stored copy must re-verify against the embedded hash");
+    PASS();
+}
+
+/* Pin the CURRENT posix gate body byte-for-byte. Every already-deployed
+ * install holds files with exactly these bytes; a well-meaning edit to the
+ * template in cbm-integrations.json would silently turn them all foreign
+ * (preserved forever, never upgraded or uninstalled). Changing this fixture
+ * is only legitimate together with moving the old body into the template's
+ * released[] list. */
+TEST(cli_integration_current_gate_script_bytes_are_pinned) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX gate body contract");
+#endif
+    static const char expected_gate[] =
+        "#!/usr/bin/env bash\n"
+        "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+        "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
+        "# Despite the name this NEVER blocks a tool call - it only adds\n"
+        "# graph context. Any failure is silent (exit 0, no output).\n"
+        "BIN='/opt/codebase-memory-mcp'\n"
+        "[ -x \"$BIN\" ] || exit 0\n"
+        "\"$BIN\" hook-augment 2>/dev/null\n"
+        "exit 0\n";
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-assets-bytes-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char gate_path[640];
+    snprintf(gate_path, sizeof(gate_path), "%s/.claude/hooks/cbm-code-discovery-gate", tmpdir);
+
+    char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    bool installed = cbm_install_hook_gate_script(tmpdir, "/opt/codebase-memory-mcp");
+    char *gate = read_test_file_alloc(gate_path);
+    bool byte_identical = installed && gate && strcmp(gate, expected_gate) == 0;
+    free(gate);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_claude);
+    test_rmdir_r(tmpdir);
+    if (!byte_identical)
+        FAIL("the materialized gate script must be byte-identical to the shipped template");
     PASS();
 }
 
@@ -14605,6 +14799,10 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(cli_upgrade_migrates_released_claude_hook_scripts);
     RUN_TEST(cli_upgrade_preserves_near_legacy_claude_hook_script);
+    RUN_TEST(cli_integration_assets_tampered_or_missing_fail_closed);
+    RUN_TEST(cli_integration_assets_install_stores_versioned_ownership_copy);
+    RUN_TEST(cli_integration_assets_retain_destination_session_history);
+    RUN_TEST(cli_integration_current_gate_script_bytes_are_pinned);
     RUN_TEST(cli_hook_upsert_rejects_linked_settings);
     RUN_TEST(cli_claude_hook_script_collisions_are_not_registered);
     RUN_TEST(cli_codex_legacy_migration_rejects_linked_config);

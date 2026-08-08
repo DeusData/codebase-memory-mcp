@@ -50,6 +50,12 @@ FIXED_RESULT_RE = re.compile(
     r"(?P<usages>\d+) usages, (?P<type_refs>\d+) type_refs, "
     r"(?P<read_write>\d+) rw, (?P<latency_ms>[0-9.]+) ms"
 )
+LEGACY_FIXED_RESULT_RE = re.compile(
+    r"(?:cs )?bench: (?P<lines>\d+) lines, "
+    r"(?P<calls>\d+) calls, (?P<resolved>\d+) resolved \(\d+%\), "
+    r"(?:\d+ high-conf \(\d+%\), )?"
+    r"(?P<latency_ms>[0-9.]+) ms"
+)
 SCALE_RESULT_RE = re.compile(
     r"scale: 100=(?P<small_ms>[0-9.]+)ms .*?"
     r"500=(?P<medium_ms>[0-9.]+)ms .*?"
@@ -108,6 +114,8 @@ def parse_sample(suite: str, output: str) -> dict[str, int | float]:
         return resource_metrics
 
     result_match = (SCALE_RESULT_RE if suite == "py_lsp_scale" else FIXED_RESULT_RE).search(output)
+    if result_match is None and suite != "py_lsp_scale":
+        result_match = LEGACY_FIXED_RESULT_RE.search(output)
     profile_match = PROFILE_RE.search(output)
     if result_match is None or profile_match is None:
         raise ValueError(f"could not parse {suite} benchmark output")
@@ -220,12 +228,11 @@ def compare_candidates(samples: list[dict[str, Any]]) -> dict[str, Any]:
                     values = {
                         (candidate_metrics.get(metric), baseline_metrics.get(metric))
                         for candidate_metrics, baseline_metrics in paired
-                        if metric in candidate_metrics and metric in baseline_metrics
                     }
                     if any(left != right for left, right in values):
                         output_differences[metric] = [
                             {"candidate": left, "baseline": right}
-                            for left, right in sorted(values)
+                            for left, right in sorted(values, key=repr)
                         ]
 
                 percent_changes: dict[str, float] = {}

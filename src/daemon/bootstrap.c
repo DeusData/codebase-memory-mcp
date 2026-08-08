@@ -209,6 +209,14 @@ bool cbm_daemon_process_role_requires_client(cbm_daemon_process_role_t role) {
 }
 
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char test_runtime_parent[BOOTSTRAP_PATH_CAP];
+    const char *configured = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", test_runtime_parent,
+                                             sizeof(test_runtime_parent), NULL);
+    if (!runtime_parent && configured && configured[0]) {
+        runtime_parent = configured;
+    }
+#endif
     char key[CBM_DAEMON_KEY_SIZE];
     if (!cbm_daemon_rendezvous_key(key)) {
         return NULL;

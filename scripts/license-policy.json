@@ -16,13 +16,15 @@
     "LicenseRef-scancode-public-domain",
     "LicenseRef-scancode-public-domain-disclaimer"
   ],
-  "_ignored_paths_comment": "Path prefixes (relative to the staged scan tree) excluded from the gate. Use ONLY for documented false positives. Justifications: the license tooling itself (gate scripts + this policy file) necessarily names prohibited licenses; gen-third-party-notices.sh echoes license terminology; audit-license-provenance.py names licenses in its verdict maps; src/discover/discover.c contains a license-FILENAME classification list (LICENSE-MIT, LICENSE-APACHE, ...) for file discovery, which ScanCode reads as license references.",
+  "_ignored_paths_comment": "Path prefixes (relative to the staged scan tree) excluded from the gate. Use ONLY for documented false positives. Justifications: the license tooling itself (gate scripts + this policy file) necessarily names prohibited licenses; gen-third-party-notices.sh echoes license terminology; audit-license-provenance.py names licenses in its verdict maps; src/discover/discover.c contains a license-FILENAME classification list (LICENSE-MIT, LICENSE-APACHE, ...) for file discovery, which ScanCode reads as license references; package-release.sh and smoke-local.sh list the archive members 'cbm-integrations.json LICENSE ...' adjacently (the order the Windows single-binary contract locks, mirrored by the smoke fixture), and ScanCode reads the '.json LICENSE' token adjacency as a reference to the SPDX 'JSON' license — first-party MIT build scripts, not vendored code.",
   "ignored_paths": [
     "tree/scripts/license-policy.json",
     "tree/scripts/license-gate-check.py",
     "tree/scripts/license-gate.sh",
     "tree/scripts/gen-third-party-notices.sh",
     "tree/src/discover/discover.c",
-    "tree/scripts/audit-license-provenance.py"
+    "tree/scripts/audit-license-provenance.py",
+    "tree/scripts/package-release.sh",
+    "tree/scripts/smoke-local.sh"
   ]
 }

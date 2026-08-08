@@ -36,10 +36,23 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 tmpdir="$(mktemp -d)"
+runtime_parent=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  Darwin*) runtime_root="/private/tmp" ;;
+  *) runtime_root="/tmp" ;;
+esac
+if [[ -n "${runtime_root:-}" ]]; then
+  runtime_parent="$(mktemp -d "${runtime_root}/cbm-worker-error.XXXXXX")"
+  mkdir "${runtime_parent}/cbm-daemon-$(id -u)"
+  chmod 700 "${runtime_parent}/cbm-daemon-$(id -u)"
+fi
 cleanup() {
   CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+    CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
     "${BINARY}" daemon stop >/dev/null 2>&1 || true
   rm -rf "${tmpdir}"
+  [[ -z "${runtime_parent}" ]] || rm -rf "${runtime_parent}"
 }
 trap cleanup EXIT
 
@@ -48,6 +61,7 @@ response="${tmpdir}/worker.response"
 args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\"}"
 
 if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   "${BINARY}" cli --index-worker \
   --index-worker-build "${BUILD_FINGERPRINT}" \
   index_repository "${args}" \
@@ -65,6 +79,7 @@ fi
 
 set +e
 CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   "${BINARY}" cli index_repository --repo-path "${missing}" --mode fast \
   >"${tmpdir}/supervisor.out" 2>"${tmpdir}/supervisor.err"
 cli_rc=$?

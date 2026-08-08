@@ -236,6 +236,9 @@ bash "$ROOT/tests/test_venue_parity_contract.sh"
 echo "=== Step 0k: spawn console-window contract (#1427) ==="
 bash "$ROOT/tests/test_spawn_no_window_contract.sh"
 
+echo "=== Step 0l: no embedded integration-script text (AV surface) ==="
+bash "$ROOT/tests/test_no_embedded_scripts_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 

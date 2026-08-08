@@ -106,7 +106,7 @@ CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 $(LIBGIT2_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
-                -I$(CBM_DIR) -I$(TS_INCLUDE)
+                -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(BUILD_DIR)/generated
 
 CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
@@ -433,7 +433,7 @@ GIT_SRCS = src/git/git_command.c \
 
 # CLI module (new)
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
-	src/cli/agent_clients.c src/cli/agent_profiles.c \
+	src/cli/agent_clients.c src/cli/agent_profiles.c src/cli/integration_assets.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
 	src/cli/config_text_edit.c src/cli/activation_transaction.c
 
@@ -547,6 +547,17 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 # thousands of grammar headers would cost more than it protects.
 PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h tests/*.h \
                tests/repro/*.h)
+
+# ── Integration-asset integrity constant (generated, never hand-edited) ──
+# The binary embeds exactly ONE fact about the shipped integration templates:
+# the SHA-256 of assets/cbm-integrations.json, generated at build time (rule
+# below the BUILD_DIR definition; target lines expand immediately). Appended
+# to PROJECT_HDRS so every single-invocation target (test-runner,
+# test-repro-runner, test-runner-tsan, codebase-memory-mcp) rebuilds when the
+# asset changes — a stale constant would make every install fail verification.
+INTEGRATIONS_ASSET = assets/cbm-integrations.json
+INTEGRATIONS_HASH_HDR = $(BUILD_DIR)/generated/cbm_integrations_hash.h
+PROJECT_HDRS += $(INTEGRATIONS_HASH_HDR)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -852,6 +863,11 @@ ALL_TEST_SRCS = \
 # ── Build directories ────────────────────────────────────────────
 
 BUILD_DIR = build/c
+
+# Integration-asset hash header (variables defined next to PROJECT_HDRS; the
+# rule lives here because target lines expand $(BUILD_DIR) immediately).
+$(INTEGRATIONS_HASH_HDR): $(INTEGRATIONS_ASSET) scripts/gen-integrations-hash.sh | $(BUILD_DIR)
+	sh scripts/gen-integrations-hash.sh $(INTEGRATIONS_ASSET) $@
 
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
@@ -1490,6 +1506,7 @@ install: cbm
 	@echo "Installing to $(INSTALL_DIR)/codebase-memory-mcp ..."
 	install -d "$(INSTALL_DIR)"
 	install -m 755 "$(BUILD_DIR)/codebase-memory-mcp" "$(INSTALL_DIR)/codebase-memory-mcp"
+	install -m 644 "$(INTEGRATIONS_ASSET)" "$(INSTALL_DIR)/cbm-integrations.json"
 	$(call codesign_binary,$(INSTALL_DIR)/codebase-memory-mcp)
 	@echo "Done. Run: $(INSTALL_DIR)/codebase-memory-mcp"
 
@@ -1508,7 +1525,11 @@ frontend:
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD)
+# $(INTEGRATIONS_HASH_HDR): generated header included by integration_assets.c.
+# The standard target gets it via $(PROJECT_HDRS); the UI target compiles in one
+# shot and must list it too, or the build fails with "cbm_integrations_hash.h
+# file not found" (seen on the Windows UI build).
+cbm-with-ui: embed $(INTEGRATIONS_HASH_HDR) $(OBJS_VENDORED_PROD)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -1567,7 +1588,7 @@ lint-cppcheck:
 		--suppress=ctunullpointerOutOfMemory \
 		--suppress='nullPointer:internal/cbm/sqlite_writer.c' \
 		-Isrc -Ivendored -Ivendored/sqlite3 \
-		-I$(CBM_DIR) -I$(TS_INCLUDE) \
+		-I$(CBM_DIR) -I$(TS_INCLUDE) -I$(BUILD_DIR)/generated \
 		$(LINT_SRCS)
 
 # clang-format: formatting check (config in .clang-format, dry-run = no changes)

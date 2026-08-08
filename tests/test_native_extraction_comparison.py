@@ -42,6 +42,25 @@ profile: files=1 parse=0.750ms non_lsp=1.675ms lsp=1.002ms total_extract=2.677ms
     }
 
 
+def test_parse_legacy_fixed_benchmark_output() -> None:
+    output = """
+cs bench: 146 lines, 54 calls, 50 resolved (93%), 45 high-conf (83%), 3.48 ms
+profile: files=1 parse=0.750ms non_lsp=1.675ms lsp=1.002ms total_extract=2.677ms
+"""
+    metrics = MODULE.parse_sample("cs_lsp_bench", output)
+    assert metrics == {
+        "lines": 146,
+        "calls": 54,
+        "resolved": 50,
+        "latency_ms": 3.48,
+        "files": 1,
+        "parse_ms": 0.75,
+        "non_lsp_ms": 1.675,
+        "lsp_ms": 1.002,
+        "total_extract_ms": 2.677,
+    }
+
+
 def test_parse_shared_parse_baseline_output() -> None:
     output = """
 bench: 10 lines, 0 defs, 0 calls, 0 resolved (0%), 0 usages, 0 type_refs, 0 rw, 41.25 ms
@@ -135,6 +154,33 @@ def test_compare_candidates_reports_parity_and_paired_deltas() -> None:
     ]
     assert comparison["paired_median_percent_change"]["latency_ms"] == 0.0
     assert comparison["paired_median_percent_change"]["peak_footprint_bytes"] == 0.0
+
+
+def test_compare_candidates_reports_missing_output_metrics() -> None:
+    samples = []
+    for suite in MODULE.SUITES:
+        samples.extend(
+            [
+                {
+                    "candidate": "legacy",
+                    "suite": suite,
+                    "repetition": 1,
+                    "metrics": {"calls": 4, "resolved": 4},
+                },
+                {
+                    "candidate": "current",
+                    "suite": suite,
+                    "repetition": 1,
+                    "metrics": {"calls": 4, "resolved": 4, "definitions": 3},
+                },
+            ]
+        )
+
+    comparison = MODULE.compare_candidates(samples)["current_vs_legacy"]["cs_lsp_bench"]
+    assert comparison["output_parity"] is False
+    assert comparison["output_differences"]["definitions"] == [
+        {"candidate": 3, "baseline": None}
+    ]
 
 
 def test_add_incremental_memory_metrics_subtracts_matching_startup_run() -> None:
