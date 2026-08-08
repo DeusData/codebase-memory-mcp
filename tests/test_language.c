@@ -609,6 +609,92 @@ TEST(lang_m_default_on_read_fail) {
     PASS();
 }
 
+/* ── .cfc disambiguation (tag vs script dialect) ───────────────── */
+
+/* Helper: write content to a temp .cfc and return its disambiguated language. */
+static CBMLanguage disambiguate_cfc_content(const char *name, const char *content) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", cbm_tmpdir(), name);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return CBM_LANG_COUNT;
+    }
+    fputs(content, f);
+    fclose(f);
+    CBMLanguage lang = cbm_disambiguate_cfc(path);
+    remove(path);
+    return lang;
+}
+
+TEST(lang_cfc_tag_component) {
+    /* <cfcomponent> wrapper ⇒ tag dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_tag.cfc",
+                                       "<cfcomponent>\n<cffunction name=\"f\"></cffunction>\n"
+                                       "</cfcomponent>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_bare_cffunction) {
+    /* A component that omits <cfcomponent> but uses <cffunction> is still tag. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_bare.cfc",
+                                       "<cffunction name=\"f\" output=\"false\">\n"
+                                       "<cfreturn 1>\n</cffunction>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_script_component) {
+    /* Plain "component { ... }" ⇒ script dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_script.cfc",
+                                       "component {\n    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_script_bare_keyword) {
+    /* "component" on its own line (brace on the next) ⇒ script dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_kw.cfc",
+                                       "component\n{\n    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_cfscript_wrapped_script) {
+    /* A script component wrapped in a leading <cfscript> is still script — the
+     * leading '<' must NOT route it to the tag grammar. */
+    ASSERT_EQ(
+        disambiguate_cfc_content("test_cfc_wrapped.cfc",
+                                 "<cfscript>\ncomponent {\n    function f() { return 1; }\n}\n"
+                                 "</cfscript>\n"),
+        CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_tag_after_license_comment) {
+    /* A leading <!--- ---> license comment before <cfcomponent> ⇒ tag. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_licensed.cfc",
+                                       "<!---\n  Copyright\n--->\n<cfcomponent>\n</cfcomponent>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_script_after_license_comment) {
+    /* A leading <!--- ---> comment before a script component ⇒ script (the
+     * comment's '<' must be skipped, not treated as a tag opener). */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_lic_script.cfc",
+                                       "<!--- header ---> \ncomponent {\n"
+                                       "    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_default_on_read_fail) {
+    /* Non-existent file defaults to script dialect. */
+    ASSERT_EQ(cbm_disambiguate_cfc("/tmp/nonexistent_file_98765.cfc"), CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
 /* --- New languages (auto-generated) --- */
 TEST(lang_ext_solidity) {
     ASSERT_EQ(cbm_language_for_extension(".sol"), CBM_LANG_SOLIDITY);
@@ -1209,6 +1295,14 @@ SUITE(language) {
     RUN_TEST(lang_m_magma);
     RUN_TEST(lang_m_matlab);
     RUN_TEST(lang_m_default_on_read_fail);
+    RUN_TEST(lang_cfc_tag_component);
+    RUN_TEST(lang_cfc_bare_cffunction);
+    RUN_TEST(lang_cfc_script_component);
+    RUN_TEST(lang_cfc_script_bare_keyword);
+    RUN_TEST(lang_cfc_cfscript_wrapped_script);
+    RUN_TEST(lang_cfc_tag_after_license_comment);
+    RUN_TEST(lang_cfc_script_after_license_comment);
+    RUN_TEST(lang_cfc_default_on_read_fail);
 
     /* Go test ports */
     /* New languages */
