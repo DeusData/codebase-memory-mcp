@@ -3899,6 +3899,13 @@ static bool win_sid_is_trusted_installer(const uint8_t *sid, size_t sid_length) 
     return true;
 }
 
+static bool win_sid_is_app_capability(const uint8_t *sid, size_t sid_length) {
+    /* S-1-15-3-…: SECURITY_APP_PACKAGE_AUTHORITY, capability RID class. */
+    return windows_sid_valid(sid, sid_length) && sid[1] >= 1U && sid[2] == 0U && sid[3] == 0U &&
+           sid[4] == 0U && sid[5] == 0U && sid[6] == 0U && sid[7] == 15U &&
+           win_sid_read_u32_le(sid + 8U) == 3U;
+}
+
 static bool win_sid_trusted(win_security_t *security, PSID sid) {
     if (!security || !sid || !security->is_valid_sid(sid)) {
         return false;
@@ -3911,7 +3918,8 @@ static bool win_sid_trusted(win_security_t *security, PSID sid) {
 }
 
 static bool win_bounded_sid_trusted(win_security_t *security, const uint8_t *sid,
-                                    size_t sid_capacity, bool creator_owner_inherit_only) {
+                                    size_t sid_capacity, bool creator_owner_inherit_only,
+                                    bool ancestor_capability_ok) {
     if (!security || !sid || sid_capacity < 8U || sid[1] > 15U) {
         return false;
     }
@@ -3927,7 +3935,14 @@ static bool win_bounded_sid_trusted(win_security_t *security, const uint8_t *sid
              * user, so such an ACE only ever grants to us. Default Windows
              * profile/temp ACLs (and GitHub runner profiles) carry it, and
              * rejecting it locked real current-user directories out. */
-            security->is_well_known_sid((PSID)sid, WinCreatorOwnerRightsSid));
+            security->is_well_known_sid((PSID)sid, WinCreatorOwnerRightsSid) ||
+            /* Capability ACEs (S-1-15-3-…) grant only to AppContainer
+             * processes the same user's sandboxing tooling provisioned;
+             * agent sandboxes stamp them onto profile ancestors (AppData)
+             * with write rights, and refusing them locked the daemon out of
+             * real machines. Ancestors only: the runtime directory itself
+             * still demands the exact user and a protected DACL below. */
+            (ancestor_capability_ok && win_sid_is_app_capability(sid, sid_length)));
 }
 
 static bool win_file_owner_secure(win_security_t *security, HANDLE file,
@@ -3962,7 +3977,8 @@ static DWORD win_private_mutation_rights(void) {
            DELETE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
 }
 
-static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mutation) {
+static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mutation,
+                                bool ancestor_capability_ok) {
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR descriptor = NULL;
     DWORD status = security->get_security_info(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
@@ -4003,7 +4019,8 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
         const uint8_t *sid = (const uint8_t *)&ace->SidStart;
         size_t sid_capacity = (size_t)header->AceSize - sid_offset;
         bool creator_owner_inherit_only = (header->AceFlags & INHERIT_ONLY_ACE) != 0U;
-        if (!win_bounded_sid_trusted(security, sid, sid_capacity, creator_owner_inherit_only)) {
+        if (!win_bounded_sid_trusted(security, sid, sid_capacity, creator_owner_inherit_only,
+                                     ancestor_capability_ok)) {
             /* Name the untrusted identity class so a harness/profile ACL leak
              * (an inherited Users / Authenticated Users / Everyone ACE) is
              * distinguishable from a genuinely hostile grant. */
@@ -4036,9 +4053,10 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
 }
 
 static bool win_file_security_secure(win_security_t *security, HANDLE file,
-                                     bool require_current_user, DWORD mutation) {
+                                     bool require_current_user, DWORD mutation,
+                                     bool ancestor_capability_ok) {
     return win_file_owner_secure(security, file, require_current_user) &&
-           win_file_acl_secure(security, file, mutation);
+           win_file_acl_secure(security, file, mutation, ancestor_capability_ok);
 }
 
 static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
@@ -4102,7 +4120,7 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     }
     bool final_private =
         secure_result == ERROR_SUCCESS &&
-        win_file_security_secure(&security, directory, true, win_private_mutation_rights());
+        win_file_security_secure(&security, directory, true, win_private_mutation_rights(), false);
     (void)CloseHandle(directory);
     win_security_destroy(&security);
     return valid_handle && owner_ok && final_private;
@@ -4125,7 +4143,7 @@ static bool win_directory_component_secure(win_security_t *security, const wchar
     bool valid = GetFileInformationByHandle(directory, &info) != 0 &&
                  (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                  (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                 win_file_security_secure(security, directory, false, mutation);
+                 win_file_security_secure(security, directory, false, mutation, true);
     (void)CloseHandle(directory);
     return valid;
 }
