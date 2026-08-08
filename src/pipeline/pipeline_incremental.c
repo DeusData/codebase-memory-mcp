@@ -68,6 +68,9 @@ void cbm_pipeline_incremental_test_reset_faults(void) {
     atomic_store(&g_incr_test_fail_result_cache_alloc, false);
     atomic_store(&g_incr_test_force_legacy_partial, false);
     atomic_store(&g_incr_test_last_route, CBM_INCREMENTAL_ROUTE_NONE);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    cbm_store_test_reset_faults();
+#endif
     cbm_pipeline_persist_test_reset_faults();
 }
 
@@ -2362,7 +2365,7 @@ out:
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
-                                 int baseline_count) {
+                                 int baseline_count, bool force_full_on_change) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     closure_plan_t closure_plan = {0};
@@ -2424,6 +2427,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 #endif
             cbm_log_info("incremental.noop", "reason", "semantic_manifest_equal");
             return cbm_pipeline_refresh_artifact(p, db_path);
+        }
+        /* A requested downgrade is promoted to the stored capability mode before
+         * discovery. The closure graph contains only changed files and their
+         * consumers, so corpus-wide edges such as SIMILAR_TO cannot be rebuilt
+         * faithfully there. Rebuild the complete graph at the promoted mode. */
+        if (force_full_on_change) {
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+            incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+#endif
+            cbm_log_info("incremental.force_full", "reason", "mode_downgrade_changed");
+            return CBM_PIPELINE_FORCE_FULL_REINDEX;
         }
         /* Manifest delta. Closure repair recomputes exactly the changed
          * files plus the recorded consumers of any changed SURFACE; every

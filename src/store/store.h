@@ -291,6 +291,13 @@ void cbm_store_close(cbm_store_t *s);
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Fail sqlite3_step in cbm_store_find_node_by_qn on the requested upcoming
+ * call. One-based and one-shot; production builds contain no seam. */
+void cbm_store_test_fail_find_node_by_qn_step_on_call(int call_number);
+void cbm_store_test_reset_faults(void);
+#endif
+
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
 
@@ -517,6 +524,8 @@ typedef struct {
 typedef struct {
     const char *project;
     const char *generation;
+    /* Effective capability mode of the published generation; mirrored in the
+     * Project node for exact JSON validation during route selection. */
     const char *index_mode;
     const char *recorded_at;
     const char *recording_status;
