@@ -2934,7 +2934,7 @@ TEST(daemon_runtime_application_transports_tools_list_changed_disposition) {
     PASS();
 }
 
-TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session) {
+TEST(daemon_runtime_final_disconnect_preserves_blocked_provisional_session) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_application_context_t context;
@@ -2955,7 +2955,7 @@ TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session) {
     bool connect_thread_started = false;
     bool provisional_started = false;
     bool owner_closed = false;
-    bool shutdown_won = false;
+    bool service_stayed_running = false;
     bool contender_accepted = false;
     bool exited = false;
 
@@ -2975,8 +2975,8 @@ TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session) {
     if (provisional_started) {
         owner_closed = cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
         owner = NULL;
-        shutdown_won = cbm_daemon_runtime_service_state(fixture.service) ==
-                       CBM_DAEMON_RUNTIME_SERVICE_STOPPING;
+        service_stayed_running =
+            cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
     }
 
     /* Release on every setup outcome so neither the server worker nor the
@@ -3013,10 +3013,10 @@ TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session) {
     ASSERT_EQ(connect_thread_create_rc, 0);
     ASSERT_TRUE(provisional_started);
     ASSERT_TRUE(owner_closed);
-    ASSERT_TRUE(shutdown_won);
+    ASSERT_TRUE(service_stayed_running);
     ASSERT_EQ(connect_thread_join_rc, 0);
     ASSERT_TRUE(atomic_load_explicit(&contender.completed, memory_order_acquire));
-    ASSERT_FALSE(contender_accepted);
+    ASSERT_TRUE(contender_accepted);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.opened), 2);
     ASSERT_EQ(atomic_load(&context.cancelled), 2);
@@ -4925,7 +4925,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_rejects_forged_identity_extension);
     RUN_TEST(daemon_runtime_application_response_roundtrip_is_byte_exact);
     RUN_TEST(daemon_runtime_application_transports_tools_list_changed_disposition);
-    RUN_TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session);
+    RUN_TEST(daemon_runtime_final_disconnect_preserves_blocked_provisional_session);
     RUN_TEST(daemon_runtime_request_cancel_is_exact_and_session_remains_usable);
     RUN_TEST(daemon_runtime_presend_request_cancel_is_sticky_and_nonterminal);
     RUN_TEST(daemon_runtime_allows_only_one_unstarted_application_token);

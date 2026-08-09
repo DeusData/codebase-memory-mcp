@@ -13,7 +13,7 @@
 | JSON linear-walk repair | `7486ba1359681d33875845717d10c1ad3ecd8428` |
 | Recovery refs | `refs/merge-recovery/pre-upstream-main-20260809-cd412fa8` and `refs/merge-input/upstream-main-20260809-10cb0e03` |
 | Evidence host | macOS arm64, 2026-08-09 |
-| Local decision | Candidate is ready to push to both PR branches with exact leases; CI and installation remain |
+| Local decision | Merge content and local gates are ready; the final hosted matrix must verify the Windows cold-start lifecycle repair before release |
 
 The candidate is a semantic superset of both parents. It retains the destination branch's
 dependency indexing, PageRank, incremental indexing, richer extraction, activation rollback,
@@ -56,6 +56,11 @@ history verification were all needed before a credible push.
    scanner recursively walked each nested JSON `document` or `array` subtree.
 6. `tests/test_extraction.c:3795` proves URL string references still survive the specialized JSON
    walk. The existing TypeScript URL check now uses the same `has_string_ref()` helper.
+7. `src/daemon/runtime.c` retires an ephemeral generation only after every already-accepted
+   exact-build connection settles. The previous last-committed-client transition rejected a
+   concurrently accepted client still inside `session_open`, making a six-client Windows cold
+   start serialize through daemon generations until one client reached the unchanged 30,000 ms
+   deadline. A lone final client still begins stopping before its close-response drain.
 
 ## Correctness, safety, and robustness evidence
 
@@ -73,6 +78,8 @@ history verification were all needed before a credible push.
 | CI lint profile | cppcheck, clang-format, NOLINT policy, source safety, and protocol stdout passed |
 | Package wrappers before the extraction-only commit | Go passed; npm 29/29; PyPI 36/36 |
 | Focused release contracts | smoke, package runtime, archive extraction, UI pack, vendored integrity, VirusTotal, Windows bundle, no-embedded-script, and venue parity passed |
+| Ephemeral concurrent-admission regression | Red-first deterministic test reproduced the owner-disconnect/provisional-open race; the repaired test passed, then all 47 `daemon_runtime` ASan/UBSan tests passed |
+| Hosted evidence that triggered the repair | Two consecutive Windows guard jobs failed `section_cold_storm` with `CBM daemon is active or starting but could not accept this client within 30000 ms`; the production deadline was not widened |
 
 The final two-file extraction commit cannot affect package wrapper code, archive composition, or
 platform launchers. Those gates therefore remain valid for the merged release surface, while all
@@ -137,6 +144,7 @@ and `A` UI asset bytes.
 | UI asset verification | `O(A)` time and memory with the upstream size cap | Same asymptotic class as upstream; bounded independently of project size. Destination did not have this release check. |
 | Install/activation persistence | `O(A)` sidecar copy plus existing transaction work | Same bounded asset cost as upstream while retaining destination rollback. |
 | Runtime-set locking/readiness checks | Constant metadata/lock work per invocation | Same class as upstream; no indexing/query hot-path cost. |
+| Concurrent ephemeral admission | `O(K)` connection work and existing per-connection storage for `K` callers; no new allocation or polling structure | Same asymptotic bounds as both parents. Already-accepted callers share one generation instead of incurring up to `K` serial daemon startups; single-client shutdown keeps the existing pre-drain transition. |
 
 No candidate path worsens runtime, latency, or memory growth relative to either parent. The one
 identified asymptotic defect is removed, and the production measurements show lower work on the
@@ -151,18 +159,19 @@ shared and scale cohorts without dropping destination output.
 - [x] Run the full native, Python, lint, analyzer, leak, scribble, Guard Malloc, and TSan gates.
 - [x] Run 21- and 41-repetition three-candidate production benchmark matrices.
 - [x] Add this ignored note as an intentional tracked assessment artifact.
-- [ ] Rerun DCO over `upstream/main..HEAD` after the note's signed commit.
-- [ ] Push `api-consolidation-merge` with an exact lease against remote `cd412fa8`.
-- [ ] Fast-forward local `api-consolidation`, then force-with-lease its stale pre-DCO remote head
-  `7433fee6` to the final signed candidate.
+- [x] Rerun DCO over `upstream/main..HEAD` after every signed progress commit through `9dfd68f`.
+- [x] Atomically publish `api-consolidation-merge` and `api-consolidation` through `9dfd68f` with
+  exact force-with-lease guards.
+- [x] Install and hash/code-sign/smoke-verify `9dfd68f` without interrupting the older active daemon.
+- [ ] Commit the concurrent ephemeral-admission repair with DCO, rerun the full local gate, and
+  install the resulting final head.
+- [ ] Atomically republish both branch names with exact leases.
 - [ ] Rewrite PR #1245's title/body from this evidence and verify its head/base commit IDs.
-- [ ] Monitor every required GitHub check; repair any branch-specific failure before installation.
-- [ ] Install from the final verified commit and verify executable mode, version, code signature,
-  sidecar/UI assets, hash binding, and a real MCP request.
+- [ ] Obtain a green required-check rollup for the final head, including the native Windows guard.
 
 ## Evidence limits
 
 The code-graph `search_graph` and `check_index_coverage` calls returned `Transport closed` for the
 worktree. Direct source, disassembly, parent diffs, tests, and retained benchmark artifacts are the
-authorities for this assessment. Local macOS tests cannot replace native Linux/Windows CI, so the
-installation decision remains contingent on the required GitHub matrix after the branch push.
+authorities for this assessment. Local macOS tests cannot replace the native Windows cold-storm
+guard, so final release readiness remains contingent on that hosted check passing after republish.

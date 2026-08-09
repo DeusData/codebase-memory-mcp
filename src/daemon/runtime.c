@@ -1189,10 +1189,20 @@ static void runtime_service_interrupt_connections(cbm_daemon_runtime_service_t *
     runtime_service_interrupt_connections_except(service, NULL, false);
 }
 
+static void runtime_service_stop_ephemeral_if_idle_locked(cbm_daemon_runtime_service_t *service,
+                                                          size_t connections_finishing) {
+    if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING && !service->permanent &&
+        service->admitted_total > 0 && service->committed_clients == 0 &&
+        service->active_connections <= connections_finishing) {
+        runtime_service_begin_stopping_locked(service,
+                                              runtime_deadline_after(service->shutdown_timeout_ms),
+                                              false, "last_accepted_client_disconnected");
+    }
+}
+
 static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
     cbm_daemon_runtime_service_t *service = worker->service;
     cbm_daemon_client_id_t client_id = CBM_DAEMON_CLIENT_ID_INVALID;
-    uint64_t shutdown_deadline = runtime_deadline_after(service->shutdown_timeout_ms);
     atomic_store_explicit(&worker->disconnecting, true, memory_order_release);
     cbm_mutex_lock(&service->mutex);
     if (worker->admitted) {
@@ -1204,16 +1214,13 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
         if (service->committed_clients > 0) {
             service->committed_clients--;
         }
-        if (service->committed_clients == 0 && !service->permanent) {
-            /* A HELLO whose application session is still opening is only a
-             * provisional coordinator client. It cannot keep the generation
-             * alive after the final fully committed frontend disconnects.
-             * A permanent generation (`daemon start`) deliberately survives
-             * this: only the stop/drain ops or a process kill end it. */
-            runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
-                                                  "last_committed_client_disconnected");
-        }
     }
+    /* An exact-build peer already accepted by the transport may still be
+     * opening its application session. Let that bounded attempt settle before
+     * retiring an ephemeral generation; otherwise parallel cold clients force
+     * serial daemon restarts. A lone final client still begins stopping here,
+     * before its close-response drain, exactly as before. */
+    runtime_service_stop_ephemeral_if_idle_locked(service, 1);
     cbm_mutex_unlock(&service->mutex);
     if (client_id == CBM_DAEMON_CLIENT_ID_INVALID) {
         return;
@@ -1547,6 +1554,9 @@ static void runtime_worker_finish(cbm_daemon_runtime_worker_t *worker) {
     if (service->active_connections > 0) {
         service->active_connections--;
     }
+    /* Completes the deferred branch above when every already-accepted peer
+     * failed or closed without becoming the next committed client. */
+    runtime_service_stop_ephemeral_if_idle_locked(service, 0);
     atomic_store_explicit(&worker->done, true, memory_order_release);
     cbm_mutex_unlock(&service->mutex);
 }
