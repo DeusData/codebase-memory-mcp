@@ -1,5 +1,5 @@
 pkgbase = codebase-memory-mcp
-	pkgdesc = Fast code intelligence engine for AI coding agents — single static binary MCP server
+	pkgdesc = Fast code intelligence engine — native executable with verified integration asset
 	pkgver = 0.8.1
 	pkgrel = 1
 	url = https://github.com/DeusData/codebase-memory-mcp

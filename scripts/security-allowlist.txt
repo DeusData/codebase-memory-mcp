@@ -16,13 +16,18 @@ src/daemon/bootstrap.c:fork:validated shell-free double-fork; grandchild resets 
 src/main.c:fork:test-only parent-death containment descendant; inert unless the private CBM_TEST_WORKER_DESCENDANT_PID_FILE probe is explicitly set
 
 # ── Coordination daemon: count-bounded local IPC (never Internet sockets) ──
-# Format: NETWORK:file:function:expected-count:justification
-NETWORK:src/daemon/ipc.c:socket:1:single owner-only AF_UNIX stream constructor
-NETWORK:src/daemon/ipc.c:connect:1:single sockaddr_un-typed connect wrapper used only with the stable owner-only daemon endpoint
+# Format: NETWORK:file:function:expected-count:transport:scope:justification
+# transport and scope are semantic policy, not documentation: the source audit
+# rejects entries whose exact enclosing helper and call shape do not prove the
+# declared local-only transport.
+NETWORK:src/daemon/ipc.c:socket:1:unix:local_socket_new:single owner-only AF_UNIX stream constructor
+NETWORK:src/daemon/ipc.c:connect:1:unix:local_socket_connect:single sockaddr_un-typed connect wrapper used only with the stable owner-only daemon endpoint
+NETWORK:src/main.c:socket:1:loopback-v4:main_daemon_ctl_ui_endpoint_ready:single AF_INET stream client for authenticated daemon UI readiness
+NETWORK:src/main.c:connect:1:loopback-v4:main_daemon_ctl_socket_connected:single sockaddr_in connect whose address is hardcoded to 127.0.0.1 and whose response must prove the daemon generation HMAC
 
 # ── Coordination daemon: count-bounded private internal file writes ────────
 # Format: WRITE:file:expected-count:justification
-WRITE:src/main.c:1:supervised worker writes its MCP result only to the private unique response path created and retained by its parent
+WRITE:src/main.c:3:supervised worker response path; cache-scoped hook notice marker; test-seam-only browser-open marker at the caller-supplied test path
 WRITE:src/daemon/application.c:1:recovery truncates only its private uniquely-created per-job marker file
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────

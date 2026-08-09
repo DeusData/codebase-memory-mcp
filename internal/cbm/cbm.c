@@ -721,6 +721,10 @@ const char *cbm_index_quarantine_phase(const char *rel_path) {
     return (const char *)cbm_ht_get(g_quarantine_set, rel_path);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic supervisor fault injection belongs only in explicitly
+ * seam-enabled test artifacts. Ordinary release binaries must never expose a
+ * filename-selected abort or infinite loop through environment variables. */
 static void cbm_test_fault_inject(const char *rel_path) {
     if (!rel_path || !rel_path[0]) {
         return;
@@ -736,6 +740,7 @@ static void cbm_test_fault_inject(const char *rel_path) {
         }
     }
 }
+#endif
 
 /* Pre-parse nesting guard for pathologically nested input. tree-sitter's GLR
  * parser recurses once per nesting level inside stack_node_add_link
@@ -1336,7 +1341,9 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     }
 
     cbm_index_mark_start(rel_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
     cbm_test_fault_inject(rel_path);
+#endif
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);

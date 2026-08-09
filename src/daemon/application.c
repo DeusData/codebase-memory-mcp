@@ -11,6 +11,8 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "foundation/secure_random.h"
+#include "foundation/sha256.h"
 #include "foundation/subprocess.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
@@ -46,6 +48,7 @@ enum {
     APPLICATION_CONTEXT_HEADER_SIZE = 19,
     APPLICATION_TOOL_HEADER_SIZE = 5,
     APPLICATION_UI_CONFIG_REQUEST_SIZE = 7,
+    APPLICATION_UI_READINESS_REQUEST_SIZE = 1 + CBM_SHA256_DIGEST_LEN,
     APPLICATION_PATH_CAP = 4096,
     APPLICATION_JOB_THREAD_STACK = 256 * 1024,
     APPLICATION_JOB_POLL_US = 10000,
@@ -191,6 +194,8 @@ struct cbm_daemon_application {
     bool stopping;
     /* See cbm_daemon_application_set_permanent. */
     bool permanent;
+    uint8_t ui_readiness_secret[CBM_SHA256_DIGEST_LEN];
+    bool ui_readiness_secret_set;
 };
 
 static void application_job_unsubscribe_locked(cbm_daemon_application_job_t *job);
@@ -2553,6 +2558,24 @@ static cbm_daemon_runtime_application_status_t application_set_ui_config(
     return saved ? CBM_DAEMON_RUNTIME_APPLICATION_OK : CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
 }
 
+static cbm_daemon_runtime_application_status_t application_ui_readiness_proof(
+    cbm_daemon_application_t *application, const uint8_t *request, uint32_t request_length,
+    uint8_t **response_out, uint32_t *response_length_out) {
+    if (!application->ui_readiness_secret_set ||
+        request_length != APPLICATION_UI_READINESS_REQUEST_SIZE) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+    }
+    uint8_t *proof = malloc(CBM_SHA256_DIGEST_LEN);
+    if (!proof) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    }
+    cbm_hmac_sha256(application->ui_readiness_secret, sizeof(application->ui_readiness_secret),
+                    request + 1, CBM_SHA256_DIGEST_LEN, proof);
+    *response_out = proof;
+    *response_length_out = CBM_SHA256_DIGEST_LEN;
+    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
 static cbm_daemon_runtime_application_status_t application_request_dispatch(
     cbm_daemon_application_t *application, cbm_daemon_application_session_t *session,
     const uint8_t *request, uint32_t request_length, uint8_t **response_out,
@@ -2568,6 +2591,9 @@ static cbm_daemon_runtime_application_status_t application_request_dispatch(
                                         response_length_out);
     case CBM_DAEMON_APPLICATION_REQUEST_SET_UI_CONFIG:
         return application_set_ui_config(application, session, request, request_length);
+    case CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF:
+        return application_ui_readiness_proof(application, request, request_length, response_out,
+                                              response_length_out);
     case CBM_DAEMON_APPLICATION_REQUEST_HOOK_AUGMENT: {
         if (!session->context_set || request_length <= 1) {
             return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
@@ -2847,6 +2873,15 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     application->physical_job_limit = APPLICATION_DEFAULT_PHYSICAL_JOB_LIMIT;
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
     if (config) {
+        if ((config->ui_readiness_secret != NULL || config->ui_readiness_secret_length != 0) &&
+            (!config->ui_readiness_secret ||
+             config->ui_readiness_secret_length != sizeof(application->ui_readiness_secret))) {
+            cbm_mutex_destroy(&application->mutex);
+            cbm_secure_zero(application->ui_readiness_secret,
+                            sizeof(application->ui_readiness_secret));
+            free(application);
+            return NULL;
+        }
         application->watcher = config->watcher;
         application->config = config->config;
         application->project_locks = config->project_locks;
@@ -2861,6 +2896,12 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         }
         if (config->update_ops) {
             application->update_ops = *config->update_ops;
+        }
+        if (config->ui_readiness_secret &&
+            config->ui_readiness_secret_length == sizeof(application->ui_readiness_secret)) {
+            memcpy(application->ui_readiness_secret, config->ui_readiness_secret,
+                   sizeof(application->ui_readiness_secret));
+            application->ui_readiness_secret_set = true;
         }
     }
     /* Equal fixed slices keep admission deterministic: starting fewer jobs does
@@ -2888,6 +2929,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     if (!application->worker_ops.poll || !application->worker_ops.cancel ||
         !application->worker_ops.log_path || !application->worker_ops.destroy) {
         cbm_mutex_destroy(&application->mutex);
+        cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
         free(application);
         return NULL;
     }
@@ -2899,6 +2941,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         (!application->update_ops.poll || !application->update_ops.cancel ||
          !application->update_ops.destroy)) {
         cbm_mutex_destroy(&application->mutex);
+        cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
         free(application);
         return NULL;
     }
@@ -3034,6 +3077,7 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
         mutations = next;
     }
     cbm_mutex_destroy(&application->mutex);
+    cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
     free(application);
     return true;
 }
@@ -3197,6 +3241,38 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_set_ui_con
         status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
     free(unexpected);
+    return status;
+}
+
+cbm_daemon_runtime_application_status_t cbm_daemon_application_client_ui_readiness_proof(
+    cbm_daemon_runtime_client_t *client, const uint8_t challenge[CBM_SHA256_DIGEST_LEN],
+    uint8_t proof_out[CBM_SHA256_DIGEST_LEN], uint32_t timeout_ms) {
+    if (!client || !challenge || !proof_out) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
+    }
+    cbm_secure_zero(proof_out, CBM_SHA256_DIGEST_LEN);
+    uint8_t *request = malloc(APPLICATION_UI_READINESS_REQUEST_SIZE);
+    if (!request) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    }
+    request[0] = CBM_DAEMON_APPLICATION_REQUEST_UI_READINESS_PROOF;
+    memcpy(request + 1, challenge, CBM_SHA256_DIGEST_LEN);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t status =
+        application_client_exchange(client, request, APPLICATION_UI_READINESS_REQUEST_SIZE,
+                                    &response, &response_length, timeout_ms);
+    if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        if (!response || response_length != CBM_SHA256_DIGEST_LEN) {
+            status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        } else {
+            memcpy(proof_out, response, CBM_SHA256_DIGEST_LEN);
+        }
+    }
+    if (response) {
+        cbm_secure_zero(response, response_length);
+    }
+    free(response);
     return status;
 }
 

@@ -76,7 +76,8 @@ TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed) {
         if (sscanf(line, "%64s %3899s", hash, path) != 2)
             continue;
         ASSERT_EQ(strlen(hash), 64U);
-        ASSERT(strncmp(path, "vendored/", strlen("vendored/")) == 0);
+        ASSERT(strncmp(path, "vendored/", strlen("vendored/")) == 0 ||
+               strncmp(path, "internal/cbm/vendored/", strlen("internal/cbm/vendored/")) == 0);
         entries++;
     }
     fclose(checksums);

@@ -15158,8 +15158,9 @@ TEST(clsp_easy_win_sfinaevoid_t) {
     PASS();
 }
 
-/* DLL resolve LSP tests removed — string literals triggered
- * Windows Defender false positive. See issue #89. */
+/* DLL resolve LSP tests removed after the associated builds received a
+ * Windows Defender verdict. The opaque verdict did not prove which feature
+ * caused it; see issue #89 for the historical observation. */
 
 TEST(clsp_dll_custom_resolver) {
     CBMFileResult *r = extract_c("\n"

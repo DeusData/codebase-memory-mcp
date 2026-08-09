@@ -21,6 +21,7 @@ $WindowsArchiveNames = @(
     "install.ps1",
     "THIRD_PARTY_NOTICES.md"
 )
+$UiPackPattern = '^cbm-ui-[0-9a-f]{64}\.pack$'
 $BaseUrl = if ($env:CBM_DOWNLOAD_URL) { $env:CBM_DOWNLOAD_URL } else { "https://github.com/$Repo/releases/latest/download" }
 
 try { $BaseUri = [Uri]$BaseUrl } catch { $BaseUri = $null }
@@ -88,6 +89,50 @@ function Invoke-CbmDownload {
     }
 }
 
+function New-CbmExclusiveSiblingTemp {
+    param([Parameter(Mandatory=$true)][string]$Destination)
+
+    $directory = [System.IO.Path]::GetDirectoryName($Destination)
+    $leaf = [System.IO.Path]::GetFileName($Destination)
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $random = [System.IO.Path]::GetRandomFileName()
+        $candidate = Join-Path $directory ".$leaf.tmp-$random"
+        try {
+            $reservation = [System.IO.File]::Open(
+                $candidate,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+            $reservation.Dispose()
+            return $candidate
+        } catch [System.IO.IOException] {
+            # A collision belongs to someone else. Never remove it; choose a
+            # fresh unpredictable sibling and reserve that path exclusively.
+        }
+    }
+    throw "could not reserve an exclusive temporary sibling for $Destination"
+}
+
+function New-CbmExclusiveTempDirectory {
+    param([Parameter(Mandatory=$true)][string]$ParentDirectory)
+
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $candidate = Join-Path $ParentDirectory (
+            "cbm-install-" + [guid]::NewGuid().ToString("N")
+        )
+        try {
+            # Without -Force, an existing path is never adopted. Only return a
+            # directory successfully created by this installer invocation.
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+            return $candidate
+        } catch [System.IO.IOException] {
+            # A collision belongs to someone else. Never remove it; choose a
+            # fresh unpredictable name and try again within the fixed bound.
+        }
+    }
+    throw "could not reserve an exclusive installer temporary directory"
+}
+
 # Detect variant from args (--ui or --standard)
 $Variant = "standard"
 $SkipConfig = $false
@@ -135,8 +180,7 @@ if ($Variant -eq "ui") {
 $Url = "$BaseUrl/$Archive"
 
 # Download
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+$TmpDir = New-CbmExclusiveTempDirectory -ParentDirectory ([System.IO.Path]::GetTempPath())
 try {
 
 Write-Host "Downloading $Archive..."
@@ -190,7 +234,7 @@ try {
 # Validate the zip namespace before extraction. Windows paths are
 # case-insensitive, so two entries that differ only in case are ambiguous and
 # must never be allowed to overwrite each other. The official five entries are
-# required at the archive root with their exact release names.
+# required at the archive root; UI adds exactly one hash-shaped pack.
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead("$TmpDir\$Archive")
@@ -198,6 +242,8 @@ try {
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
         $archiveCounts = @{}
         foreach ($archiveName in $WindowsArchiveNames) { $archiveCounts[$archiveName] = 0 }
+        $uiPackName = $null
+        $uiPackCount = 0
         foreach ($entry in $zip.Entries) {
             $entryName = $entry.FullName.Replace('\', '/')
             $isDirectory = $entryName.EndsWith('/')
@@ -215,18 +261,28 @@ try {
             if (-not $seen.Add($pathForSegments)) {
                 throw "duplicate or case-conflicting zip entry: $($entry.FullName)"
             }
-            if (-not ($WindowsArchiveNames -ccontains $entryName) -or $isDirectory) {
+            if ($isDirectory) {
                 throw "archive contains an unexpected root entry: $($entry.FullName)"
             }
-            $archiveCounts[$entryName] = $archiveCounts[$entryName] + 1
+            if ($WindowsArchiveNames -ccontains $entryName) {
+                $archiveCounts[$entryName] = $archiveCounts[$entryName] + 1
+            } elseif ($Variant -eq "ui" -and $entryName -cmatch $UiPackPattern) {
+                $uiPackName = $entryName
+                $uiPackCount++
+            } else {
+                throw "archive contains an unexpected root entry: $($entry.FullName)"
+            }
         }
         foreach ($archiveName in $WindowsArchiveNames) {
             if ($archiveCounts[$archiveName] -ne 1) {
                 throw "archive must contain exactly one $archiveName"
             }
         }
-        if ($seen.Count -ne $WindowsArchiveNames.Count) {
-            throw "archive does not match the exact Windows release allowlist"
+        $expectedUiPackCount = if ($Variant -eq "ui") { 1 } else { 0 }
+        $expectedArchiveCount = $WindowsArchiveNames.Count + $expectedUiPackCount
+        if ($uiPackCount -ne $expectedUiPackCount -or
+            $seen.Count -ne $expectedArchiveCount) {
+            throw "archive does not match the exact $Variant Windows release allowlist"
         }
     } finally {
         $zip.Dispose()
@@ -243,6 +299,21 @@ try {
 Write-Host "Extracting..."
 Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
 
+foreach ($archiveName in $WindowsArchiveNames) {
+    $extractedMember = Join-Path $TmpDir $archiveName
+    if (-not (Test-Path -LiteralPath $extractedMember -PathType Leaf)) {
+        Write-Host "error: release member is not a regular file: $archiveName" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir
+        exit 1
+    }
+    $extractedItem = Get-Item -LiteralPath $extractedMember
+    if ($extractedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Write-Host "error: refusing reparse-point release member: $archiveName" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir
+        exit 1
+    }
+}
+
 $DownloadedBinary = Join-Path $TmpDir $BinName
 if (-not (Test-Path -LiteralPath $DownloadedBinary -PathType Leaf)) {
     Write-Host "error: $BinName not found after extraction" -ForegroundColor Red
@@ -256,6 +327,29 @@ if ($binaryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
     exit 1
 }
 
+$DownloadedUiPack = $null
+if ($Variant -eq "ui") {
+    $DownloadedUiPack = Join-Path $TmpDir $uiPackName
+    if (-not (Test-Path -LiteralPath $DownloadedUiPack -PathType Leaf)) {
+        Write-Host "error: UI asset pack not found after extraction" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir
+        exit 1
+    }
+    $packItem = Get-Item -LiteralPath $DownloadedUiPack
+    if ($packItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Write-Host "error: refusing reparse-point UI asset pack" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir
+        exit 1
+    }
+    $expectedPackDigest = $uiPackName.Substring(7, 64)
+    $actualPackDigest = (Get-FileHash -LiteralPath $DownloadedUiPack -Algorithm SHA256).Hash.ToLower()
+    if ($expectedPackDigest -cne $actualPackDigest) {
+        Write-Host "error: UI asset pack digest does not match its filename" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TmpDir
+        exit 1
+    }
+}
+
 # Prove the downloaded binary runs before touching an existing installation.
 try {
     $candidateVersion = & $DownloadedBinary --version 2>&1
@@ -267,31 +361,11 @@ try {
     exit 1
 }
 
+# The candidate publishes the runtime set under one native activation guard,
+# with sidecars before the executable and retained per-file backups for
+# cooperative rollback. This is recoverable/fail-closed ordering, not a claim
+# that several filesystem entries change in one crash-atomic transaction.
 $Dest = Join-Path $InstallDir $BinName
-
-# Retire the running installation before replacing it. Windows keeps an image
-# lock on a running .exe: the file cannot be overwritten, but it CAN be renamed
-# out of the way, which is what makes an in-place update possible from here.
-if (Test-Path -LiteralPath $Dest -PathType Leaf) {
-    try { & $Dest daemon stop 2>&1 | Out-Null } catch { }
-    $retired = "$Dest.retired-$(Get-Date -Format yyyyMMddHHmmss)"
-    $renamed = $false
-    foreach ($attempt in 1..10) {
-        try { Move-Item -LiteralPath $Dest -Destination $retired -Force -ErrorAction Stop; $renamed = $true; break }
-        catch { Start-Sleep -Milliseconds 500 }
-    }
-    if (-not $renamed) {
-        Write-Host "error: could not retire the existing $BinName - close all running" -ForegroundColor Red
-        Write-Host "       codebase-memory-mcp sessions and coding agents, then re-run." -ForegroundColor Red
-        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-        exit 1
-    }
-    # A retired image stays locked until its last process exits; delete it when
-    # we can, and leave it for the next run when we cannot. Never fail here.
-    Remove-Item -LiteralPath $retired -Force -ErrorAction SilentlyContinue
-}
-Get-ChildItem -LiteralPath $InstallDir -Filter "$BinName.retired-*" -ErrorAction SilentlyContinue |
-    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 
 $InstallArgs = @("install", "-y", "--force", "--dir=$InstallDir")
 if ($SkipConfig) { $InstallArgs += "--skip-config" }
@@ -313,39 +387,23 @@ if ($LASTEXITCODE -ne 0) {
 $DownloadedInstaller = Join-Path $TmpDir "install.ps1"
 if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
     $InstallerDest = Join-Path $InstallDir "install.ps1"
-    $InstallerTmp = "$InstallerDest.new"
+    $InstallerTmp = $null
     try {
+        $InstallerTmp = New-CbmExclusiveSiblingTemp -Destination $InstallerDest
         Copy-Item -LiteralPath $DownloadedInstaller -Destination $InstallerTmp -Force -ErrorAction Stop
         Move-Item -LiteralPath $InstallerTmp -Destination $InstallerDest -Force -ErrorAction Stop
+        $InstallerTmp = $null
         Write-Host "Installed updater -> $InstallerDest"
     } catch {
-        Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        if ($InstallerTmp) {
+            Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "note: could not place install.ps1 in $InstallDir (update will explain where to find it)"
     }
 }
 
-# Place the integration-template asset beside the installed binary, mirroring
-# install.sh. `install` above published a verified copy to ~/.cbm/assets, but a
-# later install/uninstall run from $InstallDir resolves the asset next to the
-# binary first; without this copy that lookup misses and the run fails closed
-# with "integration assets missing".
-$DownloadedAsset = Join-Path $TmpDir "cbm-integrations.json"
-if (Test-Path -LiteralPath $DownloadedAsset -PathType Leaf) {
-    $AssetDest = Join-Path $InstallDir "cbm-integrations.json"
-    $AssetTmp = "$AssetDest.new"
-    try {
-        Copy-Item -LiteralPath $DownloadedAsset -Destination $AssetTmp -Force -ErrorAction Stop
-        Move-Item -LiteralPath $AssetTmp -Destination $AssetDest -Force -ErrorAction Stop
-    } catch {
-        Remove-Item -LiteralPath $AssetTmp -Force -ErrorAction SilentlyContinue
-        Write-Host "note: could not place cbm-integrations.json in $InstallDir (asset resolves from ~/.cbm/assets)"
-    }
-}
-
-# Verify. The launcher's activation transaction already staged, swapped, and
-# rolled back the binary under its own ownership and DACL checks, so this step
-# only confirms the activated executable runs; there is no script-level
-# rename-aside copy left to restore.
+# Verify the executable after its native activation transaction has published
+# the complete runtime set.
 try {
     $ver = & $Dest --version 2>&1
     if ($LASTEXITCODE -ne 0) { throw "installed binary exited with code $LASTEXITCODE" }

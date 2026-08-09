@@ -60,6 +60,26 @@ if ! grep -Fq -- '-c \"set -e -o pipefail; $*\"' "$driver"; then
     echo "FAIL: Windows VM remote shell must propagate pipeline failures" >&2
     exit 1
 fi
+if grep -Fq 'cd $VM_REPO && git apply' <<<"$sync_block" ||
+   grep -Fq 'cd $VM_REPO && tar -xf' <<<"$sync_block"; then
+    echo "FAIL: Windows VM sync must expand the selected checkout locally before transport" >&2
+    exit 1
+fi
+if ! grep -Fq "cd '\$VM_REPO' && git apply" <<<"$sync_block" ||
+   ! grep -Fq "cd '\$VM_REPO' && tar -xf" <<<"$sync_block"; then
+    echo "FAIL: Windows VM sync patch and manifest must target the selected checkout" >&2
+    exit 1
+fi
+if ! grep -Fq 'CBM_CI_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "$driver"; then
+    echo "FAIL: Windows VM run ids must be validated before remote path interpolation" >&2
+    exit 1
+fi
+preflight_block="$(sed -n '/^vm_preflight() {$/,/^}$/p' "$driver")"
+if grep -Fq 'C:\\cbm\\scripts\\ci' <<<"$preflight_block" ||
+   [ "$(grep -c 'VM_REPO_WIN' <<<"$preflight_block")" -lt 2 ]; then
+    echo "FAIL: Windows VM preflight must use the selected per-run checkout" >&2
+    exit 1
+fi
 if ! grep -Fq 'tests/test_vm_worktree_manifest.sh' "$ROOT/scripts/test.sh"; then
     echo "FAIL: Windows VM sync contract is not wired into the test suite" >&2
     exit 1
@@ -116,7 +136,7 @@ if ! grep -Fq "JOBS='\$(nproc)'" "$provisioner" ||
     exit 1
 fi
 guards_block="$(sed -n '/^guards)/,/^    ;;/p' "$driver")"
-# The guards leg builds the CI-shaped product binary (embedded UI) into an
+# The guards leg builds the CI-shaped UI product and its external pack into an
 # isolated BUILD_DIR, then hands that artifact to the maintained
 # PowerShell driver through a plain cmd shell (CI's environment shape, not
 # the MSYS2 login shell whose TMP ancestry the daemon correctly refuses).
@@ -126,6 +146,11 @@ if ! grep -Fq 'scripts/build.sh --with-ui CC=clang CXX=clang++ SANITIZE= BUILD_D
     <<<"$guards_block" ||
     ! grep -Fq -- '-GuardsOnly -Binary build\\guards\\codebase-memory-mcp.exe' <<<"$guards_block"; then
     echo "FAIL: Windows VM guards must delegate to the maintained native-Windows driver" >&2
+    exit 1
+fi
+if ! grep -Fq 'cd /d ${VM_REPO_WIN}' <<<"$guards_block" ||
+   grep -Fq 'cd /d C:\\cbm' <<<"$guards_block"; then
+    echo "FAIL: Windows VM guards must run against the selected per-run checkout" >&2
     exit 1
 fi
 if grep -Fq 'for g in tests/windows/test_*.py' <<<"$guards_block"; then

@@ -5,9 +5,9 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary — this package downloads and runs it automatically.
+**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 159 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. Streamlined MCP tools by default; classic mode exposes the full tool set. Zero dependencies. Plug and play across 11 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 158 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. Streamlined MCP tools are the default; classic mode exposes all 16. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 43 automatic/conditional client surfaces.
 
 ## Installation
 
@@ -15,7 +15,13 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 npm install -g codebase-memory-mcp
 ```
 
-The binary for your platform is downloaded automatically at install time. Then configure your coding agents:
+The standard runtime set for your platform is downloaded automatically at install time. To select the UI runtime set and its verified frontend pack, set `CBM_VARIANT=ui` while installing and when invoking the wrapper:
+
+```bash
+CBM_VARIANT=ui npm install -g codebase-memory-mcp
+```
+
+Then configure your coding agents:
 
 ```bash
 codebase-memory-mcp install
@@ -26,8 +32,8 @@ Restart your agent. Say **"Index this project"** — done.
 ## Why codebase-memory-mcp
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
-- **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys.
-- **159 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
+- **Plug and play** — verified native runtime sets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker or API keys; Node.js owns package download, cache repair, and launch.
+- **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
 - **43 supported automatic/conditional client surfaces** — `install` configures the appropriate MCP, durable-context, and documented hook surfaces without widening client permissions.
 - **Detected automatically (37)** — Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi.
@@ -44,7 +50,7 @@ Restart your agent. Say **"Index this project"** — done.
 |---------|-------------|
 | macOS   | arm64, amd64 |
 | Linux   | arm64, amd64 |
-| Windows | amd64 |
+| Windows | arm64, amd64 |
 
 ## Usage
 

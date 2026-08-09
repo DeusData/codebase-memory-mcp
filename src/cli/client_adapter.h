@@ -8,9 +8,11 @@
  *  - The module SCAFFOLDING (the node:child_process spawn bridge, header note,
  *    plugin surface) comes from the hash-verified cbm-integrations.json via
  *    integration_assets.h. It used to be compiled in as C string literals, but
- *    child-process-spawning script text inside an unsigned binary is exactly
- *    the surface AV classifiers score, so it ships as data and is verified
- *    against the binary's embedded SHA-256 before use.
+ *    child-process-spawning script text inside a native binary is unnecessary
+ *    mixed-content and attack surface with plausible static-classifier overlap.
+ *    It therefore ships as independently inspectable data and is verified
+ *    against the binary's embedded SHA-256 before use; this is not a claim of
+ *    feature attribution for any vendor verdict.
  *
  *  - The TOOL LIST is still generated at install time from the live registry
  *    (cbm_mcp_tool_count / cbm_mcp_tool_name), never hand-maintained in the

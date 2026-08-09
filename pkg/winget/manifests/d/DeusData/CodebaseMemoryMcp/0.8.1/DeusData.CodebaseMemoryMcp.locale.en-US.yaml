@@ -10,11 +10,13 @@ License: MIT
 LicenseUrl: https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE
 ShortDescription: Fast code intelligence engine for AI coding agents
 Description: |-
-  codebase-memory-mcp is a single static binary MCP server that indexes codebases
-  at extreme speed and exposes 14 MCP tools for AI coding agents. Full indexes an
-  average repository in milliseconds, the Linux kernel (28M LOC) in 3 minutes.
-  Supports 155 languages via vendored tree-sitter grammars. Zero dependencies.
-  Plug and play across 11 coding agents including Claude Code, Codex CLI, and Zed.
+  codebase-memory-mcp is a native MCP server distributed as a verified runtime
+  set. The portable archive keeps its authenticated release-owned assets with the
+  executable registered by WinGet. It indexes codebases at extreme speed and
+  exposes 14 MCP tools for AI coding agents. Full indexes an average repository
+  in milliseconds, the Linux kernel (28M LOC) in 3 minutes. Supports 155 languages
+  via vendored tree-sitter grammars. No hosted service or API key. Plug and play
+  across 11 coding agents including Claude Code, Codex CLI, and Zed.
 Moniker: codebase-memory-mcp
 Tags:
   - mcp

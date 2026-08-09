@@ -1,4 +1,4 @@
-"""GREEN regression guard — non-ASCII repo paths keep all definitions on Windows.
+"""GREEN regression guard — non-ASCII runtime and repo paths work on Windows.
 
 Guards the fix for issue #636 / #357 (landed on main via #700) at the product
 surface (real codebase-memory-mcp process, real SQLite DB, real stdio). Two
@@ -17,8 +17,8 @@ code page, so a non-ASCII path could not be opened and the parser received
 nothing. #700 routed the per-pass reads through cbm_fopen (→ _wfopen with a wide
 path, src/foundation/compat_fs.c), so non-ASCII paths now parse identically.
 
-This guard fails (red) if that fix regresses. It also passes on Linux/macOS
-(byte-transparent UTF-8 filesystem).
+This Windows guard also exercises native runtime publication beyond legacy
+MAX_PATH; it fails (red) if either path contract regresses.
 
 Exit code: 0 == invariant holds (green), 1 == invariant violated (regression),
 2 == environment/setup error.
@@ -29,6 +29,7 @@ Usage:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -60,6 +61,204 @@ NON_ASCII_SEGMENTS = {
     "cjk": "日本語_repo",
     "greek": "Ωμέγα_repo",
 }
+
+
+def windows_extended_path(path):
+    """Return a Python/Win32 path that is independent of LongPathsEnabled."""
+    absolute = os.path.abspath(path).replace("/", "\\")
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute[2:]
+    return "\\\\?\\" + absolute
+
+
+def run_product(argv, cwd, env, timeout=120):
+    options = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "timeout": timeout,
+    }
+    # With lpApplicationName=NULL, CreateProcess applies the legacy MAX_PATH
+    # limit while deriving the module name from the command line. Python's
+    # explicit `executable` argument fills lpApplicationName, allowing the
+    # extended path to reach the product exactly as a native launcher would.
+    if os.name == "nt" and argv and argv[0].startswith("\\\\?\\"):
+        options["executable"] = argv[0]
+    return subprocess.run(argv, **options)
+
+
+def verify_relocated_runtime(binary, work):
+    """Probe relocation, then install/probe/uninstall beyond legacy MAX_PATH.
+
+    This binds Windows self-discovery to GetModuleFileNameW: both the hidden
+    probe and a process launched from an extended-length path must find the
+    adjacent integration/UI assets without an ANSI-code-page fallback or an
+    environment override. The real install sequence also binds target
+    existence checks: after a secure first install, the target is rewritten in
+    place and a non-force `--no` install must preserve those exact bytes.
+    """
+    source_dir = os.path.dirname(binary)
+    runtime_dir = os.path.join(work, "café_日本語_runtime")
+    os.makedirs(runtime_dir, exist_ok=True)
+    relocated = os.path.join(runtime_dir, os.path.basename(binary))
+    shutil.copy2(binary, relocated)
+
+    integration = os.path.join(source_dir, "cbm-integrations.json")
+    if not os.path.isfile(integration):
+        return "setup: source runtime is missing cbm-integrations.json"
+    shutil.copy2(integration, os.path.join(runtime_dir, "cbm-integrations.json"))
+    packs = []
+    for name in os.listdir(source_dir):
+        if name.startswith("cbm-ui-") and name.endswith(".pack"):
+            source = os.path.join(source_dir, name)
+            if os.path.isfile(source):
+                shutil.copy2(source, os.path.join(runtime_dir, name))
+                packs.append(name)
+
+    env = os.environ.copy()
+    env.pop("CBM_ASSETS_DIR", None)
+    env.pop("CBM_UI_ASSETS_DIR", None)
+    env["HOME"] = os.path.join(work, "runtime_home")
+    env["USERPROFILE"] = env["HOME"]
+    env["APPDATA"] = os.path.join(work, "runtime_appdata")
+    env["LOCALAPPDATA"] = os.path.join(work, "runtime_localappdata")
+    env["XDG_CONFIG_HOME"] = os.path.join(work, "runtime_xdg_config")
+    env["XDG_CACHE_HOME"] = os.path.join(work, "runtime_xdg_cache")
+    env["XDG_DATA_HOME"] = os.path.join(work, "runtime_xdg_data")
+    env["CBM_CACHE_DIR"] = os.path.join(work, "runtime_cache")
+    for inherited_config in (
+            "CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME",
+            "CRUSH_GLOBAL_CONFIG", "OPENCLAW_CONFIG_PATH", "OPENCLAW_HOME",
+            "OPENCLAW_PROFILE", "OPENCLAW_STATE_DIR", "OPENCLAW_WORKSPACE_DIR",
+            "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "VIBE_HOME"):
+        env.pop(inherited_config, None)
+    for directory in (
+            env["HOME"], env["APPDATA"], env["LOCALAPPDATA"],
+            env["XDG_CONFIG_HOME"], env["XDG_CACHE_HOME"],
+            env["XDG_DATA_HOME"], env["CBM_CACHE_DIR"]):
+        os.makedirs(directory, exist_ok=True)
+
+    def stop_runtime_daemon():
+        try:
+            first = run_product(
+                [relocated, "daemon", "stop"], runtime_dir, env, timeout=30)
+            second = run_product(
+                [relocated, "daemon", "stop"], runtime_dir, env, timeout=30)
+            return first.returncode == 0 and second.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def fail(message):
+        stop_runtime_daemon()
+        return message
+
+    probe = run_product([relocated, "--verify-runtime-assets"], runtime_dir, env)
+    if probe.returncode != 0:
+        return fail("runtime probe rc=%d output=%r packs=%r" % (
+            probe.returncode, probe.stdout[-800:], packs))
+
+    # Keep every component below the per-component limit while making the
+    # complete UTF-16 path decisively longer than legacy MAX_PATH. The product,
+    # not Python, creates this tree during the first real install.
+    target = os.path.join(
+        work,
+        "install_Ωμέγα",
+        *("segment_%02d_%s" % (i, "x" * 32) for i in range(7)),
+        "bin",
+    )
+    installed = os.path.join(target, "codebase-memory-mcp.exe")
+    if len(os.path.abspath(installed)) <= 260:
+        return fail("setup: intended long install path is only %d characters" % len(
+            os.path.abspath(installed)))
+
+    first_install = run_product(
+        [relocated, "install", "--force", "--skip-config", "--yes",
+         "--dir=" + target],
+        runtime_dir,
+        env,
+    )
+    if first_install.returncode != 0:
+        return fail("long-path install rc=%d output=%r path_len=%d" % (
+            first_install.returncode,
+            first_install.stdout[-1200:],
+            len(os.path.abspath(installed)),
+        ))
+
+    installed_extended = windows_extended_path(installed)
+    if not os.path.isfile(installed_extended):
+        return fail("long-path install did not publish %r" % installed)
+    integration_installed = os.path.join(target, "cbm-integrations.json")
+    if not os.path.isfile(windows_extended_path(integration_installed)):
+        return fail("long-path install omitted cbm-integrations.json")
+    for name in packs:
+        if not os.path.isfile(windows_extended_path(os.path.join(target, name))):
+            return fail("long-path install omitted UI pack %s" % name)
+
+    installed_probe = run_product(
+        [installed_extended, "--verify-runtime-assets"], runtime_dir, env)
+    if installed_probe.returncode != 0:
+        return fail("installed long-path probe rc=%d output=%r" % (
+            installed_probe.returncode, installed_probe.stdout[-1200:]))
+
+    # Preserve the file identity/owner/DACL created by the native transaction,
+    # but make the bytes visibly foreign. A UTF-8-aware existence check sees
+    # this target and honors --no; the legacy narrow stat() treated it as absent
+    # and silently replaced it.
+    sentinel = b"cbm-long-path-existing-target-must-be-preserved\n"
+    with open(installed_extended, "wb") as stream:
+        stream.write(sentinel)
+    keep = run_product(
+        [relocated, "install", "--skip-config", "--no", "--dir=" + target],
+        runtime_dir,
+        env,
+    )
+    if keep.returncode != 0:
+        return fail("long-path non-force install rc=%d output=%r" % (
+            keep.returncode, keep.stdout[-1200:]))
+    with open(installed_extended, "rb") as stream:
+        retained = stream.read()
+    if retained != sentinel:
+        return fail("long-path existing target was overwritten despite --no "
+                    "(target existence probe is not extended-path safe)")
+
+    restore = run_product(
+        [relocated, "install", "--force", "--skip-config", "--yes",
+         "--dir=" + target],
+        runtime_dir,
+        env,
+    )
+    if restore.returncode != 0:
+        return fail("long-path restore install rc=%d output=%r" % (
+            restore.returncode, restore.stdout[-1200:]))
+    restored_probe = run_product(
+        [installed_extended, "--verify-runtime-assets"], runtime_dir, env)
+    if restored_probe.returncode != 0:
+        return fail("restored long-path probe rc=%d output=%r" % (
+            restored_probe.returncode, restored_probe.stdout[-1200:]))
+    if not stop_runtime_daemon():
+        return fail("could not retire the isolated daemon before uninstall")
+
+    uninstall = run_product(
+        [installed_extended, "uninstall", "--yes", "--dir=" + target],
+        runtime_dir,
+        env,
+    )
+    if uninstall.returncode != 0:
+        return fail("long-path uninstall rc=%d output=%r" % (
+            uninstall.returncode, uninstall.stdout[-1200:]))
+    if os.path.exists(installed_extended):
+        return fail("long-path uninstall retained the installed executable")
+    if os.path.exists(windows_extended_path(integration_installed)):
+        return fail("long-path uninstall retained owned integration assets")
+    for name in packs:
+        if os.path.exists(windows_extended_path(os.path.join(target, name))):
+            return fail("long-path uninstall retained owned UI pack %s" % name)
+    stop_runtime_daemon()
+    return None
 
 
 def make_fixture(root):
@@ -119,7 +318,16 @@ def main():
 
     work = tempfile.mkdtemp(prefix="cbm_win_nonascii_")
     failures = []
+    runtime_error = None
     try:
+        runtime_error = verify_relocated_runtime(binary, work)
+        if runtime_error:
+            print("[FAIL] non-ASCII runtime relocation: %s" % runtime_error)
+            print("\nREGRESSION (red): Unicode/extended-length runtime publication "
+                  "or exact adjacent-asset resolution failed.")
+            return 1
+        print("[PASS] Unicode relocation + extended-length install/probe/uninstall")
+
         ascii_repo = os.path.join(work, "ascii_repo")
         make_fixture(ascii_repo)
         base = index_and_count(binary, ascii_repo, os.path.join(work, "c_ascii"))
@@ -152,14 +360,15 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
     if failures:
-        print("\nREGRESSION (red): %d/%d non-ASCII path variants lost "
+        print("\nREGRESSION (red): %d/%d non-ASCII repo path variants lost "
               "definitions: %s" %
               (len(failures), len(NON_ASCII_SEGMENTS), ", ".join(failures)))
         print("Invariant violated: byte-identical fixtures under non-ASCII paths "
               "must extract the same definitions as the ASCII baseline (fixed by "
               "#700 — has the cbm_fopen routing in the pass readers regressed?).")
         return 1
-    print("\nGREEN: all non-ASCII path variants matched the ASCII baseline.")
+    print("\nGREEN: Unicode/extended-length runtime operations passed and all "
+          "non-ASCII repo variants matched the ASCII baseline.")
     return 0
 
 

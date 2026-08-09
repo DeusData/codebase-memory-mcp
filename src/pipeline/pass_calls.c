@@ -966,5 +966,6 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
     }
 }
 
-/* DLL resolve tracking removed — triggered Windows Defender false positive.
- * See issue #89. */
+/* DLL resolve tracking remains removed after associated builds received a
+ * Windows Defender verdict. The verdict did not provide feature attribution;
+ * see issue #89 for the historical observation. */

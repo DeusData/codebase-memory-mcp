@@ -159,6 +159,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
     }
 
     static const char *const stateless_commands[] = {
+        "--verify-runtime-assets",
         "install",
         "uninstall",
         "update",

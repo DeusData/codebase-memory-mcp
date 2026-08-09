@@ -1197,7 +1197,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
 
-    /* UI (config, embedded assets, layout) */
+    /* UI (config, external asset pack, layout) */
     RUN_SELECTED_SUITE(ui);
 
     /* Token reduction */

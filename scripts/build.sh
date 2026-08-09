@@ -3,7 +3,7 @@
 #
 # Usage:
 #   scripts/build.sh                              # Standard binary
-#   scripts/build.sh --with-ui                    # Binary with embedded UI
+#   scripts/build.sh --with-ui                    # Binary + external UI asset pack
 #   scripts/build.sh --help                       # Full usage
 #   scripts/build.sh --version v0.8.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
@@ -30,7 +30,7 @@ from current sources; a cache hit is byte-identical to a cold compile by
 construction (CCACHE_COMPILERCHECK=content).
 
 Options:
-  --with-ui       Embed the web UI (builds the frontend first; needs node).
+  --with-ui       Build the web UI as a content-addressed sidecar (needs node).
   --version V     Stamp the version string (release venue passes the tag).
   --arch ARCH     Force target arch (arm64 | x86_64), e.g. under Rosetta.
   -h, --help      This text.
@@ -159,12 +159,28 @@ fi
 
 # Stage the integration-template asset next to the binary so the dev/CI build
 # mirrors the release archive layout. The binary resolves cbm-integrations.json
-# next to itself, in $CBM_ASSETS_DIR, or under ~/.cbm/assets/<version>/; a plain
+# next to itself, in $CBM_ASSETS_DIR, or under ~/.cbm/assets/<sha256>/; a plain
 # build/c binary has none of those, so install/uninstall (which render the
 # templates to verify hash and ownership) would fail closed exactly as they do
 # for a user who deleted the file. Copying it here keeps `install` working
 # straight out of a build tree — smoke, local dev, and the release packaging all
 # then see the same adjacency.
 cp "$ROOT/assets/cbm-integrations.json" "$BUILD_DIR/cbm-integrations.json"
+
+if $WITH_UI; then
+    shopt -s nullglob
+    UI_PACKS=("$BUILD_DIR"/cbm-ui-*.pack)
+    shopt -u nullglob
+    if [ "${#UI_PACKS[@]}" -ne 1 ]; then
+        echo "build.sh: UI build did not produce exactly one content-addressed asset pack" >&2
+        exit 1
+    fi
+    UI_PACK_NAME="$(basename "${UI_PACKS[0]}")"
+    if ! [[ "$UI_PACK_NAME" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
+        echo "build.sh: invalid UI asset pack name: $UI_PACK_NAME" >&2
+        exit 1
+    fi
+    echo "=== UI assets: ${UI_PACKS[0]} ==="
+fi
 
 echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="
