@@ -2214,8 +2214,10 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
+    char *argv[] = {"--yes", dir_arg};
+    int rc = cli_test_cmd_uninstall(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -2274,8 +2276,10 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
+    char *argv[] = {"--yes", dir_arg};
+    int rc = cli_test_cmd_uninstall(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 

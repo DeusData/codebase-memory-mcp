@@ -318,6 +318,9 @@ grep -v ' rc=0 ' "$RESULTS_FILE" || true
 for f in $(grep -v ' rc=0 ' "$RESULTS_FILE" | awk '{print $1}'); do
     echo "──── $f: every failure site ────"
     grep -B2 -A8 "FAIL" "$LOGDIR/$f.log" | head -120
+    echo "──── $f: sanitizer failure site ────"
+    grep -B3 -A120 -E 'ERROR: AddressSanitizer|SUMMARY: AddressSanitizer|runtime error:' \
+        "$LOGDIR/$f.log" | head -160
     echo "──── $f: last 15 lines ────"
     tail -15 "$LOGDIR/$f.log"
 done
