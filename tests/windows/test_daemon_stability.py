@@ -361,6 +361,15 @@ def section_cold_storm(binary, work):
         if result is None or result.returncode != 0:
             print("RED: cold-storm client %d failed (racing daemon spawn):\n%s"
                   % (index, out_text(result)[:300] if result else "(no result)"))
+            log_path = os.path.join(cache, "logs", "cbm-daemon.log")
+            try:
+                with open(log_path, "rb") as daemon_log:
+                    daemon_log.seek(0, os.SEEK_END)
+                    daemon_log.seek(max(0, daemon_log.tell() - 32768))
+                    print("--- daemon log tail ---\n%s"
+                          % daemon_log.read().decode("utf-8", "replace"))
+            except OSError as error:
+                print("--- daemon log unavailable: %s ---" % error)
             return False
     if not wait_status_not_running(binary, cache, 90):
         print("RED: the ephemeral daemon shared by the cold storm never retired")
