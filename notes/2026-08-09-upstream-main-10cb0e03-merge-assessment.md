@@ -4,16 +4,17 @@
 
 | Field | Evidence |
 | --- | --- |
-| Working branch | `api-consolidation-merge` |
+| Release branches | `api-consolidation` and `api-consolidation-merge`; both must resolve to the same final tip |
 | Destination parent | `cd412fa8b84a085ad9777b0ec045616af1bf3e5b` |
 | Incoming parent | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
 | Merge base | `2c50c7741ec89dbcf43c2c85e005c0b58a4dbbf3` |
 | Two-parent merge | `7d3f0cfc9658c71f249466469838600d46e9d4f4` |
 | Nosan linkage repair | `779717e28c5848ac44cecad23dbbf5b7793e7740` |
 | JSON linear-walk repair | `7486ba1359681d33875845717d10c1ad3ecd8428` |
+| Concurrent-admission repair | `e245da8faa08f7a2972b504fbab35ebec7dd02c5` |
 | Recovery refs | `refs/merge-recovery/pre-upstream-main-20260809-cd412fa8` and `refs/merge-input/upstream-main-20260809-10cb0e03` |
 | Evidence host | macOS arm64, 2026-08-09 |
-| Local decision | Merge content and local gates are ready; the final hosted matrix must verify the Windows cold-start lifecycle repair before release |
+| Local decision | Merge content, local gates, and the installed binary are ready; the final hosted matrix must verify the Windows cold-start lifecycle repair before release |
 
 The candidate is a semantic superset of both parents. It retains the destination branch's
 dependency indexing, PageRank, incremental indexing, richer extraction, activation rollback,
@@ -70,20 +71,23 @@ history verification were all needed before a credible push.
 | Changed extraction suite within the full matrix | 327 passed, 0 failed |
 | Parent/worker watchdogs, worker error transport, verified daemon UI readiness, security strings | passed |
 | Python tests | 429 passed, 1 skipped, 78 subtests passed |
-| macOS leak probe on extraction | 327 passed; 0 leaks for 0 total leaked bytes |
+| macOS full allocation-owning leak gate | 1,317 passed; 0 leaks for 0 total leaked bytes |
 | MallocScribble/PreScribble JSON probe | 7 passed, 352 filtered |
 | Guard Malloc JSON probe | 7 passed, 352 filtered |
 | ThreadSanitizer selected concurrency lane | 1,348 passed, 2 skipped; no race report |
+| Final-head focused ThreadSanitizer run | All 47 `daemon_runtime` tests passed, including the provisional-session regression; no race report |
 | Clang static analyzer | exit 0; accepted test-framework macro warnings; no finding in either changed file |
 | CI lint profile | cppcheck, clang-format, NOLINT policy, source safety, and protocol stdout passed |
 | Package wrappers before the extraction-only commit | Go passed; npm 29/29; PyPI 36/36 |
 | Focused release contracts | smoke, package runtime, archive extraction, UI pack, vendored integrity, VirusTotal, Windows bundle, no-embedded-script, and venue parity passed |
 | Ephemeral concurrent-admission regression | Red-first deterministic test reproduced the owner-disconnect/provisional-open race; the repaired test passed, then all 47 `daemon_runtime` ASan/UBSan tests passed |
 | Hosted evidence that triggered the repair | Two consecutive Windows guard jobs failed `section_cold_storm` with `CBM daemon is active or starting but could not accept this client within 30000 ms`; the production deadline was not widened |
+| Installed final production binary | Build and `/Users/athundt/.local/bin/codebase-memory-mcp` SHA-256 both `c810bf4dd18744c95a696057bb1c1b97be07195b3a6040adfe1602770499ce69`; mode 755, strict code-sign verification, `--version`, and `--help` passed |
 
-The final two-file extraction commit cannot affect package wrapper code, archive composition, or
-platform launchers. Those gates therefore remain valid for the merged release surface, while all
-native and Python tests were rerun after that commit.
+The final lifecycle commit changes only `src/daemon/runtime.c`, its regression test, and this note.
+It cannot affect package wrapper code or archive composition. The complete native matrix, focused
+daemon TSan run, full allocation-owning leak gate, lint profile, release build, and installed-binary
+smoke checks were rerun after the production change.
 
 ## Production benchmark evidence
 
@@ -159,12 +163,13 @@ shared and scale cohorts without dropping destination output.
 - [x] Run the full native, Python, lint, analyzer, leak, scribble, Guard Malloc, and TSan gates.
 - [x] Run 21- and 41-repetition three-candidate production benchmark matrices.
 - [x] Add this ignored note as an intentional tracked assessment artifact.
-- [x] Rerun DCO over `upstream/main..HEAD` after every signed progress commit through `9dfd68f`.
+- [x] Rerun DCO over `upstream/main..HEAD`; all 931 release-candidate commits carry valid signoffs.
 - [x] Atomically publish `api-consolidation-merge` and `api-consolidation` through `9dfd68f` with
   exact force-with-lease guards.
 - [x] Install and hash/code-sign/smoke-verify `9dfd68f` without interrupting the older active daemon.
-- [ ] Commit the concurrent ephemeral-admission repair with DCO, rerun the full local gate, and
-  install the resulting final head.
+- [x] Commit the concurrent ephemeral-admission repair with DCO, rerun the 8,649-test canonical
+  matrix, focused 47-test TSan run, and 1,317-test leak gate, then install and smoke-test the final
+  production binary.
 - [ ] Atomically republish both branch names with exact leases.
 - [ ] Rewrite PR #1245's title/body from this evidence and verify its head/base commit IDs.
 - [ ] Obtain a green required-check rollup for the final head, including the native Windows guard.
@@ -175,3 +180,7 @@ The code-graph `search_graph` and `check_index_coverage` calls returned `Transpo
 worktree. Direct source, disassembly, parent diffs, tests, and retained benchmark artifacts are the
 authorities for this assessment. Local macOS tests cannot replace the native Windows cold-storm
 guard, so final release readiness remains contingent on that hosted check passing after republish.
+An attempted local old-versus-new CLI storm was rejected by the account-wide active-build cohort,
+despite isolated cache directories, because older interactive clients remain open. Those timings
+were discarded. The active sessions were not stopped, and the hosted cold-storm guard remains the
+valid end-to-end latency check.
