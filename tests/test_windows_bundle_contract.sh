@@ -279,7 +279,8 @@ for relative, patterns in single_binary_contracts.items():
 
 # All package downloaders parse the Windows archive against an exact official
 # root allowlist; direct install.ps1 additionally distinguishes standard from
-# UI by the single hash-shaped pack.
+# UI by the single hash-shaped pack. install.ps1 also accepts the legacy
+# four-file core set (no cbm-integrations.json) still published as v0.9.0.
 exact_archive_guards = {
     "install.ps1": (
         "$seen.Count -ne $expectedArchiveCount",
@@ -288,6 +289,8 @@ exact_archive_guards = {
         '"LICENSE"',
         '"install.ps1"',
         "THIRD_PARTY_NOTICES.md",
+        "WindowsCoreArchiveNames",
+        "WindowsIntegrationArchiveName",
     ),
     "pkg/npm/install.js": (
         "seen.size !== expectedCount",

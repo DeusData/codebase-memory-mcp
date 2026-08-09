@@ -232,9 +232,10 @@ fi
 echo "Checksum verified."
 
 # Validate the complete archive namespace before extraction. Standard releases
-# are the canonical five files; UI releases add exactly one root-level,
-# content-addressed pack. Anything else is a release-integrity failure, not a
-# sidecar to ignore.
+# ship either the current five-file set (with cbm-integrations.json) or the
+# legacy four-file set still published as v0.9.0. UI releases add exactly one
+# root-level, content-addressed pack on top of either layout. Anything else is
+# a release-integrity failure, not a sidecar to ignore.
 if [ "$OS" = "windows" ]; then
     ARCHIVE_BINARY="codebase-memory-mcp.exe"
     ARCHIVE_INSTALLER="install.ps1"
@@ -284,13 +285,24 @@ while IFS= read -r member || [ -n "$member" ]; do
     esac
 done < "$ARCHIVE_MEMBERS_FILE"
 
-EXPECTED_MEMBER_COUNT=5
-if [ "$VARIANT" = "ui" ]; then
-    EXPECTED_MEMBER_COUNT=6
+# Current releases: 5 members (+1 UI pack). Legacy published archives (v0.9.0)
+# omit cbm-integrations.json and therefore have 4 core members.
+if [ "$INTEGRATION_MEMBERS" -eq 1 ]; then
+    EXPECTED_CORE_COUNT=5
+elif [ "$INTEGRATION_MEMBERS" -eq 0 ]; then
+    EXPECTED_CORE_COUNT=4
+else
+    echo "error: release archive does not match the exact $VARIANT member set" >&2
+    exit 1
 fi
-if [ "$BINARY_MEMBERS" -ne 1 ] || [ "$INTEGRATION_MEMBERS" -ne 1 ] ||
+EXPECTED_MEMBER_COUNT=$EXPECTED_CORE_COUNT
+if [ "$VARIANT" = "ui" ]; then
+    EXPECTED_MEMBER_COUNT=$((EXPECTED_CORE_COUNT + 1))
+fi
+if [ "$BINARY_MEMBERS" -ne 1 ] ||
     [ "$LICENSE_MEMBERS" -ne 1 ] || [ "$INSTALLER_MEMBERS" -ne 1 ] ||
-    [ "$NOTICE_MEMBERS" -ne 1 ] || [ "$UI_PACK_MEMBERS" -ne $((EXPECTED_MEMBER_COUNT - 5)) ] ||
+    [ "$NOTICE_MEMBERS" -ne 1 ] ||
+    [ "$UI_PACK_MEMBERS" -ne $((EXPECTED_MEMBER_COUNT - EXPECTED_CORE_COUNT)) ] ||
     [ "$ARCHIVE_MEMBER_COUNT" -ne "$EXPECTED_MEMBER_COUNT" ]; then
     echo "error: release archive does not match the exact $VARIANT member set" >&2
     exit 1
@@ -304,8 +316,16 @@ else
     tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
 fi
 
-for extracted_member in "$ARCHIVE_BINARY" cbm-integrations.json LICENSE \
-    "$ARCHIVE_INSTALLER" THIRD_PARTY_NOTICES.md; do
+REQUIRED_EXTRACTED_MEMBERS=(
+    "$ARCHIVE_BINARY"
+    LICENSE
+    "$ARCHIVE_INSTALLER"
+    THIRD_PARTY_NOTICES.md
+)
+if [ "$INTEGRATION_MEMBERS" -eq 1 ]; then
+    REQUIRED_EXTRACTED_MEMBERS+=(cbm-integrations.json)
+fi
+for extracted_member in "${REQUIRED_EXTRACTED_MEMBERS[@]}"; do
     if [ ! -f "$DLDIR/$extracted_member" ] || [ -L "$DLDIR/$extracted_member" ]; then
         echo "error: release member is not a regular file: $extracted_member" >&2
         exit 1

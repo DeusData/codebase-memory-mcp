@@ -14,13 +14,18 @@ Add-Type -AssemblyName System.Net.Http
 $Repo = "DeusData/codebase-memory-mcp"
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
-$WindowsArchiveNames = @(
+# Core members shipped since the single-binary Windows layout. The integration
+# manifest was added later (externalized runtime assets); published v0.9.0 zips
+# still omit it, so validation accepts either the legacy 4-file core set or the
+# current 5-file set. New releases from package-release.sh always ship both.
+$WindowsCoreArchiveNames = @(
     $BinName,
-    "cbm-integrations.json",
     "LICENSE",
     "install.ps1",
     "THIRD_PARTY_NOTICES.md"
 )
+$WindowsIntegrationArchiveName = "cbm-integrations.json"
+$WindowsArchiveNames = $WindowsCoreArchiveNames + @($WindowsIntegrationArchiveName)
 $UiPackPattern = '^cbm-ui-[0-9a-f]{64}\.pack$'
 $BaseUrl = if ($env:CBM_DOWNLOAD_URL) { $env:CBM_DOWNLOAD_URL } else { "https://github.com/$Repo/releases/latest/download" }
 
@@ -232,8 +237,10 @@ try {
 
 # Validate the zip namespace before extraction. Windows paths are
 # case-insensitive, so two entries that differ only in case are ambiguous and
-# must never be allowed to overwrite each other. The official five entries are
-# required at the archive root; UI adds exactly one hash-shaped pack.
+# must never be allowed to overwrite each other. Core members are always
+# required; cbm-integrations.json is required when present and accepted as
+# absent for legacy published archives (v0.9.0). UI adds exactly one
+# hash-shaped pack on top of either layout.
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead("$TmpDir\$Archive")
@@ -272,17 +279,22 @@ try {
                 throw "archive contains an unexpected root entry: $($entry.FullName)"
             }
         }
-        foreach ($archiveName in $WindowsArchiveNames) {
+        foreach ($archiveName in $WindowsCoreArchiveNames) {
             if ($archiveCounts[$archiveName] -ne 1) {
                 throw "archive must contain exactly one $archiveName"
             }
         }
+        $integrationCount = $archiveCounts[$WindowsIntegrationArchiveName]
+        if ($integrationCount -ne 0 -and $integrationCount -ne 1) {
+            throw "archive must contain exactly one $WindowsIntegrationArchiveName"
+        }
         $expectedUiPackCount = if ($Variant -eq "ui") { 1 } else { 0 }
-        $expectedArchiveCount = $WindowsArchiveNames.Count + $expectedUiPackCount
+        $expectedArchiveCount = $WindowsCoreArchiveNames.Count + $integrationCount + $expectedUiPackCount
         if ($uiPackCount -ne $expectedUiPackCount -or
             $seen.Count -ne $expectedArchiveCount) {
             throw "archive does not match the exact $Variant Windows release allowlist"
         }
+        $script:WindowsHasIntegrationManifest = ($integrationCount -eq 1)
     } finally {
         $zip.Dispose()
     }
@@ -298,7 +310,11 @@ try {
 Write-Host "Extracting..."
 Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
 
-foreach ($archiveName in $WindowsArchiveNames) {
+$RequiredExtractedMembers = @($WindowsCoreArchiveNames)
+if ($WindowsHasIntegrationManifest) {
+    $RequiredExtractedMembers += $WindowsIntegrationArchiveName
+}
+foreach ($archiveName in $RequiredExtractedMembers) {
     $extractedMember = Join-Path $TmpDir $archiveName
     if (-not (Test-Path -LiteralPath $extractedMember -PathType Leaf)) {
         Write-Host "error: release member is not a regular file: $archiveName" -ForegroundColor Red
