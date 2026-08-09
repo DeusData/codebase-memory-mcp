@@ -1657,9 +1657,9 @@ static void handle_yaml_nested(CBMExtractCtx *ctx, TSNode node) {
 
 // --- Main unified cursor walk ---
 
-// Scan infra bindings for YAML/JSON/HCL languages.
+// Scan infra bindings for YAML/HCL languages.
 static void scan_infra_bindings(CBMExtractCtx *ctx, TSNode node) {
-    if (ctx->language == CBM_LANG_YAML || ctx->language == CBM_LANG_JSON) {
+    if (ctx->language == CBM_LANG_YAML) {
         const char *nk = ts_node_type(node);
         if (strcmp(nk, "block_sequence") == 0 || strcmp(nk, "block_mapping") == 0 ||
             strcmp(nk, "array") == 0 || strcmp(nk, "document") == 0) {
@@ -2209,10 +2209,11 @@ static CBM_EXTRACT_NOINLINE void cbm_extract_json_document(CBMExtractCtx *ctx) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
-            handle_string_constants(ctx, node, ctx->module_qn);
+            /* JSON has no assignment node kinds consumed by the constant
+             * collector, and the YAML infrastructure scanner recognizes only
+             * block_mapping nodes. Calling it for each JSON document/array
+             * recursively rewalked nested subtrees without emitting output. */
             handle_string_refs(ctx, node, ctx->module_qn);
-            handle_yaml_nested(ctx, node);
-            scan_infra_bindings(ctx, node);
         }
 
         if ((!trivia || ts_node_child_count(node) > 0) &&

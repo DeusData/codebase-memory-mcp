@@ -94,6 +94,15 @@ static int has_infra_binding(CBMFileResult *r, const char *source_name, const ch
     return 0;
 }
 
+static int has_string_ref(CBMFileResult *r, const char *value) {
+    for (int i = 0; i < r->string_refs.count; i++) {
+        if (r->string_refs.items[i].value && strcmp(r->string_refs.items[i].value, value) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *must_contain,
                               const char *must_not_contain) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -3783,6 +3792,16 @@ TEST(json_package_json_deps) {
     PASS();
 }
 
+TEST(json_url_string_ref_survives_specialized_walk) {
+    CBMFileResult *r = extract("{\"endpoint\":\"https://api.example.test/v1\"}", CBM_LANG_JSON,
+                               "t", "config.json");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_string_ref(r, "https://api.example.test/v1"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- XML (4 tests) --- */
 
 TEST(xml_basic_element) {
@@ -4069,15 +4088,7 @@ TEST(extract_ts_template_string_url_issue1006) {
     ASSERT_NOT_NULL(c);
     ASSERT_NOT_NULL(c->first_string_arg);
     ASSERT_STR_EQ(c->first_string_arg, "/api/v1/things/{}");
-    int found = 0;
-    for (int i = 0; i < r->string_refs.count; i++) {
-        if (r->string_refs.items[i].value &&
-            strcmp(r->string_refs.items[i].value, "/api/v1/things/{}/detail") == 0) {
-            found = 1;
-            break;
-        }
-    }
-    ASSERT(found);
+    ASSERT(has_string_ref(r, "/api/v1/things/{}/detail"));
     cbm_free_result(r);
     PASS();
 }
@@ -6615,6 +6626,7 @@ SUITE(extraction) {
     RUN_TEST(json_empty_object);
     RUN_TEST(json_boolean_null_values);
     RUN_TEST(json_package_json_deps);
+    RUN_TEST(json_url_string_ref_survives_specialized_walk);
     RUN_TEST(xml_basic_element);
     RUN_TEST(xml_self_closing_tag);
     RUN_TEST(xml_empty_document);
