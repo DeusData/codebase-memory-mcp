@@ -75,7 +75,7 @@ enum {
 #include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
 #ifdef _WIN32
 #include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
-#include <io.h> /* _close — async-signal-safe stdin fd close in request_shutdown */
+#include <io.h>       /* _close — async-signal-safe stdin fd close in request_shutdown */
 #endif
 #include "ui/http_server.h"
 #include "ui/asset_pack.h"

@@ -161,7 +161,7 @@ ui_sources = makefile.split("UI_SRCS =", 1)[-1].split("# mimalloc", 1)[0]
 for forbidden in ("src/ui/asset_pack.c", "src/ui/asset_manifest_stub.c"):
     if forbidden in ui_sources:
         failures.append(f"standard UI_SRCS still links {forbidden}")
-for target in ("test-runner", "test-repro-runner", "test-runner-tsan"):
+for target in ("test-runner", "test-runner-nosan", "test-repro-runner", "test-runner-tsan"):
     rule = makefile.split(f"$(BUILD_DIR)/{target}:", 1)
     if len(rule) != 2 or "$(TEST_PROD_SRCS)" not in rule[1].split("\n\n", 1)[0]:
         failures.append(f"{target} does not link the full parser test source set")
