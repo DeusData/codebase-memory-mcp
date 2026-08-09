@@ -195,8 +195,9 @@ require(
     "fixture checksums must name exact artifact basenames, never ./-prefixed paths",
 )
 
-# Native Windows packages and serves the exact five-file standard bundle or
-# six-file UI bundle (one native binary), then runs the full smoke from a
+# Native Windows packages and serves the current five-file standard bundle
+# (or legacy four-file / matching UI +1 layouts) with one native binary, then
+# runs the full smoke from a
 # protected profile-rooted directory/cache.
 for name in (
     "codebase-memory-mcp.exe",
@@ -380,13 +381,15 @@ require(
         needle in unix_installer
         for needle in (
             "ARCHIVE_MEMBER_COUNT",
-            "EXPECTED_MEMBER_COUNT=5",
-            "EXPECTED_MEMBER_COUNT=6",
+            "EXPECTED_CORE_COUNT=4",
+            "EXPECTED_CORE_COUNT=5",
+            "EXPECTED_MEMBER_COUNT=$EXPECTED_CORE_COUNT",
             "^cbm-ui-[0-9a-f]{64}\\.pack$",
             "release archive contains unexpected member",
         )
     ),
-    "install.sh must validate the exact five-member standard or six-member UI archive",
+    "install.sh must validate legacy 4-file and current 5-file standard archives "
+    "(plus optional UI pack on either layout)",
 )
 unix_binary_publish = unix_installer.find('"$DLBIN" install "${INSTALL_ARGS[@]}"')
 require(
