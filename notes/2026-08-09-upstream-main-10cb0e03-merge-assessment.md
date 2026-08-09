@@ -62,6 +62,9 @@ history verification were all needed before a credible push.
    concurrently accepted client still inside `session_open`, making a six-client Windows cold
    start serialize through daemon generations until one client reached the unchanged 30,000 ms
    deadline. A lone final client still begins stopping before its close-response drain.
+8. `tests/test_makefile_logged_command.sh` uses the repository's existing BSD/GNU `mktemp`
+   fallback. The first hosted macOS LSan job ended before compilation when `mktemp -d` returned
+   `Invalid argument`; the normal path and an injected first-call failure both pass locally.
 
 ## Correctness, safety, and robustness evidence
 
@@ -83,6 +86,7 @@ history verification were all needed before a credible push.
 | Ephemeral concurrent-admission regression | Red-first deterministic test reproduced the owner-disconnect/provisional-open race; the repaired test passed, then all 47 `daemon_runtime` ASan/UBSan tests passed |
 | Hosted evidence that triggered the repair | Two consecutive Windows guard jobs failed `section_cold_storm` with `CBM daemon is active or starting but could not accept this client within 30000 ms`; the production deadline was not widened |
 | Installed final production binary | Build and `/Users/athundt/.local/bin/codebase-memory-mcp` SHA-256 both `c810bf4dd18744c95a696057bb1c1b97be07195b3a6040adfe1602770499ce69`; mode 755, strict code-sign verification, `--version`, and `--help` passed |
+| Hosted macOS LSan setup repair | The first `mktemp -d` failure is retried with the established `mktemp -d -t` fallback; normal and injected-first-failure harness runs passed |
 
 The final lifecycle commit changes only `src/daemon/runtime.c`, its regression test, and this note.
 It cannot affect package wrapper code or archive composition. The complete native matrix, focused
@@ -163,7 +167,7 @@ shared and scale cohorts without dropping destination output.
 - [x] Run the full native, Python, lint, analyzer, leak, scribble, Guard Malloc, and TSan gates.
 - [x] Run 21- and 41-repetition three-candidate production benchmark matrices.
 - [x] Add this ignored note as an intentional tracked assessment artifact.
-- [x] Rerun DCO over `upstream/main..HEAD`; all 931 release-candidate commits carry valid signoffs.
+- [x] Rerun DCO over `upstream/main..HEAD`; all 932 release-candidate commits carry valid signoffs.
 - [x] Atomically publish `api-consolidation-merge` and `api-consolidation` through `9dfd68f` with
   exact force-with-lease guards.
 - [x] Install and hash/code-sign/smoke-verify `9dfd68f` without interrupting the older active daemon.

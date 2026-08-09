@@ -6,7 +6,7 @@ set -euo pipefail
 # pipeline's final process, and must also fail if tee cannot write the report.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WORKDIR="$(mktemp -d)"
+WORKDIR="$(mktemp -d 2>/dev/null || mktemp -d -t cbm-makefile-log)"
 trap 'rm -rf "$WORKDIR"' EXIT
 export LC_ALL=C
 POSIX_SHELL="${CBM_TEST_POSIX_SHELL:-/bin/sh}"
