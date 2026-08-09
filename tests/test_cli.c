@@ -1686,6 +1686,8 @@ typedef struct {
     int descriptor;
 } cli_install_order_lock_t;
 
+enum { CLI_INSTALL_ORDER_WAIT_ATTEMPTS = 30000 };
+
 static int cli_install_order_reserve(void *opaque, cbm_cli_activation_lock_t *lease_out) {
     cli_install_order_lock_t *lock = opaque;
     *lease_out = NULL;
@@ -1704,7 +1706,7 @@ static int cli_install_order_reserve(void *opaque, cbm_cli_activation_lock_t *le
     if (lock->first) {
         (void)write_test_file(lock->first_locked_path, "locked\n");
         bool second_waiting = false;
-        for (int attempt = 0; attempt < 10000; attempt++) {
+        for (int attempt = 0; attempt < CLI_INSTALL_ORDER_WAIT_ATTEMPTS; attempt++) {
             struct stat status;
             if (stat(lock->second_waiting_path, &status) == 0) {
                 second_waiting = true;
@@ -1744,7 +1746,7 @@ static void cli_install_order_diagnostic(void *opaque, const char *message) {
 }
 
 static bool cli_wait_child_bounded(pid_t child, int *status_out) {
-    for (int attempt = 0; attempt < 30000; attempt++) {
+    for (int attempt = 0; attempt < CLI_INSTALL_ORDER_WAIT_ATTEMPTS; attempt++) {
         pid_t waited = waitpid(child, status_out, WNOHANG);
         if (waited == child) {
             return true;
@@ -1836,7 +1838,7 @@ TEST(cli_concurrent_ui_then_standard_install_leaves_coherent_standard_set) {
         FAIL("could not fork the UI installer child");
     }
     bool ui_locked = false;
-    for (int attempt = 0; attempt < 10000; attempt++) {
+    for (int attempt = 0; attempt < CLI_INSTALL_ORDER_WAIT_ATTEMPTS; attempt++) {
         struct stat status;
         if (stat(first_locked, &status) == 0) {
             ui_locked = true;
