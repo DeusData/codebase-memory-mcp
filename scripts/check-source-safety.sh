@@ -50,7 +50,8 @@ while IFS= read -r hit; do
         add_violation "unsafe string API in production source: $hit"
     fi
 done < <(
-    grep_source '\b(strcpy|strncpy|strcat|sprintf|gets)[[:space:]]*\(' src internal cmd
+    grep_source '(^|[^[:alnum:]_])(strcpy|strncpy|strcat|sprintf|gets)[[:space:]]*\(' \
+        src internal cmd
 )
 
 while IFS= read -r hit; do
@@ -60,7 +61,7 @@ while IFS= read -r hit; do
     esac
     add_violation "stdout write in MCP/server pipeline code: $hit"
 done < <(
-    grep_source '\b(printf|puts|putchar)[[:space:]]*\(|fprintf[[:space:]]*\([[:space:]]*stdout' \
+    grep_source '(^|[^[:alnum:]_])(printf|puts|putchar)[[:space:]]*\(|fprintf[[:space:]]*\([[:space:]]*stdout' \
         src/mcp src/pipeline src/graph_buffer src/semantic internal/cbm
 )
 

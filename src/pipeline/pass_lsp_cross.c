@@ -1967,7 +1967,7 @@ static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
      * index from the full import toward its package. This only selects a small
      * candidate registry; the language resolver must still prove the symbol. */
     if (!matched && pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
-        strcpy(candidate, import_qn);
+        memcpy(candidate, import_qn, strlen(import_qn) + 1U);
         for (;;) {
             pxc_module_entry_t *entry = (pxc_module_entry_t *)cbm_ht_get(
                 idx->namespace_ht, pxc_namespace_index_key(candidate));
