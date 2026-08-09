@@ -37,7 +37,8 @@
 #endif
 
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || \
-    __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
 #define TF_SANITIZER_ACTIVE 1
 #else
 #define TF_SANITIZER_ACTIVE 0
