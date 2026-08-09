@@ -97,6 +97,12 @@ if ! grep -q 'Pipeline failed' "${tmpdir}/supervisor.out" "${tmpdir}/supervisor.
   echo "supervisor did not preserve the worker's pipeline error" >&2
   cat "${tmpdir}/supervisor.out" >&2
   cat "${tmpdir}/supervisor.err" >&2
+  daemon_log="${tmpdir}/cache-supervisor/logs/cbm-daemon.log"
+  if [[ -f "${daemon_log}" ]]; then
+    tail -c 32768 "${daemon_log}" >&2
+  else
+    echo "daemon log missing: ${daemon_log}" >&2
+  fi
   exit 1
 fi
 
