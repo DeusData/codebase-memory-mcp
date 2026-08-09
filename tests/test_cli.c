@@ -1812,6 +1812,19 @@ TEST(cli_concurrent_ui_then_standard_install_leaves_coherent_standard_set) {
     test_mkdirp(home);
     test_mkdirp(bin_dir);
     test_mkdirp(source_dir);
+    /* This test covers runtime-set locking, not staging the sanitizer runner. */
+    char self_path[CBM_SZ_4K] = {0};
+#ifdef __APPLE__
+    uint32_t self_path_size = (uint32_t)sizeof(self_path);
+    ASSERT_EQ(_NSGetExecutablePath(self_path, &self_path_size), 0);
+#else
+    ssize_t self_path_length = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1U);
+    ASSERT_GT(self_path_length, 0);
+    self_path[self_path_length] = '\0';
+#endif
+    char bin_target[1024];
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    ASSERT_EQ(link(self_path, bin_target), 0);
     char source_pack[1024];
     char pack_name[128];
     char pack_hash[65];
