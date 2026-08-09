@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  *  LEXER TESTS
