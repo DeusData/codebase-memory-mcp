@@ -15687,11 +15687,11 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_cline_lifecycle_contract);
     RUN_TEST(cli_hook_upsert_rejects_malformed_settings);
     RUN_TEST(cli_hook_upsert_rejects_concurrent_same_event_update);
+    RUN_TEST(cli_integration_assets_retain_destination_session_history);
 #ifndef _WIN32
     RUN_TEST(cli_upgrade_migrates_released_claude_hook_scripts);
     RUN_TEST(cli_upgrade_preserves_near_legacy_claude_hook_script);
     RUN_TEST(cli_integration_assets_tampered_or_missing_fail_closed);
-    RUN_TEST(cli_integration_assets_retain_destination_session_history);
     RUN_TEST(cli_runtime_asset_probe_requires_exact_adjacent_set);
     RUN_TEST(cli_integration_assets_install_stores_content_addressed_ownership_copy);
     RUN_TEST(cli_integration_assets_install_never_follows_predictable_temp_symlink);

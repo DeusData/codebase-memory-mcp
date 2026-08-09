@@ -2848,7 +2848,9 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
-    p->userconfig = cbm_userconfig_load(p->repo_path);
+    if (!p->userconfig) {
+        p->userconfig = cbm_userconfig_load(p->repo_path);
+    }
     cbm_set_user_lang_config(p->userconfig);
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
