@@ -16759,11 +16759,15 @@ static void observe_publish_boundary(cbm_pipeline_t *p, const char *staging_path
 
 typedef struct {
     int calls;
+    bool block_rollback;
 } publish_rename_fail_ctx_t;
 
 static int fail_publish_rename(const char *staging_path, const char *final_path, void *arg) {
     publish_rename_fail_ctx_t *ctx = (publish_rename_fail_ctx_t *)arg;
     ctx->calls++;
+    if (ctx->block_rollback && final_path) {
+        (void)th_write_file(final_path, "rollback-blocker");
+    }
     return staging_path && final_path ? CBM_NOT_FOUND : 0;
 }
 
@@ -22287,6 +22291,42 @@ TEST(backup_failed_rename_failure_preserves_corrupt_main) {
     PASS();
 }
 
+TEST(backup_failed_rename_reports_failed_corrupt_main_rollback) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char final_path[512];
+    char quarantine_path[544];
+    snprintf(final_path, sizeof(final_path), "%s/corrupt-rollback.db", g_incr_tmpdir);
+    snprintf(quarantine_path, sizeof(quarantine_path), "%s.corrupt", final_path);
+    ASSERT_EQ(th_write_file(final_path, "corrupt-main-before-rollback"), 0);
+
+    publish_rename_fail_ctx_t rename_fail = {.block_rollback = true};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_rename_hook_for_tests(p, fail_publish_rename, &rename_fail);
+    pipeline_capture_logs_start();
+    int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    cbm_pipeline_free(p);
+
+    bool blocker_preserved = pipeline_fixture_file_equals(final_path, "rollback-blocker");
+    bool corrupt_preserved =
+        pipeline_fixture_file_equals(quarantine_path, "corrupt-main-before-rollback");
+    (void)cbm_unlink(final_path);
+    (void)cbm_unlink(quarantine_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(rename_fail.calls, 1);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(blocker_preserved);
+    ASSERT_TRUE(corrupt_preserved);
+    ASSERT_NOT_NULL(strstr(logs, "finalize.rollback_failed"));
+    ASSERT_NOT_NULL(strstr(logs, "reason=main_restore"));
+    PASS();
+}
+
 #ifdef __linux__
 static void cleanup_long_db_fixture(char *deep_dir, const char *root, const char *db_path,
                                     const char *staging_path) {
@@ -25157,6 +25197,7 @@ SUITE(pipeline) {
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
     RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
     RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);
+    RUN_TEST(backup_failed_rename_reports_failed_corrupt_main_rollback);
 #ifdef __linux__
     RUN_TEST(full_reindex_preserves_exact_long_db_path);
 #endif

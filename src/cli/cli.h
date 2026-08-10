@@ -564,11 +564,6 @@ int cbm_cmd_install(int argc, char **argv);
 /* uninstall: remove skills, remove editor MCP configs, remove binary. */
 int cbm_cmd_uninstall(int argc, char **argv);
 
-/* Hidden package-wrapper health probe. Verifies only immutable sidecars
- * adjacent to the running executable; never consults fallbacks or mutates. */
-int cbm_cmd_verify_runtime_assets(void);
-bool cbm_cli_verify_runtime_assets_at(const char *binary_path, char *err, size_t err_sz);
-
 /* update: check latest release, prompt for index deletion, prompt for ui/standard,
  * download and replace binary. */
 int cbm_cmd_update(int argc, char **argv);

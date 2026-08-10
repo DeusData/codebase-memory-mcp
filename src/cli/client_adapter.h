@@ -3,22 +3,13 @@
  *
  * Some clients have no MCP support (pi), and some have no declarative hook
  * configuration (OpenCode); their only extension point is a JavaScript/TypeScript
- * module. Generation splits along what each source is authoritative for:
+ * module. We do not ship such a module as a repository asset — it would be a
+ * second, hand-maintained copy of the tool surface, and hand-maintained copies of
+ * the tool list have already produced defects here.
  *
- *  - The module SCAFFOLDING (the node:child_process spawn bridge, header note,
- *    plugin surface) comes from the hash-verified cbm-integrations.json via
- *    integration_assets.h. It used to be compiled in as C string literals, but
- *    child-process-spawning script text inside a native binary is unnecessary
- *    mixed-content and attack surface with plausible static-classifier overlap.
- *    It therefore ships as independently inspectable data and is verified
- *    against the binary's embedded SHA-256 before use; this is not a claim of
- *    feature attribution for any vendor verdict.
- *
- *  - The TOOL LIST is still generated at install time from the live registry
- *    (cbm_mcp_tool_count / cbm_mcp_tool_name), never hand-maintained in the
- *    asset file: hand-maintained copies of the tool surface have already
- *    produced defects here. Adding a tool to TOOLS[] adds it to every
- *    generated adapter with no second edit — that property is preserved.
+ * Instead the module is GENERATED at install time from the live registry
+ * (cbm_mcp_tool_count / cbm_mcp_tool_name), so it cannot drift: adding a tool to
+ * TOOLS[] adds it to every generated adapter with no second edit.
  *
  * Generated text is returned heap-allocated; the caller frees it. Nothing here
  * touches the filesystem — writing is the caller's job, so dry-run and

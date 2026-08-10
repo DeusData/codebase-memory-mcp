@@ -19,7 +19,7 @@ Usage: [env] bash test-infrastructure/vm/vm-smoke.sh
 
 The canonical WINDOWS smoke entry: identical in local CI (win.sh
 smoke-install), PR CI (pr.yml) and the release venues (_smoke.yml). Stages a
-complete one-executable runtime-set fixture under a disposable profile root,
+complete single-binary release fixture under a disposable profile root,
 serves it on a kernel-assigned port, prepares/verifies/cleans the user-PATH
 registry via windows-user-path-guard.ps1, neutralizes every agent-config
 destination override, then runs scripts/smoke-test.sh (all phases).
@@ -28,15 +28,13 @@ Run inside the VM's CLANGARM64 shell (or a CI msys2 shell) from the repo root.
 
 Environment:
   SMOKE_ARCH      arm64 (default) | amd64 — selects the served artifact name.
-  SMOKE_VARIANT   standard (default) | ui. ui requires the external UI pack:
-                  Phase 15's "no assets" SKIP becomes a FAILURE, so a standard
-                  binary cannot pass a ui run.
+  SMOKE_REQUIRE_UI=1
+                  Phase 15's "no embedded assets" SKIP becomes a FAILURE.
   CBM_SMOKE_ARTIFACT_DIR
                   Release mode: an EXTRACTED windows release artifact
-                  (codebase-memory-mcp.exe + cbm-integrations.json + LICENSE +
-                  install.ps1 + THIRD_PARTY_NOTICES.md + the UI pack when selected). The
-                  exact variant set is served verbatim; an incomplete archive
-                  fails the smoke.
+                  (codebase-memory-mcp.exe + LICENSE + install.ps1 +
+                  THIRD_PARTY_NOTICES.md). All four are required and served
+                  verbatim — an incomplete archive fails the smoke.
                   Unset (default): stages the freshly built binary out of
                   build/c and synthesizes the sidecars (local/PR mode).
 
@@ -60,7 +58,7 @@ ARTIFACT_DIR="${CBM_SMOKE_ARTIFACT_DIR:-}"
 if [ -n "$ARTIFACT_DIR" ]; then
     ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
     for required in codebase-memory-mcp.exe \
-        cbm-integrations.json LICENSE install.ps1 THIRD_PARTY_NOTICES.md; do
+        LICENSE install.ps1 THIRD_PARTY_NOTICES.md; do
         [ -s "$ARTIFACT_DIR/$required" ] ||
             { echo "vm-smoke: release artifact is missing $required" >&2; exit 2; }
     done
@@ -71,51 +69,16 @@ else
 fi
 
 SMOKE_ARCH="${SMOKE_ARCH:-arm64}"
-SMOKE_VARIANT="${SMOKE_VARIANT:-standard}"
 case "$SMOKE_ARCH" in
 arm64 | amd64) ;;
 *) echo "vm-smoke: SMOKE_ARCH must be arm64 or amd64. Please consult --help." >&2; exit 2 ;;
 esac
-# A ui run must be handed a binary with exactly one external asset pack beside
-# it; the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase
-# 15's documented "no UI assets" SKIP into a failure, so asking for ui and
-# supplying a standard binary can no longer pass quietly.
-case "$SMOKE_VARIANT" in
-standard) SUFFIX="" ; REQUIRE_UI=0 ;;
-ui) SUFFIX="-ui" ; REQUIRE_UI=1 ;;
-*) echo "vm-smoke: SMOKE_VARIANT must be standard or ui. Please consult --help." >&2; exit 2 ;;
-esac
-
-if [ -n "$ARTIFACT_DIR" ]; then
-    UI_PACK_SOURCE_DIR="$ARTIFACT_DIR"
-else
-    UI_PACK_SOURCE_DIR="$(dirname "$BINARY_SRC")"
-fi
-shopt -s nullglob
-UI_PACK_CANDIDATES=("$UI_PACK_SOURCE_DIR"/cbm-ui-*.pack)
-shopt -u nullglob
-UI_PACK_COUNT=0
-UI_PACK_NAME=""
-UI_PACK_SOURCE=""
-for candidate in "${UI_PACK_CANDIDATES[@]+"${UI_PACK_CANDIDATES[@]}"}"; do
-    UI_PACK_COUNT=$((UI_PACK_COUNT + 1))
-    UI_PACK_SOURCE="$candidate"
-    candidate_name="$(basename "$candidate")"
-    if ! [[ "$candidate_name" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
-        echo "vm-smoke: invalid UI pack name beside artifact: $candidate_name" >&2
-        exit 2
-    fi
-done
-if [ "$SMOKE_VARIANT" = "ui" ]; then
-    if [ "$UI_PACK_COUNT" -ne 1 ] || [ ! -s "$UI_PACK_SOURCE" ]; then
-        echo "vm-smoke: ui fixture requires exactly one content-addressed UI pack" >&2
-        exit 2
-    fi
-    UI_PACK_NAME="$(basename "$UI_PACK_SOURCE")"
-elif [ "$UI_PACK_COUNT" -ne 0 ]; then
-    echo "vm-smoke: standard fixture must not contain a UI asset pack" >&2
-    exit 2
-fi
+# Whether the UI must be present is the CALLER's claim, not this script's:
+# scripts/ci/smoke-artifact.sh builds --with-ui and packages the real archive, so
+# it sets SMOKE_REQUIRE_UI=1 and Phase 15's "no embedded assets" SKIP becomes a
+# FAILURE there. The fast PR lane deliberately builds without the frontend to
+# skip an npm build on every product PR, so it must not assert UI presence.
+REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
 
 PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
 SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-vm-smoke.XXXXXX")"
@@ -178,45 +141,23 @@ MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile -ExecutionPolicy Bypass \
     -SmokeRoot "$(cygpath -w "$SMOKE_DIR")"
 cp "$BINARY_SRC" "$SMOKE_DIR/codebase-memory-mcp.exe"
 cp "$SMOKE_DIR/codebase-memory-mcp.exe" "$FIXTURE_DIR/"
-if [ -n "$UI_PACK_SOURCE" ]; then
-    cp "$UI_PACK_SOURCE" "$SMOKE_DIR/$UI_PACK_NAME"
-    cp "$UI_PACK_SOURCE" "$FIXTURE_DIR/$UI_PACK_NAME"
-fi
-# The integration asset must sit next to the smoke binary in $SMOKE_DIR: phases
-# that invoke it directly (Phase 14 stages it by hand and drives an uninstall)
-# resolve the asset next to the binary, and without it those render-template
-# operations fail closed. Its own copy lands in the served archive below.
-if [ -n "$ARTIFACT_DIR" ]; then
-    ASSET_SRC="$ARTIFACT_DIR/cbm-integrations.json"
-else
-    ASSET_SRC="$(dirname "$BINARY_SRC")/cbm-integrations.json"
-fi
-cp "$ASSET_SRC" "$SMOKE_DIR/cbm-integrations.json"
 # The install/update phases fetch these out of the served archive, so they must
 # be the artifact's own copies whenever one was supplied — regenerating them
 # here would smoke a sidecar the release never ships.
 if [ -n "$ARTIFACT_DIR" ]; then
-    cp "$ARTIFACT_DIR/cbm-integrations.json" "$ARTIFACT_DIR/LICENSE" \
+    cp "$ARTIFACT_DIR/LICENSE" \
         "$ARTIFACT_DIR/install.ps1" "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
 else
-    # build.sh stages cbm-integrations.json next to the binary; ship it in the
-    # archive so the installed binary can verify and render its templates.
-    cp "$(dirname "$BINARY_SRC")/cbm-integrations.json" LICENSE install.ps1 "$FIXTURE_DIR/"
+    cp LICENSE install.ps1 "$FIXTURE_DIR/"
     scripts/gen-third-party-notices.sh "$FIXTURE_DIR/THIRD_PARTY_NOTICES.md"
 fi
 
-# Member set + ORDER mirror scripts/package-release.sh (Windows): the install
-# verifies cbm-integrations.json against the binary's embedded SHA-256 and fails
-# closed without it.
-EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-windows-${SMOKE_ARCH}.zip"
+# Member set + ORDER mirror scripts/package-release.sh (Windows).
+EXPECTED_ARTIFACT="codebase-memory-mcp-windows-${SMOKE_ARCH}.zip"
 (
     cd "$FIXTURE_DIR"
-    ARCHIVE_MEMBERS=(
-        codebase-memory-mcp.exe cbm-integrations.json LICENSE install.ps1
-        THIRD_PARTY_NOTICES.md
-    )
-    [ -n "$UI_PACK_NAME" ] && ARCHIVE_MEMBERS+=("$UI_PACK_NAME")
-    zip -q "$EXPECTED_ARTIFACT" "${ARCHIVE_MEMBERS[@]}"
+    zip -q "$EXPECTED_ARTIFACT" \
+        codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
     sha256sum *.zip > checksums.txt
 )
 

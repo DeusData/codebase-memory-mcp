@@ -94,10 +94,10 @@ def run_product(argv, cwd, env, timeout=120):
 def verify_relocated_runtime(binary, work):
     """Probe relocation, then install/probe/uninstall beyond legacy MAX_PATH.
 
-    This binds Windows self-discovery to GetModuleFileNameW: both the hidden
-    probe and a process launched from an extended-length path must find the
-    adjacent integration/UI assets without an ANSI-code-page fallback or an
-    environment override. The real install sequence also binds target
+    This binds Windows self-discovery to GetModuleFileNameW: a process launched
+    from an extended-length, non-ASCII path must resolve its own location
+    without an ANSI-code-page fallback. The binary is self-contained, so the
+    whole runtime is one file. The real install sequence also binds target
     existence checks: after a secure first install, the target is rewritten in
     place and a non-force `--no` install must preserve those exact bytes.
     """
@@ -106,18 +106,6 @@ def verify_relocated_runtime(binary, work):
     os.makedirs(runtime_dir, exist_ok=True)
     relocated = os.path.join(runtime_dir, os.path.basename(binary))
     shutil.copy2(binary, relocated)
-
-    integration = os.path.join(source_dir, "cbm-integrations.json")
-    if not os.path.isfile(integration):
-        return "setup: source runtime is missing cbm-integrations.json"
-    shutil.copy2(integration, os.path.join(runtime_dir, "cbm-integrations.json"))
-    packs = []
-    for name in os.listdir(source_dir):
-        if name.startswith("cbm-ui-") and name.endswith(".pack"):
-            source = os.path.join(source_dir, name)
-            if os.path.isfile(source):
-                shutil.copy2(source, os.path.join(runtime_dir, name))
-                packs.append(name)
 
     env = os.environ.copy()
     env.pop("CBM_ASSETS_DIR", None)
@@ -156,10 +144,10 @@ def verify_relocated_runtime(binary, work):
         stop_runtime_daemon()
         return message
 
-    probe = run_product([relocated, "--verify-runtime-assets"], runtime_dir, env)
+    probe = run_product([relocated, "--version"], runtime_dir, env)
     if probe.returncode != 0:
-        return fail("runtime probe rc=%d output=%r packs=%r" % (
-            probe.returncode, probe.stdout[-800:], packs))
+        return fail("runtime probe rc=%d output=%r" % (
+            probe.returncode, probe.stdout[-800:]))
 
     # Keep every component below the per-component limit while making the
     # complete UTF-16 path decisively longer than legacy MAX_PATH. The product,
@@ -191,15 +179,9 @@ def verify_relocated_runtime(binary, work):
     installed_extended = windows_extended_path(installed)
     if not os.path.isfile(installed_extended):
         return fail("long-path install did not publish %r" % installed)
-    integration_installed = os.path.join(target, "cbm-integrations.json")
-    if not os.path.isfile(windows_extended_path(integration_installed)):
-        return fail("long-path install omitted cbm-integrations.json")
-    for name in packs:
-        if not os.path.isfile(windows_extended_path(os.path.join(target, name))):
-            return fail("long-path install omitted UI pack %s" % name)
 
     installed_probe = run_product(
-        [installed_extended, "--verify-runtime-assets"], runtime_dir, env)
+        [installed_extended, "--version"], runtime_dir, env)
     if installed_probe.returncode != 0:
         return fail("installed long-path probe rc=%d output=%r" % (
             installed_probe.returncode, installed_probe.stdout[-1200:]))
@@ -235,7 +217,7 @@ def verify_relocated_runtime(binary, work):
         return fail("long-path restore install rc=%d output=%r" % (
             restore.returncode, restore.stdout[-1200:]))
     restored_probe = run_product(
-        [installed_extended, "--verify-runtime-assets"], runtime_dir, env)
+        [installed_extended, "--version"], runtime_dir, env)
     if restored_probe.returncode != 0:
         return fail("restored long-path probe rc=%d output=%r" % (
             restored_probe.returncode, restored_probe.stdout[-1200:]))
@@ -252,11 +234,6 @@ def verify_relocated_runtime(binary, work):
             uninstall.returncode, uninstall.stdout[-1200:]))
     if os.path.exists(installed_extended):
         return fail("long-path uninstall retained the installed executable")
-    if os.path.exists(windows_extended_path(integration_installed)):
-        return fail("long-path uninstall retained owned integration assets")
-    for name in packs:
-        if os.path.exists(windows_extended_path(os.path.join(target, name))):
-            return fail("long-path uninstall retained owned UI pack %s" % name)
     stop_runtime_daemon()
     return None
 
@@ -275,14 +252,38 @@ def index_and_count(binary, repo, cache):
     with McpServer(binary, cache_dir=cache) as s:
         s.initialize()
         resp = s.call_tool("index_repository", {"repo_path": repo}, timeout=180)
-        _, err = s.tool_text(resp)
+        index_txt, err = s.tool_text(resp)
         if err:
             return {"error": "index tools/call error: %r" % err}
         lp = s.call_tool("list_projects", {}, timeout=60)
         lp_txt, _ = s.tool_text(lp)
         projects = json.loads(lp_txt).get("projects") or []
         if not projects:
-            return {"error": "no project listed after index"}
+            # The count summary cannot explain a venue-specific empty listing;
+            # carry the index response and the cache contents into the log.
+            try:
+                cache_entries = sorted(os.listdir(cache))
+            except OSError as exc:
+                cache_entries = ["<listdir failed: %s>" % exc]
+            # The supervisor's worker logs carry the actual pipeline error.
+            log_tails = []
+            logs_dir = os.path.join(cache, "logs")
+            if os.path.isdir(logs_dir):
+                for log_name in sorted(os.listdir(logs_dir)):
+                    try:
+                        with open(os.path.join(logs_dir, log_name), "rb") as lf:
+                            tail = lf.read()[-800:].decode("utf-8", "replace")
+                        log_tails.append("%s: %s" % (log_name, tail))
+                    except OSError as exc:
+                        log_tails.append("%s: <unreadable: %s>" % (log_name, exc))
+            try:
+                repo_entries = sorted(os.listdir(repo))
+            except OSError as exc:
+                repo_entries = ["<listdir failed: %s>" % exc]
+            return {"error": "no project listed after index; index said %r; "
+                             "cache holds %r; repo holds %r; worker logs: %s"
+                             % (index_txt[:400], cache_entries, repo_entries,
+                                " | ".join(log_tails) or "<none>")}
         p = projects[0]
         out = {"name": p.get("name"), "nodes": p.get("nodes"),
                "edges": p.get("edges")}
@@ -355,6 +356,54 @@ def main():
                    got.get("definition_nodes"), base["nodes"], base["edges"],
                    base["definition_nodes"], got.get("name")))
             if not ok:
+                # The counts alone cannot explain a venue-specific failure;
+                # surface the captured error verbatim so CI logs carry the
+                # diagnosis instead of swallowing it.
+                if got.get("error"):
+                    print("       %s error: %s" % (key, got["error"]))
+                # Discriminate order-dependence from path-dependence: the same
+                # repo, fresh cache, immediately again. A passing retry means
+                # the previous case's daemon interfered; a failing retry means
+                # the path itself is the trigger.
+                retry = index_and_count(binary, repo,
+                                        os.path.join(work, "c2_" + key))
+                print("       %s retry: nodes=%s error=%s" % (
+                    key, retry.get("nodes"), retry.get("error", "")[:200] or None))
+                if (not retry.get("error")
+                        and retry.get("nodes") == base["nodes"]
+                        and retry.get("edges") == base["edges"]
+                        and retry.get("definition_nodes") == base["definition_nodes"]):
+                    print("       %s retry matched baseline -- order-dependent, "
+                          "not path-dependent" % key)
+                else:
+                    # The MCP result hides the pipeline's own diagnostics; the
+                    # CLI entrypoint prints them. Same repo, third fresh cache.
+                    cli_cache = os.path.join(work, "c3_" + key)
+                    cli_env = os.environ.copy()
+                    cli_env["CBM_CACHE_DIR"] = cli_cache
+                    # CBM_PROFILE keeps the supervisor from unlinking the worker
+                    # log on a clean exit (index.supervisor.profile_log), which
+                    # is the only record of the pipeline's own diagnostics.
+                    cli_env["CBM_PROFILE"] = "1"
+                    cli = subprocess.run(
+                        [binary, "cli", "index_repository",
+                         json.dumps({"repo_path": repo})],
+                        capture_output=True, timeout=180, env=cli_env)
+                    cli_out = (cli.stdout or b"").decode("utf-8", "replace")
+                    cli_err = (cli.stderr or b"").decode("utf-8", "replace")
+                    print("       %s cli probe rc=%s\n       stdout: %s\n"
+                          "       stderr: %s" % (key, cli.returncode,
+                                                 cli_out[-900:], cli_err[-900:]))
+                    probe_logs = os.path.join(cli_cache, "logs")
+                    if os.path.isdir(probe_logs):
+                        for log_name in sorted(os.listdir(probe_logs)):
+                            try:
+                                with open(os.path.join(probe_logs, log_name), "rb") as lf:
+                                    tail = lf.read()[-1500:].decode("utf-8", "replace")
+                            except OSError as exc:
+                                tail = "<unreadable: %s>" % exc
+                            print("       %s worker log %s:\n%s"
+                                  % (key, log_name, tail))
                 failures.append(key)
     finally:
         shutil.rmtree(work, ignore_errors=True)

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# INVERTED release-surface contract: Windows ships ONE executable plus its
-# authenticated runtime assets.
+# INVERTED release-surface contract: Windows ships ONE binary.
 #
 # History this guards against. The Windows release used to be a PAIR — a small
 # permanent launcher (codebase-memory-mcp.exe) plus the real product binary
@@ -8,15 +7,18 @@
 # reason: a running .exe cannot replace its own image on Windows, so an
 # in-process self-update needs a second resident binary to do the swap.
 #
-# That stub was a small unsigned PE whose whole job was verify-and-execute
-# another binary: unnecessary loader-like behavior and a second artifact to
-# audit. Historical variants received Microsoft Wacatac verdicts, but those
-# observations did not expose a stable feature or prove classifier causation.
+# That stub is statically indistinguishable from a dropper — a small unsigned
+# PE whose whole job is verify-and-execute another binary — and Defender's ML
+# scored it Trojan:Win32/Wacatac.B!ml on x64 regardless of what we changed
+# (bcrypt-free, stripped, VERSIONINFO'd and even resource-free builds were all
+# flagged), while the product binary itself scans clean on every platform.
 #
-# The fix removed the stub. The downloaded candidate now owns the complete
-# runtime-set transaction under the native activation guard; install.ps1 only
-# verifies/extracts and invokes it. In particular, the script must never retire
-# the old executable or publish sidecars ahead of the guarded transaction.
+# The fix removed the stub and moved self-update OUT of the process into
+# install.ps1, which runs while CBM is NOT running. So this file asserts the
+# ABSENCE of the flagged design, plus the one step that replaces it:
+# install.ps1 must RETIRE the running binary (rename it out of the way) before
+# publishing the new one — losing that step silently breaks every Windows
+# update.
 #
 # The non-launcher release/security assertions from the previous contract
 # (VM-driver hardening, archive allowlists, HTTPS-only downloads, profile-rooted
@@ -73,32 +75,22 @@ def yaml_run_blocks(text: str) -> list[str]:
 
 binary = "codebase-memory-mcp.exe"
 payload = "codebase-memory-mcp.payload.exe"
-# cbm-integrations.json: the integration templates the binary verifies by its
-# embedded SHA-256 before installing anything. install.ps1 runs `install` from
-# the extract dir, so the file must sit NEXT TO the .exe or every install
-# fails closed with "integration assets missing or modified".
-windows_archive_names = (
-    binary, "cbm-integrations.json", "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.md",
-)
-ui_pack_pattern = r"cbm-ui-[0-9a-f]{64}\.pack"
+windows_archive_names = (binary, "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.md")
 
-# ── 1. Standard is five files; UI adds exactly one root pack ────────────────
+# ── 1. The archive is exactly four files, defined in ONE place ───────────────
 # Every venue (release build, local artifact-flow smoke) produces archives
 # through scripts/package-release.sh, so the layout is asserted where it is
 # defined and cannot fork per venue.
 package_release = read("scripts/package-release.sh")
-member_blocks = re.findall(
-    r"ARCHIVE_MEMBERS=\(\s*(?P<members>.*?)\s*\)", package_release, re.DOTALL
+zip_call = re.search(
+    r"zip -q \"\$OUT_DIR/\$NAME\.zip\" \\\n(?P<members>(?:.|\n)*?)\n", package_release
 )
-normalized_member_blocks = [block.split() for block in member_blocks]
+require(zip_call is not None, "package-release.sh must build the Windows zip in one zip call")
+zip_members = zip_call.group("members").split() if zip_call else []
 require(
-    list(windows_archive_names) in normalized_member_blocks,
-    "package-release.sh must define the exact five-member Windows standard archive",
-)
-require(
-    package_release.count('ARCHIVE_MEMBERS+=("$UI_PACK_NAME")') == 2
-    and "^cbm-ui-[0-9a-f]{64}\\.pack$" in package_release,
-    "package-release.sh must append exactly one hash-shaped root pack only to UI archives",
+    zip_members == list(windows_archive_names),
+    "package-release.sh must archive EXACTLY "
+    f"{' '.join(windows_archive_names)} (found: {' '.join(zip_members) or 'nothing'})",
 )
 
 # ── 2. No shipped surface may name the payload or build a launcher ───────────
@@ -124,8 +116,8 @@ for relative in shipped_surfaces:
     for marker in launcher_markers:
         require(
             marker not in source,
-            f"{relative} must not reference '{marker}': Windows ships one executable and the "
-            "retired launcher/payload split must not return",
+            f"{relative} must not reference '{marker}': Windows ships ONE binary and the "
+            "launcher stub is what Defender flagged as Trojan:Win32/Wacatac.B!ml",
         )
 
 # The stub sources themselves must stay deleted, and the build must not carry a
@@ -147,27 +139,25 @@ require(
     "Makefile.cbm must not expose a Windows launcher target or variable",
 )
 
-# The single shipped Windows runtime is UI-enabled and is produced through the
-# ONE canonical packaging entry, so the six-file layout above governs it.
+# Every archive is produced through the ONE canonical packaging entry, so the
+# four-file layout above governs all of them. A reappearing --variant flag would
+# mean the retired two-composition split is back.
 build_workflow = read(".github/workflows/_build.yml")
 for archive, call in (
-    ("codebase-memory-mcp-ui-windows-amd64.zip",
-     "scripts/package-release.sh windows amd64 --variant ui"),
-    ("codebase-memory-mcp-ui-windows-arm64.zip",
-     "scripts/package-release.sh windows arm64 --variant ui"),
+    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64"),
+    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64"),
 ):
     require(
-        build_workflow.count(call) == 1,
+        re.search(re.escape(call) + r"(?!\s+--variant)", build_workflow) is not None,
         f"_build.yml must produce {archive} via the canonical packaging entry ('{call}')",
     )
-require(
-    re.search(r"scripts/package-release\.sh windows (?:amd64|arm64)(?!\s+--variant)", build_workflow) is None
-    and "ui_only" not in build_workflow
-    and "Build standard binary" not in build_workflow,
-    "_build.yml must not retain a standard/non-UI Windows release path",
-)
 
-# ── 3. install.ps1 delegates every runtime mutation to the candidate ─────────
+# ── 3. install.ps1 retires the running binary before publishing ──────────────
+# This is THE step that replaces the launcher. Windows keeps an image lock on a
+# running .exe: it cannot be overwritten, but it CAN be renamed out of the way.
+# install.ps1 runs while CBM is not running, renames the installed binary to
+# "<dest>.retired-<timestamp>", then installs over the freed name. Without the
+# retire step every Windows update fails on a locked destination.
 installer = read("install.ps1")
 # Windows PowerShell 5.1 decodes a BOM-less .ps1 as ANSI, so a UTF-8 em-dash
 # arrives as three cp1252 characters ending in a double quote. Inside a string
@@ -182,76 +172,43 @@ require(
     + ", ".join(f"U+{ord(ch):04X}" for ch in non_ascii)
     + ")",
 )
+require(
+    "$Dest = Join-Path $InstallDir $BinName" in installer,
+    "install.ps1 must resolve the canonical install destination as $Dest",
+)
+retire_match = re.search(
+    r"if \(Test-Path -LiteralPath \$Dest -PathType Leaf\) \{(?P<body>(?:.|\n)*?)\n\}\n",
+    installer,
+)
+retire = retire_match.group("body") if retire_match else ""
+require(
+    retire_match is not None
+    and re.search(r"\$retired\s*=\s*\"\$Dest\.retired-", retire) is not None
+    and "Move-Item -LiteralPath $Dest -Destination $retired" in retire,
+    "install.ps1 must RETIRE the running binary (Move-Item $Dest -> $retired) before "
+    "publishing the new one — a running .exe cannot be overwritten in place",
+)
+require(
+    retire_match is not None and "$renamed" in retire and "exit 1" in retire,
+    "install.ps1 must fail loudly when the running binary cannot be retired",
+)
 publish_index = installer.find("& $DownloadedBinary @InstallArgs")
 require(
-    publish_index >= 0,
-    "install.ps1 must invoke the downloaded candidate's native install command",
+    publish_index > (retire_match.start() if retire_match else -1) >= 0,
+    "install.ps1 must retire BEFORE it publishes the downloaded binary",
 )
 require(
     "& $DownloadedBinary --version" in installer
     and "& $DownloadedBinary @InstallArgs" in installer,
     "install.ps1 must verify and install through the downloaded binary",
 )
-require(
-    "Move-Item -LiteralPath $Dest" not in installer
-    and ".retired-" not in installer
-    and "& $Dest daemon stop" not in installer,
-    "install.ps1 must not retire, delete, or stop the installed executable before candidate install",
-)
-require(
-    "Publish-CbmSidecarAtomically" not in installer
-    and "$AssetDest" not in installer
-    and "$packDestination" not in installer
-    and 'Get-ChildItem -LiteralPath $InstallDir -Filter "cbm-ui-*.pack"' not in installer,
-    "install.ps1 must not publish or garbage-collect runtime sidecars outside the native guard",
-)
-
-# The download workspace is recursively deleted on every exit path, so the
-# installer must create it itself and must never adopt an existing name. Bind
-# the reservation to this directory specifically; the updater-file publisher
-# below has a separate exclusive-sibling helper.
-temp_dir_factory = re.search(
-    r"function\s+New-CbmExclusiveTempDirectory\s*\{(?P<body>.*?)\n\}\s*\n\s*# Detect variant",
-    installer,
-    re.DOTALL,
-)
-temp_dir_body = temp_dir_factory.group("body") if temp_dir_factory else ""
-require(
-    temp_dir_factory is not None
-    and '[guid]::NewGuid().ToString("N")' in temp_dir_body
-    and "for ($attempt = 0; $attempt -lt 32; $attempt++)" in temp_dir_body
-    and "New-Item -ItemType Directory -Path $candidate -ErrorAction Stop" in temp_dir_body
-    and "catch [System.IO.IOException]" in temp_dir_body
-    and re.search(r"New-Item[^\n]*-Force", temp_dir_body) is None
-    and "Remove-Item" not in temp_dir_body
-    and "Test-Path" not in temp_dir_body,
-    "install.ps1 must reserve a high-entropy temporary directory exclusively with bounded "
-    "collision retries, never adopt or pre-clean an existing path",
-)
-require(
-    "$TmpDir = New-CbmExclusiveTempDirectory -ParentDirectory "
-    "([System.IO.Path]::GetTempPath())" in installer
-    and '"cbm-install-$(Get-Random)"' not in installer
-    and "New-Item -ItemType Directory -Path $TmpDir -Force" not in installer,
-    "install.ps1 must clean up only the temporary directory it successfully reserved",
-)
-
-# Bind validation to the opened handle, including its exact 64-bit size. A
-# raced replacement with a valid prefix plus trailing data must be rejected.
-asset_pack = read("src/ui/asset_pack.c")
-require(
-    "handle_info.nFileSizeHigh" in asset_pack
-    and "handle_info.nFileSizeLow" in asset_pack
-    and re.search(r"handle_size\s*==\s*expected", asset_pack) is not None,
-    "Windows UI pack validation must compare the opened handle's 64-bit size to the manifest",
-)
 
 # ── 4. Package-manager shims resolve the single Windows binary ───────────────
 single_binary_contracts = {
     "pkg/npm/install.js": (
         r"const\s+WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
-        r"publishRuntimeSetWithRecovery\(",
-        r"runtimeSetReady\(",
+        r"installWindowsBinaryAtomically\(",
+        r"windowsBinaryReady\(",
     ),
     "pkg/npm/bin.js": (
         r"binName\s*=\s*isWindows\s*\?\s*['\"]codebase-memory-mcp\.exe['\"]",
@@ -260,7 +217,6 @@ single_binary_contracts = {
     "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
         r"_WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
         r"def\s+_runtime_set_ready\(",
-        r"def\s+_publish_runtime_set\(",
     ),
 }
 for relative, patterns in single_binary_contracts.items():
@@ -274,21 +230,18 @@ for relative, patterns in single_binary_contracts.items():
         f"{relative} must remain portable and not own managed launcher state",
     )
 
-# All package downloaders parse the Windows archive against an exact official
-# root allowlist; direct install.ps1 additionally distinguishes standard from
-# UI by the single hash-shaped pack.
+# All package downloaders parse the Windows archive against the exact official
+# four-root-file allowlist; they may not silently ignore an attacker-controlled
+# fifth member.
 exact_archive_guards = {
     "install.ps1": (
-        "$seen.Count -ne $expectedArchiveCount",
-        "$uiPackCount -ne $expectedUiPackCount",
-        "$UiPackPattern",
+        "$seen.Count -ne $WindowsArchiveNames.Count",
         '"LICENSE"',
         '"install.ps1"',
         "THIRD_PARTY_NOTICES.md",
     ),
     "pkg/npm/install.js": (
-        "seen.size !== expectedCount",
-        "UI_PACK_PATTERN",
+        "$seen.Count -ne $requiredNames.Count",
         "WINDOWS_BINARY_NAME",
         "'LICENSE'",
         "'install.ps1'",
@@ -296,8 +249,7 @@ exact_archive_guards = {
     ),
     "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
         "name not in required_set",
-        "len(seen) != expected_count",
-        "_UI_PACK_RE",
+        "len(seen) != len(required)",
         "_WINDOWS_BINARY_NAME",
         '"LICENSE"',
         '"install.ps1"',
@@ -308,7 +260,7 @@ for relative, needles in exact_archive_guards.items():
     source = read(relative)
     require(
         all(needle in source for needle in needles),
-        f"{relative} must reject every Windows zip namespace except its official exact "
+        f"{relative} must reject every Windows zip namespace except the official four-file "
         "allowlist",
     )
 
@@ -603,7 +555,7 @@ require(
     "cmd.exe",
 )
 
-# ── 8. Release smoke stays profile-rooted and one-executable ─────────────────
+# ── 8. Release smoke stays profile-rooted and single-binary ──────────────────
 smoke_workflow = read(".github/workflows/_smoke.yml")
 windows_match = re.search(
     r"(?ms)^  smoke-windows:\s*(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)", smoke_workflow
@@ -654,7 +606,7 @@ require(
             '"$LAUNCH_DIR/codebase-memory-mcp.exe" --version',
         )
     ),
-    "Windows release version checks must execute the runtime set's one executable beneath the current "
+    "Windows release version checks must execute the single binary beneath the current "
     "account profile",
 )
 # RUNNER_TEMP is legitimate ONLY for artifact provisioning/scanning; every
@@ -691,7 +643,7 @@ require(
             'scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"',
         )
     ),
-    "Windows release install audit must execute the runtime set's one executable beneath the current "
+    "Windows release install audit must execute the single binary beneath the current "
     "account profile",
 )
 
@@ -699,11 +651,8 @@ require(
 smoke_script = read("scripts/smoke-test.sh")
 require(
     'copy_smoke_binary "$FAKE_HOME/.local/bin/codebase-memory-mcp.exe"' not in smoke_script
-    and 'copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"' in smoke_script
-    and 'cp "$SMOKE_UI_PACK" "$(dirname "$destination")/$(basename "$SMOKE_UI_PACK")"'
-    in smoke_script,
-    "Windows smoke must leave the authenticated-install target absent while staging the complete "
-    "binary-plus-pack runtime set for the explicit update fixture",
+    and 'copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"' not in smoke_script,
+    "Windows smoke must leave canonical targets absent for an authenticated install",
 )
 require(
     "smoke_mktemp_file" in smoke_script
@@ -732,7 +681,7 @@ require(
     'HOME="$WIN_HOME" TEMP="$WIN_HOME" TMP="$WIN_HOME"' in smoke_script
     and "MSYS2_ARG_CONV_EXCL='*'" in smoke_script
     and "powershell.exe -NoProfile -ExecutionPolicy Bypass -File" in smoke_script
-    and '"$WIN_SCRIPT" "$DL_VARIANT_ARG" "--dir=$WIN_DIR"' in smoke_script
+    and '"$WIN_SCRIPT" "--dir=$WIN_DIR"' in smoke_script
     and "& $args[1]" not in smoke_script,
     "Windows install.ps1 smoke must pass native HOME/TEMP/TMP and execute the script directly",
 )
@@ -860,10 +809,10 @@ if pr_windows_blocks:
     )
 
 if failures:
-    print("Windows one-executable runtime-set contract FAILED:", file=sys.stderr)
+    print("Windows single-binary bundle contract FAILED:", file=sys.stderr)
     for failure in failures:
         print(f"  - {failure}", file=sys.stderr)
     raise SystemExit(1)
 
-print("Windows one-executable runtime-set contract passed")
+print("Windows single-binary bundle contract passed")
 PY

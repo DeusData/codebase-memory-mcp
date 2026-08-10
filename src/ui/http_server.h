@@ -2,7 +2,7 @@
  * http_server.h — Embedded HTTP server for the graph visualization UI.
  *
  * Binds to 127.0.0.1:<port> only (localhost).
- * Serves the verified external frontend pack and proxies /rpc to a dedicated
+ * Serves embedded frontend assets and proxies /rpc to a dedicated
  * read-only cbm_mcp_server_t instance.
  *
  * Runs in a background pthread, same pattern as the watcher thread.

@@ -78,7 +78,7 @@ enum {
 #include <io.h>       /* _close — async-signal-safe stdin fd close in request_shutdown */
 #endif
 #include "ui/http_server.h"
-#include "ui/asset_pack.h"
+#include "ui/embedded_assets.h"
 #include "ui/config.h"
 #include <yyjson/yyjson.h>
 
@@ -1085,14 +1085,6 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         }
     }
     for (int i = SKIP_ONE; i < argc; i++) {
-        if (strcmp(argv[i], "--verify-runtime-assets") == 0) {
-            if (i != SKIP_ONE || argc != MAIN_CLI_ARGC) {
-                (void)fprintf(
-                    stderr, "codebase-memory-mcp: --verify-runtime-assets accepts no arguments\n");
-                return 2;
-            }
-            return cbm_cmd_verify_runtime_assets();
-        }
         if (strcmp(argv[i], "--version") == 0) {
             printf("codebase-memory-mcp %s\n", CBM_VERSION);
             return 0;
@@ -1134,12 +1126,16 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
 }
 
 /* Parse --ui= and --port= into a per-field daemon mutation. */
-static uint8_t parse_ui_flags(int argc, char **argv, bool *ui_enabled, int *ui_port,
-                              bool *explicit_enable) {
+static int parse_ui_flags(int argc, char **argv, bool *ui_enabled, int *ui_port,
+                          bool *explicit_enable) {
     uint8_t update_mask = 0;
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strncmp(argv[i], "--ui=", SLEN("--ui=")) == 0) {
-            *ui_enabled = strcmp(argv[i] + MAIN_FLAG_OFF, "true") == 0;
+            if (!cbm_ui_parse_enabled(argv[i] + MAIN_FLAG_OFF, ui_enabled)) {
+                (void)fprintf(stderr,
+                              "error: invalid --ui value; use --ui=true or --ui=false\n");
+                return -1;
+            }
             if (explicit_enable && *ui_enabled) {
                 *explicit_enable = true;
             }
@@ -1147,14 +1143,12 @@ static uint8_t parse_ui_flags(int argc, char **argv, bool *ui_enabled, int *ui_p
         }
         if (strncmp(argv[i], "--port=", SLEN("--port=")) == 0) {
             const char *value = argv[i] + MAIN_PORT_OFF;
-            char *end = NULL;
-            errno = 0;
-            long port = strtol(value, &end, CBM_DECIMAL_BASE);
-            if (errno == 0 && end != value && end && *end == '\0' && port > 0 &&
-                port < MAIN_MAX_PORT) {
-                *ui_port = (int)port;
-                update_mask |= CBM_DAEMON_APPLICATION_UI_CONFIG_PORT;
+            if (!cbm_ui_parse_port(value, ui_port)) {
+                (void)fprintf(stderr,
+                              "error: invalid --port value; use an integer from 1 to 65535\n");
+                return -1;
             }
+            update_mask |= CBM_DAEMON_APPLICATION_UI_CONFIG_PORT;
         }
     }
     return update_mask;
@@ -2163,7 +2157,7 @@ static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_i
                                           bool open_browser);
 
 static void main_daemon_ctl_print_ui_configuration(void) {
-    if (!cbm_ui_assets_supported()) {
+    if (!(CBM_EMBEDDED_FILE_COUNT > 0)) {
         return;
     }
     cbm_ui_config_t ui_config;
@@ -2246,8 +2240,7 @@ static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_i
                       "opened\n",
                       timeout_ms);
         (void)fprintf(stderr,
-                      "hint: verify matching runtime assets with `codebase-memory-mcp "
-                      "--verify-runtime-assets`, check the daemon log, and if port %d is in use "
+                      "hint: check the daemon log, and if port %d is in use "
                       "retry with --port=N\n",
                       port);
         return EXIT_FAILURE;
@@ -2354,7 +2347,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
                    "last session; run `daemon stop` first if you want a permanent one\n",
                    (unsigned long)status.daemon_pid);
         }
-        if (!cbm_ui_assets_supported()) {
+        if (!(CBM_EMBEDDED_FILE_COUNT > 0)) {
             if (requested_port > 0 || open_browser) {
                 (void)fprintf(stderr, "warning: this binary was built without UI support; "
                                       "--port/--open have no effect\n");
@@ -2419,7 +2412,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     /* The committed control connection satisfied the daemon's no-client
      * startup window; configure the UI before departing. */
     int ui_port = 0;
-    if (cbm_ui_assets_supported()) {
+    if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
         ui_port = requested_port > 0 ? requested_port : ui_config.ui_port;
@@ -2452,7 +2445,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
     int ui_result =
-        cbm_ui_assets_supported()
+        (CBM_EMBEDDED_FILE_COUNT > 0)
             ? main_daemon_ctl_finish_ui_open(&start_result.client, ui_port, open_browser)
             : EXIT_SUCCESS;
     if (start_result.client) {
@@ -2491,6 +2484,18 @@ int main(int argc, char **argv) {
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init();
     cbm_log_init_from_env();
+
+    bool requested_ui_enabled = false;
+    int requested_ui_port = 0;
+    bool explicitly_enabled = false;
+    int ui_update_mask = 0;
+    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
+        ui_update_mask = parse_ui_flags(argc, argv, &requested_ui_enabled, &requested_ui_port,
+                                        &explicitly_enabled);
+        if (ui_update_mask < 0) {
+            return 2;
+        }
+    }
 
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
@@ -2968,13 +2973,9 @@ int main(int argc, char **argv) {
      * flags before bootstrap could reconfigure the already-running daemon
      * even though that client was then rejected. */
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT && cbm_mcp_tool_profile_allows_http(tool_profile)) {
-        bool ui_enabled = false;
-        int ui_port = 0;
-        bool explicitly_enabled = false;
-        uint8_t update_mask =
-            parse_ui_flags(argc, argv, &ui_enabled, &ui_port, &explicitly_enabled);
-        if (update_mask != 0 && cbm_daemon_application_client_set_ui_config(
-                                    g_daemon_client, update_mask, ui_enabled, ui_port,
+        if (ui_update_mask != 0 && cbm_daemon_application_client_set_ui_config(
+                                       g_daemon_client, (uint8_t)ui_update_mask,
+                                       requested_ui_enabled, requested_ui_port,
                                     MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
             (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
@@ -2982,7 +2983,7 @@ int main(int argc, char **argv) {
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_FAILURE;
         }
-        if (explicitly_enabled && !cbm_ui_assets_supported()) {
+        if (explicitly_enabled && !(CBM_EMBEDDED_FILE_COUNT > 0)) {
             (void)fprintf(stderr, "codebase-memory-mcp: --ui requested, but this binary was built "
                                   "without UI support; rebuild with `make -f Makefile.cbm "
                                   "cbm-with-ui`.\n");

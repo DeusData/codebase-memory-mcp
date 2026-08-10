@@ -215,12 +215,20 @@ endif
 # link), this flag fixes the OUTCOME, and the composition gate proves it on the
 # shipped artifact. ELF-only: Apple's ld rejects -z noexecstack outright and it
 # is meaningless for PE, so it is gated rather than made "common".
+#
+# -z separate-code additionally keeps read-only DATA out of the executable
+# segment. GNU ld enables it by default on x86-64 but NOT on aarch64, so the
+# arm64 binaries emitted ONE R E PT_LOAD spanning the whole image: .rodata is
+# correctly marked A (not AX), but the kernel applies SEGMENT permissions, so
+# ~259 MB of tree-sitter parse tables was mapped executable at runtime while the
+# amd64 build of the same source mapped them R only. That is a large ROP gadget
+# surface for data that is never executed, and it is invisible to section flags.
 ELF_HARDENING_FLAGS :=
 ifeq ($(IS_LINUX),yes)
 # A Linux container may cross-compile a PE binary. IS_LINUX identifies the
 # build host, so the compiler-derived target guard is also required.
 ifneq ($(IS_MINGW),yes)
-ELF_HARDENING_FLAGS := -Wl,-z,noexecstack
+ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code
 endif
 endif
 
@@ -434,19 +442,17 @@ GIT_SRCS = src/git/git_command.c \
 
 # CLI module (new)
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
-	src/cli/agent_clients.c src/cli/agent_profiles.c src/cli/integration_assets.c \
+	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
 	src/cli/config_text_edit.c src/cli/activation_transaction.c
 
-# UI module (graph visualization). Production-standard builds deliberately link
-# only the no-I/O pack stub. Test binaries substitute the real parser plus the
-# empty manifest so parser/install behavior remains covered without a UI pack.
+# UI module (graph visualization)
 UI_SRCS = \
     src/ui/config.c \
     src/ui/http_server.c \
     src/ui/layout3d.c \
     src/ui/httpd.c \
-    src/ui/asset_pack_stub.c
+    src/ui/embedded_stub.c
 
 # mimalloc (vendored, global allocator override)
 #
@@ -534,7 +540,6 @@ YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
 PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(DEPINDEX_SRCS) $(PAGERANK_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
-TEST_PROD_SRCS = $(subst src/ui/asset_pack_stub.c,src/ui/asset_pack.c src/ui/asset_manifest_stub.c,$(PROD_SRCS))
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -551,17 +556,6 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 # thousands of grammar headers would cost more than it protects.
 PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h tests/*.h \
                tests/repro/*.h)
-
-# ── Integration-asset integrity constant (generated, never hand-edited) ──
-# The binary embeds exactly ONE fact about the shipped integration templates:
-# the SHA-256 of assets/cbm-integrations.json, generated at build time (rule
-# below the BUILD_DIR definition; target lines expand immediately). Appended
-# to PROJECT_HDRS so every single-invocation target (test-runner,
-# test-repro-runner, test-runner-tsan, codebase-memory-mcp) rebuilds when the
-# asset changes — a stale constant would make every install fail verification.
-INTEGRATIONS_ASSET = assets/cbm-integrations.json
-INTEGRATIONS_HASH_HDR = $(BUILD_DIR)/generated/cbm_integrations_hash.h
-PROJECT_HDRS += $(INTEGRATIONS_HASH_HDR)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -868,11 +862,6 @@ ALL_TEST_SRCS = \
 
 BUILD_DIR = build/c
 
-# Integration-asset hash header (variables defined next to PROJECT_HDRS; the
-# rule lives here because target lines expand $(BUILD_DIR) immediately).
-$(INTEGRATIONS_HASH_HDR): $(INTEGRATIONS_ASSET) scripts/gen-integrations-hash.sh | $(BUILD_DIR)
-	sh scripts/gen-integrations-hash.sh $(INTEGRATIONS_ASSET) $@
-
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
@@ -904,7 +893,7 @@ GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
 .PHONY: test test-par test-focused test-compositional test-repro test-foundation test-tsan \
         test-syntax test-daemon-smoke \
         test-leak test-analyze test-memory test-gmalloc cbm \
-        cbm-with-ui frontend ui-pack clean-c lint lint-tidy lint-cppcheck \
+        cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck \
         lint-format lint-source-safety install test-runner-nosan security \
 		native-extraction-benchmark
 
@@ -1128,16 +1117,16 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(SQLITE3_OBJ_TSAN) $(TRE_OBJ_TSAN) $(GRAMMAR_OBJS_TSAN) $(TS_RUNTIME_OBJ_TSAN) $(LSP_OBJ_TSAN) $(PP_OBJ_TSAN) $(LZ4_OBJ_TSAN) $(ZSTD_OBJ_TSAN) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(TEST_PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) $(TEST_INCLUDE_FLAGS) -o $@ \
-		$(ALL_TEST_SRCS) $(TEST_PROD_SRCS) \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
-$(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(TEST_PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_NOSAN) | $(BUILD_DIR) $(NOSAN_DIR)
+$(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_NOSAN) | $(BUILD_DIR) $(NOSAN_DIR)
 	$(CC) $(CFLAGS_NOSAN) $(TEST_INCLUDE_FLAGS) -o $@ \
-		$(ALL_TEST_SRCS) $(TEST_PROD_SRCS) \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_NOSAN) \
 		$(LDFLAGS_NOSAN)
@@ -1204,9 +1193,9 @@ endif
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(TEST_PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
-		$(TEST_REPRO_SRCS) $(TEST_PROD_SRCS) \
+		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
@@ -1277,9 +1266,9 @@ TSAN_OPTIONS ?= halt_on_error=1:report_thread_leaks=0
 # Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
 # invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
-$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(TEST_PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TSAN) $(TEST_INCLUDE_FLAGS) -o $@ \
-		$(ALL_TEST_SRCS) $(TEST_PROD_SRCS) \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TSAN) \
 		$(LDFLAGS_TSAN)
@@ -1510,44 +1499,32 @@ install: cbm
 	@echo "Installing to $(INSTALL_DIR)/codebase-memory-mcp ..."
 	install -d "$(INSTALL_DIR)"
 	install -m 755 "$(BUILD_DIR)/codebase-memory-mcp" "$(INSTALL_DIR)/codebase-memory-mcp"
-	install -m 644 "$(INTEGRATIONS_ASSET)" "$(INSTALL_DIR)/cbm-integrations.json"
 	$(call codesign_binary,$(INSTALL_DIR)/codebase-memory-mcp)
 	@echo "Done. Run: $(INSTALL_DIR)/codebase-memory-mcp"
 
-# ── Build with external UI asset pack (requires Node.js) ────────
+# ── Build with embedded UI (requires Node.js) ───────────────────
 
-# The native image contains only a generated manifest (pack basename, SHA-256
-# and byte length). Frontend bytes stay in a content-addressed sidecar next to
-# the binary so release scanners can inspect them independently.
-UI_ASSET_MANIFEST = $(BUILD_DIR)/generated/ui_asset_manifest.c
-UI_ASSET_DIST ?= graph-ui/dist
-UI_ASSET_PREBUILT ?= 0
-ifeq ($(UI_ASSET_PREBUILT),1)
-UI_ASSET_BUILD_PREREQ :=
-else
-UI_ASSET_BUILD_PREREQ := frontend
-endif
-PROD_SRCS_WITH_ASSETS = $(subst src/ui/asset_pack_stub.c,src/ui/asset_pack.c $(UI_ASSET_MANIFEST),$(PROD_SRCS))
+# Swap embedded_stub.c for the generated embedded_assets.c
+UI_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(UI_SRCS))
+PROD_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(PROD_SRCS))
+
+# Embedded asset object files (generated by embed script)
+EMBED_OBJS = $(wildcard $(BUILD_DIR)/embedded/embed_*.o)
 
 frontend:
 	cd graph-ui && npm ci && npm run build
 
-$(UI_ASSET_MANIFEST): $(UI_ASSET_BUILD_PREREQ) scripts/pack-ui-assets.mjs | $(BUILD_DIR)
-	node scripts/pack-ui-assets.mjs $(UI_ASSET_DIST) $(BUILD_DIR) $@
+embed: frontend
+	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-ui-pack: $(UI_ASSET_MANIFEST)
-
-# $(INTEGRATIONS_HASH_HDR): generated header included by integration_assets.c.
-# The standard target gets it via $(PROJECT_HDRS); the UI target compiles in one
-# shot and must list it too, or the build fails with "cbm_integrations_hash.h
-# file not found" (seen on the Windows UI build).
-cbm-with-ui: ui-pack $(INTEGRATIONS_HASH_HDR) $(OBJS_VENDORED_PROD)
+cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
+		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(LDFLAGS)
-	@echo "Built with UI asset pack: $(BUILD_DIR)/codebase-memory-mcp"
+	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
 
 clean-c: export BUILD_DIR := $(BUILD_DIR)
 clean-c:
@@ -1582,7 +1559,7 @@ lint-tidy:
 # cppcheck: complementary analysis (config in .cppcheck). Analyze the
 # failpoint-enabled superset so test-only allocation and cleanup paths remain
 # checked instead of collapsing to production constant-false stubs.
-lint-cppcheck: $(INTEGRATIONS_HASH_HDR)
+lint-cppcheck:
 	@echo "=== cppcheck ==="
 	@$(CPPCHECK) --enable=warning,style,performance,portability \
 		--std=c11 --language=c \

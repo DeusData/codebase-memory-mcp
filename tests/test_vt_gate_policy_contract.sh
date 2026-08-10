@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Contract: the VT gate is an exact-set, content-bound, minimum-engine,
-# zero-tolerance gate. Empty, partial, duplicate, unexpected or malformed
-# action output fails before a release can be described as scanned.
+# Contract: the VT gate is an exact-set, content-bound, minimum-engine gate.
+# Empty, partial, duplicate, unexpected or malformed action output fails before
+# a release can be described as scanned.
+#
+# Detection policy: EXACTLY ONE Microsoft machine-learning (`!ml`) verdict is
+# tolerated and disclosed. Two or more engines, any non-`!ml` label, any
+# non-Microsoft engine, any suspicious verdict and every infrastructure error
+# still block.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,9 +19,12 @@ hash_file() {
   sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" | awk '{print $1}'
 }
 
-for needle in defender-endpoint-verification av-endpoint-verify false-positive false_positive; do
+# Tripwire for the REVERTED endpoint-verification mechanism specifically. The
+# current `!ml` tolerance is a policy branch inside this gate, not a callout to
+# an external verification service, and must never become one.
+for needle in defender-endpoint-verification av-endpoint-verify; do
   if grep -q "$needle" "$GATE"; then
-    fail "gate references reverted/tolerance machinery '$needle'"
+    fail "gate references reverted endpoint-verification machinery '$needle'"
   fi
 done
 
@@ -113,6 +121,43 @@ cat > "$FIX/responses/named-engine.json" <<EOF
    "Microsoft":{"category":"malicious","result":"Trojan:Script/Wacatac.B!ml",
                 "engine_version":"1.26070","engine_update":"20260808"},
    "Kaspersky":{"category":"undetected","result":null,
+                "engine_version":"22","engine_update":"20260808"}
+ }}}}
+EOF
+
+cat > "$FIX/responses/ms-signature.json" <<EOF
+{"meta":{"file_info":{"sha256":"$PROBE_SHA","size":$PROBE_SIZE}},
+ "data":{"id":"ms-signature","type":"analysis","attributes":{"status":"completed",
+ "stats":{"malicious":1,"suspicious":0,"undetected":59,"harmless":0,
+          "timeout":0,"confirmed-timeout":0,"failure":0,"type-unsupported":0},
+ "results":{
+   "Microsoft":{"category":"malicious","result":"Trojan:Win32/Emotet",
+                "engine_version":"1.26070","engine_update":"20260808"}
+ }}}}
+EOF
+
+cat > "$FIX/responses/other-engine.json" <<EOF
+{"meta":{"file_info":{"sha256":"$PROBE_SHA","size":$PROBE_SIZE}},
+ "data":{"id":"other-engine","type":"analysis","attributes":{"status":"completed",
+ "stats":{"malicious":1,"suspicious":0,"undetected":59,"harmless":0,
+          "timeout":0,"confirmed-timeout":0,"failure":0,"type-unsupported":0},
+ "results":{
+   "Microsoft":{"category":"undetected","result":null,
+                "engine_version":"1.26070","engine_update":"20260808"},
+   "Kaspersky":{"category":"malicious","result":"Trojan.Generic!ml",
+                "engine_version":"22","engine_update":"20260808"}
+ }}}}
+EOF
+
+cat > "$FIX/responses/two-engines.json" <<EOF
+{"meta":{"file_info":{"sha256":"$PROBE_SHA","size":$PROBE_SIZE}},
+ "data":{"id":"two-engines","type":"analysis","attributes":{"status":"completed",
+ "stats":{"malicious":2,"suspicious":0,"undetected":58,"harmless":0,
+          "timeout":0,"confirmed-timeout":0,"failure":0,"type-unsupported":0},
+ "results":{
+   "Microsoft":{"category":"malicious","result":"Trojan:Script/Wacatac.B!ml",
+                "engine_version":"1.26070","engine_update":"20260808"},
+   "Kaspersky":{"category":"malicious","result":"Trojan.Generic!ml",
                 "engine_version":"22","engine_update":"20260808"}
  }}}}
 EOF
@@ -230,15 +275,27 @@ done
   fail "completed analysis below the 50-engine policy must block"
 grep -q 'only 49/49 decisive engines' "$FIX/last.log" || fail "low-engine failure is not explicit"
 
-[ "$(run_gate "binaries/objects/probe=$(url_for named-engine)")" != "0" ] || \
-  fail "named-engine detection must block"
+# A single Microsoft `!ml` verdict is the tolerated case: it passes, but it is
+# reported and recorded rather than silently downgraded to "clean".
+[ "$(run_gate "binaries/objects/probe=$(url_for named-engine)")" = "0" ] || \
+  fail "a single Microsoft !ml detection must be tolerated: $(cat "$FIX/last.log")"
+grep -q 'TOLERATED:' "$FIX/last.log" || \
+  fail "a tolerated detection must be reported as TOLERATED, never as OK"
 grep -q 'Microsoft = Trojan:Script/Wacatac.B!ml' "$FIX/last.log" || \
   fail "gate must report the flagging engine and label"
 grep -q $'objects/probe\t.*\t1\t0\t' "$FIX/work/binaries/vt-results.tsv" || \
-  fail "blocked completed-set counts were not preserved as workflow evidence"
+  fail "tolerated detection was not preserved as workflow evidence"
 if grep -q 'detected by: Kaspersky' "$FIX/last.log"; then
   fail "gate listed a non-flagging engine as a detection"
 fi
+
+# Everything adjacent to the tolerated case still blocks.
+[ "$(run_gate "binaries/objects/probe=$(url_for ms-signature)")" != "0" ] || \
+  fail "a Microsoft signature (non-!ml) detection must block"
+[ "$(run_gate "binaries/objects/probe=$(url_for other-engine)")" != "0" ] || \
+  fail "a non-Microsoft detection must block"
+[ "$(run_gate "binaries/objects/probe=$(url_for two-engines)")" != "0" ] || \
+  fail "two flagging engines must block"
 
 for id in wrong-hash wrong-size malformed-stats missing-analysis-id missing-microsoft microsoft-timeout wrong-response-type missing-malicious-stat detail-aggregate-mismatch malformed-microsoft-evidence; do
   [ "$(run_gate "binaries/objects/probe=$(url_for "$id")")" != "0" ] || \
@@ -300,4 +357,4 @@ printf 'tampered\n' > "$FIX/work/binaries/objects/probe"
 [ "$(run_gate "$clean_output")" != "0" ] || fail "tampered staged object must block before polling"
 grep -q 'changed after extraction' "$FIX/last.log" || fail "tamper failure is not diagnosable"
 
-echo 'PASS: VT gate is exact-set, content-bound, >=50-engine and zero tolerance'
+echo 'PASS: VT gate is exact-set, content-bound, >=50-engine; tolerates exactly one Microsoft !ml verdict and nothing else'

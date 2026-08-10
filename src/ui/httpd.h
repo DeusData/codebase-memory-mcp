@@ -123,7 +123,7 @@ void cbm_http_replyf(cbm_http_conn_t *c, int status, const char *extra_headers, 
 #endif
     ;
 
-/* Binary-safe variant for verified asset-pack entries. */
+/* Binary-safe variant for embedded assets. */
 void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_headers, const void *data,
                         size_t len);
 

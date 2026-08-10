@@ -21,7 +21,7 @@
 #include "mcp/index_supervisor.h"
 #include "store/store.h"
 #include "ui/config.h"
-#include "ui/asset_pack.h"
+#include "ui/embedded_assets.h"
 #include "ui/http_server.h"
 #include "watcher/watcher.h"
 
@@ -50,7 +50,6 @@ enum {
     HOST_HTTP_CONFIG_POLL_MS = 1000,
     HOST_HTTP_RETRY_INITIAL_MS = 1000,
     HOST_HTTP_RETRY_MAX_MS = 30000,
-    HOST_UI_ASSET_SHUTDOWN_MS = 10000,
     HOST_WATCH_INTERVAL_MS = 5000,
     HOST_CONFLICT_LOG_CAP = 1024 * 1024,
     HOST_OPERATION_LOG_CAP = 5 * 1024 * 1024,
@@ -89,13 +88,8 @@ struct host_state {
     cbm_http_server_t *http;
     cbm_thread_t watcher_thread;
     cbm_thread_t http_thread;
-    cbm_thread_t ui_assets_thread;
     bool watcher_started;
     bool http_started;
-    bool ui_assets_started;
-    bool ui_assets_start_failed;
-    bool ui_assets_failure_logged;
-    atomic_bool ui_assets_completed;
     bool http_retiring;
     bool http_config_loaded;
     bool http_config_enabled;
@@ -309,18 +303,6 @@ static void *host_http_thread(void *opaque) {
     return NULL;
 }
 
-static void *host_ui_assets_thread(void *opaque) {
-    host_state_t *host = opaque;
-    char error[HOST_PATH_CAP];
-    if (cbm_ui_assets_warm(cbm_get_home_dir(), error, sizeof(error))) {
-        cbm_log_info("ui.assets_ready", "pack", CBM_UI_ASSET_PACK_NAME);
-    } else if (cbm_ui_assets_state() != CBM_UI_ASSETS_CANCELLED) {
-        cbm_log_warn("ui.assets_unavailable", "reason", error);
-    }
-    atomic_store_explicit(&host->ui_assets_completed, true, memory_order_release);
-    return NULL;
-}
-
 static int host_watcher_index(const char *project_name, const char *root_path, void *opaque) {
     host_state_t *host = opaque;
     return host && host->application
@@ -463,31 +445,16 @@ static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool for
     if (!host || !host->http_ops) {
         return;
     }
-    if (host->http_ops == &g_host_http_default_ops) {
-        cbm_ui_assets_state_t state = cbm_ui_assets_state();
-        host->http_assets_available = state == CBM_UI_ASSETS_READY;
-        if ((state == CBM_UI_ASSETS_FAILED || state == CBM_UI_ASSETS_CANCELLED ||
-             host->ui_assets_start_failed) &&
-            !host->ui_assets_failure_logged) {
-            cbm_log_warn("ui.assets_unavailable", "pack", CBM_UI_ASSET_PACK_NAME, "hint",
-                         "reinstall the matching UI release");
-            host->ui_assets_failure_logged = true;
-        }
+    if (!force_config_load && host->http_config_loaded && now_ms < host->http_next_config_load_ms) {
+        return;
     }
-    bool load_config =
-        force_config_load || !host->http_config_loaded || now_ms >= host->http_next_config_load_ms;
-    cbm_ui_config_t desired = {
-        .ui_enabled = host->http_config_enabled,
-        .ui_port = host->http_config_port,
-    };
-    bool config_changed = false;
-    if (load_config) {
-        host->http_next_config_load_ms = host_deadline_from(now_ms, HOST_HTTP_CONFIG_POLL_MS);
-        host->http_ops->config_load(host->http_ops->context, &desired);
-        config_changed = !host->http_config_loaded ||
-                         desired.ui_enabled != host->http_config_enabled ||
-                         desired.ui_port != host->http_config_port;
-    }
+    host->http_next_config_load_ms = host_deadline_from(now_ms, HOST_HTTP_CONFIG_POLL_MS);
+
+    cbm_ui_config_t desired;
+    host->http_ops->config_load(host->http_ops->context, &desired);
+    bool config_changed = !host->http_config_loaded ||
+                          desired.ui_enabled != host->http_config_enabled ||
+                          desired.ui_port != host->http_config_port;
     if (config_changed && !host->http_retiring) {
         host->http_retiring = true;
         host->http_retry_at_ms = now_ms;
@@ -517,9 +484,10 @@ static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool for
         return;
     }
     if (!host->http_assets_available) {
-        if (config_changed && cbm_ui_assets_state() == CBM_UI_ASSETS_UNAVAILABLE) {
+        if (config_changed) {
             cbm_log_warn("ui.no_assets", "hint", "rebuild with: make -f Makefile.cbm cbm-with-ui");
         }
+        host->http_retry_at_ms = UINT64_MAX;
         return;
     }
     if (now_ms < host->http_retry_at_ms) {
@@ -553,9 +521,6 @@ static void host_background_stop(host_state_t *host) {
     if (host->watcher) {
         cbm_watcher_stop(host->watcher);
     }
-    if (host->ui_assets_started) {
-        cbm_ui_assets_request_cancel();
-    }
 }
 
 static bool host_background_join(host_state_t *host) {
@@ -570,18 +535,6 @@ static bool host_background_join(host_state_t *host) {
             return false;
         }
         host->watcher_started = false;
-    }
-    if (host->ui_assets_started) {
-        uint64_t deadline = host_deadline_from(cbm_now_ms(), HOST_UI_ASSET_SHUTDOWN_MS);
-        while (!atomic_load_explicit(&host->ui_assets_completed, memory_order_acquire) &&
-               cbm_now_ms() < deadline) {
-            cbm_usleep(1000);
-        }
-        if (!atomic_load_explicit(&host->ui_assets_completed, memory_order_acquire) ||
-            cbm_thread_join(&host->ui_assets_thread) != 0) {
-            return false;
-        }
-        host->ui_assets_started = false;
     }
     return true;
 }
@@ -625,8 +578,7 @@ static void host_state_free(host_state_t *host) {
 
 static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint_t *endpoint) {
     host->http_ops = &g_host_http_default_ops;
-    host->http_assets_available = false;
-    atomic_init(&host->ui_assets_completed, false);
+    host->http_assets_available = CBM_EMBEDDED_FILE_COUNT > 0;
     if (!cbm_secure_random(host->ui_readiness_secret, sizeof(host->ui_readiness_secret))) {
         cbm_log_error("daemon.readiness_secret_failed", "reason", "system_rng_unavailable");
         return false;
@@ -887,18 +839,6 @@ static bool host_background_start(host_state_t *host) {
         return false;
     }
     host->watcher_started = true;
-
-    /* Runtime publication already succeeded before this function is called.
-     * Pack I/O and hashing therefore run concurrently with normal daemon
-     * service rather than extending its startup critical path. */
-    if (cbm_ui_assets_supported()) {
-        if (cbm_thread_create(&host->ui_assets_thread, 0, host_ui_assets_thread, host) == 0) {
-            host->ui_assets_started = true;
-        } else {
-            host->ui_assets_start_failed = true;
-            cbm_log_warn("ui.assets_unavailable", "reason", "warmup_thread_create_failed");
-        }
-    }
 
     host_http_reconcile_at(host, cbm_now_ms(), true);
     return true;

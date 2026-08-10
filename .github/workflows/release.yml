@@ -216,11 +216,9 @@ jobs:
           mkdir -p "$ARCHIVE_DIR" binaries
           gh release download "$VERSION" --dir "$ARCHIVE_DIR" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip'
           scripts/ci/extract-release-archives.sh "$ARCHIVE_DIR" binaries \
-            --archive-scope=ui \
             --expect-archives=8 \
             --expect-binaries=8 \
-            --expect-packs=8 \
-            --expect-runtime-files=32
+            --expect-runtime-files=24
 
       - name: Security audits on all unique extracted release objects
         run: |

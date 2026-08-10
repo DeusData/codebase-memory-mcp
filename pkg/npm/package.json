@@ -1,7 +1,7 @@
 {
   "name": "codebase-memory-mcp",
   "version": "0.8.1",
-  "description": "Fast code intelligence for AI coding agents — installs a verified native runtime set",
+  "description": "Fast code intelligence for AI coding agents — installs a verified self-contained native executable",
   "mcpName": "io.github.DeusData/codebase-memory-mcp",
   "license": "MIT",
   "repository": {

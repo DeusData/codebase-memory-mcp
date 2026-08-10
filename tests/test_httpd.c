@@ -977,17 +977,20 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     PASS();
 }
 
-TEST(ui_server_root_without_ready_assets_is_retryable) {
-    /* A listener should normally be gated on READY by the daemon. Direct
-     * constructor tests still receive a truthful retryable response. */
+TEST(ui_server_root_without_embedded_assets_is_not_found) {
+    /* The frontend is linked into the image, so its availability is decided at
+     * build time, not warmed at runtime: a binary built without --with-ui has
+     * no index.html and never will. That is a permanent 404, NOT a retryable
+     * 503 -- promising a retry for a condition that cannot change would make
+     * every client poll forever. */
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
     char resp[4096];
     int n = th_http(cbm_http_server_port(ts.srv), "GET / HTTP/1.1\r\n\r\n", resp, sizeof(resp));
     ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 503);
-    ASSERT_NOT_NULL(strstr(resp, "frontend assets are not ready"));
-    ASSERT_NOT_NULL(strstr(resp, "Retry-After: 1"));
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NOT_NULL(strstr(resp, "no frontend embedded"));
+    ASSERT_NULL(strstr(resp, "Retry-After"));
     th_server_stop(&ts);
     PASS();
 }
@@ -2452,7 +2455,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_rpc_initialize);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
-    RUN_TEST(ui_server_root_without_ready_assets_is_retryable);
+    RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);
     RUN_TEST(ui_server_mutations_require_json_content_type);

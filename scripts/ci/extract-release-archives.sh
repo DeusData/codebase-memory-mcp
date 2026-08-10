@@ -4,23 +4,22 @@
 #
 # Usage:
 #   extract-release-archives.sh <archive-dir> <output-dir> \
-#     [--archive-scope=all|ui] [--expect-archives=N] [--expect-binaries=N] [--expect-packs=N] \
+#     [--expect-archives=N] [--expect-binaries=N] \
 #     [--expect-runtime-files=N]
 #
 # The output directory is published as one atomic bundle:
 #   objects/          one file per distinct byte sequence
-#   associations.tsv  every extracted member and CBMUIPK asset -> scan object
+#   associations.tsv  every extracted archive member -> scan object
 #   scan-set.tsv      the exact path/hash/size set the VT action must return
 #
 # Every archive is validated and hashed for provenance, but downloadable
-# .tar.gz/.zip release containers are not scanned. Their exact members and the
-# uncompressed HTML/JavaScript/CSS/etc payloads inside every CBMUIPK v1 pack are
-# covered. Identical bytes are uploaded once, but no extracted member/asset
+# .tar.gz/.zip release containers are not scanned. Their exact members are
+# covered instead. Identical bytes are uploaded once, but no extracted member
 # association is discarded.
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <archive-dir> <output-dir> [--archive-scope=all|ui] [--expect-archives=N] [--expect-binaries=N] [--expect-packs=N] [--expect-runtime-files=N]" >&2
+  echo "Usage: $0 <archive-dir> <output-dir> [--expect-archives=N] [--expect-binaries=N] [--expect-runtime-files=N]" >&2
   exit 2
 fi
 
@@ -72,28 +71,18 @@ UNIX_TARGETS = (
     "linux-arm64-portable",
 )
 WINDOWS_TARGETS = ("windows-amd64", "windows-arm64")
-UI_ARCHIVES = frozenset(
-    [
-        f"codebase-memory-mcp-ui-{target}.tar.gz"
-        for target in UNIX_TARGETS
-    ]
-    + [
-        f"codebase-memory-mcp-ui-{target}.zip"
-        for target in WINDOWS_TARGETS
-    ]
-)
-STANDARD_ARCHIVES = frozenset(
+CANONICAL_ARCHIVES = frozenset(
     [f"codebase-memory-mcp-{target}.tar.gz" for target in UNIX_TARGETS]
     + [f"codebase-memory-mcp-{target}.zip" for target in WINDOWS_TARGETS]
 )
-CANONICAL_ARCHIVES = UI_ARCHIVES | STANDARD_ARCHIVES
-PACK_NAME = re.compile(r"cbm-ui-([0-9a-f]{64})\.pack\Z")
+# One composition ships; the association column is retained so the schema stays
+# stable for the gate and release-notes consumers.
+RELEASE_VARIANT = "release"
 SAFE_LABEL = re.compile(r"[^A-Za-z0-9._-]+")
 SAFE_ASSET_PATH = re.compile(rb"\A[A-Za-z0-9._/-]+\Z")
 COUNT_OPTIONS = {
     "--expect-archives": "archives",
     "--expect-binaries": "binaries",
-    "--expect-packs": "packs",
     "--expect-runtime-files": "runtime_files",
 }
 MIME_BY_EXTENSION = {
@@ -295,22 +284,13 @@ class ObjectStore:
 
 def parse_arguments(
     argv: Sequence[str],
-) -> Tuple[pathlib.Path, pathlib.Path, Dict[str, Optional[int]], str]:
+) -> Tuple[pathlib.Path, pathlib.Path, Dict[str, Optional[int]]]:
     archive_dir = pathlib.Path(argv[1]).absolute()
     output_dir = pathlib.Path(argv[2]).absolute()
     expected: Dict[str, Optional[int]] = {value: None for value in COUNT_OPTIONS.values()}
     seen: set[str] = set()
-    archive_scope = "all"
     for argument in argv[3:]:
         option, separator, raw_value = argument.partition("=")
-        if separator and option == "--archive-scope":
-            if "archive_scope" in seen:
-                raise ContractError(f"duplicate option: {option}")
-            if raw_value not in {"all", "ui"}:
-                raise ContractError("--archive-scope must be all or ui")
-            archive_scope = raw_value
-            seen.add("archive_scope")
-            continue
         if not separator or option not in COUNT_OPTIONS:
             raise ContractError(f"unknown option: {argument}")
         key = COUNT_OPTIONS[option]
@@ -320,164 +300,33 @@ def parse_arguments(
             raise ContractError(f"{option} requires a non-negative integer")
         expected[key] = int(raw_value)
         seen.add(key)
-    return archive_dir, output_dir, expected, archive_scope
+    return archive_dir, output_dir, expected
 
 
-def validate_namespace(archive_name: str, names: Iterable[str]) -> Tuple[str, Dict[str, str]]:
+def validate_namespace(archive_name: str, names: Iterable[str]) -> Dict[str, str]:
     names_list = list(names)
     if len(names_list) != len(set(names_list)):
         duplicate = next(name for name in names_list if names_list.count(name) > 1)
         raise ContractError(f"duplicate archive member in {archive_name}: {duplicate}")
     windows = archive_name.endswith(".zip")
-    variant = "ui" if archive_name.startswith("codebase-memory-mcp-ui-") else "standard"
     binary = "codebase-memory-mcp.exe" if windows else "codebase-memory-mcp"
     installer = "install.ps1" if windows else "install.sh"
     fixed = {
         binary: "binary",
-        "cbm-integrations.json": "runtime",
         "LICENSE": "runtime",
         installer: "runtime",
         "THIRD_PARTY_NOTICES.md": "runtime",
     }
     name_set = set(names_list)
     extras = name_set - set(fixed)
-    if variant == "ui":
-        invalid = sorted(name for name in extras if PACK_NAME.fullmatch(name) is None)
-        if invalid:
-            raise ContractError(f"unexpected archive member in {archive_name}: {invalid[0]}")
-        if len(extras) != 1:
-            raise ContractError(
-                f"UI archive must contain exactly one UI pack in {archive_name}; got {len(extras)}"
-            )
-        if len(name_set) != 6 or not set(fixed).issubset(name_set):
-            missing = sorted(set(fixed) - name_set)
-            raise ContractError(
-                f"member namespace mismatch in {archive_name}: expected exactly 6 root files; missing={missing}"
-            )
-        kinds = dict(fixed)
-        kinds[next(iter(extras))] = "pack"
-        return variant, kinds
     if extras:
         raise ContractError(f"unexpected archive member in {archive_name}: {sorted(extras)[0]}")
-    if len(name_set) != 5 or name_set != set(fixed):
+    if name_set != set(fixed):
         missing = sorted(set(fixed) - name_set)
         raise ContractError(
-            f"member namespace mismatch in {archive_name}: expected exactly 5 root files; missing={missing}"
+            f"member namespace mismatch in {archive_name}: expected exactly 4 root files; missing={missing}"
         )
-    return variant, fixed
-
-
-def valid_asset_path(raw: bytes) -> bool:
-    if (
-        len(raw) < 2
-        or len(raw) > PACK_MAX_PATH_BYTES
-        or not SAFE_ASSET_PATH.fullmatch(raw)
-        or not raw.startswith(b"/")
-        or raw.endswith(b"/")
-        or b"//" in raw
-    ):
-        return False
-    parts = raw[1:].split(b"/")
-    if any(part in (b"", b".", b"..") for part in parts):
-        return False
-    return raw == b"/index.html" or raw.startswith(b"/assets/")
-
-
-def parse_pack_assets(path: pathlib.Path) -> List[PackAsset]:
-    size = path.stat().st_size
-    if size < PACK_HEADER_BYTES or size > MAX_PACK_BYTES:
-        raise ContractError(f"CBMUIPK size is outside bounds: {size}")
-    with path.open("rb") as handle:
-        header = handle.read(PACK_HEADER_BYTES)
-        if len(header) != PACK_HEADER_BYTES:
-            raise ContractError("CBMUIPK header is truncated")
-        try:
-            (
-                magic,
-                version,
-                header_bytes,
-                flags,
-                count,
-                entry_bytes,
-                index_offset,
-                index_size,
-                paths_offset,
-                paths_size,
-                payload_offset,
-                payload_size,
-                total_size,
-            ) = struct.unpack("<8sHHIIIQQQQQQQ", header)
-        except struct.error as error:
-            raise ContractError(f"CBMUIPK header is malformed: {error}") from error
-        if (
-            magic != b"CBMUIPK\0"
-            or version != 1
-            or header_bytes != PACK_HEADER_BYTES
-            or flags != 0
-            or count < 1
-            or count > PACK_MAX_FILES
-            or entry_bytes != PACK_ENTRY_BYTES
-            or index_offset != PACK_HEADER_BYTES
-            or index_size != count * PACK_ENTRY_BYTES
-            or paths_offset != index_offset + index_size
-            or paths_size > count * PACK_MAX_PATH_BYTES
-            or payload_offset != paths_offset + paths_size
-            or total_size != payload_offset + payload_size
-            or total_size != size
-        ):
-            raise ContractError("CBMUIPK header/offset contract failed")
-        handle.seek(index_offset)
-        index = handle.read(index_size)
-        paths = handle.read(paths_size)
-        if len(index) != index_size or len(paths) != paths_size:
-            raise ContractError("CBMUIPK index or path table is truncated")
-
-    assets: List[PackAsset] = []
-    expected_path_offset = 0
-    expected_data_offset = 0
-    previous_path: Optional[bytes] = None
-    has_index = False
-    for item in range(count):
-        entry = struct.unpack_from("<IHBBQQ", index, item * PACK_ENTRY_BYTES)
-        path_offset, path_length, mime_id, cache_id, data_offset, data_length = entry
-        if (
-            path_offset != expected_path_offset
-            or path_length == 0
-            or path_length > paths_size - expected_path_offset
-            or data_offset != expected_data_offset
-            or data_length == 0
-            or data_length > payload_size - expected_data_offset
-        ):
-            raise ContractError("CBMUIPK entry bounds/contiguity contract failed")
-        raw_path = paths[path_offset : path_offset + path_length]
-        if not valid_asset_path(raw_path) or (previous_path is not None and previous_path >= raw_path):
-            raise ContractError("CBMUIPK asset path is invalid, duplicate or unsorted")
-        try:
-            asset_path = raw_path.decode("ascii")
-        except UnicodeDecodeError as error:
-            raise ContractError("CBMUIPK asset path is not ASCII") from error
-        extension = pathlib.PurePosixPath(asset_path).suffix
-        mapping = MIME_BY_EXTENSION.get(extension)
-        if mapping is None or mime_id != mapping[0]:
-            raise ContractError(f"CBMUIPK MIME/path contract failed: {asset_path}")
-        is_index = asset_path == "/index.html"
-        if cache_id != (1 if is_index else 2) or (is_index and has_index):
-            raise ContractError(f"CBMUIPK cache/index contract failed: {asset_path}")
-        has_index = has_index or is_index
-        assets.append(
-            PackAsset(
-                path=asset_path,
-                mime=mapping[1],
-                offset=payload_offset + data_offset,
-                size=data_length,
-            )
-        )
-        previous_path = raw_path
-        expected_path_offset += path_length
-        expected_data_offset += data_length
-    if not has_index or expected_path_offset != paths_size or expected_data_offset != payload_size:
-        raise ContractError("CBMUIPK tables do not cover exactly one complete payload")
-    return assets
+    return fixed
 
 
 def add_association(
@@ -487,7 +336,6 @@ def add_association(
     association_type: str,
     archive: str,
     archive_sha256: str,
-    variant: str,
     kind: str,
     member: str = "",
     asset_path: str = "",
@@ -500,7 +348,7 @@ def add_association(
             "association_type": association_type,
             "archive": archive,
             "archive_sha256": archive_sha256,
-            "variant": variant,
+            "variant": RELEASE_VARIANT,
             "kind": kind,
             "member": member,
             "asset_path": asset_path,
@@ -537,7 +385,7 @@ def process_member(
     kind: str,
     archive_name: str,
     archive_sha256: str,
-    variant: str,
+    variant: str = RELEASE_VARIANT,
 ) -> None:
     scan_object = store.ingest_stream(
         source,
@@ -545,43 +393,15 @@ def process_member(
         ceiling=MAX_MEMBER_BYTES,
         label=member,
     )
-    if kind == "pack":
-        match = PACK_NAME.fullmatch(member)
-        if match is None or scan_object.sha256 != match.group(1):
-            raise ContractError(
-                f"UI pack digest does not match its filename in {archive_name}: {member}"
-            )
     add_association(
         rows,
         scan_object,
         association_type="member",
         archive=archive_name,
         archive_sha256=archive_sha256,
-        variant=variant,
         kind=kind,
         member=member,
     )
-    if kind != "pack":
-        return
-    for asset in parse_pack_assets(scan_object.path):
-        asset_object = store.ingest_slice(
-            scan_object.path,
-            offset=asset.offset,
-            size=asset.size,
-            label=asset.path,
-        )
-        add_association(
-            rows,
-            asset_object,
-            association_type="pack_asset",
-            archive=archive_name,
-            archive_sha256=archive_sha256,
-            variant=variant,
-            kind="ui_asset",
-            member=member,
-            asset_path=asset.path,
-            mime=asset.mime,
-        )
 
 
 def process_tar(
@@ -605,7 +425,7 @@ def process_tar(
         total = validate_member_metadata(archive_name, ((info.name, info.size) for info in infos))
         if total > remaining_member_bytes:
             raise ContractError("release matrix exceeds total uncompressed byte ceiling")
-        variant, kinds = validate_namespace(archive_name, [info.name for info in infos])
+        kinds = validate_namespace(archive_name, [info.name for info in infos])
         for info in sorted(infos, key=lambda item: item.name):
             source = archive.extractfile(info)
             if source is None:
@@ -620,9 +440,8 @@ def process_tar(
                     kind=kinds[info.name],
                     archive_name=archive_name,
                     archive_sha256=archive_sha256,
-                    variant=variant,
                 )
-        return variant, kinds, total
+        return kinds, total
 
 
 def process_zip(
@@ -651,7 +470,7 @@ def process_zip(
         total = validate_member_metadata(archive_name, ((info.filename, info.file_size) for info in infos))
         if total > remaining_member_bytes:
             raise ContractError("release matrix exceeds total uncompressed byte ceiling")
-        variant, kinds = validate_namespace(archive_name, [info.filename for info in infos])
+        kinds = validate_namespace(archive_name, [info.filename for info in infos])
         for info in sorted(infos, key=lambda item: item.filename):
             with archive.open(info, "r") as source:
                 process_member(
@@ -663,9 +482,8 @@ def process_zip(
                     kind=kinds[info.filename],
                     archive_name=archive_name,
                     archive_sha256=archive_sha256,
-                    variant=variant,
                 )
-        return variant, kinds, total
+        return kinds, total
 
 
 def write_tsv(
@@ -688,7 +506,7 @@ def write_tsv(
 
 
 def main(argv: Sequence[str]) -> None:
-    archive_dir, output_dir, expected, archive_scope = parse_arguments(argv)
+    archive_dir, output_dir, expected = parse_arguments(argv)
     if not archive_dir.is_dir() or archive_dir.is_symlink():
         raise ContractError(f"archive directory is not a regular directory: {archive_dir}")
     if output_dir.name in ("", ".", ".."):
@@ -701,13 +519,13 @@ def main(argv: Sequence[str]) -> None:
 
     archive_paths = sorted(archive_dir.iterdir(), key=lambda candidate: candidate.name)
     actual_names = {path.name for path in archive_paths}
-    expected_names = UI_ARCHIVES if archive_scope == "ui" else CANONICAL_ARCHIVES
+    expected_names = CANONICAL_ARCHIVES
     if actual_names != expected_names or len(archive_paths) != len(expected_names):
         missing = sorted(expected_names - actual_names)
         unexpected = sorted(actual_names - expected_names)
         raise ContractError(
             f"archive namespace mismatch: expected exact canonical {len(expected_names)} "
-            f"({archive_scope}); missing={missing}, unexpected={unexpected}"
+            f"missing={missing}, unexpected={unexpected}"
         )
     for path in archive_paths:
         mode = path.lstat().st_mode
@@ -723,9 +541,7 @@ def main(argv: Sequence[str]) -> None:
     counts = {
         "archives": 0,
         "binaries": 0,
-        "packs": 0,
         "runtime_files": 0,
-        "pack_assets": 0,
         "associations": 0,
         "scan_objects": 0,
     }
@@ -738,14 +554,13 @@ def main(argv: Sequence[str]) -> None:
         archive_store = ObjectStore(pathlib.Path(temporary) / "archives")
         for archive_path in archive_paths:
             archive_name = archive_path.name
-            variant = "ui" if archive_name.startswith("codebase-memory-mcp-ui-") else "standard"
             archive_object = archive_store.ingest_path(
                 archive_path,
                 ceiling=MAX_ARCHIVE_BYTES,
                 label=archive_name,
             )
             archive_sha256 = archive_object.sha256
-            _, kinds, member_total = (
+            kinds, member_total = (
                 process_tar(
                     archive_object.path,
                     archive_name=archive_name,
@@ -769,13 +584,11 @@ def main(argv: Sequence[str]) -> None:
                 raise ContractError("release matrix exceeds total uncompressed byte ceiling")
             counts["archives"] += 1
             counts["binaries"] += sum(kind == "binary" for kind in kinds.values())
-            counts["packs"] += sum(kind == "pack" for kind in kinds.values())
             counts["runtime_files"] += sum(kind == "runtime" for kind in kinds.values())
 
-        counts["pack_assets"] = sum(row["association_type"] == "pack_asset" for row in rows)
         counts["associations"] = len(rows)
         counts["scan_objects"] = len(store.objects)
-        for key in ("archives", "binaries", "packs", "runtime_files"):
+        for key in ("archives", "binaries", "runtime_files"):
             wanted = expected[key]
             if wanted is not None and counts[key] != wanted:
                 display = key.replace("_files", " files")
@@ -786,7 +599,6 @@ def main(argv: Sequence[str]) -> None:
         rows.sort(
             key=lambda row: (
                 str(row["archive"]),
-                {"member": 0, "pack_asset": 1}[str(row["association_type"])],
                 str(row["member"]),
                 str(row["asset_path"]),
             )
@@ -794,9 +606,7 @@ def main(argv: Sequence[str]) -> None:
         metadata_order = (
             "archives",
             "binaries",
-            "packs",
             "runtime_files",
-            "pack_assets",
             "associations",
             "scan_objects",
         )
@@ -837,8 +647,7 @@ def main(argv: Sequence[str]) -> None:
 
     print(
         f"validated exact {counts['archives']}-archive matrix: "
-        f"{counts['binaries']} binaries, {counts['packs']} UI packs, "
-        f"{counts['runtime_files']} runtime files and {counts['pack_assets']} pack assets"
+        f"{counts['binaries']} binaries and {counts['runtime_files']} runtime files"
     )
     print(
         f"scan bundle: {counts['scan_objects']} distinct byte objects cover "

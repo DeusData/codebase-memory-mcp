@@ -3,7 +3,7 @@
 #
 # The standard linux release binary dynamically links glibc 2.38+ / GLIBCXX
 # 3.4.32 and fails to start on Debian 11, RHEL/Rocky 8, Ubuntu 20.04, Amazon
-# Linux 2, etc. The fix points all linux install + self-update paths at the
+# Linux 2, etc. The fix points every Linux installer/package download path at the
 # fully-static "-portable" asset. This runs a given linux binary inside an
 # old-glibc container (debian:bullseye, glibc 2.31) and asserts it starts:
 #   - RED  for the dynamic standard binary  (GLIBC_2.38 not found)

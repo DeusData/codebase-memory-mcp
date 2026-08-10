@@ -21,18 +21,14 @@ from pathlib import Path
 
 REPO = "DeusData/codebase-memory-mcp"
 _WINDOWS_BINARY_NAME = "codebase-memory-mcp.exe"
-_INTEGRATIONS_NAME = "cbm-integrations.json"
-_UI_PACK_RE = re.compile(r"cbm-ui-[0-9a-f]{64}\.pack\Z")
 _UNIX_ARCHIVE_NAMES = (
     "codebase-memory-mcp",
-    _INTEGRATIONS_NAME,
     "LICENSE",
     "install.sh",
     "THIRD_PARTY_NOTICES.md",
 )
 _WINDOWS_ARCHIVE_NAMES = (
     _WINDOWS_BINARY_NAME,
-    _INTEGRATIONS_NAME,
     "LICENSE",
     "install.ps1",
     "THIRD_PARTY_NOTICES.md",
@@ -142,7 +138,7 @@ def _verify_candidate(path: Path) -> None:
     """Require a staged native candidate to execute successfully."""
     try:
         subprocess.run(
-            [str(path), "--verify-runtime-assets"],
+            [str(path), "--version"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -173,13 +169,12 @@ def _files_equal_sha256(left: Path, right: Path) -> bool:
         return False
 
 
-def _validate_archive_names(names, archive_names, ui: bool, casefold: bool = False):
-    """Require the exact release root namespace and return its UI pack name."""
+def _validate_archive_names(names, archive_names, casefold: bool = False):
+    """Require the exact release root namespace."""
     required = tuple(archive_names)
     required_set = set(required)
     found = set()
     seen = set()
-    ui_pack = None
     for name in names:
         key = name.casefold() if casefold else name
         if key in seen:
@@ -188,28 +183,17 @@ def _validate_archive_names(names, archive_names, ui: bool, casefold: bool = Fal
                 f"(duplicate or case conflict: {name!r})"
             )
         seen.add(key)
-        is_ui_pack = ui and _UI_PACK_RE.fullmatch(name) is not None
-        if name not in required_set and not is_ui_pack:
+        if name not in required_set:
             sys.exit(
                 f"codebase-memory-mcp: archive must contain only the exact "
                 f"root files: {', '.join(required)}"
             )
-        if is_ui_pack:
-            if ui_pack is not None:
-                sys.exit(
-                    "codebase-memory-mcp: archive must contain exactly one "
-                    "content-addressed UI pack"
-                )
-            ui_pack = name
-        else:
-            found.add(name)
-    expected_count = len(required) + (1 if ui else 0)
-    if found != required_set or len(seen) != expected_count or (ui and ui_pack is None):
+        found.add(name)
+    if found != required_set or len(seen) != len(required):
         sys.exit(
             f"codebase-memory-mcp: archive must contain exactly one of each "
             f"required root file: {', '.join(required)}"
         )
-    return ui_pack
 
 
 def _safe_extract_tar(
@@ -223,12 +207,8 @@ def _safe_extract_tar(
                 f"codebase-memory-mcp: refusing unsafe tar entry "
                 f"(not a regular root file: {member.name!r})"
             )
-    ui_pack = _validate_archive_names(
-        [member.name for member in members], archive_names, ui
-    )
+    _validate_archive_names([member.name for member in members], archive_names)
     runtime_names = list(extract_names)
-    if ui_pack is not None:
-        runtime_names.append(ui_pack)
     by_name = {member.name: member for member in members}
     dest_abs = os.path.abspath(dest)
     for name in runtime_names:
@@ -281,13 +261,11 @@ def _safe_extract_zip(
                 f"codebase-memory-mcp: refusing unsafe zip entry "
                 f"(escapes dest: {raw_name!r})"
             )
-    ui_pack = _validate_archive_names(names, archive_names, ui, casefold=True)
+    _validate_archive_names(names, archive_names, casefold=True)
 
     # Extract only the validated runtime files. This avoids relying on
     # platform-specific zip path rewriting and always creates regular files.
     runtime_names = list(extract_names)
-    if ui_pack is not None:
-        runtime_names.append(ui_pack)
     for name in runtime_names:
         target = os.path.join(dest_abs, name)
         with zf.open(name) as source, open(target, "xb") as output:
@@ -393,22 +371,18 @@ def _cache_dir() -> Path:
     return base / "codebase-memory-mcp"
 
 
-def _variant() -> str:
-    return "ui" if os.environ.get("CBM_VARIANT", "").lower() == "ui" else "standard"
+def _runtime_dir(version: str) -> Path:
+    return _cache_dir() / version
 
 
-def _runtime_dir(version: str, variant: str = None) -> Path:
-    return _cache_dir() / version / (variant or _variant())
-
-
-def _bin_path(version: str, variant: str = None) -> Path:
+def _bin_path(version: str) -> Path:
     # One binary per platform: the cached file is the executed file.
     name = (
         _WINDOWS_BINARY_NAME
         if sys.platform == "win32"
         else "codebase-memory-mcp"
     )
-    return _runtime_dir(version, variant) / name
+    return _runtime_dir(version) / name
 
 
 def _execution_path(binary: Path, target_platform: str) -> Path:
@@ -428,54 +402,15 @@ def _regular_file(path: Path) -> bool:
         return False
 
 
-def _ui_pack_path_matches_name(path: Path, name: str) -> bool:
-    try:
-        expected = name[len("cbm-ui-") : -len(".pack")]
-        return _file_sha256(path) == expected
-    except OSError:
-        return False
-
-
-def _ui_pack_matches_digest(path: Path) -> bool:
-    return _ui_pack_path_matches_name(path, path.name)
-
-
-def _runtime_set_names(directory: Path, binary_name: str, variant: str):
-    if not _regular_file(directory / binary_name) or not _regular_file(
-        directory / _INTEGRATIONS_NAME
-    ):
+def _runtime_set_names(directory: Path, binary_name: str):
+    if not _regular_file(directory / binary_name):
         return None
-    try:
-        pack_like = [
-            path
-            for path in directory.iterdir()
-            if path.name.startswith("cbm-ui-") and path.name.endswith(".pack")
-        ]
-    except OSError:
-        return None
-    valid_packs = [
-        path
-        for path in pack_like
-        if _UI_PACK_RE.fullmatch(path.name) is not None
-        and _regular_file(path)
-        and _ui_pack_matches_digest(path)
-    ]
-    if variant == "ui":
-        if len(pack_like) != 1 or len(valid_packs) != 1:
-            return None
-    elif pack_like:
-        return None
-    return (
-        _INTEGRATIONS_NAME,
-        *((valid_packs[0].name,) if variant == "ui" else ()),
-        binary_name,
-    )
+    return (binary_name,)
 
 
 def _runtime_set_ready(version: str, verifier=None) -> bool:
-    variant = _variant()
-    binary = _bin_path(version, variant)
-    if _runtime_set_names(binary.parent, binary.name, variant) is None:
+    binary = _bin_path(version)
+    if _runtime_set_names(binary.parent, binary.name) is None:
         return False
     if verifier is not None:
         try:
@@ -499,16 +434,16 @@ def _runtime_set_ready_locked(version: str) -> bool:
     try:
         _refresh_runtime_lock(lock)
         _reconcile_runtime_backups(
-            binary.parent, binary.name, _variant(), _verify_candidate, lock
+            binary.parent, binary.name, _verify_candidate, lock
         )
         return _runtime_set_ready(version, _verify_candidate)
     finally:
         _release_runtime_lock(lock)
 
 
-def _runtime_set_fingerprint(directory: Path, binary_name: str, variant: str):
+def _runtime_set_fingerprint(directory: Path, binary_name: str):
     """Identify one complete set so a lock waiter can preserve its winner."""
-    names = _runtime_set_names(directory, binary_name, variant)
+    names = _runtime_set_names(directory, binary_name)
     if names is None:
         return None
     try:
@@ -519,33 +454,12 @@ def _runtime_set_fingerprint(directory: Path, binary_name: str, variant: str):
         return None
 
 
-def _staged_runtime_names(staged_paths, binary_name: str, variant: str):
+def _staged_runtime_names(staged_paths, binary_name: str):
     names = set(staged_paths)
-    required = {binary_name, _INTEGRATIONS_NAME}
-    pack_names = [
-        name
-        for name in names
-        if name.startswith("cbm-ui-") and name.endswith(".pack")
-    ]
-    if variant == "ui":
-        if len(pack_names) != 1 or _UI_PACK_RE.fullmatch(pack_names[0]) is None:
-            raise RuntimeError("staged UI runtime set must contain exactly one pack")
-        pack_name = pack_names[0]
-        if not _regular_file(staged_paths[pack_name]) or not _ui_pack_path_matches_name(
-            staged_paths[pack_name], pack_name
-        ):
-            raise RuntimeError("staged UI pack digest does not match its filename")
-        required.add(pack_name)
-        runtime_names = (_INTEGRATIONS_NAME, pack_name, binary_name)
-    else:
-        if pack_names:
-            raise RuntimeError("standard runtime set must not contain a UI pack")
-        runtime_names = (_INTEGRATIONS_NAME, binary_name)
-    if names != required or any(
-        not _regular_file(staged_paths[name]) for name in required
-    ):
+    required = {binary_name}
+    if names != required or not _regular_file(staged_paths[binary_name]):
         raise RuntimeError("staged package cache is incomplete")
-    return runtime_names
+    return (binary_name,)
 
 
 def _windows_process_api():
@@ -890,11 +804,7 @@ def _release_runtime_lock(lock):
 # partial retirement from partial publication; cleanup-only makes deletion
 # retryable after the destination has been accepted or restored.
 def _runtime_backup_target_name(name: str, binary_name: str) -> bool:
-    return (
-        name == binary_name
-        or name == _INTEGRATIONS_NAME
-        or (name.startswith("cbm-ui-") and name.endswith(".pack"))
-    )
+    return name == binary_name
 
 
 def _create_runtime_backup_directory(directory: Path) -> Path:
@@ -994,10 +904,8 @@ def _current_runtime_targets(directory: Path, binary_name: str):
     return targets
 
 
-def _runtime_set_ready_at(
-    directory: Path, binary_name: str, variant: str, verifier=None
-) -> bool:
-    if _runtime_set_names(directory, binary_name, variant) is None:
+def _runtime_set_ready_at(directory: Path, binary_name: str, verifier=None) -> bool:
+    if _runtime_set_names(directory, binary_name) is None:
         return False
     if verifier is not None:
         try:
@@ -1068,9 +976,7 @@ def _copy_runtime_backup_file(
             pass
 
 
-def _reconcile_runtime_backups(
-    directory: Path, binary_name: str, variant: str, verifier, lock
-):
+def _reconcile_runtime_backups(directory: Path, binary_name: str, verifier, lock):
     _refresh_runtime_lock(lock)
     backups = _list_runtime_backups(directory, binary_name)
     for backup in [item for item in backups if item["cleanup_only"]]:
@@ -1079,7 +985,7 @@ def _reconcile_runtime_backups(
     if not backups:
         return
 
-    if _runtime_set_ready_at(directory, binary_name, variant, verifier):
+    if _runtime_set_ready_at(directory, binary_name, verifier):
         for backup in backups:
             _cleanup_runtime_backup(backup, lock)
         return
@@ -1151,31 +1057,24 @@ def _publish_runtime_set(
     staged_paths,
     dest: Path,
     binary_name: str,
-    variant: str,
     replace_file=None,
     verifier=None,
 ):
     """Publish sidecars first, retaining exact-byte backups for recovery."""
-    runtime_names = _staged_runtime_names(staged_paths, binary_name, variant)
+    runtime_names = _staged_runtime_names(staged_paths, binary_name)
     if replace_file is None:
         replace_file = os.replace
     _require_safe_runtime_directory(dest.parent)
-    initial_fingerprint = _runtime_set_fingerprint(
-        dest.parent, binary_name, variant
-    )
+    initial_fingerprint = _runtime_set_fingerprint(dest.parent, binary_name)
     lock, contended = _acquire_runtime_lock(dest.parent)
     operation_error = None
     try:
         _refresh_runtime_lock(lock)
-        _reconcile_runtime_backups(
-            dest.parent, binary_name, variant, verifier, lock
-        )
+        _reconcile_runtime_backups(dest.parent, binary_name, verifier, lock)
         # Preserve a complete set that appeared or changed while this publisher
         # waited. An unchanged pre-existing set may still be repaired/replaced,
         # with its bytes retained below for rollback.
-        locked_fingerprint = _runtime_set_fingerprint(
-            dest.parent, binary_name, variant
-        )
+        locked_fingerprint = _runtime_set_fingerprint(dest.parent, binary_name)
         if (
             locked_fingerprint is not None
             and (contended or locked_fingerprint != initial_fingerprint)
@@ -1185,13 +1084,7 @@ def _publish_runtime_set(
         backup_directory = None
         try:
             backup_directory = _create_runtime_backup_directory(dest.parent)
-            pack_like = sorted(
-                path.name
-                for path in dest.parent.iterdir()
-                if path.name.startswith("cbm-ui-")
-                and path.name.endswith(".pack")
-            )
-            retire_names = (binary_name, _INTEGRATIONS_NAME, *pack_like)
+            retire_names = (binary_name,)
             retired = set()
             # Retire the executable first: until the final rename, readiness is false.
             for name in retire_names:
@@ -1227,7 +1120,7 @@ def _publish_runtime_set(
                 except OSError as publish_error:
                     if not _files_equal_sha256(staged_paths[name], target):
                         raise publish_error
-            if _runtime_set_names(dest.parent, binary_name, variant) is None:
+            if _runtime_set_names(dest.parent, binary_name) is None:
                 raise RuntimeError("published package cache is incomplete")
             if verifier is not None:
                 verifier(dest.parent / binary_name)
@@ -1235,14 +1128,10 @@ def _publish_runtime_set(
         except Exception as publication_error:
             _assert_runtime_lock_owner(lock)
             # Preserve a complete non-cooperating winner; never delete its bytes.
-            preserve_winner = _runtime_set_ready_at(
-                dest.parent, binary_name, variant, verifier
-            )
+            preserve_winner = _runtime_set_ready_at(dest.parent, binary_name, verifier)
             if backup_directory is not None:
                 try:
-                    _reconcile_runtime_backups(
-                        dest.parent, binary_name, variant, verifier, lock
-                    )
+                    _reconcile_runtime_backups(dest.parent, binary_name, verifier, lock)
                 except Exception as recovery_error:
                     raise RuntimeError(
                         f"{publication_error}; package-cache recovery failed: "
@@ -1271,19 +1160,15 @@ def _download(version: str) -> Path:
     os_name = _os_name()
     arch = _arch()
     ext = "zip" if os_name == "windows" else "tar.gz"
-    selected_variant = _variant()
     # Linux ships a fully-static "-portable" build; the standard linux binary
     # dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
     # have no such variant. Keep in sync with install.sh / install.js / cli.c.
     portable = "-portable" if os_name == "linux" else ""
-    # Opt into the UI build, whose verified asset pack is published beside the
-    # binary, with CBM_VARIANT=ui. Default is the standard (headless) build.
-    ui = "ui-" if selected_variant == "ui" else ""
-    archive = f"codebase-memory-mcp-{ui}{os_name}-{arch}{portable}.{ext}"
+    archive = f"codebase-memory-mcp-{os_name}-{arch}{portable}.{ext}"
     url = f"https://github.com/{REPO}/releases/download/v{version}/{archive}"
     _validate_url_scheme(url)
 
-    dest = _bin_path(version, selected_variant)
+    dest = _bin_path(version)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -1307,7 +1192,7 @@ def _download(version: str) -> Path:
         bin_name = (
             _WINDOWS_BINARY_NAME if os_name == "windows" else "codebase-memory-mcp"
         )
-        extraction_names = (bin_name, _INTEGRATIONS_NAME)
+        extraction_names = (bin_name,)
         archive_names = (
             _WINDOWS_ARCHIVE_NAMES
             if os_name == "windows"
@@ -1321,7 +1206,6 @@ def _download(version: str) -> Path:
                     tmp,
                     archive_names,
                     extraction_names,
-                    selected_variant == "ui",
                 )
         else:
             import zipfile
@@ -1331,7 +1215,6 @@ def _download(version: str) -> Path:
                     tmp,
                     archive_names,
                     extraction_names,
-                    selected_variant == "ui",
                 )
 
         extracted_paths = {}
@@ -1348,7 +1231,7 @@ def _download(version: str) -> Path:
                     current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
                 )
             extracted_paths[name] = extracted_path
-        if _runtime_set_names(Path(tmp), bin_name, selected_variant) is None:
+        if _runtime_set_names(Path(tmp), bin_name) is None:
             sys.exit(
                 "codebase-memory-mcp: extracted runtime set failed content "
                 "verification"
@@ -1387,7 +1270,6 @@ def _download(version: str) -> Path:
                 staged_paths,
                 dest,
                 bin_name,
-                selected_variant,
                 verifier=_verify_candidate,
             )
             _verify_candidate(dest)
@@ -1501,7 +1383,7 @@ def _run_cache_sensitive_mutation(version: str, executable: Path, args) -> int:
         _refresh_runtime_lock(lock)
         if not _runtime_set_ready(version, _verify_candidate):
             raise RuntimeError(
-                "cached runtime assets changed before mutation launch"
+                "cached executable changed before mutation launch"
             )
         thread = threading.Thread(
             name="cbm-cache-lock-heartbeat", target=heartbeat, daemon=True

@@ -20,7 +20,7 @@
 # A missing tool is a hard error for the same reason: a skipped assertion must
 # never look like a satisfied one.
 #
-# Usage: scripts/ci/check-binary-composition.sh [--variant=auto|standard|ui] <binary-or-dir>...
+# Usage: scripts/ci/check-binary-composition.sh <binary-or-dir>...
 #   Directories are scanned recursively; format (ELF / Mach-O / PE) is detected
 #   per file from its magic bytes and each assertion runs where it is
 #   meaningful. Exit 0 = every assertion passed, 1 = at least one failed,
@@ -98,44 +98,15 @@ UI_HTTP_NEEDLES=(
     '[c]odebase-memory-mcp'
 )
 
-# The binary used to embed nine complete shebang'd shell scripts, their
-# PowerShell/.cmd twins and two node:child_process client modules — script
-# bodies written to disk at 0755. Keeping those programs outside the native
-# image narrows executable surface and lets each component be inspected and
-# scanned independently. They now ship in
-# cbm-integrations.json (the binary embeds only its SHA-256); these needles
-# prove the removal stayed removed. Source-level enforcement lives in
-# tests/test_no_embedded_scripts_contract.sh; this is the shipped-artifact
-# half of the same property.
-SCRIPT_NEEDLES=(
-    '#!/usr/bin/env bash'
-    '#!/bin/bash'
-    '#!/bin/sh'
-    'node:child_process'
-)
-
-# UI frontend bytes belong exclusively in the independently scannable pack.
-# These are structural bytes from the pack header and Vite's emitted index,
-# selected to avoid generic HTML grammar strings that legitimately occur in the
-# language parsers linked into every binary.
-UI_ASSET_BYTE_NEEDLES=(
-    'CBMUIPK'
-    '<!doctype html>'
-    '<html lang="en" class="dark">'
-    '<script type="module" crossorigin'
-)
-
 # Canary: proves the needle scan can actually see this file's strings. Without
 # it, handing the gate a gzip, a stub or a 0-byte file would pass every
 # absence assertion. 168+ occurrences in a real artifact, 0 in anything else.
 CANARY_NEEDLE='codebase-memory-mcp'
 
 # ── Args ────────────────────────────────────────────────────────────
-VARIANT=auto
 TARGETS=()
 for arg in "$@"; do
     case "$arg" in
-    --variant=*) VARIANT="${arg#--variant=}" ;;
     -*)
         echo "FAIL: unknown flag $arg (see --help)" >&2
         exit 2
@@ -143,13 +114,6 @@ for arg in "$@"; do
     *) TARGETS+=("$arg") ;;
     esac
 done
-case "$VARIANT" in
-auto | standard | ui) ;;
-*)
-    echo "FAIL: --variant must be auto, standard or ui (got '$VARIANT')" >&2
-    exit 2
-    ;;
-esac
 if [ "${#TARGETS[@]}" -eq 0 ]; then
     echo "FAIL: no binaries or directories given (see --help)" >&2
     exit 2
@@ -183,6 +147,29 @@ resolve_elf_reader() {
 
 # Echoes the GNU_STACK flag field ("RWE", "RW", "rwx", "rw-"), empty if the
 # header is absent or unparseable.
+exec_load_bytes() {
+    # Total size of PT_LOAD segments carrying the execute bit. With
+    # -z separate-code the executable segment holds only code; without it the
+    # linker merges .rodata in, so this number balloons to nearly the whole file.
+    case "$ELF_READER_KIND" in
+    readelf)
+        # NOT strtonum(): that is a gawk extension, and CI's awk is mawk, where
+        # it is undefined -- the sum would silently be 0 and this gate would
+        # pass vacuously on exactly the artifacts it exists to catch. Emit the
+        # hex MemSiz fields and convert in the shell.
+        total=0
+        for hex in $("$ELF_READER" -lW "$1" 2>/dev/null |
+            awk '/^  LOAD/ && $0 ~ /R E/ { print $6 }'); do
+            total=$((total + 16#${hex#0x}))
+        done
+        echo "$total"
+        ;;
+    objdump)
+        echo unsupported
+        ;;
+    esac
+}
+
 gnu_stack_flags() {
     case "$ELF_READER_KIND" in
     readelf)
@@ -249,8 +236,8 @@ skipped_files=0
 
 check_file() {
     file="$1"
-    # Two path components: both variants ship a binary literally named
-    # "codebase-memory-mcp", so the parent directory is what tells them apart.
+    # Two path components: the binary is literally named
+    # "codebase-memory-mcp", so the parent directory disambiguates the log.
     token=$(printf '%s' "$file" | awk -F/ '{ if (NF > 1) print $(NF - 1) "/" $NF; else print $NF }')
     fmt=$(detect_format "$file")
     if [ "$fmt" = other ]; then
@@ -259,24 +246,7 @@ check_file() {
         return 0
     fi
 
-    is_ui=0
-    case "$VARIANT" in
-    ui) is_ui=1 ;;
-    standard) is_ui=0 ;;
-    auto)
-        # The UI archive is codebase-memory-mcp-ui-<os>-<arch>, but the binary
-        # inside it is just "codebase-memory-mcp" — so the whole path decides,
-        # not the basename. Printed below so a misclassified path is visible in
-        # the log instead of silently disarming the UI assertion.
-        case "$file" in
-        *-ui | *-ui.* | *-ui-* | *-ui/*) is_ui=1 ;;
-        esac
-        ;;
-    esac
-
-    variant_label=standard
-    [ "$is_ui" -eq 1 ] && variant_label='UI (A5-no-ui-http not applicable)'
-    printf '\n── %s [%s, %s] ──\n' "$token" "$fmt" "$variant_label"
+    printf '\n── %s [%s] ──\n' "$token" "$fmt"
     checked_files=$((checked_files + 1))
 
     # A0 — anti-vacuity canary; every assertion below is an absence check.
@@ -310,6 +280,32 @@ check_file() {
         esac
     else
         printf 'n/a  %-22s %s: executable-stack check is ELF-only\n' A1-noexec-stack "$token"
+    fi
+
+
+    # A1b — read-only DATA must not live in the executable mapping. GNU ld
+    # enables -z separate-code by default on x86-64 but NOT on aarch64, so the
+    # arm64 binaries shipped ONE R E PT_LOAD spanning the whole image: 259 MB of
+    # tree-sitter parse tables mapped executable while amd64 mapped the same
+    # bytes R only. Section flags said A, not AX -- the kernel applies SEGMENT
+    # permissions, so section flags were never the control. Heuristic on
+    # purpose: if executable segments cover most of the file, .rodata is in them.
+    if [ "$fmt" = elf ]; then
+        exec_bytes=$(exec_load_bytes "$file")
+        file_bytes=$(wc -c < "$file" | tr -d ' ')
+        if [ "$exec_bytes" = unsupported ]; then
+            printf 'n/a  %-22s %s: %s cannot report segment sizes\n' \
+                A1b-rodata-noexec "$token" "$ELF_READER_KIND"
+        elif [ "${exec_bytes:-0}" -gt 0 ] && [ "$file_bytes" -gt 0 ] &&
+            [ $((exec_bytes * 100 / file_bytes)) -gt 60 ]; then
+            report FAIL A1b-rodata-noexec "$token" \
+                "executable PT_LOAD segments cover $((exec_bytes * 100 / file_bytes))% of the file ($exec_bytes/$file_bytes bytes) — read-only data is mapped executable (link with -z separate-code)"
+        else
+            report PASS A1b-rodata-noexec "$token" \
+                "executable PT_LOAD segments cover $((exec_bytes * 100 / file_bytes))% of the file (read-only data is outside them)"
+        fi
+    else
+        printf 'n/a  %-22s %s: segment-permission check is ELF-only\n' A1b-rodata-noexec "$token"
     fi
 
     # A2 — test-only seams.
@@ -362,46 +358,17 @@ check_file() {
             "sqlite compile-option table absent; A4 rests on absence needles only"
     fi
 
-    # A5 — UI/HTTP subsystem, standard artifacts only.
-    #
-    # The temporary standard variant still links the UI control/HTTP code but
-    # substitutes the no-I/O asset-pack stub, so it cannot publish a UI. That
-    # variant remains only for before/after VirusTotal verification and is then
-    # deprecated in favor of one UI-capable product composition. Until that
-    # evidence gate is complete, this assertion remains an explicit diagnostic;
-    # CBM_CHECK_UI_ABSENT=1 is available for any future true no-UI composition.
-    if [ "$is_ui" -eq 1 ]; then
-        printf 'n/a  %-22s %s: UI artifact, HTTP server ships here by design\n' \
-            A5-no-ui-http "$token"
-    elif [ "${CBM_CHECK_UI_ABSENT:-0}" = "1" ]; then
+    # A5 — UI/HTTP subsystem. One composition ships and it serves the graph UI
+    # from embedded assets, so the HTTP server belongs here by construction.
+    # CBM_CHECK_UI_ABSENT=1 still enforces absence for any future headless build.
+    if [ "${CBM_CHECK_UI_ABSENT:-0}" = "1" ]; then
         for needle in "${UI_HTTP_NEEDLES[@]}"; do
             assert_absent "$file" "$token" A5-no-ui-http "$needle"
         done
     else
-        ui_hits=0
-        for needle in "${UI_HTTP_NEEDLES[@]}"; do
-            if LC_ALL=C grep -a -q -F -e "$needle" "$file"; then
-                ui_hits=$((ui_hits + 1))
-            fi
-        done
-        printf 'INFO %-22s %s: %d/%d UI/HTTP needles present (temporary standard variant; set CBM_CHECK_UI_ABSENT=1 to enforce a true no-UI composition)\n' \
-            A5-no-ui-http "$token" "$ui_hits" "${#UI_HTTP_NEEDLES[@]}"
+        printf 'n/a  %-22s %s: UI-capable artifact, HTTP server ships here by design\n' \
+            A5-no-ui-http "$token"
     fi
-
-    # A6 — embedded integration-script text. Every variant is now subject to
-    # the same hard gate: the UI frontend is external, so it can no longer mask
-    # a returned shebang or node:child_process body in the native image.
-    for needle in "${SCRIPT_NEEDLES[@]}"; do
-        assert_absent "$file" "$token" A6-no-embedded-scripts "$needle"
-    done
-
-    # A7 — UI pack/header and frontend HTML/script bytes. The pack is scanned as
-    # its own release file; none of its raw frontend bytes belongs in any
-    # ELF/Mach-O/PE variant. Applying this to standard too makes the boundary a
-    # product-wide invariant rather than relying on path classification.
-    for needle in "${UI_ASSET_BYTE_NEEDLES[@]}"; do
-        assert_absent "$file" "$token" A7-no-ui-asset-bytes "$needle"
-    done
 }
 
 # ── Walk the targets ────────────────────────────────────────────────

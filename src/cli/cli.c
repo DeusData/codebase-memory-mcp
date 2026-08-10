@@ -23,12 +23,10 @@
 #include "foundation/sha256.h"
 #include "depindex/depindex.h"
 #include "cli/client_adapter.h"
-#include "cli/integration_assets.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 #include "mcp/index_supervisor.h"
 #include "pagerank/pagerank.h"
 #include "pipeline/pipeline.h"
-#include "ui/asset_pack.h"
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -60,7 +58,6 @@ enum {
     CLI_OK = 0,
     CLI_TRUE = 1,
     CLI_ACTIVATION_PARTIAL = 2,
-    CLI_ACTIVATION_RUNTIME_ROLLED_BACK = 3,
     CLI_ELEM_SIZE = 1,    /* fread/fwrite element size */
     CLI_IDX_1 = 1,        /* array index 1 */
     CLI_IDX_2 = 2,        /* array index 2 */
@@ -91,8 +88,6 @@ enum {
     MIN_ARGC_GET = 2,
     AUTO_YES = 1,
     AUTO_NO = -1,
-    VARIANT_A = 1,
-    VARIANT_B = 2,
     OCTAL_BASE = 8,
     CLI_ACTIVATION_DRAIN_TIMEOUT_MS = 15000,
     CLI_ACTIVATION_CONTROL_TIMEOUT_MS = 2000,
@@ -192,10 +187,6 @@ static const char CLI_ACTIVATION_MUTATION_FAILED_MESSAGE[] =
     "error: activation failed while CBM sessions were stopped; filesystem "
     "changes that completed before the failure may remain. Review the errors "
     "above and restart your coding-agent sessions before retrying.";
-static const char CLI_ACTIVATION_RUNTIME_ROLLED_BACK_MESSAGE[] =
-    "error: activation stopped after a configuration or cleanup failure; the previous "
-    "executable and runtime assets were restored. Configuration changes that completed may "
-    "remain; resolve the errors above before retrying.";
 
 typedef struct {
     cbm_daemon_ipc_endpoint_t *endpoint;
@@ -277,9 +268,8 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
     int rc = mutation ? mutation(mutation_context) : CLI_OK;
     ops->mutation_lease_release(ops->context, mutation_lease);
     if (rc != CLI_OK) {
-        cli_activation_diagnostic(ops, rc == CLI_ACTIVATION_PARTIAL ? CLI_ACTIVATION_PARTIAL_MESSAGE
-                                       : rc == CLI_ACTIVATION_RUNTIME_ROLLED_BACK
-                                           ? CLI_ACTIVATION_RUNTIME_ROLLED_BACK_MESSAGE
+        cli_activation_diagnostic(ops, rc == CLI_ACTIVATION_PARTIAL
+                                           ? CLI_ACTIVATION_PARTIAL_MESSAGE
                                            : CLI_ACTIVATION_MUTATION_FAILED_MESSAGE);
     }
     return rc;
@@ -754,10 +744,9 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
         (void)cli_activation_log_event(
             &context, "failed",
             context.mutation_authorized
-                ? (rc == CLI_ACTIVATION_PARTIAL ? "published/current binary retained; agent "
-                                                  "configuration refresh or cleanup incomplete"
-                   : rc == CLI_ACTIVATION_RUNTIME_ROLLED_BACK
-                       ? "previous runtime set restored; configuration writes may remain"
+                ? (rc == CLI_ACTIVATION_PARTIAL
+                       ? "published/current binary retained; agent "
+                         "configuration refresh or cleanup incomplete"
                        : "activation mutation failed; filesystem writes may "
                          "have completed")
                 : "cohort drain or coordination failed");
@@ -1191,6 +1180,13 @@ static void cli_activation_transaction_finalize_committed_or_fail_stop(
                       deferred ? deferred : "unknown path");
     }
     cli_activation_transaction_abort_or_fail_stop(transaction_io, component);
+}
+
+static int cli_activation_transaction_commit_removal(cbm_activation_transaction_t *transaction) {
+    return transaction && cbm_activation_transaction_commit(transaction, NULL, NULL) ==
+                              CBM_ACTIVATION_TRANSACTION_OK
+               ? CLI_OK
+               : CLI_ERR;
 }
 
 static bool cli_activation_transaction_expected_build(cbm_activation_transaction_t *transaction,
@@ -4842,15 +4838,160 @@ static bool cbm_write_owned_hook_script(const char *path, const char *script) {
     return cbm_write_owned_hook_script_with_legacy(path, script, NULL, 0U);
 }
 
-/* ── Integration-template rendering ───────────────────────────── */
-/* Script bodies are no longer compiled in: a block of shebang'd shell text
- * inside a native executable is unnecessary mixed-content and attack surface
- * with plausible static-classifier overlap. The bodies come from the
- * hash-verified cbm-integrations.json via integration_assets.h
- * and are materialized here by placeholder substitution. Byte-identity with
- * the old embedded builders is the migration contract: ownership checks
- * recognise previously written files only because the rendered bytes are
- * exactly what those versions wrote. */
+#ifdef _WIN32
+#define AUGMENT_SESSION_SCRIPT "codebase-memory-session.ps1"
+#define AUGMENT_COVERAGE_SCRIPT "codebase-memory-coverage.ps1"
+#else
+#define AUGMENT_SESSION_SCRIPT "codebase-memory-session.sh"
+#define AUGMENT_COVERAGE_SCRIPT "codebase-memory-coverage.sh"
+#endif
+
+static int cbm_build_augment_session_script(const char *binary_path, char *script,
+                                            size_t script_size) {
+    if (!binary_path || !script || script_size == 0U) {
+        return CLI_ERR;
+    }
+    char quoted[CLI_BUF_8K];
+#ifdef _WIN32
+    if (cbm_powershell_quote_word(binary_path, quoted, sizeof(quoted)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "# SessionStart adapter installed by codebase-memory-mcp.\n"
+                           "$bin = %s\n"
+                           "if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) { exit 0 }\n"
+                           "& $bin hook-augment --event SessionStart 2>$null\n"
+                           "exit 0\n",
+                           quoted);
+#else
+    if (cbm_shell_quote_word(binary_path, quoted, sizeof(quoted)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "#!/bin/sh\n"
+                           "# SessionStart adapter installed by codebase-memory-mcp.\n"
+                           "BIN=%s\n"
+                           "[ -x \"$BIN\" ] || exit 0\n"
+                           "exec \"$BIN\" hook-augment --event SessionStart 2>/dev/null\n",
+                           quoted);
+#endif
+    return written > 0 && (size_t)written < script_size ? CLI_OK : CLI_ERR;
+}
+
+static bool cbm_install_augment_session_script(const char *binary_path, const char *script_path) {
+    char script[CLI_BUF_8K];
+    return ensure_parent_dir(script_path) == CLI_OK &&
+           cbm_build_augment_session_script(binary_path, script, sizeof(script)) == CLI_OK &&
+           cbm_write_owned_hook_script(script_path, script);
+}
+
+static int cbm_build_augment_coverage_script(const char *binary_path, char *script,
+                                             size_t script_size) {
+    if (!binary_path || !script || script_size == 0U) {
+        return CLI_ERR;
+    }
+    char quoted[CLI_BUF_8K];
+#ifdef _WIN32
+    if (cbm_powershell_quote_word(binary_path, quoted, sizeof(quoted)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "# PostToolUse view adapter installed by codebase-memory-mcp.\n"
+                           "$bin = %s\n"
+                           "if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) { exit 0 }\n"
+                           "& $bin hook-augment --dialect augment 2>$null\n"
+                           "exit 0\n",
+                           quoted);
+#else
+    if (cbm_shell_quote_word(binary_path, quoted, sizeof(quoted)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "#!/bin/sh\n"
+                           "# PostToolUse view adapter installed by codebase-memory-mcp.\n"
+                           "BIN=%s\n"
+                           "[ -x \"$BIN\" ] || exit 0\n"
+                           "exec \"$BIN\" hook-augment --dialect augment 2>/dev/null\n",
+                           quoted);
+#endif
+    return written > 0 && (size_t)written < script_size ? CLI_OK : CLI_ERR;
+}
+
+static bool cbm_install_augment_coverage_script(const char *binary_path, const char *script_path) {
+    char script[CLI_BUF_8K];
+    return ensure_parent_dir(script_path) == CLI_OK &&
+           cbm_build_augment_coverage_script(binary_path, script, sizeof(script)) == CLI_OK &&
+           cbm_write_owned_hook_script(script_path, script);
+}
+
+static const char *const cmm_cline_context_events[] = {"TaskStart", "TaskResume",
+                                                       "UserPromptSubmit", "PreCompact"};
+
+static int cbm_cline_hook_path(const char *cline_root, const char *event, char *path,
+                               size_t path_size) {
+#ifdef _WIN32
+    int written = snprintf(path, path_size, "%s/hooks/%s.ps1", cline_root, event);
+#else
+    int written = snprintf(path, path_size, "%s/hooks/%s", cline_root, event);
+#endif
+    return written > 0 && (size_t)written < path_size ? CLI_OK : CLI_ERR;
+}
+
+static int cbm_build_cline_context_script(const char *binary_path, const char *event, char *script,
+                                          size_t script_size) {
+    char quoted[CLI_BUF_8K];
+#ifdef _WIN32
+    if (cbm_powershell_quote_word(binary_path, quoted, sizeof(quoted)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "# Cline %s context adapter installed by codebase-memory-mcp.\n"
+                           "$bin = %s\n"
+                           "if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) { exit 0 }\n"
+                           "& $bin hook-augment --dialect cline --event %s 2>$null\n"
+                           "exit 0\n",
+                           event, quoted, event);
+#else
+    if (cbm_shell_quote_word(binary_path, quoted, sizeof(quoted)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "#!/bin/sh\n"
+                           "# Cline %s context adapter installed by codebase-memory-mcp.\n"
+                           "BIN=%s\n"
+                           "[ -x \"$BIN\" ] || exit 0\n"
+                           "exec \"$BIN\" hook-augment --dialect cline --event %s 2>/dev/null\n",
+                           event, quoted, event);
+#endif
+    return written > 0 && (size_t)written < script_size ? CLI_OK : CLI_ERR;
+}
+
+static const char cmm_gate_script_prefix[] =
+    "#!/usr/bin/env bash\n"
+    "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+    "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
+    "# Despite the name this NEVER blocks a tool call - it only adds\n"
+    "# graph context. Any failure is silent (exit 0, no output).\n"
+    "BIN=";
+
+static const char cmm_session_script_prefix[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart context adapter installed by codebase-memory-mcp.\n"
+    "# Fail-open: it never blocks or logs hook/prompt content.\n"
+    "BIN=";
+
+static const char cmm_subagent_script_prefix[] =
+    "#!/usr/bin/env bash\n"
+    "# SubagentStart context adapter installed by codebase-memory-mcp.\n"
+    "# Fail-open: it never blocks or logs hook/prompt content.\n"
+    "BIN=";
+
+#ifndef _WIN32
+static const char cmm_hook_script_suffix[] = "\n"
+                                             "[ -x \"$BIN\" ] || exit 0\n"
+                                             "\"$BIN\" hook-augment 2>/dev/null\n"
+                                             "exit 0\n";
+#endif
 
 #ifdef _WIN32
 static int cbm_escape_batch_value(const char *value, char *escaped, size_t escaped_size) {
@@ -4876,190 +5017,95 @@ static int cbm_escape_batch_value(const char *value, char *escaped, size_t escap
 }
 #endif
 
-/* Encode the binary path exactly as the template's era/format requires. The
- * modes mirror the historical builders one-to-one; "raw" is the pre-quoting
- * released form, which never escaped and only refused the one character able
- * to terminate its double-quoted context. */
-static int cbm_encode_template_binary(const char *bin_mode, const char *binary_path, char *out,
-                                      size_t out_size) {
-    if (!bin_mode || !binary_path || !out || out_size == 0U) {
-        return CLI_ERR;
-    }
-    if (strcmp(bin_mode, "sh") == 0) {
-        return cbm_shell_quote_word(binary_path, out, out_size);
-    }
-    if (strcmp(bin_mode, "ps") == 0) {
-        return cbm_powershell_quote_word(binary_path, out, out_size);
-    }
+static int cbm_build_current_hook_script(const char *prefix, const char *binary_path, char *script,
+                                         size_t script_size) {
 #ifdef _WIN32
-    if (strcmp(bin_mode, "cmd") == 0) {
-        return cbm_escape_batch_value(binary_path, out, out_size);
-    }
-#endif
-    if (strcmp(bin_mode, "raw") == 0) {
-        if (strchr(binary_path, '"')) {
-            return CLI_ERR;
-        }
-        int written = snprintf(out, out_size, "%s", binary_path);
-        return written > 0 && (size_t)written < out_size ? CLI_OK : CLI_ERR;
-    }
-    return CLI_ERR;
-}
-
-static int cbm_template_append(char *out, size_t out_size, size_t *used, const char *chunk,
-                               size_t chunk_length) {
-    if (chunk_length >= out_size - *used) {
+    char escaped_binary[CLI_BUF_8K];
+    if (!prefix || !binary_path || !script ||
+        cbm_escape_batch_value(binary_path, escaped_binary, sizeof(escaped_binary)) != CLI_OK) {
         return CLI_ERR;
     }
-    memcpy(out + *used, chunk, chunk_length);
-    *used += chunk_length;
-    out[*used] = '\0';
-    return CLI_OK;
-}
-
-/* Materialize one template body: substitute {{BIN}} (encoded per bin_mode)
- * and {{EVENT}}. An unresolved "{{" is an error, never emitted — a template
- * placeholder must not survive into a file we write to disk. */
-static int cbm_render_integration_body(const cbm_integration_body_t *body, const char *binary_path,
-                                       const char *event, char *out, size_t out_size) {
-    static const char bin_token[] = "{{BIN}}";
-    static const char event_token[] = "{{EVENT}}";
-    if (!body || !body->text || !out || out_size == 0U) {
+    const char *description = NULL;
+    if (strcmp(prefix, cmm_gate_script_prefix) == 0) {
+        description = "PreToolUse search and read coverage adapter";
+    } else if (strcmp(prefix, cmm_session_script_prefix) == 0) {
+        description = "SessionStart context adapter";
+    } else if (strcmp(prefix, cmm_subagent_script_prefix) == 0) {
+        description = "SubagentStart context adapter";
+    } else {
         return CLI_ERR;
     }
-    char encoded_binary[CLI_BUF_8K];
-    encoded_binary[0] = '\0';
-    if (body->bin_mode && cbm_encode_template_binary(body->bin_mode, binary_path, encoded_binary,
-                                                     sizeof(encoded_binary)) != CLI_OK) {
-        return CLI_ERR;
-    }
-    size_t used = 0U;
-    out[0] = '\0';
-    const char *cursor = body->text;
-    while (*cursor) {
-        const char *brace = strstr(cursor, "{{");
-        if (!brace) {
-            return cbm_template_append(out, out_size, &used, cursor, strlen(cursor));
-        }
-        if (cbm_template_append(out, out_size, &used, cursor, (size_t)(brace - cursor)) != CLI_OK) {
-            return CLI_ERR;
-        }
-        if (body->bin_mode && strncmp(brace, bin_token, SLEN(bin_token)) == 0) {
-            if (cbm_template_append(out, out_size, &used, encoded_binary, strlen(encoded_binary)) !=
-                CLI_OK) {
-                return CLI_ERR;
-            }
-            cursor = brace + SLEN(bin_token);
-        } else if (event && strncmp(brace, event_token, SLEN(event_token)) == 0) {
-            if (cbm_template_append(out, out_size, &used, event, strlen(event)) != CLI_OK) {
-                return CLI_ERR;
-            }
-            cursor = brace + SLEN(event_token);
-        } else {
-            return CLI_ERR;
-        }
-    }
-    return CLI_OK;
-}
-
-/* Render a template's current body for this platform. */
-static int cbm_render_integration_script(const char *template_id, const char *binary_path,
-                                         const char *event, char *script, size_t script_size) {
-    const cbm_integration_template_t *tpl = cbm_integration_template(template_id);
-    if (!tpl) {
-        return CLI_ERR;
-    }
-    return cbm_render_integration_body(&tpl->current, binary_path, event, script, script_size);
-}
-
-/* Upper bound on historical bodies per template; the data file currently
- * carries two SessionStart bodies and one for each other Claude hook. */
-#define CMM_MAX_RELEASED_SCRIPTS 4U
-
-/* Render every historical body of a template into caller storage. A body
- * whose era-quoting refuses this binary path is skipped — exactly how the
- * old embedded builders degraded — while remaining bodies still count. */
-static size_t cbm_render_released_scripts(const cbm_integration_template_t *tpl,
-                                          const char *binary_path, char storage[][CLI_BUF_8K],
-                                          const char **out, size_t max_count) {
-    size_t count = 0U;
-    for (size_t i = 0U; tpl && i < tpl->released_count && count < max_count; i++) {
-        if (cbm_render_integration_body(&tpl->released[i], binary_path, NULL, storage[count],
-                                        CLI_BUF_8K) == CLI_OK) {
-            out[count] = storage[count];
-            count++;
-        }
-    }
-    return count;
-}
-
-#ifdef _WIN32
-#define AUGMENT_SESSION_SCRIPT "codebase-memory-session.ps1"
-#define AUGMENT_COVERAGE_SCRIPT "codebase-memory-coverage.ps1"
+    int written = snprintf(script, script_size,
+                           "@echo off\r\n"
+                           "setlocal DisableDelayedExpansion\r\n"
+                           "REM %s installed by codebase-memory-mcp.\r\n"
+                           "REM Fail-open: it never blocks or logs hook or prompt content.\r\n"
+                           "set \"BIN=%s\"\r\n"
+                           "if not exist \"%%BIN%%\" exit /b 0\r\n"
+                           "\"%%BIN%%\" hook-augment 2>NUL\r\n"
+                           "exit /b 0\r\n",
+                           description, escaped_binary);
 #else
-#define AUGMENT_SESSION_SCRIPT "codebase-memory-session.sh"
-#define AUGMENT_COVERAGE_SCRIPT "codebase-memory-coverage.sh"
-#endif
-
-static int cbm_build_augment_session_script(const char *binary_path, char *script,
-                                            size_t script_size) {
-    if (!binary_path || !script || script_size == 0U) {
+    char quoted_binary[CLI_BUF_8K];
+    if (!prefix || !binary_path || !script ||
+        cbm_shell_quote_word(binary_path, quoted_binary, sizeof(quoted_binary)) != CLI_OK) {
         return CLI_ERR;
     }
-    return cbm_render_integration_script("augment_session", binary_path, NULL, script, script_size);
-}
-
-static bool cbm_install_augment_session_script(const char *binary_path, const char *script_path) {
-    char script[CLI_BUF_8K];
-    return ensure_parent_dir(script_path) == CLI_OK &&
-           cbm_build_augment_session_script(binary_path, script, sizeof(script)) == CLI_OK &&
-           cbm_write_owned_hook_script(script_path, script);
-}
-
-static int cbm_build_augment_coverage_script(const char *binary_path, char *script,
-                                             size_t script_size) {
-    if (!binary_path || !script || script_size == 0U) {
-        return CLI_ERR;
-    }
-    return cbm_render_integration_script("augment_coverage", binary_path, NULL, script,
-                                         script_size);
-}
-
-static bool cbm_install_augment_coverage_script(const char *binary_path, const char *script_path) {
-    char script[CLI_BUF_8K];
-    return ensure_parent_dir(script_path) == CLI_OK &&
-           cbm_build_augment_coverage_script(binary_path, script, sizeof(script)) == CLI_OK &&
-           cbm_write_owned_hook_script(script_path, script);
-}
-
-static const char *const cmm_cline_context_events[] = {"TaskStart", "TaskResume",
-                                                       "UserPromptSubmit", "PreCompact"};
-
-static int cbm_cline_hook_path(const char *cline_root, const char *event, char *path,
-                               size_t path_size) {
-#ifdef _WIN32
-    int written = snprintf(path, path_size, "%s/hooks/%s.ps1", cline_root, event);
-#else
-    int written = snprintf(path, path_size, "%s/hooks/%s", cline_root, event);
+    int written =
+        snprintf(script, script_size, "%s%s%s", prefix, quoted_binary, cmm_hook_script_suffix);
 #endif
-    return written > 0 && (size_t)written < path_size ? CLI_OK : CLI_ERR;
+    return written > 0 && (size_t)written < script_size ? CLI_OK : CLI_ERR;
 }
 
-static int cbm_build_cline_context_script(const char *binary_path, const char *event, char *script,
+static const char cmm_released_session_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
+    "cat << 'REMINDER'\n"
+    "CRITICAL - Code Discovery Protocol:\n"
+    "1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:\n"
+    "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
+    "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
+    "   - get_code_snippet(qualified_name) for exact symbol source (precise ranges)\n"
+    "   - query_graph(query) for complex Cypher patterns\n"
+    "   - get_architecture(aspects) for project structure\n"
+    "   - search_code(pattern) for text search (graph-augmented grep)\n"
+    "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
+    "   always Read a file before editing it.\n"
+    "3. If a project is not indexed yet, run index_repository FIRST.\n"
+    "REMINDER\n";
+
+static const char cmm_released_subagent_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires when any subagent is spawned.\n"
+    "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
+    "cat << 'REMINDER'\n"
+    "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
+    "\"additionalContext\":\"Code discovery: prefer codebase-memory-mcp tools "
+    "(search_graph, trace_path, get_code_snippet, query_graph, get_architecture, "
+    "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
+    "text, configs, and non-code files.\"}}\n"
+    "REMINDER\n";
+
+static int cbm_build_released_gate_script(const char *binary_path, char *script,
                                           size_t script_size) {
-    if (!binary_path || !event || !script || script_size == 0U) {
+    if (!binary_path || !script || strchr(binary_path, '"')) {
         return CLI_ERR;
     }
-    return cbm_render_integration_script("cline_context", binary_path, event, script, script_size);
+    int written = snprintf(script, script_size,
+                           "#!/usr/bin/env bash\n"
+                           "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+                           "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
+                           "# Despite the name this NEVER blocks a tool call - it only adds\n"
+                           "# graph context. Any failure is silent (exit 0, no output).\n"
+                           "BIN=\"%s\"\n"
+                           "[ -x \"$BIN\" ] || exit 0\n"
+                           "\"$BIN\" hook-augment 2>/dev/null\n"
+                           "exit 0\n",
+                           binary_path);
+    return written > 0 && (size_t)written < script_size ? CLI_OK : CLI_ERR;
 }
-
-/* Claude Code hook templates in cbm-integrations.json. Their "released"
- * bodies are the exact historical scripts older versions wrote (including
- * the pre-quoting gate form), so upgrade and uninstall keep recognising
- * previously written files byte-for-byte. */
-#define CMM_HOOK_GATE_TEMPLATE "claude_gate"
-#define CMM_SESSION_REMINDER_TEMPLATE "claude_session"
-#define CMM_SUBAGENT_REMINDER_TEMPLATE "claude_subagent"
 
 static int cbm_remove_owned_hook_script(const char *path, const char *expected_current,
                                         const char *const *released_scripts,
@@ -5122,16 +5168,17 @@ bool cbm_install_hook_gate_script(const char *home, const char *binary_path) {
         return false;
     }
 
-    const cbm_integration_template_t *tpl = cbm_integration_template(CMM_HOOK_GATE_TEMPLATE);
     char script[CLI_BUF_8K];
-    if (!tpl || cbm_render_integration_body(&tpl->current, binary_path, NULL, script,
-                                            sizeof(script)) != CLI_OK) {
+    if (cbm_build_current_hook_script(cmm_gate_script_prefix, binary_path, script,
+                                      sizeof(script)) != CLI_OK) {
         return false;
     }
-    char released_storage[CMM_MAX_RELEASED_SCRIPTS][CLI_BUF_8K];
-    const char *legacy[CMM_MAX_RELEASED_SCRIPTS];
-    size_t legacy_count = cbm_render_released_scripts(tpl, binary_path, released_storage, legacy,
-                                                      CMM_MAX_RELEASED_SCRIPTS);
+    char released_script[CLI_BUF_8K];
+    const char *const legacy[] = {released_script};
+    size_t legacy_count = cbm_build_released_gate_script(binary_path, released_script,
+                                                         sizeof(released_script)) == CLI_OK
+                              ? 1U
+                              : 0U;
 #ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_HOOK_GATE_SCRIPT_LEGACY, script, legacy,
                                             legacy_count) != CLI_OK) {
@@ -5174,23 +5221,19 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
         return false;
     }
 
-    const cbm_integration_template_t *tpl = cbm_integration_template(CMM_SESSION_REMINDER_TEMPLATE);
     char script[CLI_BUF_8K];
-    if (!tpl || cbm_render_integration_body(&tpl->current, binary_path, NULL, script,
-                                            sizeof(script)) != CLI_OK) {
+    if (cbm_build_current_hook_script(cmm_session_script_prefix, binary_path, script,
+                                      sizeof(script)) != CLI_OK) {
         return false;
     }
-    char released_storage[CMM_MAX_RELEASED_SCRIPTS][CLI_BUF_8K];
-    const char *legacy[CMM_MAX_RELEASED_SCRIPTS];
-    size_t legacy_count = cbm_render_released_scripts(tpl, binary_path, released_storage, legacy,
-                                                      CMM_MAX_RELEASED_SCRIPTS);
+    const char *const legacy[] = {cmm_released_session_script};
 #ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_SESSION_REMINDER_SCRIPT_LEGACY, script,
-                                            legacy, legacy_count) != CLI_OK) {
+                                            legacy, 1U) != CLI_OK) {
         return false;
     }
 #endif
-    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, legacy_count);
+    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
 static int cbm_upsert_session_hooks(const char *settings_path) {
@@ -5380,24 +5423,19 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
         return false;
     }
 
-    const cbm_integration_template_t *tpl =
-        cbm_integration_template(CMM_SUBAGENT_REMINDER_TEMPLATE);
     char script[CLI_BUF_8K];
-    if (!tpl || cbm_render_integration_body(&tpl->current, binary_path, NULL, script,
-                                            sizeof(script)) != CLI_OK) {
+    if (cbm_build_current_hook_script(cmm_subagent_script_prefix, binary_path, script,
+                                      sizeof(script)) != CLI_OK) {
         return false;
     }
-    char released_storage[CMM_MAX_RELEASED_SCRIPTS][CLI_BUF_8K];
-    const char *legacy[CMM_MAX_RELEASED_SCRIPTS];
-    size_t legacy_count = cbm_render_released_scripts(tpl, binary_path, released_storage, legacy,
-                                                      CMM_MAX_RELEASED_SCRIPTS);
+    const char *const legacy[] = {cmm_released_subagent_script};
 #ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY, script,
-                                            legacy, legacy_count) != CLI_OK) {
+                                            legacy, 1U) != CLI_OK) {
         return false;
     }
 #endif
-    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, legacy_count);
+    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
 /* #1387 dry-run predicate: would writing this hook script succeed, or would
@@ -5421,24 +5459,29 @@ static bool cbm_hook_script_write_would_succeed(const char *home, const char *bi
     if (written <= 0 || (size_t)written >= sizeof(script_path)) {
         return false;
     }
-    const char *template_id = CMM_HOOK_GATE_TEMPLATE;
+    const char *prefix = cmm_gate_script_prefix;
     if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
-        template_id = CMM_SESSION_REMINDER_TEMPLATE;
+        prefix = cmm_session_script_prefix;
     } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
-        template_id = CMM_SUBAGENT_REMINDER_TEMPLATE;
+        prefix = cmm_subagent_script_prefix;
     }
-    const cbm_integration_template_t *tpl = cbm_integration_template(template_id);
     char script[CLI_BUF_8K];
-    if (!tpl || cbm_render_integration_body(&tpl->current, binary_path, NULL, script,
-                                            sizeof(script)) != CLI_OK) {
+    if (cbm_build_current_hook_script(prefix, binary_path, script, sizeof(script)) != CLI_OK) {
         return false;
     }
     /* Released shapes are accepted by the real write, so they must be accepted
      * here too or the preview would warn about a script that upgrades fine. */
-    char released_storage[CMM_MAX_RELEASED_SCRIPTS][CLI_BUF_8K];
-    const char *candidates[CMM_MAX_RELEASED_SCRIPTS];
-    size_t candidate_count = cbm_render_released_scripts(tpl, binary_path, released_storage,
-                                                         candidates, CMM_MAX_RELEASED_SCRIPTS);
+    char released[CLI_BUF_8K];
+    const char *candidates[2];
+    size_t candidate_count = 0U;
+    if (strcmp(script_name, CMM_HOOK_GATE_SCRIPT) == 0 &&
+        cbm_build_released_gate_script(binary_path, released, sizeof(released)) == CLI_OK) {
+        candidates[candidate_count++] = released;
+    } else if (strcmp(script_name, CMM_SESSION_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_session_script;
+    } else if (strcmp(script_name, CMM_SUBAGENT_REMINDER_SCRIPT) == 0) {
+        candidates[candidate_count++] = cmm_released_subagent_script;
+    }
     return cbm_text_owned_document_status(script_path, script, candidates, candidate_count) == 0;
 }
 
@@ -6253,10 +6296,9 @@ static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
  * LTO or function-section garbage collection to drop it.
  *
  * "Download an archive, decompress it in memory, pick an executable out of it,
- * write it to disk and mark it executable" is a high-risk dual-use capability
- * commonly associated with installer and loader behavior. We do not do that
- * in production, and now we cannot: the capability is not in the artifact
- * rather than merely unreachable within it. Verified by
+ * write it to disk and mark it executable" is the canonical dropper composite.
+ * We do not do that in production, and now we cannot: the capability is not in
+ * the artifact rather than merely unreachable within it. Verified by
  * scripts/ci/check-binary-composition.sh.
  */
 #ifdef CBM_CLI_ENABLE_TEST_API
@@ -9922,6 +9964,9 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     buf[0] = '\0';
     bool exact = false;
 #ifdef _WIN32
+    /* GetModuleFileNameA renders the module path through the ANSI code page,
+     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
+     * wide and convert to UTF-8 so the returned path survives verbatim. */
     char *module_path = cbm_module_path_utf8();
     size_t length = module_path ? strlen(module_path) : 0U;
     exact = module_path && length > 0U && length < buf_sz;
@@ -9947,7 +9992,7 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
         buf[0] = '\0';
     }
 #endif
-    if (!buf[0] && home && home[0]) {
+    if (!buf[0]) {
 #ifdef _WIN32
         snprintf(buf, buf_sz, "%s/.local/bin/codebase-memory-mcp.exe", home);
 #else
@@ -9955,73 +10000,6 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
 #endif
     }
     return exact;
-}
-
-static bool cli_runtime_asset_regular_leaf(const char *path) {
-    cbm_path_info_t info;
-    return path && cbm_path_info_utf8(path, &info) == 0 && info.is_regular && !info.is_symlink;
-}
-
-bool cbm_cli_verify_runtime_assets_at(const char *binary_path, char *err, size_t err_sz) {
-    if (!binary_path || !binary_path[0]) {
-        if (err && err_sz > 0U) {
-            (void)snprintf(err, err_sz, "runtime executable path is unavailable");
-        }
-        return false;
-    }
-    char directory[CLI_BUF_4K];
-    int directory_length = snprintf(directory, sizeof(directory), "%s", binary_path);
-    char *separator = directory_length > 0 ? strrchr(directory, '/') : NULL;
-#ifdef _WIN32
-    char *backslash = directory_length > 0 ? strrchr(directory, '\\') : NULL;
-    if (backslash && (!separator || backslash > separator)) {
-        separator = backslash;
-    }
-#endif
-    if (directory_length <= 0 || (size_t)directory_length >= sizeof(directory) || !separator ||
-        separator == directory) {
-        if (err && err_sz > 0U) {
-            (void)snprintf(err, err_sz, "runtime executable directory is unavailable");
-        }
-        return false;
-    }
-    *separator = '\0';
-    char integration[CLI_BUF_4K];
-    int integration_length =
-        snprintf(integration, sizeof(integration), "%s/%s", directory, CBM_INTEGRATIONS_ASSET_NAME);
-    if (integration_length <= 0 || (size_t)integration_length >= sizeof(integration) ||
-        !cli_runtime_asset_regular_leaf(integration) ||
-        !cbm_integration_assets_verify_file(integration)) {
-        if (err && err_sz > 0U) {
-            (void)snprintf(err, err_sz, "adjacent integration assets do not match this binary");
-        }
-        return false;
-    }
-    if (cbm_ui_assets_supported()) {
-        char pack[CLI_BUF_4K];
-        int pack_length =
-            snprintf(pack, sizeof(pack), "%s/%s", directory, cbm_ui_assets_current_pack_name());
-        if (pack_length <= 0 || (size_t)pack_length >= sizeof(pack) ||
-            !cli_runtime_asset_regular_leaf(pack) || !cbm_ui_assets_verify_file(pack)) {
-            if (err && err_sz > 0U) {
-                (void)snprintf(err, err_sz, "adjacent UI assets do not match this binary");
-            }
-            return false;
-        }
-    }
-    return true;
-}
-
-int cbm_cmd_verify_runtime_assets(void) {
-    const char *home = cbm_get_home_dir();
-    char self_path[CLI_BUF_4K] = {0};
-    char err[CLI_BUF_1K] = {0};
-    if (!cbm_detect_self_path(self_path, sizeof(self_path), home) ||
-        !cbm_cli_verify_runtime_assets_at(self_path, err, sizeof(err))) {
-        (void)fprintf(stderr, "runtime asset verification failed%s%s\n", err[0] ? ": " : "", err);
-        return CLI_TRUE;
-    }
-    return CLI_OK;
 }
 
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
@@ -10161,98 +10139,6 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     return cbm_build_install_plan_json_options(home, binary_path, false);
 }
 
-static bool cli_ui_pack_filename_digest(const char *name,
-                                        char digest[CBM_SHA256_HEX_LEN + CLI_SKIP_ONE]) {
-    static const char prefix[] = "cbm-ui-";
-    static const char suffix[] = ".pack";
-    size_t prefix_length = sizeof(prefix) - CLI_SKIP_ONE;
-    size_t suffix_length = sizeof(suffix) - CLI_SKIP_ONE;
-    size_t expected_length = prefix_length + CBM_SHA256_HEX_LEN + suffix_length;
-    if (!name || strlen(name) != expected_length || strncmp(name, prefix, prefix_length) != 0 ||
-        strcmp(name + expected_length - suffix_length, suffix) != 0) {
-        return false;
-    }
-    for (size_t index = 0U; index < CBM_SHA256_HEX_LEN; index++) {
-        char byte = name[prefix_length + index];
-        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
-            return false;
-        }
-        digest[index] = byte;
-    }
-    digest[CBM_SHA256_HEX_LEN] = '\0';
-    return true;
-}
-
-/* Remove only content-addressed packs whose exact retained bytes hash to the
- * digest in their filename. The removal transaction first moves the snapshotted
- * entry to its private backup; hashing that backup binds verification and
- * deletion to one file identity. A mismatch is rolled back and preserved. */
-static void cli_gc_stale_ui_asset_packs(const char *install_dir) {
-    if (!install_dir || !install_dir[0]) {
-        return;
-    }
-    const char *current_pack = cbm_ui_assets_current_pack_name();
-    cbm_dir_t *directory = cbm_opendir(install_dir);
-    if (!directory) {
-        return;
-    }
-    cbm_dirent_t *entry;
-    while ((entry = cbm_readdir(directory)) != NULL) {
-        char expected_digest[CBM_SHA256_HEX_LEN + CLI_SKIP_ONE];
-        if (!cli_ui_pack_filename_digest(entry->name, expected_digest) ||
-            (current_pack && strcmp(entry->name, current_pack) == 0)) {
-            continue;
-        }
-        char path[CLI_BUF_4K];
-        int path_length = snprintf(path, sizeof(path), "%s/%s", install_dir, entry->name);
-        if (path_length <= 0 || (size_t)path_length >= sizeof(path)) {
-            continue;
-        }
-        cbm_path_info_t path_info;
-        if (cbm_path_info_utf8(path, &path_info) != 0 || !path_info.is_regular ||
-            path_info.is_symlink) {
-            continue;
-        }
-        cbm_activation_transaction_t *removal = NULL;
-        cbm_activation_transaction_status_t status =
-            cbm_activation_transaction_stage_removal(path, &removal);
-        if (status != CBM_ACTIVATION_TRANSACTION_OK || !removal) {
-            (void)fprintf(stderr, "note: retained stale UI asset pack %s (cannot stage)\n",
-                          entry->name);
-            if (removal) {
-                (void)cbm_activation_transaction_close(&removal);
-            }
-            continue;
-        }
-        status = cbm_activation_transaction_commit(removal, NULL, NULL);
-        const char *retained = cbm_activation_transaction_backup_path(removal);
-        char actual_digest[CBM_SHA256_HEX_LEN + CLI_SKIP_ONE];
-        bool owned =
-            status == CBM_ACTIVATION_TRANSACTION_OK && retained &&
-            cbm_cli_sha256_file(retained, actual_digest, sizeof(actual_digest)) == CLI_OK &&
-            strcmp(actual_digest, expected_digest) == 0;
-        if (!owned) {
-            if (status == CBM_ACTIVATION_TRANSACTION_OK &&
-                cbm_activation_transaction_rollback(removal) != CBM_ACTIVATION_TRANSACTION_OK) {
-                cli_activation_cleanup_fail_stop(NULL, "stale_ui_pack_restore");
-            }
-            cli_activation_transaction_abort_or_fail_stop(&removal, "stale_ui_pack_preservation");
-            continue;
-        }
-        status = cbm_activation_transaction_finalize(removal);
-        if (status != CBM_ACTIVATION_TRANSACTION_OK &&
-            status != CBM_ACTIVATION_TRANSACTION_DEFERRED) {
-            cli_activation_transaction_abort_or_fail_stop(&removal,
-                                                          "stale_ui_pack_finalize_recovery");
-            (void)fprintf(stderr, "note: retained stale UI asset pack %s (cleanup failed)\n",
-                          entry->name);
-            continue;
-        }
-        cli_activation_transaction_abort_or_fail_stop(&removal, "stale_ui_pack_close");
-    }
-    cbm_closedir(directory);
-}
-
 typedef struct {
     const char *bin_target;
     const char *bin_dir;
@@ -10260,54 +10146,14 @@ typedef struct {
     const char *shell_rc;
     const char *prepared_candidate;
     cbm_activation_transaction_t *binary_transaction;
-    cbm_activation_transaction_t *integration_adjacent_transaction;
-    cbm_activation_transaction_t *integration_ownership_transaction;
-    cbm_activation_transaction_t *ui_pack_transaction;
     cli_binary_validator_t binary_validator;
     bool has_binary_validator;
     bool copy_binary;
-    bool publish_runtime_assets;
     bool delete_indexes;
     bool skip_config;
     bool force;
     bool dry_run;
 } cli_install_activation_t;
-
-static void cli_install_runtime_abort(cli_install_activation_t *activation, const char *component) {
-    if (!activation) {
-        return;
-    }
-    cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction, component);
-    cli_activation_transaction_abort_or_fail_stop(&activation->ui_pack_transaction, component);
-    cli_activation_transaction_abort_or_fail_stop(&activation->integration_ownership_transaction,
-                                                  component);
-    cli_activation_transaction_abort_or_fail_stop(&activation->integration_adjacent_transaction,
-                                                  component);
-}
-
-static bool cli_install_commit_integration_asset(cbm_activation_transaction_t *transaction) {
-    return !transaction ||
-           cbm_integration_assets_commit_install(transaction) == CBM_ACTIVATION_TRANSACTION_OK;
-}
-
-static bool cli_install_commit_ui_asset(cbm_activation_transaction_t *transaction) {
-    return !transaction ||
-           cbm_ui_assets_commit_install(transaction) == CBM_ACTIVATION_TRANSACTION_OK;
-}
-
-static void cli_install_runtime_finalize(cli_install_activation_t *activation) {
-    if (!activation) {
-        return;
-    }
-    cli_activation_transaction_finalize_committed_or_fail_stop(
-        &activation->integration_adjacent_transaction, "install_integration_adjacent_finalize");
-    cli_activation_transaction_finalize_committed_or_fail_stop(
-        &activation->integration_ownership_transaction, "install_integration_ownership_finalize");
-    cli_activation_transaction_finalize_committed_or_fail_stop(&activation->ui_pack_transaction,
-                                                               "install_ui_pack_finalize");
-    cli_activation_transaction_finalize_committed_or_fail_stop(&activation->binary_transaction,
-                                                               "install_transaction_finalize");
-}
 
 static int cli_install_activate(void *opaque) {
     cli_install_activation_t *activation = opaque;
@@ -10323,60 +10169,25 @@ static int cli_install_activate(void *opaque) {
             printf("Would install binary -> %s\n\n", activation->bin_target);
         }
     }
-    /* Candidate bytes may be prepared and fingerprinted before maintenance,
-     * but the target snapshot must be taken after the lease is acquired. A
-     * concurrent winner can legitimately change the target while this install
-     * is waiting. Re-stage from the immutable private candidate/old stage into
-     * a fresh final transaction on every guarded activation. */
-    if (!activation->dry_run &&
-        (activation->binary_transaction || activation->prepared_candidate)) {
+    if (!activation->dry_run && !activation->binary_transaction && activation->prepared_candidate) {
         if (!cbm_mkdir_p(activation->bin_dir, CLI_OCTAL_PERM)) {
             (void)fprintf(stderr, "error: cannot create install directory %s\n",
                           activation->bin_dir);
             return CLI_TRUE;
         }
-        cbm_activation_transaction_t *pre_guard_transaction = activation->binary_transaction;
-        const char *restage_source =
-            activation->prepared_candidate
-                ? activation->prepared_candidate
-                : cbm_activation_transaction_staged_path(pre_guard_transaction);
-        cbm_activation_transaction_t *guarded_transaction = NULL;
         cbm_activation_transaction_status_t stage_status = cbm_activation_transaction_stage_file(
-            activation->bin_target, restage_source, &guarded_transaction);
+            activation->bin_target, activation->prepared_candidate,
+            &activation->binary_transaction);
         cli_binary_validator_t restaged_validator = {{0}};
-        if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !guarded_transaction ||
-            !cli_activation_transaction_expected_build(guarded_transaction, &restaged_validator) ||
+        if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !activation->binary_transaction ||
+            !cli_activation_transaction_expected_build(activation->binary_transaction,
+                                                       &restaged_validator) ||
             !activation->has_binary_validator ||
             strcmp(restaged_validator.fingerprint, activation->binary_validator.fingerprint) != 0) {
             (void)fprintf(stderr, "error: verified install candidate could not be "
                                   "re-staged on the target filesystem\n");
-            cli_activation_transaction_abort_or_fail_stop(&guarded_transaction,
-                                                          "install_guarded_restaging_cleanup");
-            return CLI_TRUE;
-        }
-        activation->binary_transaction = guarded_transaction;
-        cli_activation_transaction_abort_or_fail_stop(&pre_guard_transaction,
-                                                      "install_pre_guard_stage_cleanup");
-    }
-
-    if (!activation->dry_run && activation->publish_runtime_assets) {
-        char asset_error[CLI_BUF_1K] = {0};
-        if (!cbm_integration_assets_stage_install(activation->home, activation->bin_dir,
-                                                  &activation->integration_adjacent_transaction,
-                                                  &activation->integration_ownership_transaction,
-                                                  asset_error, sizeof(asset_error)) ||
-            !cbm_ui_assets_stage_install(activation->bin_dir, &activation->ui_pack_transaction,
-                                         asset_error, sizeof(asset_error))) {
-            cli_install_runtime_abort(activation, "install_runtime_asset_stage_cleanup");
-            (void)fprintf(stderr, "error: %s\n",
-                          asset_error[0] ? asset_error : "failed to stage runtime assets");
-            return CLI_TRUE;
-        }
-        if (!cli_install_commit_integration_asset(activation->integration_adjacent_transaction) ||
-            !cli_install_commit_integration_asset(activation->integration_ownership_transaction) ||
-            !cli_install_commit_ui_asset(activation->ui_pack_transaction)) {
-            cli_install_runtime_abort(activation, "install_runtime_asset_publish_recovery");
-            (void)fprintf(stderr, "error: failed to publish the staged runtime assets\n");
+            cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction,
+                                                          "install_transaction_restaging_cleanup");
             return CLI_TRUE;
         }
     }
@@ -10385,7 +10196,8 @@ static int cli_install_activate(void *opaque) {
                 activation->binary_transaction,
                 activation->has_binary_validator ? &activation->binary_validator : NULL,
                 CLI_OCTAL_PERM) != CLI_OK) {
-            cli_install_runtime_abort(activation, "install_transaction_publish_recovery");
+            cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction,
+                                                          "install_transaction_publish_recovery");
             (void)fprintf(stderr, "error: failed to publish the staged binary to %s\n",
                           activation->bin_target);
             return CLI_TRUE;
@@ -10403,11 +10215,12 @@ static int cli_install_activate(void *opaque) {
             activation->dry_run);
     }
     if (agent_config_rc != CLI_OK) {
-        cli_install_runtime_abort(activation, "install_config_failure_rollback");
-        (void)fprintf(stderr, "error: one or more agent configurations failed; the previous "
-                              "runtime set was restored, and PATH/index cleanup was not "
-                              "attempted\n");
-        return CLI_ACTIVATION_RUNTIME_ROLLED_BACK;
+        cli_activation_transaction_finalize_committed_or_fail_stop(
+            &activation->binary_transaction, "install_transaction_partial_finalize");
+        (void)fprintf(stderr, "error: one or more agent configurations failed; the "
+                              "published/current executable was kept, and PATH/index cleanup "
+                              "was not attempted\n");
+        return CLI_ACTIVATION_PARTIAL;
     }
     int path_rc = CLI_TRUE;
 #ifdef _WIN32
@@ -10429,26 +10242,26 @@ static int cli_install_activate(void *opaque) {
     }
 #endif
     if (path_rc == CLI_ERR) {
-        cli_install_runtime_abort(activation, "install_path_failure_rollback");
-        (void)fprintf(stderr, "error: PATH configuration failed; the previous runtime set was "
-                              "restored, and index cleanup was not attempted\n");
-        return CLI_ACTIVATION_RUNTIME_ROLLED_BACK;
+        cli_activation_transaction_finalize_committed_or_fail_stop(
+            &activation->binary_transaction, "install_transaction_path_failure_finalize");
+        (void)fprintf(stderr, "error: PATH configuration failed; the published/current "
+                              "executable was kept, and index cleanup was not attempted\n");
+        return CLI_ACTIVATION_PARTIAL;
     }
     if (!activation->dry_run && activation->delete_indexes) {
         int expected = count_db_indexes(activation->home);
         int removed = cbm_remove_indexes(activation->home);
         printf("Removed %d index(es).\n\n", removed);
         if (removed != expected) {
-            cli_install_runtime_abort(activation, "install_index_failure_rollback");
+            cli_activation_transaction_finalize_committed_or_fail_stop(
+                &activation->binary_transaction, "install_transaction_index_failure_finalize");
             (void)fprintf(stderr, "error: only %d of %d indexes could be removed\n", removed,
                           expected);
-            return CLI_ACTIVATION_RUNTIME_ROLLED_BACK;
+            return CLI_ACTIVATION_PARTIAL;
         }
     }
-    if (!activation->dry_run && activation->publish_runtime_assets) {
-        cli_gc_stale_ui_asset_packs(activation->bin_dir);
-    }
-    cli_install_runtime_finalize(activation);
+    cli_activation_transaction_finalize_committed_or_fail_stop(&activation->binary_transaction,
+                                                               "install_transaction_finalize");
     return CLI_OK;
 }
 
@@ -10535,12 +10348,14 @@ int cbm_cmd_install(int argc, char **argv) {
         return 0;
     }
 
-    char self_path[CLI_BUF_1K] = {0};
-    (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
-    cbm_ui_assets_set_binary_path(self_path);
-
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
+    char self_path[CLI_BUF_1K] = {0};
+    (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
+
+    /* NOT stat(): on Windows it goes through the ANSI code page, so an
+     * extended-length or non-ASCII target reports "absent" and a non-force
+     * install silently overwrites bytes the user asked to keep. */
     cbm_path_info_t target_status;
     bool target_exists = cbm_path_info_utf8(bin_target, &target_status) == 0;
     bool same_binary = cbm_same_file(self_path, bin_target);
@@ -10568,34 +10383,13 @@ int cbm_cmd_install(int argc, char **argv) {
             printf("Keeping existing binary; configs will point at it.\n\n");
         }
     }
-    /* A retained, different target must keep the sidecars compiled for that
-     * target. Publishing this process's assets would create a cross-build
-     * runtime set even though the user explicitly declined the binary. */
-    bool publish_runtime_assets = same_binary || do_copy;
-
-    /* Config generation needs the integration templates. Runtime publication
-     * additionally needs the UI pack. Resolve only what this invocation will
-     * actually consume, after the replacement decision is final. */
-    {
-        char assets_error[CLI_BUF_1K];
-        if ((publish_runtime_assets || !skip_config) &&
-            !cbm_integration_assets_require(home, assets_error, sizeof(assets_error))) {
-            (void)fprintf(stderr, "error: %s\n", assets_error);
-            return CLI_TRUE;
-        }
-        if (publish_runtime_assets &&
-            !cbm_ui_assets_warm(home, assets_error, sizeof(assets_error))) {
-            (void)fprintf(stderr, "error: %s\n", assets_error);
-            return CLI_TRUE;
-        }
-    }
 #ifdef __APPLE__
     /* A freshly clang-built arm64 binary is linker-signed (flags=0x20002)
      * and gets Killed:9 when spawned by an MCP host. Sign the private staged
      * candidate before disrupting sessions, then publish those exact verified
      * bytes inside the activation window. */
-    bool sign_binary = do_copy;
-    bool prepare_binary = do_copy;
+    bool sign_binary = do_copy || target_exists;
+    bool prepare_binary = sign_binary;
 #else
     bool prepare_binary = do_copy;
 #endif
@@ -10611,31 +10405,40 @@ int cbm_cmd_install(int argc, char **argv) {
         /* Non-macOS activation reaches this block only for a real copy. */
         const char *candidate = self_path;
 #endif
-        /* Preparation is always out-of-line. The target transaction must not
-         * snapshot or reserve anything in the install directory until the
-         * activation guard is held; otherwise a waiter races the current
-         * winner and carries a stale target snapshot into commit. */
-        int dir_length =
-            snprintf(prepared_dir, sizeof(prepared_dir), "%s/cbm-install-XXXXXX", cbm_tmpdir());
-        if (dir_length <= 0 || (size_t)dir_length >= sizeof(prepared_dir) ||
-            !cbm_mkdtemp(prepared_dir)) {
-            (void)fprintf(stderr, "error: cannot create private install staging directory\n");
-            return CLI_TRUE;
-        }
-#ifdef _WIN32
-        int candidate_length = snprintf(prepared_candidate, sizeof(prepared_candidate),
-                                        "%s/codebase-memory-mcp.exe", prepared_dir);
-#else
-        int candidate_length = snprintf(prepared_candidate, sizeof(prepared_candidate),
-                                        "%s/codebase-memory-mcp", prepared_dir);
+        bool target_parent_exists = cbm_is_dir(bin_dir);
+        bool prepare_out_of_line = !target_parent_exists;
+#ifdef __APPLE__
+        /* codesign may replace the file's inode. Sign a private published copy
+         * first, then open the final transaction over those immutable bytes;
+         * mutating a transaction-owned stage invalidates its identity snapshot. */
+        prepare_out_of_line = prepare_out_of_line || sign_binary;
 #endif
-        if (candidate_length <= 0 || (size_t)candidate_length >= sizeof(prepared_candidate)) {
-            (void)cbm_rmdir(prepared_dir);
-            (void)fprintf(stderr, "error: private install staging path is too long\n");
-            return CLI_TRUE;
+        const char *stage_target = bin_target;
+        if (prepare_out_of_line) {
+            int dir_length =
+                snprintf(prepared_dir, sizeof(prepared_dir), "%s/cbm-install-XXXXXX", cbm_tmpdir());
+            if (dir_length <= 0 || (size_t)dir_length >= sizeof(prepared_dir) ||
+                !cbm_mkdtemp(prepared_dir)) {
+                (void)fprintf(stderr, "error: cannot create private install staging "
+                                      "directory\n");
+                return CLI_TRUE;
+            }
+#ifdef _WIN32
+            int candidate_length = snprintf(prepared_candidate, sizeof(prepared_candidate),
+                                            "%s/codebase-memory-mcp.exe", prepared_dir);
+#else
+            int candidate_length = snprintf(prepared_candidate, sizeof(prepared_candidate),
+                                            "%s/codebase-memory-mcp", prepared_dir);
+#endif
+            if (candidate_length <= 0 || (size_t)candidate_length >= sizeof(prepared_candidate)) {
+                (void)cbm_rmdir(prepared_dir);
+                (void)fprintf(stderr, "error: private install staging path is too long\n");
+                return CLI_TRUE;
+            }
+            stage_target = prepared_candidate;
         }
-        cbm_activation_transaction_status_t stage_status = cbm_activation_transaction_stage_file(
-            prepared_candidate, candidate, &binary_transaction);
+        cbm_activation_transaction_status_t stage_status =
+            cbm_activation_transaction_stage_file(stage_target, candidate, &binary_transaction);
         cli_binary_validator_t staged_validator = {{0}};
         if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction ||
             !cli_activation_transaction_expected_build(binary_transaction, &staged_validator)) {
@@ -10649,33 +10452,70 @@ int cbm_cmd_install(int argc, char **argv) {
             }
             return CLI_TRUE;
         }
-        if (cli_activation_transaction_commit_validated(binary_transaction, &staged_validator,
-                                                        CLI_OCTAL_PERM) != CLI_OK ||
-            cli_activation_transaction_finalize_close(&binary_transaction) != CLI_OK) {
-            (void)cli_activation_transaction_abort(&binary_transaction);
-            (void)cbm_unlink(prepared_candidate);
-            (void)cbm_rmdir(prepared_dir);
-            (void)fprintf(stderr, "error: private install candidate preparation failed\n");
-            return CLI_TRUE;
-        }
+        if (prepare_out_of_line) {
+            if (cli_activation_transaction_commit_validated(binary_transaction, &staged_validator,
+                                                            CLI_OCTAL_PERM) != CLI_OK ||
+                cli_activation_transaction_finalize_close(&binary_transaction) != CLI_OK) {
+                (void)cli_activation_transaction_abort(&binary_transaction);
+                (void)cbm_unlink(prepared_candidate);
+                (void)cbm_rmdir(prepared_dir);
+                (void)fprintf(stderr, "error: private install candidate preparation "
+                                      "failed\n");
+                return CLI_TRUE;
+            }
 #ifdef __APPLE__
-        if (sign_binary && cbm_macos_adhoc_sign(prepared_candidate) != 0) {
-            (void)fprintf(stderr, "error: ad-hoc signing the private macOS candidate failed\n");
-            (void)cbm_unlink(prepared_candidate);
-            (void)cbm_rmdir(prepared_dir);
-            return CLI_TRUE;
-        }
+            if (sign_binary && cbm_macos_adhoc_sign(prepared_candidate) != 0) {
+                (void)fprintf(stderr, "error: ad-hoc signing the private macOS candidate failed\n");
+                (void)cbm_unlink(prepared_candidate);
+                (void)cbm_rmdir(prepared_dir);
+                return CLI_TRUE;
+            }
 #endif
-        has_binary_validator =
-            cbm_daemon_build_fingerprint_file(prepared_candidate, binary_validator.fingerprint);
-        if (has_binary_validator && !g_cli_activation_test_ops_set) {
-            const char *candidate_argv[] = {prepared_candidate, "--version", NULL};
-            has_binary_validator = cbm_exec_no_shell(candidate_argv) == CLI_OK;
+            has_binary_validator =
+                cbm_daemon_build_fingerprint_file(prepared_candidate, binary_validator.fingerprint);
+            if (has_binary_validator && !g_cli_activation_test_ops_set) {
+                const char *candidate_argv[] = {prepared_candidate, "--version", NULL};
+                has_binary_validator = cbm_exec_no_shell(candidate_argv) == CLI_OK;
+            }
+            if (!has_binary_validator) {
+                (void)fprintf(stderr, "error: prepared install candidate could not be "
+                                      "verified\n");
+                (void)cbm_unlink(prepared_candidate);
+                (void)cbm_rmdir(prepared_dir);
+                return CLI_TRUE;
+            }
+            if (target_parent_exists) {
+                stage_status = cbm_activation_transaction_stage_file(bin_target, prepared_candidate,
+                                                                     &binary_transaction);
+                cli_binary_validator_t final_validator = {{0}};
+                if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction ||
+                    !cli_activation_transaction_expected_build(binary_transaction,
+                                                               &final_validator) ||
+                    strcmp(final_validator.fingerprint, binary_validator.fingerprint) != 0) {
+                    (void)fprintf(stderr, "error: signed install candidate could not be staged "
+                                          "on the target filesystem\n");
+                    (void)cli_activation_transaction_abort(&binary_transaction);
+                    (void)cbm_unlink(prepared_candidate);
+                    (void)cbm_rmdir(prepared_dir);
+                    return CLI_TRUE;
+                }
+                binary_validator = final_validator;
+            }
+        } else {
+            binary_validator = staged_validator;
+            has_binary_validator = true;
         }
         if (!has_binary_validator) {
-            (void)fprintf(stderr, "error: prepared install candidate could not be verified\n");
-            (void)cbm_unlink(prepared_candidate);
-            (void)cbm_rmdir(prepared_dir);
+            (void)fprintf(stderr, "error: staged install candidate could not be verified\n");
+            if (binary_transaction) {
+                (void)cli_activation_transaction_abort(&binary_transaction);
+            }
+            if (prepared_candidate[0]) {
+                (void)cbm_unlink(prepared_candidate);
+            }
+            if (prepared_dir[0]) {
+                (void)cbm_rmdir(prepared_dir);
+            }
             return CLI_TRUE;
         }
     }
@@ -10693,7 +10533,6 @@ int cbm_cmd_install(int argc, char **argv) {
         .binary_validator = binary_validator,
         .has_binary_validator = has_binary_validator,
         .copy_binary = do_copy,
-        .publish_runtime_assets = publish_runtime_assets,
         .delete_indexes = delete_indexes,
         .skip_config = skip_config,
         .force = force,
@@ -10704,7 +10543,9 @@ int cbm_cmd_install(int argc, char **argv) {
                 : cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL, CBM_VERSION,
                                        has_binary_validator ? binary_validator.fingerprint : NULL,
                                        cli_install_activate, &activation);
-    cli_install_runtime_abort(&activation, "install_runtime_post_guard_cleanup");
+    if (activation.binary_transaction) {
+        (void)cli_activation_transaction_abort(&activation.binary_transaction);
+    }
     if (prepared_candidate[0]) {
         (void)cbm_unlink(prepared_candidate);
     }
@@ -10794,61 +10635,83 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
             record_agent_config_error(true, "Claude Code", "subagent_hook_uninstall",
                                       settings_path);
         }
-        /* Ownership reference for the on-disk scripts: materialize current +
-         * released bodies from the verified asset store and compare exactly.
-         * When the assets are unavailable the render fails and every script
-         * is preserved with a recorded error — never guessed at. */
+        char current_gate[CLI_BUF_8K];
+        char current_session[CLI_BUF_8K];
+        char current_subagent[CLI_BUF_8K];
+        char released_gate[CLI_BUF_8K];
+        const char *const gate_legacy[] = {released_gate};
+        const char *const session_legacy[] = {cmm_released_session_script};
+        const char *const subagent_legacy[] = {cmm_released_subagent_script};
+        size_t gate_legacy_count = cbm_build_released_gate_script(installed_binary, released_gate,
+                                                                  sizeof(released_gate)) == CLI_OK
+                                       ? 1U
+                                       : 0U;
         static const struct {
             const char *name;
             const char *legacy_name;
-            const char *template_id;
+            const char *prefix;
         } hook_types[] = {
-            {CMM_HOOK_GATE_SCRIPT, CMM_HOOK_GATE_SCRIPT_LEGACY, CMM_HOOK_GATE_TEMPLATE},
+            {CMM_HOOK_GATE_SCRIPT, CMM_HOOK_GATE_SCRIPT_LEGACY, cmm_gate_script_prefix},
             {CMM_SESSION_REMINDER_SCRIPT, CMM_SESSION_REMINDER_SCRIPT_LEGACY,
-             CMM_SESSION_REMINDER_TEMPLATE},
+             cmm_session_script_prefix},
             {CMM_SUBAGENT_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY,
-             CMM_SUBAGENT_REMINDER_TEMPLATE},
+             cmm_subagent_script_prefix},
+        };
+        struct {
+            const char *name;
+            const char *legacy_name;
+            const char *current;
+            const char *const *legacy;
+            size_t legacy_count;
+            bool current_valid;
+        } owned_scripts[] = {
+            {hook_types[0].name, hook_types[0].legacy_name, current_gate, gate_legacy,
+             gate_legacy_count,
+             cbm_build_current_hook_script(hook_types[0].prefix, installed_binary, current_gate,
+                                           sizeof(current_gate)) == CLI_OK},
+            {hook_types[1].name, hook_types[1].legacy_name, current_session, session_legacy, 1U,
+             cbm_build_current_hook_script(hook_types[1].prefix, installed_binary, current_session,
+                                           sizeof(current_session)) == CLI_OK},
+            {hook_types[2].name, hook_types[2].legacy_name, current_subagent, subagent_legacy, 1U,
+             cbm_build_current_hook_script(hook_types[2].prefix, installed_binary, current_subagent,
+                                           sizeof(current_subagent)) == CLI_OK},
         };
         char hooks_dir[CLI_BUF_1K];
         int hooks_written = snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
         bool hooks_dir_valid = hooks_written > 0 && (size_t)hooks_written < sizeof(hooks_dir);
-        for (size_t i = 0; i < sizeof(hook_types) / sizeof(hook_types[0]); i++) {
+        for (size_t i = 0; i < sizeof(owned_scripts) / sizeof(owned_scripts[0]); i++) {
             char script_path[CLI_BUF_1K];
-            int script_written = hooks_dir_valid ? snprintf(script_path, sizeof(script_path),
-                                                            "%s/%s", hooks_dir, hook_types[i].name)
-                                                 : CLI_ERR;
+            int script_written = hooks_dir_valid
+                                     ? snprintf(script_path, sizeof(script_path), "%s/%s",
+                                                hooks_dir, owned_scripts[i].name)
+                                     : CLI_ERR;
             bool script_path_valid =
                 script_written > 0 && (size_t)script_written < sizeof(script_path);
-            const cbm_integration_template_t *tpl =
-                cbm_integration_template(hook_types[i].template_id);
-            char current[CLI_BUF_8K];
-            if (!tpl || cbm_render_integration_body(&tpl->current, installed_binary, NULL, current,
-                                                    sizeof(current)) != CLI_OK) {
+            if (!owned_scripts[i].current_valid) {
                 record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
-                                          hook_types[i].name);
+                                          owned_scripts[i].name);
                 continue;
             }
-            char released_storage[CMM_MAX_RELEASED_SCRIPTS][CLI_BUF_8K];
-            const char *legacy[CMM_MAX_RELEASED_SCRIPTS];
-            size_t legacy_count = cbm_render_released_scripts(
-                tpl, installed_binary, released_storage, legacy, CMM_MAX_RELEASED_SCRIPTS);
             if (!script_path_valid ||
-                cbm_remove_owned_hook_script(script_path, current, legacy, legacy_count) < CLI_OK) {
+                cbm_remove_owned_hook_script(script_path, owned_scripts[i].current,
+                                             owned_scripts[i].legacy,
+                                             owned_scripts[i].legacy_count) < CLI_OK) {
                 record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
-                                          script_path_valid ? script_path : hook_types[i].name);
+                                          script_path_valid ? script_path : owned_scripts[i].name);
             }
 #ifdef _WIN32
             if (!hooks_dir_valid ||
-                cbm_remove_owned_legacy_hook_script(hooks_dir, hook_types[i].legacy_name, current,
-                                                    legacy, legacy_count) != CLI_OK) {
+                cbm_remove_owned_legacy_hook_script(
+                    hooks_dir, owned_scripts[i].legacy_name, owned_scripts[i].current,
+                    owned_scripts[i].legacy, owned_scripts[i].legacy_count) != CLI_OK) {
                 char legacy_path[CLI_BUF_1K];
                 int written = hooks_dir_valid ? snprintf(legacy_path, sizeof(legacy_path), "%s/%s",
-                                                         hooks_dir, hook_types[i].legacy_name)
+                                                         hooks_dir, owned_scripts[i].legacy_name)
                                               : CLI_ERR;
                 record_agent_config_error(true, "Claude Code", "legacy_hook_script_uninstall",
                                           written > 0 && (size_t)written < sizeof(legacy_path)
                                               ? legacy_path
-                                              : hook_types[i].legacy_name);
+                                              : owned_scripts[i].legacy_name);
             }
 #endif
         }
@@ -11851,57 +11714,12 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
 typedef struct {
     const char *home;
     const char *bin_path;
-    const char *bin_dir;
     cbm_activation_transaction_t *binary_transaction;
-    cbm_activation_transaction_t *integration_adjacent_transaction;
-    cbm_activation_transaction_t *integration_ownership_transaction;
-    cbm_activation_transaction_t *ui_pack_transaction;
     cbm_detected_agents_t agents;
     bool binary_exists;
-    bool foreign_integration_preserved;
-    bool foreign_ui_pack_preserved;
     bool delete_indexes;
     bool dry_run;
 } cli_uninstall_activation_t;
-
-static void cli_uninstall_runtime_abort(cli_uninstall_activation_t *activation,
-                                        const char *component) {
-    if (!activation) {
-        return;
-    }
-    cli_activation_transaction_abort_or_fail_stop(&activation->ui_pack_transaction, component);
-    cli_activation_transaction_abort_or_fail_stop(&activation->integration_ownership_transaction,
-                                                  component);
-    cli_activation_transaction_abort_or_fail_stop(&activation->integration_adjacent_transaction,
-                                                  component);
-    cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction, component);
-}
-
-static bool cli_uninstall_commit_removal(cbm_activation_transaction_t *transaction) {
-    return !transaction || cbm_activation_transaction_commit(transaction, NULL, NULL) ==
-                               CBM_ACTIVATION_TRANSACTION_OK;
-}
-
-static bool cli_uninstall_commit_integration_removal(cbm_activation_transaction_t *transaction) {
-    return !transaction ||
-           cbm_integration_assets_commit_removal(transaction) == CBM_ACTIVATION_TRANSACTION_OK;
-}
-
-static bool cli_uninstall_commit_ui_removal(cbm_activation_transaction_t *transaction) {
-    return !transaction ||
-           cbm_ui_assets_commit_removal(transaction) == CBM_ACTIVATION_TRANSACTION_OK;
-}
-
-static void cli_uninstall_runtime_finalize(cli_uninstall_activation_t *activation) {
-    cli_activation_transaction_finalize_committed_or_fail_stop(&activation->ui_pack_transaction,
-                                                               "uninstall_ui_pack_finalize");
-    cli_activation_transaction_finalize_committed_or_fail_stop(
-        &activation->integration_ownership_transaction, "uninstall_integration_owner_finalize");
-    cli_activation_transaction_finalize_committed_or_fail_stop(
-        &activation->integration_adjacent_transaction, "uninstall_integration_adjacent_finalize");
-    cli_activation_transaction_finalize_committed_or_fail_stop(&activation->binary_transaction,
-                                                               "uninstall_binary_finalize");
-}
 
 /* Report — never delete — the updater script sitting next to the binary.
  *
@@ -11972,41 +11790,11 @@ static int cli_uninstall_activate(void *opaque) {
     uninstall_agent_client_registry(activation->home, activation->dry_run);
 
     if (g_agent_uninstall_errors != 0) {
-        cli_uninstall_runtime_abort(activation, "uninstall_transaction_config_cleanup_abort");
+        cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction,
+                                                      "uninstall_transaction_config_cleanup_abort");
         (void)fprintf(stderr, "error: one or more agent cleanup operations failed; executable "
                               "and index removal were not started\n");
         return CLI_ACTIVATION_PARTIAL;
-    }
-
-    /* All removal staging belongs inside the activation guard: staging creates
-     * durable sibling reservations even though it does not yet move targets. */
-    if (!activation->dry_run) {
-        cbm_path_info_t binary_info;
-        activation->binary_exists = cbm_path_info_utf8(activation->bin_path, &binary_info) == 0;
-        if (activation->binary_exists) {
-            cbm_activation_transaction_status_t status = cbm_activation_transaction_stage_removal(
-                activation->bin_path, &activation->binary_transaction);
-            if (status != CBM_ACTIVATION_TRANSACTION_OK || !activation->binary_transaction) {
-                cli_uninstall_runtime_abort(activation, "uninstall_binary_stage_cleanup");
-                (void)fprintf(stderr, "error: failed to stage uninstall transaction: %s\n",
-                              cbm_activation_transaction_status_message(status));
-                return CLI_ACTIVATION_PARTIAL;
-            }
-        }
-        char asset_error[CLI_BUF_1K] = {0};
-        if (!cbm_integration_assets_stage_remove(activation->home, activation->bin_dir,
-                                                 &activation->integration_adjacent_transaction,
-                                                 &activation->integration_ownership_transaction,
-                                                 &activation->foreign_integration_preserved,
-                                                 asset_error, sizeof(asset_error)) ||
-            !cbm_ui_assets_stage_remove(activation->bin_dir, &activation->ui_pack_transaction,
-                                        &activation->foreign_ui_pack_preserved, asset_error,
-                                        sizeof(asset_error))) {
-            cli_uninstall_runtime_abort(activation, "uninstall_runtime_asset_stage_cleanup");
-            (void)fprintf(stderr, "error: %s\n",
-                          asset_error[0] ? asset_error : "failed to stage runtime asset removal");
-            return CLI_ACTIVATION_PARTIAL;
-        }
     }
 
     if (activation->delete_indexes && !activation->dry_run) {
@@ -12014,40 +11802,28 @@ static int cli_uninstall_activate(void *opaque) {
         int idx_removed = cbm_remove_indexes(activation->home);
         printf("Removed %d index(es).\n", idx_removed);
         if (idx_removed != expected) {
-            cli_uninstall_runtime_abort(activation, "uninstall_transaction_index_failure_abort");
+            cli_activation_transaction_abort_or_fail_stop(
+                &activation->binary_transaction, "uninstall_transaction_index_failure_abort");
             (void)fprintf(stderr, "error: only %d of %d indexes could be removed\n", idx_removed,
                           expected);
             return CLI_ACTIVATION_PARTIAL;
         }
     }
-    if (!activation->dry_run) {
-        /* Remove the executable first. A crash during the subsequent sidecar
-         * removals can leave inert data behind, never a runnable binary with a
-         * partial runtime set. Cooperative failures roll every commit back. */
-        if (!cli_uninstall_commit_removal(activation->binary_transaction) ||
-            !cli_uninstall_commit_integration_removal(
-                activation->integration_adjacent_transaction) ||
-            !cli_uninstall_commit_integration_removal(
-                activation->integration_ownership_transaction) ||
-            !cli_uninstall_commit_ui_removal(activation->ui_pack_transaction)) {
-            cli_uninstall_runtime_abort(activation, "uninstall_transaction_removal_recovery");
+    if (!activation->dry_run && activation->binary_transaction) {
+        if (cli_activation_transaction_commit_removal(activation->binary_transaction) != CLI_OK) {
+            cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction,
+                                                          "uninstall_transaction_removal_recovery");
             (void)fprintf(stderr,
-                          "error: failed to remove the owned runtime set for %s; completed "
+                          "error: failed to remove %s; completed "
                           "configuration/index cleanup may remain\n",
                           activation->bin_path);
             return CLI_ACTIVATION_PARTIAL;
         }
-        cli_uninstall_runtime_finalize(activation);
+        cli_activation_transaction_finalize_committed_or_fail_stop(
+            &activation->binary_transaction, "uninstall_transaction_removal_finalize");
     }
     if (activation->binary_exists) {
-        printf("%s %s\n", activation->dry_run ? "Would remove" : "Removed", activation->bin_path);
-    }
-    if (activation->foreign_integration_preserved) {
-        (void)fprintf(stderr, "note: a modified or foreign %s was preserved\n",
-                      CBM_INTEGRATIONS_ASSET_NAME);
-    }
-    if (activation->foreign_ui_pack_preserved) {
-        (void)fprintf(stderr, "note: a modified or foreign UI asset pack was preserved\n");
+        printf("Removed %s\n", activation->bin_path);
     }
     cli_uninstall_report_leftover_installer(activation->bin_path, activation->dry_run);
     return CLI_OK;
@@ -12060,6 +11836,9 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    /* An install into a custom --dir must be removable from that same dir:
+     * without this, anyone who installed outside ~/.local/bin has no supported
+     * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
     const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         /* The public command dispatcher passes option-only argv, while the
@@ -12096,18 +11875,6 @@ int cbm_cmd_uninstall(int argc, char **argv) {
 
     printf("codebase-memory-mcp uninstall\n\n");
 
-    /* Load the ownership reference (the stored asset copy, or any other
-     * hash-verified candidate) up front. When none is available every
-     * template-dependent file removal below preserves its file and records
-     * this one actionable error, while settings/registration cleanup — which
-     * needs no templates — still proceeds. */
-    {
-        char assets_error[CLI_BUF_1K];
-        if (!cbm_integration_assets_require(home, assets_error, sizeof(assets_error))) {
-            (void)fprintf(stderr, "warning: %s\n", assets_error);
-        }
-    }
-
     g_agent_uninstall_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
@@ -12133,89 +11900,38 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
     }
 
-    char bin_dir_storage[CLI_BUF_1K] = {0};
-    char bin_path_storage[CLI_BUF_1K] = {0};
-    bool use_self_path = false;
-    if (!requested_bin_dir) {
-        char self_path[CLI_BUF_1K] = {0};
-        if (cbm_detect_self_path(self_path, sizeof(self_path), home)) {
-            const char *base = strrchr(self_path, '/');
+    char bin_path_storage[CLI_BUF_1K];
+    const char *bin_path = bin_path_storage;
 #ifdef _WIN32
-            const char *backslash = strrchr(self_path, '\\');
-            if (backslash && (!base || backslash > base)) {
-                base = backslash;
-            }
-#endif
-            base = base ? base + CLI_SKIP_ONE : self_path;
-#ifdef _WIN32
-            use_self_path = strcmp(base, "codebase-memory-mcp.exe") == 0;
+    static const char kBinaryLeaf[] = "codebase-memory-mcp.exe";
 #else
-            use_self_path = strcmp(base, "codebase-memory-mcp") == 0;
+    static const char kBinaryLeaf[] = "codebase-memory-mcp";
 #endif
-            if (use_self_path) {
-                int path_length =
-                    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s", self_path);
-                char *separator = strrchr(bin_path_storage, '/');
-#ifdef _WIN32
-                char *path_backslash = strrchr(bin_path_storage, '\\');
-                if (path_backslash && (!separator || path_backslash > separator)) {
-                    separator = path_backslash;
-                }
-#endif
-                if (path_length <= 0 || (size_t)path_length >= sizeof(bin_path_storage) ||
-                    !separator || separator == bin_path_storage) {
-                    (void)fprintf(stderr, "error: cannot resolve current install directory\n");
-                    return CLI_TRUE;
-                }
-                size_t directory_length = (size_t)(separator - bin_path_storage);
-                if (directory_length >= sizeof(bin_dir_storage)) {
-                    (void)fprintf(stderr, "error: current install directory path is too long\n");
-                    return CLI_TRUE;
-                }
-                memcpy(bin_dir_storage, bin_path_storage, directory_length);
-                bin_dir_storage[directory_length] = '\0';
-            }
-        }
+    int bin_path_length = requested_bin_dir ? snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/%s", requested_bin_dir, kBinaryLeaf)
+                                            : snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/.local/bin/%s", home, kBinaryLeaf);
+    if (bin_path_length <= 0 || (size_t)bin_path_length >= sizeof(bin_path_storage)) {
+        (void)fprintf(stderr, "error: uninstall target path is too long\n");
+        return CLI_TRUE;
     }
-    if (!use_self_path) {
-        int directory_length;
-        if (requested_bin_dir) {
-            directory_length =
-                snprintf(bin_dir_storage, sizeof(bin_dir_storage), "%s", requested_bin_dir);
-        } else {
-#ifdef _WIN32
-            const char *local = cbm_app_local_dir();
-            directory_length = local ? snprintf(bin_dir_storage, sizeof(bin_dir_storage),
-                                                "%s/Programs/codebase-memory-mcp", local)
-                                     : -1;
-#else
-            directory_length =
-                snprintf(bin_dir_storage, sizeof(bin_dir_storage), "%s/.local/bin", home);
-#endif
-        }
-        if (directory_length <= 0 || (size_t)directory_length >= sizeof(bin_dir_storage)) {
-            (void)fprintf(stderr, "error: uninstall directory path is unavailable or too long\n");
-            return CLI_TRUE;
-        }
-        cbm_normalize_path_sep(bin_dir_storage);
-#ifdef _WIN32
-        int target_length = snprintf(bin_path_storage, sizeof(bin_path_storage),
-                                     "%s/codebase-memory-mcp.exe", bin_dir_storage);
-#else
-        int target_length = snprintf(bin_path_storage, sizeof(bin_path_storage),
-                                     "%s/codebase-memory-mcp", bin_dir_storage);
-#endif
-        if (target_length <= 0 || (size_t)target_length >= sizeof(bin_path_storage)) {
-            (void)fprintf(stderr, "error: uninstall target path is too long\n");
+    cbm_path_info_t binary_status;
+    bool binary_exists = cbm_path_info_utf8(bin_path, &binary_status) == 0;
+    cbm_activation_transaction_t *binary_transaction = NULL;
+    if (!dry_run && binary_exists) {
+        cbm_activation_transaction_status_t stage_status =
+            cbm_activation_transaction_stage_removal(bin_path, &binary_transaction);
+        if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction) {
+            (void)fprintf(stderr, "error: failed to stage uninstall transaction: %s\n",
+                          cbm_activation_transaction_status_message(stage_status));
+            (void)cli_activation_transaction_abort(&binary_transaction);
             return CLI_TRUE;
         }
     }
-    cbm_path_info_t binary_info;
-    bool binary_exists = cbm_path_info_utf8(bin_path_storage, &binary_info) == 0;
     cli_uninstall_activation_t activation = {
         .home = home,
-        .bin_path = bin_path_storage,
-        .bin_dir = bin_dir_storage,
+        .bin_path = bin_path,
+        .binary_transaction = binary_transaction,
         .agents = agents,
         .binary_exists = binary_exists,
         .delete_indexes = delete_indexes,
@@ -12228,7 +11944,9 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         activation_rc = cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_UNINSTALL, NULL, NULL,
                                              cli_uninstall_activate, &activation);
     }
-    cli_uninstall_runtime_abort(&activation, "uninstall_runtime_post_guard_cleanup");
+    if (activation.binary_transaction) {
+        (void)cli_activation_transaction_abort(&activation.binary_transaction);
+    }
     if (activation_rc != CLI_OK) {
         return CLI_TRUE;
     }
@@ -12467,7 +12185,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
  * covers the flow through the activation test seam. */
 /* Build the download URL for the update command. */
 static void build_update_url(char *url, int url_sz, const char *os, const char *arch,
-                             const char *ext, bool want_ui) {
+                             const char *ext) {
     char base_url_buf[CLI_BUF_512];
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
@@ -12479,8 +12197,7 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
      * have no such variant. Keep in sync with install.sh / install.js / pypi
      * _cli.py. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url, want_ui ? "ui-" : "", os,
-             arch, portable, ext);
+    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s-%s%s.%s", base_url, os, arch, portable, ext);
 }
 
 /* Confirm index deletion before network I/O, but defer the deletion itself to
@@ -12513,8 +12230,8 @@ static int update_prepare_clear_indexes(const char *home, bool dry_run, bool *de
 
 /* Download and verify before disruption, then activate under daemon locks. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
-                                   const char *arch, bool want_ui, const char *bin_dest,
-                                   const char *home, bool delete_indexes) {
+                                   const char *arch, const char *bin_dest, const char *home,
+                                   bool delete_indexes) {
     char tmp_archive[CLI_BUF_256];
     int archive_path_length =
         snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update-XXXXXX", cbm_tmpdir());
@@ -12545,8 +12262,8 @@ static int download_verify_install(const char *url, const char *ext, const char 
     char archive_name[CLI_BUF_256];
     /* Must match build_update_url: linux uses the static "-portable" asset. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s%s.%s",
-             want_ui ? "ui-" : "", os, arch, portable, ext);
+    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s-%s%s.%s", os, arch,
+             portable, ext);
     /* Fail closed: install only a positively-verified download. A mismatch,
      * a missing checksum entry, or an unavailable hash tool (crc != 0) all
      * abort rather than install an unverified binary. */
@@ -12567,34 +12284,6 @@ static int download_verify_install(const char *url, const char *ext, const char 
         return CLI_TRUE;
     }
     return 0;
-}
-
-/* Select update variant. Returns 0=standard, 1=ui, -1=error. */
-static int select_update_variant(int variant_flag) {
-    if (variant_flag == VARIANT_A) {
-        return 0;
-    }
-    if (variant_flag == VARIANT_B) {
-        return CLI_TRUE;
-    }
-#ifndef _WIN32
-    if (!isatty(fileno(stdin))) {
-        (void)fprintf(stderr, "error: variant selection requires a terminal. "
-                              "Use --standard or --ui flag.\n");
-        return CLI_ERR;
-    }
-#endif
-    printf("Which binary variant do you want?\n");
-    printf("  1) standard  — MCP server only\n");
-    printf("  2) ui        — MCP server + external graph-visualization assets\n");
-    printf("Choose (1/2): ");
-    (void)fflush(stdout);
-    char choice[CLI_BUF_16];
-    if (!fgets(choice, sizeof(choice), stdin)) {
-        (void)fprintf(stderr, "error: failed to read input\n");
-        return CLI_ERR;
-    }
-    return (choice[0] == '2') ? CLI_TRUE : 0;
 }
 
 /* Case-insensitive prefix match (portable — no strncasecmp dependency). */
@@ -12682,14 +12371,9 @@ int cbm_cmd_update(int argc, char **argv) {
 
     bool dry_run = false;
     bool force = false;
-    int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
-        } else if (strcmp(argv[i], "--standard") == 0) {
-            variant_flag = VARIANT_A;
-        } else if (strcmp(argv[i], "--ui") == 0) {
-            variant_flag = VARIANT_B;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
@@ -12704,16 +12388,15 @@ int cbm_cmd_update(int argc, char **argv) {
      *
      * Windows forced the split first: a running .exe cannot replace itself, so
      * an in-process updater needed a second resident binary to swap the first
-     * one out. That launcher stub also combined verifier/launcher behavior in a
-     * small executable, an unnecessary dropper-like surface.
+     * one out, and that launcher stub was exactly the shape Defender's ML
+     * scores as a dropper.
      *
      * The rest followed for the same reason rather than a different one. An
      * in-process updater is, structurally, a downloader: it fetches a remote
-     * archive, extracts it, marks the result executable and runs it. Those are
-     * dual-use behaviors represented in malware-classification literature, but
-     * their presence cannot attribute an opaque vendor verdict. Carrying them
-     * in the product binary still put download/extract/chmod/exec in every
-     * shipped artifact for a command most users run a handful of times.
+     * archive, extracts it, marks the result executable and runs it. That is
+     * the behaviour Microsoft's Wacatac family describes almost verbatim, and
+     * carrying it in the product binary put download/extract/chmod/exec in
+     * every shipped artifact for a command most users run a handful of times.
      *
      * The install script already does all of it, is idempotent -- so re-running
      * it IS the update -- and runs while cbm is NOT running. Print the exact
@@ -12724,7 +12407,6 @@ int cbm_cmd_update(int argc, char **argv) {
      * rejecting typos instead of silently accepting them. */
     (void)dry_run;
     (void)force;
-    (void)variant_flag;
 #endif
 #ifdef CBM_CLI_ENABLE_TEST_API
     if (g_cli_activation_test_ops_set) {
@@ -12735,6 +12417,9 @@ int cbm_cmd_update(int argc, char **argv) {
     {
         char self_dir[CLI_BUF_1K] = {0};
         bool have_dir = false;
+        /* cbm_detect_self_path resolves wide on Windows (non-ASCII install
+         * paths survive) and normalizes to forward separators on every
+         * platform, so one branch serves both. */
         char *last_sep = cbm_detect_self_path(self_dir, sizeof(self_dir), cbm_get_home_dir())
                              ? strrchr(self_dir, '/')
                              : NULL;
@@ -12777,7 +12462,7 @@ int cbm_cmd_update(int argc, char **argv) {
         }
         printf("It downloads the latest release, verifies its checksum, and replaces\n"
                "this binary in place. install.sh is idempotent, so re-running it IS\n"
-               "the update; pass --ui for the UI build.\n");
+               "the update.\n");
 #endif
         return 0;
     }
@@ -12806,26 +12491,17 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    /* Step 2: Determine variant */
-    int want_ui_rc = select_update_variant(variant_flag);
-    if (want_ui_rc < 0) {
-        return CLI_TRUE;
-    }
-    bool want_ui = (want_ui_rc == CLI_TRUE);
-    const char *variant = want_ui ? "ui-" : "";
-    const char *variant_label = want_ui ? "ui" : "standard";
-
     const char *os = detect_os();
     const char *arch = detect_arch();
     const char *ext = strcmp(os, "windows") == 0 ? "zip" : "tar.gz";
 
     char url[CLI_BUF_512];
-    build_update_url(url, sizeof(url), os, arch, ext, want_ui);
+    build_update_url(url, sizeof(url), os, arch, ext);
 
     if (dry_run) {
-        printf("\nWould download %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nWould download release binary for %s/%s ...\n", os, arch);
     } else {
-        printf("\nDownloading %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nDownloading release binary for %s/%s ...\n", os, arch);
     }
     printf("  %s\n", url);
 
@@ -12836,10 +12512,8 @@ int cbm_cmd_update(int argc, char **argv) {
 #else
         printf("  target: %s/.local/bin/codebase-memory-mcp\n", home);
 #endif
-        printf("  variant: %s\n", variant_label);
         printf("  os/arch: %s/%s\n", os, arch);
         printf("\nUpdate dry-run complete.\n");
-        (void)variant;
         return 0;
     }
 
@@ -12859,7 +12533,7 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    int rc = download_verify_install(url, ext, os, arch, want_ui, bin_dest, home, delete_indexes);
+    int rc = download_verify_install(url, ext, os, arch, bin_dest, home, delete_indexes);
     if (rc != 0) {
         return CLI_TRUE;
     }
@@ -12876,7 +12550,6 @@ int cbm_cmd_update(int argc, char **argv) {
     printf("automatically when you next use the MCP server.\n");
     printf("\nUpdate complete. Please restart your coding-agent sessions to "
            "properly take this into account.\n");
-    (void)variant;
     return 0;
 #endif /* CBM_CLI_ENABLE_TEST_API */
 }
@@ -13253,7 +12926,7 @@ void cbm_cli_print_main_help(void) {
     printf("  codebase-memory-mcp cli <tool> [--flag value ...]  Run a single tool\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
-    printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");
+    printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run]\n");
     printf("  codebase-memory-mcp config <list|get|describe|set|reset>\n");
     printf("  codebase-memory-mcp config preset <list|apply>\n");
     printf("  codebase-memory-mcp daemon <start|stop|status>\n");
@@ -14029,15 +13702,13 @@ static void print_uninstall_help(void) {
 }
 
 static void print_update_help(void) {
-    puts("Usage: codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]");
+    puts("Usage: codebase-memory-mcp update [-y|-n] [--force] [--dry-run]");
     puts("");
-    puts("Download a release binary, replace the installed binary, and refresh agent configs.");
+    puts("Print the platform installer command; this process does not download or replace files.");
     puts("");
     puts("Options:");
-    puts("  -y, --yes   Answer yes to prompts");
-    puts("  -n, --no    Answer no to prompts");
-    puts("  --force     Skip latest-version check");
-    puts("  --dry-run   Show actions without downloading or modifying files");
-    puts("  --standard  Select MCP-server-only binary without prompting");
-    puts("  --ui        Select binary with embedded graph visualization without prompting");
+    puts("  -y, --yes   Accepted for compatibility; the handoff is non-interactive");
+    puts("  -n, --no    Accepted for compatibility; the handoff is non-interactive");
+    puts("  --force     Accepted for compatibility; the installer selects the release");
+    puts("  --dry-run   Print the handoff without modifying files (the default behavior)");
 }

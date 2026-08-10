@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "codebase-memory-mcp"
 version = "0.8.1"
-description = "Fast code intelligence for AI coding agents — installs a verified native runtime set"
+description = "Fast code intelligence for AI coding agents — installs a verified self-contained native executable"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"

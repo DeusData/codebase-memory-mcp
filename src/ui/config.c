@@ -6,7 +6,7 @@
  */
 #include "foundation/constants.h"
 #include "ui/config.h"
-#include "ui/asset_pack.h"
+#include "ui/embedded_assets.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
@@ -39,6 +39,40 @@ void cbm_ui_config_path(char *buf, int bufsz) {
         dir = cbm_tmpdir();
     }
     snprintf(buf, (size_t)bufsz, "%s/config.json", dir);
+}
+
+bool cbm_ui_parse_enabled(const char *value, bool *enabled_out) {
+    if (!value || !enabled_out) {
+        return false;
+    }
+    if (strcmp(value, "true") == 0) {
+        *enabled_out = true;
+        return true;
+    }
+    if (strcmp(value, "false") == 0) {
+        *enabled_out = false;
+        return true;
+    }
+    return false;
+}
+
+bool cbm_ui_parse_port(const char *value, int *port_out) {
+    if (!value || !value[0] || !port_out) {
+        return false;
+    }
+    for (const char *cursor = value; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return false;
+        }
+    }
+    char *end = NULL;
+    errno = 0;
+    long port = strtol(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || port <= 0 || port > CBM_UI_MAX_PORT) {
+        return false;
+    }
+    *port_out = (int)port;
+    return true;
 }
 
 /* ── Load ────────────────────────────────────────────────────── */
@@ -123,9 +157,8 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     bool opened = false;
     char *buffer = config_read_file(path, &length, &opened);
     if (!opened) {
-        /* Capability does not transiently disappear while the daemon warms
-         * the verified external pack asynchronously. */
-        if (cbm_ui_assets_supported()) {
+        /* No config file — auto-enable UI if binary has embedded assets */
+        if (CBM_EMBEDDED_FILE_COUNT > 0) {
             cfg->ui_enabled = true;
         }
         return;
@@ -155,7 +188,7 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     yyjson_val *v_port = yyjson_obj_get(root, "ui_port");
     if (yyjson_is_int(v_port)) {
         int64_t port = yyjson_get_int(v_port);
-        if (port > 0 && port <= 65535) {
+        if (port > 0 && port <= CBM_UI_MAX_PORT) {
             cfg->ui_port = (int)port;
         }
     }
@@ -346,7 +379,7 @@ static bool config_write_atomic(const char *path, const char *json, size_t json_
 #endif
 
 bool cbm_ui_config_save(const cbm_ui_config_t *cfg) {
-    if (!cfg || cfg->ui_port <= 0 || cfg->ui_port > 65535) {
+    if (!cfg || cfg->ui_port <= 0 || cfg->ui_port > CBM_UI_MAX_PORT) {
         cbm_log_error("ui.config.write_fail", "reason", "invalid_config");
         return false;
     }

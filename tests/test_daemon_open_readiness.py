@@ -1,9 +1,8 @@
 r"""Product guard for ``daemon start --open`` UI readiness.
 
-The daemon intentionally warms and verifies its external UI pack after the
-control socket is already available.  ``--open`` is the one synchronous user
-request in that flow: it must wait for the *CBM HTTP endpoint*, not merely for
-the daemon process, before it reports or opens the URL.
+The control socket becomes available before the HTTP listener does.  ``--open``
+is the one synchronous user request in that flow: it must wait for the *CBM HTTP
+endpoint*, not merely for the daemon process, before it reports or opens the URL.
 
 This guard uses a real UI build and isolated daemon generations:
 
@@ -11,8 +10,6 @@ This guard uses a real UI build and isolated daemon generations:
   the verified UI listener becomes available;
 * a foreign service returning the exact formerly accepted HTML markers proves
   public page text is not treated as daemon identity;
-* a copied binary without its content-addressed pack proves missing/invalid
-  runtime assets never result in an opened or reported UI URL.
 * a second ``daemon start --open`` proves the already-active daemon path obtains
   the same generation-bound proof over a fresh authenticated IPC client.
 
@@ -330,38 +327,6 @@ def assert_active_daemon_open(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
-def assert_missing_pack_failure(binary, work):
-    isolated = os.path.join(work, "without-pack")
-    os.makedirs(isolated, exist_ok=True)
-    copied_binary = os.path.join(isolated, os.path.basename(binary))
-    shutil.copy2(binary, copied_binary)
-
-    cache = os.path.join(work, "cache-missing-pack")
-    marker = os.path.join(work, "browser-missing-pack.txt")
-    probe, port = occupied_loopback_port()
-    probe.close()  # reserve an unused port number without keeping it occupied
-    process, env = launch_start(copied_binary, work, cache, marker, port, 900)
-    daemon_pid = 0
-    try:
-        result, text = collect(process, timeout=10)
-        daemon_pid = pid_from(text)
-        url = "http://127.0.0.1:%d" % port
-        if (result.returncode == 0 or os.path.exists(marker) or url in text or
-                "UI endpoint did not become ready" not in text or
-                "matching runtime assets" not in text):
-            print("RED: a UI binary without its verified pack must fail --open without "
-                  "reporting/opening a URL:\n%s" % text[:700])
-            return False
-        print("PASS: missing verified UI assets fail --open without opening/reporting a URL")
-        return True
-    finally:
-        if process.poll() is None:
-            process.kill()
-            _, text = collect(process)
-            daemon_pid = daemon_pid or pid_from(text)
-        stop_daemon(copied_binary, env, daemon_pid)
-
-
 def main():
     if len(sys.argv) != 2:
         print("usage: python3 test_daemon_open_readiness.py <ui-binary>")
@@ -369,11 +334,6 @@ def main():
     binary = os.path.abspath(sys.argv[1])
     if not os.path.isfile(binary):
         print("SETUP FAIL: binary not found: %s" % binary)
-        return 2
-    binary_dir = os.path.dirname(binary)
-    if not any(name.startswith("cbm-ui-") and name.endswith(".pack")
-               for name in os.listdir(binary_dir)):
-        print("SETUP FAIL: no cbm-ui-*.pack adjacent to UI binary: %s" % binary_dir)
         return 2
     if os.name == "nt":
         with open(binary, "rb") as handle:
@@ -391,8 +351,6 @@ def main():
         if not assert_bounded_foreign_port_failure(binary, work):
             return 1
         if not assert_active_daemon_open(binary, work):
-            return 1
-        if not assert_missing_pack_failure(binary, work):
             return 1
     print("\nGREEN: daemon --open is bound to verified UI endpoint readiness.")
     return 0

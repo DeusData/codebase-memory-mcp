@@ -5,9 +5,9 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
+**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the self-contained native executable for the current platform.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 158 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. Streamlined MCP tools are the default; classic mode exposes all 16. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 43 automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 158 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. Streamlined MCP tools are the default; classic mode exposes all 16. No hosted service or API key; this package requires Node.js to manage and launch the cached self-contained native executable. Plug and play across 43 automatic/conditional client surfaces.
 
 ## Installation
 
@@ -15,11 +15,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 npm install -g codebase-memory-mcp
 ```
 
-The standard runtime set for your platform is downloaded automatically at install time. To select the UI runtime set and its verified frontend pack, set `CBM_VARIANT=ui` while installing and when invoking the wrapper:
-
-```bash
-CBM_VARIANT=ui npm install -g codebase-memory-mcp
-```
+The platform runtime, including the graph UI, is downloaded automatically at install time.
 
 Then configure your coding agents:
 
@@ -32,7 +28,7 @@ Restart your agent. Say **"Index this project"** — done.
 ## Why codebase-memory-mcp
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
-- **Plug and play** — verified native runtime sets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker or API keys; Node.js owns package download, cache repair, and launch.
+- **Plug and play** — one verified self-contained native executable for each macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64) target. No Docker or API keys; Node.js owns package download, cache repair, and launch.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
 - **43 supported automatic/conditional client surfaces** — `install` configures the appropriate MCP, durable-context, and documented hook surfaces without widening client permissions.
@@ -58,7 +54,7 @@ Restart your agent. Say **"Index this project"** — done.
 codebase-memory-mcp install          # configure all detected coding agents
 codebase-memory-mcp --version
 codebase-memory-mcp --help
-codebase-memory-mcp update           # update to latest release
+codebase-memory-mcp update           # print the platform installer handoff
 codebase-memory-mcp uninstall        # remove agent configs
 ```
 

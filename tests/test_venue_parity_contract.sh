@@ -343,6 +343,22 @@ for path in sorted(shell_surfaces):
             "under native Windows process lookup"
         )
 
+# ── Release archives are extracted from an ISOLATED directory ──
+# The release/dry-run verify jobs used to download archives into the tracked
+# checkout, so the extractor scanned a directory that also held repo files.
+# Both now stage into $RUNNER_TEMP. This assertion lived in the archive-extractor
+# contract, which was deleted with the UI-pack architecture it tested; the fix
+# itself is unrelated to packs, so its guard moves here rather than vanishing.
+for name in ("release.yml", "dry-run.yml"):
+    text = (workflows / name).read_text(encoding="utf-8")
+    if "scripts/ci/extract-release-archives.sh" not in text:
+        continue
+    if "$RUNNER_TEMP/release-archives" not in text:
+        failures.append(
+            f"{name}: release archives must be downloaded into "
+            "$RUNNER_TEMP/release-archives, never into the tracked checkout"
+        )
+
 if failures:
     print("VENUE PARITY CONTRACT VIOLATED — one harness, every venue:")
     for failure in failures:

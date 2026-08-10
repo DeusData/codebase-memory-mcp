@@ -30,8 +30,8 @@ NETWORK:src/main.c:connect:1:loopback-v4:main_daemon_ctl_socket_connected:single
 WRITE:src/main.c:3:supervised worker response path; cache-scoped hook notice marker; test-seam-only browser-open marker at the caller-supplied test path
 WRITE:src/daemon/application.c:1:recovery truncates only its private uniquely-created per-job marker file
 
-# ── CLI: update command (user-initiated, interactive) ──────────────────────
-src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
+# ── CLI: release-checksum helpers used by installer fixtures ──────────────
+src/cli/cli.c:cbm_popen:sha256 checksum verification helper
 src/cli/cli.c:popen:sha256 checksum computation via shasum
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──

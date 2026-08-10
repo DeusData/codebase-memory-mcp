@@ -213,7 +213,7 @@ if ($FromSource) {
     Write-Host ""
     Write-Host "Building binary (this may take a minute)..." -ForegroundColor White
     $wslBinaryPath = "/home/$wslUser/.local/bin/$BinaryName"
-    Invoke-WSL "mkdir -p /home/$wslUser/.local/bin && cd $sourceDir && scripts/build.sh && cp build/c/codebase-memory-mcp build/c/cbm-integrations.json /home/$wslUser/.local/bin/"
+    Invoke-WSL "mkdir -p /home/$wslUser/.local/bin && cd $sourceDir && scripts/build.sh && cp build/c/codebase-memory-mcp $wslBinaryPath"
     Write-Ok "Built to $wslBinaryPath (inside WSL)"
 
     # Verify
@@ -238,7 +238,7 @@ if ($FromSource) {
     Write-Ok "Done! Restart Claude Code and verify with /mcp"
     Write-Host ""
     Write-Host "  To uninstall:" -ForegroundColor White
-    Write-Host "    wsl.exe -- rm $wslBinaryPath /home/$wslUser/.local/bin/cbm-integrations.json"
+    Write-Host "    wsl.exe -- rm $wslBinaryPath"
     Write-Host "    wsl.exe -- rm -rf $sourceDir"
     Write-Host "    wsl.exe -- rm -rf ~/.cache/codebase-memory-mcp/"
 

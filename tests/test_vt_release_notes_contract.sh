@@ -17,14 +17,12 @@ cat > "$FIX/binaries/associations.tsv" <<EOF
 # cbm-release-scan-associations-v3
 # archives=1
 # binaries=1
-# packs=0
-# runtime_files=0
-# pack_assets=1
+# runtime_files=1
 # associations=2
 # scan_objects=2
 association_type	archive	archive_sha256	variant	kind	member	asset_path	mime	scan_path	object_sha256	size
-member	codebase-memory-mcp-linux-amd64.tar.gz	$ARCHIVE_SHA	standard	binary	codebase-memory-mcp			objects/member	$MEMBER_SHA	40
-pack_asset	codebase-memory-mcp-linux-amd64.tar.gz	$ARCHIVE_SHA	ui	ui_asset	cbm-ui-$ASSET_SHA.pack	/assets/app.js	application/javascript	objects/script	$ASSET_SHA	20
+member	codebase-memory-mcp-linux-amd64.tar.gz	$ARCHIVE_SHA	release	binary	codebase-memory-mcp			objects/member	$MEMBER_SHA	40
+member	codebase-memory-mcp-linux-amd64.tar.gz	$ARCHIVE_SHA	release	runtime	LICENSE			objects/license	$ASSET_SHA	20
 EOF
 cat > "$FIX/binaries/vt-results.tsv" <<EOF
 # cbm-virustotal-results-v1
@@ -35,7 +33,7 @@ cat > "$FIX/binaries/vt-results.tsv" <<EOF
 # max_completed_engines=61
 scan_path	sha256	size	association_count	completed_engines	total_engines	malicious	suspicious	analysis_id	microsoft_category	microsoft_engine_version	microsoft_engine_update	virustotal_url
 objects/member	$MEMBER_SHA	40	1	59	62	0	0	analysis-a	undetected	1.26070	20260808	https://www.virustotal.com/gui/file/$MEMBER_SHA/detection
-objects/script	$ASSET_SHA	20	1	61	64	0	0	analysis-b				https://www.virustotal.com/gui/file/$ASSET_SHA/detection
+objects/license	$ASSET_SHA	20	1	61	64	0	0	analysis-b	undetected	1.26070	20260808	https://www.virustotal.com/gui/file/$ASSET_SHA/detection
 EOF
 cat > "$FIX/current.md" <<'EOF'
 Intro text.
@@ -100,7 +98,7 @@ grep -q 'Intro text.' "$FIX/first.md" || fail "content before marked section was
 grep -q 'Outro text.' "$FIX/first.md" || fail "content after marked section was lost"
 ! grep -q 'stale data' "$FIX/first.md" || fail "stale marked section was appended instead of replaced"
 grep -q '2 distinct extracted byte objects' "$FIX/first.md" || fail "unique extracted-object scope missing"
-grep -q '2 exact extracted-file associations' "$FIX/first.md" || fail "extracted-file association scope missing"
+grep -q '2 exact extracted archive members' "$FIX/first.md" || fail "extracted member scope missing"
 grep -q '1 downloadable archive' "$FIX/first.md" || fail "archive provenance scope missing"
 grep -q '59–61 decisive engine results' "$FIX/first.md" || fail "measured engine range missing"
 grep -q 'Microsoft returned a decisive clean verdict for all 1 executable objects' "$FIX/first.md" || \
@@ -120,7 +118,10 @@ done
 ! grep -q '70+' "$FIX/first.md" || fail "unmeasured engine claim returned"
 
 run_notes "$FIX/first.md" "$FIX/second.md"
-cmp -s "$FIX/first.md" "$FIX/second.md" || fail "marked release-note update is not idempotent"
+# python3 rather than cmp/diff: this contract runs on the Windows VM's MSYS2
+# shell too, where neither is guaranteed to be on PATH (cmp is not).
+python3 -c 'import sys;sys.exit(0 if open(sys.argv[1],"rb").read()==open(sys.argv[2],"rb").read() else 1)' \
+  "$FIX/first.md" "$FIX/second.md" || fail "marked release-note update is not idempotent"
 
 cp "$FIX/binaries/vt-results.tsv" "$FIX/binaries/vt-results.clean.tsv"
 printf '\textra-cell\n' >> "$FIX/binaries/vt-results.tsv"
@@ -167,7 +168,7 @@ cat > "$FIX/binaries/scan-set.tsv" <<EOF
 # associations=2
 scan_path	sha256	size	association_count	association_kinds
 objects/member	$MEMBER_SHA	40	1	binary
-objects/script	$ASSET_SHA	20	1	ui_asset
+objects/license	$ASSET_SHA	20	1	runtime
 EOF
 run_publish
 for asset in virustotal-associations.tsv virustotal-scan-set.tsv virustotal-results.tsv virustotal-evidence-checksums.txt; do

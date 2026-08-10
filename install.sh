@@ -5,7 +5,6 @@ set -euo pipefail
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
-#   curl -fsSL ... | bash -s -- --ui          # Install the UI variant
 #   curl -fsSL ... | bash -s -- --dir /path   # Custom install directory
 #
 # Environment:
@@ -19,7 +18,6 @@ main() {
 
 REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
-VARIANT="standard"
 SKIP_CONFIG=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
 
@@ -83,14 +81,10 @@ download_file() {
 
 for arg in "$@"; do
     case "$arg" in
-        --ui)           VARIANT="ui" ;;
-        --standard)     VARIANT="standard" ;;
         --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
         --skip-config)  SKIP_CONFIG=true ;;
         --help|-h)
-            echo "Usage: install.sh [--ui] [--dir=<path>] [--skip-config]"
-            echo "  --ui           Install the UI variant (with graph visualization)"
-            echo "  --standard     Install the standard variant (default)"
+            echo "Usage: install.sh [--dir=<path>] [--skip-config]"
             echo "  --dir PATH     Install directory (default: ~/.local/bin)"
             echo "  --skip-config  Skip automatic agent configuration"
             exit 0
@@ -138,7 +132,6 @@ ARCH=$(detect_arch)
 echo "codebase-memory-mcp installer"
 echo "  os:      $OS"
 echo "  arch:    $ARCH"
-echo "  variant: $VARIANT"
 echo "  target:  $INSTALL_DIR/codebase-memory-mcp"
 echo ""
 
@@ -155,11 +148,7 @@ fi
 PORTABLE=""
 [ "$OS" = "linux" ] && PORTABLE="-portable"
 
-if [ "$VARIANT" = "ui" ]; then
-    ARCHIVE="codebase-memory-mcp-ui-${OS}-${ARCH}${PORTABLE}.${EXT}"
-else
-    ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.${EXT}"
-fi
+ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.${EXT}"
 
 URL="${CBM_DOWNLOAD_URL}/${ARCHIVE}"
 
@@ -231,71 +220,6 @@ if [ "$EXPECTED" != "$ACTUAL" ]; then
 fi
 echo "Checksum verified."
 
-# Validate the complete archive namespace before extraction. Standard releases
-# are the canonical five files; UI releases add exactly one root-level,
-# content-addressed pack. Anything else is a release-integrity failure, not a
-# sidecar to ignore.
-if [ "$OS" = "windows" ]; then
-    ARCHIVE_BINARY="codebase-memory-mcp.exe"
-    ARCHIVE_INSTALLER="install.ps1"
-else
-    ARCHIVE_BINARY="codebase-memory-mcp"
-    ARCHIVE_INSTALLER="install.sh"
-fi
-ARCHIVE_MEMBERS_FILE="$DLDIR/archive-members.txt"
-if [ "$EXT" = "zip" ]; then
-    if ! unzip -Z1 "$DLDIR/$ARCHIVE" > "$ARCHIVE_MEMBERS_FILE"; then
-        echo "error: could not enumerate release archive" >&2
-        exit 1
-    fi
-else
-    if ! tar -tzf "$DLDIR/$ARCHIVE" > "$ARCHIVE_MEMBERS_FILE"; then
-        echo "error: could not enumerate release archive" >&2
-        exit 1
-    fi
-fi
-
-BINARY_MEMBERS=0
-INTEGRATION_MEMBERS=0
-LICENSE_MEMBERS=0
-INSTALLER_MEMBERS=0
-NOTICE_MEMBERS=0
-UI_PACK_MEMBERS=0
-ARCHIVE_MEMBER_COUNT=0
-UI_PACK_NAME=""
-while IFS= read -r member || [ -n "$member" ]; do
-    ARCHIVE_MEMBER_COUNT=$((ARCHIVE_MEMBER_COUNT + 1))
-    case "$member" in
-        "$ARCHIVE_BINARY") BINARY_MEMBERS=$((BINARY_MEMBERS + 1)) ;;
-        cbm-integrations.json) INTEGRATION_MEMBERS=$((INTEGRATION_MEMBERS + 1)) ;;
-        LICENSE) LICENSE_MEMBERS=$((LICENSE_MEMBERS + 1)) ;;
-        "$ARCHIVE_INSTALLER") INSTALLER_MEMBERS=$((INSTALLER_MEMBERS + 1)) ;;
-        THIRD_PARTY_NOTICES.md) NOTICE_MEMBERS=$((NOTICE_MEMBERS + 1)) ;;
-        *)
-            if [ "$VARIANT" = "ui" ] &&
-                [[ "$member" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
-                UI_PACK_MEMBERS=$((UI_PACK_MEMBERS + 1))
-                UI_PACK_NAME="$member"
-            else
-                echo "error: release archive contains unexpected member: $member" >&2
-                exit 1
-            fi
-            ;;
-    esac
-done < "$ARCHIVE_MEMBERS_FILE"
-
-EXPECTED_MEMBER_COUNT=5
-if [ "$VARIANT" = "ui" ]; then
-    EXPECTED_MEMBER_COUNT=6
-fi
-if [ "$BINARY_MEMBERS" -ne 1 ] || [ "$INTEGRATION_MEMBERS" -ne 1 ] ||
-    [ "$LICENSE_MEMBERS" -ne 1 ] || [ "$INSTALLER_MEMBERS" -ne 1 ] ||
-    [ "$NOTICE_MEMBERS" -ne 1 ] || [ "$UI_PACK_MEMBERS" -ne $((EXPECTED_MEMBER_COUNT - 5)) ] ||
-    [ "$ARCHIVE_MEMBER_COUNT" -ne "$EXPECTED_MEMBER_COUNT" ]; then
-    echo "error: release archive does not match the exact $VARIANT member set" >&2
-    exit 1
-fi
-
 # Extract
 echo "Extracting..."
 if [ "$EXT" = "zip" ]; then
@@ -304,39 +228,10 @@ else
     tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
 fi
 
-for extracted_member in "$ARCHIVE_BINARY" cbm-integrations.json LICENSE \
-    "$ARCHIVE_INSTALLER" THIRD_PARTY_NOTICES.md; do
-    if [ ! -f "$DLDIR/$extracted_member" ] || [ -L "$DLDIR/$extracted_member" ]; then
-        echo "error: release member is not a regular file: $extracted_member" >&2
-        exit 1
-    fi
-done
-
-DLBIN="$DLDIR/$ARCHIVE_BINARY"
-if [ ! -f "$DLBIN" ] || [ -L "$DLBIN" ]; then
+DLBIN="$DLDIR/codebase-memory-mcp"
+if [ ! -f "$DLBIN" ]; then
     echo "error: binary not found after extraction" >&2
     exit 1
-fi
-
-DL_UI_PACK=""
-if [ "$VARIANT" = "ui" ]; then
-    DL_UI_PACK="$DLDIR/$UI_PACK_NAME"
-    if [ ! -f "$DL_UI_PACK" ] || [ -L "$DL_UI_PACK" ]; then
-        echo "error: UI asset pack not found after extraction" >&2
-        exit 1
-    fi
-    PACK_EXPECTED="${UI_PACK_NAME#cbm-ui-}"
-    PACK_EXPECTED="${PACK_EXPECTED%.pack}"
-    if command -v sha256sum &>/dev/null; then
-        PACK_ACTUAL=$(sha256sum "$DL_UI_PACK" | awk '{print $1}')
-    else
-        PACK_ACTUAL=$(shasum -a 256 "$DL_UI_PACK" | awk '{print $1}')
-    fi
-    PACK_ACTUAL=$(printf '%s' "$PACK_ACTUAL" | tr 'A-F' 'a-f')
-    if [ "$PACK_EXPECTED" != "$PACK_ACTUAL" ]; then
-        echo "error: UI asset pack digest does not match its filename" >&2
-        exit 1
-    fi
 fi
 
 # macOS: fix signing
@@ -355,20 +250,7 @@ if ! CANDIDATE_VERSION=$("$DLBIN" --version 2>&1); then
 fi
 echo "Verified candidate: $CANDIDATE_VERSION"
 
-# The candidate publishes the runtime set under one native activation guard,
-# with sidecars before the executable and retained per-file backups for
-# cooperative rollback. The set is intentionally recoverable/fail-closed, not
-# claimed to be a crash-atomic multi-file filesystem transaction.
-new_exclusive_sibling_temp() {
-    local destination="$1"
-    local directory basename
-    directory="$(dirname "$destination")"
-    basename="$(basename "$destination")"
-    mktemp "$directory/.${basename}.tmp.XXXXXX"
-}
-
 DEST="$INSTALL_DIR/codebase-memory-mcp"
-[ "$OS" = "windows" ] && DEST="$INSTALL_DIR/codebase-memory-mcp.exe"
 INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
 if [ "$SKIP_CONFIG" = true ]; then
     INSTALL_ARGS+=(--skip-config)
@@ -390,16 +272,13 @@ fi
 # working install, and `update` falls back to explaining where to find it.
 DL_INSTALLER="$DLDIR/install.sh"
 if [ -f "$DL_INSTALLER" ]; then
-    INSTALLER_TMP=""
-    if INSTALLER_TMP="$(new_exclusive_sibling_temp "$INSTALL_DIR/install.sh" 2>/dev/null)" &&
-        cp "$DL_INSTALLER" "$INSTALLER_TMP" 2>/dev/null &&
+    INSTALLER_TMP="$INSTALL_DIR/.install.sh.$$"
+    if cp "$DL_INSTALLER" "$INSTALLER_TMP" 2>/dev/null &&
         chmod 755 "$INSTALLER_TMP" 2>/dev/null &&
         mv -f "$INSTALLER_TMP" "$INSTALL_DIR/install.sh" 2>/dev/null; then
         echo "Installed updater -> $INSTALL_DIR/install.sh"
     else
-        # A non-empty path was exclusively created by mktemp above. If
-        # reservation failed, leave every pre-existing sibling untouched.
-        [ -z "$INSTALLER_TMP" ] || rm -f "$INSTALLER_TMP" 2>/dev/null || true
+        rm -f "$INSTALLER_TMP" 2>/dev/null || true
         echo "note: could not place install.sh in $INSTALL_DIR (update will explain where to find it)"
     fi
 fi

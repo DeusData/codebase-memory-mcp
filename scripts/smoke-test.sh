@@ -28,7 +28,7 @@ Arguments:
   --agent-config-only   only version + agent-config install/uninstall phases
 
 Environment (set by the wrappers): SMOKE_DOWNLOAD_URL, SMOKE_UPDATE_FIXTURE_DIR,
-SMOKE_TEMP_ROOT, SMOKE_ARCH, SMOKE_REQUIRE_UI (ui variant: Phase 15 skip => FAIL).
+SMOKE_TEMP_ROOT, SMOKE_ARCH, SMOKE_REQUIRE_UI (embedded UI: Phase 15 skip => FAIL).
 HELPEOF
   exit 0
   ;;
@@ -40,32 +40,6 @@ if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
   exit 2
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-SMOKE_REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
-
-# A UI binary is a two-file runtime contract: native image plus exactly one
-# content-addressed pack beside it. Remember that source pack so every fixture
-# copy below stages the same sidecar rather than silently testing a binary-only
-# layout that no UI release ships.
-SMOKE_UI_PACK=""
-SMOKE_UI_PACK_COUNT=0
-shopt -s nullglob
-SMOKE_UI_PACK_CANDIDATES=("$(dirname "$BINARY")"/cbm-ui-*.pack)
-shopt -u nullglob
-for candidate in "${SMOKE_UI_PACK_CANDIDATES[@]+"${SMOKE_UI_PACK_CANDIDATES[@]}"}"; do
-  SMOKE_UI_PACK_COUNT=$((SMOKE_UI_PACK_COUNT + 1))
-  SMOKE_UI_PACK="$candidate"
-  candidate_name="$(basename "$candidate")"
-  if ! [[ "$candidate_name" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
-    echo "FAIL: invalid UI asset pack name beside smoke binary: $candidate_name"
-    exit 1
-  fi
-done
-if [ "$SMOKE_REQUIRE_UI" = "1" ]; then
-  if [ "$SMOKE_UI_PACK_COUNT" -ne 1 ] || [ ! -s "$SMOKE_UI_PACK" ]; then
-    echo "FAIL: SMOKE_REQUIRE_UI=1 requires exactly one UI asset pack beside $BINARY"
-    exit 1
-  fi
-fi
 
 smoke_mktemp_file() {
   if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
@@ -119,14 +93,11 @@ smoke_rmtree() {
   return 0
 }
 
-# Every platform ships one native binary. UI runtime copies also require their
-# external, content-addressed pack beside that binary.
+# Every platform ships ONE binary, Windows included: a fixture copy is complete
+# with nothing beside it.
 copy_smoke_binary() {
   local destination="$1"
   cp "$BINARY" "$destination"
-  if [ -n "$SMOKE_UI_PACK" ]; then
-    cp "$SMOKE_UI_PACK" "$(dirname "$destination")/$(basename "$SMOKE_UI_PACK")"
-  fi
 }
 
 # Retire the shared account daemon (if one is running) and wait until it
@@ -1132,19 +1103,19 @@ if ! echo "$UNINSTALL_OUT" | grep -qi 'uninstall\|remov'; then
 fi
 echo "OK: uninstall --dry-run completed"
 
-# 6c: update --dry-run --standard -y
+# 6c: update --dry-run -y
 # The product binary never replaces itself on ANY platform. `update` is a
 # handoff: it prints the shipped install script's command and exits 0. An
 # in-process updater is structurally a downloader -- fetch archive, extract,
 # chmod, exec -- which is impossible on Windows without a second resident
-# binary, and is unnecessary dropper-like surface in every platform artifact.
+# binary, and is the shape Defender's ML scores as a dropper everywhere else.
 echo "--- Phase 6c: update --dry-run ---"
 if [[ "$BINARY" == *.exe ]]; then
   UPDATE_SCRIPT="install.ps1"
 else
   UPDATE_SCRIPT="install.sh"
 fi
-if ! UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1); then
+if ! UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run -y 2>&1); then
   echo "FAIL: update handoff exited non-zero"
   echo "$UPDATE_OUT"
   exit 1
@@ -1416,7 +1387,7 @@ if [[ "$BINARY" == *.exe ]]; then
     echo "FAIL 8-0: installed binary missing after install"
     exit 1
   fi
-  # ONE executable, one link: a second hard link here would mean the retired
+  # ONE binary, one link: a second hard link here would mean the retired
   # launcher/generation layout came back.
   PHASE8_LINKS=$(stat -c %h "$PHASE8_CANONICAL" 2>/dev/null || echo 1)
   if [ "$PHASE8_LINKS" != "1" ]; then
@@ -2529,10 +2500,7 @@ echo "OK 8aw: all supported Scout/Verify/Auditor profile sets"
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
 
-# Run uninstall from the installed copy. Uninstall intentionally targets the
-# exact executable that invoked it; using the build input here removes the
-# harness binary on POSIX and makes every later adversarial case test a missing
-# command instead of the product.
+# Run uninstall (same FAKE_HOME with all configs present)
 UNINSTALL_BINARY="$SELF_PATH"
 HOME="$FAKE_HOME" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
@@ -2978,16 +2946,32 @@ echo "OK 9b-8: double uninstall doesn't crash"
 retire_account_daemon "9b-8-cleanup"
 smoke_rmtree "$DBL_HOME"
 
-# 9b-9: Non-interactive update without --standard/--ui should fail cleanly (not hang)
+# 9b-9: retired release-variant flags must fail cleanly instead of being ignored.
 if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
-  NONINT_OUT=$(echo "" | "$BINARY" update --dry-run 2>&1) || true
-  if echo "$NONINT_OUT" | grep -qi 'terminal\|requires.*flag\|error'; then
-    echo "OK 9b-9: non-interactive update fails with clear error"
-  else
-    # Dry-run may still complete if no variant prompt needed
-    echo "OK 9b-9: non-interactive update handled gracefully"
+  VARIANT_RC=0
+  VARIANT_OUT=$("$BINARY" update --standard --dry-run 2>&1) || VARIANT_RC=$?
+  if [ "$VARIANT_RC" -eq 0 ] || ! echo "$VARIANT_OUT" | grep -qi 'unknown argument'; then
+    echo "FAIL 9b-9: update accepted retired --standard flag or returned no exact error"
+    exit 1
   fi
+  echo "OK 9b-9: update rejects retired release-variant flags"
 fi
+
+# 9b-10: invalid persisted UI values must fail before daemon admission or mutation.
+for INVALID_ARG in "--ui=maybe" "--port=0"; do
+  case "$INVALID_ARG" in
+    --ui=*) EXPECTED_ERROR='invalid --ui value' ;;
+    *) EXPECTED_ERROR='invalid --port value' ;;
+  esac
+  INVALID_RC=0
+  INVALID_OUT=$(HOME="$FAKE_HOME" CBM_CACHE_DIR="$FAKE_HOME/.cache/codebase-memory-mcp" \
+    "$BINARY" "$INVALID_ARG" < /dev/null 2>&1) || INVALID_RC=$?
+  if [ "$INVALID_RC" -ne 2 ] || ! echo "$INVALID_OUT" | grep -Fq "$EXPECTED_ERROR"; then
+    echo "FAIL 9b-10: $INVALID_ARG did not fail before daemon admission with an exact error"
+    exit 1
+  fi
+done
+echo "OK 9b-10: invalid UI values fail before daemon admission"
 
 retire_account_daemon "9-cleanup"
 smoke_rmtree "$FAKE_HOME" "$EMPTY_HOME"
@@ -3155,23 +3139,18 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   UPDATE_HOME=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
   # This phase stages the binary by hand into a fresh HOME — it does NOT go
-  # through install.sh or `install`, so nothing populates ~/.cbm/assets. The
-  # integration asset ships next to the binary in every real layout (archive,
-  # build tree, installed dir), so stage it next to each staged copy here too;
-  # otherwise the uninstall this phase drives fails closed rendering templates.
-  BINARY_ASSET="$(dirname "$BINARY")/cbm-integrations.json"
+  # through install.sh or `install`. The binary is self-contained, so a staged
+  # copy is immediately able to render and remove its own integrations.
   if [[ "$BINARY" == *.exe ]]; then
-    copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
     mkdir -p "$UPDATE_HOME/retired-install"
-    copy_smoke_binary "$UPDATE_HOME/retired-install/codebase-memory-mcp.exe"
-    [ -f "$BINARY_ASSET" ] && cp "$BINARY_ASSET" "$UPDATE_HOME/.local/bin/cbm-integrations.json"
+    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp.exe"
   else
-    copy_smoke_binary "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
     chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
     mkdir -p "$UPDATE_HOME/retired-install"
-    copy_smoke_binary "$UPDATE_HOME/retired-install/codebase-memory-mcp"
+    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp"
     chmod 755 "$UPDATE_HOME/retired-install/codebase-memory-mcp"
-    [ -f "$BINARY_ASSET" ] && cp "$BINARY_ASSET" "$UPDATE_HOME/.local/bin/cbm-integrations.json"
     if [ "$(uname -s)" = "Darwin" ]; then
       codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp" 2>/dev/null || true
       codesign --sign - --force "$UPDATE_HOME/retired-install/codebase-memory-mcp" \
@@ -3207,11 +3186,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
     'import json, os; print(json.dumps({"mcpServers":{"codebase-memory-mcp":{"command":os.environ["STALE_CMD"]}}}))' \
     > "$UPDATE_HOME/.claude.json"
 
-  # 14a: Run actual update command (detect variant from available archive)
-  UPDATE_VARIANT="--standard"
-  if curl --noproxy '*' -sf "$SMOKE_DOWNLOAD_URL/" 2>/dev/null | grep -q "ui-"; then
-    UPDATE_VARIANT="--ui"
-  fi
+  # 14a: Run the one-composition update handoff.
   UPDATE_LOG=$(smoke_mktemp_file)
   # Hash the driver BEFORE the run and compare it against itself afterwards.
   # Comparing against "$BINARY" instead looks equivalent but is not: the POSIX
@@ -3219,16 +3194,15 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   # is ever invoked and the assertion fires on a difference the fixture created.
   UPDATE_BIN_SHA_BEFORE=$(smoke_file_sha256 "$UPDATE_DRIVER")
   HOME="$UPDATE_HOME" CBM_DOWNLOAD_URL="$UPDATE_DOWNLOAD_URL" \
-    "$UPDATE_DRIVER" update $UPDATE_VARIANT -y > "$UPDATE_LOG" 2>&1
+    "$UPDATE_DRIVER" update -y > "$UPDATE_LOG" 2>&1
   UPDATE_RC=$?
   cat "$UPDATE_LOG"
 
   # Contract, every platform: update NEVER replaces the running image in
   # process. It exits 0 and prints the shipped install script's command. On
-  # Windows regressing this means reintroducing the removed launcher stub;
+  # Windows regressing this means reintroducing the AV-flagged launcher stub;
   # everywhere else it means putting download -> extract -> chmod -> exec back
-  # into the product binary. Historical scanner results motivated measuring
-  # this boundary but do not attribute a classifier decision to it.
+  # into the product binary.
   if [ "$UPDATE_RC" -ne 0 ]; then
     echo "FAIL 14a: update exited rc=$UPDATE_RC (expected 0)"
     exit 1
@@ -3365,12 +3339,9 @@ if [ "$DL_OS" = "darwin" ] || [ "$DL_OS" = "linux" ]; then
 else
   DL_EXT="zip"
 fi
-# Try standard name first, fall back to UI variant
 DL_ARCHIVE="codebase-memory-mcp-${DL_OS}-${DL_ARCH}.${DL_EXT}"
-DL_ARCHIVE_UI="codebase-memory-mcp-ui-${DL_OS}-${DL_ARCH}.${DL_EXT}"
-DL_VARIANT_ARG="--standard"
 
-# 12a: curl download (try standard, then UI variant)
+# 12a: curl download
 echo "--- Phase 12a: curl download ---"
 # --noproxy '*': never route the local test server through a proxy — a proxy env
 # var present on some runners (notably windows-11-arm) made curl fail to reach
@@ -3378,16 +3349,10 @@ echo "--- Phase 12a: curl download ---"
 # surface curl's stderr instead of swallowing it so the reason is visible.
 CURL12_ERR="$DL_DIR/curl12a.err"
 if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>"$CURL12_ERR"; then
-  # Try UI variant
-  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>"$CURL12_ERR"; then
-    DL_ARCHIVE="$DL_ARCHIVE_UI"
-    DL_VARIANT_ARG="--ui"
-  else
-    echo "FAIL 12a: curl download failed (tried standard and ui variants)"
-    echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
-    cat "$CURL12_ERR" 2>/dev/null || true
-    exit 1
-  fi
+  echo "FAIL 12a: curl download failed"
+  echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
+  cat "$CURL12_ERR" 2>/dev/null || true
+  exit 1
 fi
 if [ ! -s "$DL_DIR/$DL_ARCHIVE" ]; then
   echo "FAIL 12a: downloaded archive is empty"
@@ -3428,28 +3393,14 @@ echo "--- Phase 12d: extraction ---"
 (cd "$DL_DIR" && if [ "$DL_EXT" = "zip" ]; then unzip -q "$DL_ARCHIVE"; else tar -xzf "$DL_ARCHIVE"; fi)
 if [ "$DL_OS" = "windows" ]; then
   DL_BIN="$DL_DIR/codebase-memory-mcp.exe"
-  # ONE executable per runtime set: a second executable in the archive would
-  # mean the removed launcher/payload split came back.
+  # ONE binary per platform: a second executable in the archive would mean the
+  # AV-flagged launcher/payload split came back.
   if [ -e "$DL_DIR/codebase-memory-mcp.payload.exe" ]; then
     echo "FAIL 12d: Windows archive still ships a launcher/payload pair"
     exit 1
   fi
 else
   DL_BIN="$DL_DIR/codebase-memory-mcp"
-fi
-
-shopt -s nullglob
-DL_UI_PACKS=("$DL_DIR"/cbm-ui-*.pack)
-shopt -u nullglob
-if [ "$DL_VARIANT_ARG" = "--ui" ]; then
-  if [ "${#DL_UI_PACKS[@]}" -ne 1 ] ||
-     ! [[ "$(basename "${DL_UI_PACKS[0]}")" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
-    echo "FAIL 12d: UI archive does not contain exactly one content-addressed pack"
-    exit 1
-  fi
-elif [ "${#DL_UI_PACKS[@]}" -ne 0 ]; then
-  echo "FAIL 12d: standard archive contains a UI asset pack"
-  exit 1
 fi
 if [ ! -f "$DL_BIN" ]; then
   echo "FAIL 12d: binary not found after extraction"
@@ -3500,7 +3451,7 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
 
   # 13a: run install.sh with local URL + isolated HOME
   HOME="$INSTALL_TEST_HOME" CBM_DOWNLOAD_URL="$SMOKE_DOWNLOAD_URL" \
-    "$REPO_ROOT/install.sh" "$DL_VARIANT_ARG" --dir="$INSTALL_TEST_DIR" 2>&1 || true
+    "$REPO_ROOT/install.sh" --dir="$INSTALL_TEST_DIR" 2>&1 || true
 
   # 13b: binary placed
   if [ ! -f "$INSTALL_TEST_DIR/codebase-memory-mcp" ]; then
@@ -3508,21 +3459,6 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
     exit 1
   fi
   echo "OK 13b: binary placed"
-
-  shopt -s nullglob
-  INSTALLED_UI_PACKS=("$INSTALL_TEST_DIR"/cbm-ui-*.pack)
-  shopt -u nullglob
-  if [ "$DL_VARIANT_ARG" = "--ui" ]; then
-    if [ "${#INSTALLED_UI_PACKS[@]}" -ne 1 ] ||
-       ! [[ "$(basename "${INSTALLED_UI_PACKS[0]}")" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
-      echo "FAIL 13b: install.sh did not publish exactly one UI asset pack"
-      exit 1
-    fi
-    echo "OK 13b: UI asset pack placed before binary activation"
-  elif [ "${#INSTALLED_UI_PACKS[@]}" -ne 0 ]; then
-    echo "FAIL 13b: standard install retained a UI asset pack"
-    exit 1
-  fi
 
   # 13c: binary runs
   # Sign if needed on macOS
@@ -3601,7 +3537,7 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   if ! HOME="$WIN_HOME" TEMP="$WIN_HOME" TMP="$WIN_HOME" \
     CBM_DOWNLOAD_URL="$WIN_URL" CBM_ARCH="$DL_ARCH" MSYS2_ARG_CONV_EXCL='*' \
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
-      "$WIN_SCRIPT" "$DL_VARIANT_ARG" "--dir=$WIN_DIR" 2>&1; then
+      "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1; then
     echo "FAIL 13f: install.ps1 execution failed"
     exit 1
   fi
@@ -3615,21 +3551,6 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
     echo "OK 13g: binary placed by install.ps1"
   else
     echo "FAIL 13g: binary not placed by install.ps1"
-    exit 1
-  fi
-
-  shopt -s nullglob
-  PS1_UI_PACKS=("$PS1_TEST_DIR"/cbm-ui-*.pack)
-  shopt -u nullglob
-  if [ "$DL_VARIANT_ARG" = "--ui" ]; then
-    if [ "${#PS1_UI_PACKS[@]}" -ne 1 ] ||
-       ! [[ "$(basename "${PS1_UI_PACKS[0]}")" =~ ^cbm-ui-[0-9a-f]{64}\.pack$ ]]; then
-      echo "FAIL 13g: install.ps1 did not publish exactly one UI asset pack"
-      exit 1
-    fi
-    echo "OK 13g: UI asset pack placed before binary activation"
-  elif [ "${#PS1_UI_PACKS[@]}" -ne 0 ]; then
-    echo "FAIL 13g: standard install retained a UI asset pack"
     exit 1
   fi
 
@@ -3659,12 +3580,13 @@ else
 fi
 
 # ── Phase 15: UI HTTP server reachability ──
-# Only runs if the binary has a verified external UI asset pack.
+# Only runs if the binary was built with embedded UI assets.
 #
-# SMOKE_REQUIRE_UI=1 (set by the wrappers for a -ui variant) makes the
-# no-assets outcome a FAILURE instead of a SKIP: a ui run that smoked a
-# standard binary under a ui name would otherwise pass green, and a skip that
-# cannot fail is not a gate.
+# SMOKE_REQUIRE_UI=1 makes the no-assets outcome a FAILURE instead of a SKIP.
+# scripts/ci/smoke-artifact.sh sets it because that lane builds --with-ui and
+# packages the real archive, so a binary serving no frontend is a defect there.
+# The fast PR lane builds without the frontend on purpose and leaves it unset.
+SMOKE_REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
 UI_INPUT=""
 UI_PID=""
 smoke_ui_stop() {
@@ -3679,7 +3601,7 @@ smoke_ui_stop() {
 }
 smoke_ui_missing() {
   if [ "$SMOKE_REQUIRE_UI" = "1" ]; then
-    echo "FAIL $1: SMOKE_REQUIRE_UI=1 but this binary serves no external UI assets"
+    echo "FAIL $1: SMOKE_REQUIRE_UI=1 but this binary serves no embedded UI assets"
     smoke_ui_stop
     exit 1
   fi
@@ -3696,8 +3618,7 @@ UI_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0
 # --ui=true is REQUIRED: the HTTP UI is a persisted, default-off setting, so
 # on any fresh profile (every CI runner, every smoke HOME) a bare --port
 # invocation can never serve — the probe then misread "UI disabled" as "no
-# assets" on binaries with a valid pack (first exposed when the
-# ui-variant no-skip guard made Phase 15 mandatory). Stdin must be HELD OPEN:
+# embedded assets" on binaries that carry them. Stdin must be HELD OPEN:
 # the UI does not pin the process, so stdio EOF ends it cleanly (rc=0) before
 # the poll can see it serve — the drive-listing guard holds a pipe for the
 # same reason. Equals-form flags match that guard's proven invocation.
@@ -3713,24 +3634,24 @@ UI_PID=$!
 # Fixed fd 7 works in macOS Bash 3.2, Linux Bash, and MSYS2 Bash.
 exec 7>"$UI_INPUT"
 # Readiness poll instead of a fixed sleep: SKIP is legitimate ONLY when the
-# process exited (the documented no-asset-pack case); a slow start on a
+# process exited (the documented no-embedded-assets case); a slow start on a
 # loaded runner must not masquerade as it. The UI binds ~6s after launch even
 # on a fast host (measured against the release artifact), so the window
 # matches the drive-listing guard's 25s, not a 10s sprint.
 UI_READY=0
 for _ in $(seq 1 150); do
   if ! kill -0 "$UI_PID" 2>/dev/null; then break; fi
-  if curl -sf "http://127.0.0.1:$UI_PORT/" -o /dev/null 2>/dev/null; then UI_READY=1; break; fi
+  if curl --noproxy '*' -sf "http://127.0.0.1:$UI_PORT/" -o /dev/null 2>/dev/null; then UI_READY=1; break; fi
   sleep 0.2
 done
 
 if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
-  # 15a: GET / returns 200 with HTML content from the external pack
-  UI_BODY=$(curl -sf "http://127.0.0.1:$UI_PORT/" 2>/dev/null || echo "")
+  # 15a: GET / returns 200 with HTML content
+  UI_BODY=$(curl --noproxy '*' -sf "http://127.0.0.1:$UI_PORT/" 2>/dev/null || echo "")
   if echo "$UI_BODY" | grep -qi "<html"; then
     echo "OK 15a: UI serves HTML at /"
   elif [ -z "$UI_BODY" ]; then
-    smoke_ui_missing "15a" "UI not reachable (binary may not have a valid asset pack)"
+    smoke_ui_missing "15a" "UI not reachable (binary may not have embedded assets)"
   else
     echo "FAIL 15a: UI root did not return HTML"
     smoke_ui_stop
@@ -3742,7 +3663,7 @@ if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
   # old probe POSTed an MCP initialize at /rpc, but the UI's /rpc speaks the
   # UI's own narrow query protocol, not MCP — the probe asserted a request
   # the endpoint never answered; protocol depth belongs to the UI guards.)
-  RPC_BODY=$(curl -sf "http://127.0.0.1:$UI_PORT/api/ui-config" 2>/dev/null || echo "")
+  RPC_BODY=$(curl --noproxy '*' -sf "http://127.0.0.1:$UI_PORT/api/ui-config" 2>/dev/null || echo "")
   if echo "$RPC_BODY" | grep -q "{"; then
     echo "OK 15b: /api/ui-config returns JSON"
   elif [ -z "$RPC_BODY" ]; then
@@ -3752,8 +3673,9 @@ if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
     smoke_ui_stop
     exit 1
   fi
+
 else
-  smoke_ui_missing "Phase 15" "binary exited immediately (no UI asset pack loaded)"
+  smoke_ui_missing "Phase 15" "binary exited immediately (no UI assets embedded)"
 fi
 smoke_ui_stop
 

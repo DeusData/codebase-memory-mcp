@@ -4,7 +4,7 @@
 
 codebase-memory-mcp interacts deeply with your filesystem. It reads source files across your entire codebase, writes to agent configuration files, and spawns background processes. This is inherent to what it does — not a bug.
 
-**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each archive contains a native executable and its authenticated release-owned runtime assets.
+**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each platform runtime is one self-contained native executable; the graph UI and integration templates are embedded.
 
 We are humans and can make mistakes. We take security seriously — it is Priority #1 for this project — but we cannot guarantee perfection. By using this software you accept responsibility for evaluating whether it meets your own security requirements.
 
@@ -29,9 +29,11 @@ check is ignored. The request is also bounded with `curl --max-time 5`; a
 process shutting down immediately while the check is still running may wait for
 that bounded background thread to finish.
 
-Explicit install, package-manager, and `codebase-memory-mcp update` flows are
-separate user-initiated network operations that download release assets and
-checksums from GitHub.
+Explicit install and package-manager flows are separate user-initiated network
+operations that download release archives and checksums from GitHub.
+`codebase-memory-mcp update` performs no network or replacement work itself; it
+prints the platform installer command, and downloading begins only if the user
+runs that command.
 
 ## Help Us Stay Secure
 
@@ -126,7 +128,7 @@ Releases are created as **drafts** (invisible to users) and only published after
 2. **Sigstore cosign signing** — keyless digital signatures verifiable by anyone
 3. **SBOM** — Software Bill of Materials (SPDX) listing all vendored dependencies
 4. **SHA-256 checksums** — published with every release
-5. **VirusTotal scanning** — every distinct extracted member and unpacked UI asset is scanned; downloadable `.tar.gz`/`.zip` containers are not submitted. Each completed analysis must contain at least 50 decisive engine results, zero malicious verdicts, and zero suspicious verdicts. Release notes retain archive SHA-256 provenance and link durable public association, exact-scan-set, per-object-result, and evidence-checksum assets.
+5. **VirusTotal scanning** — every distinct extracted release object is scanned; downloadable `.tar.gz`/`.zip` containers are not submitted. Each completed analysis must contain at least 50 decisive engine results and no suspicious verdicts. Malicious verdicts block unless the result contains exactly one detection from Microsoft and its label ends in `!ml`; release notes publish that exception and retain archive SHA-256 provenance plus the exact association, scan-set, result, and evidence-checksum assets.
 6. **OpenSSF Scorecard** — repository security health score
 
 Scope of the SLSA claim: this is a build provenance claim for release
@@ -137,9 +139,8 @@ not mean the source code is vulnerability-free or that maintainers cannot change
 source. Consumers should verify the signer workflow, not only repository
 ownership.
 
-If any antivirus engine flags any scanned release object, the release stays as a
-draft and is not published until the issue is investigated and resolved. There
-is no exception path in this release gate.
+Any antivirus finding outside the narrow single-Microsoft-`!ml` policy keeps the
+release as a draft until the issue is investigated and resolved.
 
 ### Code-Level Defenses
 
@@ -148,13 +149,12 @@ is no exception path in this release gate.
 - **CORS locked to localhost** — graph UI only accessible from localhost origins
 - **Path containment** — `realpath()` check prevents reading files outside project root
 - **Process-kill restriction** — only server-spawned PIDs can be terminated
-- **Release-set verification** — installers verify downloaded archives, then the
-  candidate executable authenticates its adjacent runtime assets before
-  activation
+- **Release-set verification** — installers verify the downloaded archive's exact
+  member set and SHA-256 before the candidate executable is activated
 
 ### Verification
 
-Users can independently verify any release archive and the runtime set it contains:
+Users can independently verify any release archive and the executable it contains:
 
 ```bash
 # SLSA Build Level 3 provenance for release archives
@@ -171,6 +171,119 @@ sha256sum -c checksums.txt
 # VirusTotal (follow the durable per-object results link in the release notes)
 # https://www.virustotal.com/
 ```
+
+## Antivirus False Positives
+
+Some release binaries are reported by **one** engine — Microsoft — as
+`Trojan:Script/Wacatac.B!ml`. We believe this is a false positive, we do not hide
+it, and this section exists so you can check that judgement yourself rather than
+take our word for it.
+
+### What the detection is
+
+The `!ml` suffix marks a **machine-learning / heuristic** classification, not a
+signature match. The `Script` token is a generic bucket in that naming scheme and
+says nothing about script content — GitHub's own `gh` CLI and Anthropic's Claude
+installer have both carried `Trojan:Script/Wacatac.H!ml` on native binaries.
+
+Typically 61 of ~62 engines on VirusTotal return clean for the same file.
+
+### What we measured
+
+We dissected a full release matrix built from one commit. The verdicts split
+across every axis at once:
+
+| Binary | Link | Verdict |
+|---|---|---|
+| linux-amd64 | dynamic | flagged |
+| linux-amd64-portable | static | clean |
+| linux-arm64 | dynamic | clean |
+| linux-arm64-portable | static | flagged |
+| darwin-amd64 | — | flagged |
+| darwin-arm64 | — | clean |
+| windows amd64 / arm64 | — | clean |
+
+The static/dynamic axis **inverts** between architectures, so no build or link
+property explains it. The two macOS binaries have identical segment structure and
+still split. Sibling artifacts from one build landed in *different* variant
+buckets (`.B` vs `.C`).
+
+We also tested and rejected the obvious structural hypothesis: entropy is low
+everywhere (embedded vectors 4.17, parse tables 3.46 bits/byte, against 7.5–8.0
+for genuinely packed payloads), so the binary does not resemble a packed dropper.
+
+### What we changed, and what we reverted
+
+We removed every embedded shell script from the binary and moved the UI bundle
+and the agent integration templates out into separate verified files. **The
+detection count did not drop** — it simply moved between artifacts. We reverted
+both changes rather than keep permanent complexity that bought nothing. We are
+documenting that here because a negative result is still evidence.
+
+### This is endemic, not specific to us
+
+The same `!ml` family repeatedly hits large, unsigned, native open-source
+binaries:
+
+- [llama.cpp #15874](https://github.com/ggml-org/llama.cpp/issues/15874),
+  [#24487](https://github.com/ggml-org/llama.cpp/issues/24487),
+  [#24558](https://github.com/ggml-org/llama.cpp/issues/24558) — including one
+  DLL of many in a single archive, with nothing found on reverse engineering
+- [GitHub CLI #13306](https://github.com/cli/cli/issues/13306)
+- [Microsoft's own Go toolchain #1255](https://github.com/microsoft/go/issues/1255)
+- [Anthropic Claude Code #36796](https://github.com/anthropics/claude-code/issues/36796)
+- [yt-dlp #7532](https://github.com/yt-dlp/yt-dlp/issues/7532),
+  [Godot #110612](https://github.com/godotengine/godot/issues/110612),
+  [PyInstaller #5854](https://github.com/pyinstaller/pyinstaller/issues/5854),
+  [Tauri #2486](https://github.com/tauri-apps/tauri/issues/2486),
+  [OpenAI Codex #2228](https://github.com/openai/codex/issues/2228),
+  [rust-lang/rust #88297](https://github.com/rust-lang/rust/issues/88297)
+
+A Microsoft engineer on the Go team [put it plainly](https://github.com/microsoft/go/issues/1255):
+*"we're aware of Windows Security/Defender issues with Go apps… we can't exactly
+go fix something and solve all Go false positives."*
+
+### Why we do not obfuscate around it
+
+Deliberately reshaping a binary to avoid a classifier is what malware does, and
+it measurably backfires — the same Microsoft engineer reports that obfuscation
+*"increases scrutiny rather than avoiding it."* We would rather be scannable and
+explain a false positive than be unreadable and score well.
+
+### Verify it yourself
+
+Every release ships the material needed to check our artifacts independently.
+Use the commands in [Verification](#verification) above: SLSA Build Level 3
+provenance ties the archive to the workflow run that produced it, Sigstore cosign
+verifies the signature, and `checksums.txt` pins the bytes. The release notes
+carry a durable per-object VirusTotal link for every scanned file, including any
+tolerated detection — we publish those results whether or not they are clean.
+
+You can also rebuild from source and compare: `scripts/build.sh --with-ui`
+produces the shipped composition.
+
+### Our release policy
+
+A release may ship with **at most one** detection, and only when the engine is
+Microsoft and the label ends in `!ml`. Two or more engines, any signature-based
+label, any other vendor, or any "suspicious" verdict blocks the release. That
+rule is enforced in `scripts/ci/check-virustotal.sh` and pinned by
+`tests/test_vt_gate_policy_contract.sh`.
+
+### If you find something real
+
+We would genuinely rather be wrong in public than confidently wrong. If you find
+anything that explains or contradicts the assessment above:
+
+- Open an issue with the **`av-analysis`** label — include the artifact SHA-256,
+  the engine and label, and what you found.
+- If it looks like an actual compromise rather than a classifier artifact, use
+  the private process in [Reporting a Vulnerability](#reporting-a-vulnerability)
+  instead.
+
+A concrete finding changes our position. Signing is on the roadmap and will help
+on Windows, but note that no code-signing scheme exists that AV engines honour
+for Linux ELF binaries, so it is not a complete answer either.
 
 ## Supported Versions
 

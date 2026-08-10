@@ -3273,6 +3273,10 @@ static int rollback_quarantined_generation(const char *db_path,
     }
     static const char *const suffixes[] = {"-wal", "-shm", "-journal"};
     if (cbm_rename_noreplace(prepared->backup_path, db_path) != 0) {
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_error("finalize.rollback_failed", "reason", "main_restore", "source",
+                      prepared->backup_path, "dest", db_path, "errno", errno_text);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
@@ -3281,9 +3285,15 @@ static int rollback_quarantined_generation(const char *db_path,
         if (replacement_sidecar_path(source, sizeof(source), prepared->backup_path, suffixes[i]) !=
                 0 ||
             replacement_sidecar_path(destination, sizeof(destination), db_path, suffixes[i]) != 0) {
+            cbm_log_error("finalize.rollback_failed", "reason", "sidecar_path", "suffix",
+                          suffixes[i], "dest", db_path);
             return CBM_PIPELINE_PERSIST_FAILED;
         }
         if (replacement_path_exists(source) && cbm_rename_noreplace(source, destination) != 0) {
+            char errno_text[16];
+            (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+            cbm_log_error("finalize.rollback_failed", "reason", "sidecar_restore", "source",
+                          source, "dest", destination, "errno", errno_text);
             return CBM_PIPELINE_PERSIST_FAILED;
         }
     }
@@ -3347,18 +3357,40 @@ static int quarantine_existing_generation(const char *db_path,
 static int prepare_existing_generation_for_replace(const char *db_path,
                                                    cbm_replacement_prepare_t *prepared) {
     memset(prepared, 0, sizeof(*prepared));
+    /* A silent persistence failure is reported to users as a bad repository,
+     * so name every destination-side edge before returning it. */
     cbm_path_info_t info;
     if (cbm_path_info_utf8(db_path, &info) != 0 || !info.is_regular || info.is_symlink) {
+        cbm_log_error("finalize.prepare_failed", "reason", "destination_not_regular", "path",
+                      db_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
     int seal_rc = cbm_store_seal_existing_path_for_replace(db_path);
     if (seal_rc == CBM_STORE_NOT_FOUND) {
-        return quarantine_existing_generation(db_path, prepared);
+        int quarantine_rc = quarantine_existing_generation(db_path, prepared);
+        if (quarantine_rc != 0) {
+            char errno_text[16];
+            (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+            cbm_log_error("finalize.prepare_failed", "reason", "quarantine_existing", "errno",
+                          errno_text, "path", db_path);
+        }
+        return quarantine_rc;
     }
     if (seal_rc != CBM_STORE_OK) {
+        char seal_text[16];
+        (void)snprintf(seal_text, sizeof(seal_text), "%d", seal_rc);
+        cbm_log_error("finalize.prepare_failed", "reason", "seal_existing", "rc", seal_text,
+                      "path", db_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
-    return cbm_remove_db_sidecars(db_path) == 0 ? 0 : CBM_PIPELINE_PERSIST_FAILED;
+    if (cbm_remove_db_sidecars(db_path) != 0) {
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_error("finalize.prepare_failed", "reason", "sidecar_cleanup", "errno", errno_text,
+                      "path", db_path);
+        return CBM_PIPELINE_PERSIST_FAILED;
+    }
+    return 0;
 }
 
 static int prepare_publish_destination(const char *final_path, bool final_existed,
@@ -3371,7 +3403,14 @@ static int prepare_publish_destination(const char *final_path, bool final_existe
     }
     if (!final_exists_now) {
         /* A crashed generation can leave sidecars without a main file. */
-        return cbm_remove_db_sidecars(final_path) == 0 ? 0 : CBM_PIPELINE_PERSIST_FAILED;
+        if (cbm_remove_db_sidecars(final_path) != 0) {
+            char errno_text[16];
+            (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+            cbm_log_error("finalize.prepare_failed", "reason", "orphan_sidecar_cleanup", "errno",
+                          errno_text, "path", final_path);
+            return CBM_PIPELINE_PERSIST_FAILED;
+        }
+        return 0;
     }
     if (!backup_succeeded) {
         if (!db_sidecars_absent(final_path)) {
@@ -3544,11 +3583,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (prepare_rc == 0 && cbm_pipeline_persist_test_take_cancel_after_destination_prepare()) {
         atomic_store(p->cancelled, 1);
-        (void)rollback_quarantined_generation(final_path, &prepared);
+        int rollback_rc = rollback_quarantined_generation(final_path, &prepared);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return rollback_rc == 0 ? CBM_PIPELINE_ABORT_PRESERVE_DB : CBM_PIPELINE_PERSIST_FAILED;
     }
 #endif
     int rename_rc =
@@ -3557,6 +3596,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                               : cbm_rename_replace(staging_path, final_path))
             : CBM_NOT_FOUND;
     if (prepare_rc != 0 || rename_rc != 0) {
+        if (prepare_rc == 0) {
+            char errno_text[16];
+            (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+            cbm_log_error("finalize.rename_failed", "errno", errno_text, "stage", staging_path,
+                          "dest", final_path);
+        }
         cbm_log_error("pipeline.err", "phase", "publish", "reason",
                       prepare_rc == 0 ? "rename_replace" : "destination_prepare", "path",
                       final_path);

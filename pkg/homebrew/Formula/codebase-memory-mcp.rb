@@ -28,7 +28,6 @@ class CodebaseMemoryMcp < Formula
 
   def install
     bin.install "codebase-memory-mcp"
-    (share/"codebase-memory-mcp").install "cbm-integrations.json"
     # Third-party attribution bundle (present in archives since v0.8.1)
     doc.install "THIRD_PARTY_NOTICES.md" if File.exist?("THIRD_PARTY_NOTICES.md")
   end
@@ -46,6 +45,5 @@ class CodebaseMemoryMcp < Formula
 
   test do
     assert_match "codebase-memory-mcp", shell_output("#{bin}/codebase-memory-mcp --version")
-    assert_path_exists share/"codebase-memory-mcp/cbm-integrations.json"
   end
 end

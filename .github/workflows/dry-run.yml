@@ -147,15 +147,13 @@ jobs:
           path: ${{ runner.temp }}/release-archives
 
       # Same extraction the release verify job performs. VirusTotal receives
-      # only extracted files and unpacked UI assets, never .tar.gz/.zip containers.
+      # only extracted release objects, never .tar.gz/.zip containers.
       - name: Extract archive artifacts
         run: |
           scripts/ci/extract-release-archives.sh "$RUNNER_TEMP/release-archives" binaries \
-            --archive-scope=ui \
             --expect-archives=8 \
             --expect-binaries=8 \
-            --expect-packs=8 \
-            --expect-runtime-files=32
+            --expect-runtime-files=24
 
       - name: VirusTotal scan
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0

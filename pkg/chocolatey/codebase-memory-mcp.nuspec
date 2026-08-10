@@ -13,9 +13,8 @@
     <tags>mcp ai claude code-intelligence codebase developer-tools tree-sitter llm</tags>
     <summary>Fast code intelligence engine for AI coding agents</summary>
     <description>
-codebase-memory-mcp is a native MCP server distributed with authenticated
-release-owned runtime assets. Chocolatey retains the complete extracted runtime
-set and exposes its executable through a PATH shim.
+codebase-memory-mcp is a self-contained native MCP server. Chocolatey retains
+the verified executable and exposes it through a PATH shim.
 
 Full indexes an average repository in milliseconds, the Linux kernel (28M LOC) in
 3 minutes. Answers structural queries in under 1ms. Supports 159 languages via

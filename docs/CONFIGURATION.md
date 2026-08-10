@@ -155,7 +155,7 @@ Current format:
 
 Notes:
 
-- If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- If a binary carries the embedded frontend and no UI config file exists yet, the UI auto-enables on first run. Development builds without the frontend keep the MCP/daemon service available and leave the UI disabled.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
@@ -168,7 +168,7 @@ These environment variables affect runtime behavior:
 | `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction — but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
-| `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
+| `CBM_DOWNLOAD_URL` | GitHub releases | Override the install-script download base URL; also used by local release-fixture tests. |
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 

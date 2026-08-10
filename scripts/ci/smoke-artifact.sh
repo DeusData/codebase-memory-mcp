@@ -17,17 +17,13 @@ cd "$ROOT"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ci/smoke-artifact.sh <goos> <goarch> [--variant standard|ui]
-                                    [VAR=VAL ...]
+Usage: scripts/ci/smoke-artifact.sh <goos> <goarch> [VAR=VAL ...]
 
 Build → package (scripts/package-release.sh) → extract → smoke the EXTRACTED
 artifact through the canonical wrapper, exactly like the release venue:
   unix:    scripts/smoke-local.sh with CBM_SMOKE_ARTIFACT_DIR
   windows: test-infrastructure/vm/vm-smoke.sh with CBM_SMOKE_ARTIFACT_DIR
            (run inside the VM/CI msys2 shell)
-
-  --variant ui builds --with-ui and smokes the ui archive (Phase 15 external
-  assets become mandatory — a standard binary cannot pass a ui run).
 
 Make passthrough (VAR=VAL): CC= CXX= STATIC=1 ... forwarded to build steps.
 Environment: BUILD_DIR (default build/c) — build tree used for the archive.
@@ -37,17 +33,11 @@ EOF
 
 GOOS=""
 GOARCH=""
-VARIANT="standard"
 BUILD_ARGS=()
 expect_value=""
 for arg in "$@"; do
-    if [ "$expect_value" = "variant" ]; then
-        VARIANT="$arg"; expect_value=""; continue
-    fi
     case "$arg" in
     -h | --help) usage; exit 0 ;;
-    --variant) expect_value="variant" ;;
-    --variant=*) VARIANT="${arg#--variant=}" ;;
     -*)
         echo "smoke-artifact: unknown option '$arg'. Please consult --help." >&2
         exit 2
@@ -64,11 +54,10 @@ for arg in "$@"; do
     esac
 done
 [ -n "$GOOS" ] && [ -n "$GOARCH" ] || { usage >&2; exit 2; }
-case "$VARIANT" in
-standard) SUFFIX=""; UI_FLAG=() ;;
-ui) SUFFIX="-ui"; UI_FLAG=(--with-ui) ;;
-*) echo "smoke-artifact: variant must be 'standard' or 'ui'. Please consult --help." >&2; exit 2 ;;
-esac
+UI_FLAG=(--with-ui)
+# This lane builds and packages the SHIPPED composition, so a binary that serves
+# no frontend is a defect here, not a documented skip.
+export SMOKE_REQUIRE_UI=1
 case "$GOARCH" in
 *-portable) BUILD_ARGS+=("STATIC=1") ;;
 esac
@@ -95,20 +84,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-scripts/package-release.sh "$GOOS" "$GOARCH" --variant "$VARIANT" \
+scripts/package-release.sh "$GOOS" "$GOARCH" \
     --out-dir "$WORK_DIR" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
 
-NAME="codebase-memory-mcp${SUFFIX}-${GOOS}-${GOARCH}"
+NAME="codebase-memory-mcp-${GOOS}-${GOARCH}"
 EXTRACT_DIR="$WORK_DIR/extract"
 mkdir -p "$EXTRACT_DIR"
 if [ "$GOOS" = "windows" ]; then
     unzip -q -o "$WORK_DIR/$NAME.zip" -d "$EXTRACT_DIR"
     test -s "$EXTRACT_DIR/codebase-memory-mcp.exe"
-    # ONE executable per runtime set: a payload sibling means the removed
-    # launcher split came back.
+    # ONE binary per platform: a payload sibling means the AV-flagged launcher
+    # stub came back.
     test ! -e "$EXTRACT_DIR/codebase-memory-mcp.payload.exe"
     echo "=== smoke-artifact: smoking EXTRACTED $NAME.zip via vm-smoke.sh ==="
-    SMOKE_ARCH="$GOARCH" SMOKE_VARIANT="$VARIANT" \
+    SMOKE_ARCH="$GOARCH" \
         CBM_SMOKE_ARTIFACT_DIR="$EXTRACT_DIR" \
         bash test-infrastructure/vm/vm-smoke.sh
 else
@@ -116,6 +105,6 @@ else
     chmod +x "$EXTRACT_DIR/codebase-memory-mcp"
     echo "=== smoke-artifact: smoking EXTRACTED $NAME.tar.gz via smoke-local.sh ==="
     CBM_SMOKE_ARTIFACT_DIR="$EXTRACT_DIR" \
-        scripts/smoke-local.sh "$EXTRACT_DIR/codebase-memory-mcp" "$VARIANT"
+        scripts/smoke-local.sh "$EXTRACT_DIR/codebase-memory-mcp"
 fi
 echo "=== smoke-artifact: $NAME passed ==="

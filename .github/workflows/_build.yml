@@ -85,13 +85,13 @@ jobs:
       # Archive layout/name live in the ONE canonical script the local
       # artifact-flow smoke lane also runs (venue-parity contract).
       - name: Archive release binary (canonical package-release.sh)
-        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }} --variant ui
+        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          subject-path: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -133,13 +133,13 @@ jobs:
       # artifact-flow smoke lane also runs (venue-parity contract).
       - name: Archive release binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: scripts/package-release.sh windows amd64 --variant ui CC=clang CXX=clang++
+        run: scripts/package-release.sh windows amd64 CC=clang CXX=clang++
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-windows-amd64.zip
+          subject-path: codebase-memory-mcp-windows-amd64.zip
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -183,13 +183,13 @@ jobs:
 
       - name: Archive release binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: scripts/package-release.sh windows arm64 --variant ui CC=clang CXX=clang++
+        run: scripts/package-release.sh windows arm64 CC=clang CXX=clang++
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-windows-arm64.zip
+          subject-path: codebase-memory-mcp-windows-arm64.zip
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -235,13 +235,13 @@ jobs:
           ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
 
       - name: Archive release binary (canonical package-release.sh)
-        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable --variant ui
+        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz
+          subject-path: codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

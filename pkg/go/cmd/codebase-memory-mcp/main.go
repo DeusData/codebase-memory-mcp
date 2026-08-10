@@ -35,10 +35,9 @@ import (
 )
 
 const (
-	repo                 = "DeusData/codebase-memory-mcp"
-	version              = "0.8.1"
-	windowsBinaryName    = "codebase-memory-mcp.exe"
-	integrationsFileName = "cbm-integrations.json"
+	repo              = "DeusData/codebase-memory-mcp"
+	version           = "0.8.1"
+	windowsBinaryName = "codebase-memory-mcp.exe"
 
 	maxRedirects            = 5
 	requestTimeout          = 2 * time.Minute
@@ -154,7 +153,7 @@ func main() {
 func ensureBinary() (string, error) {
 	binary := binPath()
 	ready, err := runtimeSetReadyLocked(
-		filepath.Dir(binary), filepath.Base(binary), runtimeVariant(), verifyCandidate,
+		filepath.Dir(binary), filepath.Base(binary), verifyCandidate,
 	)
 	if err != nil {
 		return "", err
@@ -170,7 +169,7 @@ func ensureBinary() (string, error) {
 
 func binPath() string {
 	return filepath.Join(
-		cacheDir(), version, runtimeVariant(), binaryNameForOS(runtime.GOOS),
+		cacheDir(), version, binaryNameForOS(runtime.GOOS),
 	)
 }
 
@@ -185,13 +184,6 @@ func executionPathForOS(binary, targetOS string) string {
 	return binary
 }
 
-func runtimeVariant() string {
-	if strings.EqualFold(os.Getenv("CBM_VARIANT"), "ui") {
-		return "ui"
-	}
-	return "standard"
-}
-
 func printPortableMutationGuidance(args []string) {
 	action := runtimeMutationAction(args)
 	if action != "uninstall" {
@@ -200,7 +192,7 @@ func printPortableMutationGuidance(args []string) {
 	packageCommand := "Remove-Item (Get-Command codebase-memory-mcp).Source"
 	fmt.Fprintf(
 		os.Stderr,
-		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed installation with coordinated self-update/uninstall.\n",
+		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed installation with coordinated install/update/uninstall.\n",
 		packageCommand,
 		"codebase-memory-mcp install --yes",
 	)
@@ -361,7 +353,6 @@ func archiveNamesForOS(platform, binaryName string) []string {
 	}
 	return []string{
 		binaryName,
-		integrationsFileName,
 		"LICENSE",
 		installer,
 		"THIRD_PARTY_NOTICES.md",
@@ -371,7 +362,6 @@ func archiveNamesForOS(platform, binaryName string) []string {
 func download(dest string) error {
 	platform := goos()
 	arch := goarch()
-	selectedVariant := runtimeVariant()
 	ext := "tar.gz"
 	if platform == "windows" {
 		ext = "zip"
@@ -381,13 +371,9 @@ func download(dest string) error {
 	if platform == "linux" {
 		portable = "-portable"
 	}
-	uiPrefix := ""
-	if selectedVariant == "ui" {
-		uiPrefix = "ui-"
-	}
 	archive := fmt.Sprintf(
-		"codebase-memory-mcp-%s%s-%s%s.%s",
-		uiPrefix, platform, arch, portable, ext,
+		"codebase-memory-mcp-%s-%s%s.%s",
+		platform, arch, portable, ext,
 	)
 	url := fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", repo, version, archive)
 	checksumURL := fmt.Sprintf("https://github.com/%s/releases/download/v%s/checksums.txt", repo, version)
@@ -421,19 +407,19 @@ func download(dest string) error {
 
 	binName := binaryNameForOS(platform)
 	archiveNames := archiveNamesForOS(platform, binName)
-	extractNames := []string{binName, integrationsFileName}
+	extractNames := []string{binName}
 	var runtimeNames []string
 
 	if ext == "tar.gz" {
 		runtimeNames, err = extractTarGz(
-			archivePath, tmp, archiveNames, extractNames, selectedVariant,
+			archivePath, tmp, archiveNames, extractNames,
 		)
 		if err != nil {
 			return fmt.Errorf("extraction failed: %w", err)
 		}
 	} else {
 		runtimeNames, err = extractZip(
-			archivePath, tmp, archiveNames, extractNames, selectedVariant,
+			archivePath, tmp, archiveNames, extractNames,
 		)
 		if err != nil {
 			return fmt.Errorf("extraction failed: %w", err)
@@ -458,7 +444,7 @@ func download(dest string) error {
 	}
 
 	if err := publishRuntimeSetWithRecovery(
-		tmp, filepath.Dir(dest), binName, selectedVariant, verifyCandidate,
+		tmp, filepath.Dir(dest), binName, verifyCandidate,
 	); err != nil {
 		return fmt.Errorf("could not install runtime set: %w", err)
 	}
@@ -611,81 +597,41 @@ func verifyChecksum(path, expected string) error {
 	return nil
 }
 
-func isUIPackName(name string) bool {
-	const prefix = "cbm-ui-"
-	const suffix = ".pack"
-	if len(name) != len(prefix)+sha256.Size*2+len(suffix) ||
-		!strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
-		return false
-	}
-	digest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
-	if digest != strings.ToLower(digest) {
-		return false
-	}
-	decoded, err := hex.DecodeString(digest)
-	return err == nil && len(decoded) == sha256.Size
-}
-
 func validateArchiveMemberNames(
-	names, archiveNames []string, variant string, caseInsensitive bool,
-) (string, error) {
+	names, archiveNames []string, caseInsensitive bool,
+) error {
 	required := make(map[string]struct{}, len(archiveNames))
 	for _, name := range archiveNames {
 		required[name] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(names))
 	found := make(map[string]struct{}, len(archiveNames))
-	uiPack := ""
 	for _, name := range names {
 		key := name
 		if caseInsensitive {
 			key = strings.ToLower(name)
 		}
 		if _, exists := seen[key]; exists {
-			return "", fmt.Errorf(
+			return fmt.Errorf(
 				"duplicate or case-conflicting archive entry: %q", name,
 			)
 		}
 		seen[key] = struct{}{}
-		_, isRequired := required[name]
-		isPack := variant == "ui" && isUIPackName(name)
-		if !isRequired && !isPack {
-			return "", fmt.Errorf(
+		if _, isRequired := required[name]; !isRequired {
+			return fmt.Errorf(
 				"archive must contain only the exact root files: %s",
 				strings.Join(archiveNames, ", "),
 			)
 		}
-		if isPack {
-			if uiPack != "" {
-				return "", fmt.Errorf(
-					"archive must contain exactly one content-addressed UI pack",
-				)
-			}
-			uiPack = name
-		} else {
-			found[name] = struct{}{}
-		}
+		found[name] = struct{}{}
 	}
-	expectedCount := len(archiveNames)
-	if variant == "ui" {
-		expectedCount++
-	}
-	if len(seen) != expectedCount || len(found) != len(required) ||
-		(variant == "ui" && uiPack == "") {
-		return "", fmt.Errorf(
+	if len(seen) != len(archiveNames) || len(found) != len(required) {
+		return fmt.Errorf(
 			"archive must contain exactly one of each required root file: %s",
 			strings.Join(archiveNames, ", "),
 		)
 	}
-	return uiPack, nil
-}
-
-func runtimeArchiveNames(extractNames []string, uiPack string) []string {
-	result := append([]string(nil), extractNames...)
-	if uiPack != "" {
-		result = append(result, uiPack)
-	}
-	return result
+	return nil
 }
 
 func validateArchiveResourceLimits(limits archiveResourceLimits) error {
@@ -837,14 +783,12 @@ func tarGzMemberNamesWithLimits(
 func extractTarGz(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-	variant string,
 ) ([]string, error) {
 	return extractTarGzWithLimits(
 		archivePath,
 		destDir,
 		archiveNames,
 		extractNames,
-		variant,
 		defaultArchiveResourceLimits,
 	)
 }
@@ -852,20 +796,16 @@ func extractTarGz(
 func extractTarGzWithLimits(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-	variant string,
 	limits archiveResourceLimits,
 ) ([]string, error) {
 	names, err := tarGzMemberNamesWithLimits(archivePath, limits)
 	if err != nil {
 		return nil, err
 	}
-	uiPack, err := validateArchiveMemberNames(
-		names, archiveNames, variant, false,
-	)
-	if err != nil {
+	if err := validateArchiveMemberNames(names, archiveNames, false); err != nil {
 		return nil, err
 	}
-	runtimeNames := runtimeArchiveNames(extractNames, uiPack)
+	runtimeNames := append([]string(nil), extractNames...)
 	targets := make(map[string]struct{}, len(runtimeNames))
 	for _, name := range runtimeNames {
 		targets[name] = struct{}{}
@@ -948,14 +888,12 @@ func extractTarGzWithLimits(
 func extractZip(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-	variant string,
 ) ([]string, error) {
 	return extractZipWithLimits(
 		archivePath,
 		destDir,
 		archiveNames,
 		extractNames,
-		variant,
 		defaultArchiveResourceLimits,
 	)
 }
@@ -963,7 +901,6 @@ func extractZip(
 func extractZipWithLimits(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-	variant string,
 	limits archiveResourceLimits,
 ) ([]string, error) {
 	if err := validateArchiveResourceLimits(limits); err != nil {
@@ -1010,13 +947,10 @@ func extractZipWithLimits(
 		names = append(names, name)
 		declaredSizes[name] = declaredSize
 	}
-	uiPack, err := validateArchiveMemberNames(
-		names, archiveNames, variant, true,
-	)
-	if err != nil {
+	if err := validateArchiveMemberNames(names, archiveNames, true); err != nil {
 		return nil, err
 	}
-	runtimeNames := runtimeArchiveNames(extractNames, uiPack)
+	runtimeNames := append([]string(nil), extractNames...)
 	targetNames := make(map[string]struct{}, len(runtimeNames))
 	for _, name := range runtimeNames {
 		targetNames[name] = struct{}{}
@@ -1103,7 +1037,7 @@ func validateWindowsZipMember(raw string) (string, error) {
 func verifyCandidate(path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), candidateTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "--verify-runtime-assets")
+	cmd := exec.CommandContext(ctx, path, "--version")
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
@@ -1163,58 +1097,17 @@ func regularRuntimeFile(path string) bool {
 		platformRuntimeSetFileLinkCountOne(path, status)
 }
 
-func uiPackMatchesDigest(directory, name string) bool {
-	digest, err := fileSHA256(filepath.Join(directory, name))
-	if err != nil {
-		return false
-	}
-	expected := strings.TrimSuffix(strings.TrimPrefix(name, "cbm-ui-"), ".pack")
-	return hex.EncodeToString(digest[:]) == expected
-}
-
-func runtimeSetNames(
-	directory, binaryName, variant string,
-) ([]string, bool) {
-	if !regularRuntimeFile(filepath.Join(directory, binaryName)) ||
-		!regularRuntimeFile(filepath.Join(directory, integrationsFileName)) {
+func runtimeSetNames(directory, binaryName string) ([]string, bool) {
+	if !regularRuntimeFile(filepath.Join(directory, binaryName)) {
 		return nil, false
 	}
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		return nil, false
-	}
-	var packLike []string
-	var validPacks []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasPrefix(name, "cbm-ui-") && strings.HasSuffix(name, ".pack") {
-			packLike = append(packLike, name)
-			if isUIPackName(name) &&
-				regularRuntimeFile(filepath.Join(directory, name)) &&
-				uiPackMatchesDigest(directory, name) {
-				validPacks = append(validPacks, name)
-			}
-		}
-	}
-	if variant == "ui" {
-		if len(packLike) != 1 || len(validPacks) != 1 {
-			return nil, false
-		}
-	} else if len(packLike) != 0 {
-		return nil, false
-	}
-	names := []string{integrationsFileName}
-	if variant == "ui" {
-		names = append(names, validPacks[0])
-	}
-	names = append(names, binaryName)
-	return names, true
+	return []string{binaryName}, true
 }
 
 func runtimeSetReady(
-	directory, binaryName, variant string, verifier func(string) error,
+	directory, binaryName string, verifier func(string) error,
 ) bool {
-	if _, ok := runtimeSetNames(directory, binaryName, variant); !ok {
+	if _, ok := runtimeSetNames(directory, binaryName); !ok {
 		return false
 	}
 	return verifier == nil || verifier(filepath.Join(directory, binaryName)) == nil
@@ -1232,7 +1125,7 @@ func requireSafeRuntimeDirectory(directory string) error {
 }
 
 func runtimeSetReadyLocked(
-	directory, binaryName, variant string, verifier func(string) error,
+	directory, binaryName string, verifier func(string) error,
 ) (ready bool, result error) {
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		return false, err
@@ -1251,11 +1144,11 @@ func runtimeSetReadyLocked(
 		return false, err
 	}
 	if err := reconcileRuntimeBackups(
-		directory, binaryName, variant, verifier, lock,
+		directory, binaryName, verifier, lock,
 	); err != nil {
 		return false, err
 	}
-	return runtimeSetReady(directory, binaryName, variant, verifier), nil
+	return runtimeSetReady(directory, binaryName, verifier), nil
 }
 
 func copyRuntimeStage(
@@ -1338,8 +1231,7 @@ func runtimeBackupDirectoryName(name string) bool {
 }
 
 func runtimeBackupTargetName(name, binaryName string) bool {
-	return name == binaryName || name == integrationsFileName ||
-		(strings.HasPrefix(name, "cbm-ui-") && strings.HasSuffix(name, ".pack"))
+	return name == binaryName
 }
 
 func createRuntimeBackupDirectory(directory string) (string, error) {
@@ -1567,7 +1459,7 @@ func copyRuntimeBackupFile(
 }
 
 func reconcileRuntimeBackups(
-	directory, binaryName, variant string,
+	directory, binaryName string,
 	verifier func(string) error,
 	lock *runtimeSetLock,
 ) error {
@@ -1592,7 +1484,7 @@ func reconcileRuntimeBackups(
 	if len(backups) == 0 {
 		return nil
 	}
-	if runtimeSetReady(directory, binaryName, variant, verifier) {
+	if runtimeSetReady(directory, binaryName, verifier) {
 		for _, backup := range backups {
 			if err := cleanupRuntimeBackup(backup, lock); err != nil {
 				return err
@@ -2051,11 +1943,11 @@ func attachRuntimeLockReleaseError(result *error, releaseErr error) {
 }
 
 func publishRuntimeSetWithRecoveryAndRenamer(
-	sourceDirectory, destinationDirectory, binaryName, variant string,
+	sourceDirectory, destinationDirectory, binaryName string,
 	verifier func(string) error,
 	renameFile func(string, string) error,
 ) (result error) {
-	sourceNames, ok := runtimeSetNames(sourceDirectory, binaryName, variant)
+	sourceNames, ok := runtimeSetNames(sourceDirectory, binaryName)
 	if !ok {
 		return fmt.Errorf("source release does not contain a complete runtime set")
 	}
@@ -2081,13 +1973,13 @@ func publishRuntimeSetWithRecoveryAndRenamer(
 		return err
 	}
 	if err := reconcileRuntimeBackups(
-		destinationDirectory, binaryName, variant, verifier, lock,
+		destinationDirectory, binaryName, verifier, lock,
 	); err != nil {
 		return err
 	}
 	// A contender may have committed while this process waited. Its complete
 	// runtime set wins and is never retired or mixed with this contender.
-	if runtimeSetReady(destinationDirectory, binaryName, variant, verifier) {
+	if runtimeSetReady(destinationDirectory, binaryName, verifier) {
 		return nil
 	}
 
@@ -2121,17 +2013,7 @@ func publishRuntimeSetWithRecoveryAndRenamer(
 			return err
 		}
 
-		entries, err := os.ReadDir(destinationDirectory)
-		if err != nil {
-			return err
-		}
-		retireNames := []string{binaryName, integrationsFileName}
-		for _, entry := range entries {
-			name := entry.Name()
-			if strings.HasPrefix(name, "cbm-ui-") && strings.HasSuffix(name, ".pack") {
-				retireNames = append(retireNames, name)
-			}
-		}
+		retireNames := []string{binaryName}
 		retired := make(map[string]struct{}, len(retireNames))
 		// Retire the executable first so a partial publication is never ready.
 		for _, name := range retireNames {
@@ -2190,7 +2072,7 @@ func publishRuntimeSetWithRecoveryAndRenamer(
 			}
 			delete(staged, name)
 		}
-		if !runtimeSetReady(destinationDirectory, binaryName, variant, verifier) {
+		if !runtimeSetReady(destinationDirectory, binaryName, verifier) {
 			return fmt.Errorf("published package-cache runtime set failed verification")
 		}
 		if err := assertRuntimeSetLockOwner(lock); err != nil {
@@ -2217,11 +2099,11 @@ func publishRuntimeSetWithRecoveryAndRenamer(
 		return nil
 	}
 	preserveWinner := runtimeSetReady(
-		destinationDirectory, binaryName, variant, verifier,
+		destinationDirectory, binaryName, verifier,
 	)
 	if backupDirectory != "" {
 		if recoveryErr := reconcileRuntimeBackups(
-			destinationDirectory, binaryName, variant, verifier, lock,
+			destinationDirectory, binaryName, verifier, lock,
 		); recoveryErr != nil {
 			return fmt.Errorf(
 				"%v; package-cache recovery failed: %w", operationErr, recoveryErr,
@@ -2235,14 +2117,13 @@ func publishRuntimeSetWithRecoveryAndRenamer(
 }
 
 func publishRuntimeSetWithRecovery(
-	sourceDirectory, destinationDirectory, binaryName, variant string,
+	sourceDirectory, destinationDirectory, binaryName string,
 	verifier func(string) error,
 ) error {
 	return publishRuntimeSetWithRecoveryAndRenamer(
 		sourceDirectory,
 		destinationDirectory,
 		binaryName,
-		variant,
 		verifier,
 		os.Rename,
 	)
@@ -2260,16 +2141,16 @@ func execBinary(executable string, args []string) error {
 }
 
 func createMutationRuntimeSnapshot(
-	executable, variant string,
+	executable string,
 	verifier func(string) error,
 	maintainLease func() error,
 ) (snapshotDirectory, snapshotExecutable string, result error) {
 	sourceDirectory := filepath.Dir(executable)
 	binaryName := filepath.Base(executable)
-	names, ok := runtimeSetNames(sourceDirectory, binaryName, variant)
+	names, ok := runtimeSetNames(sourceDirectory, binaryName)
 	if !ok {
 		return "", "", fmt.Errorf(
-			"cached runtime assets changed before mutation snapshot",
+			"cached executable changed before mutation snapshot",
 		)
 	}
 
@@ -2309,7 +2190,7 @@ func createMutationRuntimeSnapshot(
 			!pathMatchesSHA256(sourcePath, expectedDigest) {
 			_ = os.Remove(stagedPath)
 			return "", "", fmt.Errorf(
-				"cached runtime asset changed while mutation snapshot was copied: %s",
+				"cached executable changed while mutation snapshot was copied: %s",
 				name,
 			)
 		}
@@ -2323,7 +2204,7 @@ func createMutationRuntimeSnapshot(
 
 	snapshotExecutable = filepath.Join(snapshotDirectory, binaryName)
 	if !runtimeSetReady(
-		snapshotDirectory, binaryName, variant, verifier,
+		snapshotDirectory, binaryName, verifier,
 	) {
 		return "", "", fmt.Errorf(
 			"private mutation runtime snapshot failed verification",
@@ -2344,7 +2225,6 @@ func runMutationBinary(executable string, args []string) error {
 func execBinaryWithRuntimeLockAndRunner(
 	executable string,
 	args []string,
-	variant string,
 	verifier func(string) error,
 	runner func(string, []string) error,
 ) (result error) {
@@ -2376,13 +2256,12 @@ func execBinaryWithRuntimeLockAndRunner(
 		return err
 	}
 	if !runtimeSetReady(
-		directory, filepath.Base(executable), variant, verifier,
+		directory, filepath.Base(executable), verifier,
 	) {
-		return fmt.Errorf("cached runtime assets changed before mutation launch")
+		return fmt.Errorf("cached executable changed before mutation launch")
 	}
 	snapshotDirectory, snapshotExecutable, err := createMutationRuntimeSnapshot(
 		executable,
-		variant,
 		verifier,
 		func() error { return refreshRuntimeSetLock(lock) },
 	)
@@ -2414,7 +2293,6 @@ func execBinaryWithRuntimeLock(executable string, args []string) error {
 	return execBinaryWithRuntimeLockAndRunner(
 		executable,
 		args,
-		runtimeVariant(),
 		verifyCandidate,
 		runMutationBinary,
 	)

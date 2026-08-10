@@ -71,12 +71,9 @@ jobs:
             WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
             PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" '$a')
           fi
-          # Keep the UI marker explicit because the smoke wrappers use it to
-          # require and validate the shipped content-addressed frontend pack.
-          VARIANTS='["ui"]'
-          UNIX_M=$(jq -cn --argjson a "$UNIX" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
-          WIN_M=$(jq -cn --argjson a "$WIN" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
-          PORTABLE_M=$(jq -cn --argjson a "$PORTABLE" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          UNIX_M=$(jq -cn --argjson a "$UNIX" '{include:$a}')
+          WIN_M=$(jq -cn --argjson a "$WIN" '{include:$a}')
+          PORTABLE_M=$(jq -cn --argjson a "$PORTABLE" '{include:$a}')
           echo "unix=$UNIX_M" >> "$GITHUB_OUTPUT"
           echo "windows=$WIN_M" >> "$GITHUB_OUTPUT"
           echo "portable=$PORTABLE_M" >> "$GITHUB_OUTPUT"
@@ -102,9 +99,8 @@ jobs:
 
       - name: Extract release artifact
         run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           mkdir -p "$RUNNER_TEMP/cbm-artifact"
-          tar -xzf codebase-memory-mcp${SUFFIX}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+          tar -xzf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
             -C "$RUNNER_TEMP/cbm-artifact"
           chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
@@ -117,7 +113,7 @@ jobs:
       - name: Smoke test (shared wrapper)
         run: |
           scripts/smoke-local.sh \
-            "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp" ${{ matrix.variant }}
+            "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
 
@@ -195,11 +191,10 @@ jobs:
       - name: Extract release artifact
         shell: msys2 {0}
         run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           ARCH=${{ matrix.arch }}
           ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
           mkdir -p "$ARTIFACT_DIR"
-          unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
+          unzip -o "codebase-memory-mcp-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
           test -s "$ARTIFACT_DIR/codebase-memory-mcp.exe"
           # ONE executable per runtime set: a payload sibling would mean the
           # removed launcher split came back.
@@ -226,7 +221,6 @@ jobs:
         shell: msys2 {0}
         env:
           SMOKE_ARCH: ${{ matrix.arch }}
-          SMOKE_VARIANT: ${{ matrix.variant }}
         run: |
           export CBM_SMOKE_ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
           bash test-infrastructure/vm/vm-smoke.sh
@@ -288,9 +282,8 @@ jobs:
 
       - name: Extract release artifact
         run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           mkdir -p "$RUNNER_TEMP/cbm-artifact"
-          tar -xzf codebase-memory-mcp${SUFFIX}-linux-${{ matrix.arch }}-portable.tar.gz \
+          tar -xzf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
             -C "$RUNNER_TEMP/cbm-artifact"
           chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
@@ -302,7 +295,7 @@ jobs:
       - name: Smoke test (shared wrapper)
         run: |
           scripts/smoke-local.sh \
-            "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp" ${{ matrix.variant }}
+            "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
 

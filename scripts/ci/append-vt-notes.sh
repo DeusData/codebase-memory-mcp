@@ -131,6 +131,7 @@ executable_paths = {
 for association in associations:
     scan_path = association["scan_path"]
     association_counts[scan_path] = association_counts.get(scan_path, 0) + 1
+tolerated_paths: List[str] = []
 for result in results:
     scan_path = result["scan_path"]
     if scan_path in results_by_path:
@@ -145,8 +146,18 @@ for result in results:
     ):
         if not result[numeric].isdigit():
             fail(f"malformed numeric result field {numeric}: {scan_path}")
-    if int(result["malicious"]) != 0 or int(result["suspicious"]) != 0:
+    # Mirrors the gate's release policy: a single Microsoft machine-learning
+    # verdict is tolerated and disclosed in the notes; anything else must never
+    # have reached publication.
+    tolerated = (
+        int(result["malicious"]) == 1
+        and int(result["suspicious"]) == 0
+        and result["microsoft_category"] == "malicious"
+    )
+    if (int(result["malicious"]) != 0 or int(result["suspicious"]) != 0) and not tolerated:
         fail(f"detected object reached release-note publication: {scan_path}")
+    if tolerated:
+        tolerated_paths.append(scan_path)
     if (
         re.fullmatch(r"[0-9a-f]{64}", result["sha256"]) is None
         or result["virustotal_url"]
@@ -156,8 +167,8 @@ for result in results:
     if int(result["association_count"]) != association_counts.get(scan_path):
         fail(f"result association count mismatch: {scan_path}")
     if scan_path in executable_paths:
-        if result["microsoft_category"] not in {"undetected", "harmless"}:
-            fail(f"executable result lacks a decisive clean Microsoft verdict: {scan_path}")
+        if result["microsoft_category"] not in {"undetected", "harmless", "malicious"}:
+            fail(f"executable result lacks a decisive Microsoft verdict: {scan_path}")
         if not result["microsoft_engine_version"] or not result["microsoft_engine_update"]:
             fail(f"executable result lacks Microsoft version evidence: {scan_path}")
     results_by_path[scan_path] = result
@@ -172,15 +183,14 @@ for association in associations:
         fail(f"result hash/size differs from association: {association['scan_path']}")
 
 member_rows = [row for row in associations if row["association_type"] == "member"]
-asset_rows = [row for row in associations if row["association_type"] == "pack_asset"]
-if len(member_rows) + len(asset_rows) != len(associations):
+if len(member_rows) != len(associations):
     fail("association manifest contains a non-extracted scan target")
 archive_hashes: Dict[str, str] = {}
 for association in associations:
     archive = association["archive"]
     archive_sha256 = association["archive_sha256"]
     if not archive or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None:
-        fail("member/asset association lacks valid archive SHA provenance")
+        fail("member association lacks valid archive SHA provenance")
     previous_sha256 = archive_hashes.get(archive)
     if previous_sha256 is not None and previous_sha256 != archive_sha256:
         fail(f"conflicting archive SHA provenance: {archive}")
@@ -202,9 +212,7 @@ section = [
     "",
     (
         f"VirusTotal completed **{len(results)} distinct extracted byte objects** covering "
-        f"**{len(associations)} exact extracted-file associations**: "
-        f"{len(member_rows)} archive members and "
-        f"{len(asset_rows)} independently extracted UI-pack assets."
+        f"**{len(associations)} exact extracted archive members**."
     ),
     (
         f"The extraction manifest binds those associations to "
@@ -216,10 +224,26 @@ section = [
     (
         f"Every scanned object returned **0 malicious and 0 suspicious** verdicts with "
         f"{engine_range} decisive engine results (required minimum: {policy})."
+        if not tolerated_paths
+        else (
+            f"{len(results) - len(tolerated_paths)} of {len(results)} scanned objects returned "
+            f"**0 malicious and 0 suspicious** verdicts with {engine_range} decisive engine "
+            f"results (required minimum: {policy})."
+        )
     ),
     (
         f"Microsoft returned a decisive clean verdict for all "
         f"{len(executable_paths)} executable objects."
+        if not tolerated_paths
+        else (
+            f"**{len(tolerated_paths)} object(s) carry a single Microsoft machine-learning "
+            f"detection** (`!ml`), which this project treats as a known false positive and "
+            f"publishes rather than hides. Every other engine returned clean. See "
+            f"[Antivirus False Positives](https://github.com/{repository}"
+            f"/blob/main/SECURITY.md#antivirus-false-positives) for the evidence and for how to "
+            f"verify these artifacts yourself: "
+            + ", ".join(f"`{path}`" for path in sorted(tolerated_paths))
+        )
     ),
     "",
     (

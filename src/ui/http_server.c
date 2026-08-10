@@ -3,8 +3,8 @@
  *
  * Transport (sockets, parsing, limits) lives in httpd.c; this file owns
  * the routes and their handlers:
- *   GET /             → verified external index.html
- *   GET /assets/...   → verified external JS/CSS
+ *   GET /             → embedded index.html
+ *   GET /assets/...   → embedded JS/CSS
  *   POST /rpc         → JSON-RPC dispatch via own cbm_mcp_server_t
  *   OPTIONS /rpc      → CORS preflight (for vite dev on :5173)
  *   GET/POST /api/... → UI support endpoints (layout, index, browse, …)
@@ -15,7 +15,7 @@
  */
 #include "ui/http_server.h"
 #include "ui/httpd.h"
-#include "ui/asset_pack.h"
+#include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
@@ -206,7 +206,7 @@ struct cbm_http_server {
     bool readiness_secret_set;
 };
 
-/* ── Serve verified frontend asset ───────────────────────────── */
+/* ── Serve embedded asset ─────────────────────────────────────── */
 
 /* Content-Security-Policy for the served UI. No external host appears in any
  * directive, so the browser cannot load or connect to anything off-origin —
@@ -221,22 +221,20 @@ struct cbm_http_server {
     "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
     "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n"
 
-static bool serve_frontend_asset(cbm_http_conn_t *c, const char *path) {
-    const cbm_ui_asset_t *f = cbm_ui_asset_lookup(path);
+static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
+    const cbm_embedded_file_t *f = cbm_embedded_lookup(path);
     if (!f)
         return false;
 
     /* Build headers with correct Content-Type for this asset */
     char hdrs[1024];
-    const char *cache = f->cache == CBM_UI_ASSET_REVALIDATE
-                            ? "Cache-Control: no-cache\r\n"
-                            : "Cache-Control: public, max-age=31536000, immutable\r\n";
     snprintf(hdrs, sizeof(hdrs),
              "%sContent-Type: %s\r\n"
-             "%sX-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
-             g_cors, f->content_type, cache);
+             "Cache-Control: public, max-age=31536000, immutable\r\n"
+             "X-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
+             g_cors, f->content_type);
 
-    cbm_http_reply_buf(c, 200, hdrs, f->data, f->size);
+    cbm_http_reply_buf(c, 200, hdrs, f->data, (size_t)f->size);
     return true;
 }
 
@@ -1023,7 +1021,6 @@ void cbm_http_server_set_binary_path(const char *path) {
             g_binary_path[0] = '\0';
         }
     }
-    cbm_ui_assets_set_binary_path(g_binary_path);
 }
 
 /* Execute through the daemon's shared job registry. The thread is retained in
@@ -1969,23 +1966,22 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     /* GET / → index.html (no-cache so browser always gets latest) */
     if (cbm_http_path_match(req->path, "/")) {
-        const cbm_ui_asset_t *f = cbm_ui_asset_lookup("/index.html");
+        const cbm_embedded_file_t *f = cbm_embedded_lookup("/index.html");
         if (f) {
             char html_hdrs[1024];
             snprintf(html_hdrs, sizeof(html_hdrs),
                      "%sContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache\r\n"
                      "X-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
                      g_cors);
-            cbm_http_reply_buf(c, 200, html_hdrs, f->data, f->size);
+            cbm_http_reply_buf(c, 200, html_hdrs, f->data, (size_t)f->size);
             return;
         }
-        cbm_http_replyf(c, 503, "Cache-Control: no-store\r\nRetry-After: 1\r\n",
-                        "frontend assets are not ready");
+        cbm_http_replyf(c, 404, g_cors, "no frontend embedded");
         return;
     }
 
-    /* GET /assets/... → exact lookup in the immutable verified pack. */
-    if (serve_frontend_asset(c, req->path))
+    /* GET /assets/... → exact lookup in the embedded asset table. */
+    if (serve_embedded(c, req->path))
         return;
 
     cbm_http_replyf(c, 404, g_cors, "not found");

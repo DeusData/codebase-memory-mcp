@@ -6,8 +6,7 @@
     Builds the product binary if it is not already present, stages it under its
     release name, then runs the deterministic Windows integration tests under
     tests/windows/ against it (real stdio / CLI / HTTP UI, real SQLite DB).
-    Windows ships one native executable inside the same verified runtime-set
-    layout as Linux and macOS.
+    Windows ships ONE binary, exactly like Linux and macOS.
 
     Two categories of test:
 
@@ -22,11 +21,8 @@
                       * test_daemon_stability.py guards the daemon parameter
                         surface, crash recovery, busy-stop refusal, and churn
                       * test_windows_update_handoff.py guards that `update`
-                        hands off to install.ps1 instead of replacing its
-                        currently running executable
-                      * test_daemon_open_readiness.py guards that
-                        `daemon start --open` waits for the verified CBM UI
-                        endpoint while ordinary daemon startup remains asynchronous
+                        hands off to install.ps1 instead of replacing its own
+                        running image (the removed launcher stub's only job)
 
       KNOWN REDS  - genuine, still-open Windows bugs reproduced at the product
                     surface. They are EXPECTED to be RED (exit 1) and are opt-in
@@ -50,7 +46,7 @@
 
 .PARAMETER Target
     Makefile.cbm target used when building: 'cbm-with-ui' (default; needed for the
-    drive-picker guard's UI-enabled HTTP service) or 'cbm' (no UI - the drive guard then
+    drive-picker guard's embedded HTTP UI) or 'cbm' (no UI - the drive guard then
     reports a precondition and is skipped).
 
 .PARAMETER GuardsOnly
@@ -93,13 +89,9 @@ function Resolve-Binary {
     param([string]$Explicit)
     if ($Explicit) { return (Resolve-Path $Explicit).Path }
     $built = Join-Path $repoRoot "build\c\codebase-memory-mcp.exe"
+    if (Test-Path $built) { return $built }
     Write-Host "Building $Target via Makefile.cbm ..." -ForegroundColor Cyan
-    $makeArgs = @(
-        "-j", "-f", "Makefile.cbm", $Target, "SANITIZE=",
-        "TMP=$tmp", "TEMP=$tmp", "TMPDIR=$tmp"
-    )
-    if ($Target -eq "cbm-with-ui") { $makeArgs += "TEST_SEAMS=1" }
-    & $Make @makeArgs | Out-Host
+    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
     $buildExit = $LASTEXITCODE
     if ($buildExit -ne 0) { throw "build failed (exit $buildExit)" }
     if (-not (Test-Path $built)) { throw "binary not produced at $built" }
@@ -142,22 +134,12 @@ try {
     New-Item -ItemType Directory -Path $guardBundle | Out-Null
     $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
     Copy-Item -LiteralPath $bin -Destination $guardBin
-    $sourceRuntimeDir = Split-Path -Parent $bin
-    $sourceIntegration = Join-Path $sourceRuntimeDir "cbm-integrations.json"
-    if (-not (Test-Path -LiteralPath $sourceIntegration -PathType Leaf)) {
-        throw "Windows guard source runtime is missing cbm-integrations.json beside $bin"
-    }
-    Copy-Item -LiteralPath $sourceIntegration -Destination $guardBundle
-    Get-ChildItem -LiteralPath $sourceRuntimeDir -File -Filter "cbm-ui-*.pack" |
-        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $guardBundle }
 
     # Ownership is never inherited on Windows: descendants created under the
     # hardened root by an admin-group token can default to the Administrators
     # SID, while the exe policy demands the exact current user as owner. Stamp
     # the current SID explicitly on everything staged here.
-    $stagedRuntime = @($guardBundle) + @(Get-ChildItem -LiteralPath $guardBundle -File |
-        ForEach-Object { $_.FullName })
-    foreach ($staged in $stagedRuntime) {
+    foreach ($staged in @($guardBundle, $guardBin)) {
         $stagedAcl = Get-Acl -LiteralPath $staged
         $stagedAcl.SetOwner($currentSid)
         Set-Acl -LiteralPath $staged -AclObject $stagedAcl
@@ -173,9 +155,9 @@ try {
     $env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
 
 # Green regression guards - must stay GREEN (exit 0). RED (exit 1) = the fix for
-# the referenced issue regressed. The drive-picker guard needs the UI-enabled
-# build and its external asset pack (target cbm-with-ui); against a non-UI
-# binary it reports a precondition (exit 2) and is skipped rather than failed.
+# the referenced issue regressed. The drive-picker guard needs the embedded HTTP
+# UI (build target cbm-with-ui); against a non-UI binary it reports a precondition
+# (exit 2) and is skipped rather than failed.
 $guards = @(
     "tests\windows\test_non_ascii_path.py",
     "tests\windows\test_non_ascii_cache_dump.py",
@@ -186,10 +168,6 @@ $guards = @(
     "tests\windows\test_cli_non_ascii_arg.py",
     "tests\windows\test_windows_update_handoff.py"
 )
-$readinessGuard = "tests\test_daemon_open_readiness.py"
-if (Get-ChildItem -LiteralPath $guardBundle -File -Filter "cbm-ui-*.pack") {
-    $guards += $readinessGuard
-}
 
 # Opt-in known-red repros - EXPECTED red (exit 1); never gate CI. Currently empty:
 # test_cli_non_ascii_arg.py was promoted to a guard when #423/#20's wide-argv fix landed.
@@ -208,13 +186,6 @@ foreach ($t in $guards) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
     } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_update_handoff.py") {
         Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
-        $guardFailures += $t
-    } elseif ($code -eq 2 -and $t -eq $readinessGuard) {
-        # This guard must run against a UI runtime set built with TEST_SEAMS=1.
-        # Treat a missing pack/seam as a broken gate, never a green precondition
-        # skip; the workflow's guard build deliberately supplies both.
-        Write-Host "FAILED ($t) exit=2 - UI readiness fixture is incomplete or lacks TEST_SEAMS=1" `
-            -ForegroundColor Red
         $guardFailures += $t
     } elseif ($code -eq 2) {
         # Exit 2 is the guards' DOCUMENTED precondition-skip contract; every
