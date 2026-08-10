@@ -2950,7 +2950,8 @@ smoke_rmtree "$DBL_HOME"
 if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
   VARIANT_RC=0
   VARIANT_OUT=$("$BINARY" update --standard --dry-run 2>&1) || VARIANT_RC=$?
-  if [ "$VARIANT_RC" -eq 0 ] || ! echo "$VARIANT_OUT" | grep -qi 'unknown argument'; then
+  if [ "$VARIANT_RC" -eq 0 ] ||
+    ! echo "$VARIANT_OUT" | grep -Fqi 'error: unknown update option: --standard'; then
     echo "FAIL 9b-9: update accepted retired --standard flag or returned no exact error"
     exit 1
   fi
