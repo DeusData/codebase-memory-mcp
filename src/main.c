@@ -1363,18 +1363,7 @@ static uint64_t main_deadline_after(uint32_t timeout_ms) {
 }
 
 static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
-    const char *runtime_parent = NULL;
-#ifdef CBM_ENABLE_TEST_SEAMS
-    /* Product daemon coordination is deliberately account-wide. Product-level
-     * lifecycle guards need an isolated rendezvous namespace so they cannot
-     * attach to or retire a developer's real daemon while exercising exact
-     * start/open/stop behavior. The seam is opt-in at compile time and the
-     * detached child inherits the same environment value. */
-    char seam_runtime_parent[MAIN_PATH_CAP];
-    runtime_parent = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", seam_runtime_parent,
-                                     sizeof(seam_runtime_parent), NULL);
-#endif
-    return cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+    return cbm_daemon_bootstrap_endpoint_new(NULL);
 }
 
 static bool main_local_cli_feedback_enabled(int argc, char **argv) {
