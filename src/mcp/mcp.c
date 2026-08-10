@@ -604,7 +604,7 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
-     "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
+     "\",\"default\":10,\"minimum\":1}},\"required\":[\"pattern\",\"project\"]}"},
 
     {"list_projects", "List projects", "List all indexed projects",
      "{\"type\":\"object\",\"properties\":{}}"},
@@ -9577,6 +9577,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
+    if (limit < 1) {
+        limit = MCP_DEFAULT_LIMIT;
+    }
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
