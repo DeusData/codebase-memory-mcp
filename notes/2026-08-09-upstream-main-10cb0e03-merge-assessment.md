@@ -5,8 +5,8 @@
 | Field | Current evidence |
 | --- | --- |
 | Purpose | Release record, benchmark report, and remaining publication plan for PR #1245 |
-| Status | Live upstream v0.10.0 is merged; exact-head sanitizer, lint, source-safety, DCO, focused py-LSP, and refreshed parent benchmark gates pass; final publication, hosted CI, installation, and PR metadata remain |
-| Evidence baseline | macOS arm64, 2026-08-10; product tree `f0627b1c`; local candidate `caf81288`; published head `8b6d3219` |
+| Status | Live upstream v0.10.0 is merged; exact-head correctness, safety, DCO, parent benchmark, publication, and installation gates pass; a TDD fix for the first hosted Windows harness failure is locally green and awaits replacement-head CI |
+| Evidence baseline | macOS arm64, 2026-08-10; product tree `f0627b1c`; merge `caf81288`; published evidence head `9dd18e53` |
 | Destination parent | `9953c328d1af27a836c533b399dc5b8ec08a22f5` |
 | Exact final merge parents | First `8b6d321953ad7f40083c2f3c7f5cf65daff6c81d`; second/current upstream `61b3b1b2ed740cbdb0a7ca6bd209d37a80135add` |
 | Current upstream main | `61b3b1b2ed740cbdb0a7ca6bd209d37a80135add` (`v0.10.0`), confirmed by `ls-remote` and an explicit remote-tracking ref fetch on 2026-08-10 |
@@ -16,8 +16,8 @@
 | Consolidation merge | `32bc95314e2e9d64bb62211a78c16c58331c0588` |
 | Current-main refresh merges | `29c7a2f1` joins `1f8ccb76` with `ad010b16`; `8778050` joins `a2e019fc` with `aa6d740a`; `caf81288` joins release head `8b6d3219` with live upstream `61b3b1b2` |
 | Recovery refs | Prior recovery pairs plus `refs/merge-input/api-consolidation-pre-61b3-8b6d321` and `refs/merge-input/upstream-main-20260810-61b3b1b2` |
-| Publication baseline | Remote `api-consolidation` and `api-consolidation-merge` both resolve to `8b6d3219`; final publication must move both atomically to the evidence commit containing this note |
-| Decision needed | None for code composition. Release still requires green final-head CI and separate PR-metadata authorization. |
+| Publication baseline | Remote `api-consolidation` and `api-consolidation-merge` both resolve to `9dd18e53`; replacement publication must move both atomically to the signed Windows harness fix |
+| Decision needed | None for code composition. Release still requires green replacement-head CI and separate PR-metadata authorization. |
 
 This note supersedes its earlier test counts, parent SHAs, benchmark paths, and
 installation hash. Historical commits remain available in Git.
@@ -107,6 +107,13 @@ installation, Windows evidence, DCO, and guarded publication are all required.
     retains this branch's definition, call, resolution, usage, type-reference,
     and read/write counters plus the 50% resolution-ratio assertion. The focused
     fixture passes with 55 of 56 calls resolved (98%) in 31.55 ms.
+15. Both exact parents carry the same extensionless executable validation in
+    `tests/test_daemon_open_readiness.py`, but only the first parent's stronger
+    canonical test flow invokes it. Both hosted Windows shards completed their
+    unit suites and then failed loudly because MSYS execution resolves `.exe`
+    while Python's `os.path.isfile()` does not. `resolve_binary_path()` now uses
+    the `.exe` sibling only on Windows and leaves missing paths on the existing
+    exit-2 `SETUP FAIL` path.
 
 ## Correctness, safety, and robustness evidence
 
@@ -121,7 +128,9 @@ installation, Windows evidence, DCO, and guarded publication are all required.
 | Guard Malloc on `f0627b1c` | 1,366 allocation-owning tests passed; no overrun or use-after-free crash |
 | Clang static analyzer | Exit 0; no warning in an edited line range |
 | Local lint | `lint-ci`, clang-format, cppcheck, NOLINT, and source-safety passed. LLVM 22 clang-tidy found no issue in either edited production source; its full-tree target reports 1,088 existing findings in unrelated extraction and CLI files. |
-| DCO through this evidence commit | All 953 owned non-merge commits after live upstream `61b3b1b2` contain valid sign-offs |
+| Top-level Python unit suite | 272 tests passed, 1 platform test skipped; the Windows extensionless-path regression is included |
+| Windows readiness harness fix | Red before implementation; focused unit passed; a nonexistent binary still returns exit 2 with `SETUP FAIL`; the real three-case isolated UI fixture passed |
+| DCO through this evidence commit | All 954 owned non-merge commits after live upstream `61b3b1b2` contain valid sign-offs |
 | Daemon production lifecycle | Full stability guard passed; 20 consecutive six-client cold waves accepted 120 clients and retired each ephemeral daemon |
 | CLI after `a60199ac` | ASan/UBSan CLI and agent-client lane passed 355 tests |
 | Hosted `f0627b1c` checks | DCO, lint, analyze, CodeQL, diagnostics, LSan, PR smoke, package wrappers, TSan, dedicated Windows daemon guard, and completed Unix legs passed |
@@ -240,6 +249,7 @@ work for one temporary store.
 | Empty import specification | `O(1)` | Avoids an unnecessary root cursor walk |
 | Unsupported-language LSP gate | `O(1)` dispatch with no timer/atomic write | Removes empty instrumentation work |
 | Py-LSP benchmark liveness backstop | `O(1)` test-only comparison after extraction | Equal to both parents; the merge changes only the constant threshold and retains the ratio assertion |
+| Windows readiness executable resolution | `O(1)` time and `O(1)` space with at most two regular-file probes | Equal growth bounds; test-only and leaves the production tree and benchmark runners unchanged |
 | Registry finalization scratch index | `O(F)` temporary memory for `F` functions, reclaimed with the supplied scratch arena | Same time bound; lower retained memory ownership than allocating into the result arena |
 | Optional diagnostics RSS sample | `O(1)` time and `O(1)` space every five seconds while diagnostics are enabled | Same bounds as both parents; OS RSS helpers replace a Linux mimalloc counter that could wrap to a false exabyte-scale value; disabled request paths are unchanged |
 | General indexing | Existing destination bounds in `P` and `G` | Destination algorithms and exact-delta behavior retained |
@@ -269,12 +279,17 @@ confirms the Python hot-path change reduces retired work as input grows.
   binary identity with `8b6d3219` and product-tree identity between `61b3b1b2`
   and measured `aa6d740a`.
 - [x] Commit this final evidence record with DCO.
-- [ ] Atomically publish both release branch names with fresh exact leases.
-- [ ] Obtain green hosted checks on that exact head, including both Windows unit
-  shards and the Windows daemon guard.
-- [ ] Build and install with no active CBM process; verify build/install hash
+- [x] Atomically publish both release branch names with fresh exact leases to
+  signed evidence head `9dd18e53`.
+- [x] Build and install with no active CBM process; verify build/install hash
   equality, mode 755, strict code signature, `--version`, `--help`, and MCP
   initialize.
+- [x] Diagnose both hosted Windows shards from their exact logs, add the smallest
+  red extensionless-`.exe` regression, preserve fail-loud missing-path behavior,
+  and pass the focused and full Python unit suites plus the real UI fixture.
+- [ ] Commit and atomically publish the signed Windows harness fix, then obtain
+  green hosted checks on that exact head, including both Windows unit shards and
+  the Windows daemon guard.
 - [ ] Publish the final PR title/body after separate authorization and verify its
   rendered metadata.
 

@@ -327,11 +327,19 @@ def assert_active_daemon_open(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
+def resolve_binary_path(argument, platform_name=os.name):
+    binary = os.path.abspath(argument)
+    executable = binary + ".exe"
+    if platform_name == "nt" and not os.path.isfile(binary) and os.path.isfile(executable):
+        return executable
+    return binary
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: python3 test_daemon_open_readiness.py <ui-binary>")
         return 2
-    binary = os.path.abspath(sys.argv[1])
+    binary = resolve_binary_path(sys.argv[1])
     if not os.path.isfile(binary):
         print("SETUP FAIL: binary not found: %s" % binary)
         return 2
