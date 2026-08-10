@@ -11265,6 +11265,17 @@ TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
         released_legacy_removed = released_legacy_removed && stat(legacy_path, &state) != 0;
     }
 
+    char streamlined_session_path[768];
+    snprintf(streamlined_session_path, sizeof(streamlined_session_path), "%s/%s", hooks_dir,
+             legacy_names[1]);
+    bool streamlined_released_removed =
+        write_test_file(streamlined_session_path,
+                        test_released_streamlined_session_hook_script) == 0 &&
+        cbm_install_agent_configs(tmpdir, binary_path, false, false) == 0;
+    struct stat streamlined_state;
+    streamlined_released_removed =
+        streamlined_released_removed && stat(streamlined_session_path, &streamlined_state) != 0;
+
     bool uninstall_seeded = current_scripts_ready;
     for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
         char legacy_path[768];
@@ -11292,7 +11303,8 @@ TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
         restore_test_env(env_names[i], saved_env[i]);
     }
     test_rmdir_r(tmpdir);
-    if (!current_legacy_removed || !released_legacy_removed || !all_owned_shapes_removed)
+    if (!current_legacy_removed || !released_legacy_removed || !streamlined_released_removed ||
+        !all_owned_shapes_removed)
         FAIL("Windows lifecycle must migrate and uninstall current and released owned hook "
              "script shapes");
     PASS();
