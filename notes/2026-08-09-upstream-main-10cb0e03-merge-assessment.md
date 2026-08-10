@@ -5,8 +5,8 @@
 | Field | Current evidence |
 | --- | --- |
 | Purpose | Release record, benchmark report, and remaining publication plan for PR #1245 |
-| Status | Product code, two-parent benchmarks, sanitizer lanes, and dual-ref publication verified; final-head hosted CI, installation, and PR metadata remain |
-| Evidence baseline | macOS arm64, 2026-08-10; product tree `f0627b1c`; published head `a60199ac` |
+| Status | Product code, two-parent benchmarks, sanitizer lanes, and installation verified; final dual-ref publication, hosted CI, and PR metadata remain |
+| Evidence baseline | macOS arm64, 2026-08-10; product tree `f0627b1c`; local candidate `add6e20`; published head `a60199ac` |
 | Destination parent | `9953c328d1af27a836c533b399dc5b8ec08a22f5` |
 | Exact final merge parents | First `a2e019fc9455632632bb15786a0dd6671ba3c054`; second/current upstream `aa6d740a8b7c7819c045d7bab67b69456994d70e` |
 | Current upstream main | `aa6d740a8b7c7819c045d7bab67b69456994d70e`, confirmed by a fresh fetch on 2026-08-10 |
@@ -16,8 +16,8 @@
 | Consolidation merge | `32bc95314e2e9d64bb62211a78c16c58331c0588` |
 | Current-main refresh merges | `29c7a2f1` joins `1f8ccb76` with `ad010b16`; `8778050` joins `a2e019fc` with current main `aa6d740a` |
 | Recovery refs | Prior `refs/merge-recovery/` and `refs/merge-input/` pairs plus `pre-upstream-main-20260810-a2e019fc` and `upstream-main-20260810-aa6d740a` |
-| Release refs | Remote `api-consolidation` and `api-consolidation-merge` both resolve to `a60199ac` |
-| Decision needed | None for code composition. Release still requires green final-head CI, final installation, and separate PR-metadata authorization. |
+| Publication baseline | Remote `api-consolidation` and `api-consolidation-merge` both resolve to prior diagnostic head `a60199ac`; final publication must move both to the evidence commit containing this note |
+| Decision needed | None for code composition. Release still requires green final-head CI and separate PR-metadata authorization. |
 
 This note supersedes its earlier test counts, parent SHAs, benchmark paths, and
 installation hash. Historical commits remain available in Git.
@@ -26,7 +26,7 @@ installation hash. Historical commits remain available in Git.
 
 | Area | Before | Verified now | Release target | Consequence |
 | --- | --- | --- | --- | --- |
-| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `8778050` retains exact parents `a2e019fc` and `aa6d740a`; both release refs publish signed head `a60199ac` | Keep both release branch names at the exact final tip | Reviewers see one auditable superset history |
+| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `8778050` retains exact parents `a2e019fc` and `aa6d740a`; both release refs published signed diagnostic head `a60199ac` | Move both release branch names atomically to the exact final tip | Reviewers see one auditable superset history |
 | Release packaging | Upstream carried the newer embedded UI/runtime-set design; destination carried rollback and richer installation behavior | One embedded binary, one four-member archive set, exact asset lookup, rollback, activation, and ownership contracts coexist | Keep all package and install checks green on the published head | No sidecar-era or variant-binary regression |
 | Indexing and API behavior | Destination was ahead in dependency indexing, PageRank, incremental indexing, extraction, and diagnostics | Those paths remain, together with upstream UI, Windows, archive, and release hardening | Preserve both parents' useful behavior | The merge does not trade branch functionality for upstream freshness |
 | Python registry filtering | Repeated indexed root-child scans scaled poorly with registry size | One circular `TSTreeCursor` performs root membership checks in `O(R*N)` time and `O(1)` auxiliary space | Retain exact class filtering for arbitrary registry order | Scale latency and retired work fall without output loss |
@@ -34,8 +34,7 @@ installation hash. Historical commits remain available in Git.
 | Trust boundaries | Invalid UI/port inputs and rollback failures could be hidden by permissive or secondary paths | Shared strict parsing, pre-admission rejection, and propagated persistence/rollback errors fail loudly | Preserve the same errors in package and hosted tests | Bad input and partial persistence cannot look successful |
 
 No code-composition decision remains. The release gate is green final-head CI,
-installation of the exact final source head, matching refs, clean worktrees, and
-current PR metadata.
+matching refs, clean worktrees, and current PR metadata.
 
 ## Parent assessment
 
@@ -97,12 +96,17 @@ installation, Windows evidence, DCO, and guarded publication are all required.
     Windows migration lifecycle test. It changes only `tests/test_cli.c`, so it
     does not invalidate the production benchmark binaries built from
     `f0627b1c`.
+13. `add6e20` removes `main.c`'s duplicate read of
+    `CBM_TEST_DAEMON_RUNTIME_PARENT`. The shared bootstrap helper now owns its
+    existing empty-is-unset rule for every frontend. Nonempty invalid paths still
+    fail at the IPC boundary, and the seam-free production binary remains
+    byte-identical to `f0627b1c`.
 
 ## Correctness, safety, and robustness evidence
 
 | Gate | Final local result |
 | --- | --- |
-| Canonical ASan/UBSan on `a60199ac` | 8,637 tests passed, 2 platform tests skipped; exit 0; no sanitizer or runtime-error report |
+| Canonical ASan/UBSan on `add6e20` | 8,637 tests passed, 2 platform tests skipped; exit 0; no sanitizer or runtime-error report |
 | Focused daemon ASan/UBSan on `f0627b1c` | Application 51, runtime 47, bootstrap 24, and IPC 47 tests passed |
 | ThreadSanitizer on `f0627b1c` | 1,349 tests passed, 2 platform tests skipped; exit 0; no race report |
 | Apple `leaks` on `f0627b1c` | 1,319 allocation-owning tests passed; 0 leaks for 0 total leaked bytes |
@@ -113,8 +117,8 @@ installation, Windows evidence, DCO, and guarded publication are all required.
 | Daemon production lifecycle | Full stability guard passed; 20 consecutive six-client cold waves accepted 120 clients and retired each ephemeral daemon |
 | CLI after `a60199ac` | ASan/UBSan CLI and agent-client lane passed 355 tests |
 | Hosted `f0627b1c` checks | DCO, lint, analyze, CodeQL, diagnostics, LSan, PR smoke, package wrappers, TSan, dedicated Windows daemon guard, and completed Unix legs passed |
-| Hosted Windows unit shards on `f0627b1c` | Both stopped at `tests/test_cli.c:9727` with `-Werror,-Wunused-const-variable`; `a60199ac` now uses that exact fixture in the Windows lifecycle test |
-| Prior installed product merge `8778050` | Build/install SHA-256 `08c8125485cd46a240b958ddfeec436fd356fdf68f1ada3ba25105a48cb24443`; mode 755; strict code signature, `--version`, `--help`, and MCP initialize passed. Exact-final-head installation remains open. |
+| Hosted Windows unit shards on `a60199ac` | Shard 1 passed 4,522 tests with 23 platform skips; shard 2 passed 3,812 tests with 47 platform skips. Both then exposed the same post-unit worker-transport defect: an empty test runtime parent reached IPC as an explicit path and daemon startup timed out. `add6e20` delegates the empty-is-unset contract to the shared bootstrap helper. |
+| Installed production binary | Build/install SHA-256 `14ab8e54db1f735a9e8e69067ce88c319f5b69113c694f3da3a73c5d5064dd90`; mode 755; strict code signature, `--version`, `--help`, and MCP initialize passed. The only post-`f0627b1c` product-source change is compiled under `CBM_TEST_SEAMS`; the seam-free release binary remains byte-identical. |
 | Production npm dependency audit | 0 vulnerabilities with `npm audit --omit=dev --audit-level=high` |
 | Source secret scan | No match |
 
@@ -241,12 +245,16 @@ confirms the Python hot-path change reduces retired work as input grows.
   `a60199ac`; pass the local 355-test CLI/agent-client sanitizer lane.
 - [x] Publish `a60199ac` atomically to both release branch names with exact
   force-with-lease guards; verify PR #1245 resolves to that head.
+- [x] Commit `add6e20` after both Windows unit shards passed their unit tests and
+  reproduced the same post-unit empty-runtime-parent timeout; pass the native and
+  simulated-Windows worker transport guards and preserve the release binary hash.
 - [ ] Obtain green hosted checks on the exact final head, including both Windows
   unit shards and the Windows daemon guard.
-- [ ] Commit this release record with DCO, audit every owned non-merge commit
-  after `aa6d740a`, then atomically republish both branch names with fresh exact
-  leases.
-- [ ] Build and install the exact final source head with no active CBM process;
+- [x] Commit the parent, benchmark, and sanitizer record as signed `96cf097`.
+- [ ] Commit the final Windows/install closure with DCO, audit every owned
+  non-merge commit after `aa6d740a`, then atomically republish both branch names
+  with fresh exact leases.
+- [x] Build and install with no active CBM process;
   verify build/install SHA-256 equality, mode 755, strict code signature,
   `--version`, `--help`, and MCP initialize.
 - [ ] Publish the final PR title/body after separate authorization and verify its
@@ -259,6 +267,6 @@ source, parent diffs, history, tests, disassembly where needed, and retained
 benchmark artifacts are the evidence authority.
 
 Local macOS verification cannot replace native Windows lifecycle checks. The
-published head is release-ready only after those hosted checks pass. No
-codebase-memory-mcp process may be stopped merely to perform the final
-installation; installation waits until the account has no active CBM process.
+published head is release-ready only after those hosted checks pass. Installation
+ran only after the account had no active codebase-memory-mcp process; no daemon or
+client was stopped for it.
