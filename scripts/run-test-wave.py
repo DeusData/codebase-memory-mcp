@@ -123,7 +123,7 @@ def start_suite(
     )
 
 
-def windows_descendants(pid: int, timeout: int) -> bool:
+def windows_descendants(pid: int) -> bool:
     """True if any live process still claims `pid` as its parent.
 
     Used only when the suite leader has already exited: `taskkill /T` cannot
@@ -133,27 +133,52 @@ def windows_descendants(pid: int, timeout: int) -> bool:
     and would not be found here. That is a weaker proof than taskkill /T, which
     is why it is reserved for the case where the strong proof is impossible.
     """
-    try:
-        completed = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "@(Get-CimInstance Win32_Process -Filter "
-                f"'ParentProcessId={pid}').Count",
-            ],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return True  # cannot prove absence -> assume the worst
-    if completed.returncode != 0:
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot_processes = kernel32.CreateToolhelp32Snapshot
+    snapshot_processes.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    snapshot_processes.restype = wintypes.HANDLE
+    process_first = kernel32.Process32FirstW
+    process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+    process_first.restype = wintypes.BOOL
+    process_next = kernel32.Process32NextW
+    process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+    process_next.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    snapshot = snapshot_processes(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == ctypes.c_void_p(-1).value:
         return True
-    return (completed.stdout or "").strip() not in ("0", "")
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not process_first(snapshot, ctypes.byref(entry)):
+            return True
+        while True:
+            if entry.th32ParentProcessID == pid:
+                return True
+            if not process_next(snapshot, ctypes.byref(entry)):
+                return ctypes.get_last_error() != 18  # ERROR_NO_MORE_FILES
+    finally:
+        close_handle(snapshot)
 
 
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
@@ -167,7 +192,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
             # how a deliberately-hanging fixture suite reddened a release run.
             # taskkill /T cannot walk a tree from a dead PID, so prove cleanup
             # the only way still available -- nothing is parented to it.
-            if windows_descendants(process.pid, kill_grace):
+            if windows_descendants(process.pid):
                 raise RuntimeError(
                     f"suite {active.name!r} leader exited leaving live descendants"
                 )
