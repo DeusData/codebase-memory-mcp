@@ -29,6 +29,8 @@
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/secure_random.h"
+#include "foundation/sha256.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
@@ -180,6 +182,8 @@ struct cbm_http_server {
     atomic_int run_state;
     int port;
     bool listener_ok;
+    uint8_t readiness_secret[CBM_SHA256_DIGEST_LEN];
+    bool readiness_secret_set;
 };
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
@@ -206,7 +210,8 @@ static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
     char hdrs[1024];
     snprintf(hdrs, sizeof(hdrs),
              "%sContent-Type: %s\r\n"
-             "Cache-Control: public, max-age=31536000, immutable\r\n" CBM_UI_CSP,
+             "Cache-Control: public, max-age=31536000, immutable\r\n"
+             "X-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
              g_cors, f->content_type);
 
     cbm_http_reply_buf(c, 200, hdrs, f->data, (size_t)f->size);
@@ -936,15 +941,7 @@ static bool resolve_self_executable(char *out, size_t outsz) {
 }
 #else
 static bool resolve_self_executable(char *out, size_t outsz) {
-    /* GetModuleFileNameA renders the module path through the ANSI code page,
-     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
-     * wide and convert to UTF-8 so the returned path survives verbatim. */
-    wchar_t wbuf[1024];
-    DWORD n = GetModuleFileNameW(NULL, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
-    if (n == 0 || n >= sizeof(wbuf) / sizeof(wbuf[0])) {
-        return false;
-    }
-    char *utf8 = cbm_wide_to_utf8(wbuf);
+    char *utf8 = cbm_module_path_utf8();
     if (!utf8) {
         return false;
     }
@@ -1716,6 +1713,77 @@ static bool content_type_is_json(const char *content_type) {
     return *suffix == '\0' || *suffix == ';';
 }
 
+static int readiness_hex_nibble(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    return -1;
+}
+
+static bool readiness_hex_decode(const char *hex, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+    if (!hex || strlen(hex) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        int high = readiness_hex_nibble(hex[i * 2U]);
+        int low = readiness_hex_nibble(hex[i * 2U + 1U]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((high << 4) | low);
+    }
+    return true;
+}
+
+static void readiness_hex_encode(const uint8_t bytes[CBM_SHA256_DIGEST_LEN],
+                                 char out[CBM_SHA256_HEX_LEN + 1U]) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2U] = hex[bytes[i] >> 4];
+        out[i * 2U + 1U] = hex[bytes[i] & 0x0fU];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static void handle_ui_readiness(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                                const cbm_http_req_t *req) {
+    if (!srv->readiness_secret_set) {
+        cbm_http_replyf(c, 503, "Cache-Control: no-store\r\n", "%s", "readiness proof unavailable");
+        return;
+    }
+    char challenge_hex[CBM_SHA256_HEX_LEN + 1U];
+    uint8_t challenge[CBM_SHA256_DIGEST_LEN];
+    static const char prefix[] = "challenge=";
+    if (strncmp(req->query, prefix, sizeof(prefix) - 1U) != 0 ||
+        strlen(req->query) != sizeof(prefix) - 1U + CBM_SHA256_HEX_LEN) {
+        cbm_http_replyf(c, 400, "Cache-Control: no-store\r\n", "%s", "invalid challenge");
+        return;
+    }
+    memcpy(challenge_hex, req->query + sizeof(prefix) - 1U, CBM_SHA256_HEX_LEN);
+    challenge_hex[CBM_SHA256_HEX_LEN] = '\0';
+    if (!readiness_hex_decode(challenge_hex, challenge)) {
+        cbm_secure_zero(challenge, sizeof(challenge));
+        cbm_http_replyf(c, 400, "Cache-Control: no-store\r\n", "%s", "invalid challenge");
+        return;
+    }
+    uint8_t proof[CBM_SHA256_DIGEST_LEN];
+    char proof_hex[CBM_SHA256_HEX_LEN + 1U];
+    cbm_hmac_sha256(srv->readiness_secret, sizeof(srv->readiness_secret), challenge,
+                    sizeof(challenge), proof);
+    readiness_hex_encode(proof, proof_hex);
+    cbm_http_replyf(c, 200,
+                    "Content-Type: text/plain; charset=utf-8\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "X-Content-Type-Options: nosniff\r\n",
+                    "%s", proof_hex);
+    cbm_secure_zero(challenge, sizeof(challenge));
+    cbm_secure_zero(proof, sizeof(proof));
+    cbm_secure_zero(proof_hex, sizeof(proof_hex));
+}
+
 static bool request_passes_http_security(cbm_http_server_t *srv, cbm_http_conn_t *c,
                                          const cbm_http_req_t *req) {
     if (req->http_minor == 1 && req->host[0] == '\0') {
@@ -1753,6 +1821,14 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* OPTIONS preflight for CORS */
     if (strcmp(req->method, "OPTIONS") == 0) {
         cbm_http_replyf(c, 204, g_cors, "%s", "");
+        return;
+    }
+
+    /* Private-generation proof used only by `daemon start --open`. The
+     * challenge is public; the HMAC key exists only in this daemon's
+     * authenticated application and HTTP server instances. */
+    if (is_get && strcmp(req->path, "/__cbm/ui-readiness") == 0) {
+        handle_ui_readiness(srv, c, req);
         return;
     }
 
@@ -1840,7 +1916,9 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         if (f) {
             char html_hdrs[1024];
             snprintf(html_hdrs, sizeof(html_hdrs),
-                     "%sContent-Type: text/html\r\nCache-Control: no-cache\r\n" CBM_UI_CSP, g_cors);
+                     "%sContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache\r\n"
+                     "X-Content-Type-Options: nosniff\r\n" CBM_UI_CSP,
+                     g_cors);
             cbm_http_reply_buf(c, 200, html_hdrs, f->data, (size_t)f->size);
             return;
         }
@@ -1848,7 +1926,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* GET /assets/... → embedded assets, then generic embedded fallback */
+    /* GET /assets/... → exact lookup in the embedded asset table. */
     if (serve_embedded(c, req->path))
         return;
 
@@ -1927,6 +2005,7 @@ bool cbm_http_server_free(cbm_http_server_t *srv) {
     if (!cbm_httpd_close(srv->listener))
         return false;
     cbm_mcp_server_free(srv->mcp);
+    cbm_secure_zero(srv->readiness_secret, sizeof(srv->readiness_secret));
     free(srv);
     return true;
 }
@@ -2042,4 +2121,14 @@ void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *srv,
     srv->mutation_context = begin ? context : NULL;
     cbm_mcp_server_set_project_mutation_guard(srv->mcp, begin, end, begin ? context : NULL);
     cbm_mcp_server_set_project_mutation_try_guard(srv->mcp, begin);
+}
+
+void cbm_http_server_set_readiness_secret(cbm_http_server_t *srv,
+                                          const uint8_t secret[CBM_SHA256_DIGEST_LEN]) {
+    if (!srv || !secret ||
+        atomic_load_explicit(&srv->run_state, memory_order_acquire) != HTTP_RUN_IDLE) {
+        return;
+    }
+    memcpy(srv->readiness_secret, secret, sizeof(srv->readiness_secret));
+    srv->readiness_secret_set = true;
 }

@@ -4,7 +4,7 @@ mcp-name: io.github.DeusData/codebase-memory-mcp
 
 **Fast code intelligence engine for AI coding agents.** Indexes an average repository in milliseconds, the Linux kernel (28M LOC) in 3 minutes. Answers structural queries in under 1ms.
 
-This package installs the `codebase-memory-mcp` binary from [GitHub Releases](https://github.com/DeusData/codebase-memory-mcp/releases). The binary is downloaded on first run and cached in your OS cache directory.
+This Python wrapper downloads the selected `codebase-memory-mcp` runtime set from [GitHub Releases](https://github.com/DeusData/codebase-memory-mcp/releases) on first run and verifies it before publishing it in your OS cache directory. The standard set contains the native executable and authenticated integration asset; `CBM_VARIANT=ui` additionally selects the content-addressed UI pack.
 
 ## Installation
 
@@ -13,6 +13,8 @@ pip install codebase-memory-mcp
 # or
 pipx install codebase-memory-mcp
 ```
+
+To use the UI variant, set `CBM_VARIANT=ui` when invoking the wrapper (and consistently for any package-managed update or reinstall).
 
 ## Usage
 
@@ -27,7 +29,7 @@ codebase-memory-mcp --help
 |---------|-------------|
 | macOS   | arm64, amd64 |
 | Linux   | arm64, amd64 |
-| Windows | amd64 |
+| Windows | arm64, amd64 |
 
 ## Full documentation
 

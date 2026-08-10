@@ -1,4 +1,4 @@
-# Reusable: smoke test every binary (standard + UI, all platforms)
+# Reusable: smoke test shipped release binaries on all platforms
 name: Smoke
 
 on:
@@ -8,7 +8,6 @@ on:
         description: 'Smoke the shipped binaries on the broad platform matrix (extra OS versions) instead of the core set'
         type: boolean
         default: false
-
 permissions:
   contents: read
 
@@ -72,16 +71,11 @@ jobs:
             WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
             PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" '$a')
           fi
-          # Expand each OS entry over both variants into a FLAT include list so
-          # every {os,variant} runs as its own job. A {variant:[...],include:$LIST}
-          # matrix collapses under GitHub's include-merge (later os entries
-          # overwrite the variant combos last-wins), which silently dropped every
-          # OS except the last — e.g. only windows-11-arm ran, never windows-latest.
-          # Building the cartesian explicitly avoids that.
-          VARIANTS='["standard","ui"]'
-          UNIX_M=$(jq -cn --argjson a "$UNIX" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
-          WIN_M=$(jq -cn --argjson a "$WIN" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
-          PORTABLE_M=$(jq -cn --argjson a "$PORTABLE" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          # One composition ships; the wrappers assert the embedded UI themselves
+          # (SMOKE_REQUIRE_UI in scripts/ci/smoke-artifact.sh and below).
+          UNIX_M=$(jq -cn --argjson a "$UNIX" '{include:$a}')
+          WIN_M=$(jq -cn --argjson a "$WIN" '{include:$a}')
+          PORTABLE_M=$(jq -cn --argjson a "$PORTABLE" '{include:$a}')
           echo "unix=$UNIX_M" >> "$GITHUB_OUTPUT"
           echo "windows=$WIN_M" >> "$GITHUB_OUTPUT"
           echo "portable=$PORTABLE_M" >> "$GITHUB_OUTPUT"
@@ -107,9 +101,8 @@ jobs:
 
       - name: Extract release artifact
         run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           mkdir -p "$RUNNER_TEMP/cbm-artifact"
-          tar -xzf codebase-memory-mcp${SUFFIX}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+          tar -xzf codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
             -C "$RUNNER_TEMP/cbm-artifact"
           chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
@@ -121,10 +114,10 @@ jobs:
       # the wrapper (no env isolation, no user-PATH guard, fixed port).
       - name: Smoke test (shared wrapper)
         run: |
-          scripts/smoke-local.sh \
-            "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp" ${{ matrix.variant }}
+          scripts/smoke-local.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
+          SMOKE_REQUIRE_UI: "1"
 
       - name: Security audits
         run: |
@@ -133,8 +126,8 @@ jobs:
           scripts/security-install.sh "$BIN"
           scripts/security-network.sh "$BIN"
 
-      - name: MCP robustness test (linux-amd64 standard only)
-        if: matrix.variant == 'standard' && matrix.goos == 'linux' && matrix.goarch == 'amd64'
+      - name: MCP robustness test (selected linux-amd64 runtime)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: |
           BIN="$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
           scripts/security-fuzz.sh "$BIN"
@@ -200,14 +193,13 @@ jobs:
       - name: Extract release artifact
         shell: msys2 {0}
         run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           ARCH=${{ matrix.arch }}
           ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
           mkdir -p "$ARTIFACT_DIR"
-          unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
+          unzip -o "codebase-memory-mcp-windows-${ARCH}.zip" -d "$ARTIFACT_DIR"
           test -s "$ARTIFACT_DIR/codebase-memory-mcp.exe"
-          # ONE binary per platform: a payload sibling would mean the
-          # AV-flagged launcher stub came back.
+          # ONE executable per runtime set: a payload sibling would mean the
+          # removed launcher split came back.
           test ! -e "$ARTIFACT_DIR/codebase-memory-mcp.payload.exe"
           # Pre-flight the image from a profile-rooted directory: the shared
           # runner workspace is deliberately not a valid install root.
@@ -231,7 +223,7 @@ jobs:
         shell: msys2 {0}
         env:
           SMOKE_ARCH: ${{ matrix.arch }}
-          SMOKE_VARIANT: ${{ matrix.variant }}
+          SMOKE_REQUIRE_UI: "1"
         run: |
           export CBM_SMOKE_ARTIFACT_DIR="$(cygpath -u "$RUNNER_TEMP")/cbm-artifact"
           bash test-infrastructure/vm/vm-smoke.sh
@@ -293,9 +285,8 @@ jobs:
 
       - name: Extract release artifact
         run: |
-          SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           mkdir -p "$RUNNER_TEMP/cbm-artifact"
-          tar -xzf codebase-memory-mcp${SUFFIX}-linux-${{ matrix.arch }}-portable.tar.gz \
+          tar -xzf codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz \
             -C "$RUNNER_TEMP/cbm-artifact"
           chmod +x "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
@@ -306,10 +297,10 @@ jobs:
       # exactly the phases it most needs to run.
       - name: Smoke test (shared wrapper)
         run: |
-          scripts/smoke-local.sh \
-            "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp" ${{ matrix.variant }}
+          scripts/smoke-local.sh "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
         env:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
+          SMOKE_REQUIRE_UI: "1"
 
       # The -portable binary is what all linux install/update paths now deliver;
       # it MUST start on old glibc (Debian 11 / RHEL 8 / Ubuntu 20.04). Runs it

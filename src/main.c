@@ -14,6 +14,12 @@
  * per-account daemon. One-shot CLI tool calls run in an isolated local server
  * and never create or retain a daemon generation.
  */
+#ifdef _WIN32
+/* winsock2 must precede every project header that can transitively include
+ * windows.h, otherwise the legacy winsock declarations conflict. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include "cbm.h"
 #include "store/store.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "daemon/application.h"
@@ -59,6 +65,7 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/profile.h"
 #include "foundation/sha256.h"
+#include "foundation/secure_random.h"
 #include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
 #ifdef _WIN32
 #include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
@@ -70,13 +77,18 @@ enum {
 #include <yyjson/yyjson.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
 #ifndef _WIN32
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -211,12 +223,10 @@ static void main_project_lock_release_fully(cbm_project_lock_lease_t **lease) {
  * COMPILED OUT of ordinary builds alongside the watchdog probe above. This one
  * is benign in isolation (an O_EXCL|O_NOFOLLOW PID file), but it is still
  * test-only code reachable through a caller-supplied path in a shipped binary,
- * and its consumers all build with TEST_SEAMS=1. The two seams smoke genuinely
- * needs against real release artifacts (CBM_TEST_CRASH_ON / CBM_TEST_HANG_ON
- * fault injection, and CBM_TEST_WINDOWS_USER_PATH_RUN_ID, which is what keeps
- * the PATH smoke from touching the real user PATH) deliberately REMAIN: smoke's
- * whole value is exercising the artifact we ship, and removing them would trade
- * release-artifact coverage for a cosmetic win. */
+ * and its consumers all build with TEST_SEAMS=1. The crash/hang injectors in
+ * internal/cbm/cbm.c are governed by the same boundary. The narrowly validated
+ * Windows PATH smoke redirect remains in release artifacts so artifact tests
+ * never mutate the runner's live user PATH. */
 #ifdef CBM_ENABLE_TEST_SEAMS
 static bool main_test_worker_project_lock_marker(const main_local_cli_mutation_t *mutation) {
 #ifdef _WIN32
@@ -1253,6 +1263,21 @@ static uint64_t main_deadline_after(uint32_t timeout_ms) {
     return now_ms > UINT64_MAX - timeout_ms ? UINT64_MAX : now_ms + timeout_ms;
 }
 
+static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
+    const char *runtime_parent = NULL;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* Product daemon coordination is deliberately account-wide. Product-level
+     * lifecycle guards need an isolated rendezvous namespace so they cannot
+     * attach to or retire a developer's real daemon while exercising exact
+     * start/open/stop behavior. The seam is opt-in at compile time and the
+     * detached child inherits the same environment value. */
+    char seam_runtime_parent[MAIN_PATH_CAP];
+    runtime_parent = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", seam_runtime_parent,
+                                     sizeof(seam_runtime_parent), NULL);
+#endif
+    return cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+}
+
 static bool main_local_cli_feedback_enabled(int argc, char **argv) {
     bool requested = false;
     for (int index = 1; index < argc; index++) {
@@ -1674,6 +1699,10 @@ enum {
     MAIN_DAEMON_CTL_PROBE_TIMEOUT_MS = 3000,
     MAIN_DAEMON_CTL_STOP_TIMEOUT_MS = 10000,
     MAIN_DAEMON_CTL_START_TIMEOUT_MS = 30000,
+    MAIN_DAEMON_CTL_UI_READY_TIMEOUT_MS = 30000,
+    MAIN_DAEMON_CTL_UI_PROBE_TIMEOUT_MS = 250,
+    MAIN_DAEMON_CTL_UI_PROBE_INTERVAL_US = 50000,
+    MAIN_DAEMON_CTL_UI_RESPONSE_CAP = 4096,
 };
 
 static void main_daemon_ctl_print_clients(const uint32_t *pids, uint8_t count, uint16_t committed) {
@@ -1686,14 +1715,333 @@ static void main_daemon_ctl_print_clients(const uint32_t *pids, uint8_t count, u
     }
 }
 
-static void main_daemon_ctl_print_ui(void) {
-    if (CBM_EMBEDDED_FILE_COUNT == 0) {
+#ifdef _WIN32
+typedef SOCKET main_daemon_ctl_socket_t;
+#define MAIN_DAEMON_CTL_BAD_SOCKET INVALID_SOCKET
+#define main_daemon_ctl_socket_close closesocket
+#else
+typedef int main_daemon_ctl_socket_t;
+#define MAIN_DAEMON_CTL_BAD_SOCKET (-1)
+#define main_daemon_ctl_socket_close close
+#endif
+
+#ifdef _WIN32
+static bool main_daemon_ctl_socket_runtime_ready(void) {
+    /* main is single-threaded along this path. As in the HTTP listener, keep
+     * Winsock initialized for the short remaining lifetime of this process. */
+    static bool attempted = false;
+    static bool ready = false;
+    if (!attempted) {
+        attempted = true;
+        WSADATA winsock;
+        ready = WSAStartup(MAKEWORD(2, 2), &winsock) == 0;
+    }
+    return ready;
+}
+#endif
+
+static bool main_daemon_ctl_socket_set_nonblocking(main_daemon_ctl_socket_t socket_handle) {
+#ifdef _WIN32
+    u_long enabled = 1;
+    return ioctlsocket(socket_handle, FIONBIO, &enabled) == 0;
+#else
+    int flags = fcntl(socket_handle, F_GETFL, 0);
+    return flags >= 0 && fcntl(socket_handle, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+static bool main_daemon_ctl_socket_would_block(void) {
+#ifdef _WIN32
+    int error = WSAGetLastError();
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEALREADY ||
+           error == WSAEINTR;
+#else
+    return errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+}
+
+/* 1 = requested readiness, 0 = timeout/interruption, -1 = socket error. */
+static int main_daemon_ctl_socket_wait(main_daemon_ctl_socket_t socket_handle, bool writing,
+                                       int timeout_ms) {
+#ifdef _WIN32
+    fd_set ready;
+    fd_set errors;
+    FD_ZERO(&ready);
+    FD_ZERO(&errors);
+    FD_SET(socket_handle, &ready);
+    FD_SET(socket_handle, &errors);
+    struct timeval timeout = {
+        .tv_sec = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
+    };
+    int result = select(0, writing ? NULL : &ready, writing ? &ready : NULL, &errors, &timeout);
+    if (result <= 0) {
+        return result < 0 ? -1 : 0;
+    }
+    return FD_ISSET(socket_handle, &errors) ? -1 : 1;
+#else
+    struct pollfd descriptor = {
+        .fd = socket_handle,
+        .events = writing ? POLLOUT : POLLIN,
+        .revents = 0,
+    };
+    int result = poll(&descriptor, 1, timeout_ms);
+    if (result < 0) {
+        return errno == EINTR ? 0 : -1;
+    }
+    if (result == 0) {
+        return 0;
+    }
+    return (descriptor.revents & descriptor.events) != 0 ? 1 : -1;
+#endif
+}
+
+static int main_daemon_ctl_socket_remaining_ms(uint64_t deadline_ms) {
+    uint64_t now_ms = cbm_now_ms();
+    if (now_ms >= deadline_ms) {
+        return 0;
+    }
+    uint64_t remaining = deadline_ms - now_ms;
+    return remaining > (uint64_t)INT_MAX ? INT_MAX : (int)remaining;
+}
+
+static bool main_daemon_ctl_socket_connected(main_daemon_ctl_socket_t socket_handle, int port,
+                                             uint64_t deadline_ms) {
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((unsigned short)port);
+    address.sin_addr.s_addr = htonl(0x7F000001U);
+    if (connect(socket_handle, (const struct sockaddr *)&address, sizeof(address)) == 0) {
+        return true;
+    }
+    if (!main_daemon_ctl_socket_would_block()) {
+        return false;
+    }
+    int remaining = main_daemon_ctl_socket_remaining_ms(deadline_ms);
+    if (remaining <= 0 || main_daemon_ctl_socket_wait(socket_handle, true, remaining) != 1) {
+        return false;
+    }
+    int socket_error = 0;
+#ifdef _WIN32
+    int socket_error_size = (int)sizeof(socket_error);
+    return getsockopt(socket_handle, SOL_SOCKET, SO_ERROR, (char *)&socket_error,
+                      &socket_error_size) == 0 &&
+           socket_error == 0;
+#else
+    socklen_t socket_error_size = sizeof(socket_error);
+    return getsockopt(socket_handle, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) ==
+               0 &&
+           socket_error == 0;
+#endif
+}
+
+static int main_daemon_ctl_socket_send(main_daemon_ctl_socket_t socket_handle, const char *data,
+                                       size_t length) {
+#ifdef _WIN32
+    return send(socket_handle, data, (int)length, 0);
+#else
+#ifdef MSG_NOSIGNAL
+    return (int)send(socket_handle, data, length, MSG_NOSIGNAL);
+#else
+    return (int)send(socket_handle, data, length, 0);
+#endif
+#endif
+}
+
+static int main_daemon_ctl_socket_receive(main_daemon_ctl_socket_t socket_handle, char *data,
+                                          size_t capacity) {
+#ifdef _WIN32
+    return recv(socket_handle, data, (int)capacity, 0);
+#else
+    return (int)recv(socket_handle, data, capacity, 0);
+#endif
+}
+
+typedef struct {
+    char challenge_hex[CBM_SHA256_HEX_LEN + 1U];
+    char proof_hex[CBM_SHA256_HEX_LEN + 1U];
+} main_daemon_ctl_ui_readiness_t;
+
+static void main_daemon_ctl_hex_encode(const uint8_t bytes[CBM_SHA256_DIGEST_LEN],
+                                       char out[CBM_SHA256_HEX_LEN + 1U]) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2U] = hex[bytes[i] >> 4];
+        out[i * 2U + 1U] = hex[bytes[i] & 0x0fU];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static bool main_daemon_ctl_ui_readiness_prepare(cbm_daemon_runtime_client_t *client,
+                                                 main_daemon_ctl_ui_readiness_t *readiness) {
+    uint8_t challenge[CBM_SHA256_DIGEST_LEN] = {0};
+    uint8_t proof[CBM_SHA256_DIGEST_LEN] = {0};
+    if (!client || !readiness) {
+        return false;
+    }
+    cbm_secure_zero(readiness, sizeof(*readiness));
+    bool prepared = cbm_secure_random(challenge, sizeof(challenge)) &&
+                    cbm_daemon_application_client_ui_readiness_proof(client, challenge, proof,
+                                                                     MAIN_CONNECT_TIMEOUT_MS) ==
+                        CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    if (prepared) {
+        main_daemon_ctl_hex_encode(challenge, readiness->challenge_hex);
+        main_daemon_ctl_hex_encode(proof, readiness->proof_hex);
+    }
+    cbm_secure_zero(challenge, sizeof(challenge));
+    cbm_secure_zero(proof, sizeof(proof));
+    return prepared;
+}
+
+static bool main_daemon_ctl_constant_time_equal(const char *left, const char *right,
+                                                size_t length) {
+    unsigned char difference = 0;
+    for (size_t index = 0; index < length; index++) {
+        difference |= (unsigned char)left[index] ^ (unsigned char)right[index];
+    }
+    return difference == 0;
+}
+
+/* Bind HTTP readiness to the exact daemon generation already authenticated by
+ * local IPC. The public challenge is safe to expose; a foreign listener cannot
+ * compute the expected HMAC because the generation secret never leaves the
+ * daemon's application and HTTP server instances. */
+static bool main_daemon_ctl_ui_endpoint_ready(int port,
+                                              const main_daemon_ctl_ui_readiness_t *readiness,
+                                              uint32_t timeout_ms) {
+    if (port <= 0 || port >= MAIN_MAX_PORT || !readiness || timeout_ms == 0) {
+        return false;
+    }
+#ifdef _WIN32
+    if (!main_daemon_ctl_socket_runtime_ready()) {
+        return false;
+    }
+#endif
+    main_daemon_ctl_socket_t socket_handle = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_handle == MAIN_DAEMON_CTL_BAD_SOCKET ||
+        !main_daemon_ctl_socket_set_nonblocking(socket_handle)) {
+        if (socket_handle != MAIN_DAEMON_CTL_BAD_SOCKET) {
+            (void)main_daemon_ctl_socket_close(socket_handle);
+        }
+        return false;
+    }
+#if !defined(_WIN32) && defined(SO_NOSIGPIPE)
+    int no_sigpipe = 1;
+    (void)setsockopt(socket_handle, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
+
+    uint64_t deadline_ms = main_deadline_after(timeout_ms);
+    bool ready = main_daemon_ctl_socket_connected(socket_handle, port, deadline_ms);
+    char request[384];
+    int request_length = snprintf(request, sizeof(request),
+                                  "GET /__cbm/ui-readiness?challenge=%s HTTP/1.1\r\n"
+                                  "Host: 127.0.0.1:%d\r\nAccept: text/plain\r\n"
+                                  "Connection: close\r\n\r\n",
+                                  readiness->challenge_hex, port);
+    if (request_length <= 0 || request_length >= (int)sizeof(request)) {
+        ready = false;
+    }
+    size_t sent = 0;
+    while (ready && sent < (size_t)request_length) {
+        int remaining = main_daemon_ctl_socket_remaining_ms(deadline_ms);
+        if (remaining <= 0 || main_daemon_ctl_socket_wait(socket_handle, true, remaining) != 1) {
+            ready = false;
+            break;
+        }
+        int count = main_daemon_ctl_socket_send(socket_handle, request + sent,
+                                                (size_t)request_length - sent);
+        if (count > 0) {
+            sent += (size_t)count;
+        } else if (count == 0 || !main_daemon_ctl_socket_would_block()) {
+            ready = false;
+        }
+    }
+
+    char response[MAIN_DAEMON_CTL_UI_RESPONSE_CAP] = {0};
+    size_t received = 0;
+    while (ready && received + 1U < sizeof(response)) {
+        int remaining = main_daemon_ctl_socket_remaining_ms(deadline_ms);
+        if (remaining <= 0 || main_daemon_ctl_socket_wait(socket_handle, false, remaining) != 1) {
+            ready = false;
+            break;
+        }
+        int count = main_daemon_ctl_socket_receive(socket_handle, response + received,
+                                                   sizeof(response) - received - 1U);
+        if (count > 0) {
+            received += (size_t)count;
+            response[received] = '\0';
+        } else if (count == 0 || !main_daemon_ctl_socket_would_block()) {
+            break;
+        }
+    }
+    if (received + 1U >= sizeof(response)) {
+        response[sizeof(response) - 1U] = '\0';
+    }
+    char *body = strstr(response, "\r\n\r\n");
+    body = body ? body + 4 : NULL;
+    ready = ready && received > 0U && strncmp(response, "HTTP/1.1 200 ", 13) == 0 &&
+            strstr(response, "\r\nContent-Type: text/plain; charset=utf-8\r\n") != NULL &&
+            strstr(response, "\r\nCache-Control: no-store\r\n") != NULL && body &&
+            strlen(body) == CBM_SHA256_HEX_LEN &&
+            main_daemon_ctl_constant_time_equal(body, readiness->proof_hex, CBM_SHA256_HEX_LEN);
+    (void)main_daemon_ctl_socket_close(socket_handle);
+    return ready;
+}
+
+static uint32_t main_daemon_ctl_ui_ready_timeout_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char timeout_text[32];
+    const char *configured = cbm_safe_getenv("CBM_TEST_DAEMON_UI_READY_TIMEOUT_MS", timeout_text,
+                                             sizeof(timeout_text), NULL);
+    if (configured) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(configured, &end, 10);
+        if (errno == 0 && end && *end == '\0' && parsed >= 50UL &&
+            parsed <= MAIN_DAEMON_CTL_UI_READY_TIMEOUT_MS) {
+            return (uint32_t)parsed;
+        }
+    }
+#endif
+    return MAIN_DAEMON_CTL_UI_READY_TIMEOUT_MS;
+}
+
+static bool main_daemon_ctl_wait_for_ui(int port, const main_daemon_ctl_ui_readiness_t *readiness,
+                                        uint32_t timeout_ms) {
+    uint64_t deadline_ms = main_deadline_after(timeout_ms);
+    for (;;) {
+        uint64_t now_ms = cbm_now_ms();
+        if (now_ms >= deadline_ms) {
+            return false;
+        }
+        uint64_t remaining = deadline_ms - now_ms;
+        uint32_t attempt_ms = remaining > MAIN_DAEMON_CTL_UI_PROBE_TIMEOUT_MS
+                                  ? MAIN_DAEMON_CTL_UI_PROBE_TIMEOUT_MS
+                                  : (uint32_t)remaining;
+        if (main_daemon_ctl_ui_endpoint_ready(port, readiness, attempt_ms)) {
+            return true;
+        }
+        if (cbm_now_ms() >= deadline_ms) {
+            return false;
+        }
+        cbm_usleep(MAIN_DAEMON_CTL_UI_PROBE_INTERVAL_US);
+    }
+}
+
+static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_io, int port,
+                                          bool open_browser);
+
+static void main_daemon_ctl_print_ui_configuration(void) {
+    if (!(CBM_EMBEDDED_FILE_COUNT > 0)) {
         return;
     }
     cbm_ui_config_t ui_config;
     cbm_ui_config_load(&ui_config);
     if (ui_config.ui_enabled) {
-        printf("  ui: http://127.0.0.1:%d\n", ui_config.ui_port);
+        printf("  ui: configured at http://127.0.0.1:%d (readiness not checked; "
+               "`daemon start --open` verifies it)\n",
+               ui_config.ui_port);
     } else {
         printf("  ui: disabled (enable with `daemon start` in a UI build)\n");
     }
@@ -1702,6 +2050,20 @@ static void main_daemon_ctl_print_ui(void) {
 static void main_daemon_ctl_open_browser(int port) {
     char url[64];
     (void)snprintf(url, sizeof(url), "http://127.0.0.1:%d", port);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char marker_path[MAIN_PATH_CAP];
+    if (cbm_safe_getenv("CBM_TEST_DAEMON_OPEN_MARKER", marker_path, sizeof(marker_path), NULL)) {
+        FILE *marker = cbm_fopen(marker_path, "wb");
+        bool opened = marker && fwrite(url, 1, strlen(url), marker) == strlen(url);
+        if (marker && fclose(marker) != 0) {
+            opened = false;
+        }
+        if (!opened) {
+            (void)fprintf(stderr, "hint: could not record the test browser request\n");
+        }
+        return;
+    }
+#endif
 #if defined(_WIN32)
     /* ShellExecuteW resolves the http protocol association directly — no
      * command shell interprets the argument. Values > 32 signal success. */
@@ -1719,6 +2081,49 @@ static void main_daemon_ctl_open_browser(int port) {
     if (!opened) {
         (void)fprintf(stderr, "hint: could not open a browser automatically; visit %s\n", url);
     }
+}
+
+static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_io, int port,
+                                          bool open_browser) {
+    if (!open_browser) {
+        printf("  ui: warming asynchronously on configured port %d\n", port);
+        return EXIT_SUCCESS;
+    }
+    main_daemon_ctl_ui_readiness_t readiness = {0};
+    cbm_daemon_runtime_client_t *client = client_io ? *client_io : NULL;
+    if (!main_daemon_ctl_ui_readiness_prepare(client, &readiness)) {
+        (void)fprintf(stderr,
+                      "error: the active daemon generation could not provide an authenticated "
+                      "UI readiness proof; browser was not opened\n");
+        return EXIT_FAILURE;
+    }
+    /* The generation-bound proof is self-contained.  Do not retain the
+     * application client while polling HTTP: the daemon deliberately serves
+     * one application connection at a time, so an idle retained client would
+     * make `daemon status` and other control probes wait for the whole UI
+     * deadline.  EOF/disconnect cannot weaken the HMAC proof we already hold. */
+    if (client_io && *client_io) {
+        cbm_daemon_runtime_client_t *owned_client = *client_io;
+        *client_io = NULL;
+        (void)cbm_daemon_runtime_client_close(owned_client, MAIN_CLOSE_TIMEOUT_MS);
+    }
+    uint32_t timeout_ms = main_daemon_ctl_ui_ready_timeout_ms();
+    bool ready = main_daemon_ctl_wait_for_ui(port, &readiness, timeout_ms);
+    cbm_secure_zero(&readiness, sizeof(readiness));
+    if (!ready) {
+        (void)fprintf(stderr,
+                      "error: UI endpoint did not become ready within %u ms; browser was not "
+                      "opened\n",
+                      timeout_ms);
+        (void)fprintf(stderr,
+                      "hint: check the daemon log, and if port %d is in use "
+                      "retry with --port=N\n",
+                      port);
+        return EXIT_FAILURE;
+    }
+    printf("  ui: http://127.0.0.1:%d\n", port);
+    main_daemon_ctl_open_browser(port);
+    return EXIT_SUCCESS;
 }
 
 static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpoint_t *endpoint,
@@ -1774,7 +2179,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         }
         main_daemon_ctl_print_clients(status.client_pids, status.client_count,
                                       status.committed_clients);
-        main_daemon_ctl_print_ui();
+        main_daemon_ctl_print_ui_configuration();
         return EXIT_SUCCESS;
     }
 
@@ -1818,8 +2223,43 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
                    "last session; run `daemon stop` first if you want a permanent one\n",
                    (unsigned long)status.daemon_pid);
         }
-        main_daemon_ctl_print_ui();
-        return EXIT_SUCCESS;
+        if (!(CBM_EMBEDDED_FILE_COUNT > 0)) {
+            if (requested_port > 0 || open_browser) {
+                (void)fprintf(stderr, "warning: this binary was built without UI support; "
+                                      "--port/--open have no effect\n");
+            }
+            return EXIT_SUCCESS;
+        }
+        cbm_ui_config_t ui_config;
+        cbm_ui_config_load(&ui_config);
+        if (!ui_config.ui_enabled) {
+            (void)fprintf(stderr, "error: UI is disabled for the active daemon; browser was not "
+                                  "opened\n");
+            return open_browser ? EXIT_FAILURE : EXIT_SUCCESS;
+        }
+        if (requested_port > 0 && requested_port != ui_config.ui_port) {
+            (void)fprintf(stderr,
+                          "warning: the active daemon remains configured on port %d; stop it "
+                          "before starting on --port=%d\n",
+                          ui_config.ui_port, requested_port);
+        }
+        cbm_daemon_runtime_client_t *ui_client = NULL;
+        cbm_daemon_runtime_connect_result_t connect_result;
+        if (open_browser) {
+            ui_client = cbm_daemon_runtime_client_connect(endpoint, identity,
+                                                          MAIN_CONNECT_TIMEOUT_MS, &connect_result);
+            if (!ui_client) {
+                (void)fprintf(stderr,
+                              "error: the active daemon generation could not be authenticated; "
+                              "browser was not opened\n");
+                return EXIT_FAILURE;
+            }
+        }
+        int ui_result = main_daemon_ctl_finish_ui_open(&ui_client, ui_config.ui_port, open_browser);
+        if (ui_client) {
+            (void)cbm_daemon_runtime_client_close(ui_client, MAIN_CLOSE_TIMEOUT_MS);
+        }
+        return ui_result;
     }
 
     cbm_daemon_bootstrap_config_t start_config = {
@@ -1848,19 +2288,25 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     /* The committed control connection satisfied the daemon's no-client
      * startup window; configure the UI before departing. */
     int ui_port = 0;
-    if (CBM_EMBEDDED_FILE_COUNT > 0) {
+    if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
         ui_port = requested_port > 0 ? requested_port : ui_config.ui_port;
         uint8_t update_mask = 0x03U; /* enabled + port */
-        if (cbm_daemon_application_client_set_ui_config(start_result.client, update_mask, true,
-                                                        ui_port, MAIN_CONNECT_TIMEOUT_MS) !=
-            CBM_DAEMON_RUNTIME_APPLICATION_OK) {
-            (void)fprintf(stderr, "warning: the daemon did not accept the UI configuration; "
-                                  "check `daemon status` and the daemon log\n");
+        bool context_set =
+            main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,
+                                    MAIN_CONNECT_TIMEOUT_MS);
+        if (!context_set || cbm_daemon_application_client_set_ui_config(
+                                start_result.client, update_mask, true, ui_port,
+                                MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+            (void)fprintf(stderr,
+                          "error: the daemon did not accept the UI configuration; browser was "
+                          "not opened\n");
+            (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
+            return EXIT_FAILURE;
         }
     } else if (requested_port > 0 || open_browser) {
-        (void)fprintf(stderr, "warning: this binary was built without the embedded UI; "
+        (void)fprintf(stderr, "warning: this binary was built without UI support; "
                               "--port/--open have no effect\n");
     }
 
@@ -1874,16 +2320,14 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
-    if (CBM_EMBEDDED_FILE_COUNT > 0) {
-        printf("  ui: http://127.0.0.1:%d\n", ui_port);
-        printf("  If this port is unavailable the daemon keeps retrying and logs the "
-               "conflict; pass --port=N for a different port.\n");
-        if (open_browser) {
-            main_daemon_ctl_open_browser(ui_port);
-        }
+    int ui_result =
+        (CBM_EMBEDDED_FILE_COUNT > 0)
+            ? main_daemon_ctl_finish_ui_open(&start_result.client, ui_port, open_browser)
+            : EXIT_SUCCESS;
+    if (start_result.client) {
+        (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
     }
-    (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
-    return EXIT_SUCCESS;
+    return ui_result;
 }
 
 int main(int argc, char **argv) {
@@ -2240,7 +2684,7 @@ int main(int argc, char **argv) {
         return result;
     }
 
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     if (!endpoint) {
         (void)fprintf(stderr, "codebase-memory-mcp: secure daemon endpoint could not be created\n");
         return EXIT_FAILURE;
@@ -2392,9 +2836,9 @@ int main(int argc, char **argv) {
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_FAILURE;
         }
-        if (explicitly_enabled && CBM_EMBEDDED_FILE_COUNT == 0) {
+        if (explicitly_enabled && !(CBM_EMBEDDED_FILE_COUNT > 0)) {
             (void)fprintf(stderr, "codebase-memory-mcp: --ui requested, but this binary was built "
-                                  "without the embedded UI; rebuild with `make -f Makefile.cbm "
+                                  "without UI support; rebuild with `make -f Makefile.cbm "
                                   "cbm-with-ui`.\n");
         }
     }

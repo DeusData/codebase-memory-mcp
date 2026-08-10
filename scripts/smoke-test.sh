@@ -3068,6 +3068,9 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   fi
   UPDATE_HOME=$(smoke_mktemp_dir)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
+  # This phase stages the binary by hand into a fresh HOME — it does NOT go
+  # through install.sh or `install`. The binary is self-contained, so a staged
+  # copy is immediately able to render and remove its own integrations.
   if [[ "$BINARY" == *.exe ]]; then
     cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
     mkdir -p "$UPDATE_HOME/retired-install"
@@ -3270,11 +3273,9 @@ if [ "$DL_OS" = "darwin" ] || [ "$DL_OS" = "linux" ]; then
 else
   DL_EXT="zip"
 fi
-# Try standard name first, fall back to UI variant
 DL_ARCHIVE="codebase-memory-mcp-${DL_OS}-${DL_ARCH}.${DL_EXT}"
-DL_ARCHIVE_UI="codebase-memory-mcp-ui-${DL_OS}-${DL_ARCH}.${DL_EXT}"
 
-# 12a: curl download (try standard, then UI variant)
+# 12a: curl download
 echo "--- Phase 12a: curl download ---"
 # --noproxy '*': never route the local test server through a proxy — a proxy env
 # var present on some runners (notably windows-11-arm) made curl fail to reach
@@ -3282,15 +3283,10 @@ echo "--- Phase 12a: curl download ---"
 # surface curl's stderr instead of swallowing it so the reason is visible.
 CURL12_ERR="$DL_DIR/curl12a.err"
 if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>"$CURL12_ERR"; then
-  # Try UI variant
-  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>"$CURL12_ERR"; then
-    DL_ARCHIVE="$DL_ARCHIVE_UI"
-  else
-    echo "FAIL 12a: curl download failed (tried standard and ui variants)"
-    echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
-    cat "$CURL12_ERR" 2>/dev/null || true
-    exit 1
-  fi
+  echo "FAIL 12a: curl download failed"
+  echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
+  cat "$CURL12_ERR" 2>/dev/null || true
+  exit 1
 fi
 if [ ! -s "$DL_DIR/$DL_ARCHIVE" ]; then
   echo "FAIL 12a: downloaded archive is empty"
@@ -3510,10 +3506,12 @@ fi
 # ── Phase 15: UI HTTP server reachability ──
 # Only runs if the binary was built with embedded UI assets.
 #
-# SMOKE_REQUIRE_UI=1 (set by the wrappers for a -ui variant) makes the
-# no-assets outcome a FAILURE instead of a SKIP: a ui run that smoked a
-# standard binary under a ui name would otherwise pass green, and a skip that
-# cannot fail is not a gate.
+# SMOKE_REQUIRE_UI=1 makes the no-assets outcome a FAILURE instead of a SKIP.
+# scripts/ci/smoke-artifact.sh sets it because that lane builds --with-ui and
+# packages the real archive, so a binary serving no frontend is a defect there.
+# The fast PR lane builds without the frontend on purpose and leaves it unset --
+# a skip that cannot fail is not a gate, but neither is asserting a property the
+# lane deliberately does not produce.
 SMOKE_REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
 smoke_ui_missing() {
   if [ "$SMOKE_REQUIRE_UI" = "1" ]; then

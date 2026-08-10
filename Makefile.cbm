@@ -52,7 +52,7 @@ CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 $(GCC_ONLY_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
-                -I$(CBM_DIR) -I$(TS_INCLUDE)
+                -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(BUILD_DIR)/generated
 
 CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
@@ -148,7 +148,7 @@ ifeq ($(IS_MINGW),yes)
 # two Windows builds of identical source are never byte-identical and every
 # release is a brand-new file to a reputation system. Same motivation as the
 # mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
-WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -lbcrypt -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -162,9 +162,19 @@ endif
 # link), this flag fixes the OUTCOME, and the composition gate proves it on the
 # shipped artifact. ELF-only: Apple's ld rejects -z noexecstack outright and it
 # is meaningless for PE, so it is gated rather than made "common".
+#
+# -z separate-code additionally keeps read-only DATA out of the executable
+# segment. GNU ld enables it by default on x86-64 but NOT on aarch64, so the
+# arm64 binaries emitted ONE R E PT_LOAD spanning the whole image: .rodata is
+# correctly marked A (not AX), but the kernel applies SEGMENT permissions, so
+# ~259 MB of tree-sitter parse tables was mapped executable at runtime while the
+# amd64 build of the same source mapped them R only. That is a large ROP gadget
+# surface for data that is never executed, and it is invisible to section flags.
 ELF_HARDENING_FLAGS :=
 ifeq ($(IS_LINUX),yes)
-ELF_HARDENING_FLAGS := -Wl,-z,noexecstack
+ifneq ($(IS_MINGW),yes)
+ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code
+endif
 endif
 
 # The POSIX wrap shim exists only so the profiler can observe allocations. It
@@ -205,6 +215,7 @@ FOUNDATION_SRCS = \
     src/foundation/limits.c \
     src/foundation/subprocess.c \
     src/foundation/sha256.c \
+    src/foundation/secure_random.c \
     src/foundation/macos_acl.c \
     src/foundation/private_file_lock.c \
     src/foundation/lock_registry.c
@@ -254,7 +265,7 @@ TS_RUNTIME_DEPS = \
 	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/portable/*.h) \
 	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/unicode/*.h)
 
-# All 64 grammar shim files
+# All 159 grammar shim files
 GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
 
 # LZ4 + Aho-Corasick
@@ -1098,7 +1109,7 @@ lint-cppcheck:
 		--suppress=ctunullpointerOutOfMemory \
 		--suppress='nullPointer:internal/cbm/sqlite_writer.c' \
 		-Isrc -Ivendored -Ivendored/sqlite3 \
-		-I$(CBM_DIR) -I$(TS_INCLUDE) \
+		-I$(CBM_DIR) -I$(TS_INCLUDE) -I$(BUILD_DIR)/generated \
 		$(LINT_SRCS)
 
 # clang-format: formatting check (config in .clang-format, dry-run = no changes)

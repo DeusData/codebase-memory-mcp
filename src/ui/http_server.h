@@ -11,6 +11,7 @@
 #define CBM_UI_HTTP_SERVER_H
 
 #include "ui/httpd.h"
+#include "foundation/sha256.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -74,6 +75,12 @@ void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *srv,
                                                 cbm_http_project_mutation_begin_fn begin,
                                                 cbm_http_project_mutation_end_fn end,
                                                 void *context);
+
+/* Copy the daemon generation's private readiness secret into the server
+ * before its run loop starts. GET /__cbm/ui-readiness returns only a
+ * challenge-bound HMAC proof; the secret itself is never served. */
+void cbm_http_server_set_readiness_secret(cbm_http_server_t *srv,
+                                          const uint8_t secret[CBM_SHA256_DIGEST_LEN]);
 
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);

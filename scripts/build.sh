@@ -3,7 +3,7 @@
 #
 # Usage:
 #   scripts/build.sh                              # Standard binary
-#   scripts/build.sh --with-ui                    # Binary with embedded UI
+#   scripts/build.sh --with-ui                    # Binary with the UI embedded
 #   scripts/build.sh --help                       # Full usage
 #   scripts/build.sh --version v0.8.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
@@ -29,7 +29,7 @@ from current sources; a cache hit is byte-identical to a cold compile by
 construction (CCACHE_COMPILERCHECK=content).
 
 Options:
-  --with-ui       Embed the web UI (builds the frontend first; needs node).
+  --with-ui       Build the web UI as a content-addressed sidecar (needs node).
   --version V     Stamp the version string (release venue passes the tag).
   --arch ARCH     Force target arch (arm64 | x86_64), e.g. under Rosetta.
   -h, --help      This text.

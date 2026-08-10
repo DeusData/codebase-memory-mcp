@@ -125,7 +125,7 @@ cbm_path_info_result_t cbm_path_info_utf8(const char *path, cbm_path_info_t *out
     if (!path || !out) {
         return CBM_PATH_INFO_ERROR;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_PATH_INFO_ERROR;
     }
@@ -515,15 +515,28 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    size_t start = wlen > 0U && (tmp[0] == L'/' || tmp[0] == L'\\') ? 1U : 0U;
-    if (wlen >= 3U && tmp[1] == L':' && (tmp[2] == L'/' || tmp[2] == L'\\')) {
+    size_t start = wlen > 0U && cbm_win_path_separator(tmp[0]) ? 1U : 0U;
+    if (wlen >= 8U && _wcsnicmp(tmp, L"\\\\?\\UNC\\", 8U) == 0) {
+        /* Extended UNC roots are \\?\UNC\server\share\. Neither the server
+         * nor share component is creatable; begin with the first descendant. */
+        size_t separators = 0U;
+        start = 8U;
+        while (start < wlen && separators < 2U) {
+            if (cbm_win_path_separator(tmp[start])) {
+                separators++;
+            }
+            start++;
+        }
+    } else if (wlen >= 7U && wcsncmp(tmp, L"\\\\?\\", 4U) == 0 && tmp[5] == L':' &&
+               cbm_win_path_separator(tmp[6])) {
+        start = 7U;
+    } else if (wlen >= 3U && tmp[1] == L':' && cbm_win_path_separator(tmp[2])) {
         start = 3U;
-    } else if (wlen >= 2U && (tmp[0] == L'/' || tmp[0] == L'\\') &&
-               (tmp[1] == L'/' || tmp[1] == L'\\')) {
+    } else if (wlen >= 2U && cbm_win_path_separator(tmp[0]) && cbm_win_path_separator(tmp[1])) {
         size_t separators = 0U;
         start = 2U;
         while (start < wlen && separators < 2U) {
-            if (tmp[start] == L'/' || tmp[start] == L'\\') {
+            if (cbm_win_path_separator(tmp[start])) {
                 separators++;
             }
             start++;
@@ -531,8 +544,8 @@ bool cbm_mkdir_p(const char *path, int mode) {
     }
     bool ok = true;
     for (wchar_t *p = tmp + start; ok && *p; p++) {
-        if (*p == L'/' || *p == L'\\') {
-            if (p == tmp || p[-1] == L'/' || p[-1] == L'\\') {
+        if (cbm_win_path_separator(*p)) {
+            if (p == tmp || cbm_win_path_separator(p[-1])) {
                 continue;
             }
             wchar_t separator = *p;
@@ -1048,8 +1061,8 @@ int cbm_rename_noreplace(const char *src, const char *dst) {
         return CBM_NOT_FOUND;
     }
 #ifdef _WIN32
-    wchar_t *wsrc = cbm_utf8_to_wide(src);
-    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    wchar_t *wsrc = cbm_path_to_wide(src);
+    wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
         ret = MoveFileExW(wsrc, wdst, MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)

@@ -255,14 +255,15 @@ TEST(pylsp_bench_resolution_ratio) {
         ASSERT_GTE(resolved * 2, calls);
     }
 
-    /* Time budget. ASan+UBSan instrumentation slows the parse ~5-10×, so
-     * scale the budget when a sanitizer is active. Native: 150 ms for a
-     * ~200-line fixture; sanitized: 1500 ms. */
-#if defined(CBM_SANITIZED_BUILD) || defined(__SANITIZE_ADDRESS__)
-    ASSERT(ms < 1500.0);
-#else
-    ASSERT(ms < 150.0);
-#endif
+    /* Liveness backstop ONLY — not a perf gate. The perf content of this test
+     * is the resolution-ratio assertion above; wall-clock on a shared CI
+     * runner is not a property of the code (the 1500 ms sanitized budget was
+     * exceeded twice on loaded ubuntu-24.04-arm runners by the SAME sha that
+     * passed hours earlier). Absolute timings belong to
+     * scripts/benchmark-*.sh, which record rather than gate. This bound
+     * exists solely so a catastrophic hang fails the suite instead of the
+     * 900 s shard wall clock. */
+    ASSERT(ms < 30000.0);
     PASS();
 }
 

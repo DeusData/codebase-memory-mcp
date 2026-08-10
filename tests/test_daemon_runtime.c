@@ -246,7 +246,7 @@ static bool runtime_test_windows_copy_self(const char *destination) {
     wchar_t source[32768];
     DWORD source_length =
         GetModuleFileNameW(NULL, source, (DWORD)(sizeof(source) / sizeof(source[0])));
-    wchar_t *destination_wide = cbm_utf8_to_wide(destination);
+    wchar_t *destination_wide = cbm_path_to_wide(destination);
     bool copied = source_length > 0 &&
                   source_length < (DWORD)(sizeof(source) / sizeof(source[0])) && destination_wide &&
                   CopyFileW(source, destination_wide, TRUE) != 0;
@@ -314,7 +314,7 @@ static bool runtime_test_windows_spawn_image_holder(const char *image_path, cons
     char command_line[RUNTIME_TEST_PATH_CAP * 2];
     int written = snprintf(command_line, sizeof(command_line),
                            "\"%s\" __cbm_runtime_image_holder \"%s\"", image_path, ready_event);
-    wchar_t *application = cbm_utf8_to_wide(image_path);
+    wchar_t *application = cbm_path_to_wide(image_path);
     wchar_t *command =
         written > 0 && written < (int)sizeof(command_line) ? cbm_utf8_to_wide(command_line) : NULL;
     STARTUPINFOW startup;
@@ -4151,6 +4151,108 @@ TEST(daemon_runtime_kernel_process_fingerprint_is_stable_and_fail_closed) {
     PASS();
 }
 
+#ifdef _WIN32
+TEST(daemon_runtime_process_fingerprint_supports_extended_length_image) {
+    static const char segment[] = "/segment-abcdefghijklmnopqrstuvwxyz-0123456789";
+    char root[RUNTIME_TEST_PATH_CAP] = {0};
+    char directory[RUNTIME_TEST_PATH_CAP] = {0};
+    char image_path[RUNTIME_TEST_PATH_CAP] = {0};
+    char event_name[128] = {0};
+    int root_written =
+        snprintf(root, sizeof(root), "%s/cbm-runtime-long-image-XXXXXX", cbm_tmpdir());
+    bool root_created =
+        root_written > 0 && root_written < (int)sizeof(root) && cbm_mkdtemp(root) != NULL;
+    bool path_built = root_created && snprintf(directory, sizeof(directory), "%s", root) > 0;
+    for (size_t index = 0; path_built && index < 7U; index++) {
+        size_t used = strlen(directory);
+        int appended = snprintf(directory + used, sizeof(directory) - used, "%s", segment);
+        path_built = appended > 0 && (size_t)appended < sizeof(directory) - used;
+    }
+    bool directory_created = path_built && cbm_mkdir_p(directory, 0700);
+    int image_written = directory_created ? snprintf(image_path, sizeof(image_path),
+                                                     "%s/test-runner-long-image.exe", directory)
+                                          : -1;
+    wchar_t *ordinary_wide = image_written > 0 && image_written < (int)sizeof(image_path)
+                                 ? cbm_utf8_to_wide(image_path)
+                                 : NULL;
+    bool exceeds_legacy_limit = ordinary_wide && wcslen(ordinary_wide) >= MAX_PATH;
+    free(ordinary_wide);
+    bool copied = exceeds_legacy_limit && runtime_test_windows_copy_self(image_path);
+    const char *expected = runtime_test_self_build();
+
+    int event_written =
+        snprintf(event_name, sizeof(event_name), "Local\\cbm-runtime-long-image-%lu-%llu",
+                 (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
+    HANDLE ready_event = copied && expected && expected[0] && event_written > 0 &&
+                                 event_written < (int)sizeof(event_name)
+                             ? CreateEventA(NULL, TRUE, FALSE, event_name)
+                             : NULL;
+    bool event_private = ready_event && GetLastError() != ERROR_ALREADY_EXISTS;
+    PROCESS_INFORMATION process;
+    memset(&process, 0, sizeof(process));
+    bool spawned =
+        event_private && runtime_test_windows_spawn_image_holder(image_path, event_name, &process);
+    bool ready = spawned && WaitForSingleObject(ready_event, 5000U) == WAIT_OBJECT_0;
+
+    wchar_t process_path[32768];
+    DWORD process_path_length = (DWORD)(sizeof(process_path) / sizeof(process_path[0]));
+    bool queried_long_image =
+        ready &&
+        QueryFullProcessImageNameW(process.hProcess, 0U, process_path, &process_path_length) != 0 &&
+        process_path_length >= MAX_PATH;
+    char observed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool fingerprinted = queried_long_image && cbm_daemon_runtime_process_build_fingerprint(
+                                                   (uint64_t)process.dwProcessId, observed);
+    bool exact = fingerprinted && strcmp(observed, expected) == 0;
+
+    bool stopped = !spawned;
+    if (spawned) {
+        bool termination_requested = TerminateProcess(process.hProcess, 30U) != 0;
+        stopped =
+            termination_requested && WaitForSingleObject(process.hProcess, 5000U) == WAIT_OBJECT_0;
+        (void)CloseHandle(process.hProcess);
+    }
+    if (ready_event) {
+        (void)CloseHandle(ready_event);
+    }
+    bool image_removed = !copied || cbm_unlink(image_path) == 0;
+    bool tree_removed = true;
+    if (root_created) {
+        char cleanup[RUNTIME_TEST_PATH_CAP];
+        (void)snprintf(cleanup, sizeof(cleanup), "%s", directory_created ? directory : root);
+        for (;;) {
+            tree_removed = cbm_rmdir(cleanup) == 0 && tree_removed;
+            if (strcmp(cleanup, root) == 0) {
+                break;
+            }
+            char *separator = strrchr(cleanup, '/');
+            if (!separator || separator < cleanup + strlen(root)) {
+                tree_removed = false;
+                break;
+            }
+            *separator = '\0';
+        }
+    }
+
+    ASSERT_TRUE(root_created);
+    ASSERT_TRUE(path_built);
+    ASSERT_TRUE(directory_created);
+    ASSERT_TRUE(exceeds_legacy_limit);
+    ASSERT_TRUE(copied);
+    ASSERT_TRUE(runtime_test_is_fingerprint(expected));
+    ASSERT_TRUE(event_private);
+    ASSERT_TRUE(spawned);
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(queried_long_image);
+    ASSERT_TRUE(fingerprinted);
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(image_removed);
+    ASSERT_TRUE(tree_removed);
+    PASS();
+}
+#endif
+
 #ifdef __APPLE__
 /* RED: the former macOS fast path accepted the daemon vnode in any RX mapping,
  * even when a differently fingerprinted main executable owned the connection.
@@ -4604,6 +4706,9 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_host_forced_shutdown_is_logged_flushed_and_process_bounded);
 #endif
     RUN_TEST(daemon_runtime_kernel_process_fingerprint_is_stable_and_fail_closed);
+#ifdef _WIN32
+    RUN_TEST(daemon_runtime_process_fingerprint_supports_extended_length_image);
+#endif
 #ifdef __APPLE__
     RUN_TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active);
 #endif

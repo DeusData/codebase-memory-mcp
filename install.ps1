@@ -87,12 +87,8 @@ function Invoke-CbmDownload {
     }
 }
 
-# Detect variant from args (--ui or --standard)
-$Variant = "standard"
 $SkipConfig = $false
 foreach ($arg in $args) {
-    if ($arg -eq "--ui") { $Variant = "ui" }
-    if ($arg -eq "--standard") { $Variant = "standard" }
     if ($arg -eq "--skip-config") { $SkipConfig = $true }
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
@@ -120,17 +116,12 @@ if ($env:CBM_ARCH) {
 }
 
 Write-Host "codebase-memory-mcp installer (Windows)"
-Write-Host "  variant: $Variant"
 Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
 
 # Build download URL
-if ($Variant -eq "ui") {
-    $Archive = "codebase-memory-mcp-ui-windows-$Arch.zip"
-} else {
-    $Archive = "codebase-memory-mcp-windows-$Arch.zip"
-}
+$Archive = "codebase-memory-mcp-windows-$Arch.zip"
 $Url = "$BaseUrl/$Archive"
 
 # Download

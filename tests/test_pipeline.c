@@ -9892,8 +9892,9 @@ TEST(pipeline_fastapi_depends_edges) {
     PASS();
 }
 
-/* DLL resolve test removed — feature removed due to Windows Defender
- * false positive (Wacatac.B!ml). See issue #89. */
+/* DLL resolve test removed after the associated builds received a Windows
+ * Defender Wacatac.B!ml verdict. The opaque verdict did not attribute the
+ * result to this feature; see issue #89 for the historical observation. */
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Incremental reindex

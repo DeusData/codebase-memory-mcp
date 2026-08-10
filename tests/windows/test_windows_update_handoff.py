@@ -1,14 +1,15 @@
 """GREEN native-Windows guard for the `update` -> install.ps1 handoff.
 
-Windows ships ONE binary, exactly like Linux and macOS: ``codebase-memory-mcp.exe``.
+Windows ships one executable in its runtime set, exactly like Linux and macOS:
+``codebase-memory-mcp.exe``.
 
 There used to be a second, permanently resident launcher stub whose only job
 was to swap the product binary out from under itself, because a running .exe
-cannot replace its own image on Windows.  Defender's ML scored that stub
-Trojan:Win32/Wacatac.B!ml on x64 no matter what the build changed (bcrypt-free,
-stripped, versioned and resource-free variants were all flagged), while the
-product binary itself scans clean everywhere.  So the swap moved OUT of the
-process into install.ps1, which runs while CBM is NOT running.
+cannot replace its own image on Windows. Historical variants of that stub
+received Microsoft Wacatac verdicts. Those observations did not expose a
+stable feature or prove causation, but the stub remained unnecessary loader-
+like behavior and a second artifact to audit. The swap therefore moved OUT of
+the process into install.ps1, which runs while CBM is NOT running.
 
 This guard asserts the replacement contract on real native Windows:
 
@@ -20,8 +21,8 @@ This guard asserts the replacement contract on real native Windows:
   hole.
 * ``update`` does not disturb an already-open MCP/daemon session.
 
-A regression here means the in-process self-update — and therefore the
-AV-flagged launcher stub — came back.
+A regression here means the in-process self-update and removed launcher stub
+came back.
 
 Exit code: 0 == contract honored, 1 == regression, 2 == precondition failure.
 

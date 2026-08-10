@@ -102,10 +102,15 @@ USER_="${CBM_VM_USER:-test}"
 # Unset (the default) keeps the historical single-tree behaviour.
 VM_BASE_REPO="/c/cbm"
 if [ -n "${CBM_CI_RUN_ID:-}" ]; then
+    if [[ ! "$CBM_CI_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        echo "FATAL: CBM_CI_RUN_ID must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}." >&2
+        exit 2
+    fi
     VM_REPO="/c/cbm-run-${CBM_CI_RUN_ID}"
 else
     VM_REPO="$VM_BASE_REPO"
 fi
+VM_REPO_WIN="C:\\${VM_REPO#/c/}"
 HOST_KEY="${CBM_VM_HOST_KEY_SHA256:?set CBM_VM_HOST_KEY_SHA256 in ~/.claude/cbm-vm/config}"
 LOCAL_BRANCH="$(git -C "$ROOT" branch --show-current)"
 BRANCH="${CBM_VM_BRANCH:-${LOCAL_BRANCH:-main}}"
@@ -185,12 +190,12 @@ vm_preflight() {
         return 0
     }
     vm_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File \
-C:\\cbm\\scripts\\ci\\clean-test-residue.ps1 -MinFreeGB ${CBM_VM_MIN_FREE_GB:-14}"
+${VM_REPO_WIN}\\scripts\\ci\\clean-test-residue.ps1 -MinFreeGB ${CBM_VM_MIN_FREE_GB:-14}"
     # Defender parity: every Windows venue (this VM and the GitHub runners)
     # tests with real-time protection ACTIVE — the same canonical script the
     # CI jobs run, so a drifted-off Defender fails loudly, never silently.
     vm_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File \
-C:\\cbm\\scripts\\ci\\ensure-defender.ps1"
+${VM_REPO_WIN}\\scripts\\ci\\ensure-defender.ps1"
 }
 
 cmd="${1:-status}"; shift || true
@@ -198,10 +203,16 @@ case "$cmd" in
 status | help | -h | --help) ;;
 *) cbm_vm_sync_windows_clock "${SSH[@]}" ;;
 esac
+# An isolated update/sync needs its checkout before the checkout-owned
+# preflight scripts can run. Other venue commands deliberately fail preflight
+# when their requested checkout has not been established by update/sync.
+case "$cmd" in
+update | sync) vm_ensure_run_checkout ;;
+esac
 # Inspection and plumbing commands need no clean disk; anything that builds or
 # runs on the VM does.
 case "$cmd" in
-status | sh | push-file | pageheap | help | -h | --help) ;;
+status | sh | push-file | pageheap | drop-run-checkout | help | -h | --help) ;;
 *) vm_preflight ;;
 esac
 case "$cmd" in
@@ -210,7 +221,6 @@ status)
     vm clangarm64 "cd $VM_REPO 2>/dev/null && git log --oneline -1 && ls -la build/c/codebase-memory-mcp.exe build/c/test-runner.exe 2>/dev/null || echo 'repo/build missing — run provision-windows.sh'"
     ;;
 update)
-    vm_ensure_run_checkout
     vm clangarm64 "cd $VM_REPO && git fetch origin ${BRANCH} && git reset --hard FETCH_HEAD && git clean -fdx && git log --oneline -1"
     exec "$0" build
     ;;
@@ -225,7 +235,6 @@ drop-run-checkout)
     fi
     ;;
 sync)
-    vm_ensure_run_checkout
     local_head="$(git -C "$ROOT" rev-parse --verify HEAD)"
     WIN_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-manifest.XXXXXX")"
     WIN_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/cbm-vm-worktree.XXXXXX.tar")"
@@ -243,14 +252,12 @@ sync)
     vm clangarm64 \
         "cd $VM_REPO && git reset --hard '$local_head' && git clean -fdx"
     if [ -s "$WIN_PATCH" ]; then
-        "${SSH[@]}" \
-            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd $VM_REPO && git apply --binary --whitespace=nowarn -"' \
+        vm clangarm64 \
+            "cd '$VM_REPO' && git apply --binary --whitespace=nowarn -" \
             <"$WIN_PATCH"
     fi
     if [ -s "$WIN_MANIFEST" ]; then
-        "${SSH[@]}" \
-            'C:\msys64\msys2_shell.cmd -defterm -no-start -clangarm64 -c "cd $VM_REPO && tar -xf -"' \
-            <"$WIN_ARCHIVE"
+        vm clangarm64 "cd '$VM_REPO' && tar -xf -" <"$WIN_ARCHIVE"
     fi
     vm clangarm64 "cd $VM_REPO && git status --short --branch"
     win_cleanup
@@ -280,7 +287,8 @@ test)
     [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
     ;;
 guards)
-    # Match the Windows CI product build: a clean, embedded-UI product binary.
+    # Match the Windows CI product build: a clean UI product runtime set with
+    # its external, content-addressed pack.
     # Passing that freshly built artifact to the maintained
     # PowerShell driver prevents an earlier non-UI `win.sh build` from silently
     # turning product guards into precondition skips. BUILD_DIR isolates the
@@ -297,7 +305,7 @@ guards)
     # different environment shape than CI's profile-rooted TEMP. Python must
     # be PREPENDED: the Microsoft Store python.exe alias stub lives early in
     # the profile PATH and otherwise shadows any appended interpreter.
-    vm_cmd "cd /d C:\\cbm && set PATH=C:\\msys64\\clangarm64\\bin;C:\\msys64\\usr\\bin;%PATH%&& powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\test-windows.ps1 -GuardsOnly -Binary build\\guards\\codebase-memory-mcp.exe -Make C:\\msys64\\usr\\bin\\make.exe"
+    vm_cmd "cd /d ${VM_REPO_WIN} && set PATH=C:\\msys64\\clangarm64\\bin;C:\\msys64\\usr\\bin;%PATH%&& powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\test-windows.ps1 -GuardsOnly -Binary build\\guards\\codebase-memory-mcp.exe -Make C:\\msys64\\usr\\bin\\make.exe"
     ;;
 smoke-install)
     # EXACTLY the PR CI smoke job (pr.yml pr-smoke windows): a clean canonical

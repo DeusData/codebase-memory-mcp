@@ -9364,13 +9364,19 @@ static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     buf[0] = '\0';
     bool exact = false;
 #ifdef _WIN32
-    DWORD length = GetModuleFileNameA(NULL, buf, (DWORD)buf_sz);
-    exact = length > 0 && (size_t)length < buf_sz;
+    /* GetModuleFileNameA renders the module path through the ANSI code page,
+     * which mangles non-ASCII install paths (café_日本語 -> caf?_???). Resolve
+     * wide and convert to UTF-8 so the returned path survives verbatim. */
+    char *module_path = cbm_module_path_utf8();
+    size_t length = module_path ? strlen(module_path) : 0U;
+    exact = module_path && length > 0U && length < buf_sz;
     if (exact) {
+        memcpy(buf, module_path, length + 1U);
         cbm_normalize_path_sep(buf);
     } else {
         buf[0] = '\0';
     }
+    free(module_path);
 #elif defined(__APPLE__)
     uint32_t sp_sz = (uint32_t)buf_sz;
     exact = _NSGetExecutablePath(buf, &sp_sz) == 0;
@@ -9726,8 +9732,11 @@ int cbm_cmd_install(int argc, char **argv) {
     char self_path[CLI_BUF_1K] = {0};
     (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
 
-    struct stat target_status;
-    bool target_exists = (stat(bin_target, &target_status) == 0);
+    /* NOT stat(): on Windows it goes through the ANSI code page, so an
+     * extended-length or non-ASCII target reports "absent" and a non-force
+     * install silently overwrites bytes the user asked to keep. */
+    cbm_path_info_t target_status;
+    bool target_exists = cbm_path_info_utf8(bin_target, &target_status) == 0;
     bool same_binary = cbm_same_file(self_path, bin_target);
     bool do_copy = !same_binary && (!target_exists || force);
 
@@ -11179,6 +11188,10 @@ static int cli_uninstall_activate(void *opaque) {
 int cbm_cmd_uninstall(int argc, char **argv) {
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    /* An install into a custom --dir must be removable from that same dir:
+     * without this, anyone who installed outside ~/.local/bin has no supported
+     * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
+    const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         /* The public command dispatcher passes option-only argv, while the
          * long-standing direct API/tests include the subcommand at argv[0]. */
@@ -11187,6 +11200,18 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
+            requested_bin_dir = argv[i] + SLEN("--dir=");
+            if (!requested_bin_dir[0]) {
+                (void)fprintf(stderr, "error: --dir requires a non-empty path\n");
+                return CLI_TRUE;
+            }
+        } else if (strcmp(argv[i], "--dir") == 0) {
+            if (i + 1 >= argc || !argv[i + 1] || !argv[i + 1][0] || argv[i + 1][0] == '-') {
+                (void)fprintf(stderr, "error: --dir requires a non-empty path\n");
+                return CLI_TRUE;
+            }
+            requested_bin_dir = argv[++i];
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown uninstall option: %s\n", argv[i]);
@@ -11226,13 +11251,20 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;
 #ifdef _WIN32
-    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp.exe",
-             home);
+    static const char kBinaryLeaf[] = "codebase-memory-mcp.exe";
 #else
-    snprintf(bin_path_storage, sizeof(bin_path_storage), "%s/.local/bin/codebase-memory-mcp", home);
+    static const char kBinaryLeaf[] = "codebase-memory-mcp";
 #endif
-    struct stat binary_status;
-    bool binary_exists = stat(bin_path, &binary_status) == 0;
+    int bin_path_length = requested_bin_dir ? snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/%s", requested_bin_dir, kBinaryLeaf)
+                                            : snprintf(bin_path_storage, sizeof(bin_path_storage),
+                                                       "%s/.local/bin/%s", home, kBinaryLeaf);
+    if (bin_path_length <= 0 || (size_t)bin_path_length >= sizeof(bin_path_storage)) {
+        (void)fprintf(stderr, "error: uninstall target path is too long\n");
+        return CLI_TRUE;
+    }
+    cbm_path_info_t binary_status;
+    bool binary_exists = cbm_path_info_utf8(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
     if (!dry_run && binary_exists) {
         cbm_activation_transaction_status_t stage_status =
@@ -11764,17 +11796,12 @@ int cbm_cmd_update(int argc, char **argv) {
     {
         char self_dir[CLI_BUF_1K] = {0};
         bool have_dir = false;
-#ifdef _WIN32
-        /* Native separators on purpose: this path is printed for the user to
-         * paste into PowerShell verbatim. */
-        DWORD self_len = GetModuleFileNameA(NULL, self_dir, (DWORD)sizeof(self_dir));
-        char *last_sep =
-            (self_len > 0 && (size_t)self_len < sizeof(self_dir)) ? strrchr(self_dir, '\\') : NULL;
-#else
+        /* cbm_detect_self_path resolves wide on Windows (non-ASCII install
+         * paths survive) and normalizes to forward separators on every
+         * platform, so one branch serves both. */
         char *last_sep = cbm_detect_self_path(self_dir, sizeof(self_dir), cbm_get_home_dir())
                              ? strrchr(self_dir, '/')
                              : NULL;
-#endif
         if (last_sep) {
             *last_sep = '\0';
             have_dir = true;
@@ -11793,7 +11820,7 @@ int cbm_cmd_update(int argc, char **argv) {
         printf("The update runs from install.ps1, not from this process. Close any\n"
                "running sessions, then run\n\n");
         if (have_dir) {
-            printf("  powershell -File \"%s\\install.ps1\"\n\n", self_dir);
+            printf("  powershell -File \"%s/install.ps1\"\n\n", self_dir);
         } else {
             printf("  powershell -File install.ps1\n"
                    "  (ships in the release archive, and is placed beside the\n"

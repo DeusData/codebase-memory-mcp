@@ -15,4 +15,4 @@ CI and the local infrastructure — both of which the venue-parity contract
 | `generate-sbom.py` | The release SPDX SBOM (vendored versions reviewable here, diffable by vendoring PRs — was inline YAML). | `release.yml` |
 | `require-all-green.sh` | The aggregate gate: fail unless every needed job succeeded or legitimately skipped (was inline YAML). | `pr.yml ci-ok` |
 | `verify-shard-union.sh` | Prove sharded test legs lost nothing: shard count agreement, indices 1..n, identical suite lists, union of slices == full list (was inline YAML). | `_test.yml` shard-completeness |
-| `check-virustotal.sh` | Release-asset VirusTotal lookups. | `release.yml` |
+| `check-virustotal.sh` | Exact extracted-file VirusTotal lookups. | `release.yml` |

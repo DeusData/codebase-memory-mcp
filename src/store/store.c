@@ -1215,8 +1215,12 @@ int cbm_store_prepare_path_for_replace(const char *path) {
     if (!path) {
         return CBM_STORE_ERR;
     }
+    char prepare_path[4096];
+    if (!cbm_path_for_file_api(path, prepare_path, sizeof(prepare_path))) {
+        return CBM_STORE_ERR;
+    }
     sqlite3 *db = NULL;
-    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
+    int rc = sqlite3_open_v2(prepare_path, &db, SQLITE_OPEN_READWRITE, NULL);
     if (rc != SQLITE_OK) {
         sqlite3_close(db);
         return CBM_STORE_ERR;
@@ -1237,15 +1241,21 @@ int cbm_store_backup_path(const char *source_path, const char *staging_path) {
         return CBM_STORE_ERR;
     }
 
+    char source_api[4096];
+    char staging_api[4096];
+    if (!cbm_path_for_file_api(source_path, source_api, sizeof(source_api)) ||
+        !cbm_path_for_file_api(staging_path, staging_api, sizeof(staging_api))) {
+        return CBM_STORE_ERR;
+    }
     sqlite3 *source = NULL;
     sqlite3 *dest = NULL;
-    int rc = sqlite3_open_v2(source_path, &source, SQLITE_OPEN_READONLY, NULL);
+    int rc = sqlite3_open_v2(source_api, &source, SQLITE_OPEN_READONLY, NULL);
     if (rc != SQLITE_OK) {
         sqlite3_close(source);
         return CBM_STORE_ERR;
     }
     sqlite3_busy_timeout(source, 10000);
-    rc = sqlite3_open_v2(staging_path, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    rc = sqlite3_open_v2(staging_api, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     if (rc != SQLITE_OK) {
         sqlite3_close(dest);
         sqlite3_close(source);
@@ -1354,8 +1364,17 @@ int cbm_store_seal_existing_path_for_replace(const char *db_path) {
         return CBM_STORE_ERR;
     }
 
+    /* Normalize to the Windows file-API form exactly as the primary open does
+     * (cbm_store_open_internal). SQLite's win VFS needs the wide-round-tripped
+     * path; the raw UTF-8 string fails to open a file that was WRITTEN through
+     * the normalized form, so re-sealing a just-indexed generation returned -1
+     * and finalize misreported it as "repo has no source files". */
+    char seal_path[4096];
+    if (!cbm_path_for_file_api(db_path, seal_path, sizeof(seal_path))) {
+        return CBM_STORE_ERR;
+    }
     cbm_store_t maintenance = {0};
-    int rc = sqlite3_open_v2(db_path, &maintenance.db, SQLITE_OPEN_READWRITE, NULL);
+    int rc = sqlite3_open_v2(seal_path, &maintenance.db, SQLITE_OPEN_READWRITE, NULL);
     if (rc != SQLITE_OK) {
         int primary = rc & 0xff;
         sqlite3_close(maintenance.db);
@@ -1427,8 +1446,13 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
     (void)unlink(tmp_path);
 
+    char tmp_api[4096];
+    if (!cbm_path_for_file_api(tmp_path, tmp_api, sizeof(tmp_api))) {
+        store_set_error(s, "dump: cannot normalize temp file path");
+        return CBM_STORE_ERR;
+    }
     sqlite3 *dest_db = NULL;
-    int rc = sqlite3_open(tmp_path, &dest_db);
+    int rc = sqlite3_open_v2(tmp_api, &dest_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     if (rc != SQLITE_OK) {
         store_set_error(s, "dump: cannot open temp file");
         return CBM_STORE_ERR;

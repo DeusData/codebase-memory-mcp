@@ -2,6 +2,7 @@
  * against the NIST test vectors in tests/test_cli.c. */
 
 #include "foundation/sha256.h"
+#include "foundation/secure_random.h"
 
 #include <string.h>
 
@@ -126,4 +127,52 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
         out[i * 2 + 1] = hex[digest[i] & 0x0f];
     }
     out[CBM_SHA256_HEX_LEN] = '\0';
+    cbm_secure_zero(&c, sizeof(c));
+    cbm_secure_zero(digest, sizeof(digest));
+}
+
+void cbm_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
+                     uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+    enum { SHA256_BLOCK_LEN = 64 };
+    const uint8_t *key_bytes = (const uint8_t *)key;
+    uint8_t normalized_key[CBM_SHA256_DIGEST_LEN];
+    uint8_t inner_pad[SHA256_BLOCK_LEN];
+    uint8_t outer_pad[SHA256_BLOCK_LEN];
+    uint8_t inner_digest[CBM_SHA256_DIGEST_LEN];
+
+    if (key_len > SHA256_BLOCK_LEN) {
+        cbm_sha256_ctx key_hash;
+        cbm_sha256_init(&key_hash);
+        cbm_sha256_update(&key_hash, key, key_len);
+        cbm_sha256_final(&key_hash, normalized_key);
+        cbm_secure_zero(&key_hash, sizeof(key_hash));
+        key_bytes = normalized_key;
+        key_len = sizeof(normalized_key);
+    }
+
+    memset(inner_pad, 0x36, sizeof(inner_pad));
+    memset(outer_pad, 0x5c, sizeof(outer_pad));
+    for (size_t i = 0; i < key_len; i++) {
+        inner_pad[i] ^= key_bytes[i];
+        outer_pad[i] ^= key_bytes[i];
+    }
+
+    cbm_sha256_ctx inner;
+    cbm_sha256_init(&inner);
+    cbm_sha256_update(&inner, inner_pad, sizeof(inner_pad));
+    cbm_sha256_update(&inner, data, data_len);
+    cbm_sha256_final(&inner, inner_digest);
+
+    cbm_sha256_ctx outer;
+    cbm_sha256_init(&outer);
+    cbm_sha256_update(&outer, outer_pad, sizeof(outer_pad));
+    cbm_sha256_update(&outer, inner_digest, sizeof(inner_digest));
+    cbm_sha256_final(&outer, out);
+
+    cbm_secure_zero(&inner, sizeof(inner));
+    cbm_secure_zero(&outer, sizeof(outer));
+    cbm_secure_zero(normalized_key, sizeof(normalized_key));
+    cbm_secure_zero(inner_pad, sizeof(inner_pad));
+    cbm_secure_zero(outer_pad, sizeof(outer_pad));
+    cbm_secure_zero(inner_digest, sizeof(inner_digest));
 }

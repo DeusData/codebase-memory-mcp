@@ -21,9 +21,12 @@ destination override neutralized.
 
 Arguments:
   <binary>     Product binary to smoke (e.g. build/c/codebase-memory-mcp).
-  ui           Mirror the -ui asset naming AND require the embedded UI:
-               Phase 15's "no assets" outcome becomes a FAILURE
-               (SMOKE_REQUIRE_UI=1), so a standard binary cannot pass a ui run.
+
+Environment:
+  SMOKE_REQUIRE_UI=1   Phase 15's "no embedded assets" SKIP becomes a FAILURE.
+                       Set by scripts/ci/smoke-artifact.sh, which builds and
+                       packages the shipped --with-ui composition. Unset in the
+                       fast PR lane, which builds without the frontend.
 
 Environment:
   CBM_SMOKE_ARTIFACT_DIR   Release mode: an EXTRACTED release artifact
@@ -48,7 +51,6 @@ if [ $# -gt 2 ]; then
 fi
 
 BINARY="${1:?smoke-local: missing <binary> argument. Please consult --help.}"
-VARIANT="${2:-standard}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 
@@ -56,15 +58,12 @@ if [ ! -x "$BINARY" ]; then
     echo "smoke-local: binary is not executable: $BINARY" >&2
     exit 2
 fi
-# A ui run must be handed a binary that actually carries the embedded assets;
-# the suffix alone only renames the archive. SMOKE_REQUIRE_UI turns Phase 15's
-# documented "no embedded assets" SKIP into a failure, so asking for ui and
-# supplying a standard binary can no longer pass quietly.
-case "$VARIANT" in
-standard) SUFFIX="" ; REQUIRE_UI=0 ;;
-ui) SUFFIX="-ui" ; REQUIRE_UI=1 ;;
-*) echo "smoke-local: variant must be 'standard' or 'ui'. Please consult --help." >&2; exit 2 ;;
-esac
+# Whether the UI must be present is the CALLER's claim, not this script's:
+# scripts/ci/smoke-artifact.sh builds --with-ui and packages the real archive, so
+# it sets SMOKE_REQUIRE_UI=1 and Phase 15's "no embedded assets" SKIP becomes a
+# FAILURE there. The fast PR lane deliberately builds without the frontend to
+# skip an npm build on every product PR, so it must not assert UI presence.
+REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
 
 # Unset (the local + PR default): synthesize the release sidecars from this
 # checkout. Set: take them from an EXTRACTED release artifact, so the release
@@ -123,30 +122,25 @@ mkdir -p "$FIXTURE_DIR" "$SMOKE_TEMP_DIR" "$SMOKE_HOME" "$SMOKE_XDG_CONFIG" \
     "$SMOKE_APPDATA" "$SMOKE_LOCALAPPDATA"
 cp "$BINARY" "$FIXTURE_DIR/codebase-memory-mcp"
 if [ -n "$ARTIFACT_DIR" ]; then
-    cp "$ARTIFACT_DIR/LICENSE" "$ARTIFACT_DIR/install.sh" \
-        "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
+    cp "$ARTIFACT_DIR/LICENSE" \
+        "$ARTIFACT_DIR/install.sh" "$ARTIFACT_DIR/THIRD_PARTY_NOTICES.md" "$FIXTURE_DIR/"
 else
     cp "$ROOT/LICENSE" "$ROOT/install.sh" "$FIXTURE_DIR/"
     "$ROOT/scripts/gen-third-party-notices.sh" "$FIXTURE_DIR/THIRD_PARTY_NOTICES.md"
 fi
 
-EXPECTED_ARTIFACT="codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz"
+# Member set and ORDER mirror scripts/package-release.sh (the Windows
+# single-binary contract locks that order); a fixture with a different inventory
+# would smoke a release layout we never ship.
+EXPECTED_ARTIFACT="codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
 tar -czf "$FIXTURE_DIR/$EXPECTED_ARTIFACT" -C "$FIXTURE_DIR" \
     codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-if [ -n "$SUFFIX" ]; then
-    cp "$FIXTURE_DIR/$EXPECTED_ARTIFACT" \
-        "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
-fi
 
 # Linux install/update resolves the portable release asset even when this local
 # smoke started from the dynamic production binary.
 if [ "$OS" = "linux" ]; then
     cp "$FIXTURE_DIR/$EXPECTED_ARTIFACT" \
-        "$FIXTURE_DIR/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz"
-    if [ -n "$SUFFIX" ]; then
-        cp "$FIXTURE_DIR/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz" \
-            "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz"
-    fi
+        "$FIXTURE_DIR/codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz"
 fi
 (cd "$FIXTURE_DIR" && { sha256sum *.tar.gz > checksums.txt 2>/dev/null ||
     shasum -a 256 *.tar.gz > checksums.txt; })

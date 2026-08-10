@@ -137,15 +137,15 @@ for relative, source in (
 # Unix fixtures mirror the release archive surface and Linux update aliases.
 for name in ("LICENSE", "install.sh", "THIRD_PARTY_NOTICES.md"):
     require(name in smoke_local, f"smoke-local.sh archive must include {name}")
+# One composition ships, so there is one archive name and no variant alias.
 require(
-    "codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" in smoke_local
-    and "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local,
-    "smoke-local.sh must create the selected variant and standard alias",
+    "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local
+    and "${SUFFIX}" not in smoke_local,
+    "smoke-local.sh must create the single canonical archive with no variant alias",
 )
 require(
-    "codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz" in smoke_local
-    and "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
-    "smoke-local.sh must create Linux portable selected-variant and standard aliases",
+    "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
+    "smoke-local.sh must create the Linux portable update alias",
 )
 require(
     'CBM_CACHE_DIR="$WORK_DIR/cache"' in smoke_local

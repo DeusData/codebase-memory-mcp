@@ -139,21 +139,16 @@ require(
     "Makefile.cbm must not expose a Windows launcher target or variable",
 )
 
-# Each archive variant is still produced through the ONE canonical packaging
-# entry, so the four-file layout above governs all of them.
+# Every archive is produced through the ONE canonical packaging entry, so the
+# four-file layout above governs all of them. A reappearing --variant flag would
+# mean the retired two-composition split is back.
 build_workflow = read(".github/workflows/_build.yml")
-for archive, call, ui in (
-    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64", False),
-    ("codebase-memory-mcp-ui-windows-amd64.zip",
-     "scripts/package-release.sh windows amd64 --variant ui", True),
-    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64", False),
-    ("codebase-memory-mcp-ui-windows-arm64.zip",
-     "scripts/package-release.sh windows arm64 --variant ui", True),
+for archive, call in (
+    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64"),
+    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64"),
 ):
-    # The lookahead keeps a ui call from satisfying a standard check.
-    pattern = re.escape(call) + ("" if ui else r"(?!\s+--variant)")
     require(
-        re.search(pattern, build_workflow) is not None,
+        re.search(re.escape(call) + r"(?!\s+--variant)", build_workflow) is not None,
         f"_build.yml must produce {archive} via the canonical packaging entry ('{call}')",
     )
 
@@ -221,7 +216,7 @@ single_binary_contracts = {
     ),
     "pkg/pypi/src/codebase_memory_mcp/_cli.py": (
         r"_WINDOWS_BINARY_NAME\s*=\s*['\"]codebase-memory-mcp\.exe['\"]",
-        r"def\s+_windows_binary_ready\(",
+        r"def\s+_runtime_set_ready\(",
     ),
 }
 for relative, patterns in single_binary_contracts.items():

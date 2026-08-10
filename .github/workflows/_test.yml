@@ -174,6 +174,37 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
 
+  # The package wrappers own their own runtime-set publication and lease-lock
+  # implementations. Run the same suites against both host families so Unix
+  # inode/flock behavior and Windows handle/link behavior are each gating,
+  # without adding Node/Go provisioning to every sanitizer/container leg.
+  test-package-wrappers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: pkg/go/go.mod
+          cache: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Test Go, npm, and PyPI runtime-set wrappers
+        shell: bash
+        run: scripts/ci/test-package-wrappers.sh
+
   # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
   # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable
   # daemon-coordination paths) plus allocator concurrency all run under TSan
@@ -394,6 +425,7 @@ jobs:
             mingw-w64-clang-${{ matrix.pkg }}-ccache
             make
             git
+            zip
 
       - name: Create protected per-user temp root
         # One implementation, shared with _soak.yml and the VM leg
@@ -502,7 +534,7 @@ jobs:
         run: repo/scripts/ci/verify-shard-union.sh manifests
 
   # Windows product-surface regression guards. Distinct from test-windows above
-  # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
+  # (the sanitizer C suite): these drive a real product binary + external UI pack
   # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
   # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
   # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
@@ -530,10 +562,6 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Test npm wrapper failure handling
-        working-directory: pkg/npm
-        run: npm test
-
       - name: Compiler cache (content-verified)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -543,11 +571,12 @@ jobs:
             ccache-guards-${{ github.ref }}-
             ccache-guards-
 
-      - name: Build product binary with embedded UI
+      - name: Build product binary with external UI assets and guard seams
         shell: msys2 {0}
-        # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
-        # guard's HTTP UI is available. Functional gate only (no sanitizers).
-        run: scripts/build.sh --with-ui CC=clang CXX=clang++
+        # --with-ui builds the frontend and its content-addressed asset pack, so
+        # the drive-picker guard's HTTP UI is available. Functional gate only
+        # (no sanitizers).
+        run: scripts/build.sh --with-ui CC=clang CXX=clang++ TEST_SEAMS=1
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M

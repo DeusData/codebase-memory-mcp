@@ -100,7 +100,7 @@ ALLOWED_CMDS = {
     "gh", "python3", "node", "codesign", "xcrun", "command", "awk",
 }
 # Per-file additions: _build.yml packages artifacts (make/strip are packaging
-# steps, not test legs) and drives npm for the embedded UI; release.yml pushes finished artifacts to registries after
+# steps, not test legs) and drives npm for the UI build; release.yml pushes finished artifacts to registries after
 # every product-exercising gate already ran; the brew tap smoke installs the
 # released formula.
 ALLOWED_EXTRA = {
@@ -318,6 +318,47 @@ for local, pattern, why in LOCAL_REQUIRED:
     path = root / local
     if path.exists() and not re.search(pattern, path.read_text()):
         failures.append(f"{local}: missing required `{pattern}` — {why}")
+
+# Native Windows process lookup searches system locations before PATH. A bare
+# `bash` argv launched by embedded Python can therefore select the WSL alias
+# instead of the MSYS2 Bash that is already running this contract. Every
+# shell-hosted Python block must receive the current `$BASH` as an explicit
+# argument and launch that resolved path. Enforce this textually on every
+# maintained shell surface so the rule is deterministic on non-Windows hosts
+# too, rather than relying on a runner to happen to have the WSL alias.
+BARE_BASH_ARGV = re.compile(r"""[\[(]\s*["']bash["']\s*,""")
+shell_surfaces = list(root.glob("*.sh"))
+for directory in ("tests", "scripts", "test-infrastructure", "pkg"):
+    base = root / directory
+    if not base.exists():
+        continue
+    shell_surfaces.extend(base.rglob("*.sh"))
+for path in sorted(shell_surfaces):
+    text = path.read_text(encoding="utf-8")
+    for match in BARE_BASH_ARGV.finditer(text):
+        number = text.count("\n", 0, match.start()) + 1
+        relative = path.relative_to(root).as_posix()
+        failures.append(
+            f"{relative}:{number}: embedded Python must launch the current "
+            "$BASH by explicit argv path; bare `bash` is WSL-alias-sensitive "
+            "under native Windows process lookup"
+        )
+
+# ── Release archives are extracted from an ISOLATED directory ──
+# The release/dry-run verify jobs used to download archives into the tracked
+# checkout, so the extractor scanned a directory that also held repo files.
+# Both now stage into $RUNNER_TEMP. This assertion lived in the archive-extractor
+# contract, which was deleted with the UI-pack architecture it tested; the fix
+# itself is unrelated to packs, so its guard moves here rather than vanishing.
+for name in ("release.yml", "dry-run.yml"):
+    text = (workflows / name).read_text(encoding="utf-8")
+    if "scripts/ci/extract-release-archives.sh" not in text:
+        continue
+    if "$RUNNER_TEMP/release-archives" not in text:
+        failures.append(
+            f"{name}: release archives must be downloaded into "
+            "$RUNNER_TEMP/release-archives, never into the tracked checkout"
+        )
 
 if failures:
     print("VENUE PARITY CONTRACT VIOLATED — one harness, every venue:")

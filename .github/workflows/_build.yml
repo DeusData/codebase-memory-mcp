@@ -1,4 +1,4 @@
-# Reusable: build binaries (standard + UI) on all platforms
+# Reusable: build release binaries on all supported platforms
 name: Build
 
 on:
@@ -12,7 +12,6 @@ on:
         description: 'Generate build provenance attestations for release artifacts'
         type: boolean
         default: false
-
 permissions:
   contents: read
   id-token: write
@@ -63,34 +62,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build standard binary
-        env:
-          VERSION: ${{ inputs.version }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
-          else
-            scripts/build.sh "CC=$CC" "CXX=$CXX"
-          fi
-
-      - name: Ad-hoc sign macOS binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      # Archive layout/name live in the ONE canonical script the local
-      # artifact-flow smoke lane also runs (venue-parity contract).
-      - name: Archive standard binary (canonical package-release.sh)
-        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }}
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
-
-      - name: Build UI binary
+      - name: Build release binary with UI
         env:
           VERSION: ${{ inputs.version }}
           CC: ${{ matrix.cc }}
@@ -102,7 +74,7 @@ jobs:
             scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
           fi
 
-      - name: Ad-hoc sign macOS UI binary
+      - name: Ad-hoc sign macOS release binary
         if: startsWith(matrix.os, 'macos')
         run: codesign --sign - --force build/c/codebase-memory-mcp
 
@@ -110,14 +82,16 @@ jobs:
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: scripts/security-ui.sh
 
-      - name: Archive UI binary (canonical package-release.sh)
-        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }} --variant ui
+      # Archive layout/name live in the ONE canonical script the local
+      # artifact-flow smoke lane also runs (venue-parity contract).
+      - name: Archive release binary (canonical package-release.sh)
+        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
-      - name: Attest UI binary provenance
+      - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          subject-path: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -144,30 +118,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build standard binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
-
-      # Archive layout/name live in the ONE canonical script the local
-      # artifact-flow smoke lane also runs (venue-parity contract).
-      - name: Archive standard binary (canonical package-release.sh)
-        shell: msys2 {0}
-        run: scripts/package-release.sh windows amd64 CC=clang CXX=clang++
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-windows-amd64.zip
-
-      - name: Build UI binary
+      - name: Build release binary with UI
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
@@ -178,15 +129,17 @@ jobs:
             scripts/build.sh --with-ui CC=clang CXX=clang++
           fi
 
-      - name: Archive UI binary (canonical package-release.sh)
+      # Archive layout/name live in the ONE canonical script the local
+      # artifact-flow smoke lane also runs (venue-parity contract).
+      - name: Archive release binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: scripts/package-release.sh windows amd64 --variant ui CC=clang CXX=clang++
+        run: scripts/package-release.sh windows amd64 CC=clang CXX=clang++
 
-      - name: Attest UI binary provenance
+      - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-windows-amd64.zip
+          subject-path: codebase-memory-mcp-windows-amd64.zip
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -217,28 +170,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build standard binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
-
-      - name: Archive standard binary (canonical package-release.sh)
-        shell: msys2 {0}
-        run: scripts/package-release.sh windows arm64 CC=clang CXX=clang++
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-windows-arm64.zip
-
-      - name: Build UI binary
+      - name: Build release binary with UI
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
@@ -249,15 +181,15 @@ jobs:
             scripts/build.sh --with-ui CC=clang CXX=clang++
           fi
 
-      - name: Archive UI binary (canonical package-release.sh)
+      - name: Archive release binary (canonical package-release.sh)
         shell: msys2 {0}
-        run: scripts/package-release.sh windows arm64 --variant ui CC=clang CXX=clang++
+        run: scripts/package-release.sh windows arm64 CC=clang CXX=clang++
 
-      - name: Attest UI binary provenance
+      - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-windows-arm64.zip
+          subject-path: codebase-memory-mcp-windows-arm64.zip
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -287,31 +219,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build standard binary (static)
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ STATIC=1
-          else
-            scripts/build.sh CC=gcc CXX=g++ STATIC=1
-          fi
-
-      - name: Verify static linking
-        run: |
-          file build/c/codebase-memory-mcp
-          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
-
-      - name: Archive standard binary (canonical package-release.sh)
-        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable
-
-      - name: Attest standard binary provenance
-        if: ${{ inputs.attest }}
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
-
-      - name: Build UI binary (static)
+      - name: Build release binary with UI (static)
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -321,14 +229,19 @@ jobs:
             scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
           fi
 
-      - name: Archive UI binary (canonical package-release.sh)
-        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable --variant ui
+      - name: Verify release static linking
+        run: |
+          file build/c/codebase-memory-mcp
+          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
 
-      - name: Attest UI binary provenance
+      - name: Archive release binary (canonical package-release.sh)
+        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable
+
+      - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz
+          subject-path: codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

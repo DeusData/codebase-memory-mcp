@@ -528,9 +528,16 @@ static void write_diagnostics(void) {
     size_t page_faults = 0;
     mi_process_info(&elapsed_ms, &user_ms, &sys_ms, &current_rss, &peak_rss, &current_commit,
                     &peak_commit, &page_faults);
-    if (current_rss == 0) {
-        current_rss = cbm_mem_rss();
-    }
+    /* Do NOT report mi_process_info's rss fields: on Linux mimalloc never sets
+     * current_rss, so the field keeps mimalloc's internal committed-page
+     * counter — deliberately tuned low here (purge_decommits=1, purge_delay=0)
+     * and able to go transiently NEGATIVE under purge, which wraps through
+     * size_t and printed rss_bytes of ~2^64 (soak read it as a 17-exabyte
+     * "leak"). cbm_mem_rss()/cbm_mem_peak_rss() already encode the whole
+     * lesson: /proc statm is authoritative on Linux, mimalloc is correct on
+     * macOS/Windows, and peak is reconciled to never undercut current. */
+    current_rss = cbm_mem_rss();
+    peak_rss = cbm_mem_peak_rss();
 
     int fds = count_open_fds();
     time_t now = time(NULL);
