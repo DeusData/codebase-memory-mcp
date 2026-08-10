@@ -1,190 +1,195 @@
-# Upstream main 10cb0e03 merge assessment, performance record, and release plan
+# API consolidation merge assessment and release record
 
-## Decision record
+## Decision dashboard
 
-| Field | Evidence |
+| Field | Current evidence |
 | --- | --- |
-| Release branches | `api-consolidation` and `api-consolidation-merge`; both must resolve to the same final tip |
-| Destination parent | `cd412fa8b84a085ad9777b0ec045616af1bf3e5b` |
-| Incoming parent | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
-| Merge base | `2c50c7741ec89dbcf43c2c85e005c0b58a4dbbf3` |
-| Two-parent merge | `7d3f0cfc9658c71f249466469838600d46e9d4f4` |
-| Nosan linkage repair | `779717e28c5848ac44cecad23dbbf5b7793e7740` |
-| JSON linear-walk repair | `7486ba1359681d33875845717d10c1ad3ecd8428` |
-| Concurrent-admission repair | `e245da8faa08f7a2972b504fbab35ebec7dd02c5` |
-| Recovery refs | `refs/merge-recovery/pre-upstream-main-20260809-cd412fa8` and `refs/merge-input/upstream-main-20260809-10cb0e03` |
-| Evidence host | macOS arm64, 2026-08-09 |
-| Local decision | Merge content, local gates, and the installed binary are ready; the final hosted matrix must verify the Windows cold-start lifecycle repair before release |
+| Purpose | Release record, benchmark report, and remaining publication plan for PR #1245 |
+| Status | Local candidate verified; installation, guarded publication, PR metadata, and final-head hosted CI remain |
+| Evidence baseline | macOS arm64, 2026-08-10; candidate `5504dcf` |
+| Destination parent | `9953c328d1af27a836c533b399dc5b8ec08a22f5` |
+| Upstream parent | `4ed8d384f76b4945f1b50845d8b0e28c78ea304b` |
+| Merge base | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
+| Two-parent merge | `32bc95314e2e9d64bb62211a78c16c58331c0588` |
+| Recovery refs | `refs/merge-recovery/pre-upstream-main-20260810-9953c328`; `refs/merge-input/upstream-main-20260810-4ed8d384` |
+| Release refs | `api-consolidation` and `api-consolidation-merge` must resolve to the same final commit |
+| Decision needed | None for local content. Publication is gated on final install smoke tests and exact remote leases. |
 
-The candidate is a semantic superset of both parents. It retains the destination branch's
-dependency indexing, PageRank, incremental indexing, richer extraction, activation rollback,
-fragmented SHA-256 handling, and bounded smoke-process lifecycle. It also takes upstream's
-content-addressed UI asset packs, authenticated UI readiness, runtime-set locks, UTF-8 path
-handling, and exact release/VirusTotal contracts.
+This note supersedes its earlier 10cb0e03-era test counts, parent SHAs, benchmark
+paths, and installation hash. Historical commits remain available in Git.
 
-This was not a safe “take incoming” merge. The parents conflicted in 11 files, and several clean
-sections still required cross-file checks because build linkage, install transactions, sidecar
-ownership, release archives, smoke fixtures, and Windows launch behavior form one contract.
+## Before, now, and target
 
-## Critical parent assessment
+| Area | Before | Verified now | Release target | Consequence |
+| --- | --- | --- | --- | --- |
+| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `32bc9531` has exactly `9953c328` and `4ed8d384` as parents; both are ancestors of `5504dcf` | Publish both release branch names at one tip | Reviewers see one auditable superset history |
+| Release packaging | Upstream carried the newer embedded UI/runtime-set design; destination carried rollback and richer installation behavior | One embedded binary, one four-member archive set, exact asset lookup, rollback, activation, and ownership contracts coexist | Keep all package and install checks green on the published head | No sidecar-era or variant-binary regression |
+| Indexing and API behavior | Destination was ahead in dependency indexing, PageRank, incremental indexing, extraction, and diagnostics | Those paths remain, together with upstream UI, Windows, archive, and release hardening | Preserve both parents' useful behavior | The merge does not trade branch functionality for upstream freshness |
+| Python registry filtering | Repeated indexed root-child scans scaled poorly with registry size | One circular `TSTreeCursor` performs root membership checks in `O(R*N)` time and `O(1)` auxiliary space | Retain exact class filtering for arbitrary registry order | Scale latency and retired work fall without output loss |
+| Hook migration | Upstream static re-embedding retained only the older released SessionStart identity | The finite allowlist includes both exact released scripts | Remove only known owned historical scripts | User hooks are migrated without fuzzy deletion |
+| Trust boundaries | Invalid UI/port inputs and rollback failures could be hidden by permissive or secondary paths | Shared strict parsing, pre-admission rejection, and propagated persistence/rollback errors fail loudly | Preserve the same errors in package and hosted tests | Bad input and partial persistence cannot look successful |
 
-| Parent | Value and quality | Risks or limits | Disposition |
+No content decision remains. The implementation gate is a signed final note commit,
+an installed-binary smoke test, guarded dual-ref publication, and green final-head CI.
+
+## Parent assessment
+
+| Parent | Value and quality | Risk if taken wholesale | Disposition |
 | --- | --- | --- | --- |
-| Destination `cd412fa8` | More advanced indexing and query implementation, dependency graph and PageRank, incremental correctness fixes, activation rollback, richer benchmark output, broad native tests, and prior performance evidence. | Lacked upstream's final external UI-pack/runtime-set release design and the newest Windows/VirusTotal hardening. Its JSON specialized walk also called output-free YAML handlers, creating a latent nested-input time-bound defect. | Keep as the behavioral, correctness, and hot-path baseline; repair the JSON traversal defect rather than accepting it as branch cost. |
-| Upstream `10cb0e03` | Sixteen focused commits externalize UI assets, bind runtime sets, authenticate loopback readiness, harden Windows packaging, and make archive/VirusTotal evidence exact and content-bound. The release/security design is coherent and heavily contract-tested. | Does not contain the destination's later dependency indexing, PageRank, rollback, extraction result surface, or benchmark infrastructure. Its scale and shared-extraction runners are materially slower because those destination optimizations are absent. | Take the release/security design and compose it with destination behavior; do not replace destination subsystems wholesale. |
+| Destination `9953c328` | More advanced dependency indexing, PageRank, exact-delta and overlay indexing, richer extraction, activation transactions, daemon admission, JSON hot paths, diagnostics, tests, and benchmark coverage | It lacked the refreshed upstream release composition and some later portability fixes | Use as the behavior, correctness, and hot-path baseline |
+| Upstream `4ed8d384` | Coherent embedded UI/templates, unsuffixed archive composition, wrapper/install corrections, Windows path handling, arm64 W^X behavior, and current release contracts | Wholesale replacement would remove destination-only indexing, query, lifecycle, and benchmark work | Take the release and portability changes, then compose them with destination behavior |
 
-Investigation difficulty was **5/5**. The incoming side spans 128 first-parent-diff files with
-20,699 additions and 2,674 deletions, while the destination has a much larger independent history.
-Text resolution alone could not establish lifecycle safety or performance equivalence. Completion
-difficulty was **4/5**: the code resolutions were bounded, but equivalent production runners,
-two-parent benchmarks, sanitizer rebuilds, daemon lifecycle tests, package contracts, and DCO
-history verification were all needed before a credible push.
+The merge base to destination range changes 350 files (179,660 insertions and
+31,411 deletions). The merge base to upstream range changes 78 files (3,113
+insertions and 11,652 deletions). Investigation difficulty is **5/5** because
+many lifecycle, package, protocol, and performance contracts cross file boundaries
+without textual conflicts. Completion difficulty is **4/5**: the shared fixes are
+small, but exact-parent builds, sanitizer lanes, allocator checks, installation,
+Windows evidence, DCO, and guarded publication are all required.
 
 ## Merge composition and lateral repairs
 
-1. `Makefile.cbm` links dependency indexing and PageRank together with the real UI asset parser in
-   sanitizer, TSan, and nosan runners. `779717e2` fixes the nosan-only unresolved asset symbols that
-   the first merge build exposed.
-2. `src/cli/cli.c` keeps one path/sidecar transaction with destination rollback and upstream
-   runtime-set, UTF-8, asset staging, and install/uninstall ownership checks.
-3. `scripts/smoke-test.sh` preserves the destination FIFO stdin owner while probing upstream's
-   external UI pack. Release, package, Windows bundle, no-embedded-script, venue, archive, and
-   VirusTotal contracts remain active.
-4. `tests/test_cli.c` retains destination fragmented SHA-256 and historical ownership coverage
-   alongside upstream runtime-set, HMAC, secure-zero, and UI-asset tests.
-5. `internal/cbm/extract_unified.c:2205` no longer invokes constant, YAML-nesting, or YAML
-   infrastructure handlers from the JSON cursor. Those handlers emitted no JSON output; the YAML
-   scanner recursively walked each nested JSON `document` or `array` subtree.
-6. `tests/test_extraction.c:3795` proves URL string references still survive the specialized JSON
-   walk. The existing TypeScript URL check now uses the same `has_string_ref()` helper.
-7. `src/daemon/runtime.c` retires an ephemeral generation only after every already-accepted
-   exact-build connection settles. The previous last-committed-client transition rejected a
-   concurrently accepted client still inside `session_open`, making a six-client Windows cold
-   start serialize through daemon generations until one client reached the unchanged 30,000 ms
-   deadline. A lone final client still begins stopping before its close-response drain.
-8. `tests/test_makefile_logged_command.sh` uses the repository's existing BSD/GNU `mktemp`
-   fallback. The first hosted macOS LSan job ended before compilation when `mktemp -d` returned
-   `Invalid argument`; the normal path and an injected first-call failure both pass locally.
+1. `32bc9531` composes embedded UI/templates and current package contracts with
+   destination dependency indexing, PageRank, incremental indexing, richer
+   extraction, activation rollback, daemon admission, and diagnostics.
+2. `39578807` restores `O(log A)` UI asset lookup for `A` generated assets,
+   enforces generated sort order, and routes daemon-control port parsing through
+   the strict shared parser.
+3. `8df9f9d` keeps one tree cursor across Python module-class epoch checks.
+   It also allocates finalized method indexes from the supplied scratch arena,
+   skips empty import-spec walks, and skips LSP timing work for languages with no
+   per-file LSP pass.
+4. `5504dcf` restores the exact released streamlined SessionStart migration
+   identity. It also corrects a one-element test `argv` that was passed with
+   `argc=2`, which the canonical ASan run exposed as a stack-buffer-overflow.
+5. Publication rollback and cancellation report persistence failures instead of
+   returning success after failed cleanup.
+6. Package, protocol, schema, daemon, UI, activation, extraction, and benchmark
+   callers were checked laterally so the repairs remain shared and finite.
 
 ## Correctness, safety, and robustness evidence
 
-| Gate | Result |
+| Gate | Final local result |
 | --- | --- |
-| Canonical ASan/UBSan matrix, `scripts/test.sh` | 8,649 passed, 0 failed, 2 skipped across 145 suites and 16 jobs |
-| Changed extraction suite within the full matrix | 327 passed, 0 failed |
-| Parent/worker watchdogs, worker error transport, verified daemon UI readiness, security strings | passed |
-| Python tests | 429 passed, 1 skipped, 78 subtests passed |
-| macOS full allocation-owning leak gate | 1,317 passed; 0 leaks for 0 total leaked bytes |
-| MallocScribble/PreScribble JSON probe | 7 passed, 352 filtered |
-| Guard Malloc JSON probe | 7 passed, 352 filtered |
-| ThreadSanitizer selected concurrency lane | 1,348 passed, 2 skipped; no race report |
-| Final-head focused ThreadSanitizer run | All 47 `daemon_runtime` tests passed, including the provisional-session regression; no race report |
-| Clang static analyzer | exit 0; accepted test-framework macro warnings; no finding in either changed file |
-| CI lint profile | cppcheck, clang-format, NOLINT policy, source safety, and protocol stdout passed |
-| Package wrappers before the extraction-only commit | Go passed; npm 29/29; PyPI 36/36 |
-| Focused release contracts | smoke, package runtime, archive extraction, UI pack, vendored integrity, VirusTotal, Windows bundle, no-embedded-script, and venue parity passed |
-| Ephemeral concurrent-admission regression | Red-first deterministic test reproduced the owner-disconnect/provisional-open race; the repaired test passed, then all 47 `daemon_runtime` ASan/UBSan tests passed |
-| Hosted evidence that triggered the repair | Two consecutive Windows guard jobs failed `section_cold_storm` with `CBM daemon is active or starting but could not accept this client within 30000 ms`; the production deadline was not widened |
-| Installed final production binary | Build and `/Users/athundt/.local/bin/codebase-memory-mcp` SHA-256 both `c810bf4dd18744c95a696057bb1c1b97be07195b3a6040adfe1602770499ce69`; mode 755, strict code-sign verification, `--version`, and `--help` passed |
-| Hosted macOS LSan setup repair | The first `mktemp -d` failure is retried with the established `mktemp -d -t` fallback; normal and injected-first-failure harness runs passed |
+| Canonical ASan/UBSan | 8,637 passed, 2 skipped; exit 0; no sanitizer or runtime-error report |
+| ThreadSanitizer concurrency matrix | 1,349 passed, 2 platform skips; exit 0; no race report |
+| Apple `leaks` on the nosan runner | 0 leaks for 0 total leaked bytes |
+| MallocScribble and MallocPreScribble | 8,637 passed, 2 skipped; no corruption crash |
+| Guard Malloc allocation-owning suites | 1,366 passed; no overrun or use-after-free crash |
+| Clang static analyzer | exit 0; no warning in a modified production file |
+| CLI suite after the malformed-`argv` repair | 325/325 passed under ASan/UBSan |
+| Python registry, LSP, and scale focus | 151/151 passed under ASan/UBSan |
+| Benchmark driver tests | 9/9 passed |
+| Go, npm, and PyPI wrappers | 42, 11, and 28 tests passed |
+| Embedded readiness, archive, vendored, schema, daemon, UI, activation, and protocol gates | passed |
+| Source secret scan | no match |
 
-The final lifecycle commit changes only `src/daemon/runtime.c`, its regression test, and this note.
-It cannot affect package wrapper code or archive composition. The complete native matrix, focused
-daemon TSan run, full allocation-owning leak gate, lint profile, release build, and installed-binary
-smoke checks were rerun after the production change.
+The canonical logs are retained under
+`/Users/athundt/Library/Application Support/rtk/tee/`. The leak and memory
+reports are `build/c/leak-report.txt` and `build/c/mem-report.txt`; subsequent
+targets overwrite the latter, so the RTK logs retain each complete run.
 
 ## Production benchmark evidence
 
 ### Method and artifacts
 
-Each candidate used a production `-O2` native runner, production allocator binding, no sanitizer,
-and no test API. Candidate order rotated on every repetition. Two warmups preceded 41 measured
-repetitions for startup, shared JSON, fixed C#, fixed Python, and Python scale cohorts. Startup
-resource use was paired with each workload sample before incremental memory was calculated.
+Three production `-O2` arm64 runners used the production allocator and strict
+ad-hoc code signing. Candidate order rotated for two warmups and 41 measured
+repetitions of startup, shared JSON, fixed C#, fixed Python, and Python scale
+cohorts. The driver subtracts each matching startup sample from RSS, physical
+footprint, retired instructions, and cycles.
 
-- Confirmation JSON: `/Users/athundt/.cache/codebase-memory-mcp/api-consolidation-merge-bench-20260809/inprocess/post-json-linear-confirmation-41-upstream-10cb0e03/native-extraction-results.json`
-- Raw output: adjacent `native-extraction-raw.txt`
-- Earlier 21-run calibration: `/Users/athundt/.cache/codebase-memory-mcp/api-consolidation-merge-bench-20260809/inprocess/post-json-linear-21-upstream-10cb0e03/`
+| Runner | Source | SHA-256 |
+| --- | --- | --- |
+| Candidate | `5504dcf` source | `dc1d8ecc6af78c7893e7df5247d0cf73f354149ab29c9b2e9cfb2ac032077d5a` |
+| Destination | `9953c328` | `416eff2286cbcc5d7705e01097209467ce79dbb596f1d308f26ad6f554d936b7` |
+| Upstream | `4ed8d384` | `0a898316c849917f952b330f6b82fdd9cab10b1ec74cd8acbf9def46aae01b5` |
 
-The destination runner is pinned to `cd412fa8`; the upstream runner is pinned to `10cb0e03`; the
-merge runner contains `7486ba13` production sources. All shared and destination comparisons have
-exact output parity. The fixed upstream cohorts intentionally differ because the merge retains the
-destination's richer result surface.
+Result JSON:
+`/Users/athundt/.cache/codebase-memory-mcp/api-consolidation-final-20260810/results/final-stabilized-41/native-extraction-results.json`
 
-Values below are 41-run medians, shown as destination / merge / upstream.
+Result SHA-256:
+`ad21bfe84d0701d845d6b625f794c06692ddf7a6902efc88e04fa096dddc6b8f`
 
-| Workload | Latency ms | Retired instructions | Cycles | Incremental max RSS bytes | Incremental peak footprint bytes |
+All four workloads have exact output parity against both parents. Values below
+are medians in candidate / destination / upstream order.
+
+| Workload | Latency ms | Retired instructions | Incremental instructions | Incremental max RSS bytes | Incremental peak footprint bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Shared JSON, 1,024 extracts | 61.81 / 51.02 / 81.72 | 944,031,323 / 807,246,004 / 1,284,135,173 | 230,576,749 / 191,402,971 / 302,523,482 | 1,032,192 / 999,424 / 1,146,880 | 311,344 / 295,008 / 327,776 |
-| C# fixed | 3.57 / 3.56 / 3.59 | 70,526,266 / 70,497,498 / 70,851,355 | 21,463,685 / 21,537,164 / 21,498,955 | 4,849,664 / 4,915,200 / 4,849,664 | 770,120 / 770,120 / 802,888 |
-| Python fixed | 8.63 / 8.56 / 8.45 | 119,225,690 / 119,065,639 / 119,976,146 | 40,886,276 / 40,827,037 / 40,806,119 | 4,374,528 / 4,440,064 / 4,292,608 | 1,474,632 / 1,490,992 / 1,523,784 |
-| Python scale | 1,018.8 / 1,016.2 / 1,250.0 | 16,198,342,406 / 16,134,261,930 / 20,221,240,670 | 4,181,450,170 / 4,168,946,688 / 5,046,955,196 | 44,711,936 / 44,449,792 / 44,630,016 | 41,959,544 / 41,680,992 / 42,041,464 |
+| Shared JSON, 1,024 extracts | 49.05 / 49.01 / 79.27 | 803,404,990 / 801,234,593 / 1,278,503,305 | 777,097,059 / 774,914,800 / 1,252,293,393 | 1,064,960 / 1,015,808 / 1,146,880 | 294,984 / 311,368 / 344,136 |
+| C# fixed | 3.39 / 3.42 / 3.44 | 70,178,887 / 70,381,243 / 70,708,239 | 43,897,296 / 44,058,863 / 44,497,127 | 4,898,816 / 4,898,816 / 4,751,360 | 770,120 / 786,504 / 802,864 |
+| Python fixed | 7.88 / 7.91 / 7.99 | 118,322,330 / 118,465,081 / 118,740,070 | 92,052,545 / 92,169,953 / 92,533,743 | 4,407,296 / 4,456,448 / 4,276,224 | 1,474,632 / 1,491,016 / 1,540,168 |
+| Python scale, 8,000 calls | 517.7 / 979.7 / 1,190.6 | 9,699,128,817 / 16,139,328,792 / 19,479,359,303 | 9,672,815,144 / 16,113,033,627 / 19,452,944,028 | 42,909,696 / 42,958,848 / 42,860,544 | 40,173,688 / 40,190,048 / 40,271,992 |
 
 ### Performance decision
 
-Against the destination parent, shared JSON latency falls 17.27%, instructions fall 14.49%, cycles
-fall 16.97%, incremental max RSS falls 1.64%, and incremental physical footprint is effectively
-unchanged at -0.007%. Total extraction time falls 26.76%. Against upstream, the same cohort falls
-37.61% in latency, 37.13% in instructions, 36.72% in cycles, 13.70% in incremental max RSS, and
-13.04% in incremental physical footprint.
+Against destination, Python scale latency falls 47.21%, retired instructions
+fall 39.91%, incremental instructions fall 39.97%, cycles fall 43.70%, and
+incremental physical footprint falls 0.04%. Fixed C# and Python latency and
+instructions also fall. Against upstream, Python scale latency falls 56.51%,
+retired instructions fall 50.21%, cycles fall 53.22%, and incremental physical
+footprint falls 0.24%.
 
-The scale cohort is also better than both parents: versus destination, latency is 0.32% lower,
-instructions 0.39% lower, cycles 0.27% lower, and all four absolute/incremental memory medians are
-lower. Versus upstream, latency is 18.82% lower, instructions 20.21% lower, cycles 17.38% lower,
-and all four memory medians are lower.
+Shared JSON is 38.23% faster than upstream with 37.16% fewer instructions and
+14.28% lower incremental physical footprint. Relative to destination, shared
+JSON differs by +0.23% latency, +0.27% instructions, +0.09% incremental cycles,
+equal peak footprint, and -5.26% incremental peak footprint. These sub-1% work
+counters are treated as practical equivalence under the rotated 41-pair run;
+RSS moves by allocator pages and is not monotonic in the fixed cohorts.
 
-Fixed C#/Python measurements differ by one to four allocator pages. The 21- and 41-run trials flip
-the direction of the C# footprint difference, demonstrating page quantization and host variation
-rather than a growing allocation. Fixed latency and instructions are lower than destination in the
-41-run confirmation. These tiny fixed-memory shifts do not change the space bound; shared and
-scale memory, where growth would be visible, are lower.
+The candidate therefore improves the scale-sensitive workload and total measured
+work while retaining exact output. No claim is made that every noisy point
+estimate is numerically lower.
 
 ## Asymptotic bounds
 
-Let `N` be JSON syntax nodes, `D` maximum nesting depth, `R` emitted references, `P` project files,
-and `A` UI asset bytes.
+Let `N` be top-level Python syntax nodes, `R` registry types, `A` UI assets,
+`L` input length, `P` project files, `K` concurrent callers, and `G` emitted
+graph size.
 
-| Path | Candidate bound | Comparison with both parents |
+| Path | Candidate bound | Parent comparison |
 | --- | --- | --- |
-| Specialized JSON extraction | `O(N + R)` time; existing tree/output storage, no new allocation | Parents could invoke a recursive YAML subtree scan at each nested JSON array/document, producing `N + (N-1) + ... = O(N^2)` time on a nested chain. The candidate performs one cursor walk and preserves exact output. |
-| JSON auxiliary traversal memory | No added scanner allocation; recursion from the YAML helper is removed | Equal or lower than both parents; no new depth-dependent auxiliary structure is introduced. |
-| General extraction/indexing | Existing destination bounds in `P` and emitted graph size | Destination implementation retained; exact scale output and lower instructions/latency/memory than both measured parents. |
-| UI asset verification | `O(A)` time and memory with the upstream size cap | Same asymptotic class as upstream; bounded independently of project size. Destination did not have this release check. |
-| Install/activation persistence | `O(A)` sidecar copy plus existing transaction work | Same bounded asset cost as upstream while retaining destination rollback. |
-| Runtime-set locking/readiness checks | Constant metadata/lock work per invocation | Same class as upstream; no indexing/query hot-path cost. |
-| Concurrent ephemeral admission | `O(K)` connection work and existing per-connection storage for `K` callers; no new allocation or polling structure | Same asymptotic bounds as both parents. Already-accepted callers share one generation instead of incurring up to `K` serial daemon startups; single-client shutdown keeps the existing pre-drain transition. |
+| Python module-class epoch | `O(R*N)` time, `O(1)` auxiliary space | Better than the destination/current pre-repair indexed-child restart behavior; exact reversed-order test passes |
+| UI asset lookup | `O(log A)` time, `O(1)` lookup space after generated storage | Equal to destination and better than upstream's linear scan |
+| UI and daemon port parsing | `O(L)` time, `O(1)` space | Equal growth bound; strict shared parser rejects prefixes and overflow |
+| Empty import specification | `O(1)` | Avoids an unnecessary root cursor walk |
+| Unsupported-language LSP gate | `O(1)` dispatch with no timer/atomic write | Removes empty instrumentation work |
+| Registry finalization scratch index | `O(F)` temporary memory for `F` functions, reclaimed with the supplied scratch arena | Same time bound; lower retained memory ownership than allocating into the result arena |
+| General indexing | Existing destination bounds in `P` and `G` | Destination algorithms and exact-delta behavior retained |
+| Concurrent daemon admission | Existing `O(K)` connection work and storage | No serial-generation or polling structure added |
 
-No candidate path worsens runtime, latency, or memory growth relative to either parent. The one
-identified asymptotic defect is removed, and the production measurements show lower work on the
-shared and scale cohorts without dropping destination output.
+No candidate path has a worse asymptotic runtime, retained-memory, auxiliary-space,
+latency, or output-growth bound than either parent. The benchmark scale fixture
+confirms the Python hot-path change reduces retired work as input grows.
 
-## Push, PR, CI, and installation plan
+## Publication and CI plan
 
 - [x] Pin both parents, merge base, recovery refs, and isolated parent worktrees.
-- [x] Audit the DCO rewrite for tree and patch identity.
-- [x] Resolve the 11 conflicts as a semantic union and create a signed two-parent merge.
-- [x] Add the nosan linkage repair and JSON linear-walk repair as signed checkpoints.
-- [x] Run the full native, Python, lint, analyzer, leak, scribble, Guard Malloc, and TSan gates.
-- [x] Run 21- and 41-repetition three-candidate production benchmark matrices.
-- [x] Add this ignored note as an intentional tracked assessment artifact.
-- [x] Rerun DCO over `upstream/main..HEAD`; all 932 release-candidate commits carry valid signoffs.
-- [x] Atomically publish `api-consolidation-merge` and `api-consolidation` through `9dfd68f` with
-  exact force-with-lease guards.
-- [x] Install and hash/code-sign/smoke-verify `9dfd68f` without interrupting the older active daemon.
-- [x] Commit the concurrent ephemeral-admission repair with DCO, rerun the 8,649-test canonical
-  matrix, focused 47-test TSan run, and 1,317-test leak gate, then install and smoke-test the final
-  production binary.
-- [ ] Atomically republish both branch names with exact leases.
-- [ ] Rewrite PR #1245's title/body from this evidence and verify its head/base commit IDs.
-- [ ] Obtain a green required-check rollup for the final head, including the native Windows guard.
+- [x] Inspect both parents' actual code, first-parent changes, and lateral callers.
+- [x] Create the signed two-parent merge and retain both parents as ancestors.
+- [x] Add red tests for parser strictness, Python registry order/scale, scratch
+  ownership, no-op LSP work, and released-hook migration.
+- [x] Run canonical sanitizer, TSan, leak, scribble, Guard Malloc, analyzer,
+  protocol, package, source-safety, and focused unit gates.
+- [x] Build the exact parent and candidate runners; run the full 41-pair matrix.
+- [x] Commit product changes `8df9f9d` and `5504dcf` with DCO signoffs.
+- [ ] Commit this refreshed assessment with DCO and audit every commit in the
+  candidate-only range for `Signed-off-by`.
+- [ ] Build and install the final committed binary; verify mode, hash, code
+  signature, `--version`, and `--help` without stopping active clients.
+- [ ] Fetch both remote refs, record exact old object IDs, and publish both names
+  atomically with `--force-with-lease=<ref>:<old>`.
+- [ ] Verify both remote names and PR #1245's head resolve to the final commit.
+- [ ] Replace PR #1245's title/body with the final evidence and monitor every
+  required check, including native Windows daemon/UI lifecycle coverage.
 
 ## Evidence limits
 
-The code-graph `search_graph` and `check_index_coverage` calls returned `Transport closed` for the
-worktree. Direct source, disassembly, parent diffs, tests, and retained benchmark artifacts are the
-authorities for this assessment. Local macOS tests cannot replace the native Windows cold-storm
-guard, so final release readiness remains contingent on that hosted check passing after republish.
-An attempted local old-versus-new CLI storm was rejected by the account-wide active-build cohort,
-despite isolated cache directories, because older interactive clients remain open. Those timings
-were discarded. The active sessions were not stopped, and the hosted cold-storm guard remains the
-valid end-to-end latency check.
+The code-graph transport returned `Transport closed` during this merge. Direct
+source, parent diffs, history, tests, disassembly where needed, and retained
+benchmark artifacts are the evidence authority.
+
+Local macOS verification cannot replace native Windows lifecycle checks. The
+published head is release-ready only after those hosted checks pass. Active user
+clients were not stopped, so installation verification must avoid daemon
+replacement until the current daemon can hand off safely.
