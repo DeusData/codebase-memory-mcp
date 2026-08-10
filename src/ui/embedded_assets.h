@@ -24,8 +24,8 @@ extern const int CBM_EMBEDDED_FILE_COUNT;
 
 /* The generator emits bytewise path order; keep lookup logarithmic as the
  * frontend gains chunks. */
-static inline const cbm_embedded_file_t *
-cbm_embedded_lookup_sorted(const cbm_embedded_file_t *files, size_t count, const char *path) {
+static inline const cbm_embedded_file_t *cbm_embedded_lookup_sorted(
+    const cbm_embedded_file_t *files, size_t count, const char *path) {
     if (!files || !path) {
         return NULL;
     }

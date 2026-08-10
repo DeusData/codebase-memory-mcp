@@ -1132,8 +1132,7 @@ static int parse_ui_flags(int argc, char **argv, bool *ui_enabled, int *ui_port,
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strncmp(argv[i], "--ui=", SLEN("--ui=")) == 0) {
             if (!cbm_ui_parse_enabled(argv[i] + MAIN_FLAG_OFF, ui_enabled)) {
-                (void)fprintf(stderr,
-                              "error: invalid --ui value; use --ui=true or --ui=false\n");
+                (void)fprintf(stderr, "error: invalid --ui value; use --ui=true or --ui=false\n");
                 return -1;
             }
             if (explicit_enable && *ui_enabled) {
@@ -2972,10 +2971,10 @@ int main(int argc, char **argv) {
      * flags before bootstrap could reconfigure the already-running daemon
      * even though that client was then rejected. */
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT && cbm_mcp_tool_profile_allows_http(tool_profile)) {
-        if (ui_update_mask != 0 && cbm_daemon_application_client_set_ui_config(
-                                       g_daemon_client, (uint8_t)ui_update_mask,
-                                       requested_ui_enabled, requested_ui_port,
-                                    MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        if (ui_update_mask != 0 &&
+            cbm_daemon_application_client_set_ui_config(
+                g_daemon_client, (uint8_t)ui_update_mask, requested_ui_enabled, requested_ui_port,
+                MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
             (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;

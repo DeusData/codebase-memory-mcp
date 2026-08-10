@@ -3292,8 +3292,8 @@ static int rollback_quarantined_generation(const char *db_path,
         if (replacement_path_exists(source) && cbm_rename_noreplace(source, destination) != 0) {
             char errno_text[16];
             (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
-            cbm_log_error("finalize.rollback_failed", "reason", "sidecar_restore", "source",
-                          source, "dest", destination, "errno", errno_text);
+            cbm_log_error("finalize.rollback_failed", "reason", "sidecar_restore", "source", source,
+                          "dest", destination, "errno", errno_text);
             return CBM_PIPELINE_PERSIST_FAILED;
         }
     }
@@ -3379,8 +3379,8 @@ static int prepare_existing_generation_for_replace(const char *db_path,
     if (seal_rc != CBM_STORE_OK) {
         char seal_text[16];
         (void)snprintf(seal_text, sizeof(seal_text), "%d", seal_rc);
-        cbm_log_error("finalize.prepare_failed", "reason", "seal_existing", "rc", seal_text,
-                      "path", db_path);
+        cbm_log_error("finalize.prepare_failed", "reason", "seal_existing", "rc", seal_text, "path",
+                      db_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
     if (cbm_remove_db_sidecars(db_path) != 0) {
