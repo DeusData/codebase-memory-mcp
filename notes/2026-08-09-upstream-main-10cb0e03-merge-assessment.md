@@ -5,49 +5,56 @@
 | Field | Current evidence |
 | --- | --- |
 | Purpose | Release record, benchmark report, and remaining publication plan for PR #1245 |
-| Status | Exact current-main candidate, installation, sanitizer lanes, and two-parent benchmarks verified; guarded publication, PR metadata, and final-head hosted CI remain |
-| Evidence baseline | macOS arm64, 2026-08-10; final product merge `8778050` |
+| Status | Product code, two-parent benchmarks, sanitizer lanes, and dual-ref publication verified; final-head hosted CI, installation, and PR metadata remain |
+| Evidence baseline | macOS arm64, 2026-08-10; product tree `f0627b1c`; published head `a60199ac` |
 | Destination parent | `9953c328d1af27a836c533b399dc5b8ec08a22f5` |
 | Exact final merge parents | First `a2e019fc9455632632bb15786a0dd6671ba3c054`; second/current upstream `aa6d740a8b7c7819c045d7bab67b69456994d70e` |
-| Current upstream main | `aa6d740a8b7c7819c045d7bab67b69456994d70e` |
-| Merge base | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
+| Current upstream main | `aa6d740a8b7c7819c045d7bab67b69456994d70e`, confirmed by a fresh fetch on 2026-08-10 |
+| Fork `origin/main` | `988d9758134a555d95a3adf154013a69a9856d18`, an ancestor of current upstream; the PR base truth is `upstream/main` |
+| Original consolidation merge base | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
+| Exact final-parent merge base | `ad010b1656aa39c48a34b180e3501b9205a27ffd` |
 | Consolidation merge | `32bc95314e2e9d64bb62211a78c16c58331c0588` |
 | Current-main refresh merges | `29c7a2f1` joins `1f8ccb76` with `ad010b16`; `8778050` joins `a2e019fc` with current main `aa6d740a` |
 | Recovery refs | Prior `refs/merge-recovery/` and `refs/merge-input/` pairs plus `pre-upstream-main-20260810-a2e019fc` and `upstream-main-20260810-aa6d740a` |
-| Release refs | `api-consolidation` and `api-consolidation-merge` must resolve to the same final commit |
-| Decision needed | None for local content. Publication uses exact remote leases; PR metadata still requires its separate authorization. |
+| Release refs | Remote `api-consolidation` and `api-consolidation-merge` both resolve to `a60199ac` |
+| Decision needed | None for code composition. Release still requires green final-head CI, final installation, and separate PR-metadata authorization. |
 
-This note supersedes its earlier 10cb0e03-era test counts, parent SHAs, benchmark
-paths, and installation hash. Historical commits remain available in Git.
+This note supersedes its earlier test counts, parent SHAs, benchmark paths, and
+installation hash. Historical commits remain available in Git.
 
 ## Before, now, and target
 
 | Area | Before | Verified now | Release target | Consequence |
 | --- | --- | --- | --- | --- |
-| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `32bc9531` joins `9953c328` with `4ed8d384`; `29c7a2f1` takes `ad010b16`; `8778050` takes current main `aa6d740a` | Publish both release branch names at one tip | Reviewers see one auditable superset history |
+| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `8778050` retains exact parents `a2e019fc` and `aa6d740a`; both release refs publish signed head `a60199ac` | Keep both release branch names at the exact final tip | Reviewers see one auditable superset history |
 | Release packaging | Upstream carried the newer embedded UI/runtime-set design; destination carried rollback and richer installation behavior | One embedded binary, one four-member archive set, exact asset lookup, rollback, activation, and ownership contracts coexist | Keep all package and install checks green on the published head | No sidecar-era or variant-binary regression |
 | Indexing and API behavior | Destination was ahead in dependency indexing, PageRank, incremental indexing, extraction, and diagnostics | Those paths remain, together with upstream UI, Windows, archive, and release hardening | Preserve both parents' useful behavior | The merge does not trade branch functionality for upstream freshness |
 | Python registry filtering | Repeated indexed root-child scans scaled poorly with registry size | One circular `TSTreeCursor` performs root membership checks in `O(R*N)` time and `O(1)` auxiliary space | Retain exact class filtering for arbitrary registry order | Scale latency and retired work fall without output loss |
 | Hook migration | Upstream static re-embedding retained only the older released SessionStart identity | The finite allowlist includes both exact released scripts | Remove only known owned historical scripts | User hooks are migrated without fuzzy deletion |
 | Trust boundaries | Invalid UI/port inputs and rollback failures could be hidden by permissive or secondary paths | Shared strict parsing, pre-admission rejection, and propagated persistence/rollback errors fail loudly | Preserve the same errors in package and hosted tests | Bad input and partial persistence cannot look successful |
 
-No content decision remains. The implementation gate is guarded dual-ref
-publication and green final-head CI.
+No code-composition decision remains. The release gate is green final-head CI,
+installation of the exact final source head, matching refs, clean worktrees, and
+current PR metadata.
 
 ## Parent assessment
 
 | Parent | Value and quality | Risk if taken wholesale | Disposition |
 | --- | --- | --- | --- |
-| Destination `9953c328` | More advanced dependency indexing, PageRank, exact-delta and overlay indexing, richer extraction, activation transactions, daemon admission, JSON hot paths, diagnostics, tests, and benchmark coverage | It lacked the refreshed upstream release composition and some later portability fixes | Use as the behavior, correctness, and hot-path baseline |
-| Upstream `aa6d740a` | Coherent embedded UI/templates, unsuffixed archive composition, wrapper/install corrections, Windows path handling, arm64 W^X behavior, release contracts, and OS-truth diagnostic RSS on Linux | Wholesale replacement would remove destination-only indexing, query, lifecycle, diagnostics, and benchmark work | Take the release, portability, and RSS-correctness changes, then compose them with destination behavior |
+| First merge parent `a2e019fc` | Retains destination `9953c328`'s dependency indexing, PageRank, exact-delta and overlay indexing, richer extraction, activation transactions, daemon admission, JSON hot paths, diagnostics, tests, and benchmark coverage; also contains the earlier upstream refresh through `ad010b16` | It lacked the two newer upstream commits, including the Linux RSS correction | Use as the behavior, correctness, and hot-path preservation baseline |
+| Second merge parent `aa6d740a` | Coherent embedded UI/templates, unsuffixed archive composition, wrapper/install corrections, Windows path handling, arm64 W^X behavior, release contracts, and OS-truth diagnostic RSS on Linux | Wholesale replacement would remove first-parent-only indexing, query, lifecycle, diagnostics, and benchmark work | Take the release, portability, and RSS-correctness delta, then compose it with first-parent behavior |
 
-The merge base to destination range changes 350 files (179,660 insertions and
-31,411 deletions). The merge base to current upstream range changes 80 files
-(3,136 insertions and 11,672 deletions). Investigation difficulty is **5/5** because
-many lifecycle, package, protocol, and performance contracts cross file boundaries
-without textual conflicts. Completion difficulty is **4/5**: the shared fixes are
-small, but exact-parent builds, sanitizer lanes, allocator checks, installation,
-Windows evidence, DCO, and guarded publication are all required.
+The original `10cb0e03` consolidation base to destination `9953c328` range
+changes 350 files (179,660 insertions and 31,411 deletions); the same base to
+current upstream changes 80 files (3,136 insertions and 11,672 deletions). The
+exact final parents diverge at `ad010b16`, with 966 first-parent-only commits and
+2 second-parent-only commits. Relative to `a2e019fc`, product merge `8778050`
+changes only `src/foundation/diagnostics.c` (10 insertions and 3 deletions), while
+retaining the first parent's broader code and tests. Investigation difficulty is
+**5/5** because many lifecycle, package, protocol, and performance contracts cross
+file boundaries without textual conflicts. Completion difficulty is **4/5**: the
+shared fixes are small, but exact-parent builds, sanitizer lanes, allocator checks,
+installation, Windows evidence, DCO, and guarded publication are all required.
 
 ## Merge composition and lateral repairs
 
@@ -77,30 +84,44 @@ Windows evidence, DCO, and guarded publication are all required.
    `cbm_mem_rss()` and `cbm_mem_peak_rss()` helpers. The merge retains this
    branch's process CPU fields, private output paths, retained-trajectory event,
    and export-based soak cache isolation.
+10. `1a64a1f5` makes the smoke contract require the exact fail-loud
+    `error: unknown update option: --standard` rejection. `be24566f` replaces a
+    one-second PowerShell/WMI child probe with native Toolhelp enumeration for
+    the Windows test scheduler; enumeration errors still fail closed.
+11. `f0627b1c` removes the temporary SQLite memory store from daemon session
+    construction. Public `cbm_mcp_server_new(NULL)` behavior is unchanged for
+    stdio MCP, hook, UI, and embedded callers; only `application_session_open()`
+    uses the internal storeless constructor before required project context is
+    established.
+12. `a60199ac` exercises the streamlined released SessionStart identity in the
+    Windows migration lifecycle test. It changes only `tests/test_cli.c`, so it
+    does not invalidate the production benchmark binaries built from
+    `f0627b1c`.
 
 ## Correctness, safety, and robustness evidence
 
 | Gate | Final local result |
 | --- | --- |
-| Canonical ASan/UBSan on `8778050` | 8,637 passed, 2 platform skips; exit 0; focused diagnostics 7/7 and memory/RSS 51/51 also passed; no sanitizer or runtime-error report |
-| ThreadSanitizer concurrency matrix on `8778050` | 1,349 passed, 2 platform skips; exit 0; no race report |
-| Apple `leaks` on the nosan runner | Full allocation-owning lane and exact merged-head diagnostics lane: 0 leaks for 0 total leaked bytes |
-| MallocScribble and MallocPreScribble | 8,637 passed, 2 skipped; no corruption crash |
-| Guard Malloc allocation-owning suites | 1,366 passed; no overrun or use-after-free crash |
-| Clang static analyzer | exit 0; no warning in a modified production file |
-| CLI suite after the malformed-`argv` repair | 325/325 passed under ASan/UBSan |
-| Python registry, LSP, and scale focus | 151/151 passed under ASan/UBSan |
-| Benchmark driver tests | 9/9 passed |
-| Go, npm, and PyPI wrappers | 42, 11, and 28 tests passed |
-| Embedded readiness, archive, vendored, schema, daemon, UI, activation, and protocol gates | passed |
-| Installed embedded-UI binary from `8778050` | build/install SHA-256 `08c8125485cd46a240b958ddfeec436fd356fdf68f1ada3ba25105a48cb24443`; mode 755; strict code signature, `--version`, `--help`, and MCP initialize passed |
+| Canonical ASan/UBSan on `a60199ac` | 8,637 tests passed, 2 platform tests skipped; exit 0; no sanitizer or runtime-error report |
+| Focused daemon ASan/UBSan on `f0627b1c` | Application 51, runtime 47, bootstrap 24, and IPC 47 tests passed |
+| ThreadSanitizer on `f0627b1c` | 1,349 tests passed, 2 platform tests skipped; exit 0; no race report |
+| Apple `leaks` on `f0627b1c` | 1,319 allocation-owning tests passed; 0 leaks for 0 total leaked bytes |
+| MallocScribble and MallocPreScribble on `f0627b1c` | 8,637 tests passed, 2 platform tests skipped; no corruption crash |
+| Guard Malloc on `f0627b1c` | 1,366 allocation-owning tests passed; no overrun or use-after-free crash |
+| Clang static analyzer | Exit 0; no warning in an edited line range |
+| Local lint | `lint-ci`, clang-format, cppcheck, NOLINT, and source-safety passed. LLVM 22 clang-tidy found no issue in either edited production source; its full-tree target reports 1,088 existing findings in unrelated extraction and CLI files. |
+| Daemon production lifecycle | Full stability guard passed; 20 consecutive six-client cold waves accepted 120 clients and retired each ephemeral daemon |
+| CLI after `a60199ac` | ASan/UBSan CLI and agent-client lane passed 355 tests |
+| Hosted `f0627b1c` checks | DCO, lint, analyze, CodeQL, diagnostics, LSan, PR smoke, package wrappers, TSan, dedicated Windows daemon guard, and completed Unix legs passed |
+| Hosted Windows unit shards on `f0627b1c` | Both stopped at `tests/test_cli.c:9727` with `-Werror,-Wunused-const-variable`; `a60199ac` now uses that exact fixture in the Windows lifecycle test |
+| Prior installed product merge `8778050` | Build/install SHA-256 `08c8125485cd46a240b958ddfeec436fd356fdf68f1ada3ba25105a48cb24443`; mode 755; strict code signature, `--version`, `--help`, and MCP initialize passed. Exact-final-head installation remains open. |
 | Production npm dependency audit | 0 vulnerabilities with `npm audit --omit=dev --audit-level=high` |
-| Source secret scan | no match |
+| Source secret scan | No match |
 
-The canonical logs are retained under
-`/Users/athundt/Library/Application Support/rtk/tee/`. The leak and memory
-reports are `build/c/leak-report.txt` and `build/c/mem-report.txt`; subsequent
-targets overwrite the latter, so the RTK logs retain each complete run.
+The leak and memory reports are `build/c/leak-report.txt` and
+`build/c/mem-report.txt`. The verification host retains the complete command
+logs outside the repository because subsequent diagnostic targets overwrite
+`build/c/mem-report.txt`.
 
 ## Production benchmark evidence
 
@@ -114,53 +135,75 @@ footprint, retired instructions, and cycles.
 
 | Runner | Source | SHA-256 |
 | --- | --- | --- |
-| Merged | `8778050` | `0c01baff77eb4f2abeaa3f8aba8d7e8fb2ab62d08045b5ccfa0559a5540d68d6` |
+| Final product tree | `f0627b1c` | `adf1dab52f46b718889b618c5344ec7ea94fe825de6d4ad774b5e27f394f91ae` |
 | First parent | `a2e019fc` | `dc1d8ecc6af78c7893e7df5247d0cf73f354149ab29c9b2e9cfb2ac032077d5a` |
 | Second parent/current upstream | `aa6d740a` | `b5bd4b4bd9a3ffbac12f70a240a8295505374dfa889933998a22795062ba34cd` |
 
-Result JSON:
-`/Users/athundt/.cache/codebase-memory-mcp/api-consolidation-final-20260810/results/final-aa6d-parents-41/native-extraction-results.json`
+Result JSON: `native-extraction-results.json`, retained outside the repository.
 
 Result SHA-256:
-`aa4b0930907ec0d8e4dfcf79432053610b12aa68cb51fd89ad7b183996c700ae`
+`acf52d4764cf737450d55ac567fcc916e1882528354d839511c91e245647ac16`
 
-All four workloads have exact output parity against both exact merge parents.
-Values below are medians in merged / first parent / second parent order.
+All five compared cohorts have exact output parity against both exact merge
+parents. The table omits the startup resource baseline and gives medians in
+final product / first parent / second parent order.
 
 | Workload | Latency ms | Retired instructions | Incremental instructions | Incremental max RSS bytes | Incremental peak footprint bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Shared JSON, 1,024 extracts | 49.03 / 49.03 / 79.40 | 803,503,444 / 803,460,727 / 1,278,571,646 | 777,142,702 / 777,124,750 / 1,252,339,746 | 1,064,960 / 1,064,960 / 1,130,496 | 311,368 / 294,984 / 327,752 |
-| C# fixed | 3.40 / 3.40 / 3.44 | 70,184,869 / 70,194,052 / 70,706,640 | 43,868,794 / 43,918,495 / 44,519,872 | 4,915,200 / 4,898,816 / 4,734,976 | 786,504 / 770,120 / 802,888 |
-| Python fixed | 7.94 / 7.93 / 8.00 | 118,314,141 / 118,567,672 / 118,744,994 | 92,038,490 / 92,099,899 / 92,544,047 | 4,423,680 / 4,407,296 / 4,259,840 | 1,491,016 / 1,474,632 / 1,523,784 |
-| Python scale, 8,000 calls | 519.9 / 519.9 / 1,191.0 | 9,703,504,999 / 9,699,097,011 / 19,481,093,409 | 9,677,219,788 / 9,672,557,183 / 19,451,724,113 | 42,893,312 / 42,909,696 / 42,844,160 | 40,157,304 / 40,173,664 / 40,255,608 |
+| Shared JSON, 1,024 extracts | 49.03 / 49.07 / 79.54 | 803,515,745 / 803,488,230 / 1,278,632,695 | 777,108,558 / 777,055,534 / 1,252,303,821 | 1,064,960 / 1,064,960 / 1,130,496 | 294,984 / 311,368 / 327,752 |
+| C# fixed | 3.41 / 3.41 / 3.44 | 70,148,317 / 70,174,188 / 70,731,906 | 43,856,245 / 43,845,064 / 44,482,198 | 4,898,816 / 4,898,816 / 4,734,976 | 770,120 / 770,120 / 802,888 |
+| Python fixed | 7.94 / 7.92 / 7.97 | 118,309,924 / 118,353,404 / 118,768,535 | 92,021,680 / 92,016,057 / 92,539,016 | 4,407,296 / 4,407,296 / 4,259,840 | 1,474,632 / 1,474,632 / 1,523,784 |
+| Python scale, 8,000 calls | 519.8 / 518.7 / 1,190.1 | 9,698,224,935 / 9,698,721,813 / 19,478,797,591 | 9,671,743,245 / 9,671,974,558 / 19,452,575,158 | 42,893,312 / 42,909,696 / 42,844,160 | 40,140,920 / 40,157,280 / 40,255,608 |
 
 ### Performance decision
 
 Against the first parent, the merged runner is practically equivalent. Python
-scale has equal 519.9 ms medians; paired differences are +0.10% latency, +0.03%
-retired instructions, +0.04% incremental instructions, +0.14% cycles, -0.07%
-incremental max RSS, and -0.08% incremental physical footprint. Shared JSON
-differs by +0.04% latency, +0.002% instructions, and -0.03% cycles. Its +5.55%
-incremental footprint difference is exactly one 16 KiB startup-subtraction page;
-full footprint falls by 24 bytes and incremental max RSS medians are equal. The
-benchmarked workloads do not enable optional diagnostics, so this is code-layout
-and page-subtraction noise rather than algorithmic or retained-memory growth.
+scale paired differences are +0.30% latency, -0.004% retired instructions,
++0.40% cycles, -0.04% max RSS, and -0.04% physical footprint. Fixed C# latency
+is equal; fixed Python and shared JSON latency are 0.13% and 0.10% lower. Shared
+JSON's incremental footprint differs by one 16 KiB startup-subtraction page;
+full footprint differs by 24 bytes and incremental max RSS medians are equal.
+The benchmark workloads do not enable optional diagnostics, so these page-sized
+differences do not indicate an algorithmic or retained-memory growth change.
 
-Against the second parent, Python scale falls 56.33% in latency, 50.19% in
-retired instructions, 50.25% in incremental instructions, 53.11% in cycles, and
-0.24% in incremental physical footprint. Shared JSON falls 38.08% in latency,
-37.16% in instructions, and 4.99% in incremental physical footprint. Fixed C#
-and Python latency fall 0.89% and 0.85%. All compared outputs are exact.
+Against the second parent, Python scale falls 56.33% in latency, 50.21% in
+retired instructions, 50.28% in incremental instructions, 52.97% in cycles, and
+0.24% in incremental physical footprint. Shared JSON falls 38.27% in latency,
+37.16% in instructions, 5.80% in incremental max RSS, and 10.00% in incremental
+physical footprint. Fixed C# and Python latency fall 1.17% and 0.63%. All
+compared outputs are exact.
 
 The result is practical performance equivalence to the first parent and a large
 scale-sensitive improvement over the second. No claim is made that every noisy
 allocator-page counter is numerically lower.
 
+### Daemon cold-session benchmark
+
+The change-specific workload runs six concurrent `cli list_projects` one-shots
+from no daemon. Each candidate had one warmup and five measured samples; the
+harness required every compared binary process to be absent before and after
+each sample. One earlier mixed-binary probe is excluded because it switched
+builds before the account-global daemon exited and produced explicit build/cache
+conflicts.
+
+| Production binary | Valid samples | Median six-client cold-session latency |
+| --- | ---: | ---: |
+| Final `f0627b1c` | 5 of 5 | 982.366 ms |
+| First parent `a2e019fc` | 5 of 5 | 14,422.502 ms |
+| Second parent `aa6d740a` | 5 of 5 | 12,194.046 ms |
+
+Final median latency is 93.19% lower than the first parent and 91.94% lower than
+the second parent. The result file
+`final-f0627b1-parents-cold-session-5.json` is retained outside the repository
+with SHA-256
+`19b74ef128f2a9d7412b424d7817dd771768dcc5b11cede25c151bbe005f4913`.
+
 ## Asymptotic bounds
 
 Let `N` be top-level Python syntax nodes, `R` registry types, `A` UI assets,
 `L` input length, `P` project files, `K` concurrent callers, and `G` emitted
-graph size.
+graph size. Let `S` be the SQLite pragma, schema, and user-index initialization
+work for one temporary store.
 
 | Path | Candidate bound | Parent comparison |
 | --- | --- | --- |
@@ -172,7 +215,8 @@ graph size.
 | Registry finalization scratch index | `O(F)` temporary memory for `F` functions, reclaimed with the supplied scratch arena | Same time bound; lower retained memory ownership than allocating into the result arena |
 | Optional diagnostics RSS sample | `O(1)` time and `O(1)` space every five seconds while diagnostics are enabled | Same bounds as both parents; OS RSS helpers replace a Linux mimalloc counter that could wrap to a false exabyte-scale value; disabled request paths are unchanged |
 | General indexing | Existing destination bounds in `P` and `G` | Destination algorithms and exact-delta behavior retained |
-| Concurrent daemon admission | Existing `O(K)` connection work and storage | No serial-generation or polling structure added |
+| Daemon session construction | `O(K)` MCP-session initialization and `O(K)` session storage; the required named store opens lazily after project context exists | Both exact parents perform `O(K*S)` temporary SQLite initialization through `sqlite3_open_v2()`, `configure_pragmas()`, `init_schema()`, and `create_user_indexes()` before immediately closing each store. Final removes the `S` factor and its transient allocations. |
+| Concurrent daemon admission | Existing `O(K)` connection work and storage | No serial-generation, debounce, or polling structure added |
 
 No candidate path has a worse asymptotic runtime, retained-memory, auxiliary-space,
 latency, or output-growth bound than either parent. The benchmark scale fixture
@@ -183,26 +227,30 @@ confirms the Python hot-path change reduces retired work as input grows.
 - [x] Pin both parents, merge base, recovery refs, and isolated parent worktrees.
 - [x] Inspect both parents' actual code, first-parent changes, and lateral callers.
 - [x] Create the signed two-parent merge and retain both parents as ancestors.
-- [x] Add red tests for parser strictness, Python registry order/scale, scratch
-  ownership, no-op LSP work, and released-hook migration.
-- [x] Run canonical sanitizer, TSan, leak, scribble, Guard Malloc, analyzer,
-  protocol, package, source-safety, and focused unit gates.
-- [x] Build `8778050` and both exact parent runners; run the full rotated
-  41-pair matrix with exact output parity.
-- [x] Commit product changes `8df9f9d` and `5504dcf` with DCO signoffs.
-- [x] Merge current upstream `ad010b16` and pass YAML, venue-parity,
-  smoke-fixture, and Windows single-binary workflow contracts.
-- [x] Merge current upstream `aa6d740a`; verify the diagnostics and memory/RSS
-  suites, full TSan lane, diagnostics leak lane, and canonical lint.
-- [x] Build and install `8778050`; verify matching build/install SHA-256, mode,
-  strict code signature, `--version`, `--help`, and MCP initialize.
-- [ ] Commit this final release record with DCO and validate every non-merge
-  commit after `aa6d740a` with the repository DCO checker.
-- [ ] Fetch both remote refs, record exact old object IDs, and publish both names
-  atomically with `--force-with-lease=<ref>:<old>`.
-- [ ] Verify both remote names and PR #1245's head resolve to the final commit.
-- [ ] Replace PR #1245's title/body with the final evidence and monitor every
-  required check, including native Windows daemon/UI lifecycle coverage.
+- [x] Preserve strict parsing, exact incremental indexing, released-hook
+  migration, fail-loud rollback, and upstream packaging contracts with focused
+  regressions.
+- [x] Remove temporary per-session SQLite initialization at `f0627b1c` and pass
+  canonical sanitizer, TSan, leak, Scribble, Guard Malloc, analyzer, lint,
+  daemon, and cold-storm gates.
+- [x] Build `f0627b1c` and both exact parent runners; complete the rotated
+  41-repetition extraction matrix with exact output parity.
+- [x] Complete five valid process-gated six-client cold-session samples for each
+  production binary and record both parent comparisons.
+- [x] Commit the Windows released-hook lifecycle correction as signed
+  `a60199ac`; pass the local 355-test CLI/agent-client sanitizer lane.
+- [x] Publish `a60199ac` atomically to both release branch names with exact
+  force-with-lease guards; verify PR #1245 resolves to that head.
+- [ ] Obtain green hosted checks on the exact final head, including both Windows
+  unit shards and the Windows daemon guard.
+- [ ] Commit this release record with DCO, audit every owned non-merge commit
+  after `aa6d740a`, then atomically republish both branch names with fresh exact
+  leases.
+- [ ] Build and install the exact final source head with no active CBM process;
+  verify build/install SHA-256 equality, mode 755, strict code signature,
+  `--version`, `--help`, and MCP initialize.
+- [ ] Publish the final PR title/body after separate authorization and verify its
+  rendered metadata.
 
 ## Evidence limits
 
@@ -212,5 +260,5 @@ benchmark artifacts are the evidence authority.
 
 Local macOS verification cannot replace native Windows lifecycle checks. The
 published head is release-ready only after those hosted checks pass. No
-codebase-memory-mcp process was active during installation, so no daemon or client
-was stopped.
+codebase-memory-mcp process may be stopped merely to perform the final
+installation; installation waits until the account has no active CBM process.
