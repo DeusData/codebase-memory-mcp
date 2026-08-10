@@ -74,6 +74,7 @@ TEST(shared_parse_baseline) {
         ASSERT_TRUE(output_matches);
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
+    ASSERT_EQ(cbm_get_lsp_ns(), 0);
 
     int lines = 0;
     for (const char *cursor = shared_bench_source; *cursor != '\0'; ++cursor) {

@@ -59,8 +59,9 @@ output-parity cohort for parser and extraction-orchestration work; the language
 fixtures retain capability differences instead of hiding them. A no-work startup
 cohort runs in the same rotated schedule. Its resource counters are subtracted from
 each candidate's matching workload repetition to report
-`incremental_max_rss_bytes` and `incremental_peak_footprint_bytes` without charging
-the workload for different executable mappings.
+`incremental_max_rss_bytes`, `incremental_peak_footprint_bytes`,
+`incremental_instructions`, and `incremental_cycles` without charging the workload
+for different executable mappings and startup paths.
 
 The runner records output counts, extraction-phase latency, and host resource
 counters in `native-extraction-results.json`, with command output retained in

@@ -70,6 +70,28 @@ static uint64_t now_ns(void) {
     return ((uint64_t)ts.tv_sec * NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
 }
 
+static bool cbm_language_has_file_lsp(CBMLanguage language) {
+    switch (language) {
+    case CBM_LANG_GO:
+    case CBM_LANG_PYTHON:
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_RUST:
+    case CBM_LANG_JAVA:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_PHP:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_C:
+    case CBM_LANG_PERL:
+    case CBM_LANG_CUDA:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // cbm_get_profile returns accumulated parse/extract times and file count.
 void cbm_get_profile(cbm_profile_out_t out) {
     *out.parse_ns = atomic_load(&total_parse_ns);
@@ -1458,8 +1480,8 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
 
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
-    uint64_t lsp_start = now_ns();
-    {
+    if (cbm_language_has_file_lsp(language)) {
+        uint64_t lsp_start = now_ns();
         if (language == CBM_LANG_GO) {
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
@@ -1498,17 +1520,17 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         if (language == CBM_LANG_CSHARP) {
             cbm_run_cs_lsp(a, result, source, source_len, root);
         }
+        if (language == CBM_LANG_JAVA) {
+            cbm_run_java_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_KOTLIN) {
+            cbm_run_kotlin_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_RUST) {
+            cbm_run_rust_lsp(a, result, source, source_len, root);
+        }
+        atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
     }
-    if (language == CBM_LANG_JAVA) {
-        cbm_run_java_lsp(a, result, source, source_len, root);
-    }
-    if (language == CBM_LANG_KOTLIN) {
-        cbm_run_kotlin_lsp(a, result, source, source_len, root);
-    }
-    if (language == CBM_LANG_RUST) {
-        cbm_run_rust_lsp(a, result, source, source_len, root);
-    }
-    atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
     // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
     // preprocessor second pass below appends calls with EXPANDED-source lines,

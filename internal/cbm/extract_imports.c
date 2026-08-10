@@ -1364,7 +1364,7 @@ static bool spec_type_matches(const char **types, const char *kind) {
 
 static void parse_spec_imports(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
-    if (!spec || !spec->import_node_types) {
+    if (!spec || !spec->import_node_types || !spec->import_node_types[0]) {
         return;
     }
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);

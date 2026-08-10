@@ -4173,22 +4173,33 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
 /* Module bindings are replayed in source order before deferred function bodies
  * are analyzed. Class definitions always replace an earlier callable identity;
  * the registry decides whether the resulting class type is known precisely. */
-static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const char *name) {
-    uint32_t count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_named_child(root, i);
-        const char *kind = ts_node_type(node);
-        if (strcmp(kind, "decorated_definition") == 0) {
-            node = ts_node_child_by_field_name(node, "definition", 10);
-            kind = ts_node_is_null(node) ? "" : ts_node_type(node);
+static bool py_root_cursor_defines_class_named(PyLSPContext *ctx, TSNode root,
+                                               TSTreeCursor *cursor, const char *name) {
+    TSNode start = ts_tree_cursor_current_node(cursor);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(cursor);
+        bool found = false;
+        if (ts_node_is_named(node)) {
+            const char *kind = ts_node_type(node);
+            if (strcmp(kind, "decorated_definition") == 0) {
+                node = ts_node_child_by_field_name(node, "definition", 10);
+                kind = ts_node_is_null(node) ? "" : ts_node_type(node);
+            }
+            if (strcmp(kind, "class_definition") == 0) {
+                TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+                found = py_import_node_text_equals(ctx, name_node, name);
+            }
         }
-        if (strcmp(kind, "class_definition") != 0)
-            continue;
-        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
-        if (py_import_node_text_equals(ctx, name_node, name))
+        if (!ts_tree_cursor_goto_next_sibling(cursor)) {
+            ts_tree_cursor_reset(cursor, root);
+            if (!ts_tree_cursor_goto_first_child(cursor))
+                return found;
+        }
+        if (found)
             return true;
+        if (ts_node_eq(ts_tree_cursor_current_node(cursor), start))
+            return false;
     }
-    return false;
 }
 
 /* A project registry can contain another file's class in the same logical
@@ -4198,17 +4209,22 @@ static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const ch
 static void py_bind_external_module_classes(PyLSPContext *ctx, TSNode root) {
     if (!ctx || !ctx->registry || !ctx->module_qn)
         return;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool root_has_children = ts_tree_cursor_goto_first_child(&cursor);
     size_t prefix_len = strlen(ctx->module_qn);
     for (int i = 0; i < ctx->registry->type_count; i++) {
         const CBMRegisteredType *type = &ctx->registry->types[i];
         const char *qn = type->qualified_name;
         const char *name = type->short_name;
         if (!qn || !name || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
-            qn[prefix_len] != '.' || py_root_defines_class_named(ctx, root, name)) {
+            qn[prefix_len] != '.' ||
+            (root_has_children &&
+             py_root_cursor_defines_class_named(ctx, root, &cursor, name))) {
             continue;
         }
         py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static void py_bind_module_class(PyLSPContext *ctx, TSNode class_node) {

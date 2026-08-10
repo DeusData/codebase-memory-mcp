@@ -183,24 +183,36 @@ def test_compare_candidates_reports_missing_output_metrics() -> None:
     ]
 
 
-def test_add_incremental_memory_metrics_subtracts_matching_startup_run() -> None:
+def test_add_incremental_resource_metrics_subtracts_matching_startup_run() -> None:
     samples = [
         {
             "candidate": "merged",
             "suite": MODULE.STARTUP_SUITE,
             "repetition": 1,
-            "metrics": {"max_rss_bytes": 200, "peak_footprint_bytes": 125},
+            "metrics": {
+                "max_rss_bytes": 200,
+                "peak_footprint_bytes": 125,
+                "instructions": 1000,
+                "cycles": 500,
+            },
         },
         {
             "candidate": "merged",
             "suite": "shared_parse_baseline",
             "repetition": 1,
-            "metrics": {"max_rss_bytes": 350, "peak_footprint_bytes": 300},
+            "metrics": {
+                "max_rss_bytes": 350,
+                "peak_footprint_bytes": 300,
+                "instructions": 1800,
+                "cycles": 1200,
+            },
         },
     ]
 
-    MODULE.add_incremental_memory_metrics(samples)
+    MODULE.add_incremental_resource_metrics(samples)
 
-    assert samples[0]["metrics"] == {"max_rss_bytes": 200, "peak_footprint_bytes": 125}
+    assert "incremental_instructions" not in samples[0]["metrics"]
     assert samples[1]["metrics"]["incremental_max_rss_bytes"] == 150
     assert samples[1]["metrics"]["incremental_peak_footprint_bytes"] == 175
+    assert samples[1]["metrics"]["incremental_instructions"] == 800
+    assert samples[1]["metrics"]["incremental_cycles"] == 700

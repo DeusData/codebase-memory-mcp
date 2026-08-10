@@ -5,6 +5,7 @@
  * resolution strategies, and qualified name computation.
  */
 #include "test_framework.h"
+#include "lsp/type_registry.h"
 #include "pipeline/pipeline.h"
 
 #include <stdlib.h>
@@ -1105,6 +1106,31 @@ TEST(resolve_cfg_gated_twins_by_source_name) {
     PASS();
 }
 
+TEST(type_registry_finalize_into_keeps_indexes_in_scratch_arena) {
+    CBMArena data_arena;
+    CBMArena scratch_arena;
+    cbm_arena_init(&data_arena);
+    cbm_arena_init(&scratch_arena);
+
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &data_arena);
+    CBMRegisteredFunc method = {
+        .qualified_name = "pkg.Type.method",
+        .receiver_type = "pkg.Type",
+        .short_name = "method",
+    };
+    cbm_registry_add_func(&registry, method);
+    size_t data_bytes = data_arena.total_alloc;
+
+    cbm_registry_finalize_into(&registry, &scratch_arena);
+    ASSERT_EQ(data_arena.total_alloc, data_bytes);
+    ASSERT(scratch_arena.total_alloc > 0);
+
+    cbm_arena_destroy(&scratch_arena);
+    cbm_arena_destroy(&data_arena);
+    PASS();
+}
+
 SUITE(registry) {
     /* FQN */
     RUN_TEST(fqn_simple);
@@ -1142,6 +1168,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_cfg_gated_twins_by_source_name);
+    RUN_TEST(type_registry_finalize_into_keeps_indexes_in_scratch_arena);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);

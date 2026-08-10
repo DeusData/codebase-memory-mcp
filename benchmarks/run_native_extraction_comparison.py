@@ -40,6 +40,8 @@ PERFORMANCE_METRICS = (
     "peak_footprint_bytes",
     "incremental_max_rss_bytes",
     "incremental_peak_footprint_bytes",
+    "incremental_instructions",
+    "incremental_cycles",
     "instructions",
     "cycles",
 )
@@ -159,8 +161,8 @@ def run_sample(runner: Path, suite: str, timeout_seconds: float) -> tuple[dict[s
     return parse_sample(suite, output), output
 
 
-def add_incremental_memory_metrics(samples: list[dict[str, Any]]) -> None:
-    """Subtract each process's no-work startup footprint from workload peaks."""
+def add_incremental_resource_metrics(samples: list[dict[str, Any]]) -> None:
+    """Subtract each process's matching no-work startup resource counters."""
     startup_by_run = {
         (sample["candidate"], sample["repetition"]): sample["metrics"]
         for sample in samples
@@ -172,7 +174,12 @@ def add_incremental_memory_metrics(samples: list[dict[str, Any]]) -> None:
         startup = startup_by_run.get((sample["candidate"], sample["repetition"]))
         if startup is None:
             continue
-        for metric in ("max_rss_bytes", "peak_footprint_bytes"):
+        for metric in (
+            "max_rss_bytes",
+            "peak_footprint_bytes",
+            "instructions",
+            "cycles",
+        ):
             if metric in sample["metrics"] and metric in startup:
                 sample["metrics"][f"incremental_{metric}"] = max(
                     0, sample["metrics"][metric] - startup[metric]
@@ -321,7 +328,7 @@ def main() -> int:
                         flush=True,
                     )
 
-    add_incremental_memory_metrics(samples)
+    add_incremental_resource_metrics(samples)
     result = {
         "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
