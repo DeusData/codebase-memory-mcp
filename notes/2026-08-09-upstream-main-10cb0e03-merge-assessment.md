@@ -5,8 +5,8 @@
 | Field | Current evidence |
 | --- | --- |
 | Purpose | Release record, benchmark report, and remaining publication plan for PR #1245 |
-| Status | Local candidate verified; installation, guarded publication, PR metadata, and final-head hosted CI remain |
-| Evidence baseline | macOS arm64, 2026-08-10; candidate `5504dcf` |
+| Status | Local candidate and installation verified; guarded publication, PR metadata, and final-head hosted CI remain |
+| Evidence baseline | macOS arm64, 2026-08-10; product source `5504dcf`; evidence commit `8208adda` |
 | Destination parent | `9953c328d1af27a836c533b399dc5b8ec08a22f5` |
 | Upstream parent | `4ed8d384f76b4945f1b50845d8b0e28c78ea304b` |
 | Merge base | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
@@ -29,8 +29,8 @@ paths, and installation hash. Historical commits remain available in Git.
 | Hook migration | Upstream static re-embedding retained only the older released SessionStart identity | The finite allowlist includes both exact released scripts | Remove only known owned historical scripts | User hooks are migrated without fuzzy deletion |
 | Trust boundaries | Invalid UI/port inputs and rollback failures could be hidden by permissive or secondary paths | Shared strict parsing, pre-admission rejection, and propagated persistence/rollback errors fail loudly | Preserve the same errors in package and hosted tests | Bad input and partial persistence cannot look successful |
 
-No content decision remains. The implementation gate is a signed final note commit,
-an installed-binary smoke test, guarded dual-ref publication, and green final-head CI.
+No content decision remains. The implementation gate is guarded dual-ref
+publication and green final-head CI.
 
 ## Parent assessment
 
@@ -82,6 +82,8 @@ Windows evidence, DCO, and guarded publication are all required.
 | Benchmark driver tests | 9/9 passed |
 | Go, npm, and PyPI wrappers | 42, 11, and 28 tests passed |
 | Embedded readiness, archive, vendored, schema, daemon, UI, activation, and protocol gates | passed |
+| Installed embedded-UI binary | build/install SHA-256 `30ed57eeee097a4aeff8f90a355b3da86c5159464586b0fb4794dfd17731d1f1`; mode 755; strict code signature, `--version`, `--help`, and MCP initialize passed |
+| Production npm dependency audit | 0 vulnerabilities with `npm audit --omit=dev --audit-level=high` |
 | Source secret scan | no match |
 
 The canonical logs are retained under
@@ -173,10 +175,10 @@ confirms the Python hot-path change reduces retired work as input grows.
   protocol, package, source-safety, and focused unit gates.
 - [x] Build the exact parent and candidate runners; run the full 41-pair matrix.
 - [x] Commit product changes `8df9f9d` and `5504dcf` with DCO signoffs.
-- [ ] Commit this refreshed assessment with DCO and audit every commit in the
-  candidate-only range for `Signed-off-by`.
-- [ ] Build and install the final committed binary; verify mode, hash, code
-  signature, `--version`, and `--help` without stopping active clients.
+- [x] Commit the refreshed assessment with DCO; all 941 non-merge commits in
+  `4ed8d384..8208adda` have author-matching `Signed-off-by` trailers.
+- [x] Build and install the embedded-UI binary; verify mode, matching build/install
+  hash, strict code signature, `--version`, `--help`, and MCP initialize.
 - [ ] Fetch both remote refs, record exact old object IDs, and publish both names
   atomically with `--force-with-lease=<ref>:<old>`.
 - [ ] Verify both remote names and PR #1245's head resolve to the final commit.
@@ -190,6 +192,6 @@ source, parent diffs, history, tests, disassembly where needed, and retained
 benchmark artifacts are the evidence authority.
 
 Local macOS verification cannot replace native Windows lifecycle checks. The
-published head is release-ready only after those hosted checks pass. Active user
-clients were not stopped, so installation verification must avoid daemon
-replacement until the current daemon can hand off safely.
+published head is release-ready only after those hosted checks pass. No
+codebase-memory-mcp process was active during installation, so no daemon or client
+was stopped.
