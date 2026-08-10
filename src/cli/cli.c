@@ -5075,6 +5075,26 @@ static const char cmm_released_session_script[] =
     "3. If a project is not indexed yet, run index_repository FIRST.\n"
     "REMINDER\n";
 
+static const char cmm_released_streamlined_session_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
+    "cat << 'REMINDER'\n"
+    "Code Discovery Protocol:\n"
+    "1. Prefer codebase-memory-mcp tools first for structural code exploration:\n"
+    "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
+    "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
+    "   - get_code(qualified_name) for exact symbol source in streamlined mode\n"
+    "   - query_graph(query) for complex Cypher patterns\n"
+    "   - search_code(pattern) for text/regex source search in an indexed project\n"
+    "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
+    "   always Read a file before editing it.\n"
+    "3. Graph-backed tools auto-index the server CWD or explicit repo paths when\n"
+    "   auto_index=true and under auto_index_limit. search_code needs an\n"
+    "   indexed project. Use _hidden_tools\n"
+    "   to reveal index_repository or get_architecture when explicit control is needed.\n"
+    "REMINDER\n";
+
 static const char cmm_released_subagent_script[] =
     "#!/usr/bin/env bash\n"
     "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
@@ -5226,14 +5246,15 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
                                       sizeof(script)) != CLI_OK) {
         return false;
     }
-    const char *const legacy[] = {cmm_released_session_script};
+    const char *const legacy[] = {cmm_released_session_script,
+                                  cmm_released_streamlined_session_script};
 #ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_SESSION_REMINDER_SCRIPT_LEGACY, script,
-                                            legacy, 1U) != CLI_OK) {
+                                            legacy, 2U) != CLI_OK) {
         return false;
     }
 #endif
-    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
+    return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 2U);
 }
 
 static int cbm_upsert_session_hooks(const char *settings_path) {

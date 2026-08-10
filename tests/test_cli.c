@@ -1669,7 +1669,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t failure_ops = cli_activation_fake_ops(&config_failure);
     cbm_cli_set_activation_ops_for_test(&failure_ops);
-    int config_failure_rc = cli_test_cmd_update(2, argv);
+    int config_failure_rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     struct stat updated_status;
     bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
