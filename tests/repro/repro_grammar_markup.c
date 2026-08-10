@@ -59,9 +59,8 @@
  *                        languages with non-empty call_types AND a fixture that
  *                        produces a resolvable callee_name (TYPST call, QML JS
  *                        call_expression, PURESCRIPT exp_apply). BIBTEX/DIFF
- *                        have call_types ("command") but the nodes are not
- *                        function-application sites with a stable callee_name;
- *                        dim 6 is SKIPPED there and noted.
+ *                        intentionally have no call metadata because their
+ *                        `command` nodes are document records, not applications.
  *
  * FULL-PIPELINE (rh_index_files -> cbm_store_t*, via inv_count_* store helpers):
  *   7. callable-sourcing : inv_count_calls_by_source(store,project,&mod,&call).
@@ -91,15 +90,15 @@
  *                 Dims 1-8. Dim 5 asserts "Function" (a let-bound lambda).
  *                 Dim 7 may RED if the lambda is anonymous and the enclosing-func
  *                 walk attributes the call at Module.
- *   BIBTEX     -- DOCS. call_types = {command} only; entries (@article{...}) are
+ *   BIBTEX     -- DOCS. call_types is empty; entries (@article{...}) are
  *                 NOT mapped to any def label, and "command" nodes are LaTeX-style
  *                 commands, not callee-named application sites. Dims 1-4 + R
  *                 (dim 5 skipped -- no def types; dim 6 skipped -- no stable callee).
  *   MERMAID    -- structural-only. module_types only. Dims 1-4 + R.
  *   PO         -- DOCS/structural-only. module_types only (gettext msgid/msgstr
  *                 entries are not mapped to a def label). Dims 1-4 + R.
- *   DIFF       -- structural. call_types = {command} only (a "command" line in a
- *                 git-style diff header, not a function call); no def types.
+ *   DIFF       -- structural. call_types is empty because a "command" line in a
+ *                 git-style diff header is not a function call; no def types.
  *                 Dims 1-4 + R (dims 5-6 skipped).
  *   REGEX      -- structural-only. module_types = {pattern}. Dims 1-4 + R.
  *   CAPNP      -- SCHEMA. func_types = {method} -> "Function";
@@ -518,28 +517,18 @@ TEST(repro_grammar_markup_rst) {
  * Dims asserted: 1-8 (full battery).
  * Dim 5 expected GREEN: "Function" def for the let-bound lambda.
  * Dim 6 expected GREEN: call to "greet" via the call node.
- * Dim 7 expected RED if the lambda binding name does not flow to the enclosing-
- *   func walk and the call is attributed at Module. RED documents the gap.
+ * Dim 7 expected GREEN: `render` calls `greet` from its function body, so the
+ *   call must source to the `render` Function rather than the Module.
  * Dim 8 expected GREEN: no dangling CALLS endpoints.
  */
 TEST(repro_grammar_markup_typst) {
-    /* DISABLED — RARE LANGUAGE (maintainer-approved, 2026-06-28): Typst (markup).
-     * The `#greet("world")` is a genuinely top-level (module-level) application
-     * that production CORRECTLY sources to the Module, but pipeline_battery counts
-     * any non-Function-sourced edge as drift (the nix-pattern). A simple in-
-     * function wrap conflicts with markup_callable_battery, which needs that very
-     * call. Murky markup/fixture interaction in a niche language; deferred. */
-    printf("%sSKIP%s rare language (Typst top-level-call sourcing)\n", tf_dim(), tf_reset());
-    return -1; /* skip — not counted as pass or fail */
-    static const char src[] =
-        "#let title = \"Codebase Memory\"\n"
-        "#let greet(name) = [Hello, #name!]\n"
-        "\n"
-        "= #title\n"
-        "\n"
-        "#greet(\"world\")\n"
-        "\n"
-        "Some body text with a #strong[bold] run.\n";
+    static const char src[] = "#let title = \"Codebase Memory\"\n"
+                              "#let greet(name) = [Hello, #name!]\n"
+                              "#let render() = greet(\"world\")\n"
+                              "\n"
+                              "= #title\n"
+                              "\n"
+                              "Some body text with a #strong[bold] run.\n";
     static const char bad[] = "#let greet(name) = [Hello, #name";
     if (markup_callable_battery("Typst", src, CBM_LANG_TYPST, "doc.typ",
                                 "Function", "greet") != 0)
@@ -551,14 +540,13 @@ TEST(repro_grammar_markup_typst) {
 
 /* -- BIBTEX ------------------------------------------------------------------
  * Idiomatic BibTeX bibliography with an @article and an @book entry. The spec
- * has bibtex_module_types = {document} and bibtex_call_types = {command}; entry
- * declarations are NOT mapped to any def label, and "command" nodes are
- * LaTeX-style commands without a stable function callee_name.
+ * has bibtex_module_types = {document} and an empty bibtex_call_types array;
+ * entry declarations are NOT mapped to any def label, and "command" nodes are
+ * LaTeX-style document commands rather than function applications.
  *
  * Dims asserted: 1-4 + R.
  * Dim 5 SKIPPED: no def-minting types (entries unmapped).
- * Dim 6 SKIPPED: call_types exists but "command" nodes have no resolvable
- *   callee_name to assert against; asserting would be brittle.
+ * Dim 6 SKIPPED: call_types is empty by design.
  * Dims 7-8 SKIPPED: no func_types to anchor a call.
  * Expected GREEN: dims 1-4. extract-clean RED would indicate the BibTeX grammar
  * misparses standard @entry{...} records.
@@ -639,7 +627,7 @@ TEST(repro_grammar_markup_po) {
 
 /* -- DIFF --------------------------------------------------------------------
  * Idiomatic unified diff (git-style) with file headers and a hunk. The spec has
- * diff_module_types = {source} and diff_call_types = {command}; there are no
+ * diff_module_types = {source} and an empty diff_call_types array; there are no
  * def-minting types and "command" nodes are diff command lines, not function
  * application sites with a stable callee_name.
  *

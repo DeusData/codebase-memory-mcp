@@ -40,17 +40,7 @@ static void trim_newlines(char *s) {
 }
 
 static bool git_validate_repo_path(const char *repo_path) {
-    if (!cbm_validate_shell_arg(repo_path)) {
-        return false;
-    }
-#ifdef _WIN32
-    for (const char *p = repo_path; *p; p++) {
-        if (*p == '%' || *p == '!' || *p == '^') {
-            return false;
-        }
-    }
-#endif
-    return true;
+    return cbm_validate_shell_path_arg(repo_path);
 }
 
 static int git_capture(const char *repo_path, const char *git_args, char **out) {

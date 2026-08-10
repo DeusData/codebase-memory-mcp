@@ -416,6 +416,14 @@ TEST(plugin_emit_does_not_traverse_directory_links) {
     PASS();
 }
 
+TEST(plugin_emit_path_info_distinguishes_missing_from_errors) {
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8("build/test-plugin-path-info-definitely-missing", &info),
+              CBM_PATH_INFO_MISSING);
+    ASSERT_EQ(cbm_path_info_utf8(NULL, &info), CBM_PATH_INFO_ERROR);
+    PASS();
+}
+
 TEST(plugin_emit_command_returns_positive_failure_status) {
     const char *dir = "build/test-plugin-command-failure";
     ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
@@ -444,5 +452,6 @@ SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_refuses_malformed_plugin_marker);
     RUN_TEST(plugin_emit_supports_utf8_output_directory);
     RUN_TEST(plugin_emit_does_not_traverse_directory_links);
+    RUN_TEST(plugin_emit_path_info_distinguishes_missing_from_errors);
     RUN_TEST(plugin_emit_command_returns_positive_failure_status);
 }

@@ -75,7 +75,8 @@ endif
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) $(CFLAGS_EXTRA)
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
+              $(GLOBAL_OVERRIDE_DEFINE) $(CFLAGS_EXTRA)
 CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
@@ -94,13 +95,19 @@ SANITIZED_DEFINE = -DCBM_SANITIZED_BUILD=1
 else
 SANITIZED_DEFINE =
 endif
-CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
+KOTLIN_DEDUP_TEST_DEFINE = -DCBM_KOTLIN_DEDUP_TEST_API=1
+CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
+INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
+CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
+	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
+	$(INCREMENTAL_TEST_DEFINE) -g -O1 $(SANITIZE)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(CXX_STDLIB_FLAGS)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
-CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 \
-              $(TSAN_SANITIZE)
+CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
+	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
+	-g -O1 $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
                 $(TSAN_SANITIZE)
 
@@ -165,9 +172,13 @@ endif
 # and redirecting malloc into mimalloc underneath ASan's own interception mixes
 # two allocators on the same pointers. Windows keeps its wrap flags everywhere,
 # because there the shim is what makes mimalloc own the allocations at all.
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+# C++ stdlib selection: MSan builds must link an MSan-instrumented libc++
+# instead of the system libstdc++ (scripts/msan.sh overrides both vars).
+CXX_STDLIB ?= -lstdc++
+CXX_STDLIB_FLAGS ?=
+LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TSAN = -lm $(CXX_STDLIB) -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -178,6 +189,7 @@ FOUNDATION_SRCS = \
     src/foundation/str_intern.c \
     src/foundation/log.c \
     src/foundation/str_util.c \
+    src/foundation/workspace.c \
     src/foundation/platform.c \
     src/foundation/system_info.c \
     src/foundation/slab_alloc.c \
@@ -292,6 +304,8 @@ GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
 # Pipeline module (new)
 PIPELINE_SRCS = \
     src/pipeline/fqn.c \
+    src/pipeline/lsp_surface.c \
+    src/pipeline/pipeline_delta.c \
     src/pipeline/path_alias.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
@@ -340,7 +354,7 @@ WATCHER_SRCS = src/watcher/watcher.c
 GIT_SRCS = src/git/git_context.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
+CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
 	src/cli/config_text_edit.c src/cli/activation_transaction.c
@@ -373,9 +387,34 @@ UI_SRCS = \
 # derives it from the MI_OVERRIDE option); MI_OVERRIDE alone is not read by the
 # source — it is kept here only as this project's prod/test marker.
 MIMALLOC_SRC = vendored/mimalloc/src/static.c
+# Linux belongs on this list too (#1360). The "Unix relies on static-link-order
+# override" strategy described above never actually worked: mimalloc defines
+# malloc/free ONLY when MI_MALLOC_OVERRIDE is set (it gates alloc-override.c),
+# so with the define off there were no strong symbols for the link order to
+# prefer. Measured on the shipped v0.9.1-rc.1 artifacts — linux-arm64 glibc AND
+# musl-static both report 0/6 allocator-owned size classes, i.e. ordinary malloc
+# was going to libc and every purge/reclaim option set in cbm_mem_init applied
+# only to the bound sqlite/tree-sitter populations.
+#
+# The macOS objection does not transfer. That abort is specific to the two-level
+# namespace, where this binary's free becomes mi_free while system libraries keep
+# allocating from the system allocator, so a pointer crossing the boundary hits
+# "mi_free: invalid pointer". ELF is a flat namespace: interposition is
+# process-wide and all-or-nothing, which is the configuration mimalloc is
+# normally deployed in. macOS therefore stays off, deliberately and permanently.
+#
+# TWO defines, switched together in ONE place so they cannot drift:
+# MI_MALLOC_OVERRIDE reaches the mimalloc translation unit and turns the
+# override on; CBM_MEM_GLOBAL_OVERRIDE reaches OUR sources and tells the startup
+# audit what to expect. CBM_MEM_GLOBAL_OVERRIDE goes only into CFLAGS_PROD,
+# because MIMALLOC_CFLAGS_TEST compiles mimalloc with -DMI_OVERRIDE=0 and no
+# override define at all — a test binary has no global override BY CONSTRUCTION
+# and must never be told to expect one, or it warns on every run.
 MIMALLOC_OVERRIDE_DEFINE :=
-ifeq ($(IS_MINGW),yes)
+GLOBAL_OVERRIDE_DEFINE :=
+ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
+GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
@@ -428,7 +467,8 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 # Vendored trees are deliberately excluded — they are pinned, they carry their
 # own explicit dep lists (LSP_UNITY_DEPS, TS_RUNTIME_DEPS), and globbing tens of
 # thousands of grammar headers would cost more than it protects.
-PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h tests/*.h tests/repro/*.h)
+PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h tests/*.h \
+               tests/repro/*.h)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -440,6 +480,7 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_intern.c \
     tests/test_log.c \
     tests/test_str_util.c \
+    tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
     tests/test_dump_verify.c \
@@ -494,7 +535,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -562,12 +603,26 @@ TEST_SIMHASH_SRCS = tests/test_simhash.c
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 
 # Cumulative BUG-REPRODUCTION suite (separate runner, NOT in ALL_TEST_SRCS).
-# These cases are RED by design (one open bug each) — see tests/repro/repro_main.c.
+# Contains RED reproductions plus GREEN controls — see tests/repro/repro_main.c.
 # Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
 TEST_REPRO_SRCS = \
     tests/repro/repro_main.c \
     tests/repro/repro_parallel_determinism.c \
     tests/repro/repro_extraction.c \
+    tests/repro/repro_runner_filter.c \
+    tests/repro/repro_harness_cleanup.c \
+    tests/repro/repro_language_registry.c \
+    tests/repro/repro_call_node_manifest.c \
+    tests/repro/repro_call_scope_usages.c \
+    tests/repro/repro_call_argument_usages.c \
+    tests/repro/repro_lsp_ordered_signatures.c \
+    tests/repro/repro_lsp_ordered_local.c \
+    tests/repro/repro_ts_overload_return_chains.c \
+    tests/repro/repro_reference_precision.c \
+    tests/repro/repro_lexical_binding_precision.c \
+    tests/repro/repro_call_argument_matrix_a.c \
+    tests/repro/repro_call_argument_matrix_b.c \
+    tests/repro/repro_call_node_behaviors.c \
     tests/repro/repro_issue495.c \
     tests/repro/repro_issue521.c \
     tests/repro/repro_issue382.c \
@@ -737,6 +792,18 @@ TRE_OBJ_TEST = $(BUILD_DIR)/tre.o
 TRE_OBJ_TSAN = $(BUILD_DIR)/tsan_tre.o
 TRE_OBJ_PROD = $(BUILD_DIR)/prod_tre.o
 
+# tre.o keeps UBSan's alignment check OFF, and that is not a coverage
+# preference -- it is a portability fact. Arming it here (attempted, then
+# reverted after this bisect) makes the vendored TRE regex engine trap on
+# Windows/ARM64, where the CLANGARM64 leg builds with -fsanitize-trap and a
+# trap is an illegal instruction with no diagnostic: every fixture-indexing
+# suite died with STATUS_ILLEGAL_INSTRUCTION and no message. macOS and Linux
+# stay clean under the same check because Windows is LLP64 -- 32-bit long --
+# so TRE's struct layouts and access widths differ there and nowhere else.
+#
+# TRE is third-party code we vendor and do not modify, so the alignment
+# behaviour is upstream's to change; suppressing the check for this one
+# object is the honest scope. Everything else keeps alignment armed.
 $(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) $(SANITIZE) -fno-sanitize=alignment -c -o $@ $<
 
@@ -760,10 +827,18 @@ $(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (test build)
+# ZSTD_EXTRA_CFLAGS: hook for sanitizer lanes. The MSan lane needs
+# `-include stdint.h` for THIS object only: zstd's MEMORY_SANITIZER-guarded
+# block declares __msan_test_shadow returning intptr_t, but the amalgamator
+# collapsed the `#define ZSTD_DEPS_NEED_STDINT` re-include that should supply
+# it. The flag cannot go on the global SANITIZE line: force-including a libc
+# header ahead of a source file freezes glibc's feature-test macros before
+# files like sqlite3.c set _GNU_SOURCE themselves, which strips
+# MREMAP_MAYMOVE/nanosleep out of their view of libc.
 ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
 ZSTD_OBJ_TSAN = $(BUILD_DIR)/tsan_zstd.o
 $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) $(ZSTD_EXTRA_CFLAGS) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 $(BUILD_DIR)/tsan_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
@@ -799,7 +874,7 @@ test-focused: $(BUILD_DIR)/test-runner
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
 
-# ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
+# ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
@@ -811,6 +886,15 @@ $(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRC
 		$(LDFLAGS_TEST)
 
 test-repro: $(BUILD_DIR)/test-repro-runner
+	cd $(CURDIR) && bash tests/repro/repro_script_summary.sh
+	cd $(CURDIR) && bash tests/repro/repro_script_zero_selection.sh
+	cd $(CURDIR) && bash tests/repro/repro_script_missing_summary.sh
+	cd $(CURDIR) && bash tests/repro/repro_script_skipped_summary.sh
+	cd $(CURDIR) && bash tests/repro/repro_runner_zero_selection.sh
+	cd $(CURDIR) && bash tests/repro/repro_runner_passing_semantics.sh
+	cd $(CURDIR) && bash tests/repro/repro_script_no_workspace_artifact.sh
+	cd $(CURDIR) && bash tests/repro/repro_script_stderr_summary.sh
+	cd $(CURDIR) && bash tests/repro/repro_make_tracks_headers.sh
 	cd $(CURDIR) && $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
@@ -824,21 +908,30 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 # daemon_application). Was `mem slab_alloc parallel` — a keyhole that ran TSan
 # over no real threaded production code.
 #
-# Deliberately EXCLUDED (documented, not forgotten):
-#   daemon_runtime   — deadlocks under TSan: it forks after going
-#                      multi-threaded and the child re-enters the runtime, a
-#                      combination TSan's runtime does not support (hangs).
-#   daemon_ipc       — a TEST-harness data race (a helper thread writes a
-#                      main-thread stack slot without synchronization,
-#                      test_daemon_ipc.c:2088); production IPC is not implicated.
-#   daemon_frontend  — TEST-harness thread leaks (fixture threads left unjoined,
-#                      test_daemon_frontend.c:698) plus a fork-under-TSan fixture
-#                      failure. Test-quality work, tracked separately.
-# Re-enabling these three needs test-harness synchronization + a TSan-fork
-# strategy; it is out of scope for the current sanitizer-coverage pass.
+# NO EXCLUSIONS. A sanitizer covers the complete surface or it is asserting
+# coverage it does not have. The three suites once excluded here
+# (daemon_runtime, daemon_ipc, daemon_frontend) are back:
+#   daemon_ipc, daemon_frontend — the documented test-harness race and thread
+#     leaks no longer reproduce; both run clean under TSan.
+#   daemon_runtime — did NOT deadlock as documented. It reported a REAL
+#     production data race on the log sink (plain global function pointer,
+#     written by the configuring thread, read AND CALLED by connection
+#     workers), now fixed with atomics in log.c. Excluding the suite is what
+#     had hidden it.
 TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
-                    diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
-TSAN_OPTIONS ?= halt_on_error=1
+                    diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application \
+                    daemon_runtime daemon_ipc daemon_frontend
+# halt_on_error: a race is a bug, stop at the first one.
+#
+# report_thread_leaks=0: this disables TSan's thread-HYGIENE check only —
+# RACE detection, the reason the lane exists, is completely unaffected. Some
+# daemon fixtures fork after the process has gone multi-threaded, and in the
+# forked child TSan sees the parent's finished threads as never-joined even
+# though the fixture joins them (test_daemon_frontend.c:726 joins the thread
+# reported at :698). It fires on macOS and not Linux, i.e. it tracks fork
+# semantics rather than anything about our code. The alternative was dropping
+# whole suites from the lane, which costs real race coverage; this costs none.
+TSAN_OPTIONS ?= halt_on_error=1:report_thread_leaks=0
 # A fixed concurrent envelope keeps TSan deterministic across developer hosts
 # and GitHub runners. Four workers still exercise real races without turning
 # sanitizer-instrumented allocator bookkeeping into a high-core lock convoy.
@@ -909,7 +1002,13 @@ MAIN_SRC = src/main.c
 # incremental builds are unaffected. (Single-quoted: the signature may contain
 # the escaped quotes of -DCBM_VERSION, which are literal inside '', but must not
 # contain a literal single quote.)
-BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)
+# SANITIZE belongs here: it changes the instrumentation compiled into every
+# object, so a build that only changes it MUST rebuild. Its absence made
+# `scripts/test.sh SANITIZE= ...` -- the documented way to get a plain build
+# for trap debugging -- silently re-run the previously instrumented binary,
+# which during this bisect produced a "crashes without sanitizers too" result
+# that was pure artifact and sent the investigation down the wrong path.
+BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)|SANITIZE=$(SANITIZE)
 .PHONY: build-config-check
 build-config-check:
 $(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
@@ -1032,6 +1131,90 @@ lint: lint-tidy lint-cppcheck lint-format lint-no-suppress
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
 lint-ci: lint-cppcheck lint-format lint-no-suppress
 	@echo "=== CI linters passed ==="
+
+# ── Local memory-diagnostic lanes (not PR-CI gates by decision: the diag
+#    build doubles a runner's bill for a marginal delta, and a gating analyzer
+#    lane needs a suppression story the NOLINT ban deliberately forbids.
+#    Run these on the local ladder; both found real bugs on first use.) ──
+
+# Newest pinned toolchain + ASan/UBSan + straighter stacks. Separate BUILD_DIR
+# so the shipping-toolchain build stays untouched.
+#
+# This lane also turns on the ASan checks that are OFF by default everywhere
+# else, which is the difference between running ASan and running all of it:
+#   detect_stack_use_after_return  a returned-to stack frame reused later
+#   detect_stack_use_after_scope   a pointer outliving its enclosing block
+#   strict_string_checks           str* reads validated over the whole buffer
+#
+# detect_invalid_pointer_pairs is deliberately NOT here. It fires during
+# static initialisation inside vendored simplecpp -- a std::string global at
+# simplecpp.cpp:101 -- reporting a pair whose second "pointer" is the
+# sentinel 0xfffffffffffffff3, i.e. libstdc++ string internals rather than
+# anything this codebase wrote. The option is a process-wide runtime flag
+# with no per-file scoping, so it cannot be aimed away from vendored code the
+# way the analyzer's path filter can. Enabling it would mean a permanently
+# red lane reporting a non-defect, which teaches people to ignore the lane.
+# The instrumentation it requires (-fsanitize=pointer-compare,pointer-
+# subtract) comes out with it, since it is dead weight without the check.
+# They stay on the diagnostic lane rather than the gating ones until they have
+# a clean history here; promoting them is a separate, deliberate step.
+DIAG_LLVM_BIN ?= /opt/homebrew/opt/llvm/bin
+diag:
+	@echo "=== diagnostic lane: $(shell $(DIAG_LLVM_BIN)/clang --version | head -1) ==="
+	$(MAKE) -f Makefile.cbm build/diag/test-runner \
+		CC=$(DIAG_LLVM_BIN)/clang CXX=$(DIAG_LLVM_BIN)/clang++ BUILD_DIR=build/diag \
+		SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
+	ASAN_OPTIONS="detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1" \
+		./build/diag/test-runner
+
+# ── macOS leak detection ─────────────────────────────────────────
+# LeakSanitizer is ON by default under ASan on Linux, so the Linux test leg
+# has had leak coverage all along and the Linux-only leaks this branch fixed
+# were found there. On macOS it is OFF by default and Apple's clang refuses
+# detect_leaks=1 outright ("Exiting: detect_leaks is not supported on this
+# platform"), which is why this repo had NO macOS leak coverage — a whole
+# platform's worth of the sanitizer matrix missing.
+#
+# Apple's refusal is not a darwin limitation. Upstream clang supports LSan on
+# darwin/arm64: this lane runs the full suite clean and was verified to still
+# catch a deliberately leaked allocation. So the lane is simply "the normal
+# ASan test build, compiled by Homebrew LLVM instead of Apple clang, run with
+# leak detection turned on".
+LSAN_LLVM_BIN ?= $(shell brew --prefix llvm 2>/dev/null)/bin
+LSAN_SUITES ?=
+test-lsan:
+	@echo "=== macOS leak lane: $(shell $(LSAN_LLVM_BIN)/clang --version | head -1) ==="
+	$(MAKE) -f Makefile.cbm build/lsan/test-runner \
+		CC=$(LSAN_LLVM_BIN)/clang CXX=$(LSAN_LLVM_BIN)/clang++ BUILD_DIR=build/lsan
+	cd $(CURDIR) && ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" \
+		./build/lsan/test-runner $(LSAN_SUITES)
+
+# Path-sensitive memory analysis: leak paths, null derefs, uninitialized reads.
+# Non-gating: triage findings against the code (this lane's first run produced
+# 9 real fixes and 6 recorded false positives — see the analyzer batch commit).
+LINT_MEM_CHECKS = -*,clang-analyzer-unix.Malloc,clang-analyzer-unix.MallocSizeof,clang-analyzer-core.NullDereference,clang-analyzer-core.CallAndMessage,clang-analyzer-core.UndefinedBinaryOperatorResult,clang-analyzer-core.uninitialized.*,clang-analyzer-cplusplus.NewDelete,clang-analyzer-cplusplus.NewDeleteLeaks
+lint-mem:
+	@echo "=== clang-analyzer memory lane (non-gating; triage, don't suppress) ==="
+	@printf '%s\n' $(LINT_SRCS) | xargs -P 10 -I{} $(CLANG_TIDY) --quiet \
+		--checks='$(LINT_MEM_CHECKS)' {} -- $(CFLAGS_COMMON) $(SYSROOT_FLAG) 2>/dev/null; true
+
+# Gating variant: identical run, but vendored-tree diagnostics are excluded
+# (analyzer diagnostics bypass --header-filter by design; this mirrors the
+# .cppcheck vendored suppression) and any finding the gate cannot account for
+# fails the target. A finding here is a leak path, null deref, or uninitialized
+# read the analyzer can prove — triage it against the code.
+#
+# A finding is accounted for by being FIXED, or — only where the analyzer is
+# genuinely wrong — by an argued entry in scripts/lint-mem-whitelist.txt. Each
+# entry is pinned to the sha256 of the function it argues about, so editing
+# that function invalidates it and the finding must be argued again against
+# the new code. A suppression is never allowed to outlive its reasoning, and
+# NOLINT is never honoured here.
+lint-mem-ci:
+	@echo "=== clang-analyzer memory gate ==="
+	@printf '%s\n' $(LINT_SRCS) | xargs -P 4 -I{} $(CLANG_TIDY) --quiet \
+		--checks='$(LINT_MEM_CHECKS)' {} -- $(CFLAGS_COMMON) $(SYSROOT_FLAG) 2>/dev/null \
+		| python3 scripts/lint-mem-gate.py
 
 # ── Security audit (6 layers) ────────────────────────────────────
 

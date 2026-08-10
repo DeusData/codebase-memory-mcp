@@ -148,8 +148,12 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
             };
         }
     }
-    /* Canonicalize (determinism) — see cmp_fp_entry_by_qn. */
-    qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
+    /* Canonicalize (determinism) — see cmp_fp_entry_by_qn. Avoid passing the
+     * NULL empty-set buffer to qsort: libc treats zero elements as a no-op,
+     * but the standard function contract still requires a valid base pointer. */
+    if (count > 1) {
+        qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
+    }
     *out_entries = entries;
     return count;
 }

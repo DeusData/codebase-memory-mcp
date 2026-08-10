@@ -13,6 +13,8 @@
 #include "../src/foundation/compat_thread.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <cli/agent_profiles.h>
+#include <cli/activation_transaction.h>
 #include <cli/cli.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
@@ -642,6 +644,41 @@ TEST(cli_activation_refuses_when_cohort_does_not_drain) {
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_FALSE(fake.mutation_lease_held);
     ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+/* Regression for #1416: when the activation transaction recorded a concrete
+ * refusal (e.g. the Windows ACL safety check), the CLI must attribute the
+ * failure to that check instead of blaming "active CBM sessions" - reporters
+ * rebooted and hunted phantom handles because no sessions existed. The
+ * sessions wording must remain for refusals with no recorded note. */
+TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416) {
+    cbm_activation_transaction_note_refusal_for_testing(
+        "acl-grants-cross-account-mutation to S-1-5-11", 0UL);
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 1);
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "acl-grants-cross-account-mutation"));
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "not a session problem"));
+    ASSERT_NULL(strstr(fake.diagnostic, "could not be stopped safely"));
+
+    /* No note recorded -> the sessions wording is still the right message. */
+    cbm_activation_transaction_note_refusal_for_testing(NULL, 0UL);
+    cli_activation_fake_t plain = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    ops.context = &plain;
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &plain), 1);
+    ASSERT_NOT_NULL(strstr(plain.diagnostic, "could not be stopped safely"));
     PASS();
 }
 
@@ -4669,6 +4706,134 @@ TEST(cli_agent_reinstall_preserves_foreign_policy_entries) {
     PASS();
 }
 
+/* Regression for #1388: a hook client blocked by a daemon BUILD CONFLICT must
+ * emit a stdout systemMessage. stdout is the only channel a hook caller sees,
+ * so the pre-fix stderr-only reporting was indistinguishable from "no matches"
+ * and produced silent skips for the whole session. The absent-daemon notice
+ * must stay distinct: it points at `daemon start`, which cannot heal a build
+ * conflict. Non-Claude dialects take no bare stdout JSON at all. */
+TEST(cli_hook_conflict_emits_stdout_notice_issue1388) {
+    const char *conflict = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_BUILD_CONFLICT, NULL);
+    ASSERT_NOT_NULL(conflict);
+    ASSERT_NOT_NULL(strstr(conflict, "systemMessage"));
+    ASSERT_NOT_NULL(strstr(conflict, "different build"));
+    /* The actionable step: a conflicted daemon must be STOPPED, not started. */
+    ASSERT_NOT_NULL(strstr(conflict, "daemon stop"));
+
+    const char *absent = cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, NULL);
+    ASSERT_NOT_NULL(absent);
+    ASSERT_NOT_NULL(strstr(absent, "daemon start"));
+    /* Distinct diagnoses: the conflict notice must never claim no daemon runs. */
+    ASSERT_TRUE(strcmp(conflict, absent) != 0);
+    ASSERT_NULL(strstr(conflict, "no CBM daemon is running"));
+
+    /* Other dialects do not consume a bare stdout JSON object. */
+    ASSERT_NULL(cbm_hook_admission_notice(CBM_HOOK_ADMISSION_BUILD_CONFLICT, "codex"));
+    ASSERT_NULL(cbm_hook_admission_notice(CBM_HOOK_ADMISSION_DAEMON_ABSENT, "codex"));
+    PASS();
+}
+#ifndef _WIN32
+/* Regression for #1387: installing over an existing setup whose hook scripts
+ * are not byte-owned (manual install with a custom binary location, or a
+ * user-modified reminder) must NOT remove the existing, working hook entries
+ * from settings.json. The refused script rewrite is reported as an error and
+ * both the scripts and the entries survive byte-identically. */
+TEST(cli_install_preserves_hook_entries_when_scripts_unowned_issue1387) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hooks-preserve-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    if (!cbm_mkdir_p(hooks_dir, 0755))
+        FAIL("mkdir hooks_dir failed");
+
+    /* Gate script written by a manual install: BIN outside the managed target,
+     * so its bytes match no current or released installer-owned shape. */
+    static const char unowned_gate[] =
+        "#!/usr/bin/env bash\n"
+        "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+        "BIN=\"/opt/tools/cbm/codebase-memory-mcp\"\n"
+        "[ -x \"$BIN\" ] || exit 0\n"
+        "\"$BIN\" hook-augment 2>/dev/null\n"
+        "exit 0\n";
+    char gate_path[768];
+    snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(gate_path, unowned_gate);
+
+    /* Session reminder carrying a user-added line. */
+    static const char unowned_session[] =
+        "#!/usr/bin/env bash\n"
+        "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+        "echo my-extra-team-reminder\n";
+    char session_path[768];
+    snprintf(session_path, sizeof(session_path), "%s/cbm-session-reminder", hooks_dir);
+    write_test_file(session_path, unowned_session);
+
+    static const char settings_before[] =
+        "{\n"
+        "  \"hooks\": {\n"
+        "    \"PreToolUse\": [\n"
+        "      {\"matcher\": \"Grep|Glob\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-code-discovery-gate\", \"timeout\": 5}]},\n"
+        "      {\"matcher\": \"Bash\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"/usr/local/bin/my-own-guard\"}]}\n"
+        "    ],\n"
+        "    \"SessionStart\": [\n"
+        "      {\"matcher\": \"startup\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]},\n"
+        "      {\"matcher\": \"resume\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]},\n"
+        "      {\"matcher\": \"clear\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]},\n"
+        "      {\"matcher\": \"compact\", \"hooks\": [{\"type\": \"command\", "
+        "\"command\": \"~/.claude/hooks/cbm-session-reminder\"}]}\n"
+        "    ]\n"
+        "  }\n"
+        "}\n";
+    char settings_path[768];
+    snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
+    write_test_file(settings_path, settings_before);
+
+    const char *const env_names[] = {"HOME", "PATH", "CLAUDE_CONFIG_DIR"};
+    char *saved[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    int install_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/other/codebase-memory-mcp", false, false);
+
+    char *settings = read_test_file_alloc(settings_path);
+    char *gate = read_test_file_alloc(gate_path);
+    char *session = read_test_file_alloc(session_path);
+    bool preserved =
+        install_rc != 0 /* the refused rewrites are reported, not silent */
+        && settings && strstr(settings, "~/.claude/hooks/cbm-code-discovery-gate") &&
+        strstr(settings, "Grep|Glob") && strstr(settings, "/usr/local/bin/my-own-guard") &&
+        strstr(settings, "\"startup\"") && strstr(settings, "\"resume\"") &&
+        strstr(settings, "\"clear\"") && strstr(settings, "\"compact\"") &&
+        strstr(settings, "~/.claude/hooks/cbm-session-reminder") && gate &&
+        strcmp(gate, unowned_gate) == 0 && session && strcmp(session, unowned_session) == 0;
+    free(settings);
+    free(gate);
+    free(session);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!preserved)
+        FAIL("install must preserve existing hook entries and scripts when the on-disk "
+             "scripts are unowned (#1387)");
+    PASS();
+}
+#endif
+
 TEST(cli_existing_agents_install_durable_child_context) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-durable-agents-XXXXXX");
@@ -4894,11 +5059,15 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     files_ok = files_ok && test_file_contains_all(path, claude_terms, 7U);
 
     snprintf(path, sizeof(path), "%s/agents/codebase-memory.toml", codex_home);
-    const char *const codex_terms[] = {
-        "name = \"codebase-memory\"",        "description = ",
-        "developer_instructions = ",         "sandbox_mode = \"read-only\"",
-        "[mcp_servers.codebase-memory-mcp]", "check_index_coverage"};
-    files_ok = files_ok && test_file_contains_all(path, codex_terms, 6U);
+    const char *const codex_terms[] = {"name = \"codebase-memory\"",
+                                       "description = ",
+                                       "developer_instructions = ",
+                                       "sandbox_mode = \"read-only\"",
+                                       "[mcp_servers.codebase-memory-mcp]",
+                                       "command = \"/opt/codebase-memory-mcp\"",
+                                       "args = [\"--tool-profile=analysis\"]",
+                                       "check_index_coverage"};
+    files_ok = files_ok && test_file_contains_all(path, codex_terms, 8U);
     char *profile = read_test_file_alloc(path);
     files_ok = files_ok && profile && !strstr(profile, "model =") &&
                !strstr(profile, "index_repository") && !strstr(profile, "delete_project") &&
@@ -5371,25 +5540,45 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
         "name = \"codebase-memory-scout\"\nuser_note = \"preserve scout\"\n";
     write_test_file(verify_path, legacy_verify);
     write_test_file(scout_path, foreign_scout);
+    char *rc1_auditor = cbm_render_graph_profile_codex_rc1(CBM_GRAPH_TIER_AUDIT);
+    if (!rc1_auditor)
+        FAIL("rc.1 auditor rendering must be available");
+    write_test_file(auditor_path, rc1_auditor);
+    free(rc1_auditor);
 
-    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    /* Uninstall renders expected content with the installed binary path, so
+     * install with that same path to exercise exact-content removal. */
+    char installed_binary[640];
+    char expected_command[768];
+#ifdef _WIN32
+    snprintf(installed_binary, sizeof(installed_binary), "%s/.local/bin/codebase-memory-mcp.exe",
+             tmpdir);
+#else
+    snprintf(installed_binary, sizeof(installed_binary), "%s/.local/bin/codebase-memory-mcp",
+             tmpdir);
+#endif
+    snprintf(expected_command, sizeof(expected_command), "command = \"%s\"", installed_binary);
+    char *plan = cbm_build_install_plan_json(tmpdir, installed_binary);
     bool plan_ok =
         plan && strstr(plan, scout_path) && strstr(plan, verify_path) && strstr(plan, auditor_path);
     free(plan);
 
-    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int install_rc = cbm_install_agent_configs(tmpdir, installed_binary, false, false);
     char *scout = read_test_file_alloc(scout_path);
     char *verify = read_test_file_alloc(verify_path);
     char *auditor = read_test_file_alloc(auditor_path);
-    bool installed = install_rc != 0 && scout && strcmp(scout, foreign_scout) == 0 && verify &&
-                     strcmp(verify, legacy_verify) != 0 && strstr(verify, "Tier 2") &&
-                     strstr(verify, "name = \"codebase-memory\"") &&
-                     strstr(verify, "check_index_coverage") && auditor &&
-                     strstr(auditor, "Tier 3") && strstr(auditor, "check_index_coverage") &&
-                     !strstr(verify, "index_repository") && !strstr(verify, "delete_project") &&
-                     !strstr(verify, "manage_adr") && !strstr(verify, "ingest_traces") &&
-                     !strstr(auditor, "index_repository") && !strstr(auditor, "delete_project") &&
-                     !strstr(auditor, "manage_adr") && !strstr(auditor, "ingest_traces");
+    bool installed =
+        install_rc != 0 && scout && strcmp(scout, foreign_scout) == 0 && verify &&
+        strcmp(verify, legacy_verify) != 0 && strstr(verify, "Tier 2") &&
+        strstr(verify, "name = \"codebase-memory\"") && strstr(verify, expected_command) &&
+        strstr(verify, "args = [\"--tool-profile=analysis\"]") &&
+        strstr(verify, "check_index_coverage") && auditor && strstr(auditor, expected_command) &&
+        strstr(auditor, "args = [\"--tool-profile=analysis\"]") && strstr(auditor, "Tier 3") &&
+        strstr(auditor, "check_index_coverage") && !strstr(verify, "index_repository") &&
+        !strstr(verify, "delete_project") && !strstr(verify, "manage_adr") &&
+        !strstr(verify, "ingest_traces") && !strstr(auditor, "index_repository") &&
+        !strstr(auditor, "delete_project") && !strstr(auditor, "manage_adr") &&
+        !strstr(auditor, "ingest_traces");
     free(scout);
     free(verify);
     free(auditor);
@@ -5762,6 +5951,80 @@ TEST(cli_detected_agent_summary_includes_registry_clients) {
     test_rmdir_r(tmpdir);
     if (!redirected || install_rc != 0 || !summary_ok)
         FAIL("detected-agent summary must include stable registry clients");
+    PASS();
+}
+#endif
+
+#ifndef _WIN32
+/* Regression for #1387 (second half): `install --dry-run` printed all three
+ * hook groups as if they would install, even when the on-disk hook script is
+ * NOT ours and the real run would refuse to rewrite it. The dry run is exactly
+ * where that has to be visible - the reporter could not see the loss coming. */
+TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-dryrun-refusal-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    if (!cbm_mkdir_p(hooks_dir, 0755))
+        FAIL("mkdir hooks_dir failed");
+    /* A gate script that is NOT ours: a manual install pointing at another
+     * binary. The real install refuses to rewrite it (TEXT_UNOWNED). */
+    char gate_path[768];
+    snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(gate_path, "#!/usr/bin/env bash\n"
+                               "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+                               "BIN=\"/opt/tools/cbm/codebase-memory-mcp\"\n"
+                               "exec 0\n");
+
+    const char *const env_names[] = {"HOME", "PATH", "CLAUDE_CONFIG_DIR"};
+    char *saved[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    if (redirected) {
+        (void)cbm_install_agent_configs(tmpdir, "/opt/other/codebase-memory-mcp", false, true);
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+
+    /* The dry run must WARN about the script it cannot rewrite, and must not
+     * claim the search-augmentation hook group as installable. */
+    bool warned = strstr(output, "cbm-code-discovery-gate") != NULL &&
+                  (strstr(output, "not ours") != NULL ||
+                   strstr(output, "would be skipped") != NULL || strstr(output, "refuse") != NULL);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!redirected)
+        FAIL("stdout capture failed");
+    if (!warned)
+        FAIL("dry-run must predict a refused hook-script rewrite (#1387)");
     PASS();
 }
 #endif
@@ -11764,6 +12027,7 @@ SUITE(cli) {
     /* Mandatory daemon activation safety */
     RUN_TEST(cli_activation_quiesces_active_cohort_before_mutation);
     RUN_TEST(cli_activation_refuses_when_cohort_does_not_drain);
+    RUN_TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416);
     RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
     RUN_TEST(cli_activation_releases_maintenance_lease_after_success);
     RUN_TEST(cli_activation_releases_maintenance_lease_when_mutation_fails);
@@ -11911,6 +12175,10 @@ SUITE(cli) {
     RUN_TEST(cli_new_agent_install_plans_use_documented_paths);
     RUN_TEST(cli_new_agent_configs_use_documented_schemas);
     RUN_TEST(cli_agent_reinstall_preserves_foreign_policy_entries);
+    RUN_TEST(cli_hook_conflict_emits_stdout_notice_issue1388);
+#ifndef _WIN32
+    RUN_TEST(cli_install_preserves_hook_entries_when_scripts_unowned_issue1387);
+#endif
     RUN_TEST(cli_existing_agents_install_durable_child_context);
     RUN_TEST(cli_durable_profiles_follow_current_vendor_paths);
     RUN_TEST(cli_cline_data_dir_only_redirects_data_state);
@@ -11923,6 +12191,9 @@ SUITE(cli) {
     RUN_TEST(cli_hermes_stable_shell_context_contract);
 #ifndef _WIN32
     RUN_TEST(cli_detected_agent_summary_includes_registry_clients);
+#endif
+#ifndef _WIN32
+    RUN_TEST(cli_dry_run_predicts_refused_hook_script_issue1387);
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);

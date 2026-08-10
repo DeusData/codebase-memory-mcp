@@ -31,6 +31,7 @@
 
 typedef struct {
     char tmpdir[256];
+    char cachedir[256];
     char dbpath[512];
     char *project;
     cbm_mcp_server_t *srv;
@@ -54,24 +55,42 @@ static inline cbm_store_t *rh_open_indexed(RProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project)
         return NULL;
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
-    snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
+    if (!lp->cachedir[0]) {
+        snprintf(lp->cachedir, sizeof(lp->cachedir), "/tmp/cbm_repro_cache_XXXXXX");
+        if (!cbm_mkdtemp(lp->cachedir))
+            return NULL;
+        rh_to_fwd_slashes(lp->cachedir);
+    }
+    snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", lp->cachedir, lp->project);
     unlink(lp->dbpath);
+
+    const char *prior_cache_dir = getenv("CBM_CACHE_DIR");
+    char *saved_cache_dir = prior_cache_dir ? cbm_strdup(prior_cache_dir) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
+
+    cbm_store_t *store = NULL;
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv)
-        return NULL;
-    char args[700];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
-    char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp)
-        free(resp);
-    return cbm_store_open_path(lp->dbpath);
+    if (lp->srv) {
+        char args[700];
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
+        char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
+        if (resp)
+            free(resp);
+        /* Repro consumers only inspect the graph. Keep this connection query-only
+         * so the harness does not mutate the publisher's sealed journal mode. */
+        store = cbm_store_open_path_query(lp->dbpath);
+    }
+
+    if (saved_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
+        free(saved_cache_dir);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    return store;
 }
+
+static inline void rh_cleanup(RProj *lp, cbm_store_t *store);
 
 /* Write each fixture file into a fresh temp project, index it via the MCP
  * production flow, and open the resulting graph DB. Returns store (NULL on fail). */
@@ -91,12 +110,18 @@ static inline cbm_store_t *rh_index_files(RProj *lp, const RFile *files, int nfi
             *slash = '/';
         }
         FILE *f = fopen(path, "wb"); /* binary: keep "\n" exact */
-        if (!f)
+        if (!f) {
+            rh_cleanup(lp, NULL);
             return NULL;
+        }
         fputs(files[i].content, f);
         fclose(f);
     }
-    return rh_open_indexed(lp);
+    cbm_store_t *store = rh_open_indexed(lp);
+    if (!store) {
+        rh_cleanup(lp, NULL);
+    }
+    return store;
 }
 
 static inline cbm_store_t *rh_index(RProj *lp, const char *filename, const char *content) {
@@ -114,12 +139,15 @@ static inline void rh_cleanup(RProj *lp, cbm_store_t *store) {
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
-    unlink(lp->dbpath);
-    char wal[600], shm[600];
-    snprintf(wal, sizeof(wal), "%s-wal", lp->dbpath);
-    unlink(wal);
-    snprintf(shm, sizeof(shm), "%s-shm", lp->dbpath);
-    unlink(shm);
+    th_rmtree(lp->cachedir);
+    if (lp->dbpath[0]) {
+        unlink(lp->dbpath);
+        char wal[600], shm[600];
+        snprintf(wal, sizeof(wal), "%s-wal", lp->dbpath);
+        unlink(wal);
+        snprintf(shm, sizeof(shm), "%s-shm", lp->dbpath);
+        unlink(shm);
+    }
 }
 
 /* Count edges of a given type in the project graph. Returns -1 on query error. */

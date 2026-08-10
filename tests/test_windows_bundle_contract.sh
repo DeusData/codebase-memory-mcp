@@ -537,8 +537,14 @@ require(
 )
 require(
     sync_case is not None
-    and 'remote_head="$(vm clangarm64 "cd /c/cbm && git rev-parse --verify HEAD")"'
-    in sync_case.group("body")
+    # Assert the PROPERTY, not one spelling of it: capture the remote HEAD into
+    # a local variable and compare it here. The checkout path became a variable
+    # (per-run isolation), so pinning the literal `/c/cbm` was asserting the
+    # implementation rather than the contract it exists to protect.
+    and re.search(
+        r'remote_head="\$\(vm clangarm64 "cd \S+ && git rev-parse --verify HEAD"\)"',
+        sync_case.group("body"),
+    )
     and 'test \\"\\$(git rev-parse --verify HEAD)\\"' not in sync_case.group("body"),
     "win.sh sync must compare the remote HEAD locally instead of nesting shell quotes through "
     "cmd.exe",
@@ -743,8 +749,19 @@ update_windows_block = (
 require(
     update_start >= 0
     and "install.ps1" in update_windows_block
-    and "powershell -ExecutionPolicy Bypass -File" in update_windows_block,
+    and "powershell -File" in update_windows_block,
     "cbm_cmd_update must print the install.ps1 command on Windows",
+)
+# The printed command must NOT carry an execution-policy override. That is a
+# canonical malicious-loader pattern, and emitting it as a string literal put
+# the signature inside every Windows artifact we ship — to save the user one
+# documented step. The hand-off above is the property this contract cares
+# about; the bypass flag was only ever the literal form it happened to take.
+# Unblock-File covers the common case and the README covers the rest.
+require(
+    "ExecutionPolicy" not in update_windows_block,
+    "cbm_cmd_update must not print an execution-policy override "
+    "(document it instead of shipping the pattern in the binary)",
 )
 require(
     "cbm_windows_launcher" not in cli_source

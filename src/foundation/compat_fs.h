@@ -9,21 +9,42 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 /* ── Directory iteration ──────────────────────────────────────── */
 
 /* Max filename length (MAX_PATH on Windows, NAME_MAX on POSIX). */
-#define CBM_DIRENT_NAME_MAX 260
+#define CBM_DIRENT_NAME_MAX 1024
 
 typedef struct cbm_dir cbm_dir_t;
 
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
     bool is_dir;
-    bool is_reparse_point;
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
 } cbm_dirent_t;
+
+/* Locale-independent metadata for a UTF-8 path. Symlinks/reparse points are
+ * reported rather than followed so semantic-input walkers cannot leave the
+ * repository through an alias. mtime_ns is Unix-epoch nanoseconds. */
+typedef struct {
+    bool is_regular;
+    bool is_directory;
+    bool is_symlink;
+    int64_t size;
+    int64_t mtime_ns;
+} cbm_path_info_t;
+
+typedef enum {
+    CBM_PATH_INFO_ERROR = -1,
+    CBM_PATH_INFO_OK = 0,
+    CBM_PATH_INFO_MISSING = 1,
+} cbm_path_info_result_t;
+
+/* Distinguishes a missing path from an inspection error so destructive
+ * callers can fail closed. */
+cbm_path_info_result_t cbm_path_info_utf8(const char *path, cbm_path_info_t *out);
 
 /* Open a directory for iteration. Returns NULL on error. */
 cbm_dir_t *cbm_opendir(const char *path);
@@ -42,17 +63,6 @@ int cbm_pclose(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
 
-typedef struct {
-    bool exists;
-    bool is_dir;
-    bool is_regular_file;
-    bool is_reparse_point;
-} cbm_path_info_t;
-
-/* Query a path without following its final link component.
- * Returns 0 for a successful query (including a missing path), -1 on error. */
-int cbm_path_info(const char *path, cbm_path_info_t *info);
-
 /* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
 bool cbm_mkdir_p(const char *path, int mode);
 
@@ -66,6 +76,17 @@ int cbm_remove_db_sidecars(const char *db_path);
 /* rename() that replaces an existing destination on every platform
  * (Windows rename fails with EEXIST; this uses write-through MoveFileExW). */
 int cbm_rename_replace(const char *src, const char *dst);
+
+/* Copy src to dst (dst truncated/created), preferring an instant
+ * copy-on-write clone where the filesystem supports one: clonefile(2) on
+ * APFS, FICLONE on Linux reflink filesystems. Falls back to a streamed
+ * copy. Returns 0 on success. The delta-repair path stages a multi-GB
+ * database this way, so the clone fast path is the difference between
+ * milliseconds and seconds there. */
+int cbm_clone_or_copy_file(const char *src, const char *dst);
+/* Move a regular file only when dst does not exist. Never overwrites dst.
+ * Used for collision-safe evidence quarantine beside a database. */
+int cbm_rename_noreplace(const char *src, const char *dst);
 /* Canonicalize an EXISTING path and resolve links/junctions (realpath / wide
  * GetFinalPathNameByHandleW). Locale-independent on Windows — never routes
  * UTF-8 through the ANSI CRT (#973). out must be >= 4096 bytes. Returns 1 on

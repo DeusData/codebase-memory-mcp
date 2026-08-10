@@ -101,7 +101,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -183,6 +183,129 @@ jobs:
   # platform can surface a race the others miss. Windows has no TSan runtime on
   # any toolchain (documented irreducible gap); this shared-code coverage is
   # its substitute.
+  # Memory-diagnostics lane (user decision 2026-08-03: runner cost accepted).
+  # Newest pinned LLVM sanitizer runtime + straighter stacks over the full
+  # parallel suite — catches what an older compiler-rt can miss. Same
+  # canonical scripts/test.sh wave as every other leg.
+  test-diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      - name: Install LLVM 22 (pinned diagnostic toolchain)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22
+
+      - name: Compiler cache (content-verified, restore)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-diag-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-diag-${{ github.ref }}-
+            ccache-diag-
+
+      # Also enables the ASan checks that are off by default in every other
+      # lane: stack-use-after-return, stack-use-after-scope, and strict string
+      # checks. Mirrors `make -f Makefile.cbm diag`, including its reasoning
+      # for leaving detect_invalid_pointer_pairs out.
+      - name: Test (clang-22, ASan+UBSan + off-by-default ASan checks)
+        env:
+          ASAN_OPTIONS: "detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1"
+        run: |
+          scripts/test.sh CC=clang-22 CXX=clang++-22 \
+            SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
+
+      - name: Compiler cache (save)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-diag-${{ github.ref }}-${{ github.sha }}
+
+  # MemorySanitizer lane (stage 2). Uninitialized READS are the one
+  # memory-error class no other lane covers dynamically. The image carries
+  # MSan-instrumented libc++/libc++abi/libunwind + zlib (vendored C deps
+  # instrument in-tree); scripts/msan.sh drives the build and the suite.
+  #
+  # THIS JOB IS THE AUTHORITATIVE VENUE for the lane. It previously ran WITHOUT
+  # the script's default exclusions to settle whether those were an aarch64
+  # artifact — the local ladder cannot answer that, having no faithful x86-64
+  # emulation. It has now answered it, and the answer SPLIT the list:
+  #
+  #   - the five deep-recursion suites overflow their thread stacks on x86-64
+  #     too, so that limit is NOT architectural;
+  #   - `cli` does not overflow here at all — it fails in the install path for
+  #     an unrelated, still-undiagnosed reason;
+  #   - `incremental` was a shadow-memory RSS artifact, now fixed in the test
+  #     itself rather than skipped, so it stays in the lane.
+  #
+  # Per-cause detail lives in scripts/msan.sh, which is the single authoritative
+  # list both venues now share. Zero use-of-uninitialized-value findings were
+  # reported across the lane on either architecture.
+  test-msan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Buildx cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/.buildx-msan
+          key: buildx-msan-${{ hashFiles('test-infrastructure/Dockerfile.msan') }}
+
+      - name: Build MSan image (cached layers)
+        run: scripts/ci/msan-lane.sh build
+
+      - name: MSan suite (exclusions per scripts/msan.sh)
+        run: scripts/ci/msan-lane.sh run
+
+  # macOS leak coverage. LeakSanitizer runs by default under ASan on Linux, so
+  # test-unix's ubuntu legs have always had it; on macOS it is off by default
+  # and Apple's clang refuses to turn it on, which left an entire platform with
+  # zero leak detection. Upstream (Homebrew) LLVM supports LSan on darwin/arm64,
+  # so this leg is the ordinary ASan suite built with that toolchain and run
+  # with detect_leaks=1. Mirrors the local `make -f Makefile.cbm test-lsan`.
+  test-lsan-macos:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install LSan-capable toolchain
+        run: brew install llvm ccache
+
+      - name: Compiler cache (content-verified, restore)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-lsan-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-lsan-${{ github.ref }}-
+            ccache-lsan-
+
+      - name: Test (Homebrew clang, ASan + LeakSanitizer)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+        run: |
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          scripts/test.sh CC="$LLVM_PREFIX/bin/clang" CXX="$LLVM_PREFIX/bin/clang++"
+
+      - name: Compiler cache (save)
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-lsan-${{ github.ref }}-${{ github.sha }}
+
   test-tsan:
     strategy:
       fail-fast: false
@@ -194,7 +317,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps (Ubuntu)
         if: runner.os == 'Linux'
@@ -250,7 +373,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Defender posture: real-time protection is POLICY-LOCKED OFF on hosted
       # Windows images (verified 2026-07-27: WinDefend starts and
@@ -367,7 +490,7 @@ jobs:
       # The union proof lives in the canonical scripts/ci entry, not inline
       # YAML (venue-parity contract) — checkout (into repo/, so the manifest
       # download below stays untouched) provides the script.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: repo
 
@@ -390,7 +513,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:

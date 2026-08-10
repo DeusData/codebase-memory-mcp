@@ -198,9 +198,10 @@ static const char *go_assign_types[] = {"assignment_statement", "short_var_decla
 static const char *py_func_types[] = {"function_definition", NULL};
 static const char *py_class_types[] = {"class_definition", NULL};
 static const char *py_module_types[] = {"module", NULL};
-static const char *py_call_types[] = {"call", "with_statement", NULL};
+static const char *py_call_types[] = {"call", NULL};
 static const char *py_import_types[] = {"import_statement", "import", NULL};
-static const char *py_import_from_types[] = {"import_from_statement", NULL};
+static const char *py_import_from_types[] = {"import_from_statement", "future_import_statement",
+                                             NULL};
 static const char *py_branch_types[] = {
     "if_statement",  "for_statement",  "while_statement", "try_statement",
     "except_clause", "with_statement", "elif_clause",     NULL};
@@ -215,13 +216,8 @@ static const char *js_func_types[] = {"function_declaration", "generator_functio
 static const char *js_class_types[] = {"class_declaration", "class", NULL};
 static const char *js_module_types[] = {"program", NULL};
 static const char *js_call_types[] = {"call_expression", "new_expression", NULL};
-static const char *js_import_types[] = {"import_statement",
-                                        "lexical_declaration",
-                                        "export_statement",
-                                        "import",
-                                        "extends",
-                                        "require",
-                                        NULL};
+static const char *js_import_types[] = {"import_statement", "export_statement", "import",
+                                        "extends",          "require",          NULL};
 static const char *js_branch_types[] = {"if_statement",
                                         "for_statement",
                                         "for_in_statement",
@@ -343,12 +339,8 @@ static const char *cpp_class_types[] = {"class_specifier", "struct_specifier", "
 static const char *cpp_field_types[] = {"field_declaration", NULL};
 static const char *cpp_module_types[] = {"translation_unit", "namespace_definition",
                                          "linkage_specification", "declaration", NULL};
-static const char *cpp_call_types[] = {
-    "call_expression",  "field_expression",  "subscript_expression",
-    "new_expression",   "delete_expression", "binary_expression",
-    "unary_expression", "update_expression", NULL};
-static const char *cpp_import_types[] = {"preproc_include", "template_function", "declaration",
-                                         NULL};
+static const char *cpp_call_types[] = {"call_expression", "new_expression", NULL};
+static const char *cpp_import_types[] = {"preproc_include", NULL};
 static const char *cpp_branch_types[] = {"if_statement",    "for_statement",    "for_range_loop",
                                          "while_statement", "switch_statement", "case_statement",
                                          "try_statement",   "catch_clause",     NULL};
@@ -422,8 +414,7 @@ static const char *scala_class_types[] = {"class_definition", "object_definition
                                           "trait_definition", "enum_definition",
                                           "type_definition",  NULL};
 static const char *scala_module_types[] = {"compilation_unit", NULL};
-static const char *scala_call_types[] = {"call_expression",     "generic_function",
-                                         "field_expression",    "infix_expression",
+static const char *scala_call_types[] = {"call_expression", "infix_expression",
                                          "instance_expression", NULL};
 static const char *scala_import_types[] = {"import_declaration", "extends", "import",
                                            "using_directive", NULL};
@@ -442,7 +433,7 @@ static const char *kotlin_func_types[] = {"function_declaration", "secondary_con
 static const char *kotlin_class_types[] = {"class_declaration", "object_declaration",
                                            "companion_object", "type_alias", NULL};
 static const char *kotlin_module_types[] = {"source_file", NULL};
-static const char *kotlin_call_types[] = {"call_expression", "navigation_expression", NULL};
+static const char *kotlin_call_types[] = {"call_expression", NULL};
 static const char *kotlin_import_types[] = {"import", NULL};
 static const char *kotlin_branch_types[] = {
     "if_expression", "for_statement",  "while_statement", "when_expression",
@@ -456,7 +447,7 @@ static const char *kotlin_decorator_types[] = {"annotation", NULL};
 static const char *ruby_func_types[] = {"method", "singleton_method", NULL};
 static const char *ruby_class_types[] = {"class", "module", NULL};
 static const char *ruby_module_types[] = {"program", NULL};
-static const char *ruby_call_types[] = {"call", "command_call", NULL};
+static const char *ruby_call_types[] = {"call", NULL};
 static const char *ruby_import_types[] = {"call", NULL};
 static const char *ruby_branch_types[] = {"if",   "unless", "while",  "until", "for",
                                           "case", "when",   "rescue", "elsif", NULL};
@@ -507,7 +498,7 @@ static const char *zig_assign_types[] = {"assignment_expression", NULL};
 // ==================== ELIXIR ====================
 static const char *elixir_func_types[] = {"call", "anonymous_function", NULL};
 static const char *elixir_module_types[] = {"source", NULL};
-static const char *elixir_call_types[] = {"call", "dot", "binary_operator", NULL};
+static const char *elixir_call_types[] = {"call", "binary_operator", NULL};
 static const char *elixir_import_types[] = {"call", NULL};
 static const char *elixir_branch_types[] = {"call", NULL};
 static const char *elixir_var_types[] = {"binary_operator", NULL};
@@ -562,7 +553,7 @@ static const char *swift_class_types[] = {"class_declaration", "protocol_declara
 static const char *swift_field_types[] = {"property_declaration", NULL};
 static const char *swift_module_types[] = {"source_file", NULL};
 static const char *swift_call_types[] = {"call_expression", "constructor_expression",
-                                         "macro_invocation", "navigation_expression", NULL};
+                                         "macro_invocation", NULL};
 static const char *swift_import_types[] = {"import_declaration", "import", NULL};
 static const char *swift_branch_types[] = {"if_statement",    "guard_statement",  "for_statement",
                                            "while_statement", "switch_statement", NULL};
@@ -669,7 +660,7 @@ static const char *sql_func_types[] = {"create_function", "function_declaration"
 static const char *sql_field_types[] = {"column_definition", NULL};
 static const char *sql_class_types[] = {"custom_type", NULL};
 static const char *sql_module_types[] = {"program", NULL};
-static const char *sql_call_types[] = {"function_call", "invocation", "command", NULL};
+static const char *sql_call_types[] = {"invocation", NULL};
 static const char *sql_branch_types[] = {"if_statement", "case_expression", NULL};
 static const char *sql_var_types[] = {"create_table", "create_view", NULL};
 
@@ -717,7 +708,7 @@ static const char *fsharp_func_types[] = {"function_declaration", "value_declara
                                           "function_or_value_defn", NULL};
 static const char *fsharp_class_types[] = {"type_definition", "exception_definition", NULL};
 static const char *fsharp_module_types[] = {"file", NULL};
-static const char *fsharp_call_types[] = {"application_expression", "dot_expression", NULL};
+static const char *fsharp_call_types[] = {"application_expression", NULL};
 static const char *fsharp_import_types[] = {"import_decl", "open_expression", "instance", NULL};
 static const char *fsharp_branch_types[] = {"if_expression",    "for_expression",
                                             "while_expression", "match_expression",
@@ -770,7 +761,7 @@ static const char *elm_func_types[] = {"value_declaration", "function_declaratio
 static const char *elm_class_types[] = {"type_declaration", "type_alias_declaration",
                                         "module_declaration", NULL};
 static const char *elm_module_types[] = {"file", NULL};
-static const char *elm_call_types[] = {"function_call", "function_call_expr", NULL};
+static const char *elm_call_types[] = {"function_call_expr", NULL};
 static const char *elm_import_types[] = {"import", NULL};
 static const char *elm_branch_types[] = {"case_of_expr", "if_else_expr", NULL};
 
@@ -781,7 +772,7 @@ static const char *fortran_func_types[] = {"function", "subroutine", "function_s
                                            "subroutine_statement", NULL};
 static const char *fortran_class_types[] = {"derived_type_definition", "enum_statement", NULL};
 static const char *fortran_module_types[] = {"translation_unit", NULL};
-static const char *fortran_call_types[] = {"call_expression", "keyword_argument", "call", NULL};
+static const char *fortran_call_types[] = {"call_expression", "subroutine_call", NULL};
 static const char *fortran_import_types[] = {"use_statement",  "include_statement", "extends",
                                              "import",         "import_statement",  "include",
                                              "open_statement", "preproc_include",   NULL};
@@ -926,7 +917,7 @@ static const char *matlab_var_types[] = {"assignment", NULL};
 static const char *lean_func_types[] = {"def", "theorem", "instance", "abbrev", NULL};
 static const char *lean_class_types[] = {"structure", "class_inductive", "inductive", NULL};
 static const char *lean_module_types[] = {"module", NULL};
-static const char *lean_call_types[] = {"apply", "command", NULL};
+static const char *lean_call_types[] = {"apply", NULL};
 static const char *lean_import_types[] = {"import", "extends", "instance", NULL};
 static const char *lean_branch_types[] = {"if", "match", "do", NULL};
 
@@ -973,8 +964,7 @@ static const char *d_class_types[] = {"class_declaration",
                                       "module_def",
                                       NULL};
 static const char *d_field_types[] = {"variable_declaration", NULL};
-static const char *d_call_types[] = {"call_expression", "function_call_expression",
-                                     "new_expression", NULL};
+static const char *d_call_types[] = {"call_expression", "new_expression", NULL};
 static const char *d_import_types[] = {"import_declaration", "import", NULL};
 static const char *d_branch_types[] = {"if_statement",    "for_statement",   "foreach_statement",
                                        "while_statement", "do_statement",    "switch_statement",
@@ -1094,7 +1084,7 @@ static const char *fish_module_types[] = {"program", NULL};
  * called by name, so a call inside a rule is legitimately Module-sourced, and a
  * rule must NOT be treated as a function boundary. */
 static const char *awk_func_types[] = {"func_def", NULL};
-static const char *awk_call_types[] = {"func_call", "command", NULL};
+static const char *awk_call_types[] = {"func_call", NULL};
 static const char *awk_branch_types[] = {"if_statement",
                                          "for_statement",
                                          "for_in_statement",
@@ -1309,7 +1299,7 @@ static const char *prisma_call_types[] = {"call_expression", NULL};
 static const char *prisma_module_types[] = {"program", NULL};
 static const char *hyprlang_module_types[] = {"source_file", NULL};
 static const char *dotenv_module_types[] = {"source_file", NULL};
-static const char *diff_call_types[] = {"command", NULL};
+static const char *diff_call_types[] = {NULL};
 static const char *diff_module_types[] = {"source", NULL};
 static const char *wgsl_func_types[] = {"function_declaration", NULL};
 static const char *wgsl_class_types[] = {"struct_declaration", "type_alias_declaration",
@@ -1352,7 +1342,7 @@ static const char *properties_var_types[] = {"property", NULL};
 /* tree-sitter-properties roots the tree at `file`, not `source_file`. */
 static const char *properties_module_types[] = {"file", "source_file", NULL};
 static const char *sshconfig_module_types[] = {"source_file", NULL};
-static const char *bibtex_call_types[] = {"command", NULL};
+static const char *bibtex_call_types[] = {NULL};
 static const char *bibtex_module_types[] = {"document", NULL};
 static const char *starlark_func_types[] = {"function_definition", "lambda", NULL};
 static const char *starlark_call_types[] = {"call", NULL};
@@ -1423,7 +1413,7 @@ static const char *devicetree_call_types[] = {"call_expression", NULL};
 static const char *devicetree_import_types[] = {"dtsi_include", "preproc_include", NULL};
 static const char *devicetree_module_types[] = {"document", NULL};
 static const char *linkerscript_call_types[] = {"call_expression", NULL};
-static const char *linkerscript_module_types[] = {"source_file", NULL};
+static const char *linkerscript_module_types[] = {"linkerscript", NULL};
 static const char *gn_call_types[] = {"call_expression", NULL};
 static const char *gn_import_types[] = {"import_statement", "import", NULL};
 static const char *gn_branch_types[] = {"if_statement", "foreach_statement", NULL};
@@ -1510,8 +1500,7 @@ static const char *mermaid_module_types[] = {"source_file", NULL};
 static const char *puppet_func_types[] = {"function_declaration", "lambda", NULL};
 static const char *puppet_class_types[] = {"class_definition", "node_definition",
                                            "resource_declaration", "type_declaration", NULL};
-static const char *puppet_call_types[] = {"function_call", "resource_declaration",
-                                          "include_statement", NULL};
+static const char *puppet_call_types[] = {"function_call", "include_statement", NULL};
 static const char *puppet_import_types[] = {"include_statement", "require_statement", "include",
                                             "require", NULL};
 static const char *puppet_branch_types[] = {"if_statement", "unless_statement", "case_statement",
@@ -1628,7 +1617,9 @@ static const char *objectscript_udl_module_types[] = {"source_file", NULL};
 static const char *objectscript_udl_branch_types[] = {
     "command_if", "command_for", "command_while", "elseif_block", "catch_block", NULL};
 
-static const char *objectscript_routine_func_types[] = {"tag", NULL};
+/* Parameterized entries are `procedure` nodes whose direct `tag` child names
+ * the callable; bare labels remain standalone `tag` nodes. */
+static const char *objectscript_routine_func_types[] = {"procedure", "tag", NULL};
 static const char *objectscript_routine_call_types[] = {"extrinsic_function", "routine_tag_call",
                                                         NULL};
 static const char *objectscript_routine_module_types[] = {"source_file", NULL};
@@ -2645,7 +2636,11 @@ const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
     if (lang < 0 || lang >= CBM_LANG_COUNT) {
         return NULL;
     }
-    return &lang_specs[lang];
+    const CBMLangSpec *spec = &lang_specs[lang];
+    if (spec->language != lang || !spec->function_node_types) {
+        return NULL;
+    }
+    return spec;
 }
 
 const TSLanguage *cbm_ts_language(CBMLanguage lang) {
