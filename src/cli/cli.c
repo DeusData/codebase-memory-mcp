@@ -6824,8 +6824,7 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         cbm_path_info_t marker_info;
         bool owned = out_info.is_directory && !out_info.is_symlink &&
                      cbm_path_info_utf8(marker, &marker_info) == 0 && marker_info.is_regular &&
-                     !marker_info.is_symlink &&
-                     emit_marker_is_owned(marker);
+                     !marker_info.is_symlink && emit_marker_is_owned(marker);
         if (!owned) {
             (void)fprintf(stderr,
                           "error: refusing to clear %s: not an emitted plugin directory "

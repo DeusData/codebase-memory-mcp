@@ -803,8 +803,7 @@ cbm_path_info_result_t cbm_path_info_utf8(const char *path, cbm_path_info_t *out
     }
     struct stat state;
     if (lstat(path, &state) != 0) {
-        return errno == ENOENT || errno == ENOTDIR ? CBM_PATH_INFO_MISSING
-                                                   : CBM_PATH_INFO_ERROR;
+        return errno == ENOENT || errno == ENOTDIR ? CBM_PATH_INFO_MISSING : CBM_PATH_INFO_ERROR;
     }
     memset(out, 0, sizeof(*out));
     out->is_regular = S_ISREG(state.st_mode);
