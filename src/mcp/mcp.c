@@ -406,7 +406,10 @@ static const tool_def_t TOOLS[] = {
      "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
-     "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     "Teammates can bootstrap from the artifact instead of full re-indexing.\"},"
+     "\"index_worktree\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Index repo_path even when it is a linked git worktree and the "
+     "ignore_worktrees config key is enabled. No effect otherwise.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph", "Search graph",
@@ -7938,6 +7941,22 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(boundary_err, true);
     }
 
+    /* ignore_worktrees: an EXPLICIT index_repository call on a linked worktree
+     * is refused with the two ways forward (per-call override, or turn the
+     * setting off) rather than silently skipped — a silent success would be
+     * indistinguishable from a real index to the caller. */
+    if (cbm_mcp_ignore_worktrees_enabled(srv) && !cbm_mcp_get_bool_arg(args, "index_worktree") &&
+        cbm_git_is_linked_worktree(repo_path)) {
+        free(mode_str);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result(
+            "repo_path is a linked git worktree and ignore_worktrees is enabled. Pass "
+            "index_worktree=true to index it anyway, or run: codebase-memory-mcp config set "
+            "ignore_worktrees false",
+            true);
+    }
+
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
         char *result = handle_cross_repo_mode(srv, repo_path, name_override, args);
@@ -11116,6 +11135,17 @@ static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
     return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, true);
 }
 
+/* ignore_worktrees config: gates automatic indexing of LINKED git worktrees
+ * (default off, so existing setups keep indexing them). Users who create many
+ * short-lived worktrees can stop each throwaway checkout from registering a
+ * new permanent project with `config set ignore_worktrees true`. */
+bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv) {
+    if (!srv || !srv->config) {
+        return false; /* default off */
+    }
+    return cbm_config_get_bool(srv->config, CBM_CONFIG_IGNORE_WORKTREES, false);
+}
+
 /* Register the session project with the background watcher for ongoing
  * change detection — unless auto_watch is disabled. */
 static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
@@ -11239,6 +11269,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
                      "run: codebase-memory-mcp config set auto_index true");
+        return;
+    }
+
+    if (cbm_mcp_ignore_worktrees_enabled(srv) && cbm_git_is_linked_worktree(srv->session_root)) {
+        cbm_log_info("autoindex.skip", "reason", "linked_worktree", "project",
+                     srv->session_project);
         return;
     }
 

@@ -394,6 +394,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
+#define CBM_CONFIG_IGNORE_WORKTREES "ignore_worktrees"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 
 /* ── Binary activation safety ─────────────────────────────────── */

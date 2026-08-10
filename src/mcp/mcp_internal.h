@@ -43,6 +43,11 @@ const char *cbm_mcp_edge_strategy_class(const char *strategy);
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
 
+/* True when the `ignore_worktrees` config key is on for this server (default
+ * off). Callers pair it with cbm_git_is_linked_worktree() to decide whether an
+ * automatic index of a linked worktree should be skipped. */
+bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv);
+
 /* detect_changes seed scoping (#1363): does `node`'s line range overlap any
  * recorded hunk for `file`? Exposed for direct unit testing of the overlap
  * logic, independent of the git/subprocess/index plumbing around it. */

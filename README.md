@@ -153,6 +153,8 @@ When enabled, new projects are indexed automatically on first connection. Previo
 
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
 
+Linked git worktrees are indexed as their own projects by default. Set `config set ignore_worktrees true` to skip them on the automatic paths — useful when short-lived `git worktree add` checkouts would otherwise each leave behind a permanent index of the same repository. An explicit `index_repository` call on a worktree is then refused unless you pass `index_worktree=true`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#ignore_worktrees).
+
 ### Keeping Up to Date
 
 **Updates run from the install script on every platform, not from inside the running binary.** `codebase-memory-mcp update` validates your flags and then prints the exact command to run:
@@ -663,6 +665,7 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 

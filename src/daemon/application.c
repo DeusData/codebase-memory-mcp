@@ -14,6 +14,7 @@
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
+#include "git/git_context.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -1940,6 +1941,11 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                             : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
     int tracked_files = -1;
     bool auto_index_candidate = auto_index && !db_exists;
+    if (auto_index_candidate && cbm_mcp_ignore_worktrees_enabled(session->mcp) &&
+        cbm_git_is_linked_worktree(root_path)) {
+        cbm_log_info("daemon.autoindex.skipped", "project", project, "reason", "linked_worktree");
+        auto_index_candidate = false;
+    }
     bool within_auto_index_limit =
         !auto_index_candidate ||
         cbm_mcp_auto_index_within_file_limit(root_path, auto_index_limit, &tracked_files);
