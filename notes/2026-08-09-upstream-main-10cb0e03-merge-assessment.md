@@ -6,12 +6,14 @@
 | --- | --- |
 | Purpose | Release record, benchmark report, and remaining publication plan for PR #1245 |
 | Status | Local candidate and installation verified; guarded publication, PR metadata, and final-head hosted CI remain |
-| Evidence baseline | macOS arm64, 2026-08-10; product source `5504dcf`; evidence commit `8208adda` |
+| Evidence baseline | macOS arm64, 2026-08-10; product source `5504dcf`; refreshed merge `29c7a2f1` |
 | Destination parent | `9953c328d1af27a836c533b399dc5b8ec08a22f5` |
-| Upstream parent | `4ed8d384f76b4945f1b50845d8b0e28c78ea304b` |
+| Benchmarked upstream parent | `4ed8d384f76b4945f1b50845d8b0e28c78ea304b` |
+| Current upstream main | `ad010b1656aa39c48a34b180e3501b9205a27ffd` |
 | Merge base | `10cb0e03fbb03fc62435174df5a52cad3186c444` |
-| Two-parent merge | `32bc95314e2e9d64bb62211a78c16c58331c0588` |
-| Recovery refs | `refs/merge-recovery/pre-upstream-main-20260810-9953c328`; `refs/merge-input/upstream-main-20260810-4ed8d384` |
+| Consolidation merge | `32bc95314e2e9d64bb62211a78c16c58331c0588` |
+| Current-main refresh merge | `29c7a2f1b6444849cb57ef6b4440205f2e745434`; parents `1f8ccb76` and `ad010b16` |
+| Recovery refs | `refs/merge-recovery/pre-upstream-main-20260810-9953c328`; `refs/merge-recovery/pre-upstream-main-20260810-1f8ccb7`; matching `refs/merge-input/` refs for `4ed8d384` and `ad010b16` |
 | Release refs | `api-consolidation` and `api-consolidation-merge` must resolve to the same final commit |
 | Decision needed | None for local content. Publication is gated on final install smoke tests and exact remote leases. |
 
@@ -22,7 +24,7 @@ paths, and installation hash. Historical commits remain available in Git.
 
 | Area | Before | Verified now | Release target | Consequence |
 | --- | --- | --- | --- | --- |
-| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `32bc9531` has exactly `9953c328` and `4ed8d384` as parents; both are ancestors of `5504dcf` | Publish both release branch names at one tip | Reviewers see one auditable superset history |
+| Branch topology | Destination and refreshed upstream had independent changes after `10cb0e03` | `32bc9531` joins `9953c328` with `4ed8d384`; `29c7a2f1` joins that result with current main `ad010b16` | Publish both release branch names at one tip | Reviewers see one auditable superset history |
 | Release packaging | Upstream carried the newer embedded UI/runtime-set design; destination carried rollback and richer installation behavior | One embedded binary, one four-member archive set, exact asset lookup, rollback, activation, and ownership contracts coexist | Keep all package and install checks green on the published head | No sidecar-era or variant-binary regression |
 | Indexing and API behavior | Destination was ahead in dependency indexing, PageRank, incremental indexing, extraction, and diagnostics | Those paths remain, together with upstream UI, Windows, archive, and release hardening | Preserve both parents' useful behavior | The merge does not trade branch functionality for upstream freshness |
 | Python registry filtering | Repeated indexed root-child scans scaled poorly with registry size | One circular `TSTreeCursor` performs root membership checks in `O(R*N)` time and `O(1)` auxiliary space | Retain exact class filtering for arbitrary registry order | Scale latency and retired work fall without output loss |
@@ -37,11 +39,11 @@ publication and green final-head CI.
 | Parent | Value and quality | Risk if taken wholesale | Disposition |
 | --- | --- | --- | --- |
 | Destination `9953c328` | More advanced dependency indexing, PageRank, exact-delta and overlay indexing, richer extraction, activation transactions, daemon admission, JSON hot paths, diagnostics, tests, and benchmark coverage | It lacked the refreshed upstream release composition and some later portability fixes | Use as the behavior, correctness, and hot-path baseline |
-| Upstream `4ed8d384` | Coherent embedded UI/templates, unsuffixed archive composition, wrapper/install corrections, Windows path handling, arm64 W^X behavior, and current release contracts | Wholesale replacement would remove destination-only indexing, query, lifecycle, and benchmark work | Take the release and portability changes, then compose them with destination behavior |
+| Upstream `ad010b16` | Coherent embedded UI/templates, unsuffixed archive composition, wrapper/install corrections, Windows path handling, arm64 W^X behavior, and current release contracts | Wholesale replacement would remove destination-only indexing, query, lifecycle, and benchmark work | Take the release and portability changes, then compose them with destination behavior |
 
 The merge base to destination range changes 350 files (179,660 insertions and
-31,411 deletions). The merge base to upstream range changes 78 files (3,113
-insertions and 11,652 deletions). Investigation difficulty is **5/5** because
+31,411 deletions). The merge base to current upstream range changes 79 files
+(3,126 insertions and 11,669 deletions). Investigation difficulty is **5/5** because
 many lifecycle, package, protocol, and performance contracts cross file boundaries
 without textual conflicts. Completion difficulty is **4/5**: the shared fixes are
 small, but exact-parent builds, sanitizer lanes, allocator checks, installation,
@@ -66,6 +68,9 @@ Windows evidence, DCO, and guarded publication are all required.
    returning success after failed cleanup.
 6. Package, protocol, schema, daemon, UI, activation, extraction, and benchmark
    callers were checked laterally so the repairs remain shared and finite.
+7. `29c7a2f1` takes current main's single-composition smoke workflow exactly.
+   Unix, Windows, and portable artifact legs set `SMOKE_REQUIRE_UI=1`, so an
+   archive that loses its embedded UI fails instead of passing a reduced smoke.
 
 ## Correctness, safety, and robustness evidence
 
@@ -115,6 +120,10 @@ Result SHA-256:
 
 All four workloads have exact output parity against both parents. Values below
 are medians in candidate / destination / upstream order.
+
+Current upstream `ad010b16` differs from the benchmarked upstream
+`4ed8d384` only in `.github/workflows/_smoke.yml`; product source and the
+upstream benchmark runner are unchanged.
 
 | Workload | Latency ms | Retired instructions | Incremental instructions | Incremental max RSS bytes | Incremental peak footprint bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -175,6 +184,8 @@ confirms the Python hot-path change reduces retired work as input grows.
   protocol, package, source-safety, and focused unit gates.
 - [x] Build the exact parent and candidate runners; run the full 41-pair matrix.
 - [x] Commit product changes `8df9f9d` and `5504dcf` with DCO signoffs.
+- [x] Merge current upstream `ad010b16` and pass YAML, venue-parity,
+  smoke-fixture, and Windows single-binary workflow contracts.
 - [x] Commit the refreshed assessment with DCO; all 941 non-merge commits in
   `4ed8d384..8208adda` have author-matching `Signed-off-by` trailers.
 - [x] Build and install the embedded-UI binary; verify mode, matching build/install
