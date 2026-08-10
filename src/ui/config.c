@@ -45,11 +45,11 @@ bool cbm_ui_parse_enabled(const char *value, bool *enabled_out) {
     if (!value || !enabled_out) {
         return false;
     }
-    if (strcmp(value, "true") == 0) {
+    if (value[0] == 't' && strcmp(value, "true") == 0) {
         *enabled_out = true;
         return true;
     }
-    if (strcmp(value, "false") == 0) {
+    if (value[0] == 'f' && strcmp(value, "false") == 0) {
         *enabled_out = false;
         return true;
     }
@@ -60,15 +60,18 @@ bool cbm_ui_parse_port(const char *value, int *port_out) {
     if (!value || !value[0] || !port_out) {
         return false;
     }
+    unsigned port = 0;
     for (const char *cursor = value; *cursor; cursor++) {
         if (*cursor < '0' || *cursor > '9') {
             return false;
         }
+        unsigned digit = (unsigned)(*cursor - '0');
+        if (port > ((unsigned)CBM_UI_MAX_PORT - digit) / 10U) {
+            return false;
+        }
+        port = port * 10U + digit;
     }
-    char *end = NULL;
-    errno = 0;
-    long port = strtol(value, &end, 10);
-    if (errno != 0 || !end || *end != '\0' || port <= 0 || port > CBM_UI_MAX_PORT) {
+    if (port == 0U) {
         return false;
     }
     *port_out = (int)port;

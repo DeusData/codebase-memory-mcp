@@ -2267,8 +2267,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         } else if (strcmp(argv[index], "--open") == 0) {
             open_browser = true;
         } else if (strncmp(argv[index], "--port=", 7) == 0) {
-            requested_port = atoi(argv[index] + 7);
-            if (requested_port <= 0 || requested_port >= MAIN_MAX_PORT) {
+            if (!cbm_ui_parse_port(argv[index] + 7, &requested_port)) {
                 (void)fprintf(stderr, "error: --port requires a value between 1 and 65535\n");
                 return EXIT_FAILURE;
             }

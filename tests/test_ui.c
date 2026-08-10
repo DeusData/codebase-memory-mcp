@@ -301,6 +301,22 @@ TEST(embedded_stub_count) {
     PASS();
 }
 
+TEST(embedded_lookup_sorted_table) {
+    static const unsigned char bytes[] = {0};
+    const cbm_embedded_file_t files[] = {
+        {"/assets/a.css", bytes, 1, "text/css"},
+        {"/assets/b.js", bytes, 1, "application/javascript"},
+        {"/assets/c.svg", bytes, 1, "image/svg+xml"},
+        {"/index.html", bytes, 1, "text/html"},
+    };
+    ASSERT_TRUE(cbm_embedded_lookup_sorted(files, 4, "/assets/a.css") == &files[0]);
+    ASSERT_TRUE(cbm_embedded_lookup_sorted(files, 4, "/assets/c.svg") == &files[2]);
+    ASSERT_TRUE(cbm_embedded_lookup_sorted(files, 4, "/index.html") == &files[3]);
+    ASSERT_NULL(cbm_embedded_lookup_sorted(files, 4, "/assets/b.css"));
+    ASSERT_NULL(cbm_embedded_lookup_sorted(files, 4, NULL));
+    PASS();
+}
+
 /* ── Layout tests ─────────────────────────────────────────────── */
 
 TEST(layout_empty_graph) {
@@ -901,6 +917,7 @@ SUITE(ui) {
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);
     RUN_TEST(embedded_stub_count);
+    RUN_TEST(embedded_lookup_sorted_table);
 
     /* Layout engine */
     RUN_TEST(layout_empty_graph);

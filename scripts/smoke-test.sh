@@ -2973,6 +2973,18 @@ for INVALID_ARG in "--ui=maybe" "--port=0"; do
 done
 echo "OK 9b-10: invalid UI values fail before daemon admission"
 
+# The daemon-control surface shares the same exact parser; numeric prefixes
+# must not reach status/start handling as a valid port.
+DAEMON_INVALID_RC=0
+DAEMON_INVALID_OUT=$(HOME="$FAKE_HOME" CBM_CACHE_DIR="$FAKE_HOME/.cache/codebase-memory-mcp" \
+  "$BINARY" daemon status --port=9749x < /dev/null 2>&1) || DAEMON_INVALID_RC=$?
+if [ "$DAEMON_INVALID_RC" -ne 1 ] || \
+   ! echo "$DAEMON_INVALID_OUT" | grep -Fxq 'error: --port requires a value between 1 and 65535'; then
+  echo "FAIL 9b-11: daemon control accepted a numeric port prefix"
+  exit 1
+fi
+echo "OK 9b-11: daemon control rejects numeric port prefixes before endpoint access"
+
 retire_account_daemon "9-cleanup"
 smoke_rmtree "$FAKE_HOME" "$EMPTY_HOME"
 

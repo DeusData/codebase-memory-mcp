@@ -52,7 +52,7 @@ mangle() {
 FILES=()
 while IFS= read -r -d '' file; do
     FILES+=("$file")
-done < <(find "$DIST_DIR" -type f -print0 | sort -z)
+done < <(find "$DIST_DIR" -type f -print0 | LC_ALL=C sort -z)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
     echo "Error: no files found in $DIST_DIR" >&2
@@ -180,12 +180,8 @@ fi
 cat >> "$ASSETS_C" <<'LOOKUP'
 
 const cbm_embedded_file_t *cbm_embedded_lookup(const char *path) {
-    for (int i = 0; i < CBM_EMBEDDED_FILE_COUNT; i++) {
-        if (strcmp(CBM_EMBEDDED_FILES[i].path, path) == 0) {
-            return &CBM_EMBEDDED_FILES[i];
-        }
-    }
-    return NULL;
+    return cbm_embedded_lookup_sorted(CBM_EMBEDDED_FILES,
+                                      (size_t)CBM_EMBEDDED_FILE_COUNT, path);
 }
 LOOKUP
 

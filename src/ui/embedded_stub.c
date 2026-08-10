@@ -6,17 +6,9 @@
  */
 #include "ui/embedded_assets.h"
 
-#include <stddef.h>
-#include <string.h>
-
 cbm_embedded_file_t CBM_EMBEDDED_FILES[] = {{NULL, NULL, 0, NULL}};
 const int CBM_EMBEDDED_FILE_COUNT = 0;
 
 const cbm_embedded_file_t *cbm_embedded_lookup(const char *path) {
-    for (int i = 0; i < CBM_EMBEDDED_FILE_COUNT; i++) {
-        if (strcmp(CBM_EMBEDDED_FILES[i].path, path) == 0) {
-            return &CBM_EMBEDDED_FILES[i];
-        }
-    }
-    return NULL;
+    return cbm_embedded_lookup_sorted(CBM_EMBEDDED_FILES, (size_t)CBM_EMBEDDED_FILE_COUNT, path);
 }
