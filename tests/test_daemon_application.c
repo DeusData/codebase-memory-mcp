@@ -292,7 +292,9 @@ TEST(daemon_application_new_session_does_not_retain_initial_store) {
     cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
     cbm_daemon_runtime_application_callbacks_t callbacks =
         cbm_daemon_application_runtime_callbacks(application);
+    uint64_t memory_store_opens_before = cbm_mcp_memory_store_open_count_for_testing();
     cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 300);
+    uint64_t memory_store_opens_after = cbm_mcp_memory_store_open_count_for_testing();
 
     bool retains_store = session && cbm_daemon_application_session_retains_store_for_test(session);
 
@@ -304,6 +306,7 @@ TEST(daemon_application_new_session_does_not_retain_initial_store) {
 
     ASSERT_NOT_NULL(application);
     ASSERT_NOT_NULL(session);
+    ASSERT_EQ(memory_store_opens_after, memory_store_opens_before);
     ASSERT_FALSE(retains_store);
     ASSERT_TRUE(stopped);
     PASS();

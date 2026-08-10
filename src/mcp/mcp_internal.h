@@ -15,10 +15,11 @@ void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
 void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
                                           void *context);
 
-/* Release only the constructor-created pristine in-memory store. Public
- * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
- * this immediately before publication so idle sessions retain no SQLite DB. */
-bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv);
+/* Allocate a server whose store is intentionally absent. Daemon sessions set
+ * their project context before dispatch and must not build a temporary SQLite
+ * memory store merely to close it before publication. Public
+ * cbm_mcp_server_new(NULL) semantics remain unchanged. */
+cbm_mcp_server_t *cbm_mcp_server_new_without_store(void);
 
 /* Inspect, then atomically consume, one coalesced tools/list_changed
  * notification after a response is ready. Daemon dispatch peeks before its
@@ -32,6 +33,7 @@ bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv);
  * server. Tests use it to pin one-open validation/dispatch without depending
  * on wall-clock timing. */
 #ifdef CBM_ENABLE_TEST_SEAMS
+uint64_t cbm_mcp_memory_store_open_count_for_testing(void);
 uint64_t cbm_mcp_server_query_store_open_count_for_testing(const cbm_mcp_server_t *srv);
 uint64_t cbm_mcp_server_request_mem_collect_count_for_testing(const cbm_mcp_server_t *srv);
 void cbm_mcp_test_fail_next_semantic_keyword_allocation(void);

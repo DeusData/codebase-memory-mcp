@@ -2259,8 +2259,8 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     if (!session) {
         return NULL;
     }
-    session->mcp = cbm_mcp_server_new(NULL);
-    if (!session->mcp || !cbm_mcp_server_release_pristine_memory_store(session->mcp)) {
+    session->mcp = cbm_mcp_server_new_without_store();
+    if (!session->mcp) {
         cbm_mcp_server_free(session->mcp);
         free(session);
         return NULL;

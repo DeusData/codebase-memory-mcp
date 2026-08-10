@@ -3606,7 +3606,7 @@ static char *cbm_mcp_tools_list_page(cbm_mcp_server_t *srv, const char *params_j
                       : cbm_mcp_tools_list(srv);
 }
 
-cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
+static cbm_mcp_server_t *mcp_server_new_unbacked(void) {
     cbm_mcp_server_t *srv = calloc(CBM_ALLOC_ONE, sizeof(*srv));
     if (!srv) {
         return NULL;
@@ -3618,14 +3618,6 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     atomic_init(&srv->autoindex_failed, false);
     atomic_init(&srv->just_autoindexed, false);
 
-    /* If a store_path is given, open that project directly.
-     * Otherwise, create an in-memory store for test/embedded use. */
-    if (store_path) {
-        srv->store = cbm_store_open(store_path);
-        srv->current_project = heap_strdup(store_path);
-    } else {
-        srv->store = cbm_store_open_memory();
-    }
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     srv->background_tasks = true;
@@ -3642,8 +3634,38 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
                         NULL) != NULL &&
         retain_store[0] == '1';
 #endif
-
     cbm_mutex_init(&srv->overlay_compaction_lock);
+    return srv;
+}
+
+cbm_mcp_server_t *cbm_mcp_server_new_without_store(void) {
+    return mcp_server_new_unbacked();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_uint_fast64_t g_memory_store_open_count_for_testing = ATOMIC_VAR_INIT(0);
+
+uint64_t cbm_mcp_memory_store_open_count_for_testing(void) {
+    return atomic_load(&g_memory_store_open_count_for_testing);
+}
+#endif
+
+cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
+    cbm_mcp_server_t *srv = mcp_server_new_unbacked();
+    if (!srv) {
+        return NULL;
+    }
+    /* If a store_path is given, open that project directly.
+     * Otherwise, create an in-memory store for test/embedded use. */
+    if (store_path) {
+        srv->store = cbm_store_open(store_path);
+        srv->current_project = heap_strdup(store_path);
+    } else {
+#ifdef CBM_ENABLE_TEST_SEAMS
+        atomic_fetch_add(&g_memory_store_open_count_for_testing, 1);
+#endif
+        srv->store = cbm_store_open_memory();
+    }
     return srv;
 }
 
@@ -3976,17 +3998,6 @@ static cbm_store_t *mcp_open_query_store(cbm_mcp_server_t *srv, const char *path
     (void)srv;
 #endif
     return cbm_store_open_path_query(path);
-}
-
-bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv) {
-    const char *db_path = srv && srv->store ? cbm_store_db_path(srv->store) : NULL;
-    if (!srv || !srv->owns_store || !srv->store || srv->current_project ||
-        srv->store_last_used != 0 || db_path != NULL) {
-        return false;
-    }
-    cbm_store_close(srv->store);
-    srv->store = NULL;
-    return true;
 }
 
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
