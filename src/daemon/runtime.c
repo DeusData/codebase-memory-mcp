@@ -1141,6 +1141,7 @@ static void runtime_service_begin_stopping_locked(cbm_daemon_runtime_service_t *
     if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
         service->state = CBM_DAEMON_RUNTIME_SERVICE_STOPPING;
         service->stop_deadline_ms = deadline;
+        cbm_daemon_coordinator_set_permanent(service->coordinator, false);
         /* The generation's fate is decided here by one of several owners
          * (last-client exit, coordinator stop, activation drain, external
          * stop). Sessions dropped by the losing side of a race are
@@ -2367,7 +2368,10 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->worker_capacity = config->max_clients;
     service->workers = calloc(service->worker_capacity, sizeof(*service->workers));
     service->coordinator = cbm_daemon_coordinator_new(config->lease_timeout_ms);
-    if (service->coordinator && config->permanent) {
+    if (service->coordinator) {
+        /* The runtime sees accepted pre-HELLO connections that the coordinator
+         * cannot. Keep its narrower client census from ending the generation;
+         * runtime_service_begin_stopping_locked releases this hold. */
         cbm_daemon_coordinator_set_permanent(service->coordinator, true);
     }
     service->conflict_log_path =

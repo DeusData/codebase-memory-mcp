@@ -2756,6 +2756,79 @@ TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal) {
     PASS();
 }
 
+TEST(daemon_runtime_final_disconnect_preserves_accepted_slow_hello) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "slow-hello-race", &identity);
+    cbm_daemon_runtime_connect_result_t owner_result = {0};
+    cbm_daemon_runtime_client_t *owner = NULL;
+    cbm_daemon_ipc_connection_t *slow_hello = NULL;
+    uint8_t hello[CBM_DAEMON_RENDEZVOUS_REQUEST_SIZE];
+    cbm_daemon_frame_t response_frame = {0};
+    uint8_t *response_payload = NULL;
+    bool encoded = cbm_daemon_runtime_hello_request_encode(hello, &identity);
+    bool slow_slot_counted = false;
+    bool owner_closed = false;
+    bool service_stayed_running = false;
+    bool sent = false;
+    bool accepted = false;
+    bool exited = false;
+
+    if (started) {
+        owner = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                  RUNTIME_TEST_TIMEOUT_MS, &owner_result);
+    }
+    if (owner && encoded) {
+        slow_hello = cbm_daemon_ipc_connect(fixture.endpoint, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (slow_hello) {
+        slow_slot_counted = cbm_daemon_runtime_service_wait_for_connections(
+            fixture.service, 2, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (slow_slot_counted) {
+        owner_closed = cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+        owner = NULL;
+        service_stayed_running =
+            cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+        sent = cbm_daemon_ipc_send_frame(slow_hello, CBM_DAEMON_FRAME_REQUEST,
+                                         CBM_DAEMON_RUNTIME_OP_HELLO, hello,
+                                         (uint32_t)sizeof(hello));
+        int received = sent ? cbm_daemon_ipc_receive_frame(slow_hello, RUNTIME_TEST_TIMEOUT_MS,
+                                                           &response_frame, &response_payload)
+                            : 0;
+        accepted = received == 1 && response_payload &&
+                   response_frame.type == CBM_DAEMON_FRAME_RESPONSE &&
+                   response_frame.flags == CBM_DAEMON_RUNTIME_OP_HELLO &&
+                   response_frame.length == RUNTIME_TEST_RENDEZVOUS_RESPONSE_SIZE &&
+                   runtime_test_get_u32(response_payload) == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED &&
+                   runtime_test_get_u32(response_payload + 4) == CBM_DAEMON_HELLO_COMPATIBLE;
+    }
+
+    free(response_payload);
+    cbm_daemon_ipc_connection_close(slow_hello);
+    slow_hello = NULL;
+    if (started) {
+        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (owner) {
+        (void)cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    cbm_daemon_ipc_connection_close(slow_hello);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(owner_result.status, CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED);
+    ASSERT_TRUE(encoded);
+    ASSERT_TRUE(slow_slot_counted);
+    ASSERT_TRUE(owner_closed);
+    ASSERT_TRUE(service_stayed_running);
+    ASSERT_TRUE(sent);
+    ASSERT_TRUE(accepted);
+    ASSERT_TRUE(exited);
+    PASS();
+}
+
 TEST(daemon_runtime_rejects_forged_identity_extension) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
@@ -4922,6 +4995,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_final_disconnect_automatically_exits_within_bound);
     RUN_TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval);
     RUN_TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal);
+    RUN_TEST(daemon_runtime_final_disconnect_preserves_accepted_slow_hello);
     RUN_TEST(daemon_runtime_rejects_forged_identity_extension);
     RUN_TEST(daemon_runtime_application_response_roundtrip_is_byte_exact);
     RUN_TEST(daemon_runtime_application_transports_tools_list_changed_disposition);
