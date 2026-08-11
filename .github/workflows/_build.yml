@@ -247,3 +247,83 @@ jobs:
         with:
           name: binaries-linux-${{ matrix.arch }}-portable
           path: "*.tar.gz"
+
+  build-freebsd:
+    name: build-unix (freebsd-${{ matrix.release }}, freebsd, ${{ matrix.arch }}, clang, clang++)
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['15.1', '14.4']
+        arch: ['x86_64']
+        # arch: ['x86_64', 'aarch64']
+        # aarch64 disabled for now: lightningcss (a native Rust dependency of
+        # the Vite/CSS build pipeline) publishes no prebuilt binary for
+        # freebsd-arm64, so `npm run build` fails with "Cannot find module
+        # '../lightningcss.freebsd-arm64.node'" — a real gap in that
+        # package's platform coverage, not something fixable on our side
+        # without vendoring a Rust build of it. Re-enable once lightningcss
+        # ships that target, or once the frontend build is moved to run
+        # natively on a Linux host instead of inside the FreeBSD VM.
+        include:
+          - arch: x86_64
+            artifact_arch: amd64
+            sync: rsync
+          # - arch: aarch64
+          #  artifact_arch: arm64-aarch64
+          #  sync: scp
+    # Must use ubuntu-latest (x86_64 host). Running QEMU guest emulation on arm runners (ubuntu-*-arm)
+    # causes severe performance degradation leading to 3+ hour timeouts.
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build FreeBSD ${{ matrix.release }} (${{ matrix.arch }}) binaries inside VM
+        # https://github.com/vmactions/freebsd-vm
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1
+        with:
+          release: ${{ matrix.release }}
+          arch: ${{ matrix.arch }}
+          # Sync options: rsync, sshfs, nfs, scp
+          sync: ${{ matrix.sync }}
+          usesh: true
+          mem: 6144
+          cpu: 4
+          prepare: |
+            pkg update -f
+            pkg install -y gmake sqlite3 pkgconf node22 npm-node22 bash
+            which python3 >/dev/null 2>&1 || ln -sf $(which python3.15 python3.14 python3.13 python3.12 python3.11 python3.10 2>/dev/null | head -n 1) /usr/local/bin/python3
+          run: |
+            # Build standard binary (canonical scripts/build.sh pattern)
+            if [ -n "${{ inputs.version }}" ]; then
+              scripts/build.sh --version "${{ inputs.version }}" CC=clang CXX=clang++
+            else
+              scripts/build.sh CC=clang CXX=clang++
+            fi
+            scripts/package-release.sh freebsd ${{ matrix.arch }}-${{ matrix.release }}
+
+            # Build UI binary
+            if [ -n "${{ inputs.version }}" ]; then
+              scripts/build.sh --version "${{ inputs.version }}" --with-ui CC=clang CXX=clang++
+            else
+              scripts/build.sh --with-ui CC=clang CXX=clang++
+            fi
+            scripts/package-release.sh freebsd ${{ matrix.arch }}-${{ matrix.release }} --variant ui
+
+      - name: Attest standard binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-freebsd-${{ matrix.artifact_arch }}-${{ matrix.release }}.tar.gz
+
+      - name: Attest UI binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-ui-freebsd-${{ matrix.artifact_arch }}-${{ matrix.release }}.tar.gz
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-freebsd-${{ matrix.artifact_arch }}-${{ matrix.release }}
+          path: "*.tar.gz"
+

@@ -149,10 +149,10 @@ cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
 
 # Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then
-    make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
+    $MAKE -j"$NPROC" -f Makefile.cbm cbm-with-ui \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 else
-    make -j"$NPROC" -f Makefile.cbm cbm \
+    $MAKE -j"$NPROC" -f Makefile.cbm cbm \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 

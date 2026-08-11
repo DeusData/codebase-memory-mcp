@@ -7,7 +7,7 @@
 #   ARCH        — target architecture (arm64 / x86_64)
 #   ARCHFLAGS   — "-arch <arch>" on macOS (target slice for clang/ld), empty elsewhere
 #   NPROC       — number of CPU cores
-#   OS          — darwin / linux / windows
+#   OS          — darwin / linux / windows / freebsd
 
 set -euo pipefail
 
@@ -16,9 +16,20 @@ OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$OS" in
     darwin)  OS="darwin" ;;
     linux)   OS="linux" ;;
+    freebsd*) OS="freebsd" ;;
     mingw*|msys*|cygwin*) OS="windows" ;;
     *)       OS="unknown" ;;
 esac
+
+# ── Set platform-appropriate make ──────────────────────────────
+# FreeBSD ships BSD make as the default 'make'; GNU Makefile syntax in
+# Makefile.cbm requires gmake. All other platforms use 'make'.
+if [[ "$OS" == "freebsd" ]]; then
+    MAKE=gmake
+else
+    MAKE=make
+fi
+export MAKE
 
 # ── Detect / override architecture ─────────────────────────────
 # Default: native HARDWARE architecture (not Rosetta-translated).

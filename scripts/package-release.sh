@@ -21,7 +21,7 @@ Usage: scripts/package-release.sh <goos> <goarch> [--out-dir DIR] [VAR=VAL ...]
 The canonical release-archive step: identical in the release build and the
 local artifact-flow smoke lane.
 
-  goos       linux | darwin | windows
+  goos       linux | darwin | windows | freebsd
   goarch     arch label used verbatim in the archive name (amd64, arm64,
              arm64-portable, ...)
   --out-dir  where to place the archive (default: repository root).
@@ -72,8 +72,8 @@ for arg in "$@"; do
 done
 [ -n "$GOOS" ] && [ -n "$GOARCH" ] || { usage >&2; exit 2; }
 case "$GOOS" in
-linux | darwin | windows) ;;
-*) echo "package-release: goos must be linux, darwin or windows." >&2; exit 2 ;;
+linux | darwin | windows | freebsd) ;;
+*) echo "package-release: goos must be linux, darwin, windows or freebsd." >&2; exit 2 ;;
 esac
 [ -n "$expect_value" ] && { echo "package-release: --$expect_value needs a value." >&2; exit 2; }
 
