@@ -129,6 +129,8 @@ The native `install`, `update`, and `uninstall` commands are the deliberate exce
 
 Package-manager setup (npm, PyPI, or Go) verifies and publishes a coherent private cached runtime set. Sidecars are replaced before the executable with per-file atomic renames; an interrupted multi-file publication is detected and repaired on the next launch rather than being described as one crash-atomic filesystem transaction. It does not replace the active native installation and therefore does not stop running CBM sessions. When that cached binary is executed, it still enters the same exact-build admission barrier. The shell and PowerShell installers invoke the verified candidate's native `install` command, so they do receive the full account-wide activation guarantee.
 
+**Ephemeral invocations (`npx`, one-shot caches).** That admission barrier fingerprints each connecting client's running executable. A binary launched from a throwaway package cache — for example `npx -y codebase-memory-mcp`, whose executable lives under `~/.npm/_npx/<hash>/...` — cannot be fingerprinted, so the daemon rejects it as `image_unverifiable`. The rejected client then waits for admission until its timeout and exits with no JSON-RPC on stdout, which MCP clients surface as a silent connection failure (for example `-32000: Connection closed`). Use a [managed install](#installation) (`codebase-memory-mcp install`) so the binary lives at a stable, fingerprintable path, and point your MCP client at that path instead of `npx`. See [#1539](https://github.com/DeusData/codebase-memory-mcp/issues/1539).
+
 The ordinary `cli` mode is intentionally separate: it runs one command locally and never starts or connects to the coordination daemon, registers a daemon session, or starts watchers/UI. Its only shared state is the OS admission barrier plus per-project locks for graph mutations. While the command is running, a temporary monitor lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
 
 ### Graph Visualization UI
@@ -724,6 +726,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 | Queries return wrong project results | Add `project="name"` parameter. Use `list_projects` to see names. |
 | Binary not found after install | Add to PATH: `export PATH="$HOME/.local/bin:$PATH"` |
 | UI not loading | Ensure you ran `--ui=true`. Check `http://localhost:9749`. |
+| MCP client reports `-32000: Connection closed` / server exits silently at startup (launched via `npx`) | Under the daemon model the client binary must be fingerprintable; an `npx` cache path is ephemeral and rejected (`image_unverifiable`). Use a managed install: `codebase-memory-mcp install --yes` (→ `~/.local/bin/`), then point the MCP client at that binary instead of `npx -y codebase-memory-mcp`. See [Session Coordination Daemon](#session-coordination-daemon). |
 
 ## Hybrid LSP
 
