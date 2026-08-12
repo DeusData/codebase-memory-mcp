@@ -1493,10 +1493,6 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         return rc;
     }
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
-    }
     return 0;
 }
 
@@ -2488,7 +2484,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
-        return 0;
+        /* Same contract as the semantic_manifest_equal no-op above: a run that
+         * changed nothing still owes the first artifact when persistence is on. */
+        return cbm_pipeline_refresh_artifact(p, db_path);
     }
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -2859,5 +2857,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
-    return persist_rc;
+    if (persist_rc != 0) {
+        return persist_rc;
+    }
+    /* Mirrors the full path: publication succeeded, so refresh the artifact.
+     * The helper creates the FIRST one when persistence is on and propagates
+     * an export failure instead of leaving the run looking successful. */
+    return cbm_pipeline_refresh_artifact(p, db_path);
 }
