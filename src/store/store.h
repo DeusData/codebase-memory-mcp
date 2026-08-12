@@ -545,10 +545,11 @@ typedef enum {
 /* Full integrity verdict for the quarantine decision path.
  *
  * The plain cbm_store_check_integrity() returns a single bool and cannot
- * distinguish "the projects table has 99 rows" (real corruption) from
- * "sqlite3_prepare_v2 returned SQLITE_BUSY because another instance held the
- * writer lock" (a transient lock contention, #1206). Quarantining on the latter
- * is what makes concurrent MCP instances destroy each other's healthy DBs.
+ * distinguish structural damage from "sqlite3_prepare_v2 returned SQLITE_BUSY
+ * because another instance held the writer lock" (transient lock contention,
+ * #1206). Multiple project rows are valid because dependency projects share the
+ * parent database; row count alone is never corruption. Quarantining on either
+ * valid state destroys healthy indexed data.
  *
  * This function runs the shallow check, then PRAGMA quick_check, and classifies
  * the failure mode so the caller can quarantine ONLY on confirmed corruption.

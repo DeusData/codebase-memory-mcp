@@ -107,19 +107,10 @@ TMP="$TEMP"
 TMPDIR="$(cygpath -u "$root_windows")"
 export TEMP TMP TMPDIR
 
-# The runner's directory must look like a real user checkout: repos under a
-# profile carry no Authenticated-Users ACE, but C:\cbm (like CI's workspace
-# drive) inherits Modify for Authenticated Users from the drive root, which
-# the activation transaction's source-directory policy correctly refuses —
-# install-flow tests would then fail on the environment, not the code.
-# Two steps, both idempotent: protect the DIRECTORY (inheritance flags are
-# directory-only — a /T re-root leaves files with empty, deny-all DACLs),
-# then /reset the children so they re-inherit the clean set from it.
+# -ProtectDir above gives the runner directory the shared current-SID ACL.
+# Reset existing children afterward so they inherit that protected parent;
+# protecting the directory alone cannot rewrite already-created child ACLs.
 runner_dir_w="$(cygpath -w "$(dirname "$artifact")")"
-me="$(whoami | tr -d '\r')"
-MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
-    /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
-    /Q >/dev/null 2>&1 || true
 MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q >/dev/null 2>&1 || true
 
 echo "=== vm-run-tests: runner=$RUNNER temp=$TEMP suites: $* ==="

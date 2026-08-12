@@ -1194,6 +1194,9 @@ static const tool_def_t TOOLS[] = {
      "query_max_output_bytes; raise only when needed. Dependency symbols use proj.dep.* and "
      "source:dependency; filter them with a supported predicate such as "
      "WHERE n.project =~ '.*\\.dep\\..*'. "
+     "For performance audits, Function/Method properties include transitive_loop_depth, "
+     "linear_scan_in_loop (hidden quadratic work), alloc_in_loop, recursion_in_loop, and "
+     "unguarded_recursion. "
      "The stable supported-language contract and current project vocabulary are generated in "
      "tools/list from their separate canonical registries.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "

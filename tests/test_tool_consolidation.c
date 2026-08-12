@@ -266,6 +266,9 @@ TEST(query_graph_description_repeats_current_executable_schema) {
     ASSERT_NOT_NULL(
         strstr(stateless_tools, "Stable Cypher capability schema cbm.read-only-cypher/v1"));
     ASSERT_NOT_NULL(strstr(stateless_tools, "coalesce/substring/replace/left/right"));
+    ASSERT_NOT_NULL(strstr(stateless_tools, "transitive_loop_depth"));
+    ASSERT_NOT_NULL(strstr(stateless_tools, "linear_scan_in_loop (hidden quadratic work)"));
+    ASSERT_NOT_NULL(strstr(stateless_tools, "alloc_in_loop"));
     free(stateless_tools);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
