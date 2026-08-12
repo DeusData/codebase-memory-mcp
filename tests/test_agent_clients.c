@@ -1086,6 +1086,13 @@ TEST(client_adapter_pi_registers_every_registry_tool) {
          * exactly the failure this design removes. */
         ASSERT_NOT_NULL(strstr(js, needle));
     }
+    /* Pi's loader does jiti.import(path, { default: true }) and requires a
+     * function, so the module MUST export a default factory. A named-only
+     * `export function register(pi)` fails every install with "Extension does
+     * not export a valid factory function". Pin both: the default export
+     * exists, and the broken named-only form never reappears. */
+    ASSERT_NOT_NULL(strstr(js, "export default function (pi)"));
+    ASSERT_NULL(strstr(js, "export function register(pi)"));
     /* The body must NOT carry the ownership markers: cbm_text_upsert_managed_block
      * adds them and rejects content that already has them, so emitting them here
      * would make every install fail. */

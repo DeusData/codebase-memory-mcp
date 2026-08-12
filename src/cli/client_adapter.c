@@ -155,8 +155,14 @@ char *cbm_client_adapter_pi(const char *binary_path) {
              "}\n\n");
 
     /* Register every tool the registry advertises — never a hand-picked subset,
-     * which is the drift this generator exists to prevent. */
-    sb_append(&sb, "export function register(pi) {\n");
+     * which is the drift this generator exists to prevent.
+     *
+     * Pi loads extensions via jiti.import(path, { default: true }) and rejects
+     * anything that is not a function — i.e. the module must have a DEFAULT
+     * export factory. A named `export function register(pi)` makes the loader
+     * see the module namespace object instead, and every pi install fails with
+     * "Extension does not export a valid factory function". */
+    sb_append(&sb, "export default function (pi) {\n");
     for (int i = 0; i < count; i++) {
         const char *name = cbm_mcp_tool_name(i);
         if (!name || !name[0]) {
