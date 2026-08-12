@@ -1667,8 +1667,7 @@ TEST(daemon_ipc_endpoint_is_namespaced_by_instance_key) {
     if (a_startup_status == 1 && !cbm_daemon_ipc_startup_lock_prepare_handoff(a_startup)) {
         a_startup_status = -1;
     }
-    if (other_startup_status == 1 &&
-        !cbm_daemon_ipc_startup_lock_prepare_handoff(other_startup)) {
+    if (other_startup_status == 1 && !cbm_daemon_ipc_startup_lock_prepare_handoff(other_startup)) {
         other_startup_status = -1;
     }
     cbm_daemon_ipc_startup_lock_release(&a_startup);
@@ -4773,6 +4772,52 @@ TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints) {
 
 #endif /* !_WIN32 */
 
+#ifndef _WIN32
+/* #1537: the daemon's private-directory ancestry walk refused ANY group-write
+ * bit on an ancestor — the same rule #1535 removed on the activation side, and
+ * the sibling the consolidated strictness decision covers but that never got
+ * changed. A group-writable ~ or ~/.cache is ordinary (WSL2 ships 0775, so do
+ * several distro skeletons and any shared-primary-group site), so the daemon
+ * was unusable there. World-writable must still be refused: any local user
+ * could swap a path component. And the private directory itself must still end
+ * up owner-private, which is what makes admitting the ancestor safe. */
+TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537) {
+    char parent[TEST_PATH_CAP];
+    char ancestor[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    bool paths_ok = false;
+    bool ancestor_ready = false;
+    bool secured = false;
+    bool leaf_owner_private = false;
+
+    if (ipc_test_parent_new(parent, "posix-group-writable-ancestor")) {
+        int a = snprintf(ancestor, sizeof(ancestor), "%s/group-writable", parent);
+        int c = snprintf(cache, sizeof(cache), "%s/cache", ancestor);
+        paths_ok = a > 0 && a < (int)sizeof(ancestor) && c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_ready = mkdir(ancestor, 0775) == 0 && chmod(ancestor, 0775) == 0;
+    }
+    if (ancestor_ready) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+        struct stat leaf;
+        leaf_owner_private =
+            stat(cache, &leaf) == 0 && S_ISDIR(leaf.st_mode) && (leaf.st_mode & 07777) == 0700;
+    }
+
+    (void)rmdir(cache);
+    (void)rmdir(ancestor);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(leaf_owner_private);
+    PASS();
+}
+
+#endif /* !_WIN32 */
+
 SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_pending_timeout_race_returns_completed_io);
     RUN_TEST(daemon_ipc_pending_wait_failure_cancels_and_drains);
@@ -4812,6 +4857,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_startup_release_retains_retry_authority);
     RUN_TEST(daemon_ipc_frame_timeout_poisons_connection);
 #ifndef _WIN32
+    RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
     RUN_TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance);
     RUN_TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge);

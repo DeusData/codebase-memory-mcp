@@ -173,13 +173,16 @@ static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
     "error: the automatic stop request timed out while CBM sessions or operations remained "
     "active. Close or restart every coding-agent session and CBM command using this cache, "
     "then retry the same command; no executable, configuration, or index mutation was started. "
-    "Run 'codebase-memory-mcp daemon status' to list the client processes still holding the "
-    "daemon.";
-static const char CLI_ACTIVATION_SAFETY_MESSAGE[] =
+    "When a CBM binary is still installed, run 'codebase-memory-mcp daemon status' to list the "
+    "client processes still holding the daemon.";
+static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
     "error: CBM could not prove exclusive activation safety. Verify that the configured cache "
-    "directory (CBM_CACHE_DIR when set) is owner-only and writable, close or restart every "
-    "coding-agent session and CBM command using it, then retry the same command; no executable, "
-    "configuration, or index mutation was started.";
+    "directory (CBM_CACHE_DIR when set) is owner-only and writable; no executable, "
+    "configuration, or index mutation was started. This is NOT a running-session problem: "
+    "nothing needs to be closed. Check the errors above, then retry the same command. Report "
+    "persistent failures with the output of "
+    "'ls -la \"${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}\"' if it "
+    "persists.";
 static const char CLI_ACTIVATION_PARTIAL_MESSAGE[] =
     "error: activation stopped after one or more agent configuration or "
     "cleanup operations failed; the published/current executable was kept, "
@@ -219,7 +222,7 @@ static bool g_cli_activation_test_ops_set = false;
 static const char *g_cli_activation_runtime_parent_for_test = NULL;
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
-    const char *diagnostic = message ? message : CLI_ACTIVATION_SAFETY_MESSAGE;
+    const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
     /* #1416: when the transaction recorded a concrete refusal (an ACL or
      * filesystem safety check), say THAT. The generic text blames "active CBM
      * sessions" for what is a validation refusal - reporters rebooted, killed
@@ -228,7 +231,11 @@ static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const
      * stop/reservation failures, which record no refusal note. */
     char attributed[CBM_SZ_1K];
     const char *note = cbm_activation_transaction_refusal_note();
-    if (note && note[0]) {
+    /* A recorded refusal is more specific than EITHER generic message, so it
+     * wins over both the busy and the reservation-failure wording. */
+    if ((diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE ||
+         diagnostic == CLI_ACTIVATION_BUSY_MESSAGE) &&
+        note && note[0]) {
         (void)snprintf(attributed, sizeof(attributed),
                        "error: activation was refused by a filesystem safety check before any "
                        "change was made: %s\n"
@@ -249,7 +256,7 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
                                       cbm_cli_activation_mutation_fn mutation,
                                       void *mutation_context) {
     if (!ops || !ops->reserve_for_mutation || !ops->mutation_lease_release) {
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_SAFETY_MESSAGE);
+        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -262,8 +269,12 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
         if (mutation_lease) {
             ops->mutation_lease_release(ops->context, mutation_lease);
         }
+        /* 0 means the cohort was BUSY: real sessions hold it and closing them
+         * is the remedy. Anything else is the reservation itself failing, and
+         * telling that reader to close sessions sends them after processes
+         * that do not exist (#1537). */
         cli_activation_diagnostic(ops, reserve_status == 0 ? CLI_ACTIVATION_BUSY_MESSAGE
-                                                           : CLI_ACTIVATION_SAFETY_MESSAGE);
+                                                           : CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -589,7 +600,7 @@ static void cli_activation_production_diagnostic(void *opaque, const char *messa
         (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_MUTATION_FAILED_MESSAGE);
         return;
     }
-    (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_SAFETY_MESSAGE);
+    (void)fprintf(stderr, "%s\n", message ? message : CLI_ACTIVATION_REFUSED_MESSAGE);
 }
 
 static bool cli_activation_production_context_init(cli_activation_production_context_t *context,
@@ -715,7 +726,7 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
     cli_activation_production_context_t context;
     if (!cli_activation_production_context_init(&context, action, target_version, target_build)) {
         cli_activation_production_context_close(&context);
-        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_SAFETY_MESSAGE);
+        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
     printf("Stopping active CBM sessions and operations for %s...\n",
@@ -1254,6 +1265,11 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 static const char skill_content[] =
     "---\n"
     "name: codebase-memory\n"
+    /* #1554: the value contains "Triggers on: " — a colon-space, which YAML
+     * reads as a nested-mapping indicator inside an unquoted scalar. Strict
+     * parsers (js-yaml's load, the frontmatter reader in `npx skills`) reject
+     * the whole file, so the skill silently fails to load rather than loading
+     * wrongly. Quoting the scalar is the fix; the text itself is unchanged. */
     "description: \"Use the codebase knowledge graph for structural code queries. "
     "Triggers on: explore the codebase, understand the architecture, what functions exist, "
     "show me the structure, who calls this function, what does X call, trace the call chain, "
@@ -3365,8 +3381,22 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
         return CLI_ERR;
     }
     char block[CLI_BUF_8K];
+    /* #1562: Codex sanitizes the environment of stdio MCP subprocesses, passing
+     * through only the names listed in env_vars. Without CBM_CACHE_DIR the
+     * Codex-spawned server silently falls back to the DEFAULT cache while the
+     * account daemon uses the configured one; the two disagree and the
+     * handshake closes during initialization, so Codex exposes no cbm tools at
+     * all.
+     *
+     * The name is listed unconditionally rather than only when the variable is
+     * set at install time: env_vars names variables to FORWARD IF PRESENT, so
+     * listing it costs nothing when unset and keeps working for someone who
+     * sets it after installing — which install-time detection would silently
+     * fail to cover. */
     int written = snprintf(block, sizeof(block),
-                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n", escaped);
+                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n"
+                                             "env_vars = [\"CBM_CACHE_DIR\"]\n",
+                           escaped);
     if (written < 0 || (size_t)written >= sizeof(block) ||
         cbm_remove_codex_legacy_mcp(config_path) != 0) {
         return CLI_ERR;
@@ -12413,16 +12443,30 @@ int cbm_cmd_update(int argc, char **argv) {
 
     bool dry_run = false;
     bool force = false;
+    bool legacy_variant_flag = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
+        } else if (strcmp(argv[i], "--ui") == 0 || strcmp(argv[i], "--standard") == 0) {
+            /* v0.10.2 deleted the ui/standard chooser and, with it, these flags —
+             * which turned `update --ui` from a working command into a hard
+             * error for everyone who had it in a script, an alias, or muscle
+             * memory (#1544). Removing a CHOICE is fine; removing the WORDS
+             * people type is a break we owe them nothing for. Accept both,
+             * ignore them, and say once why they no longer mean anything. */
+            legacy_variant_flag = true;
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown update option: %s\n", argv[i]);
             return CLI_TRUE;
         }
+    }
+    if (legacy_variant_flag) {
+        (void)fprintf(stderr, "note: --ui/--standard are accepted but no longer do anything; since "
+                              "v0.10.0 there is one build per platform and it always includes the "
+                              "graph UI.\n");
     }
 
     /* Updates run from the install script, not from this process — on every

@@ -6768,6 +6768,7 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     ASSERT_NULL(strstr(ev_txt, "lsp_trait_dispatch"));
     free(ev_txt);
     free(ev);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -8791,6 +8792,60 @@ TEST(tool_search_code_missing_pattern) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #1511 (distilled from @lukiod's #1512): search_code echoed a negative limit
+ * back as the result count — "results: -5" — which an agent reads as an answer,
+ * not as a rejected argument. Both halves matter: the schema declares the bound
+ * so well-behaved clients never send it, and the handler clamps because a
+ * schema is a request to the client, never a guarantee to the server. */
+TEST(tool_search_code_negative_limit_is_not_echoed_issue1511) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":35,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"func main\","
+                                   "\"project\":\"nonexistent\",\"limit\":-5}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "results: -5"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_code_limit_declares_a_minimum_issue1511) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":36,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *result = root ? yyjson_obj_get(root, "result") : NULL;
+    yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+    yyjson_val *minimum = NULL;
+    if (tools && yyjson_is_arr(tools)) {
+        size_t index, max;
+        yyjson_val *tool;
+        yyjson_arr_foreach(tools, index, max, tool) {
+            yyjson_val *name = yyjson_obj_get(tool, "name");
+            if (!name || !yyjson_is_str(name) || strcmp(yyjson_get_str(name), "search_code") != 0) {
+                continue;
+            }
+            yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
+            yyjson_val *props = schema ? yyjson_obj_get(schema, "properties") : NULL;
+            yyjson_val *limit = props ? yyjson_obj_get(props, "limit") : NULL;
+            minimum = limit ? yyjson_obj_get(limit, "minimum") : NULL;
+            break;
+        }
+    }
+    bool declared = minimum && yyjson_is_int(minimum) && yyjson_get_int(minimum) >= 1;
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(declared);
     PASS();
 }
 
@@ -18982,6 +19037,8 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_missing_qn);
     RUN_TEST(tool_get_code_snippet_not_found);
     RUN_TEST(tool_search_code_missing_pattern);
+    RUN_TEST(tool_search_code_negative_limit_is_not_echoed_issue1511);
+    RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_preserves_valid_utf8_source);

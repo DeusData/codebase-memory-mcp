@@ -1391,8 +1391,26 @@ static bool posix_directory_parent_secure(int directory_fd) {
         !cbm_macos_extended_acl_fd_is_deny_only(directory_fd)) {
         return false;
     }
-    return (status.st_mode & 0022) == 0 ||
-           (status.st_uid == (uid_t)0 && (status.st_mode & S_ISVTX) != 0);
+    /* #1537: this ANCESTOR check refused any group-write bit, which is the same
+     * rule #1535 removed on the activation side — and the sibling that decision
+     * covers but that never got changed. A group-writable ~ or ~/.cache is
+     * ordinary (WSL2 ships 0775, so do several distro skeletons and any site
+     * with a shared primary group), and refusing it here made the daemon
+     * unusable with no way for the reader to see why.
+     *
+     * WORLD-writable is still refused: any local user could swap a path
+     * component. Group-writable is admitted for ancestors only — the private
+     * directory itself is chmod'd to 0700 and verified after this walk, so the
+     * thing that actually holds data stays owner-private either way. */
+    if ((status.st_mode & 0002) != 0) {
+        return status.st_uid == (uid_t)0 && (status.st_mode & S_ISVTX) != 0;
+    }
+    if ((status.st_mode & 0020) != 0) {
+        char mode_text[16];
+        (void)snprintf(mode_text, sizeof(mode_text), "%04o", (unsigned)(status.st_mode & 07777));
+        cbm_log_warn("daemon.private_dir_group_writable_ancestor", "mode", mode_text);
+    }
+    return true;
 }
 
 /* Validate a path transition only through the two already-open directory
@@ -1443,6 +1461,17 @@ static int private_directory_tree_open(const char *directory_path) {
             ok = false;
         } else {
             ok = posix_directory_parent_secure(current_fd);
+            if (!ok) {
+                /* #1537: this branch used to leave the detail empty, so the
+                 * caller fell back to printing errno — which NOTHING here sets.
+                 * A reporter was handed "errno 2" (ENOENT) for a permission
+                 * refusal and went looking for a missing file that existed.
+                 * An unset errno is not a diagnosis; name the component. */
+                ipc_validation_detail_set("%s: ancestor '%s' is not a usable private-directory "
+                                          "parent (must be owned by you, not world-writable, and "
+                                          "carry no allow-ACL)",
+                                          directory_path, component);
+            }
             bool created = ok && mkdirat(current_fd, component, 0700) == 0;
             if (!created && errno != EEXIST) {
                 ok = false;

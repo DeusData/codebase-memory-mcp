@@ -1096,6 +1096,24 @@ TEST(client_adapter_pi_registers_every_registry_tool) {
     PASS();
 }
 
+/* #1550: Pi loads an extension by calling its DEFAULT export as a factory. The
+ * generator emitted a named `register` export instead, so the file failed to
+ * load — and a Pi extension that fails to load takes every pi command with it
+ * (`pi doctor` included), not just cbm's tools. The blast radius is why this is
+ * pinned rather than left to the registry-drift test above, which passed the
+ * whole time this was broken: it checked WHICH tools were listed, never whether
+ * the file Pi loads is loadable. */
+TEST(client_adapter_pi_default_exports_its_factory_issue1550) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "export default function (pi)"));
+    /* The old shape must be gone: a bare `export function register(pi)` is the
+     * exact form Pi rejects. */
+    ASSERT_NULL(strstr(js, "export function register(pi)"));
+    free(js);
+    PASS();
+}
+
 /* #616 rejected `"` in its path template but not `\`, so a Windows home like
  * C:\Users\urs\bin produced `\u` — an invalid unicode escape — and the whole
  * auto-loaded plugin failed to parse. A broken plugin in an auto-load directory
@@ -1185,6 +1203,7 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_continue_uses_owned_yaml_sequence_item);
     RUN_TEST(agent_clients_continue_refuses_foreign_same_name_and_nonsequence_section);
     RUN_TEST(client_adapter_pi_registers_every_registry_tool);
+    RUN_TEST(client_adapter_pi_default_exports_its_factory_issue1550);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_rejects_missing_binary_path);

@@ -747,6 +747,40 @@ TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416) {
     PASS();
 }
 
+/* #1537: a reservation that FAILED (lock I/O, leftover coordination state,
+ * permissions) is not a reservation that was BUSY. Reporting both as "active
+ * CBM sessions could not be stopped" sent a reporter hunting processes that a
+ * reboot proved did not exist — and the remedy we printed told them to run a
+ * cbm binary they had just uninstalled. Each condition now names itself. */
+TEST(cli_activation_distinguishes_busy_from_reservation_failure_issue1537) {
+    cbm_activation_transaction_note_refusal_for_testing(NULL, 0UL);
+
+    /* BUSY (0): real sessions hold the cohort — closing something is the fix. */
+    cli_activation_fake_t busy = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &busy,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &busy), 1);
+    ASSERT_NOT_NULL(strstr(busy.diagnostic, "automatic stop request timed out"));
+
+    /* FAILURE (-1): nothing is running, so the reader must not be told to close
+     * sessions — and must not be handed a command that may not be installed. */
+    cli_activation_fake_t failed = {
+        .mutation_reserve_result = -1,
+    };
+    ops.context = &failed;
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &failed), 1);
+    ASSERT_NOT_NULL(strstr(failed.diagnostic, "NOT a running-session problem"));
+    ASSERT_NULL(strstr(failed.diagnostic, "automatic stop request timed out"));
+    PASS();
+}
+
 TEST(cli_activation_refuses_unsafe_cohort_reservation) {
     cli_activation_fake_t fake = {
         .mutation_reserve_result = -1,
@@ -1139,13 +1173,11 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     char *empty_dir[] = {"--dir="};
     char *bad_install[] = {"--skip-config=value"};
     char *bad_update[] = {"--not-an-update-option"};
-    char *retired_update_variant[] = {"--standard"};
     char *bad_uninstall[] = {"--not-an-uninstall-option"};
     int missing_rc = cli_test_cmd_install(1, missing_dir);
     int empty_rc = cli_test_cmd_install(1, empty_dir);
     int install_rc = cli_test_cmd_install(1, bad_install);
     int update_rc = cli_test_cmd_update(1, bad_update);
-    int retired_variant_rc = cli_test_cmd_update(1, retired_update_variant);
     int uninstall_rc = cli_test_cmd_uninstall(1, bad_uninstall);
     cbm_cli_set_activation_ops_for_test(NULL);
 
@@ -1153,7 +1185,6 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     ASSERT_EQ(empty_rc, 1);
     ASSERT_EQ(install_rc, 1);
     ASSERT_EQ(update_rc, 1);
-    ASSERT_EQ(retired_variant_rc, 1);
     ASSERT_EQ(uninstall_rc, 1);
     ASSERT_EQ(fake.mutation_reserve_count, 0);
     PASS();
@@ -10356,6 +10387,11 @@ TEST(cli_upsert_codex_mcp_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "[mcp_servers.codebase-memory-mcp]") != NULL);
     ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
+    /* #1562: Codex passes only the names listed in env_vars into a stdio MCP
+     * subprocess. Without CBM_CACHE_DIR the spawned server uses the DEFAULT
+     * cache while the daemon uses the configured one, the two disagree, and the
+     * handshake closes — Codex then shows no cbm tools at all. */
+    ASSERT(strstr(data, "env_vars = [\"CBM_CACHE_DIR\"]") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -12773,6 +12809,77 @@ TEST(cli_secure_zero_overwrites_sensitive_storage) {
     PASS();
 }
 
+/* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
+ * so `update --ui` — a command people had in scripts and aliases — started
+ * failing with "unknown update option". Retiring a choice is fine; breaking the
+ * words people already type is not. Both flags must be accepted, do nothing,
+ * and say so once. A genuinely unknown flag must still be rejected, or this
+ * degenerates into ignoring typos. */
+/* #1554: the skill's `description` contained "Triggers on: " — a colon-space,
+ * which YAML reads as a nested-mapping indicator inside an UNQUOTED scalar.
+ * Strict readers (js-yaml's load, the frontmatter parser in `npx skills`)
+ * reject the whole document, so the installed skill silently fails to load.
+ *
+ * The rule is checked for EVERY skill, not just the one that broke: any
+ * frontmatter scalar whose value contains ": " must be quoted. Pinning only
+ * the current text would let the next added skill reintroduce it. */
+TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
+    const cbm_skill_t *sk = cbm_get_skills();
+    ASSERT_NOT_NULL(sk);
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        const char *body = sk[i].content;
+        ASSERT_NOT_NULL(body);
+        /* Frontmatter is the block between the first two "---" lines. */
+        ASSERT_TRUE(strncmp(body, "---\n", 4) == 0);
+        const char *end = strstr(body + 4, "\n---\n");
+        ASSERT_NOT_NULL(end);
+
+        const char *line = body + 4;
+        while (line < end) {
+            const char *eol = strchr(line, '\n');
+            if (!eol || eol > end) {
+                break;
+            }
+            const char *sep = NULL;
+            for (const char *c = line; c < eol - 1; c++) {
+                if (c[0] == ':' && c[1] == ' ') {
+                    sep = c;
+                    break;
+                }
+            }
+            if (sep) {
+                const char *value = sep + 2;
+                /* A value that itself contains ": " must be quoted, or a
+                 * strict parser treats it as a nested mapping. */
+                bool has_inner_colon = false;
+                for (const char *c = value; c < eol - 1; c++) {
+                    if (c[0] == ':' && c[1] == ' ') {
+                        has_inner_colon = true;
+                        break;
+                    }
+                }
+                if (has_inner_colon) {
+                    ASSERT_TRUE(value[0] == '"' || value[0] == '\'');
+                }
+            }
+            line = eol + 1;
+        }
+    }
+    PASS();
+}
+
+TEST(cli_update_accepts_retired_variant_flags_issue1544) {
+    char *ui_argv[] = {"--dry-run", "--ui", "--yes"};
+    char *standard_argv[] = {"--dry-run", "--standard", "--yes"};
+    char *bogus_argv[] = {"--dry-run", "--not-a-flag", "--yes"};
+
+    ASSERT_EQ(cbm_cmd_update(3, ui_argv), 0);
+    ASSERT_EQ(cbm_cmd_update(3, standard_argv), 0);
+    /* Unknown flags stay an error — the point is compatibility, not silence. */
+    ASSERT_TRUE(cbm_cmd_update(3, bogus_argv) != 0);
+    PASS();
+}
+
 #ifdef _WIN32
 /* The Windows update contract, asserted with the activation seam OFF so this
  * takes the exact dispatch a release binary ships: `update` never replaces the
@@ -14627,6 +14734,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_quiesces_active_cohort_before_mutation);
     RUN_TEST(cli_activation_refuses_when_cohort_does_not_drain);
     RUN_TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416);
+    RUN_TEST(cli_activation_distinguishes_busy_from_reservation_failure_issue1537);
     RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
     RUN_TEST(cli_activation_releases_maintenance_lease_after_success);
     RUN_TEST(cli_activation_releases_maintenance_lease_when_mutation_fails);
@@ -14643,6 +14751,8 @@ SUITE(cli) {
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
+    RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
+    RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);

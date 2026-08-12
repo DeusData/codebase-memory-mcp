@@ -948,6 +948,28 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
 
 #else /* POSIX */
 
+/* Transient spawn-failure retry (see the EAGAIN note in cbm_darwin_spawn_managed).
+ * Three attempts over ~20ms total: long enough to ride out a burst of process
+ * creation, short enough that a genuinely exhausted system still fails fast. */
+enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 3 };
+static const struct timespec CBM_SPAWN_RETRY_DELAY = {0, 10L * 1000L * 1000L};
+#define CBM_SPAWN_RETRY_DELAY_NS (&CBM_SPAWN_RETRY_DELAY)
+
+/* fork() fails with EAGAIN under the same pressure posix_spawn does, and the
+ * fallback path must not be less robust than the primary one. */
+static pid_t cbm_fork_with_retry(void) {
+    for (int attempt = 0; attempt < CBM_SPAWN_RETRY_ATTEMPTS; attempt++) {
+        pid_t pid = fork();
+        if (pid >= 0 || (errno != EAGAIN && errno != ENOMEM)) {
+            return pid;
+        }
+        if (attempt + 1 < CBM_SPAWN_RETRY_ATTEMPTS) {
+            (void)cbm_nanosleep(CBM_SPAWN_RETRY_DELAY_NS, NULL);
+        }
+    }
+    return -1;
+}
+
 /* Used by the fork+exec child. posix_spawn performs the same reset
  * declaratively via SETSIGDEF + SETSIGMASK, but Apple still forks for the
  * exec-failure fallback below, so this stays compiled everywhere. */
@@ -1052,8 +1074,8 @@ static int cbm_posix_fd_at_least_three(int fd) {
 }
 
 #ifdef __APPLE__
-static bool cbm_darwin_spawn_managed(cbm_subprocess_t *process, int input, int output,
-                                     int error_output, pid_t *out_pid) {
+static int cbm_darwin_spawn_managed(cbm_subprocess_t *process, int input, int output,
+                                    int error_output, pid_t *out_pid) {
     /*
      * Darwin exposes no public close_range()/closefrom() API, while OPEN_MAX is
      * commonly near one million. Reuse the daemon launcher's kernel-backed
@@ -1062,13 +1084,12 @@ static bool cbm_darwin_spawn_managed(cbm_subprocess_t *process, int input, int o
      * lookup, starts a new child-PID process group, resets inherited signal
      * state, and leaves cbm_subprocess_t's parent-side supervision unchanged.
      *
-     * Any setup or spawn error falls back to fork/exec below. Besides retaining
-     * compatibility, that preserves the existing exec-failure result: a missing
-     * binary is reaped as exit 127 rather than reported as a spawn failure.
+     * Setup and exec-class errors fall back to fork/exec below. Transient
+     * EAGAIN/ENOMEM results are retried by the caller with a fixed bound.
      */
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
-        return false;
+        return 1;
     }
     bool actions_ready =
         posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO) == 0 &&
@@ -1079,13 +1100,13 @@ static bool cbm_darwin_spawn_managed(cbm_subprocess_t *process, int input, int o
         (error_output == output || posix_spawn_file_actions_addclose(&actions, error_output) == 0);
     if (!actions_ready) {
         (void)posix_spawn_file_actions_destroy(&actions);
-        return false;
+        return 1;
     }
 
     posix_spawnattr_t attributes;
     if (posix_spawnattr_init(&attributes) != 0) {
         (void)posix_spawn_file_actions_destroy(&actions);
-        return false;
+        return 1;
     }
     sigset_t defaults;
     sigset_t empty;
@@ -1107,7 +1128,19 @@ static bool cbm_darwin_spawn_managed(cbm_subprocess_t *process, int input, int o
                                         : EINVAL;
     (void)posix_spawnattr_destroy(&attributes);
     (void)posix_spawn_file_actions_destroy(&actions);
-    return spawn_status == 0;
+    if (attributes_ready && spawn_status == 0 && *out_pid > 0) {
+        return 0;
+    }
+    /* EAGAIN/ENOMEM are the kernel saying "not right now", not "never": the
+     * process table or a per-user limit is momentarily full. Reporting
+     * spawn_failed for that turns transient load into a user-visible error —
+     * a git or LSP probe failing on a busy laptop for no reason the user can
+     * see or act on. Retry briefly. Setup and exec-class errors retain the
+     * fork+exec fallback so missing binaries still become child exit 127. */
+    if (attributes_ready && (spawn_status == EAGAIN || spawn_status == ENOMEM)) {
+        return CBM_SPAWN_RETRY;
+    }
+    return 1;
 }
 #endif
 
@@ -1171,7 +1204,14 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
 
     pid_t pid = -1;
 #ifdef __APPLE__
-    bool spawned = cbm_darwin_spawn_managed(process, input, output, error_output, &pid);
+    int spawn_rc = cbm_darwin_spawn_managed(process, input, output, error_output, &pid);
+    for (int attempt = 1; spawn_rc == CBM_SPAWN_RETRY && attempt < CBM_SPAWN_RETRY_ATTEMPTS;
+         attempt++) {
+        (void)cbm_nanosleep(CBM_SPAWN_RETRY_DELAY_NS, NULL);
+        spawn_rc = cbm_darwin_spawn_managed(process, input, output, error_output, &pid);
+    }
+    bool spawned = spawn_rc == 0;
+    bool fallback_allowed = spawn_rc != CBM_SPAWN_RETRY;
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (spawned && darwin_post_spawn_test_hook) {
         darwin_post_spawn_test_hook((long)pid);
@@ -1179,10 +1219,11 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
 #endif
 #else
     bool spawned = false;
+    bool fallback_allowed = true;
 #endif
-    if (!spawned) {
+    if (!spawned && fallback_allowed) {
         long max_fd = cbm_subprocess_posix_fd_close_limit();
-        pid = fork();
+        pid = cbm_fork_with_retry();
         if (pid == 0) {
             cbm_posix_child_exec(process, input, output, error_output, max_fd);
         }

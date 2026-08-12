@@ -924,9 +924,27 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
      * below that budget SIGKILLs a slow-but-legitimate startup — on
      * oversubscribed CI runners this fired every round (announced=0,
      * daemon_signal=9) while fast local machines never saw it. Keep the
-     * deadline comfortably above the daemon's own worst-case budget. */
-    bool announced_read = daemon > 0 && frontend_test_read_byte(ready_pipe[0], &announced_marker,
-                                                                cbm_now_ms() + 30000U);
+     * deadline comfortably above the daemon's own worst-case budget.
+     *
+     * This wait is a LIVENESS BACKSTOP, not a race budget: the daemon either
+     * announces or it does not, and the test asserts the announcement, never a
+     * timing window. A backstop is only doing its job if it never fires on a
+     * legitimately slow start — so it has to scale with the build. Under
+     * MemorySanitizer (instrumented libc++ and origin tracking) startup runs
+     * several times slower than the 12s budget it must clear, which is what
+     * reddened test-msan while every other lane and the same suite under local
+     * MSan stayed green. Widening the backstop for sanitized builds costs
+     * nothing when the daemon is healthy: a passing run returns as soon as the
+     * byte arrives, whatever the ceiling is. */
+#if defined(CBM_SANITIZED_BUILD) || defined(__SANITIZE_ADDRESS__) || \
+    defined(__SANITIZE_MEMORY__) || defined(__SANITIZE_THREAD__)
+    const uint64_t announce_backstop_ms = 180000U;
+#else
+    const uint64_t announce_backstop_ms = 30000U;
+#endif
+    bool announced_read =
+        daemon > 0 && frontend_test_read_byte(ready_pipe[0], &announced_marker,
+                                              cbm_now_ms() + announce_backstop_ms);
     bool announced = announced_read && announced_marker == 'R';
 
     /* This raw runtime client intentionally owns no cohort lease. It is a

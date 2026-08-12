@@ -64,10 +64,27 @@ stamp_windows_build_dir() {
     # (COMPUTERNAME=BUILD, user build) the grant lands on an empty principal
     # (BUILD\) and, combined with /inheritance:r above, locks this script out
     # of its own log directory.
-    me="$(whoami | tr -d '\r')"
-    if [ -n "${USERDOMAIN:-}" ]; then
-        me="${USERDOMAIN}\\${me}"
-    fi
+    # Identify the account by SID, never by name. icacls resolves a bare name
+    # against the machine first, so a host whose name equals the user's grants
+    # to an empty principal (#1532); and a USERDOMAIN-qualified name is
+    # UNRESOLVABLE on a workgroup machine — "WORKGROUP\test: No mapping between
+    # account names and security IDs was done" — which fails the grant outright
+    # and silently leaves the tree writable by Authenticated Users. A SID has
+    # neither ambiguity, and the SYSTEM/Administrators grants below already use
+    # this form. Name lookup remains only as a fallback where PowerShell is
+    # unavailable.
+    me="$(powershell.exe -NoProfile -NonInteractive -Command \
+        '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value' 2>/dev/null |
+        tr -d '\r\n')"
+    case "${me}" in
+    S-1-*) me="*${me}" ;;
+    *)
+        me="$(whoami | tr -d '\r')"
+        if [ -n "${USERDOMAIN:-}" ]; then
+            me="${USERDOMAIN}\\${me}"
+        fi
+        ;;
+    esac
     # Normalize FIRST: some runner images stamp EXPLICIT (non-inherited)
     # Authenticated-Users ACEs onto the workspace tree, which /inheritance:r
     # cannot strip and /grant:r does not touch (it replaces only the granted

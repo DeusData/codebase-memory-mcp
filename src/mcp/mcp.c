@@ -1358,7 +1358,7 @@ static const tool_def_t TOOLS[] = {
      "\"compact\","
      "\"description\":\"compact=deduplicated matches, full=include source snippets, files=matching "
      "files only.\"},"
-     "\"limit\":{\"type\":\"integer\",\"description\":\"Max "
+     "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Max "
      "results (configurable via search_limit config key). Set higher for exhaustive text search."
      "\"},\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
      "\"description\":\"Compact TOON matches by default; json returns legacy objects. Omit to "
