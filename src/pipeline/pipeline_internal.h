@@ -765,6 +765,8 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+/* Borrowed checkout identity captured and validated for this pipeline run. */
+const char *cbm_pipeline_indexed_checkout_sha(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

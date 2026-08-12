@@ -411,6 +411,10 @@ const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
 }
 
+const char *cbm_pipeline_indexed_checkout_sha(const cbm_pipeline_t *p) {
+    return p ? p->git_ctx.head_sha : NULL;
+}
+
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
     return p ? p->cancelled : NULL;
 }

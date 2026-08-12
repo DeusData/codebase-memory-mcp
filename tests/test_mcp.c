@@ -2685,6 +2685,11 @@ TEST(tool_index_status_omits_freshness_by_default) {
     ASSERT_NOT_NULL(strstr(inner, "\"status\""));
     ASSERT_NULL(strstr(inner, "\"freshness\""));
     ASSERT_NULL(strstr(inner, "indexed_checkout_sha"));
+    /* BT-240 increment 3: the worktree-status snapshot is part of the
+     * verbose-only freshness block and must not leak into the default call. */
+    ASSERT_NULL(strstr(inner, "status_available"));
+    ASSERT_NULL(strstr(inner, "tracked_changes"));
+    ASSERT_NULL(strstr(inner, "untracked_source"));
 
     free(inner);
     free(resp);
@@ -2694,14 +2699,27 @@ TEST(tool_index_status_omits_freshness_by_default) {
 }
 
 /* ── BT-240: freshness verdict against the recorded indexed checkout ──
- * These shell out to git, so they are skipped on Windows CI (the shell there
- * cannot init a repo via system()). */
+ * These shell out to git via cbm_popen (the same isolated spawn production
+ * git_context uses) rather than system(), so they run on every platform that
+ * has git on PATH — Windows CI included. A genuinely missing git is the only
+ * skip. */
 
-#ifndef _WIN32
 static int mcp_git_run(const char *dir, const char *args) {
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s >/dev/null 2>&1", dir, args);
-    return system(cmd);
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", dir, args, null_dev);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return -1;
+    }
+    char drain[256];
+    while (fgets(drain, sizeof(drain), fp)) {
+    }
+    return cbm_pclose(fp);
 }
 
 static int mcp_make_git_repo(const char *dir) {
@@ -2714,11 +2732,9 @@ static int mcp_make_git_repo(const char *dir) {
     if (mcp_git_run(dir, "commit -qm init") != 0) return -1;
     return 0;
 }
-#endif
 
 /* Helper: build a server whose project root is the given git repo and whose
  * coverage metadata records indexed_checkout_sha = sha (may be NULL). */
-#ifndef _WIN32
 static cbm_mcp_server_t *mcp_freshness_server(const char *repo, const char *sha) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) return NULL;
@@ -2744,12 +2760,8 @@ static cbm_mcp_server_t *mcp_freshness_server(const char *repo, const char *sha)
     }
     return srv;
 }
-#endif
 
 TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) {
-#ifdef _WIN32
-    SKIP_PLATFORM("git-based index_status freshness test not supported on Windows CI");
-#else
     char *repo = th_mktempdir("cbm_fresh_git");
     if (!repo) FAIL("th_mktempdir returned NULL");
     if (mcp_make_git_repo(repo) != 0) {
@@ -2782,6 +2794,10 @@ TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) 
     ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\""));
     ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
     ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"use_graph\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status_available\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
 
     free(inner);
     free(resp);
@@ -2789,13 +2805,9 @@ TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) 
     free(head);
     th_rmtree(repo);
     PASS();
-#endif
 }
 
 TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches) {
-#ifdef _WIN32
-    SKIP_PLATFORM("git-based index_status freshness test not supported on Windows CI");
-#else
     char *repo = th_mktempdir("cbm_fresh_git");
     if (!repo) FAIL("th_mktempdir returned NULL");
     if (mcp_make_git_repo(repo) != 0) {
@@ -2826,7 +2838,258 @@ TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches)
     cbm_mcp_server_free(srv);
     th_rmtree(repo);
     PASS();
-#endif
+}
+
+/* BT-240 increment 3: a modified tracked file makes the verdict stale even
+ * when the indexed SHA matches the live HEAD, with the sample surfaced. */
+TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
+        mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
+        mcp_git_run(repo, "commit -qm add tracked") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to commit tracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v2") != 0) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("failed to modify tracked file");
+    }
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "tracked_changes_present"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"paths\":[\"tracked.txt\"]"));
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":false"));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: untracked sources prevent "current" — verdict is
+ * unknown (no stale reason), with the untracked_not_indexed reason. */
+TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "newfile.txt"), "n") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to create untracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "untracked_not_indexed"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":1"));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: tracked changes win over untracked — both reasons are
+ * present but the verdict is stale, never unknown. */
+TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
+        mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
+        mcp_git_run(repo, "commit -qm add tracked") != 0) {
+        th_rmtree(repo);
+        FAIL("failed to commit tracked file");
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    if (th_write_file(TH_PATH(repo, "tracked.txt"), "v2") != 0 ||
+        th_write_file(TH_PATH(repo, "untracked.txt"), "n") != 0) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("failed to prepare mixed worktree");
+    }
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "tracked_changes_present"));
+    ASSERT_NOT_NULL(strstr(inner, "untracked_not_indexed"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: a non-git root with a recorded identity cannot prove
+ * current — status availability must be false and the verdict unknown. */
+TEST(tool_index_status_freshness_status_unavailable_non_git) {
+    char *repo = th_mktempdir("cbm_fresh_non_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+
+    /* Record an identity even though the root is not a git repository. */
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, "0123456789012345678901234567890123456789");
+    if (!srv) {
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status_available\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "status_unavailable"));
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_current"));
+    ASSERT_NOT_NULL(strstr(inner, "\"tracked_changes\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":0"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* BT-240 increment 3: sample cap at the MCP layer — many untracked sources
+ * surface the true count, a bounded paths array and truncated=true. */
+TEST(tool_index_status_freshness_sample_cap_truncates) {
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    enum { N_FILES = 17, MCP_SAMPLE_MAX = 16 };
+    for (int i = 0; i < N_FILES; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/u%02d.txt", repo, i);
+        if (th_write_file(path, "u") != 0) {
+            th_rmtree(repo);
+            FAIL("failed to create untracked file");
+        }
+    }
+
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
+    ASSERT_NOT_NULL(strstr(inner, "\"count\":17"));
+    ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
+    char sample_buf[128];
+    snprintf(sample_buf, sizeof(sample_buf), "\"paths\":[\"u00.txt\",\"u01.txt\",\"u02.txt\",\"u03.txt\",\"u04.txt\",\"u05.txt\",\"u06.txt\",\"u07.txt\",\"u08.txt\",\"u09.txt\",\"u10.txt\",\"u11.txt\",\"u12.txt\",\"u13.txt\",\"u14.txt\",\"u15.txt\"]");
+    ASSERT_NOT_NULL(strstr(inner, sample_buf));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
 }
 
 TEST(tool_trace_call_path_not_found) {
@@ -10728,6 +10991,11 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_omits_freshness_by_default);
     RUN_TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches);
     RUN_TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes);
+    RUN_TEST(tool_index_status_freshness_verdict_unknown_when_untracked_only);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked);
+    RUN_TEST(tool_index_status_freshness_status_unavailable_non_git);
+    RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);

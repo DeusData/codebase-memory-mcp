@@ -2184,7 +2184,9 @@ TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback) {
     cbm_coverage_meta_t failed_meta = new_meta;
     failed_meta.generation = "gen-must-not-commit";
     failed_meta.indexed_checkout_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
-    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &failed_meta),
+    cbm_coverage_row_t failed_row = row;
+    failed_row.detail = "changed-to-force-shadow-rebuild";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &failed_row, 1, &failed_meta),
               CBM_STORE_ERR);
     got = (cbm_coverage_meta_t){0};
     ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
