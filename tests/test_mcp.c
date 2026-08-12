@@ -2851,7 +2851,7 @@ TEST(tool_index_status_freshness_verdict_stale_when_tracked_changes) {
     }
     if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
         mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
-        mcp_git_run(repo, "commit -qm add tracked") != 0) {
+        mcp_git_run(repo, "commit -q -m add-tracked") != 0) {
         th_rmtree(repo);
         FAIL("failed to commit tracked file");
     }
@@ -2959,7 +2959,7 @@ TEST(tool_index_status_freshness_verdict_stale_when_tracked_and_untracked) {
     }
     if (th_write_file(TH_PATH(repo, "tracked.txt"), "v1") != 0 ||
         mcp_git_run(repo, "add -f -- tracked.txt") != 0 ||
-        mcp_git_run(repo, "commit -qm add tracked") != 0) {
+        mcp_git_run(repo, "commit -q -m add-tracked") != 0) {
         th_rmtree(repo);
         FAIL("failed to commit tracked file");
     }
