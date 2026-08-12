@@ -2642,6 +2642,56 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
+/* BT-240 RED: a live checkout SHA is not proof of the generation that produced
+ * graph content. Older databases lack an indexed-checkout identity, so verbose
+ * status must fail closed as unknown while exposing graph generation
+ * separately. */
+TEST(tool_index_status_fails_closed_without_indexed_checkout_identity) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"test-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"unknown\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_generation\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":null"));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_unavailable"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* BT-240 lean-default guard: the freshness verdict is diagnostics — a
+ * report-only signal that never auto-indexes — so it must stay out of the
+ * common (non-verbose) status call. */
+TEST(tool_index_status_omits_freshness_by_default) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
+    ASSERT_NULL(strstr(inner, "\"freshness\""));
+    ASSERT_NULL(strstr(inner, "indexed_checkout_sha"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
@@ -10541,6 +10591,8 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_fails_closed_without_indexed_checkout_identity);
+    RUN_TEST(tool_index_status_omits_freshness_by_default);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
