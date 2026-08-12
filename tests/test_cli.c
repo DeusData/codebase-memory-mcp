@@ -6368,10 +6368,15 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
                                              "search_graph",
                                              "trace_path"};
     const char *const graph_terms[] = {"codebase-memory", "search_graph", "trace_path"};
+    const char *const yaml_safe_skill_terms[] = {
+        "description: \"Use the codebase knowledge graph",
+        "how to use search_graph.\"\n---\n",
+    };
     bool qoder_skill_ok = test_file_contains_all(qoder_skill, graph_terms, 3U);
     bool qoder_agent_terms_ok = test_file_contains_all(qoder_agent, qoder_agent_terms, 6U);
     bool pi_instructions_ok = test_file_contains_all(pi_instructions, graph_terms, 3U);
-    bool pi_skill_ok = test_file_contains_all(pi_skill, graph_terms, 3U);
+    bool pi_skill_ok = test_file_contains_all(pi_skill, graph_terms, 3U) &&
+                       test_file_contains_all(pi_skill, yaml_safe_skill_terms, 2U);
     bool durable_ok = qoder_skill_ok && qoder_agent_terms_ok && pi_instructions_ok && pi_skill_ok;
     char *qoder_agent_data = read_test_file_alloc(qoder_agent);
     durable_ok = durable_ok && qoder_agent_data && !strstr(qoder_agent_data, "Bash") &&
