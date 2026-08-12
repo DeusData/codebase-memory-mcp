@@ -18676,7 +18676,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
      * "idle" label owns everything outside a request, which is what makes a
      * request-path retainer distinguishable from background growth. */
     cbm_mem_phase_mark("request.scope_begin");
-    bool request_scope = !srv || cbm_mcp_server_request_scope_begin(srv);
+    bool request_scope = srv && cbm_mcp_server_request_scope_begin(srv);
     if (!request_scope) {
         release_request_store(srv);
         cbm_mem_phase_mark("idle");

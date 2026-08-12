@@ -754,6 +754,15 @@ TEST(mcp_tool_input_schemas_are_closed_in_classic_and_streamlined_modes) {
     PASS();
 }
 
+TEST(mcp_handle_tool_rejects_null_server_before_dispatch) {
+    char *response = cbm_mcp_handle_tool(NULL, "delete_project", "{\"project\":\"orphan\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "request cancellation scope unavailable"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    free(response);
+    PASS();
+}
+
 TEST(mcp_canonical_input_schemas_cover_implemented_format_and_verbose_options) {
     struct {
         const char *tool;
@@ -18772,6 +18781,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_help_list_matches_registry);
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_tool_input_schemas_are_closed_in_classic_and_streamlined_modes);
+    RUN_TEST(mcp_handle_tool_rejects_null_server_before_dispatch);
     RUN_TEST(mcp_canonical_input_schemas_cover_implemented_format_and_verbose_options);
     RUN_TEST(mcp_index_repository_auto_dep_limit_schema_uses_shared_bounds);
     RUN_TEST(mcp_tools_have_behavior_annotations);
