@@ -1260,19 +1260,38 @@ static uint64_t main_deadline_after(uint32_t timeout_ms) {
     return now_ms > UINT64_MAX - timeout_ms ? UINT64_MAX : now_ms + timeout_ms;
 }
 
-static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
+/* The rendezvous directory lives under %LOCALAPPDATA% (Windows) or the POSIX
+ * runtime/home directory by default. That ancestry is not always acceptable to
+ * cbm_daemon_ipc_private_directory_secure(): a profile that has acquired a
+ * mutation-granting ACE for an untrusted identity -- an AppContainer capability
+ * SID, for instance -- fails it, and the binary then cannot start at all, with
+ * no supported way to point it elsewhere. `config` is unreachable too, because
+ * it needs the same endpoint.
+ *
+ * CBM_RUNTIME_DIR does NOT relax that check. The directory it names goes
+ * through exactly the same validation; the operator merely chooses an ancestry
+ * that passes. An unset or rejected value keeps the default behavior. */
+static const char *main_runtime_parent(char *buffer, size_t capacity) {
     const char *runtime_parent = NULL;
 #ifdef CBM_ENABLE_TEST_SEAMS
     /* Product daemon coordination is deliberately account-wide. Product-level
      * lifecycle guards need an isolated rendezvous namespace so they cannot
      * attach to or retire a developer's real daemon while exercising exact
      * start/open/stop behavior. The seam is opt-in at compile time and the
-     * detached child inherits the same environment value. */
-    char seam_runtime_parent[MAIN_PATH_CAP];
-    runtime_parent = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", seam_runtime_parent,
-                                     sizeof(seam_runtime_parent), NULL);
+     * detached child inherits the same environment value. It wins over the
+     * product override so existing lifecycle tests keep their isolation. */
+    runtime_parent = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", buffer, capacity, NULL);
 #endif
-    return cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+    if (!runtime_parent) {
+        runtime_parent = cbm_safe_getenv("CBM_RUNTIME_DIR", buffer, capacity, NULL);
+    }
+    return runtime_parent;
+}
+
+static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
+    char runtime_parent_buffer[MAIN_PATH_CAP];
+    return cbm_daemon_bootstrap_endpoint_new(
+        main_runtime_parent(runtime_parent_buffer, sizeof(runtime_parent_buffer)));
 }
 
 static bool main_local_cli_feedback_enabled(int argc, char **argv) {
@@ -1522,7 +1541,7 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
  * one is spawned for this command — with a hint that `daemon start` removes
  * that per-command cost. Only supervised index workers stay in-process. */
 static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json) {
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     char executable_path[MAIN_PATH_CAP] = {0};
     cbm_daemon_build_identity_t identity;
     bool prepared =
@@ -2435,7 +2454,7 @@ int main(int argc, char **argv) {
             (void)fputs("Preparing one-shot local CBM command...\n", feedback);
             (void)fflush(feedback);
         }
-        cbm_daemon_ipc_endpoint_t *local_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+        cbm_daemon_ipc_endpoint_t *local_endpoint = main_daemon_endpoint_new();
         char local_executable[MAIN_PATH_CAP];
         cbm_daemon_build_identity_t local_identity;
         cbm_project_lock_manager_t *project_locks =
@@ -2595,7 +2614,7 @@ int main(int argc, char **argv) {
                           cbm_index_worker_argv_status_message(worker_status));
             return EXIT_FAILURE;
         }
-        cbm_daemon_ipc_endpoint_t *worker_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+        cbm_daemon_ipc_endpoint_t *worker_endpoint = main_daemon_endpoint_new();
         cbm_project_lock_manager_t *worker_project_locks =
             worker_endpoint ? cbm_project_lock_manager_new(worker_endpoint) : NULL;
         cbm_version_cohort_manager_t *worker_cohort_manager =
