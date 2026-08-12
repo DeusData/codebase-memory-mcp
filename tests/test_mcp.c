@@ -14,6 +14,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <git/git_context.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <mcp/mcp_internal.h>
@@ -2692,9 +2693,141 @@ TEST(tool_index_status_omits_freshness_by_default) {
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════
- *  TOOL HANDLERS WITH DATA
- * ══════════════════════════════════════════════════════════════════ */
+/* ── BT-240: freshness verdict against the recorded indexed checkout ──
+ * These shell out to git, so they are skipped on Windows CI (the shell there
+ * cannot init a repo via system()). */
+
+#ifndef _WIN32
+static int mcp_git_run(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s >/dev/null 2>&1", dir, args);
+    return system(cmd);
+}
+
+static int mcp_make_git_repo(const char *dir) {
+    if (th_mkdir_p(dir) != 0) return -1;
+    if (mcp_git_run(dir, "init -q") != 0) return -1;
+    if (mcp_git_run(dir, "config user.email test@example.com") != 0) return -1;
+    if (mcp_git_run(dir, "config user.name Test") != 0) return -1;
+    if (th_write_file(TH_PATH(dir, ".keep"), "") != 0) return -1;
+    if (mcp_git_run(dir, "add -A") != 0) return -1;
+    if (mcp_git_run(dir, "commit -qm init") != 0) return -1;
+    return 0;
+}
+#endif
+
+/* Helper: build a server whose project root is the given git repo and whose
+ * coverage metadata records indexed_checkout_sha = sha (may be NULL). */
+#ifndef _WIN32
+static cbm_mcp_server_t *mcp_freshness_server(const char *repo, const char *sha) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) return NULL;
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_mcp_server_set_project(srv, "fresh-project");
+    cbm_store_upsert_project(st, "fresh-project", repo);
+    cbm_coverage_meta_t meta = {
+        .generation = "fresh-generation",
+        .index_mode = "fast",
+        .recorded_at = "2026-08-11T00:00:00Z",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+        .indexed_checkout_sha = sha,
+    };
+    if (cbm_store_coverage_replace_ex(st, "fresh-project", NULL, 0, &meta) != CBM_STORE_OK) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+#endif
+
+TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based index_status freshness test not supported on Windows CI");
+#else
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    cbm_git_context_t ctx = {0};
+    if (cbm_git_context_resolve(repo, &ctx) != 0 || !ctx.head_sha || !ctx.head_sha[0]) {
+        cbm_git_context_free(&ctx);
+        th_rmtree(repo);
+        SKIP_PLATFORM("git head not resolvable");
+    }
+    char *head = strdup(ctx.head_sha);
+    cbm_git_context_free(&ctx);
+
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, head);
+    if (!srv) {
+        free(head);
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"current\""));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_current"));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"use_graph\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(head);
+    th_rmtree(repo);
+    PASS();
+#endif
+}
+
+TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based index_status freshness test not supported on Windows CI");
+#else
+    char *repo = th_mktempdir("cbm_fresh_git");
+    if (!repo) FAIL("th_mktempdir returned NULL");
+    if (mcp_make_git_repo(repo) != 0) {
+        th_rmtree(repo);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    /* A stale recorded identity that does not equal the live HEAD. */
+    cbm_mcp_server_t *srv = mcp_freshness_server(repo, "0000000000000000000000000000000000000000");
+    if (!srv) {
+        th_rmtree(repo);
+        FAIL("mcp_freshness_server failed");
+    }
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_status", "{\"project\":\"fresh-project\",\"verbose\":true}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"verdict\":\"stale\""));
+    ASSERT_NOT_NULL(strstr(inner, "indexed_checkout_mismatch"));
+    ASSERT_NOT_NULL(strstr(inner, "\"indexed_checkout_sha\":\"0000000000000000000000000000000000000000\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"checkout_sha\":\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"reindex_to_match_checkout\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+#endif
+}
 
 TEST(tool_trace_call_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -10593,6 +10726,8 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_includes_git_metadata);
     RUN_TEST(tool_index_status_fails_closed_without_indexed_checkout_identity);
     RUN_TEST(tool_index_status_omits_freshness_by_default);
+    RUN_TEST(tool_index_status_freshness_verdict_current_when_indexed_checkout_matches);
+    RUN_TEST(tool_index_status_freshness_verdict_stale_when_indexed_checkout_mismatches);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);

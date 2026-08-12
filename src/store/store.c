@@ -225,6 +225,33 @@ static void iso_now(char *buf, size_t sz) {
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
+/* Best-effort probe for the BT-240 indexed_checkout_sha column. Returns true
+ * only when the index_coverage_meta table exists AND exposes the column.
+ * Writable opens run init_schema (which adds it), so false is expected only on
+ * read-only legacy DBs opened via the query path — those must keep working and
+ * simply report no indexed-checkout identity. */
+static bool coverage_meta_has_checkout_column(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(index_coverage_meta);", CBM_NOT_FOUND, &stmt,
+                           NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool has = false;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (name && strcmp(name, "indexed_checkout_sha") == 0) {
+            has = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return has;
+}
+
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
@@ -320,12 +347,23 @@ static int init_schema(cbm_store_t *s) {
         "  ignored_files_stored INTEGER NOT NULL DEFAULT 0,"
         "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
-        "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
+        "  hash_records_complete INTEGER NOT NULL DEFAULT 0,"
+        "  indexed_checkout_sha TEXT"
         ");";
 
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+
+    /* BT-240 migration: CREATE TABLE IF NOT EXISTS cannot add a column to an
+     * existing legacy index_coverage_meta, so add it idempotently for any
+     * writable DB that predates it. Read-only query opens skip init_schema
+     * entirely and meta_get probes the column separately. */
+    if (!coverage_meta_has_checkout_column(s) &&
+        exec_sql(s, "ALTER TABLE index_coverage_meta ADD COLUMN indexed_checkout_sha TEXT;") !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
 
     /* Schema-compat probe (#768): DBs created before the local_name_gen
@@ -2952,11 +2990,12 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                 "INSERT INTO index_coverage_meta "
                 "(project, generation, index_mode, recorded_at, recording_status, "
                 " ignored_files_stored, ignored_files_total, coverage_version, "
-                " hash_records_complete) "
-                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+                " hash_records_complete, indexed_checkout_sha) "
+                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
                 "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
                 "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
-                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
+                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9, "
+                "indexed_checkout_sha=?10;",
                 CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
             store_set_error_sqlite(s, "coverage meta upsert prepare");
             (void)exec_sql(s, "ROLLBACK;");
@@ -2971,6 +3010,11 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_bind_int(up_meta, 7, ignored_total);
         sqlite3_bind_int(up_meta, 8, coverage_version);
         sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
+        if (meta->indexed_checkout_sha && meta->indexed_checkout_sha[0]) {
+            bind_text(up_meta, 10, meta->indexed_checkout_sha);
+        } else {
+            sqlite3_bind_null(up_meta, 10);
+        }
         int meta_rc = sqlite3_step(up_meta);
         sqlite3_finalize(up_meta);
         if (meta_rc != SQLITE_DONE) {
@@ -3098,6 +3142,7 @@ void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     free((char *)meta->index_mode);
     free((char *)meta->recorded_at);
     free((char *)meta->recording_status);
+    free((char *)meta->indexed_checkout_sha);
     memset(meta, 0, sizeof(*meta));
 }
 
@@ -3110,11 +3155,21 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db,
-                           "SELECT project, generation, index_mode, recorded_at, recording_status, "
-                           "ignored_files_stored, ignored_files_total, coverage_version, "
-                           "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+    /* Legacy read-only DBs (query opens skip init_schema) lack the
+     * indexed_checkout_sha column — probe and fall back so they still read and
+     * report no identity instead of erroring. */
+    static const char SQL_FULL[] =
+        "SELECT project, generation, index_mode, recorded_at, recording_status, "
+        "ignored_files_stored, ignored_files_total, coverage_version, "
+        "hash_records_complete, indexed_checkout_sha FROM index_coverage_meta "
+        "WHERE project = ?1;";
+    static const char SQL_LEGACY[] =
+        "SELECT project, generation, index_mode, recorded_at, recording_status, "
+        "ignored_files_stored, ignored_files_total, coverage_version, "
+        "hash_records_complete FROM index_coverage_meta WHERE project = ?1;";
+    bool has_checkout_column = coverage_meta_has_checkout_column(s);
+    if (sqlite3_prepare_v2(s->db, has_checkout_column ? SQL_FULL : SQL_LEGACY, CBM_NOT_FOUND,
+                           &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage meta get prepare");
         return CBM_STORE_ERR;
     }
@@ -3130,6 +3185,10 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
+        if (has_checkout_column) {
+            const char *sha = (const char *)sqlite3_column_text(stmt, 9);
+            out->indexed_checkout_sha = sha && sha[0] ? heap_strdup(sha) : NULL;
+        }
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
             !out->recording_status) {

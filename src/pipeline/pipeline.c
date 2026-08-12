@@ -1961,6 +1961,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
                 .ignored_files_total = p->ignored_total,
                 .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                 .hash_records_complete = true,
+                .indexed_checkout_sha = p->git_ctx.head_sha,
             },
         .surface_rows = p->surface_rows,
         .surface_row_count = p->surface_row_count,

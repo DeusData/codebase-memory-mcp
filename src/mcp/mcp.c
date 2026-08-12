@@ -4456,24 +4456,75 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     return result;
 }
 
-/* BT-240: fail-closed freshness verdict. A live checkout SHA is not proof of
- * the generation that produced graph content, so the verdict must come from
- * the indexed-checkout identity recorded with the DB. Legacy DBs record no
- * such identity: expose the graph generation separately and fail closed as
- * unknown rather than pretending the live checkout produced the graph. This
- * is a report-only signal — it never triggers indexing. */
+/* BT-240: fail-closed freshness verdict against the indexed-checkout identity
+ * recorded with the DB at the successful staged-generation boundary. A live
+ * checkout SHA is not proof of the generation that produced graph content, so
+ * the verdict comes from that recorded identity:
+ *   - no indexed SHA (legacy DB or non-git run)  → unknown / unavailable
+ *   - indexed SHA differs from the live git HEAD → stale / mismatch
+ *   - equal                                       → current
+ * Report-only: it never triggers indexing. Verbose-only and read-only; the
+ * live checkout is resolved fresh from the project root (never mutated). */
 static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                     const char *indexed_generation) {
+                                     cbm_store_t *store, const char *project,
+                                     const char *root_path, const char *indexed_generation) {
     yyjson_mut_val *freshness = yyjson_mut_obj(doc);
     if (indexed_generation && indexed_generation[0]) {
         yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_generation", indexed_generation);
     } else {
         yyjson_mut_obj_add_str(doc, freshness, "indexed_generation", "");
     }
-    yyjson_mut_obj_add_null(doc, freshness, "indexed_checkout_sha");
-    yyjson_mut_obj_add_str(doc, freshness, "verdict", "unknown");
-    yyjson_mut_obj_add_str(doc, freshness, "reason", "indexed_checkout_unavailable");
+
+    cbm_coverage_meta_t meta = {0};
+    bool have_meta = store && cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
+    const char *indexed_sha = NULL;
+    if (have_meta && meta.indexed_checkout_sha && meta.indexed_checkout_sha[0]) {
+        indexed_sha = meta.indexed_checkout_sha;
+    }
+
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(root_path, &ctx);
+    const char *checkout_sha = ctx.head_sha && ctx.head_sha[0] ? ctx.head_sha : NULL;
+
+    if (indexed_sha) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_checkout_sha", indexed_sha);
+    } else {
+        yyjson_mut_obj_add_null(doc, freshness, "indexed_checkout_sha");
+    }
+    if (checkout_sha) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "checkout_sha", checkout_sha);
+    } else {
+        yyjson_mut_obj_add_null(doc, freshness, "checkout_sha");
+    }
+
+    const char *verdict;
+    const char *reason;
+    const char *recommended_action;
+    if (!indexed_sha) {
+        verdict = "unknown";
+        reason = "indexed_checkout_unavailable";
+        recommended_action = "reindex_to_record_indexed_checkout";
+    } else if (!checkout_sha || strcmp(indexed_sha, checkout_sha) != 0) {
+        verdict = "stale";
+        reason = "indexed_checkout_mismatch";
+        recommended_action = "reindex_to_match_checkout";
+    } else {
+        verdict = "current";
+        reason = "indexed_checkout_current";
+        recommended_action = "use_graph";
+    }
+    yyjson_mut_obj_add_str(doc, freshness, "verdict", verdict);
+    yyjson_mut_obj_add_str(doc, freshness, "reason", reason);
+    yyjson_mut_val *reasons = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_str(doc, reasons, reason);
+    yyjson_mut_obj_add_val(doc, freshness, "reasons", reasons);
+    yyjson_mut_obj_add_str(doc, freshness, "recommended_action", recommended_action);
     yyjson_mut_obj_add_val(doc, root, "freshness", freshness);
+
+    if (have_meta) {
+        cbm_store_coverage_meta_clear(&meta);
+    }
+    cbm_git_context_free(&ctx);
 }
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
@@ -4502,7 +4553,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                                       proj_info.root_path ? proj_info.root_path : "");
             if (verbose) {
                 add_git_context_json(doc, root, proj_info.root_path);
-                add_index_freshness_json(doc, root, proj_info.indexed_at);
+                add_index_freshness_json(doc, root, store, project, proj_info.root_path,
+                                         proj_info.indexed_at);
             }
             safe_str_free(&proj_info.name);
             safe_str_free(&proj_info.indexed_at);
