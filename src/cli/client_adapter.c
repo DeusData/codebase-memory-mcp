@@ -156,7 +156,7 @@ char *cbm_client_adapter_pi(const char *binary_path) {
 
     /* Register every tool the registry advertises — never a hand-picked subset,
      * which is the drift this generator exists to prevent. */
-    sb_append(&sb, "export function register(pi) {\n");
+    sb_append(&sb, "export default function (pi) {\n");
     for (int i = 0; i < count; i++) {
         const char *name = cbm_mcp_tool_name(i);
         if (!name || !name[0]) {

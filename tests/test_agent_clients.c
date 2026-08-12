@@ -1071,6 +1071,18 @@ TEST(agent_clients_continue_refuses_foreign_same_name_and_nonsequence_section) {
  * of the tool surface. #534 shipped one mirroring 7 of 15 tools; every tool
  * added afterwards would have been silently missing for that client. This pins
  * the property that makes generation worth doing: EVERY registry tool appears. */
+TEST(client_adapter_pi_default_exports_factory) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+
+    /* Pi imports only the module's default export as its extension factory. */
+    ASSERT_NOT_NULL(strstr(js, "export default function (pi) {"));
+    ASSERT_NULL(strstr(js, "export function register(pi) {"));
+
+    free(js);
+    PASS();
+}
+
 TEST(client_adapter_pi_registers_every_registry_tool) {
     char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
@@ -1184,6 +1196,7 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_deep_same_name_json_fails_closed_byte_identically);
     RUN_TEST(agent_clients_continue_uses_owned_yaml_sequence_item);
     RUN_TEST(agent_clients_continue_refuses_foreign_same_name_and_nonsequence_section);
+    RUN_TEST(client_adapter_pi_default_exports_factory);
     RUN_TEST(client_adapter_pi_registers_every_registry_tool);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
