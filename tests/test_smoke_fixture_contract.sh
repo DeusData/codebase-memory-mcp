@@ -144,6 +144,19 @@ require(
     'tar --no-same-owner -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"' in install_script,
     "install.sh must not preserve release-builder ownership when extracting tar archives",
 )
+require(
+    all(
+        needle in install_script
+        for needle in (
+            "ARCHIVE_MEMBER_COUNT",
+            "release archive contains unexpected member",
+            "release archive does not match the exact member set",
+            'for extracted_member in "$ARCHIVE_BINARY" LICENSE "$ARCHIVE_INSTALLER"',
+        )
+    )
+    and "cbm-integrations.json" not in install_script,
+    "install.sh must validate and accept the exact four-member release archive layout",
+)
 # One composition ships, so there is one archive name and no variant alias.
 require(
     "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local
