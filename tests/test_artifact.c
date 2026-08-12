@@ -642,6 +642,7 @@ TEST(store_open_or_deep_integrity_rejects_page_corruption) {
     cbm_store_t *bad = cbm_store_open_path(db2);
     if (bad) {
         ASSERT_FALSE(cbm_store_check_integrity_deep(bad));
+        ASSERT_EQ(cbm_store_check_integrity_verdict(bad), CBM_INTEGRITY_CORRUPT);
         cbm_store_close(bad);
     }
     PASS();

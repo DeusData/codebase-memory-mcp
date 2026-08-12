@@ -41,6 +41,7 @@
   },
   "overrides": {
     "form-data": ">=4.0.6",
-    "@babel/core": ">=7.29.6"
+    "@babel/core": ">=7.29.6",
+    "nanoid": "^3.3.17"
   }
 }

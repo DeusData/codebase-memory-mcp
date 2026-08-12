@@ -1657,6 +1657,72 @@ bool cbm_store_check_integrity_deep(cbm_store_t *s) {
     return ok;
 }
 
+/* Classify a SQLite result code as a transient (retryable) condition vs. a
+ * hard error. SQLITE_BUSY / SQLITE_LOCKED happen when another connection holds
+ * the writer lock — they are NOT evidence of corruption, yet the bare
+ * cbm_store_check_integrity() treats any prepare failure as "corrupt". This
+ * helper backs the verdict API so the quarantine path stops destroying healthy
+ * DBs that merely lost a lock race (#1206, #1037). */
+static bool st_rc_is_transient(int rc) {
+    switch (rc & 0xff) {
+    case SQLITE_BUSY:
+    case SQLITE_LOCKED:
+    case SQLITE_READONLY:
+    case SQLITE_CANTOPEN:
+    case SQLITE_IOERR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+cbm_integrity_verdict_t cbm_store_check_integrity_verdict(cbm_store_t *s) {
+    if (!s || !s->db) {
+        /* No handle at all — the caller could not even open the file. That is
+         * an open problem, not a corruption verdict, so the DB must not be
+         * quarantined (renaming it would discard a file we never read). */
+        return CBM_INTEGRITY_TRANSIENT;
+    }
+
+    /* Reuse the canonical shallow policy so dependency rows and cosmetic
+     * root_path failures retain the destination branch's behavior. Only the
+     * result classification differs on this quarantine-grade path. */
+    bool path_only = false;
+    if (!cbm_store_check_integrity_full(s, &path_only)) {
+        if (path_only) {
+            return CBM_INTEGRITY_OK;
+        }
+        int rc = sqlite3_errcode(s->db);
+        return st_rc_is_transient(rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+
+    /* ── Deep check: walk the btrees for page-level damage (#1037) ──
+     * The shallow check above passes for a DB whose projects table is intact
+     * but whose node/edge btrees are torn (observed: 185k nodes / 6k edges with
+     * PRAGMA integrity_check reporting btreeInitPage errors). Only quick_check
+     * catches that. quick_check is O(db size); this function runs only on the
+     * quarantine decision path, never on hot opens. */
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(s->db, "PRAGMA quick_check(1);", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return st_rc_is_transient(rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *res = (const char *)sqlite3_column_text(stmt, 0);
+        if (!res || strcmp(res, "ok") != 0) {
+            (void)fprintf(stderr, "ERROR store.corrupt quick_check=%s\n", res ? res : "(null)");
+            sqlite3_finalize(stmt);
+            return CBM_INTEGRITY_CORRUPT;
+        }
+    } else {
+        int step_rc = sqlite3_errcode(s->db);
+        sqlite3_finalize(stmt);
+        return st_rc_is_transient(step_rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_INTEGRITY_OK;
+}
+
 cbm_store_t *cbm_store_open(const char *project) {
     if (!project) {
         return NULL;
@@ -2098,24 +2164,17 @@ int cbm_store_seal_existing_path_for_replace(const char *db_path) {
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(maintenance.db, "PRAGMA quick_check(1);", CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        int primary = rc & 0xff;
         sqlite3_close(maintenance.db);
-        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED || primary == SQLITE_READONLY ||
-                       primary == SQLITE_CANTOPEN || primary == SQLITE_IOERR
-                   ? CBM_STORE_ERR
-                   : CBM_STORE_NOT_FOUND;
+        return st_rc_is_transient(rc) ? CBM_STORE_ERR : CBM_STORE_NOT_FOUND;
     }
     rc = sqlite3_step(stmt);
     const char *result = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
     bool structurally_valid = result && strcmp(result, "ok") == 0;
     int finalize_rc = sqlite3_finalize(stmt);
     if (!structurally_valid || finalize_rc != SQLITE_OK) {
-        int primary = rc & 0xff;
+        int failure_rc = finalize_rc != SQLITE_OK ? finalize_rc : rc;
         sqlite3_close(maintenance.db);
-        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED || primary == SQLITE_READONLY ||
-                       primary == SQLITE_CANTOPEN || primary == SQLITE_IOERR
-                   ? CBM_STORE_ERR
-                   : CBM_STORE_NOT_FOUND;
+        return st_rc_is_transient(failure_rc) ? CBM_STORE_ERR : CBM_STORE_NOT_FOUND;
     }
 
     /* A structurally valid SQLite file that is not recognizably a codebase

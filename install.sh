@@ -225,7 +225,7 @@ echo "Extracting..."
 if [ "$EXT" = "zip" ]; then
     unzip -q "$DLDIR/$ARCHIVE" -d "$DLDIR"
 else
-    tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
+    tar --no-same-owner -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
 fi
 
 DLBIN="$DLDIR/codebase-memory-mcp"
@@ -237,8 +237,13 @@ fi
 # macOS: fix signing
 if [ "$OS" = "darwin" ]; then
     echo "Fixing macOS code signing..."
-    xattr -d com.apple.quarantine "$DLBIN" 2>/dev/null || true
-    codesign --sign - --force "$DLBIN" 2>/dev/null || true
+    # A curl-downloaded archive usually carries no quarantine attribute at all,
+    # and xattr then prints "No such xattr: com.apple.quarantine" on stderr.
+    # That harmless line was read as the cause of an unrelated install failure
+    # and became a bug report's title (#1537) — silence it; nothing here is an
+    # error worth showing.
+    xattr -d com.apple.quarantine "$DLBIN" >/dev/null 2>&1 || true
+    codesign --sign - --force "$DLBIN" >/dev/null 2>&1 || true
 fi
 
 # Verify the candidate before it requests account-wide maintenance. The

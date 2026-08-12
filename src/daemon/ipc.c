@@ -3329,6 +3329,7 @@ typedef BOOL(WINAPI *is_well_known_sid_fn)(PSID, WELL_KNOWN_SID_TYPE);
 typedef BOOL(WINAPI *is_valid_acl_fn)(PACL);
 typedef BOOL(WINAPI *initialize_acl_fn)(PACL, DWORD, DWORD);
 typedef BOOL(WINAPI *add_access_allowed_ace_fn)(PACL, DWORD, DWORD, PSID);
+typedef BOOL(WINAPI *add_access_allowed_ace_ex_fn)(PACL, DWORD, DWORD, DWORD, PSID);
 typedef BOOL(WINAPI *initialize_security_descriptor_fn)(PSECURITY_DESCRIPTOR, DWORD);
 typedef BOOL(WINAPI *set_security_descriptor_dacl_fn)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
 typedef BOOL(WINAPI *set_security_descriptor_owner_fn)(PSECURITY_DESCRIPTOR, PSID, BOOL);
@@ -3356,6 +3357,7 @@ typedef struct {
     is_valid_acl_fn is_valid_acl;
     initialize_acl_fn initialize_acl;
     add_access_allowed_ace_fn add_access_allowed_ace;
+    add_access_allowed_ace_ex_fn add_access_allowed_ace_ex;
     initialize_security_descriptor_fn initialize_security_descriptor;
     set_security_descriptor_dacl_fn set_security_descriptor_dacl;
     set_security_descriptor_owner_fn set_security_descriptor_owner;
@@ -3369,6 +3371,9 @@ typedef struct {
     PACL acl;
     PSECURITY_DESCRIPTOR descriptor;
     SECURITY_ATTRIBUTES attributes;
+    PACL directory_acl;
+    PSECURITY_DESCRIPTOR directory_descriptor;
+    SECURITY_ATTRIBUTES directory_attributes;
 } win_security_t;
 
 typedef struct win_generation_address {
@@ -3577,6 +3582,8 @@ static void win_security_destroy(win_security_t *security) {
     }
     free(security->descriptor);
     free(security->acl);
+    free(security->directory_descriptor);
+    free(security->directory_acl);
     free(security->user_sid);
     if (security->advapi) {
         (void)FreeLibrary(security->advapi);
@@ -3631,6 +3638,8 @@ static bool win_security_init(win_security_t *security) {
     RESOLVE_ADVAPI_MEMBER(security, initialize_acl, initialize_acl_fn, "InitializeAcl");
     RESOLVE_ADVAPI_MEMBER(security, add_access_allowed_ace, add_access_allowed_ace_fn,
                           "AddAccessAllowedAce");
+    RESOLVE_ADVAPI_MEMBER(security, add_access_allowed_ace_ex, add_access_allowed_ace_ex_fn,
+                          "AddAccessAllowedAceEx");
     RESOLVE_ADVAPI_MEMBER(security, initialize_security_descriptor,
                           initialize_security_descriptor_fn, "InitializeSecurityDescriptor");
     RESOLVE_ADVAPI_MEMBER(security, set_security_descriptor_dacl, set_security_descriptor_dacl_fn,
@@ -3696,6 +3705,37 @@ static bool win_security_init(win_security_t *security) {
     security->attributes.nLength = sizeof(security->attributes);
     security->attributes.lpSecurityDescriptor = security->descriptor;
     security->attributes.bInheritHandle = FALSE;
+
+    /* Containers need a second, inheritable ACL. AddAccessAllowedAce above
+     * cannot express inheritance flags, and a flagless ACE applied to a
+     * directory together with PROTECTED_DACL_SECURITY_INFORMATION yields
+     * D:PAI(A;;FA;;;<user>): the protection severs the inherited ACEs while
+     * the new one propagates nothing, so every child is created with an empty
+     * DACL. Files and kernel objects are leaves and keep the flagless ACL.
+     *
+     * The rights here must be specific (FILE_ALL_ACCESS) rather than
+     * GENERIC_ALL. Windows splits an inheritable generic-rights ACE into an
+     * effective mapped ACE plus an INHERIT_ONLY one carrying the generic bits,
+     * and the owner-only DACL validators require exactly one ACE. */
+    security->directory_acl = malloc(acl_size);
+    security->directory_descriptor = malloc(SECURITY_DESCRIPTOR_MIN_LENGTH);
+    if (!security->directory_acl || !security->directory_descriptor ||
+        !security->initialize_acl(security->directory_acl, (DWORD)acl_size, ACL_REVISION) ||
+        !security->add_access_allowed_ace_ex(security->directory_acl, ACL_REVISION,
+                                             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                                             FILE_ALL_ACCESS, security->user_sid) ||
+        !security->initialize_security_descriptor(security->directory_descriptor,
+                                                  SECURITY_DESCRIPTOR_REVISION) ||
+        !security->set_security_descriptor_dacl(security->directory_descriptor, TRUE,
+                                                security->directory_acl, FALSE) ||
+        !security->set_security_descriptor_owner(security->directory_descriptor, security->user_sid,
+                                                 FALSE)) {
+        win_security_destroy(security);
+        return false;
+    }
+    security->directory_attributes.nLength = sizeof(security->directory_attributes);
+    security->directory_attributes.lpSecurityDescriptor = security->directory_descriptor;
+    security->directory_attributes.bInheritHandle = FALSE;
     return true;
 }
 
@@ -4064,7 +4104,7 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     if (!win_security_init(&security)) {
         return false;
     }
-    bool created = CreateDirectoryW(runtime_dir, &security.attributes) != 0;
+    bool created = CreateDirectoryW(runtime_dir, &security.directory_attributes) != 0;
     if (!created && GetLastError() != ERROR_ALREADY_EXISTS) {
         win_security_destroy(&security);
         return false;
@@ -4111,7 +4151,7 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
             directory, SE_FILE_OBJECT,
             (owner_exact ? 0U : (DWORD)OWNER_SECURITY_INFORMATION) | DACL_SECURITY_INFORMATION |
                 PROTECTED_DACL_SECURITY_INFORMATION,
-            owner_exact ? NULL : security.user_sid, NULL, security.acl, NULL);
+            owner_exact ? NULL : security.user_sid, NULL, security.directory_acl, NULL);
     }
     if (valid_handle && owner_ok && secure_result != ERROR_SUCCESS) {
         ipc_validation_detail_set("owner/DACL repair failed (status %lu%s)",
@@ -4198,7 +4238,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
                 ok = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
-                     CreateDirectoryW(path, &security.attributes) != 0;
+                     CreateDirectoryW(path, &security.directory_attributes) != 0;
             }
             /* Ancestors are observe-only and must already be secure.  The
              * final current-user directory is intentionally handled below by

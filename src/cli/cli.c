@@ -172,7 +172,9 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
 static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
     "error: the automatic stop request timed out while CBM sessions or operations remained "
     "active. Close or restart every coding-agent session and CBM command using this cache, "
-    "then retry the same command; no executable, configuration, or index mutation was started.";
+    "then retry the same command; no executable, configuration, or index mutation was started. "
+    "Run 'codebase-memory-mcp daemon status' to list the client processes still holding the "
+    "daemon.";
 static const char CLI_ACTIVATION_SAFETY_MESSAGE[] =
     "error: CBM could not prove exclusive activation safety. Verify that the configured cache "
     "directory (CBM_CACHE_DIR when set) is owner-only and writable, close or restart every "
@@ -7365,6 +7367,10 @@ static int cbm_config_describe(const char *key) {
     return 0;
 }
 
+static void cbm_config_print_unknown_key(const char *key) {
+    (void)fprintf(stderr, "error: unknown config key: %s\n", key ? key : "");
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     /* NULL argv with a nonzero argc previously slipped past this guard (the
      * inner `argv &&` shielded only the help comparison) and dereferenced
@@ -7440,11 +7446,23 @@ int cbm_cmd_config(int argc, char **argv) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
             rc = CLI_TRUE;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+            const cbm_config_entry_t *entry = cbm_config_registry_entry(argv[CLI_SKIP_ONE]);
+            if (!entry) {
+                cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
+                rc = CLI_TRUE;
+            } else {
+                /* Stored value or the key's real default — the same fallback
+                 * the runtime readers use. `""` here was #1522's bug 2: every
+                 * unset key read as empty with exit 0. */
+                printf("%s\n", cbm_config_get_effective(cfg, entry->key, entry->default_val));
+            }
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < MIN_ARGC_CMD) {
             (void)fprintf(stderr, "Usage: config set <key> <value>\n");
+            rc = CLI_TRUE;
+        } else if (!cbm_config_registry_entry(argv[CLI_SKIP_ONE])) {
+            cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
         } else {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
@@ -7460,6 +7478,9 @@ int cbm_cmd_config(int argc, char **argv) {
     } else if (strcmp(argv[0], "reset") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config reset <key>\n");
+            rc = CLI_TRUE;
+        } else if (!cbm_config_registry_entry(argv[CLI_SKIP_ONE])) {
+            cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
         } else {
             cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);
@@ -12483,7 +12504,8 @@ int cbm_cmd_update(int argc, char **argv) {
         }
         printf("It downloads the latest release, verifies its checksum, and replaces\n"
                "this binary in place. install.sh is idempotent, so re-running it IS\n"
-               "the update.\n");
+               "the update. One build per platform — the graph UI is always\n"
+               "included.\n");
 #endif
         return 0;
     }

@@ -23,6 +23,10 @@ enum {
     GB_MIN_FOR_DEDUP = 2,    /* need at least 2 vectors to sort+dedup */
     GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
 };
+
+/* Sentinel for an edge property blob carrying no parseable "confidence": any
+ * blob that states one outranks a blob that does not. */
+#define CBM_EDGE_CONF_ABSENT (-1.0)
 #include "graph_buffer/graph_buffer.h"
 #include "cbm.h"
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
@@ -1465,6 +1469,60 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 
+/* Parse the numeric confidence property as JSON. Byte slicing misclassified
+ * valid whitespace and occurrences inside strings, breaking the total order. */
+static bool edge_props_confidence(const char *props_json, double *out) {
+    if (!props_json || !out) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(props_json, strlen(props_json), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *confidence = yyjson_is_obj(root) ? yyjson_obj_get(root, "confidence") : NULL;
+    bool found = yyjson_is_num(confidence);
+    if (found) {
+        *out = yyjson_get_real(confidence);
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
+/* Decide whether an incoming property blob replaces the stored one on a
+ * duplicate edge key.
+ *
+ * confidence/strategy/via are not part of the edge key, and the same logical
+ * edge is legitimately minted by more than one strategy carrying different
+ * values — LSP resolution and registry-textual matching both produce CALLS
+ * edges. Per-worker edge buffers merge in worker-slot order, so any rule that
+ * depends on arrival order makes the surviving attributes a function of thread
+ * scheduling.
+ *
+ * This rule is a total order over the two candidates, hence commutative and
+ * associative — the outcome is independent of arrival order:
+ *   1. higher "confidence" wins, which also enforces the intended precedence
+ *      that an LSP-resolved call outranks a textual match;
+ *   2. on equal confidence, the lexicographically greater blob wins, giving a
+ *      deterministic choice between otherwise equal candidates.
+ * An empty or absent incoming blob never displaces stored properties. */
+static bool edge_props_should_replace(const char *existing_json, const char *incoming_json) {
+    if (!incoming_json || strcmp(incoming_json, "{}") == 0) {
+        return false;
+    }
+    if (!existing_json || strcmp(existing_json, "{}") == 0) {
+        return true;
+    }
+    double inc = CBM_EDGE_CONF_ABSENT;
+    double cur = CBM_EDGE_CONF_ABSENT;
+    bool inc_has_confidence = edge_props_confidence(incoming_json, &inc);
+    bool cur_has_confidence = edge_props_confidence(existing_json, &cur);
+    if (inc_has_confidence != cur_has_confidence) {
+        return inc_has_confidence;
+    }
+    if (inc_has_confidence && inc != cur) {
+        return inc > cur;
+    }
+    return strcmp(incoming_json, existing_json) > 0;
+}
+
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
                              const char *properties_json) {
     if (!gb || !type) {
@@ -1477,10 +1535,15 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
-        /* Merge properties (just replace for now) */
-        if (properties_json && strcmp(properties_json, "{}") != 0) {
-            free(existing->properties_json);
-            existing->properties_json = heap_strdup(properties_json);
+        bool replace = strcmp(type, "CALLS") == 0
+                           ? edge_props_should_replace(existing->properties_json, properties_json)
+                           : properties_json != NULL;
+        if (replace) {
+            char *replacement = heap_strdup(properties_json);
+            if (replacement) {
+                free(existing->properties_json);
+                existing->properties_json = replacement;
+            }
         }
         return existing->id;
     }

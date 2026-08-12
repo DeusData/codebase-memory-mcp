@@ -498,33 +498,56 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
             return false;
         }
     }
-    cbm_mutex_lock(&state->mutex);
-    bool stopped = state->stopping || state->failed;
-    bool capacity = state->count < FRONTEND_QUEUE_CAPACITY &&
-                    state->queued_bytes <= FRONTEND_QUEUE_BYTES_MAX &&
-                    length <= FRONTEND_QUEUE_BYTES_MAX - state->queued_bytes;
-    if (!stopped && capacity) {
-        size_t tail = (state->head + state->count) % FRONTEND_QUEUE_CAPACITY;
-        state->queue[tail] = (frontend_item_t){
-            .message = message,
-            .length = length,
-            .content_length_framed = content_length_framed,
-            .has_id = has_id,
-            .id = id,
-            .id_str = id_str,
-        };
-        state->count++;
-        state->queued_bytes += length;
+    /* A frame that exceeds the whole byte budget can never be admitted no
+     * matter how long we wait; only that case is a hard failure. */
+    if (length > FRONTEND_QUEUE_BYTES_MAX) {
+        cbm_mutex_lock(&state->mutex);
+        if (!state->stopping && !state->failed) {
+            state->failed = true;
+            state->stopping = true;
+        }
         cbm_mutex_unlock(&state->mutex);
-        return true;
+        free(id_str);
+        return false;
     }
-    if (!stopped) {
-        state->failed = true;
-        state->stopping = true;
+    /* A full queue is BACKPRESSURE, not failure. This runs on the stdin reader
+     * thread, so blocking here stops further reads and lets the kernel pipe
+     * absorb the client's burst — a pipelining client is a client going fast,
+     * not a client going wrong. The old code failed the whole session at frame
+     * capacity+1, killing it with every buffered response unwritten: any 7+
+     * pipelined requests (e.g. an agent issuing parallel tool calls) died with
+     * rc=1 and zero output (#1522 follow-up). Waits are bounded only by the
+     * stop/fail flags, which every teardown path already sets — the same
+     * condition the polling worker and watchdogs key on. */
+    for (;;) {
+        cbm_mutex_lock(&state->mutex);
+        bool stopped = state->stopping || state->failed;
+        if (stopped) {
+            cbm_mutex_unlock(&state->mutex);
+            free(id_str);
+            return false;
+        }
+        bool capacity = state->count < FRONTEND_QUEUE_CAPACITY &&
+                        state->queued_bytes <= FRONTEND_QUEUE_BYTES_MAX &&
+                        length <= FRONTEND_QUEUE_BYTES_MAX - state->queued_bytes;
+        if (capacity) {
+            size_t tail = (state->head + state->count) % FRONTEND_QUEUE_CAPACITY;
+            state->queue[tail] = (frontend_item_t){
+                .message = message,
+                .length = length,
+                .content_length_framed = content_length_framed,
+                .has_id = has_id,
+                .id = id,
+                .id_str = id_str,
+            };
+            state->count++;
+            state->queued_bytes += length;
+            cbm_mutex_unlock(&state->mutex);
+            return true;
+        }
+        cbm_mutex_unlock(&state->mutex);
+        cbm_usleep(FRONTEND_WAIT_US);
     }
-    cbm_mutex_unlock(&state->mutex);
-    free(id_str);
-    return false;
 }
 
 static bool frontend_stop_begin(frontend_state_t *state) {

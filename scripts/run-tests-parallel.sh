@@ -58,7 +58,16 @@ stamp_windows_build_dir() {
     esac
     local runner_dir_w me norm_out stamp_out reset_out
     runner_dir_w="$(cygpath -w "$(dirname "$RUNNER")")"
+    # Qualify the account with its domain. Git Bash resolves `whoami` to
+    # coreutils, which prints a bare name, and icacls resolves a bare name
+    # against the machine first: on a host whose name equals the user's
+    # (COMPUTERNAME=BUILD, user build) the grant lands on an empty principal
+    # (BUILD\) and, combined with /inheritance:r above, locks this script out
+    # of its own log directory.
     me="$(whoami | tr -d '\r')"
+    if [ -n "${USERDOMAIN:-}" ]; then
+        me="${USERDOMAIN}\\${me}"
+    fi
     # Normalize FIRST: some runner images stamp EXPLICIT (non-inherited)
     # Authenticated-Users ACEs onto the workspace tree, which /inheritance:r
     # cannot strip and /grant:r does not touch (it replaces only the granted

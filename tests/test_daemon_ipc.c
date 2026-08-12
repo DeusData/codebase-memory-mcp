@@ -776,6 +776,108 @@ TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl) {
     PASS();
 }
 
+/* A private directory is a container, so its owner-only ACE must propagate.
+ * Otherwise the protected DACL severs inheritance and every child is created
+ * with an empty DACL, unreadable even by its owner. */
+TEST(daemon_ipc_windows_private_directory_ace_is_inheritable) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool secured = false;
+    bool ace_read = false;
+    bool ace_single = false;
+    bool ace_inheritable = false;
+    bool child_has_dacl = false;
+    bool lock_directory_accepted = false;
+
+    if (ipc_test_parent_new(parent, "win-inheritable-ace")) {
+        int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = written > 0 && written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+    }
+    if (secured) {
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        LPVOID opaque_ace = NULL;
+        ACL_SIZE_INFORMATION information;
+        memset(&information, 0, sizeof(information));
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                  &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            dacl &&
+            GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation) &&
+            GetAce(dacl, 0, &opaque_ace) && opaque_ace) {
+            ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)opaque_ace;
+            ace_read = true;
+            /* The owner-only validators require exactly one ACE. An
+             * inheritable ACE built from GENERIC_ALL rather than specific
+             * rights is split by Windows into an effective ACE plus an
+             * INHERIT_ONLY one, which fails that check. */
+            ace_single = information.AceCount == 1;
+            ace_inheritable = (ace->Header.AceFlags & CONTAINER_INHERIT_ACE) != 0 &&
+                              (ace->Header.AceFlags & OBJECT_INHERIT_ACE) != 0;
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+    if (ace_inheritable) {
+        char child[TEST_PATH_CAP] = {0};
+        int written = snprintf(child, sizeof(child), "%s/child", cache);
+        if (written > 0 && written < (int)sizeof(child) && CreateDirectoryA(child, NULL) != 0) {
+            PACL child_dacl = NULL;
+            PSECURITY_DESCRIPTOR child_descriptor = NULL;
+            ACL_SIZE_INFORMATION information;
+            memset(&information, 0, sizeof(information));
+            child_has_dacl =
+                GetNamedSecurityInfoA(child, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                      &child_dacl, NULL, &child_descriptor) == ERROR_SUCCESS &&
+                child_dacl &&
+                GetAclInformation(child_dacl, &information, sizeof(information),
+                                  AclSizeInformation) &&
+                information.AceCount > 0;
+            if (child_descriptor) {
+                (void)LocalFree(child_descriptor);
+            }
+            (void)RemoveDirectoryA(child);
+        }
+    }
+
+    if (ace_single) {
+        /* The owner-only DACL validator gates every project lock: a secured
+         * directory it refuses takes the whole coordination layer down with
+         * "secure CLI coordination could not be created (project-locks)". */
+        HANDLE handle =
+            CreateFileA(cache, FILE_READ_ATTRIBUTES | READ_CONTROL,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (handle != INVALID_HANDLE_VALUE) {
+            cbm_private_lock_directory_t *directory = NULL;
+            lock_directory_accepted = cbm_private_lock_directory_adopt_windows(
+                                          handle, cache, &directory) == CBM_PRIVATE_FILE_LOCK_OK &&
+                                      directory;
+            if (directory) {
+                cbm_private_lock_directory_close(directory);
+            } else {
+                (void)CloseHandle(handle);
+            }
+        }
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(ace_read);
+    ASSERT_TRUE(ace_single);
+    ASSERT_TRUE(ace_inheritable);
+    ASSERT_TRUE(child_has_dacl);
+    ASSERT_TRUE(lock_directory_accepted);
+    PASS();
+}
+
 TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor) {
     char parent[TEST_PATH_CAP] = {0};
     char add_only[TEST_PATH_CAP] = {0};
@@ -4681,6 +4783,7 @@ SUITE(daemon_ipc) {
 #ifdef _WIN32
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
+    RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);

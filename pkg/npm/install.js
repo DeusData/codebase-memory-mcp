@@ -580,6 +580,9 @@ async function main() {
   // dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
   // have no such variant. Keep in sync with install.sh / pypi _cli.py / cli.c.
   const variant = platform === 'linux' ? '-portable' : '';
+  // No UI/standard split since v0.10.0: one archive per platform, graph UI
+  // always embedded. The retired UI opt-in pointed at archives that no longer
+  // exist, so honoring it could only 404 (#1538).
   const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
 

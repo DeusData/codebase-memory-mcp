@@ -106,7 +106,13 @@ fi
 soak_stamp_windows_dir() {
     local dir_w me output
     dir_w="$(cygpath -w "$1")"
+    # Qualify with the domain: a bare name from coreutils `whoami` resolves
+    # against the machine first, so on a host whose name equals the user's the
+    # grant lands on an empty principal.
     me="$(whoami | tr -d '\r')"
+    if [ -n "${USERDOMAIN:-}" ]; then
+        me="${USERDOMAIN}\\${me}"
+    fi
     if ! output=$(MSYS2_ARG_CONV_EXCL='*' icacls "$dir_w" /reset /Q 2>&1); then
         echo "FAIL: soak DACL normalize failed (dir=$dir_w user=$me)" >&2
         printf '%s\n' "$output" >&2

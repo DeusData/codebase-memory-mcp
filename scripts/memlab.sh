@@ -35,7 +35,13 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
     ! command -v winepath >/dev/null 2>&1; then
     WIN_ROOT=$(mktemp -d "$(cygpath "$USERPROFILE")/cbm-memlab.XXXXXX")
     WIN_ROOT_W="$(cygpath -w "$WIN_ROOT")"
+    # Qualify with the domain: a bare name from coreutils `whoami` resolves
+    # against the machine first, so on a host whose name equals the user's the
+    # grant lands on an empty principal.
     ME="$(whoami | tr -d '\r')"
+    if [ -n "${USERDOMAIN:-}" ]; then
+        ME="${USERDOMAIN}\\${ME}"
+    fi
     MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /reset /Q >/dev/null 2>&1 || true
     if ! MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /inheritance:r \
         /grant:r "${ME}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \

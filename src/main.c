@@ -1542,6 +1542,45 @@ static bool main_semver_newer(const char *candidate, const char *active) {
     return false;
 }
 
+/* A client that cannot reach the daemon must SAY SO, in the caller's own
+ * protocol. An MCP client speaks JSON-RPC over stdout, and the old path
+ * returned EXIT_FAILURE having written nothing at all: agents saw a transport
+ * that closed mid-handshake and reported "Connection closed" with no cause,
+ * while the real reason (image rejection, startup timeout, conflict) sat in
+ * bootstrap_result.message and was dropped on the floor (#1539).
+ *
+ * stdout carries a JSON-RPC error object so the agent surfaces the reason;
+ * id is null because the failure precedes reading any request. stderr carries
+ * the same text for humans reading a terminal. */
+static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
+                                                 const cbm_daemon_bootstrap_result_t *result) {
+    const char *detail = (result && result->message[0])
+                             ? result->message
+                             : "CBM daemon connection failed before the session was established";
+    if (cbm_daemon_process_role_requires_client(role)) {
+        char escaped[CBM_DAEMON_CONFLICT_MESSAGE_SIZE * 2];
+        size_t out = 0;
+        for (size_t i = 0; detail[i] && out + 2 < sizeof(escaped); i++) {
+            unsigned char c = (unsigned char)detail[i];
+            if (c == '"' || c == '\\') {
+                escaped[out++] = '\\';
+                escaped[out++] = (char)c;
+            } else if (c < 0x20) {
+                escaped[out++] = ' ';
+            } else {
+                escaped[out++] = (char)c;
+            }
+        }
+        escaped[out] = '\0';
+        (void)fprintf(stdout,
+                      "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,"
+                      "\"message\":\"%s\"}}\n",
+                      escaped);
+        (void)fflush(stdout);
+    }
+    (void)fprintf(stderr, "codebase-memory-mcp: %s\n", detail);
+}
+
 /* Client bootstrap with the upgrade policy: a CONFLICT against a PERMANENT
  * daemon of a strictly OLDER release is resolved by draining that daemon
  * (the same authenticated path install/update use) and retrying once. A
@@ -2939,6 +2978,7 @@ int main(int argc, char **argv) {
         main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
+        main_report_client_bootstrap_failure(role, &bootstrap_result);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
     }

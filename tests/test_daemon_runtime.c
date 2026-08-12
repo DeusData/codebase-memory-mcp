@@ -1917,12 +1917,49 @@ TEST(daemon_runtime_exact_hello_issues_connection_bound_identity) {
  * silently dropped. The old path logged daemon.client_image_rejected and
  * finished the worker without sending a hello response, so the client sat on
  * "pending" indefinitely - indistinguishable from a slow cold start - with the
- * reason visible only in the daemon log. */
+ * reason visible only in the daemon log.
+ *
+ * The rejection is now scoped to fingerprint_mismatch (see #1539 below), so
+ * this drives the seam that keeps a peer image readable but DIFFERENT. */
 TEST(daemon_runtime_image_rejection_reaches_client_issue1383) {
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_test_fixture_t fixture;
     bool started = runtime_test_fixture_start(&fixture, "image-reject", &identity);
+    cbm_daemon_runtime_connect_result_t result = {0};
+    cbm_daemon_runtime_client_t *client = NULL;
+
+    cbm_daemon_runtime_force_peer_image_mismatch_for_testing(true);
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &result);
+    }
+    cbm_daemon_runtime_force_peer_image_mismatch_for_testing(false);
+
+    bool rejected_with_reason = client == NULL &&
+                                result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
+                                strstr(result.message, "fingerprint_mismatch") != NULL;
+    if (client) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(rejected_with_reason);
+    PASS();
+}
+
+/* #1539: a peer whose image cannot be EXAMINED is not a peer that failed a
+ * check — it is a peer we could not look at. Every `npx codebase-memory-mcp`
+ * invocation lands here (ephemeral cache path, unfingerprintable), and the old
+ * gate rejected all of them: the MCP client saw a 30 s wait and zero bytes.
+ * The HELLO exchange that already succeeded proves version, build fingerprint
+ * and ABI compatibility, so admission is the honest outcome. */
+TEST(daemon_runtime_unverifiable_image_is_admitted_issue1539) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "image-unverifiable", &identity);
     cbm_daemon_runtime_connect_result_t result = {0};
     cbm_daemon_runtime_client_t *client = NULL;
 
@@ -1933,16 +1970,14 @@ TEST(daemon_runtime_image_rejection_reaches_client_issue1383) {
     }
     cbm_daemon_runtime_force_peer_image_unverified_for_testing(false);
 
-    bool rejected_with_reason = client == NULL &&
-                                result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
-                                strstr(result.message, "image_unverifiable") != NULL;
+    bool admitted = client != NULL && result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
     if (client) {
-        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        admitted = cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS) && admitted;
     }
     runtime_test_fixture_finish(&fixture);
 
     ASSERT_TRUE(started);
-    ASSERT_TRUE(rejected_with_reason);
+    ASSERT_TRUE(admitted);
     PASS();
 }
 
@@ -4981,6 +5016,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
     RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);
+    RUN_TEST(daemon_runtime_unverifiable_image_is_admitted_issue1539);
     RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);

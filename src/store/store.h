@@ -533,6 +533,28 @@ bool cbm_store_check_integrity_deep(cbm_store_t *s);
  * check. */
 bool cbm_store_check_integrity_full(cbm_store_t *s, bool *path_only_failure);
 
+/* Outcome of a quarantine-grade integrity check. Used to decide whether a DB
+ * that failed the cheap open-time check should be quarantined (renamed to
+ * .corrupt and rebuilt) or left alone. See cbm_store_check_integrity_verdict. */
+typedef enum {
+    CBM_INTEGRITY_OK = 0,        /* DB is healthy */
+    CBM_INTEGRITY_CORRUPT = 1,   /* DB is structurally damaged — safe to quarantine */
+    CBM_INTEGRITY_TRANSIENT = 2, /* SQL/busy/IO error — NOT corruption, do NOT quarantine */
+} cbm_integrity_verdict_t;
+
+/* Full integrity verdict for the quarantine decision path.
+ *
+ * The plain cbm_store_check_integrity() returns a single bool and cannot
+ * distinguish "the projects table has 99 rows" (real corruption) from
+ * "sqlite3_prepare_v2 returned SQLITE_BUSY because another instance held the
+ * writer lock" (a transient lock contention, #1206). Quarantining on the latter
+ * is what makes concurrent MCP instances destroy each other's healthy DBs.
+ *
+ * This function runs the shallow check, then PRAGMA quick_check, and classifies
+ * the failure mode so the caller can quarantine ONLY on confirmed corruption.
+ * O(db size); use only on the recovery/quarantine path, not hot opens. */
+cbm_integrity_verdict_t cbm_store_check_integrity_verdict(cbm_store_t *s);
+
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);
 

@@ -6507,6 +6507,39 @@ TEST(store_integrity_full_path_only_classification) {
     PASS();
 }
 
+TEST(store_integrity_verdict_preserves_dependency_and_path_only_data) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_NOT_NULL(db);
+
+    for (int i = 0; i < 10; i++) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('dep-%d', '2026-08-12', '/tmp/%d');",
+                 i, i);
+        ASSERT_EQ(sqlite3_exec(db, sql, NULL, NULL, NULL), SQLITE_OK);
+    }
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_OK);
+
+    ASSERT_EQ(sqlite3_exec(db, "DELETE FROM projects;", NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "INSERT INTO projects (name, indexed_at, root_path) "
+                           "VALUES ('path-only', '2026-08-12', '826');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_OK);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_without_handle_is_transient) {
+    ASSERT_EQ(cbm_store_check_integrity_verdict(NULL), CBM_INTEGRITY_TRANSIENT);
+    PASS();
+}
+
 /* ── Edge case: NULL / empty field handling ────────────────────── */
 
 TEST(store_node_null_project) {
@@ -7392,6 +7425,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_project_graph_stats_are_exact_and_generation_invalidated);
     RUN_TEST(store_integrity_full_path_only_classification);
+    RUN_TEST(store_integrity_verdict_preserves_dependency_and_path_only_data);
+    RUN_TEST(store_integrity_verdict_without_handle_is_transient);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_reads_reset_cached_statements);
     RUN_TEST(store_project_update);

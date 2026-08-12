@@ -91,6 +91,12 @@ typedef struct {
     atomic_bool block_first_request;
     atomic_bool first_request_started;
     atomic_bool tools_list_changed;
+    /* Overflow mode: set by the writer AFTER stdin is fully pumped and closed,
+     * releasing the deliberately-held first request. The hold is what forces
+     * the input queue to actually fill (proving enqueue backpressures instead
+     * of failing the session); the release is a state transition, not a
+     * timeout, so the drain that follows is deterministic. */
+    atomic_bool release_first_request;
     int request_observed_fd;
     int session_cancel_fd;
 } frontend_eof_application_context_t;
@@ -164,10 +170,14 @@ static cbm_daemon_runtime_application_status_t frontend_eof_application_request(
     if (request_index == 0 &&
         atomic_load_explicit(&context->block_first_request, memory_order_acquire)) {
         atomic_store_explicit(&context->first_request_started, true, memory_order_release);
-        while (!atomic_load_explicit(&session->cancelled, memory_order_acquire)) {
+        while (!atomic_load_explicit(&session->cancelled, memory_order_acquire) &&
+               !atomic_load_explicit(&context->release_first_request, memory_order_acquire)) {
             cbm_usleep(1000);
         }
-        return CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
+        if (atomic_load_explicit(&session->cancelled, memory_order_acquire)) {
+            return CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
+        }
+        /* Released: fall through and answer normally like every later item. */
     }
     if (atomic_load_explicit(&context->tools_list_changed, memory_order_acquire)) {
         static const char response[] = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
@@ -284,6 +294,14 @@ static void *frontend_eof_writer(void *opaque) {
     }
     ok = close(writer->fd) == 0 && ok;
     writer->fd = -1;
+    if (writer->overflow) {
+        /* Everything — 32 over-capacity frames AND the EOF behind them — is now
+         * committed to the pipe. Only now release the held first request: the
+         * queue was provably full while it blocked, so the drain that follows
+         * exercises enqueue-wait, not a conveniently fast worker. */
+        atomic_store_explicit(&writer->application->release_first_request, true,
+                              memory_order_release);
+    }
     atomic_store_explicit(&writer->succeeded, ok, memory_order_release);
     atomic_store_explicit(&writer->finished, true, memory_order_release);
     return NULL;
@@ -299,6 +317,7 @@ static bool frontend_eof_fixture_start(frontend_eof_fixture_t *fixture, const ch
     atomic_init(&fixture->application.block_first_request, true);
     atomic_init(&fixture->application.first_request_started, false);
     atomic_init(&fixture->application.tools_list_changed, false);
+    atomic_init(&fixture->application.release_first_request, false);
     fixture->application.request_observed_fd = -1;
     fixture->application.session_cancel_fd = -1;
     char key[CBM_DAEMON_KEY_SIZE];
@@ -422,13 +441,31 @@ static int frontend_eof_child_run(const char *parent, bool overflow) {
         atomic_load_explicit(&fixture.application.first_request_started, memory_order_acquire);
     bool session_cancelled =
         atomic_load_explicit(&fixture.application.session_cancels, memory_order_acquire) > 0;
+    int requests_observed =
+        atomic_load_explicit(&fixture.application.requests, memory_order_acquire);
     bool input_closed = fclose(input) == 0;
     bool output_closed = fclose(output) == 0;
     bool streams_closed = input_closed && output_closed;
     bool fixture_closed = frontend_eof_fixture_finish(&fixture);
-    bool result_matches_contract = overflow ? result < 0 : result == 0;
-    return result_matches_contract && joined && writer_ok && request_started && session_cancelled &&
-                   streams_closed && fixture_closed
+    bool result_matches_contract;
+    if (overflow) {
+        /* Over-capacity pipelined input is a client going FAST, not a client
+         * going WRONG (#1522 follow-up): enqueue must backpressure the stdin
+         * reader until the worker drains, then every queued frame — the held
+         * first request plus all 32 over-capacity frames — is answered and the
+         * session closes cleanly. The old contract pinned the defect: enqueue
+         * overflow failed the whole session (result < 0, session cancelled,
+         * every buffered response lost). */
+        /* session_cancel also fires on the ordinary client disconnect at EOF
+         * teardown, so it cannot discriminate this contract; the loss-free
+         * property is the request count plus the clean run result. */
+        result_matches_contract =
+            result == 0 && requests_observed == 1 + FRONTEND_EOF_TEST_OVERFLOW_MESSAGES;
+    } else {
+        result_matches_contract = result == 0 && session_cancelled;
+    }
+    return result_matches_contract && joined && writer_ok && request_started && streams_closed &&
+                   fixture_closed
                ? 0
                : 73;
 }
@@ -677,6 +714,7 @@ static int frontend_backpressure_daemon_run(const char *parent, int ready_fd, in
     atomic_init(&application.second_session_cancels, 0);
     atomic_init(&application.block_first_request, false);
     atomic_init(&application.first_request_started, false);
+    atomic_init(&application.release_first_request, false);
     application.request_observed_fd = ready_fd;
     application.session_cancel_fd = cancel_fd;
     cbm_daemon_runtime_application_callbacks_t callbacks = {
@@ -1426,7 +1464,7 @@ TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
  * prevents the sole reader from observing that already-pending EOF, so neither
  * the request nor its daemon session is cancelled. Overload must instead fail
  * the frontend promptly and close/cancel the authenticated session. */
-TEST(daemon_frontend_over_capacity_input_cannot_hide_eof_behind_active_request) {
+TEST(daemon_frontend_over_capacity_input_backpressures_without_loss) {
     ASSERT_TRUE(frontend_eof_run_isolated("overflow", true));
     PASS();
 }
@@ -1490,7 +1528,7 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked);
     RUN_TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation);
     RUN_TEST(daemon_local_participant_monitor_allows_supervisor_containment_window);
-    RUN_TEST(daemon_frontend_over_capacity_input_cannot_hide_eof_behind_active_request);
+    RUN_TEST(daemon_frontend_over_capacity_input_backpressures_without_loss);
     RUN_TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success);
     RUN_TEST(daemon_frontend_writes_list_change_after_response_in_both_framings);
     RUN_TEST(daemon_frontend_stdout_backpressure_eof_fail_stops_and_cancels_session);

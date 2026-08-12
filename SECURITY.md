@@ -289,8 +289,8 @@ for Linux ELF binaries, so it is not a complete answer either.
 
 | Version | Supported |
 |---------|-----------|
-| Latest `0.9.x` | Yes — security fixes land in the newest release |
-| < 0.9   | No — please upgrade to the latest release |
+| Latest `0.10.x` | Yes — security fixes land in the newest release |
+| < 0.10   | No — please upgrade to the latest release |
 
 Only the latest release is supported. Security fixes are shipped in a new
 patched release rather than backported to older versions; upgrading to the

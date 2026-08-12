@@ -109,3 +109,9 @@ benchmarks/labels/
 benchmarks/campaign-specs/
 benchmarks/rollup*.json
 benchmarks/rollup*.md
+
+# Compiled Go wrapper binary. `go build` in pkg/go drops the executable beside
+# its sources; one was committed by accident (8.8 MB ELF, flagged by OSSF
+# Scorecard as a binary artifact in source). Source only, never the build.
+/pkg/go/codebase-memory-mcp
+/pkg/go/codebase-memory-mcp.exe

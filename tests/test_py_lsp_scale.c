@@ -22,26 +22,29 @@ static char *build_fixture(int n_classes, int *out_len) {
      * 256 covers up to 9-digit indices comfortably. */
     int approx = n_classes * 256 + 1024;
     char *buf = (char *)malloc((size_t)approx);
-    if (!buf) return NULL;
+    if (!buf)
+        return NULL;
     int pos = 0;
-    pos += snprintf(buf + pos, (size_t)(approx - pos),
-        "from typing import Self\n");
+    pos += snprintf(buf + pos, (size_t)(approx - pos), "from typing import Self\n");
     for (int i = 0; i < n_classes; i++) {
         int n = snprintf(buf + pos, (size_t)(approx - pos),
-            "class Cls%d:\n"
-            "    def method(self) -> int:\n"
-            "        return %d\n"
-            "    def chain(self) -> Self:\n"
-            "        return self\n", i, i);
-        if (n < 0 || pos + n >= approx) break;
+                         "class Cls%d:\n"
+                         "    def method(self) -> int:\n"
+                         "        return %d\n"
+                         "    def chain(self) -> Self:\n"
+                         "        return self\n",
+                         i, i);
+        if (n < 0 || pos + n >= approx)
+            break;
         pos += n;
     }
     int n = snprintf(buf + pos, (size_t)(approx - pos), "def use():\n");
     pos += n;
     for (int i = 0; i < n_classes; i++) {
         int m = snprintf(buf + pos, (size_t)(approx - pos),
-            "    Cls%d().chain().chain().method()\n", i);
-        if (m < 0 || pos + m >= approx) break;
+                         "    Cls%d().chain().chain().method()\n", i);
+        if (m < 0 || pos + m >= approx)
+            break;
         pos += m;
     }
     *out_len = pos;

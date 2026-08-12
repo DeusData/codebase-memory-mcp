@@ -159,14 +159,13 @@ static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) 
             snprintf(out[n].normalized, sizeof(out[n].normalized), "%s", norm);
             n++;
         }
-        /* gbuf data is borrowed — no free */
     }
     return n;
 }
 
 static int count_code_entry_capacity(cbm_gbuf_t *gb) {
     int total = 0;
-    static const char *labels[] = {"Function", "Variable", "Class", NULL};
+    static const char *labels[] = {"Function", "Variable", "Class", "Struct", NULL};
 
     for (int li = 0; labels[li]; li++) {
         const cbm_gbuf_node_t **nodes = NULL;

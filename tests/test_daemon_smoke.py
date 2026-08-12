@@ -2151,6 +2151,103 @@ def main():
                 "install activation modified a source executable",
             )
 
+            # Build the complete update payload and checksum before starting
+            # the next daemon. CBM_DOWNLOAD_URL points at this file:// fixture,
+            # so the smoke cannot contact the network. Update must then drain
+            # its live MCP generation before replacing only the temp HOME
+            # installation and performing its documented index reset.
+            update_release = tmpdir / "activation-update-release"
+            update_env = env.copy()
+            update_env["CBM_DOWNLOAD_URL"] = create_local_update_release(
+                update_release, conflict_binary
+            )
+            update_starts = len(json_events(daemon_log, "daemon.start"))
+            update_stops = len(json_events(daemon_log, "daemon.stop"))
+            update_client = start_ready_mcp_client(
+                binary,
+                update_env,
+                tmpdir / "activation-update-client.err",
+                clients,
+                initialize_params,
+                501,
+                "activation update client",
+            )
+            wait_until(
+                lambda: len(json_events(daemon_log, "daemon.start"))
+                == update_starts + 1,
+                START_TIMEOUT,
+                "update activation daemon generation",
+            )
+            update_activation_records = run_successful_activation(
+                binary,
+                update_env,
+                tmpdir,
+                activation_log,
+                "activation-update",
+                "update",
+                ["update", "--force", "--yes"],
+                active_fingerprint,
+            )
+            check(
+                update_client.wait(timeout=15) >= 0,
+                "update activation MCP frontend was killed by a signal",
+            )
+            wait_until(
+                lambda: len(json_events(daemon_log, "daemon.stop"))
+                == update_stops + 1,
+                10,
+                "update activation daemon.stop",
+            )
+            assert_coordination_idle(
+                socket_path,
+                coordination_locks,
+                "update activation coordination cleanup",
+            )
+            assert_no_activation_artifacts(target_dir, "update activation")
+            updated_version = subprocess.run(
+                [str(target_binary), "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                timeout=10,
+                check=False,
+            )
+            check(
+                updated_version.returncode == 0
+                and updated_version.stdout.strip()
+                == "codebase-memory-mcp " + semantic_version,
+                "updated target is not executable: " + updated_version.stderr,
+            )
+            updated_status = os.lstat(target_binary)
+            check(stat.S_ISREG(updated_status.st_mode), "updated target is not regular")
+            check(updated_status.st_uid == os.geteuid(), "updated target has wrong owner")
+            check(updated_status.st_nlink == 1, "updated target has multiple links")
+            check(
+                stat.S_IMODE(updated_status.st_mode) & 0o022 == 0,
+                "updated target is group/world writable",
+            )
+            updated_build = sha256_file(target_binary)
+            check(
+                updated_build != active_fingerprint,
+                "update republished the old active build",
+            )
+            check(
+                update_activation_records[-1].get("target_build")
+                == updated_build,
+                "update audit target build does not match the published binary",
+            )
+            check(not index_path.exists(), "update did not clear the opted-in index")
+            check(
+                sha256_file(install_target) == installed_build,
+                "update mutated the separate custom-dir installation",
+            )
+            check(
+                sha256_file(binary) == source_binary_before
+                and sha256_file(conflict_binary) == conflict_binary_before,
+                "update activation modified a source executable",
+            )
+
             # Launch the installed target itself as the final daemon build,
             # then uninstall it from that exact executable. This is another
             # authenticated cross-build drain and proves removal waits until

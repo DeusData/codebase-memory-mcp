@@ -11894,6 +11894,98 @@ TEST(cli_config_get_set) {
     PASS();
 }
 
+/* Capture stdout across one cbm_cmd_config invocation. Returns the command's
+ * rc and copies captured stdout (NUL-terminated, truncated to cap) out.
+ * tmpfile+dup2+rewind is the file's established portable capture idiom —
+ * pread/mkstemp/setenv do not exist on the MinGW leg. */
+static int cli_config_cmd_capture(int argc, char **argv, char *out, size_t cap) {
+    out[0] = '\0';
+    FILE *capture = tmpfile();
+    int saved = capture ? dup(fileno(stdout)) : -1;
+    if (!capture || saved < 0) {
+        if (capture)
+            fclose(capture);
+        if (saved >= 0)
+            close(saved);
+        return -1000;
+    }
+    fflush(stdout);
+    if (dup2(fileno(capture), fileno(stdout)) < 0) {
+        fclose(capture);
+        close(saved);
+        return -1000;
+    }
+    int rc = cbm_cmd_config(argc, argv);
+    fflush(stdout);
+    (void)dup2(saved, fileno(stdout));
+    close(saved);
+    rewind(capture);
+    size_t got = fread(out, 1, cap - 1, capture);
+    out[got] = '\0';
+    fclose(capture);
+    return rc;
+}
+
+/* The user-facing config contract (#1522 bug 2): `get` of an UNSET key prints
+ * that key's real default — the same fallback the runtime readers use — with
+ * exit 0; a stored value round-trips; an unknown key is an ERROR (non-zero,
+ * nothing on stdout) for get, set, and reset alike. The old code printed ""
+ * with exit 0 for every unset key AND every typo, so a misspelled key was
+ * indistinguishable from a correctly-read setting. */
+TEST(cli_config_cmd_get_prints_defaults_and_rejects_unknown_keys) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-cmd-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char *saved_cache = NULL;
+    const char *prior = getenv("CBM_CACHE_DIR");
+    if (prior) {
+        saved_cache = strdup(prior);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    char out[512];
+    /* Unset key -> its real default, exit 0. */
+    char *get_watch[] = {"get", "auto_watch"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+    char *get_limit[] = {"get", "auto_index_limit"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_limit, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "50000\n");
+
+    /* Stored value round-trips. */
+    char *set_watch[] = {"set", "auto_watch", "false"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_watch, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "false\n");
+
+    /* Reset returns the key to its default. */
+    char *reset_watch[] = {"reset", "auto_watch"};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_watch, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+
+    /* Unknown keys are errors on every subcommand, with clean stdout. */
+    char *get_bogus[] = {"get", "totally_bogus_key"};
+    ASSERT_TRUE(cli_config_cmd_capture(2, get_bogus, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+    char *set_bogus[] = {"set", "totally_bogus_key", "x"};
+    ASSERT_TRUE(cli_config_cmd_capture(3, set_bogus, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+    char *reset_bogus[] = {"reset", "totally_bogus_key"};
+    ASSERT_TRUE(cli_config_cmd_capture(2, reset_bogus, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+
+    if (saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 typedef struct {
     cbm_config_t *config;
     const char *key;
@@ -14856,6 +14948,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_open_preserves_unrecognized_development_value);
     RUN_TEST(cli_config_rejects_development_spellings_with_replacements);
     RUN_TEST(cli_config_get_set);
+    RUN_TEST(cli_config_cmd_get_prints_defaults_and_rejects_unknown_keys);
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);

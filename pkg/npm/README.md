@@ -15,7 +15,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 npm install -g codebase-memory-mcp
 ```
 
-The platform runtime, including the graph UI, is downloaded automatically at install time.
+The runtime set for your platform is downloaded automatically at install time. There is one composition per platform and the graph UI is always included — the former `CBM_VARIANT=ui` opt-in is obsolete.
 
 Then configure your coding agents:
 

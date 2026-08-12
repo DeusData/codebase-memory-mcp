@@ -965,13 +965,32 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
             yyjson_doc_free(structured_doc);
         }
     }
-    if (!has_structured_content) {
-        /* All tools advertise an object outputSchema. Preserve text content for
-         * model clients while providing a schema-conforming structured object. */
+    if (!has_structured_content && is_error) {
+        /* structuredContent has now been wrong in both directions, so the rule
+         * is spelled out here in full:
+         *
+         *   - JSON-object payload  -> structuredContent = the PARSED object
+         *     (the branch above; the spec's structured+serialized pattern).
+         *   - error                -> structuredContent = {"error": <text>} —
+         *     bounded, small, and the only machine-readable failure form.
+         *   - anything else       -> NO structuredContent key at all.
+         *
+         * Pre-#1488 the "anything else" case duplicated the payload verbatim
+         * ({"text": <payload>} beside an identical content[0].text — 2.05x the
+         * bytes on a 20k-node query_graph, #1375). #1488 replaced that with an
+         * EMPTY object on the theory that it "still satisfies outputSchema" —
+         * but clients that honor a declared outputSchema treat structuredContent
+         * as THE authoritative result, so every tree-format reply rendered as
+         * literally "{}" in Claude Code and friends (#1522). An empty object
+         * beside a non-empty payload is not conservative; it is a wrong answer.
+         *
+         * The key is therefore OMITTED for text-shaped payloads, and no tool
+         * declares an outputSchema anymore (see mcp_add_tool_def): output is
+         * format-parameter-polymorphic, so a static schema was never truthful.
+         * tests/test_mcp.c binds all three branches; scripts/smoke-test.sh
+         * asserts the same contract on the shipped binary. */
         yyjson_mut_val *structured = yyjson_mut_obj(doc);
-        if (is_error) {
-            yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
-        }
+        yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
         yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
@@ -1376,20 +1395,23 @@ static const tool_def_t TOOLS[] = {
     {"check_index_coverage", "Check index coverage",
      "Check authoritative indexing-coverage metadata for exact repository-relative paths and "
      "bounded path scopes. Use this after graph discovery for every cited or operated-on file; "
-     "use scopes before negative or exhaustive claims because fully skipped files cannot appear "
-     "in normal graph results. Returns coverage status separately from filesystem metadata "
-     "freshness, plus structured parse-error ranges and direct-source fallback actions. The "
-     "signal is best-effort: indexed_no_recorded_gap is not a completeness guarantee.",
+     "use scopes before negative/exhaustive claims because fully skipped files cannot appear in "
+     "normal graph results. Returns coverage status separately from filesystem metadata freshness, "
+     "plus structured parse-error ranges and direct-source fallback actions. The signal is "
+     "best-effort: indexed_no_recorded_gap is not a completeness guarantee. At least one of "
+     "'paths' or 'scopes' is required; the call is rejected at runtime if both are omitted.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\"},"
      "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128,"
-     "\"description\":\"Repository-relative files to check exactly.\"},"
+     "\"description\":\"Repository-relative files to check exactly. Required if 'scopes' is "
+     "omitted.\"},"
      "\"scopes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":32,"
-     "\"description\":\"Repository-relative path prefixes; use . for the project root.\"},"
+     "\"description\":\"Repository-relative path prefixes; use . for the project root. Required "
+     "if 'paths' is omitted.\"},"
      "\"scope_limit\":{\"type\":\"integer\",\"default\":200,\"minimum\":1,\"maximum\":1000},"
      "\"scope_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0}},"
-     "\"required\":[\"project\"],\"anyOf\":[{\"required\":[\"paths\"]},"
-     "{\"required\":[\"scopes\"]}]}"},
+     "\"required\":[\"project\"]"
+     "}"},
 
     {"detect_changes", "Detect changes",
      "Map a git diff to its blast radius with one multi-source graph traversal. Returns the exact "
@@ -1493,9 +1515,7 @@ static const char *const HELP_ONLY_TOOL_NAMES[] = {"_hidden_tools"};
 static const int HELP_ONLY_TOOL_COUNT =
     (int)(sizeof(HELP_ONLY_TOOL_NAMES) / sizeof(HELP_ONLY_TOOL_NAMES[0]));
 
-static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 static const char MCP_HIDDEN_TOOL_INPUT_SCHEMA[] = "{\"type\":\"object\",\"properties\":{}}";
-
 typedef struct {
     const char *name;
     bool read_only;
@@ -1537,22 +1557,6 @@ static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
     return NULL;
 }
 
-static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
-                                const char *schema_json) {
-    if (!schema_json) {
-        return;
-    }
-    yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
-    if (!schema_doc) {
-        return;
-    }
-    yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
-    if (schema) {
-        yyjson_mut_obj_add_val(doc, obj, key, schema);
-    }
-    yyjson_doc_free(schema_doc);
-}
-
 /* MCP inputs are closed globally: an undeclared key is almost always a typo
  * that would otherwise leave a real option at its default and return a
  * plausible but wrong result. Keep the property/required definitions in the
@@ -1586,8 +1590,14 @@ static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def
     yyjson_mut_obj_add_str(doc, tool, "description",
                            description_override ? description_override : tool_def->description);
     mcp_add_tool_input_schema(doc, tool, tool_def->input_schema);
-    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
     const tool_annotation_def_t *def = mcp_tool_annotations(tool_def->name);
+    /* Deliberately NO outputSchema. Tool output is format-parameter-polymorphic
+     * (tree text by default, a JSON object under format:"json"), so no static
+     * schema is truthful — and a declared schema makes spec-honoring clients
+     * read structuredContent as the authoritative result, which is exactly how
+     * the empty-object regression rendered every tree reply as "{}" (#1522).
+     * The blanket {"type":"object","additionalProperties":true} it replaced
+     * validated anything and informed nobody. */
     yyjson_mut_val *annotations = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_bool(doc, annotations, "readOnlyHint", def ? def->read_only : false);
     yyjson_mut_obj_add_bool(doc, annotations, "destructiveHint", def ? def->destructive : true);
@@ -3534,7 +3544,6 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
             yyjson_mut_obj_add_val(doc, hint_schema, "properties", hint_props);
             yyjson_mut_obj_add_bool(doc, hint_schema, "additionalProperties", false);
             yyjson_mut_obj_add_val(doc, hint_tool, "inputSchema", hint_schema);
-            mcp_add_json_schema(doc, hint_tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
             yyjson_mut_arr_add_val(tools, hint_tool);
         }
     } else {
@@ -4642,24 +4651,29 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
                     return NULL;
                 }
 
-                /* The lease may have waited behind a publisher. Re-open and trust
-                 * only the current generation, never the stale pre-wait verdict.
-                 * Re-apply the path_only distinction here too, so a generation
-                 * published while we waited is not quarantined over a merely
-                 * cosmetic root_path. */
+                /* The lease may have waited behind a publisher. Re-open and
+                 * classify only the current generation. The quarantine-grade
+                 * verdict preserves dependency rows and cosmetic root paths,
+                 * runs quick_check for page damage, and treats BUSY/LOCKED/IO
+                 * failures as retryable rather than destructive evidence. */
                 srv->store = cbm_store_open_path_query(path);
-                bool current_path_only = false;
-                bool current_valid =
-                    srv->store && cbm_store_check_integrity_full(srv->store, &current_path_only);
-                if (!current_valid && srv->store && current_path_only) {
-                    cbm_log_warn("store.integrity_retain", "project", project, "path", path,
-                                 "reason", "bad project root_path only; data retained");
-                    current_valid = true;
-                }
-                if (!current_valid) {
-                    if (srv->store) {
-                        cbm_store_close(srv->store);
+                CBM_PROF_START(prof_resolve_quarantine_integrity);
+                cbm_integrity_verdict_t verdict = cbm_store_check_integrity_verdict(srv->store);
+                CBM_PROF_END("resolve_store", "quarantine_integrity",
+                             prof_resolve_quarantine_integrity);
+                if (verdict == CBM_INTEGRITY_TRANSIENT) {
+                    cbm_store_close(srv->store);
+                    srv->store = NULL;
+                    if (recovery_status) {
+                        *recovery_status = STORE_RECOVERY_BUSY;
                     }
+                    if (!mutation_already_held) {
+                        mcp_project_mutation_end(srv, project);
+                    }
+                    return NULL;
+                }
+                if (verdict == CBM_INTEGRITY_CORRUPT) {
+                    cbm_store_close(srv->store);
                     srv->store = NULL;
                     char backup[CBM_SZ_2K] = {0};
                     bool quarantined =

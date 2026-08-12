@@ -402,7 +402,7 @@ if [ "$TOTAL" -lt 1 ]; then
 fi
 
 echo ""
-echo "=== Phase 3z: no tool duplicates its payload into structuredContent (#1375) ==="
+echo "=== Phase 3z: structuredContent carries structure or is absent — never {} and never a copy (#1375, #1522) ==="
 # Asserts on the SHIPPED artifact what the unit suite asserts from source: a
 # non-JSON payload must travel ONCE. It used to appear twice — content[0].text
 # plus an identical structuredContent.text — costing 2.05x the bytes on a large
@@ -431,21 +431,32 @@ if d.get("isError"):
     print("skip"); raise SystemExit
 content = d.get("content") or []
 text = content[0].get("text", "") if content else ""
-sc = d.get("structuredContent")
-if not isinstance(sc, dict):
-    print("no-structured"); raise SystemExit
+sc = d.get("structuredContent", "ABSENT")
 try:
     payload_is_object = isinstance(json.loads(text), dict)
 except Exception:
     payload_is_object = False
 if payload_is_object:
-    print("skip"); raise SystemExit
-print("dup" if sc.get("text") == text and text else "ok")
+    # Object payloads must carry the parsed, NON-EMPTY object.
+    print("ok" if isinstance(sc, dict) and sc else "object-lost"); raise SystemExit
+# Text payloads: no structuredContent key at all. {} rendered as the whole
+# result in outputSchema-honoring clients (#1522); {"text": ...} duplicated
+# the wire (#1375).
+if sc == "ABSENT":
+    print("ok")
+elif isinstance(sc, dict) and not sc:
+    print("empty-lie")
+elif isinstance(sc, dict) and sc.get("text") == text and text:
+    print("dup")
+else:
+    print("unexpected")
 ')
   case "$VERDICT" in
     dup) echo "FAIL: $(echo "$TOOL_ARGS" | cut -d" " -f1) repeats its payload in structuredContent (#1375)"; DUP_TOOLS=$((DUP_TOOLS+1)) ;;
+    empty-lie) echo "FAIL: $(echo "$TOOL_ARGS" | cut -d" " -f1) ships structuredContent {} beside a non-empty payload (#1522)"; DUP_TOOLS=$((DUP_TOOLS+1)) ;;
+    object-lost) echo "FAIL: $(echo "$TOOL_ARGS" | cut -d" " -f1) dropped the parsed object from structuredContent"; DUP_TOOLS=$((DUP_TOOLS+1)) ;;
+    unexpected) echo "FAIL: $(echo "$TOOL_ARGS" | cut -d" " -f1) has an unexpected structuredContent shape"; DUP_TOOLS=$((DUP_TOOLS+1)) ;;
     ok) DUP_CHECKED=$((DUP_CHECKED+1)) ;;
-    no-structured) echo "FAIL: $(echo "$TOOL_ARGS" | cut -d" " -f1) has no structuredContent object (outputSchema requires one)"; DUP_TOOLS=$((DUP_TOOLS+1)) ;;
   esac
 done
 if [ "$DUP_TOOLS" -ne 0 ]; then
@@ -457,6 +468,105 @@ if [ "$DUP_CHECKED" -eq 0 ]; then
   exit 1
 fi
 echo "OK: $DUP_CHECKED tool(s) deliver their payload exactly once"
+
+echo "=== Phase 3z1: default-format MCP replies are usable in schema-honoring clients (#1522) ==="
+# The exact end-to-end failure shape of #1522: a spec-compliant MCP client
+# (Claude Code) reads structuredContent as THE result when a tool declares an
+# outputSchema. Drive the REAL stdio server the way such a client does and
+# assert a default-format search_graph reply cannot render as "{}": either
+# structuredContent is absent (client falls back to content text) or it is a
+# non-empty object. Also assert no tool declares an outputSchema anymore.
+MCP_1522=$(python3 - "$BINARY" "$PROJECT" <<'PYMCP'
+import json, subprocess, sys
+BIN, PROJECT = sys.argv[1], sys.argv[2]
+def rpc(i, m, p): return json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p})
+reqs = "\n".join([
+    rpc(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "smoke-1522", "version": "0"}}),
+    json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    rpc(2, "tools/list", {}),
+    rpc(3, "tools/call", {"name": "search_graph", "arguments":
+        {"project": PROJECT, "name_pattern": "compute"}}),
+]) + "\n"
+out = subprocess.run([BIN], input=reqs, capture_output=True, text=True, timeout=180).stdout
+verdict = []
+for line in out.splitlines():
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if d.get("id") == 2:
+        schemas = [t["name"] for t in d.get("result", {}).get("tools", []) if "outputSchema" in t]
+        if schemas:
+            verdict.append("FAIL: outputSchema declared by: " + ",".join(schemas))
+    if d.get("id") == 3:
+        r = d.get("result", {})
+        text = (r.get("content") or [{}])[0].get("text", "")
+        sc = r.get("structuredContent", "ABSENT")
+        if not text:
+            verdict.append("FAIL: search_graph content text is empty")
+        if isinstance(sc, dict) and not sc:
+            verdict.append("FAIL: search_graph ships structuredContent {} (#1522)")
+if not verdict:
+    verdict.append("OK")
+print("; ".join(verdict))
+PYMCP
+)
+case "$MCP_1522" in
+  OK) echo "OK: default-format MCP reply is client-usable, no outputSchema declared" ;;
+  *) echo "$MCP_1522"; exit 1 ;;
+esac
+
+echo "=== Phase 3z2: pipelined requests beyond queue capacity all get answers ==="
+# Any 7+ requests written in one stdin burst used to kill the server with
+# rc=1 and ZERO bytes of output — the frontend queue (capacity 8 frames,
+# initialize + notification included) failed the whole session at overflow
+# instead of backpressuring the reader. Agent clients issuing parallel tool
+# calls pipeline exactly like this.
+PIPELINE=$(python3 - "$BINARY" <<'PYPIPE'
+import json, subprocess, sys
+BIN = sys.argv[1]
+N = 24
+def rpc(i, m, p): return json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p})
+lines = [rpc(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+         "clientInfo": {"name": "smoke-pipe", "version": "0"}}),
+         json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})]
+for i in range(N):
+    lines.append(rpc(100 + i, "tools/call", {"name": "list_projects", "arguments": {}}))
+r = subprocess.run([BIN], input="\n".join(lines) + "\n",
+                   capture_output=True, text=True, timeout=300)
+answered = set()
+for line in r.stdout.splitlines():
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(d.get("id"), int) and d["id"] >= 100:
+        answered.add(d["id"])
+if r.returncode == 0 and len(answered) == N:
+    print("OK")
+else:
+    print(f"FAIL: rc={r.returncode} answered={len(answered)}/{N} stdout_bytes={len(r.stdout)}")
+PYPIPE
+)
+case "$PIPELINE" in
+  OK) echo "OK: 24 pipelined tool calls all answered, clean exit" ;;
+  *) echo "$PIPELINE"; exit 1 ;;
+esac
+
+echo "=== Phase 3z3: config get prints real defaults and rejects unknown keys (#1522) ==="
+CFG_HOME=$(smoke_mktemp_dir)
+CFG_WATCH=$(CBM_CACHE_DIR="$CFG_HOME" "$BINARY" config get auto_watch 2>/dev/null || true)
+if [ "$CFG_WATCH" != "true" ] && [ "$CFG_WATCH" != "false" ]; then
+  echo "FAIL: config get auto_watch printed '$CFG_WATCH' (expected the stored value or the default 'true')"
+  rm -rf "$CFG_HOME"; exit 1
+fi
+if CBM_CACHE_DIR="$CFG_HOME" "$BINARY" config get totally_bogus_key >/dev/null 2>&1; then
+  echo "FAIL: config get of an unknown key exited 0"
+  rm -rf "$CFG_HOME"; exit 1
+fi
+rm -rf "$CFG_HOME"
+echo "OK: config get returns defaults and errors on unknown keys"
 
 echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 
