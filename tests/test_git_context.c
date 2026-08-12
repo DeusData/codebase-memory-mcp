@@ -308,7 +308,7 @@ TEST(worktree_status_tracked_modified) {
     }
     if (th_write_file(TH_PATH(tmp, "tracked.txt"), "v1") != 0 ||
         status_git_run(tmp, "add -f -- tracked.txt") != 0 ||
-        status_git_run(tmp, "commit -qm add tracked") != 0) {
+        status_git_run(tmp, "commit -q -m add-tracked") != 0) {
         th_rmtree(tmp);
         FAIL("failed to commit tracked file");
     }
@@ -446,7 +446,7 @@ TEST(worktree_status_mixed_tracked_and_untracked) {
     }
     if (th_write_file(TH_PATH(tmp, "tracked.txt"), "v1") != 0 ||
         status_git_run(tmp, "add -f -- tracked.txt") != 0 ||
-        status_git_run(tmp, "commit -qm add tracked") != 0) {
+        status_git_run(tmp, "commit -q -m add-tracked") != 0) {
         th_rmtree(tmp);
         FAIL("failed to commit tracked file");
     }
