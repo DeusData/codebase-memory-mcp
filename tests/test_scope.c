@@ -125,6 +125,25 @@ TEST(scope_callable_identity_follows_nearest_binding) {
     PASS();
 }
 
+TEST(scope_lookup_binding_returns_nearest_complete_record) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *root = cbm_scope_push(&a, NULL);
+    CBMScope *child = cbm_scope_push(&a, root);
+    cbm_scope_bind_callable(root, "callback", named_t(&a, "Callback"), "pkg.actual");
+    cbm_scope_bind(child, "callback", named_t(&a, "Shadow"));
+
+    const CBMVarBinding *binding = cbm_scope_lookup_binding(child, "callback");
+    ASSERT_NOT_NULL(binding);
+    ASSERT_STR_EQ(binding->name, "callback");
+    ASSERT_STR_EQ(binding->type->data.named.qualified_name, "Shadow");
+    ASSERT_NULL(binding->callable_qn);
+    ASSERT_NULL(cbm_scope_lookup_binding(child, "missing"));
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(scope_assignment_updates_or_clears_nearest_callable_only) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -260,6 +279,7 @@ SUITE(scope) {
     RUN_TEST(scope_lookup_walks_parent_chain);
     RUN_TEST(scope_child_shadows_parent);
     RUN_TEST(scope_callable_identity_follows_nearest_binding);
+    RUN_TEST(scope_lookup_binding_returns_nearest_complete_record);
     RUN_TEST(scope_assignment_updates_or_clears_nearest_callable_only);
     RUN_TEST(scope_checked_bind_reports_child_oom_despite_parent_name);
     RUN_TEST(scope_dynamic_growth_300_bindings);

@@ -82,6 +82,10 @@ bool cbm_scope_bind_callable_checked(CBMScope *scope, const char *name, const CB
 void cbm_scope_bind_callable(CBMScope *scope, const char *name, const CBMType *type,
                              const char *callable_qn);
 const CBMType* cbm_scope_lookup(const CBMScope* scope, const char* name);
+/* Return the complete nearest binding in one scope-chain walk, or NULL when
+ * unbound. Callers that need presence, type, and callable identity together
+ * should use this instead of repeating three linear scans. */
+const CBMVarBinding *cbm_scope_lookup_binding(const CBMScope *scope, const char *name);
 /* True when any lexical frame contains name, even when its type is UNKNOWN. */
 bool cbm_scope_contains(const CBMScope *scope, const char *name);
 /* Return the exact callable QN from the nearest binding.  A nearer ordinary
