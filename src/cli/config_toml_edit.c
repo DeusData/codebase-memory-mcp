@@ -34,6 +34,10 @@
 #define TOML_EDIT_OK 0
 #define TOML_EDIT_FOREIGN 1
 #define TOML_EDIT_ERR (-1)
+/* #1558: exactly one of the two managed markers is present. We are the sole
+ * writer of these markers, so an imbalance is our own residue — removal can
+ * strip it, a write still refuses. */
+#define TOML_EDIT_ORPHAN_MARKER (-2)
 #define TOML_EDIT_MAX_BYTES (16U * 1024U * 1024U)
 #define TOML_EDIT_MAX_PATH_BYTES 32768U
 
@@ -855,6 +859,21 @@ static int toml_find_markers(const char *data, size_t len, const char *begin_mar
         return TOML_EDIT_OK;
     }
     if (begin_count != 1 || end_count != 1 || begin_line->start >= end_line->start) {
+        /* #1558: an ORPHAN marker — one side present, the other missing — is
+         * reported separately from other malformations, because we are the only
+         * writer of these markers and therefore the only possible author of the
+         * imbalance. A duplicated install left a Codex config carrying a closing
+         * `# <<< ... <<<` with no opener, and every later install then failed
+         * that client outright.
+         *
+         * Refusing to touch a file we cannot parse is the right default in
+         * general. It is the wrong default for a mess we made: the caller can
+         * self-heal on REMOVAL, where deleting the stray line is unambiguous.
+         * A WRITE still refuses, because an imbalance leaves no defensible
+         * region to replace and guessing there could destroy user content. */
+        if ((begin_count == 1) != (end_count == 1) && begin_count + end_count == 1) {
+            return TOML_EDIT_ORPHAN_MARKER;
+        }
         return TOML_EDIT_ERR;
     }
     *has_pair = 1;
@@ -1080,8 +1099,28 @@ int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marke
     toml_line_t begin_line = {0};
     toml_line_t end_line = {0};
     int has_pair = 0;
-    if (toml_find_markers(existing, existing_len, begin_marker, end_marker, &begin_line, &end_line,
-                          &has_pair) != TOML_EDIT_OK) {
+    int find_rc = toml_find_markers(existing, existing_len, begin_marker, end_marker, &begin_line,
+                                    &end_line, &has_pair);
+    if (find_rc == TOML_EDIT_ORPHAN_MARKER) {
+        /* Self-heal: drop the stray marker line. Whichever side survived is the
+         * one toml_find_markers recorded, so the line bounds are known exactly
+         * — nothing is guessed, and no surrounding content is touched. */
+        const toml_line_t *stray = begin_line.full_end > 0U ? &begin_line : &end_line;
+        toml_buffer_t healed = {0};
+        if (toml_buffer_append(&healed, existing, stray->start) != TOML_EDIT_OK ||
+            toml_buffer_append(&healed, existing + stray->full_end,
+                               existing_len - stray->full_end) != TOML_EDIT_OK) {
+            toml_buffer_dispose(&healed);
+            free(existing);
+            return TOML_EDIT_ERR;
+        }
+        int healed_rc = toml_write_atomic(file_path, existing, existing_len,
+                                          healed.data ? healed.data : "", healed.len, &snapshot);
+        toml_buffer_dispose(&healed);
+        free(existing);
+        return healed_rc;
+    }
+    if (find_rc != TOML_EDIT_OK) {
         free(existing);
         return TOML_EDIT_ERR;
     }

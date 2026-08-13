@@ -1185,7 +1185,54 @@ TEST(config_toml_codex_many_foreign_aot_blocks_preserve_owned_reconciliation) {
     PASS();
 }
 
+/* #1558: a duplicated install left a Codex config.toml carrying a CLOSING
+ * managed marker with no opener. Every later install then failed that client
+ * with op=legacy_hook_cleanup and aborted the whole activation.
+ *
+ * We are the only writer of these markers, so the imbalance was our own
+ * residue. Refusing to touch a file we cannot parse is the right default in
+ * general; it is the wrong default for a mess we made. Removal now strips the
+ * stray line — its bounds are known exactly, so nothing is guessed. */
+TEST(config_toml_remove_self_heals_orphan_closing_marker_issue1558) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, "user_key = true\n"
+                                  "# <<< codebase-memory-mcp SessionStart <<<\n"
+                                  "other_key = 1\n"),
+              0);
+    ASSERT_EQ(cbm_toml_remove_managed_block(path, "# >>> codebase-memory-mcp SessionStart >>>",
+                                            "# <<< codebase-memory-mcp SessionStart <<<"),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    /* The stray marker is gone; the user's own content is untouched. */
+    ASSERT_STR_EQ(actual, "user_key = true\nother_key = 1\n");
+    th_cleanup(dir);
+    PASS();
+}
+
+/* The mirror case: an opening marker with no closer heals the same way. */
+TEST(config_toml_remove_self_heals_orphan_opening_marker_issue1558) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, "# >>> codebase-memory-mcp SessionStart >>>\n"
+                                  "keep = true\n"),
+              0);
+    ASSERT_EQ(cbm_toml_remove_managed_block(path, "# >>> codebase-memory-mcp SessionStart >>>",
+                                            "# <<< codebase-memory-mcp SessionStart <<<"),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, "keep = true\n");
+    th_cleanup(dir);
+    PASS();
+}
+
 SUITE(config_toml_edit) {
+    RUN_TEST(config_toml_remove_self_heals_orphan_closing_marker_issue1558);
+    RUN_TEST(config_toml_remove_self_heals_orphan_opening_marker_issue1558);
     RUN_TEST(config_toml_rejects_stale_content_and_identity);
     RUN_TEST(config_toml_missing_target_race_does_not_replace_winner);
     RUN_TEST(config_toml_existing_target_swap_after_check_preserves_winner);
