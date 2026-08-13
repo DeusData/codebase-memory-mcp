@@ -1,5 +1,9 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned: `python -m build` resolves the backend fresh in an isolated env, so an
+# unpinned hatchling silently follows upstream. A hatchling release that began
+# emitting Metadata-Version 2.5 broke the v0.10.1 PyPI publish with pinned
+# twine 6.2.0 rejecting it — the whole toolchain must be pinned, not half of it.
+requires = ["hatchling==1.28.0"]
 build-backend = "hatchling.build"
 
 [project]

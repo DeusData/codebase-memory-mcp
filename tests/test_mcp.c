@@ -825,8 +825,13 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Search graph\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Index repository\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Check index coverage\""));
-    ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
-    ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
+    /* No tool may declare an outputSchema. The blanket permissive schema
+     * ({"type":"object","additionalProperties":true}) carried zero information
+     * for clients, but its presence made spec-compliant clients read
+     * structuredContent as the authoritative result — which turned every
+     * text-shaped (tree/TOON) reply into a rendered "{}" (#1522). Tool output
+     * here is format-parameter-polymorphic, so no static schema is truthful. */
+    ASSERT_NULL(strstr(json, "\"outputSchema\""));
     /* search_graph's compact degree columns intentionally count the graph
      * relationships used for call/reference/type centrality, not every edge
      * family (for example DEFINES or CONTAINS_FILE). Keep the public contract
@@ -1093,19 +1098,24 @@ TEST(mcp_text_result) {
     PASS();
 }
 
-TEST(mcp_text_result_does_not_duplicate_plain_text_into_structured_content) {
-    /* A non-JSON payload used to be repeated verbatim as
-     * structuredContent {"text": <payload>} beside content[0].text — 2.05x the
-     * payload measured on a 20k-node query_graph, i.e. half the transport budget
-     * and double the tokens for every LLM caller (#1375).
+TEST(mcp_text_result_omits_structured_content_for_plain_text) {
+    /* A non-JSON payload must not produce a structuredContent key AT ALL.
      *
-     * structuredContent carries STRUCTURE; a string rewrapped in a one-key
-     * object has none, so the empty object is the honest answer and still
-     * satisfies the permissive outputSchema. The payload stays in content. */
+     * History, because this field has now been wrong in both directions:
+     * pre-#1488 it duplicated the whole payload ({"text": <payload>} beside an
+     * identical content[0].text — 2.05x the bytes). #1488 replaced that with an
+     * EMPTY object — and spec-compliant clients (Claude Code among them) treat
+     * structuredContent as THE result whenever the tool declares an
+     * outputSchema, so every default-format search_graph/trace_path rendered as
+     * literally "{}" (#1522). Empty is not honest; it is a second lie.
+     *
+     * The corrected contract: no duplication AND no empty-object placeholder.
+     * A text payload travels once, in content[0].text, and the envelope simply
+     * has no structuredContent. (Real JSON objects and error envelopes keep
+     * theirs — that is structure, not padding.) */
     char *json = cbm_mcp_text_result("plain text", false);
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{}"));
-    ASSERT_NULL(strstr(json, "\"structuredContent\":{\"text\""));
+    ASSERT_NULL(strstr(json, "\"structuredContent\""));
     /* The payload is still delivered — exactly once. */
     ASSERT_NOT_NULL(strstr(json, "\"text\":\"plain text\""));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":false"));
@@ -1832,10 +1842,13 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
  * catch it in whatever tool is added next. So this enumerates the tool table
  * itself — a new tool is covered the moment it is registered, with no test edit.
  *
- * The invariant: for a NON-error result whose payload is not a JSON object,
- * structuredContent must not carry the payload a second time. Errors are exempt
- * and deliberately so — bounded, small, and structuredContent.error is the only
- * machine-readable form of a failure a client gets. */
+ * The invariant, tightened by #1522: for a NON-error result whose payload is
+ * not a JSON object, the envelope must carry NO structuredContent key — not the
+ * payload a second time (#1375's duplication), and not an empty object either
+ * (#1488's replacement, which spec-compliant clients rendered as the entire
+ * result: "{}"). Object payloads keep their parsed structuredContent; errors
+ * keep structuredContent.error — bounded, small, and the only machine-readable
+ * form of a failure a client gets. */
 TEST(mcp_every_tool_result_is_duplication_free) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -1863,30 +1876,36 @@ TEST(mcp_every_tool_result_is_duplication_free) {
         const char *text = text_val ? yyjson_get_str(text_val) : NULL;
         yyjson_val *structured = yyjson_obj_get(root, "structuredContent");
 
-        /* outputSchema is declared for every tool, so this stays mandatory. */
-        ASSERT_NOT_NULL(structured);
-        ASSERT_TRUE(yyjson_is_obj(structured));
-
         yyjson_val *is_error = yyjson_obj_get(root, "isError");
         bool errored = is_error && yyjson_is_true(is_error);
 
-        if (text && text[0] && !errored) {
-            /* If the payload is itself a JSON object, structuredContent is the
-             * PARSED form and legitimately holds the same data — that is the
-             * spec's structured+serialized pattern, not waste. Only the
-             * non-object case is checked here. */
+        if (errored) {
+            /* Errors keep machine-readable structure: either the wrapped
+             * {"error": <text>} form, or — when the error payload is itself a
+             * JSON object — that object parsed. Non-empty either way; an empty
+             * object is the #1522 lie in error clothing. */
+            ASSERT_NOT_NULL(structured);
+            ASSERT_TRUE(yyjson_is_obj(structured));
+            ASSERT_TRUE(yyjson_obj_size(structured) > 0);
+        } else if (text && text[0]) {
             yyjson_doc *as_json = yyjson_read(text, strlen(text), 0);
             bool payload_is_object = as_json && yyjson_is_obj(yyjson_doc_get_root(as_json));
             if (as_json) {
                 yyjson_doc_free(as_json);
             }
-            if (!payload_is_object) {
-                yyjson_val *dup = yyjson_obj_get(structured, "text");
-                if (dup && yyjson_is_str(dup)) {
-                    const char *dup_str = yyjson_get_str(dup);
-                    /* The exact defect: same bytes, twice, in one reply. */
-                    ASSERT_TRUE(!(dup_str && strcmp(dup_str, text) == 0));
-                }
+            if (payload_is_object) {
+                /* JSON-object payloads: structuredContent is the PARSED form —
+                 * the spec's structured+serialized pattern, not waste. It must
+                 * be present and non-empty (an empty object beside a non-empty
+                 * payload is exactly the #1522 lie). */
+                ASSERT_NOT_NULL(structured);
+                ASSERT_TRUE(yyjson_is_obj(structured));
+                ASSERT_TRUE(yyjson_obj_size(structured) > 0);
+            } else {
+                /* Text-shaped payloads (tree/TOON): NO structuredContent key.
+                 * {} rendered as the whole result in schema-honoring clients
+                 * (#1522); {"text": payload} doubled the wire cost (#1375). */
+                ASSERT_NULL(structured);
                 checked++;
             }
         }
@@ -1919,11 +1938,11 @@ TEST(tool_search_graph_includes_node_properties) {
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
              "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
-    /* TOON is not a JSON object, so structuredContent stays empty rather than
-     * repeating the whole table a second time (#1375). The payload travels once,
-     * in content. */
-    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{}"));
-    ASSERT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
+    /* TOON is not a JSON object, so the envelope has no structuredContent at
+     * all: {} was rendered as the entire result by schema-honoring clients
+     * (#1522), and {"text": ...} doubled the wire cost (#1375). The payload
+     * travels once, in content. */
+    ASSERT_NULL(strstr(resp, "\"structuredContent\""));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
@@ -3142,6 +3161,26 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     ASSERT_NULL(strstr(ev_txt, "lsp_trait_dispatch"));
     free(ev_txt);
     free(ev);
+
+    /* #1542: the same request with format:"json" returned cols ["name","hop"]
+     * — include_evidence was implemented on the tree path only, so the callers
+     * most likely to ask for structured output were the ones who silently got
+     * nothing. The two formats must promise the same fields. */
+    char *ev_json = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-proj\",\"direction\":\"outbound\",\"include_evidence\":true,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(ev_json);
+    char *ev_json_txt = extract_text_content(ev_json);
+    ASSERT_NOT_NULL(ev_json_txt);
+    ASSERT_NOT_NULL(strstr(ev_json_txt, "\"strategy\""));
+    ASSERT_NOT_NULL(strstr(ev_json_txt, "\"confidence\""));
+    ASSERT_NOT_NULL(strstr(ev_json_txt, "lsp"));
+    ASSERT_NOT_NULL(strstr(ev_json_txt, "0.95"));
+    ASSERT_NULL(strstr(ev_json_txt, "lsp_trait_dispatch"));
+    free(ev_json_txt);
+    free(ev_json);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -3970,6 +4009,60 @@ TEST(tool_search_code_missing_pattern) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #1511 (distilled from @lukiod's #1512): search_code echoed a negative limit
+ * back as the result count — "results: -5" — which an agent reads as an answer,
+ * not as a rejected argument. Both halves matter: the schema declares the bound
+ * so well-behaved clients never send it, and the handler clamps because a
+ * schema is a request to the client, never a guarantee to the server. */
+TEST(tool_search_code_negative_limit_is_not_echoed_issue1511) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":35,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"func main\","
+                                   "\"project\":\"nonexistent\",\"limit\":-5}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "results: -5"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_code_limit_declares_a_minimum_issue1511) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":36,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *result = root ? yyjson_obj_get(root, "result") : NULL;
+    yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+    yyjson_val *minimum = NULL;
+    if (tools && yyjson_is_arr(tools)) {
+        size_t index, max;
+        yyjson_val *tool;
+        yyjson_arr_foreach(tools, index, max, tool) {
+            yyjson_val *name = yyjson_obj_get(tool, "name");
+            if (!name || !yyjson_is_str(name) || strcmp(yyjson_get_str(name), "search_code") != 0) {
+                continue;
+            }
+            yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
+            yyjson_val *props = schema ? yyjson_obj_get(schema, "properties") : NULL;
+            yyjson_val *limit = props ? yyjson_obj_get(props, "limit") : NULL;
+            minimum = limit ? yyjson_obj_get(limit, "minimum") : NULL;
+            break;
+        }
+    }
+    bool declared = minimum && yyjson_is_int(minimum) && yyjson_get_int(minimum) >= 1;
+    yyjson_doc_free(doc);
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(declared);
     PASS();
 }
 
@@ -10451,7 +10544,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
     RUN_TEST(mcp_text_result);
-    RUN_TEST(mcp_text_result_does_not_duplicate_plain_text_into_structured_content);
+    RUN_TEST(mcp_text_result_omits_structured_content_for_plain_text);
     RUN_TEST(mcp_every_tool_result_is_duplication_free);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
@@ -10552,6 +10645,8 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_missing_qn);
     RUN_TEST(tool_get_code_snippet_not_found);
     RUN_TEST(tool_search_code_missing_pattern);
+    RUN_TEST(tool_search_code_negative_limit_is_not_echoed_issue1511);
+    RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);

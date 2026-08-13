@@ -220,16 +220,73 @@ if [ "$EXPECTED" != "$ACTUAL" ]; then
 fi
 echo "Checksum verified."
 
+# Validate the complete archive namespace before extraction. Current and legacy
+# release assets use the same four-member root layout; anything outside that
+# closed set is a release-integrity failure, not a sidecar to ignore.
+if [ "$OS" = "windows" ]; then
+    ARCHIVE_BINARY="codebase-memory-mcp.exe"
+    ARCHIVE_INSTALLER="install.ps1"
+else
+    ARCHIVE_BINARY="codebase-memory-mcp"
+    ARCHIVE_INSTALLER="install.sh"
+fi
+ARCHIVE_MEMBERS_FILE="$DLDIR/archive-members.txt"
+if [ "$EXT" = "zip" ]; then
+    if ! unzip -Z1 "$DLDIR/$ARCHIVE" > "$ARCHIVE_MEMBERS_FILE"; then
+        echo "error: could not enumerate release archive" >&2
+        exit 1
+    fi
+else
+    if ! tar -tzf "$DLDIR/$ARCHIVE" > "$ARCHIVE_MEMBERS_FILE"; then
+        echo "error: could not enumerate release archive" >&2
+        exit 1
+    fi
+fi
+
+BINARY_MEMBERS=0
+LICENSE_MEMBERS=0
+INSTALLER_MEMBERS=0
+NOTICE_MEMBERS=0
+ARCHIVE_MEMBER_COUNT=0
+while IFS= read -r member || [ -n "$member" ]; do
+    ARCHIVE_MEMBER_COUNT=$((ARCHIVE_MEMBER_COUNT + 1))
+    case "$member" in
+        "$ARCHIVE_BINARY") BINARY_MEMBERS=$((BINARY_MEMBERS + 1)) ;;
+        LICENSE) LICENSE_MEMBERS=$((LICENSE_MEMBERS + 1)) ;;
+        "$ARCHIVE_INSTALLER") INSTALLER_MEMBERS=$((INSTALLER_MEMBERS + 1)) ;;
+        THIRD_PARTY_NOTICES.md) NOTICE_MEMBERS=$((NOTICE_MEMBERS + 1)) ;;
+        *)
+            echo "error: release archive contains unexpected member: $member" >&2
+            exit 1
+            ;;
+    esac
+done < "$ARCHIVE_MEMBERS_FILE"
+
+if [ "$BINARY_MEMBERS" -ne 1 ] || [ "$LICENSE_MEMBERS" -ne 1 ] ||
+    [ "$INSTALLER_MEMBERS" -ne 1 ] || [ "$NOTICE_MEMBERS" -ne 1 ] ||
+    [ "$ARCHIVE_MEMBER_COUNT" -ne 4 ]; then
+    echo "error: release archive does not match the exact member set" >&2
+    exit 1
+fi
+
 # Extract
 echo "Extracting..."
 if [ "$EXT" = "zip" ]; then
     unzip -q "$DLDIR/$ARCHIVE" -d "$DLDIR"
 else
-    tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
+    tar --no-same-owner -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
 fi
 
-DLBIN="$DLDIR/codebase-memory-mcp"
-if [ ! -f "$DLBIN" ]; then
+for extracted_member in "$ARCHIVE_BINARY" LICENSE "$ARCHIVE_INSTALLER" \
+    THIRD_PARTY_NOTICES.md; do
+    if [ ! -f "$DLDIR/$extracted_member" ] || [ -L "$DLDIR/$extracted_member" ]; then
+        echo "error: release member is not a regular file: $extracted_member" >&2
+        exit 1
+    fi
+done
+
+DLBIN="$DLDIR/$ARCHIVE_BINARY"
+if [ ! -f "$DLBIN" ] || [ -L "$DLBIN" ]; then
     echo "error: binary not found after extraction" >&2
     exit 1
 fi
@@ -237,8 +294,13 @@ fi
 # macOS: fix signing
 if [ "$OS" = "darwin" ]; then
     echo "Fixing macOS code signing..."
-    xattr -d com.apple.quarantine "$DLBIN" 2>/dev/null || true
-    codesign --sign - --force "$DLBIN" 2>/dev/null || true
+    # A curl-downloaded archive usually carries no quarantine attribute at all,
+    # and xattr then prints "No such xattr: com.apple.quarantine" on stderr.
+    # That harmless line was read as the cause of an unrelated install failure
+    # and became a bug report's title (#1537) — silence it; nothing here is an
+    # error worth showing.
+    xattr -d com.apple.quarantine "$DLBIN" >/dev/null 2>&1 || true
+    codesign --sign - --force "$DLBIN" >/dev/null 2>&1 || true
 fi
 
 # Verify the candidate before it requests account-wide maintenance. The

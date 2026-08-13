@@ -682,6 +682,40 @@ TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416) {
     PASS();
 }
 
+/* #1537: a reservation that FAILED (lock I/O, leftover coordination state,
+ * permissions) is not a reservation that was BUSY. Reporting both as "active
+ * CBM sessions could not be stopped" sent a reporter hunting processes that a
+ * reboot proved did not exist — and the remedy we printed told them to run a
+ * cbm binary they had just uninstalled. Each condition now names itself. */
+TEST(cli_activation_distinguishes_busy_from_reservation_failure_issue1537) {
+    cbm_activation_transaction_note_refusal_for_testing(NULL, 0UL);
+
+    /* BUSY (0): real sessions hold the cohort — closing something is the fix. */
+    cli_activation_fake_t busy = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &busy,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &busy), 1);
+    ASSERT_NOT_NULL(strstr(busy.diagnostic, "could not be stopped safely"));
+
+    /* FAILURE (-1): nothing is running, so the reader must not be told to close
+     * sessions — and must not be handed a command that may not be installed. */
+    cli_activation_fake_t failed = {
+        .mutation_reserve_result = -1,
+    };
+    ops.context = &failed;
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &failed), 1);
+    ASSERT_NOT_NULL(strstr(failed.diagnostic, "NOT a running-session problem"));
+    ASSERT_NULL(strstr(failed.diagnostic, "could not be stopped safely"));
+    PASS();
+}
+
 TEST(cli_activation_refuses_unsafe_cohort_reservation) {
     cli_activation_fake_t fake = {
         .mutation_reserve_result = -1,
@@ -1383,8 +1417,8 @@ TEST(cli_update_download_failure_does_not_quiesce_sessions) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--force", "--standard", "--yes"};
-    int rc = cli_test_cmd_update(3, argv);
+    char *argv[] = {"--force", "--yes"};
+    int rc = cli_test_cmd_update(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -1444,7 +1478,7 @@ TEST(cli_update_already_current_does_not_quiesce_sessions) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--standard"};
+    char *argv[] = {"--yes"};
     int rc = fixture_ready ? cli_test_cmd_update(1, argv) : -1;
     cbm_cli_set_activation_ops_for_test(NULL);
 
@@ -1576,8 +1610,8 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--force", "--standard"};
-    int rc = cli_test_cmd_update(2, argv);
+    char *argv[] = {"--force"};
+    int rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
 
     /* Re-run against a known old target while one independently detected agent
@@ -1599,7 +1633,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t failure_ops = cli_activation_fake_ops(&config_failure);
     cbm_cli_set_activation_ops_for_test(&failure_ops);
-    int config_failure_rc = cli_test_cmd_update(2, argv);
+    int config_failure_rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     struct stat updated_status;
     bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
@@ -1767,11 +1801,11 @@ TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
     cbm_cli_set_activation_ops_for_test(&ops);
     char *install_dry[] = {"--force", "--dry-run"};
     char *install_plan[] = {"--force", "--plan"};
-    char *update_dry[] = {"--force", "--dry-run", "--standard"};
+    char *update_dry[] = {"--force", "--dry-run"};
     char *uninstall_dry[] = {"--dry-run", "--yes"};
     int install_dry_rc = cli_test_cmd_install(2, install_dry);
     int install_plan_rc = cli_test_cmd_install(2, install_plan);
-    int update_dry_rc = cli_test_cmd_update(3, update_dry);
+    int update_dry_rc = cli_test_cmd_update(2, update_dry);
     int uninstall_dry_rc = cli_test_cmd_uninstall(2, uninstall_dry);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
@@ -7315,6 +7349,40 @@ TEST(cli_opencode_honors_custom_config) {
     PASS();
 }
 
+/* Discussion #1560: OpenCode reads either opencode.json or opencode.jsonc, but
+ * we always wrote the .json name. A user whose real config is .jsonc got a
+ * SECOND file that OpenCode ignores — the MCP server silently never appeared
+ * while the install reported success. Prefer an existing .jsonc; with neither
+ * present, .json is still created, so fresh installs are unchanged. */
+TEST(cli_opencode_prefers_existing_jsonc_config_discussion1560) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-jsonc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char config_dir[512];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/opencode", tmpdir);
+    test_mkdirp(config_dir);
+    char jsonc_path[640];
+    snprintf(jsonc_path, sizeof(jsonc_path), "%s/opencode.jsonc", config_dir);
+    write_test_file(jsonc_path, "{\n  // user's hand-written config\n  \"theme\": \"dark\"\n}\n");
+
+    char *saved_path = save_test_env("PATH");
+    char *saved_file = save_test_env("OPENCODE_CONFIG");
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("OPENCODE_CONFIG");
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool targets_jsonc = json && strstr(json, "/.config/opencode/opencode.jsonc") != NULL;
+
+    free(json);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("OPENCODE_CONFIG", saved_file);
+    test_rmdir_r(tmpdir);
+    if (!targets_jsonc)
+        FAIL("an existing opencode.jsonc must be the install target, not a new opencode.json");
+    PASS();
+}
+
 TEST(cli_opencode_config_dir_detects_without_retargeting_global_json) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-dir-XXXXXX");
@@ -10088,6 +10156,11 @@ TEST(cli_upsert_codex_mcp_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "[mcp_servers.codebase-memory-mcp]") != NULL);
     ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
+    /* #1562: Codex passes only the names listed in env_vars into a stdio MCP
+     * subprocess. Without CBM_CACHE_DIR the spawned server uses the DEFAULT
+     * cache while the daemon uses the configured one, the two disagree, and the
+     * handshake closes — Codex then shows no cbm tools at all. */
+    ASSERT(strstr(data, "env_vars = [\"CBM_CACHE_DIR\"]") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -11460,6 +11533,98 @@ TEST(cli_config_get_set) {
     PASS();
 }
 
+/* Capture stdout across one cbm_cmd_config invocation. Returns the command's
+ * rc and copies captured stdout (NUL-terminated, truncated to cap) out.
+ * tmpfile+dup2+rewind is the file's established portable capture idiom —
+ * pread/mkstemp/setenv do not exist on the MinGW leg. */
+static int cli_config_cmd_capture(int argc, char **argv, char *out, size_t cap) {
+    out[0] = '\0';
+    FILE *capture = tmpfile();
+    int saved = capture ? dup(fileno(stdout)) : -1;
+    if (!capture || saved < 0) {
+        if (capture)
+            fclose(capture);
+        if (saved >= 0)
+            close(saved);
+        return -1000;
+    }
+    fflush(stdout);
+    if (dup2(fileno(capture), fileno(stdout)) < 0) {
+        fclose(capture);
+        close(saved);
+        return -1000;
+    }
+    int rc = cbm_cmd_config(argc, argv);
+    fflush(stdout);
+    (void)dup2(saved, fileno(stdout));
+    close(saved);
+    rewind(capture);
+    size_t got = fread(out, 1, cap - 1, capture);
+    out[got] = '\0';
+    fclose(capture);
+    return rc;
+}
+
+/* The user-facing config contract (#1522 bug 2): `get` of an UNSET key prints
+ * that key's real default — the same fallback the runtime readers use — with
+ * exit 0; a stored value round-trips; an unknown key is an ERROR (non-zero,
+ * nothing on stdout) for get, set, and reset alike. The old code printed ""
+ * with exit 0 for every unset key AND every typo, so a misspelled key was
+ * indistinguishable from a correctly-read setting. */
+TEST(cli_config_cmd_get_prints_defaults_and_rejects_unknown_keys) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-cfg-cmd-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char *saved_cache = NULL;
+    const char *prior = getenv("CBM_CACHE_DIR");
+    if (prior) {
+        saved_cache = strdup(prior);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    char out[512];
+    /* Unset key -> its real default, exit 0. */
+    char *get_watch[] = {"get", "auto_watch"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+    char *get_limit[] = {"get", "auto_index_limit"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_limit, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "50000\n");
+
+    /* Stored value round-trips. */
+    char *set_watch[] = {"set", "auto_watch", "false"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_watch, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "false\n");
+
+    /* Reset returns the key to its default. */
+    char *reset_watch[] = {"reset", "auto_watch"};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_watch, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+
+    /* Unknown keys are errors on every subcommand, with clean stdout. */
+    char *get_bogus[] = {"get", "totally_bogus_key"};
+    ASSERT_TRUE(cli_config_cmd_capture(2, get_bogus, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+    char *set_bogus[] = {"set", "totally_bogus_key", "x"};
+    ASSERT_TRUE(cli_config_cmd_capture(3, set_bogus, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+    char *reset_bogus[] = {"reset", "totally_bogus_key"};
+    ASSERT_TRUE(cli_config_cmd_capture(2, reset_bogus, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+
+    if (saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 typedef struct {
     cbm_config_t *config;
     const char *key;
@@ -11969,6 +12134,77 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+/* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
+ * so `update --ui` — a command people had in scripts and aliases — started
+ * failing with "unknown update option". Retiring a choice is fine; breaking the
+ * words people already type is not. Both flags must be accepted, do nothing,
+ * and say so once. A genuinely unknown flag must still be rejected, or this
+ * degenerates into ignoring typos. */
+/* #1554: the skill's `description` contained "Triggers on: " — a colon-space,
+ * which YAML reads as a nested-mapping indicator inside an UNQUOTED scalar.
+ * Strict readers (js-yaml's load, the frontmatter parser in `npx skills`)
+ * reject the whole document, so the installed skill silently fails to load.
+ *
+ * The rule is checked for EVERY skill, not just the one that broke: any
+ * frontmatter scalar whose value contains ": " must be quoted. Pinning only
+ * the current text would let the next added skill reintroduce it. */
+TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
+    const cbm_skill_t *sk = cbm_get_skills();
+    ASSERT_NOT_NULL(sk);
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        const char *body = sk[i].content;
+        ASSERT_NOT_NULL(body);
+        /* Frontmatter is the block between the first two "---" lines. */
+        ASSERT_TRUE(strncmp(body, "---\n", 4) == 0);
+        const char *end = strstr(body + 4, "\n---\n");
+        ASSERT_NOT_NULL(end);
+
+        const char *line = body + 4;
+        while (line < end) {
+            const char *eol = strchr(line, '\n');
+            if (!eol || eol > end) {
+                break;
+            }
+            const char *sep = NULL;
+            for (const char *c = line; c < eol - 1; c++) {
+                if (c[0] == ':' && c[1] == ' ') {
+                    sep = c;
+                    break;
+                }
+            }
+            if (sep) {
+                const char *value = sep + 2;
+                /* A value that itself contains ": " must be quoted, or a
+                 * strict parser treats it as a nested mapping. */
+                bool has_inner_colon = false;
+                for (const char *c = value; c < eol - 1; c++) {
+                    if (c[0] == ':' && c[1] == ' ') {
+                        has_inner_colon = true;
+                        break;
+                    }
+                }
+                if (has_inner_colon) {
+                    ASSERT_TRUE(value[0] == '"' || value[0] == '\'');
+                }
+            }
+            line = eol + 1;
+        }
+    }
+    PASS();
+}
+
+TEST(cli_update_accepts_retired_variant_flags_issue1544) {
+    char *ui_argv[] = {"--dry-run", "--ui", "--yes"};
+    char *standard_argv[] = {"--dry-run", "--standard", "--yes"};
+    char *bogus_argv[] = {"--dry-run", "--not-a-flag", "--yes"};
+
+    ASSERT_EQ(cbm_cmd_update(3, ui_argv), 0);
+    ASSERT_EQ(cbm_cmd_update(3, standard_argv), 0);
+    /* Unknown flags stay an error — the point is compatibility, not silence. */
+    ASSERT_TRUE(cbm_cmd_update(3, bogus_argv) != 0);
+    PASS();
+}
+
 #ifdef _WIN32
 /* The Windows update contract, asserted with the activation seam OFF so this
  * takes the exact dispatch a release binary ships: `update` never replaces the
@@ -12028,6 +12264,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_quiesces_active_cohort_before_mutation);
     RUN_TEST(cli_activation_refuses_when_cohort_does_not_drain);
     RUN_TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416);
+    RUN_TEST(cli_activation_distinguishes_busy_from_reservation_failure_issue1537);
     RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
     RUN_TEST(cli_activation_releases_maintenance_lease_after_success);
     RUN_TEST(cli_activation_releases_maintenance_lease_when_mutation_fails);
@@ -12044,6 +12281,8 @@ SUITE(cli) {
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
+    RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
+    RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
@@ -12211,6 +12450,7 @@ SUITE(cli) {
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
     RUN_TEST(cli_antigravity_plan_uses_documented_global_files);
     RUN_TEST(cli_opencode_honors_custom_config);
+    RUN_TEST(cli_opencode_prefers_existing_jsonc_config_discussion1560);
     RUN_TEST(cli_opencode_config_dir_detects_without_retargeting_global_json);
     RUN_TEST(cli_kiro_and_hermes_homes_are_honored);
     RUN_TEST(cli_detect_agents_finds_official_kiro_cli_executable);
@@ -12346,6 +12586,7 @@ SUITE(cli) {
     /* Config store (7 tests — group F) */
     RUN_TEST(cli_config_open_close);
     RUN_TEST(cli_config_get_set);
+    RUN_TEST(cli_config_cmd_get_prints_defaults_and_rejects_unknown_keys);
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);

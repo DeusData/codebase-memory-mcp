@@ -2135,7 +2135,7 @@ def main():
                 activation_log,
                 "activation-update",
                 "update",
-                ["update", "--force", "--standard", "--yes"],
+                ["update", "--force", "--yes"],
                 active_fingerprint,
             )
             check(

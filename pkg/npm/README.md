@@ -15,11 +15,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 npm install -g codebase-memory-mcp
 ```
 
-The standard runtime set for your platform is downloaded automatically at install time. To select the UI runtime set and its verified frontend pack, set `CBM_VARIANT=ui` while installing and when invoking the wrapper:
-
-```bash
-CBM_VARIANT=ui npm install -g codebase-memory-mcp
-```
+The runtime set for your platform is downloaded automatically at install time. There is one composition per platform and the graph UI is always included — the former `CBM_VARIANT=ui` opt-in is obsolete.
 
 Then configure your coding agents:
 

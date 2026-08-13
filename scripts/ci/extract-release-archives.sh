@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -71,9 +72,20 @@ UNIX_TARGETS = (
     "linux-arm64-portable",
 )
 WINDOWS_TARGETS = ("windows-amd64", "windows-arm64")
+# MCPB bundles exist for darwin/windows and the STATIC linux builds only —
+# the same eligibility rule scripts/package-release.sh encodes.
+MCPB_TARGETS = (
+    "darwin-amd64",
+    "darwin-arm64",
+    "linux-amd64-portable",
+    "linux-arm64-portable",
+    "windows-amd64",
+    "windows-arm64",
+)
 CANONICAL_ARCHIVES = frozenset(
     [f"codebase-memory-mcp-{target}.tar.gz" for target in UNIX_TARGETS]
     + [f"codebase-memory-mcp-{target}.zip" for target in WINDOWS_TARGETS]
+    + [f"codebase-memory-mcp-{target}.mcpb" for target in MCPB_TARGETS]
 )
 # One composition ships; the association column is retained so the schema stays
 # stable for the gate and release-notes consumers.
@@ -308,15 +320,26 @@ def validate_namespace(archive_name: str, names: Iterable[str]) -> Dict[str, str
     if len(names_list) != len(set(names_list)):
         duplicate = next(name for name in names_list if names_list.count(name) > 1)
         raise ContractError(f"duplicate archive member in {archive_name}: {duplicate}")
-    windows = archive_name.endswith(".zip")
-    binary = "codebase-memory-mcp.exe" if windows else "codebase-memory-mcp"
-    installer = "install.ps1" if windows else "install.sh"
-    fixed = {
-        binary: "binary",
-        "LICENSE": "runtime",
-        installer: "runtime",
-        "THIRD_PARTY_NOTICES.md": "runtime",
-    }
+    # The archive name is already validated against CANONICAL_ARCHIVES, so
+    # platform detection by name is sound for every container kind.
+    windows = "-windows-" in archive_name
+    if archive_name.endswith(".mcpb"):
+        binary = "server/codebase-memory-mcp.exe" if windows else "server/codebase-memory-mcp"
+        fixed = {
+            "manifest.json": "runtime",
+            binary: "binary",
+            "server/LICENSE": "runtime",
+            "server/THIRD_PARTY_NOTICES.md": "runtime",
+        }
+    else:
+        binary = "codebase-memory-mcp.exe" if windows else "codebase-memory-mcp"
+        installer = "install.ps1" if windows else "install.sh"
+        fixed = {
+            binary: "binary",
+            "LICENSE": "runtime",
+            installer: "runtime",
+            "THIRD_PARTY_NOTICES.md": "runtime",
+        }
     name_set = set(names_list)
     extras = name_set - set(fixed)
     if extras:
@@ -324,9 +347,41 @@ def validate_namespace(archive_name: str, names: Iterable[str]) -> Dict[str, str
     if name_set != set(fixed):
         missing = sorted(set(fixed) - name_set)
         raise ContractError(
-            f"member namespace mismatch in {archive_name}: expected exactly 4 root files; missing={missing}"
+            f"member namespace mismatch in {archive_name}: expected exactly 4 members; missing={missing}"
         )
     return fixed
+
+
+def validate_mcpb_manifest(path: pathlib.Path, *, archive_name: str) -> None:
+    """A structurally broken bundle must fail the matrix, not ship.
+
+    The namespace check above proves manifest.json EXISTS; this proves it
+    actually describes the binary the bundle carries. Full schema validation
+    belongs to MCPB hosts — the gate pins only what a wrong build would break.
+    """
+    with zipfile.ZipFile(path, "r") as archive:
+        try:
+            manifest = json.loads(archive.read("manifest.json"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ContractError(f"manifest.json in {archive_name} is not valid JSON: {error}")
+        if not isinstance(manifest, dict):
+            raise ContractError(f"manifest.json in {archive_name} must be a JSON object")
+        if not manifest.get("version"):
+            raise ContractError(f"manifest.json in {archive_name} lacks a version")
+        server = manifest.get("server")
+        if not isinstance(server, dict) or server.get("type") != "binary":
+            raise ContractError(f"manifest.json in {archive_name} must declare a binary server")
+        entry = server.get("entry_point")
+        if entry not in set(archive.namelist()):
+            raise ContractError(
+                f"manifest entry_point is not a member of {archive_name}: {entry}"
+            )
+        mcp_config = server.get("mcp_config")
+        command = mcp_config.get("command") if isinstance(mcp_config, dict) else None
+        if not isinstance(command, str) or not command.endswith(entry):
+            raise ContractError(
+                f"manifest mcp_config.command does not target the entry_point in {archive_name}"
+            )
 
 
 def add_association(
@@ -582,6 +637,8 @@ def main(argv: Sequence[str]) -> None:
             total_members += member_total
             if total_members > MAX_TOTAL_MEMBER_BYTES:
                 raise ContractError("release matrix exceeds total uncompressed byte ceiling")
+            if archive_name.endswith(".mcpb"):
+                validate_mcpb_manifest(archive_object.path, archive_name=archive_name)
             counts["archives"] += 1
             counts["binaries"] += sum(kind == "binary" for kind in kinds.values())
             counts["runtime_files"] += sum(kind == "runtime" for kind in kinds.values())

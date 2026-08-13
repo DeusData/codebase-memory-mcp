@@ -22,6 +22,10 @@ enum {
     GB_MIN_FOR_DEDUP = 2,    /* need at least 2 vectors to sort+dedup */
     GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
 };
+
+/* Sentinel for an edge property blob carrying no parseable "confidence": any
+ * blob that states one outranks a blob that does not. */
+#define CBM_EDGE_CONF_ABSENT (-1.0)
 #include "graph_buffer/graph_buffer.h"
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
@@ -1029,6 +1033,53 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 
+/* Read "confidence":<double> out of an edge property blob. Absent/unparseable
+ * reads as -1 so any edge that carries a confidence outranks one that does
+ * not. */
+static double edge_props_confidence(const char *props_json) {
+    if (!props_json) {
+        return CBM_EDGE_CONF_ABSENT;
+    }
+    static const char conf_key[] = "\"confidence\":";
+    const char *p = strstr(props_json, conf_key);
+    if (!p) {
+        return CBM_EDGE_CONF_ABSENT;
+    }
+    return strtod(p + sizeof(conf_key) - SKIP_ONE, NULL);
+}
+
+/* Decide whether an incoming property blob replaces the stored one on a
+ * duplicate edge key.
+ *
+ * confidence/strategy/via are not part of the edge key, and the same logical
+ * edge is legitimately minted by more than one strategy carrying different
+ * values — LSP resolution and registry-textual matching both produce CALLS
+ * edges. Per-worker edge buffers merge in worker-slot order, so any rule that
+ * depends on arrival order makes the surviving attributes a function of thread
+ * scheduling.
+ *
+ * This rule is a total order over the two candidates, hence commutative and
+ * associative — the outcome is independent of arrival order:
+ *   1. higher "confidence" wins, which also enforces the intended precedence
+ *      that an LSP-resolved call outranks a textual match;
+ *   2. on equal confidence, the lexicographically greater blob wins, giving a
+ *      deterministic choice between otherwise equal candidates.
+ * An empty or absent incoming blob never displaces stored properties. */
+static bool edge_props_should_replace(const char *existing_json, const char *incoming_json) {
+    if (!incoming_json || strcmp(incoming_json, "{}") == 0) {
+        return false;
+    }
+    if (!existing_json || strcmp(existing_json, "{}") == 0) {
+        return true;
+    }
+    double inc = edge_props_confidence(incoming_json);
+    double cur = edge_props_confidence(existing_json);
+    if (inc != cur) {
+        return inc > cur;
+    }
+    return strcmp(incoming_json, existing_json) > 0;
+}
+
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
                              const char *properties_json) {
     if (!gb || !type) {
@@ -1041,8 +1092,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
-        /* Merge properties (just replace for now) */
-        if (properties_json && strcmp(properties_json, "{}") != 0) {
+        if (edge_props_should_replace(existing->properties_json, properties_json)) {
             free(existing->properties_json);
             existing->properties_json = heap_strdup(properties_json);
         }

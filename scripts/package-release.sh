@@ -31,10 +31,17 @@ Make passthrough (VAR=VAL, forwarded to the build):
 
 Environment:
   BUILD_DIR  build tree to archive from (default build/c).
+  VERSION    release version stamped into the MCPB manifest (v-prefix
+             accepted; defaults to 0.0.0-dev outside a release build).
 
 Archive contents (defined here, canonical) — ONE executable, no sidecars:
   unix:    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md (.tar.gz)
   windows: codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md (.zip)
+
+MCPB bundle (.mcpb, a zip) — darwin/windows targets plus the STATIC linux
+builds; same staged binary, for MCP-Registry one-click-install hosts:
+  manifest.json  server/codebase-memory-mcp[.exe]  server/LICENSE
+  server/THIRD_PARTY_NOTICES.md
 
 Only one build variant ships: the binary carries the graph UI and the agent
 integration templates inside itself, so an extracted archive is immediately
@@ -194,3 +201,70 @@ else
         codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
     echo "=== package-release: $OUT_DIR/$NAME.tar.gz ==="
 fi
+
+# ── MCPB bundle (registryType "mcpb" in the MCP Registry) ─────────────────
+# Repackages the SAME staged binary the archive above ships — already
+# stripped, re-signed and composition-gated — so the VirusTotal scan set
+# dedupes the executable to the archive's object; only manifest.json is a
+# new scan member. The installer script is deliberately absent: an MCPB
+# host manages install/update itself.
+build_mcpb_bundle() {
+    local out="$OUT_DIR/$NAME.mcpb"
+    local stage="$PACK_DIR/.mcpb-stage"
+    local entry="server/$STAGED_BINARY_NAME"
+    local platform
+    case "$GOOS" in
+    darwin) platform="darwin" ;;
+    windows) platform="win32" ;;
+    linux) platform="linux" ;;
+    esac
+    command -v zip >/dev/null 2>&1 || {
+        echo "package-release: zip is required to build $NAME.mcpb" >&2
+        return 1
+    }
+    mkdir -p "$stage/server"
+    cp "$STAGED_BINARY" "$stage/$entry"
+    cp "$PACK_DIR/LICENSE" "$PACK_DIR/THIRD_PARTY_NOTICES.md" "$stage/server/"
+    local mcpb_version="${VERSION:-0.0.0-dev}"
+    mcpb_version="${mcpb_version#v}"
+    # ${__dirname} is the MCPB host's substitution variable, not shell —
+    # hence the escapes. Hosts append .exe themselves where needed, but the
+    # manifest names the actual member so non-normalizing hosts also work.
+    cat >"$stage/manifest.json" <<EOF
+{
+  "manifest_version": "0.3",
+  "name": "codebase-memory-mcp",
+  "display_name": "Codebase Memory",
+  "version": "$mcpb_version",
+  "description": "Codebase knowledge graph for AI agents — 159 languages, sub-ms queries, 99% fewer tokens.",
+  "author": { "name": "DeusData", "url": "https://github.com/DeusData" },
+  "repository": { "type": "git", "url": "https://github.com/DeusData/codebase-memory-mcp" },
+  "homepage": "https://deusdata.github.io/codebase-memory-mcp/",
+  "license": "MIT",
+  "server": {
+    "type": "binary",
+    "entry_point": "$entry",
+    "mcp_config": {
+      "command": "\${__dirname}/$entry",
+      "args": []
+    }
+  },
+  "compatibility": {
+    "platforms": ["$platform"]
+  }
+}
+EOF
+    rm -f "$out"
+    (
+        cd "$stage"
+        zip -q -X "$out" \
+            manifest.json "$entry" server/LICENSE server/THIRD_PARTY_NOTICES.md
+    )
+    echo "=== package-release: $out ==="
+}
+
+# MCPB eligibility: every darwin/windows target, but only the STATIC linux
+# builds — a glibc-dynamic binary defeats the one-click-install promise.
+case "$GOOS/$GOARCH" in
+darwin/* | windows/* | linux/*-portable) build_mcpb_bundle || exit 2 ;;
+esac

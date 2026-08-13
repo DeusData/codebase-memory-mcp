@@ -116,9 +116,9 @@ def assert_update_hands_off_to_install_script(source, env, work):
     # of the just-written image inflates process load time, and the handoff
     # itself is a fast STATELESS local print (no daemon IPC, no download) whose
     # timing is what this guard measures. The warm-up behaves identically.
-    run([binary, "update", "--yes", "--standard"], command_env, timeout=20)
+    run([binary, "update", "--yes"], command_env, timeout=20)
     started = time.monotonic()
-    result = run([binary, "update", "--yes", "--standard"], command_env, timeout=20)
+    result = run([binary, "update", "--yes"], command_env, timeout=20)
     elapsed = time.monotonic() - started
     diagnostic = output_text(result)
     lowered = diagnostic.lower()
@@ -165,7 +165,7 @@ def assert_update_does_not_drain_active_session(source, env, cache, work):
         command = copy_binary(source, work / "update-session-command")
         command_env = dict(env)
         command_env["CBM_DOWNLOAD_URL"] = "https://127.0.0.1:1"
-        result = run([command, "update", "--yes", "--standard"], command_env, timeout=20)
+        result = run([command, "update", "--yes"], command_env, timeout=20)
         require(
             result.returncode == 0,
             "update exited %s beside a live session: %s"

@@ -948,6 +948,107 @@ bool cbm_store_check_integrity_deep(cbm_store_t *s) {
     return ok;
 }
 
+/* Classify a SQLite result code as a transient (retryable) condition vs. a
+ * hard error. SQLITE_BUSY / SQLITE_LOCKED happen when another connection holds
+ * the writer lock — they are NOT evidence of corruption, yet the bare
+ * cbm_store_check_integrity() treats any prepare failure as "corrupt". This
+ * helper backs the verdict API so the quarantine path stops destroying healthy
+ * DBs that merely lost a lock race (#1206, #1037). */
+static bool st_rc_is_transient(int rc) {
+    switch (rc) {
+    case SQLITE_BUSY:
+    case SQLITE_LOCKED:
+    case SQLITE_IOERR_LOCK:
+    case SQLITE_IOERR_BLOCKED:
+        return true;
+    default:
+        return false;
+    }
+}
+
+cbm_integrity_verdict_t cbm_store_check_integrity_verdict(cbm_store_t *s) {
+    if (!s || !s->db) {
+        /* No handle at all — the caller could not even open the file. That is
+         * an open problem, not a corruption verdict, so the DB must not be
+         * quarantined (renaming it would discard a file we never read). */
+        return CBM_INTEGRITY_TRANSIENT;
+    }
+
+    /* ── Shallow check (projects table shape + root_path sanity) ── */
+    sqlite3_stmt *stmt = NULL;
+    int rc =
+        sqlite3_prepare_v2(s->db, "SELECT count(*) FROM projects;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        /* A prepare failure here is the #1206 trigger: under concurrent access
+         * the schema lookup can return BUSY/LOCKED. Treat transient codes as
+         * "do not quarantine"; only a hard error is corruption evidence. */
+        return st_rc_is_transient(rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    cbm_integrity_verdict_t verdict = CBM_INTEGRITY_OK;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        int row_count = sqlite3_column_int(stmt, 0);
+        if (row_count > ST_MAX_ROW_CHECK) {
+            (void)fprintf(stderr, "ERROR store.corrupt table=projects rows=%d (expected 1)\n",
+                          row_count);
+            verdict = CBM_INTEGRITY_CORRUPT;
+        }
+    } else {
+        /* step returned DONE/ERROR — for a SELECT count(*) this means the table
+         * is unreadable. BUSY-family => transient; otherwise corruption. */
+        int step_rc = sqlite3_errcode(s->db);
+        verdict = st_rc_is_transient(step_rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    sqlite3_finalize(stmt);
+    if (verdict != CBM_INTEGRITY_OK) {
+        return verdict;
+    }
+
+    /* root_path sanity — same logic as cbm_store_check_integrity, but classify
+     * prepare failures as transient vs. corrupt rather than a blanket false. */
+    rc = sqlite3_prepare_v2(s->db,
+                            "SELECT root_path FROM projects WHERE root_path != '' "
+                            "AND NOT (substr(root_path, 1, 1) = '/' "
+                            "OR (substr(root_path, 1, 1) BETWEEN 'A' AND 'Z') "
+                            "OR (substr(root_path, 1, 1) BETWEEN 'a' AND 'z')) LIMIT 1;",
+                            CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return st_rc_is_transient(rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *bad_path = (const char *)sqlite3_column_text(stmt, 0);
+        (void)fprintf(stderr, "ERROR store.corrupt table=projects bad_root_path=%s\n",
+                      bad_path ? bad_path : "(null)");
+        verdict = CBM_INTEGRITY_CORRUPT;
+    }
+    sqlite3_finalize(stmt);
+    if (verdict != CBM_INTEGRITY_OK) {
+        return verdict;
+    }
+
+    /* ── Deep check: walk the btrees for page-level damage (#1037) ──
+     * The shallow check above passes for a DB whose projects table is intact
+     * but whose node/edge btrees are torn (observed: 185k nodes / 6k edges with
+     * PRAGMA integrity_check reporting btreeInitPage errors). Only quick_check
+     * catches that. quick_check is O(db size); this function runs only on the
+     * quarantine decision path, never on hot opens. */
+    rc = sqlite3_prepare_v2(s->db, "PRAGMA quick_check(1);", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return st_rc_is_transient(rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *res = (const char *)sqlite3_column_text(stmt, 0);
+        if (!res || strcmp(res, "ok") != 0) {
+            (void)fprintf(stderr, "ERROR store.corrupt quick_check=%s\n", res ? res : "(null)");
+            verdict = CBM_INTEGRITY_CORRUPT;
+        }
+    } else {
+        int step_rc = sqlite3_errcode(s->db);
+        verdict = st_rc_is_transient(step_rc) ? CBM_INTEGRITY_TRANSIENT : CBM_INTEGRITY_CORRUPT;
+    }
+    sqlite3_finalize(stmt);
+    return verdict;
+}
+
 bool cbm_store_check_integrity(cbm_store_t *s) {
     if (!s || !s->db) {
         return false;

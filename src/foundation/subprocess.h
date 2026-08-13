@@ -177,4 +177,12 @@ bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv);
 bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable,
                                const char *payload);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Force the next N spawn attempts to behave as if the kernel returned EAGAIN
+ * ("try again"), so the retry path can be exercised deterministically instead
+ * of hoping a loaded machine reproduces it. Test builds only. */
+void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
+int cbm_subprocess_pending_spawn_eagain_for_testing(void);
+#endif
+
 #endif /* CBM_SUBPROCESS_H */

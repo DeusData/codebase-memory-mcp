@@ -144,15 +144,24 @@ jobs:
           merge-multiple: true
 
       - name: List artifacts
-        run: ls -la *.tar.gz *.zip
+        run: ls -la *.tar.gz *.zip *.mcpb
 
       - name: Generate checksums
-        run: sha256sum *.tar.gz *.zip > checksums.txt
+        run: sha256sum *.tar.gz *.zip *.mcpb > checksums.txt
 
       - name: Attest checksum provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: checksums.txt
+
+      # publish-mcp-registry reads the *.mcpb sha256 lines from here — a
+      # same-run workflow artifact, not a draft-release download, so that
+      # job keeps contents: read and no gh dependency.
+      - name: Preserve checksums for the registry job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-checksums
+          path: checksums.txt
 
       # SBOM content lives in the canonical scripts/ci entry, not inline YAML
       # (venue-parity contract): vendored versions are reviewable there.
@@ -170,7 +179,7 @@ jobs:
 
       - name: Sign artifacts
         run: |
-          for f in *.tar.gz *.zip checksums.txt; do
+          for f in *.tar.gz *.zip *.mcpb checksums.txt; do
             cosign sign-blob --yes --bundle "${f}.bundle" "$f"
           done
 
@@ -202,6 +211,7 @@ jobs:
           files: |
             *.tar.gz
             *.zip
+            *.mcpb
             checksums.txt
             sbom.json
             *.bundle
@@ -229,11 +239,14 @@ jobs:
         run: |
           ARCHIVE_DIR="$RUNNER_TEMP/release-archives"
           mkdir -p "$ARCHIVE_DIR" binaries
-          gh release download "$VERSION" --dir "$ARCHIVE_DIR" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip'
+          gh release download "$VERSION" --dir "$ARCHIVE_DIR" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --pattern '*.mcpb'
+          # 14 = 8 archives + 6 MCPB bundles; runtime 42 = 8×3 archive
+          # sidecars + 6×3 bundle members (manifest.json, LICENSE, notices).
+          # The bundle binaries dedupe to the archive objects byte-for-byte.
           scripts/ci/extract-release-archives.sh "$ARCHIVE_DIR" binaries \
-            --expect-archives=8 \
-            --expect-binaries=8 \
-            --expect-runtime-files=24
+            --expect-archives=14 \
+            --expect-binaries=14 \
+            --expect-runtime-files=42
 
       - name: Security audits on all unique extracted release objects
         run: |
@@ -350,8 +363,17 @@ jobs:
         # A prerelease must never become npm `latest` — plain `npm install`
         # would serve the RC to everyone. Publish prereleases under the
         # `next` dist-tag; testers opt in via `npm i codebase-memory-mcp@next`.
+        #
+        # Idempotency: npm versions are immutable, so a re-run of this job
+        # after a partial success (v0.10.1: npm published, then the twine
+        # step died) can never republish — it 403s on its own earlier
+        # success and the release wedges in draft forever. If the exact
+        # version already exists on the registry, publishing is DONE; skip.
         run: |
-          if [[ "$RELEASE_VERSION" == *-* ]]; then
+          V="${RELEASE_VERSION#v}"
+          if npm view "codebase-memory-mcp@$V" version >/dev/null 2>&1; then
+            echo "npm already has codebase-memory-mcp@$V — skipping publish (idempotent re-run)"
+          elif [[ "$RELEASE_VERSION" == *-* ]]; then
             npm publish --access public --provenance --tag next
           else
             npm publish --access public --provenance
@@ -366,18 +388,30 @@ jobs:
       - name: Build PyPI distribution
         working-directory: pkg/pypi
         run: |
-          # Pin to specific versions (typosquatting / supply-chain mitigation).
-          # OSSF scorecard prefers --require-hashes, but that needs full
-          # transitive deps; version pinning is the practical compromise.
-          python -m pip install --upgrade 'build==1.3.0' 'twine==6.2.0'
+          # Every byte of the publish toolchain is bound by hash: version pins
+          # alone still let a compromised index serve different content, and a
+          # bare `pip install` resolves the whole transitive graph at run time
+          # (OSSF Scorecard pinned-dependencies). requirements-publish.txt is
+          # generated on a linux/amd64 python:3.12 image — see its header for
+          # the exact regeneration command.
+          #
+          # twine must stay >= 7 and hatchling is pinned in pyproject.toml:
+          # `python -m build` resolves its backend fresh in an isolated env, and
+          # a hatchling emitting Metadata-Version 2.5 against twine 6.2.0 is
+          # what broke the v0.10.1 publish.
+          python -m pip install --require-hashes -r requirements-publish.txt
           python -m build
+          twine check dist/*
 
       - name: Publish to PyPI
         working-directory: pkg/pypi
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: twine upload --non-interactive dist/*
+        # --skip-existing: PyPI files are immutable like npm versions; a
+        # re-run after partial success must treat already-uploaded files
+        # as done, not as a fatal collision.
+        run: twine upload --non-interactive --skip-existing dist/*
 
   # ── 8b. Publish server.json to the official MCP Registry ──────
   # Runs after npm + PyPI so the registry can verify package ownership
@@ -412,6 +446,20 @@ jobs:
           jq --arg v "$VERSION" '.version = $v | (.packages[].version) = $v' \
             server.json > server.tmp && mv server.tmp server.json
           echo "server.json pinned to $VERSION"
+
+      # The MCPB entries need each bundle's sha256; checksums.txt comes from
+      # the release-draft job as a same-run artifact (not a draft-release
+      # download — that would need contents beyond read plus gh).
+      - name: Fetch release checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-checksums
+
+      - name: Append MCPB package entries to server.json
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          scripts/ci/gen-mcpb-registry-entries.sh server.json checksums.txt "$RELEASE_VERSION"
           cat server.json
 
       - name: Install mcp-publisher
@@ -435,6 +483,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Legacy ui-* aliases so 0.9.x updaters stop 404ing (#1538). Runs after
+      # verify: same bytes as archives the VirusTotal gate already cleared, and
+      # publishing earlier would duplicate the scan set and provenance manifest.
+      - name: Publish legacy ui-* archive aliases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/ci/publish-legacy-aliases.sh "${{ inputs.version }}" "$GITHUB_REPOSITORY"
+
       - name: Un-draft GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

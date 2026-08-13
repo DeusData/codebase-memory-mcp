@@ -85,18 +85,26 @@ jobs:
       # Archive layout/name live in the ONE canonical script the local
       # artifact-flow smoke lane also runs (venue-parity contract).
       - name: Archive release binary (canonical package-release.sh)
+        env:
+          VERSION: ${{ inputs.version }}
         run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          # *.mcpb matches nothing on the glibc-dynamic linux targets — the
+          # canonical packager builds bundles only where static/one-click holds.
+          subject-path: |
+            codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            *.mcpb
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: "*.tar.gz"
+          path: |
+            *.tar.gz
+            *.mcpb
 
   build-windows:
     runs-on: windows-latest
@@ -133,18 +141,24 @@ jobs:
       # artifact-flow smoke lane also runs (venue-parity contract).
       - name: Archive release binary (canonical package-release.sh)
         shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
         run: scripts/package-release.sh windows amd64 CC=clang CXX=clang++
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-windows-amd64.zip
+          subject-path: |
+            codebase-memory-mcp-windows-amd64.zip
+            *.mcpb
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-windows-amd64
-          path: "*.zip"
+          path: |
+            *.zip
+            *.mcpb
 
   build-windows-arm64:
     # Native ARM64 Windows binary via the CLANGARM64 toolchain on the
@@ -183,18 +197,24 @@ jobs:
 
       - name: Archive release binary (canonical package-release.sh)
         shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
         run: scripts/package-release.sh windows arm64 CC=clang CXX=clang++
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-windows-arm64.zip
+          subject-path: |
+            codebase-memory-mcp-windows-arm64.zip
+            *.mcpb
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-windows-arm64
-          path: "*.zip"
+          path: |
+            *.zip
+            *.mcpb
 
   build-linux-portable:
     # Fully static Linux binaries (gcc -static on Ubuntu).
@@ -235,15 +255,21 @@ jobs:
           ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
 
       - name: Archive release binary (canonical package-release.sh)
+        env:
+          VERSION: ${{ inputs.version }}
         run: scripts/package-release.sh linux ${{ matrix.arch }}-portable
 
       - name: Attest release binary provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
+          subject-path: |
+            codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
+            *.mcpb
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-linux-${{ matrix.arch }}-portable
-          path: "*.tar.gz"
+          path: |
+            *.tar.gz
+            *.mcpb

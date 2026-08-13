@@ -242,6 +242,12 @@ bash "$ROOT/tests/test_vt_release_notes_contract.sh"
 echo "=== Step 0n: VirusTotal gate policy contract ==="
 bash "$ROOT/tests/test_vt_gate_policy_contract.sh"
 
+echo "=== Step 0o: MCPB bundle contract (#1246) ==="
+bash "$ROOT/tests/test_mcpb_bundle_contract.sh"
+
+echo "=== Step 0p: MCPB registry entries contract (#1246) ==="
+bash "$ROOT/tests/test_mcpb_registry_entries_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 

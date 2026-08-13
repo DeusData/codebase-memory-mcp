@@ -137,6 +137,24 @@ for relative, source in (
 # Unix fixtures mirror the release archive surface and Linux update aliases.
 for name in ("LICENSE", "install.sh", "THIRD_PARTY_NOTICES.md"):
     require(name in smoke_local, f"smoke-local.sh archive must include {name}")
+install_script = read("install.sh")
+require(
+    'tar --no-same-owner -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"' in install_script,
+    "install.sh must not preserve release-builder ownership when extracting tar archives",
+)
+require(
+    all(
+        needle in install_script
+        for needle in (
+            "ARCHIVE_MEMBER_COUNT",
+            "release archive contains unexpected member",
+            "release archive does not match the exact member set",
+            'for extracted_member in "$ARCHIVE_BINARY" LICENSE "$ARCHIVE_INSTALLER"',
+        )
+    )
+    and "cbm-integrations.json" not in install_script,
+    "install.sh must validate and accept the exact four-member release archive layout",
+)
 # One composition ships, so there is one archive name and no variant alias.
 require(
     "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local
@@ -311,9 +329,25 @@ require(
     and "& $args[1]" not in smoke_test,
     "Windows Phase 13 must execute install.ps1 directly with native paths",
 )
+# A count cannot tell "we still have four curls" from "every curl is safe" — it
+# passed while a loopback UI probe carried no --noproxy at all, which is the
+# exact failure this rule exists to prevent (an ambient http_proxy makes a
+# 127.0.0.1 request leave the machine). Assert the property on every invocation
+# instead, so adding or removing a curl cannot silently satisfy the rule.
+unproxied_curls = [
+    line.strip()
+    for line in smoke_test.splitlines()
+    # An invocation starts a command: line start, or after ; & | ( or `if`/`then`
+    # etc. Mentions inside echo/comment strings are not invocations.
+    if re.search(r"(?:^|[;&|(]|\b(?:if|then|else|do|not)\s)\s*curl\s", line)
+    and not line.lstrip().startswith("#")
+    and not re.search(r"echo\s", line.split("curl")[0])
+    and "--noproxy" not in line
+]
 require(
-    smoke_test.count("--noproxy '*'") >= 4,
-    "all loopback release-fixture curl requests must bypass ambient proxies",
+    not unproxied_curls,
+    "every curl in the smoke fixture must bypass ambient proxies (--noproxy '*'): "
+    + "; ".join(unproxied_curls[:3]),
 )
 require(
     "/tmp/cbm-curl12a.err" not in smoke_test

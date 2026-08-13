@@ -77,7 +77,30 @@ mkdir -p "$RESULTS_DIR"
 soak_stamp_windows_dir() {
     local dir_w me output
     dir_w="$(cygpath -w "$1")"
-    me="$(whoami | tr -d '\r')"
+    # Qualify with the domain: a bare name from coreutils `whoami` resolves
+    # against the machine first, so on a host whose name equals the user's the
+    # grant lands on an empty principal.
+    # Identify the account by SID, never by name. icacls resolves a bare name
+    # against the machine first, so a host whose name equals the user's grants
+    # to an empty principal (#1532); and a USERDOMAIN-qualified name is
+    # UNRESOLVABLE on a workgroup machine — "WORKGROUP\test: No mapping between
+    # account names and security IDs was done" — which fails the grant outright
+    # and silently leaves the tree writable by Authenticated Users. A SID has
+    # neither ambiguity, and the SYSTEM/Administrators grants below already use
+    # this form. Name lookup remains only as a fallback where PowerShell is
+    # unavailable.
+    me="$(powershell.exe -NoProfile -NonInteractive -Command \
+        '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value' 2>/dev/null |
+        tr -d '\r\n')"
+    case "${me}" in
+    S-1-*) me="*${me}" ;;
+    *)
+        me="$(whoami | tr -d '\r')"
+        if [ -n "${USERDOMAIN:-}" ]; then
+            me="${USERDOMAIN}\\${me}"
+        fi
+        ;;
+    esac
     if ! output=$(MSYS2_ARG_CONV_EXCL='*' icacls "$dir_w" /reset /Q 2>&1); then
         echo "FAIL: soak DACL normalize failed (dir=$dir_w user=$me)" >&2
         printf '%s\n' "$output" >&2

@@ -63,5 +63,47 @@ else
     PASS=$((PASS + 1))
 fi
 
+# ── Case 3: an .mcpb bundle manifest must not be audited as a compiled binary ──
+# `file` reports JSON as "JSON data", which matched none of the text patterns, so
+# the manifest was run through the URL audit and its own homepage/documentation
+# fields were BLOCKED as unauthorized. This blocked the v0.10.3 release — the
+# first release to ship .mcpb bundles, hence the first time a manifest reached
+# the scanned object set.
+MANIFEST="$TMP/manifest.json"
+cat > "$MANIFEST" <<'JSON'
+{
+  "name": "codebase-memory-mcp",
+  "homepage": "https://github.com/DeusData/codebase-memory-mcp",
+  "documentation": "https://deusdata.github.io/codebase-memory-mcp/",
+  "server": { "command": "codebase-memory-mcp", "args": [] }
+}
+JSON
+if bash "$SCRIPT" "$MANIFEST" >/dev/null 2>&1; then
+    echo "PASS: .mcpb manifest.json audited as structured text, not as a binary"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: manifest.json still audited as a compiled binary (regression)"
+    bash "$SCRIPT" "$MANIFEST" 2>&1 | grep -i "BLOCKED" || true
+    FAIL=$((FAIL + 1))
+fi
+
+# ── Case 4 (negative control for case 3): the exemption is by FILE TYPE, not a
+# blanket pass. A binary carrying an unauthorized URL must still be blocked even
+# though a .json carrying one would not be — that asymmetry is the design, and
+# case 2 above proves the binary half still holds. Here we prove the credential
+# audit still runs on structured text, so the exemption is narrow. ──
+CREDS="$TMP/creds.json"
+# The credential audit matches assignment syntax (api_key=, secret=, ...), which
+# is what leaks look like in embedded strings — so the fixture uses that form
+# inside the JSON value rather than a JSON "key": "value" pair.
+printf '{"connection":"host=db user=admin password=hunter2-not-a-real-secret"}' > "$CREDS"
+if bash "$SCRIPT" "$CREDS" >/dev/null 2>&1; then
+    echo "FAIL: credential pattern in JSON was NOT flagged (exemption too broad)"
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: credential audit still runs on structured text"
+    PASS=$((PASS + 1))
+fi
+
 echo "=== security-strings allow-list test: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

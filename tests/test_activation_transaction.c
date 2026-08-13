@@ -608,6 +608,68 @@ TEST(activation_transaction_rejects_cross_account_writable_target_directory) {
     PASS();
 }
 
+/* #1535: the refusal above is correct, but for a year it surfaced to users as
+ * "activation transaction I/O failed" — a policy decision wearing an I/O
+ * costume. Reporters chased disk errors and filesystem types for a mode bit.
+ * The refusal must name the directory, its mode, and which rule refused. */
+TEST(activation_transaction_permission_refusal_names_directory_and_mode) {
+#ifndef _WIN32
+    char directory[ACTIVATION_TEST_PATH_CAP];
+    char target[ACTIVATION_TEST_PATH_CAP];
+    ASSERT_TRUE(activation_test_fixture(directory));
+    ASSERT_TRUE(activation_test_path(target, directory, "cbm"));
+    /* Group-writable LEAF: still refused (the binary lands here), unlike a
+     * group-writable ancestor which is now only warned about. */
+    ASSERT_EQ(chmod(directory, 0775), 0);
+    cbm_activation_transaction_t *transaction = NULL;
+    ASSERT_EQ(cbm_activation_transaction_stage_bytes(target, "candidate", strlen("candidate"),
+                                                     &transaction),
+              CBM_ACTIVATION_TRANSACTION_IO);
+    ASSERT_NULL(transaction);
+
+    const char *note = cbm_activation_transaction_refusal_note();
+    ASSERT_NOT_NULL(note);
+    ASSERT_TRUE(note[0] != '\0');
+    /* WHICH rule refused, WHAT the mode was, and WHERE — all three, or the
+     * message is back to sending people after phantom disk failures. */
+    ASSERT_NOT_NULL(strstr(note, "install_dir_group_or_world_writable"));
+    ASSERT_NOT_NULL(strstr(note, "0775"));
+    ASSERT_NOT_NULL(strstr(note, directory));
+
+    ASSERT_EQ(chmod(directory, 0700), 0);
+    ASSERT_EQ(th_rmtree(directory), 0);
+#endif
+    PASS();
+}
+
+/* #1535: a group-writable ANCESTOR is the default shape of WSL2 and several
+ * distro home trees. Refusing it broke install.sh for a large fraction of Linux
+ * users; it is now warned about and admitted, while the leaf stays private. */
+TEST(activation_transaction_admits_group_writable_ancestor) {
+#ifndef _WIN32
+    char parent[ACTIVATION_TEST_PATH_CAP];
+    char child[ACTIVATION_TEST_PATH_CAP];
+    char target[ACTIVATION_TEST_PATH_CAP];
+    ASSERT_TRUE(activation_test_fixture(parent));
+    ASSERT_TRUE(activation_test_path(child, parent, "bin"));
+    ASSERT_TRUE(cbm_mkdir_p(child, 0700));
+    ASSERT_TRUE(activation_test_path(target, child, "cbm"));
+    ASSERT_EQ(chmod(parent, 0775), 0);
+
+    cbm_activation_transaction_t *transaction = NULL;
+    ASSERT_EQ(cbm_activation_transaction_stage_bytes(target, "candidate", strlen("candidate"),
+                                                     &transaction),
+              CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_NOT_NULL(transaction);
+    (void)cbm_activation_transaction_rollback(transaction);
+    ASSERT_EQ(cbm_activation_transaction_close(&transaction), CBM_ACTIVATION_TRANSACTION_OK);
+
+    ASSERT_EQ(chmod(parent, 0700), 0);
+    ASSERT_EQ(th_rmtree(parent), 0);
+#endif
+    PASS();
+}
+
 TEST(activation_transaction_rejects_windows_callback_allow_directory_ace) {
 #ifdef _WIN32
     char directory[ACTIVATION_TEST_PATH_CAP];
@@ -1023,6 +1085,8 @@ SUITE(activation_transaction) {
     RUN_TEST(activation_transaction_removal_survives_transient_rename_locks);
 #endif
     RUN_TEST(activation_transaction_rejects_cross_account_writable_target_directory);
+    RUN_TEST(activation_transaction_permission_refusal_names_directory_and_mode);
+    RUN_TEST(activation_transaction_admits_group_writable_ancestor);
     RUN_TEST(activation_transaction_rejects_windows_callback_allow_directory_ace);
     RUN_TEST(activation_transaction_rejects_symlink_candidate_target_and_parent);
     RUN_TEST(activation_transaction_fails_closed_if_target_directory_is_replaced);

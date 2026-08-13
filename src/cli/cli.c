@@ -72,8 +72,6 @@ enum {
     MIN_ARGC_GET = 2,
     AUTO_YES = 1,
     AUTO_NO = -1,
-    VARIANT_A = 1,
-    VARIANT_B = 2,
     OCTAL_BASE = 8,
     CLI_ACTIVATION_DRAIN_TIMEOUT_MS = 15000,
     CLI_ACTIVATION_CONTROL_TIMEOUT_MS = 2000,
@@ -154,9 +152,31 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
     return maintenance_cancelled && exit_status == EXIT_SUCCESS ? EXIT_FAILURE : exit_status;
 }
 
-static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
+/* #1537. Two very different failures reached this one message: the cohort was
+ * BUSY (real sessions are running — the reader can close them), or the
+ * reservation failed outright (lock I/O, stale coordination state, permissions
+ * — nothing the reader can close, because nothing is running). Reporting both
+ * as "active sessions" sent someone hunting processes that a reboot proved did
+ * not exist.
+ *
+ * The remedy line must also survive the situation it prints in: an install or
+ * a retry after `uninstall` has no cbm on PATH, so "run codebase-memory-mcp
+ * daemon status" was advice the reader could not follow at exactly the moment
+ * they needed it. Each message now names its own condition and stays runnable. */
+static const char CLI_ACTIVATION_BUSY_MESSAGE[] =
     "error: active CBM sessions and operations could not be stopped safely; "
-    "no activation was committed.";
+    "no activation was committed.\n"
+    "error: something is still using CBM. If an editor or agent is running an "
+    "MCP server, close it and retry; 'codebase-memory-mcp daemon status' lists "
+    "the holders when a cbm binary is still installed.";
+static const char CLI_ACTIVATION_REFUSED_MESSAGE[] =
+    "error: activation could not reserve exclusive access; no activation was "
+    "committed.\n"
+    "error: this is NOT a running-session problem — the reservation itself "
+    "failed (coordination lock, leftover state, or permissions). Nothing needs "
+    "to be closed. Check the errors above, and report this with the output of "
+    "'ls -la \"${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}\"' if it "
+    "persists.";
 static const char CLI_ACTIVATION_PARTIAL_MESSAGE[] =
     "error: activation stopped after one or more agent configuration or "
     "cleanup operations failed; the published/current executable was kept, "
@@ -205,7 +225,11 @@ static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const
      * stop/reservation failures, which record no refusal note. */
     char attributed[CBM_SZ_1K];
     const char *note = cbm_activation_transaction_refusal_note();
-    if (diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE && note && note[0]) {
+    /* A recorded refusal is more specific than EITHER generic message, so it
+     * wins over both the busy and the reservation-failure wording. */
+    if ((diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE ||
+         diagnostic == CLI_ACTIVATION_BUSY_MESSAGE) &&
+        note && note[0]) {
         (void)snprintf(attributed, sizeof(attributed),
                        "error: activation was refused by a filesystem safety check before any "
                        "change was made: %s\n"
@@ -239,7 +263,12 @@ int cbm_cli_activation_guard_with_ops(const cbm_cli_activation_ops_t *ops,
         if (mutation_lease) {
             ops->mutation_lease_release(ops->context, mutation_lease);
         }
-        cli_activation_diagnostic(ops, CLI_ACTIVATION_REFUSED_MESSAGE);
+        /* 0 means the cohort was BUSY: real sessions hold it and closing them
+         * is the remedy. Anything else is the reservation itself failing, and
+         * telling that reader to close sessions sends them after processes
+         * that do not exist (#1537). */
+        cli_activation_diagnostic(ops, reserve_status == 0 ? CLI_ACTIVATION_BUSY_MESSAGE
+                                                           : CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
 
@@ -1226,12 +1255,17 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 static const char skill_content[] =
     "---\n"
     "name: codebase-memory\n"
-    "description: Use the codebase knowledge graph for structural code queries. "
+    /* #1554: the value contains "Triggers on: " — a colon-space, which YAML
+     * reads as a nested-mapping indicator inside an unquoted scalar. Strict
+     * parsers (js-yaml's load, the frontmatter reader in `npx skills`) reject
+     * the whole file, so the skill silently fails to load rather than loading
+     * wrongly. Quoting the scalar is the fix; the text itself is unchanged. */
+    "description: \"Use the codebase knowledge graph for structural code queries. "
     "Triggers on: explore the codebase, understand the architecture, what functions exist, "
     "show me the structure, who calls this function, what does X call, trace the call chain, "
     "find callers of, show dependencies, impact analysis, dead code, unused functions, "
     "high fan-out, refactor candidates, code quality audit, graph query syntax, "
-    "Cypher query examples, edge types, how to use search_graph.\n"
+    "Cypher query examples, edge types, how to use search_graph.\"\n"
     "---\n"
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
@@ -2398,6 +2432,20 @@ static void cbm_opencode_config_path(const char *home_dir, char *out, size_t out
         snprintf(out, out_sz, "%s", custom);
         return;
     }
+    /* OpenCode reads either opencode.json or opencode.jsonc. We always wrote
+     * the .json name, so a user whose real config is .jsonc got a SECOND file
+     * that OpenCode ignores — their MCP server silently never appeared, and the
+     * install looked like it had succeeded (discussion #1560). Prefer whichever
+     * file already exists, .jsonc first since it is the one we used to miss;
+     * with neither present, create .json as before. Other clients in this file
+     * (pochi, kilo) already carry .jsonc paths — OpenCode was the gap. */
+    char candidate[CLI_BUF_1K];
+    int written = snprintf(candidate, sizeof(candidate), "%s/.config/opencode/opencode.jsonc",
+                           home_dir ? home_dir : "");
+    if (written > 0 && (size_t)written < sizeof(candidate) && cbm_file_exists(candidate)) {
+        snprintf(out, out_sz, "%s", candidate);
+        return;
+    }
     snprintf(out, out_sz, "%s/.config/opencode/opencode.json", home_dir);
 }
 
@@ -3244,8 +3292,22 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
         return CLI_ERR;
     }
     char block[CLI_BUF_8K];
+    /* #1562: Codex sanitizes the environment of stdio MCP subprocesses, passing
+     * through only the names listed in env_vars. Without CBM_CACHE_DIR the
+     * Codex-spawned server silently falls back to the DEFAULT cache while the
+     * account daemon uses the configured one; the two disagree and the
+     * handshake closes during initialization, so Codex exposes no cbm tools at
+     * all.
+     *
+     * The name is listed unconditionally rather than only when the variable is
+     * set at install time: env_vars names variables to FORWARD IF PRESENT, so
+     * listing it costs nothing when unset and keeps working for someone who
+     * sets it after installing — which install-time detection would silently
+     * fail to cover. */
     int written = snprintf(block, sizeof(block),
-                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n", escaped);
+                           CODEX_CMM_SECTION "\ncommand = \"%s\"\nargs = []\n"
+                                             "env_vars = [\"CBM_CACHE_DIR\"]\n",
+                           escaped);
     if (written < 0 || (size_t)written >= sizeof(block) ||
         cbm_remove_codex_legacy_mcp(config_path) != 0) {
         return CLI_ERR;
@@ -6510,6 +6572,43 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+/* THE config-key table. list, get, help, and key validation all read this one
+ * definition, so a key cannot exist with different defaults in different
+ * subcommands again: `config list` used to print stored-or-DEFAULT while
+ * `config get` printed stored-or-EMPTY — every unset key (and every typo'd
+ * key, at exit 0) "got" an empty string, indistinguishable from a real value
+ * (#1522). The defaults here mirror the runtime readers' fallbacks
+ * (cbm_config_get_bool/int call sites); keep them in sync. */
+typedef struct {
+    const char *key;
+    const char *default_value;
+    const char *help;
+} config_key_def_t;
+
+static const config_key_def_t CONFIG_KEYS[] = {
+    {CBM_CONFIG_AUTO_INDEX, "false", "Enable auto-indexing on MCP session start"},
+    {CBM_CONFIG_AUTO_INDEX_LIMIT, "50000", "Max files for auto-indexing new projects"},
+    {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
+    {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
+};
+
+static const config_key_def_t *config_key_lookup(const char *key) {
+    for (size_t i = 0; key && i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+        if (strcmp(CONFIG_KEYS[i].key, key) == 0) {
+            return &CONFIG_KEYS[i];
+        }
+    }
+    return NULL;
+}
+
+static void config_print_unknown_key(const char *key) {
+    (void)fprintf(stderr, "error: unknown config key: %s\nKnown keys:", key ? key : "");
+    for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+        (void)fprintf(stderr, " %s", CONFIG_KEYS[i].key);
+    }
+    (void)fprintf(stderr, "\n");
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     /* NULL argv with a nonzero argc previously slipped past this guard (the
      * inner `argv &&` shielded only the help comparison) and dereferenced
@@ -6522,14 +6621,10 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n\n");
         printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
-               "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
-               "Register background git watcher on session connect");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
-               "Pin graph UI language: en, zh, or auto");
+        for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+            printf("  %-25s  default=%-10s  %s\n", CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value,
+                   CONFIG_KEYS[i].help);
+        }
         return 0;
     }
 
@@ -6551,24 +6646,32 @@ int cbm_cmd_config(int argc, char **argv) {
     int rc = 0;
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
         printf("Configuration:\n");
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
-        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+        for (size_t i = 0; i < sizeof(CONFIG_KEYS) / sizeof(CONFIG_KEYS[0]); i++) {
+            printf("  %-25s = %-10s\n", CONFIG_KEYS[i].key,
+                   cbm_config_get(cfg, CONFIG_KEYS[i].key, CONFIG_KEYS[i].default_value));
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
             rc = CLI_TRUE;
         } else {
-            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+            const config_key_def_t *def = config_key_lookup(argv[CLI_SKIP_ONE]);
+            if (!def) {
+                config_print_unknown_key(argv[CLI_SKIP_ONE]);
+                rc = CLI_TRUE;
+            } else {
+                /* Stored value or the key's real default — the same fallback
+                 * the runtime readers use. `""` here was #1522's bug 2: every
+                 * unset key read as empty with exit 0. */
+                printf("%s\n", cbm_config_get(cfg, def->key, def->default_value));
+            }
         }
     } else if (strcmp(argv[0], "set") == 0) {
         if (argc < MIN_ARGC_CMD) {
             (void)fprintf(stderr, "Usage: config set <key> <value>\n");
+            rc = CLI_TRUE;
+        } else if (!config_key_lookup(argv[CLI_SKIP_ONE])) {
+            config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
         } else {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
@@ -6581,6 +6684,9 @@ int cbm_cmd_config(int argc, char **argv) {
     } else if (strcmp(argv[0], "reset") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config reset <key>\n");
+            rc = CLI_TRUE;
+        } else if (!config_key_lookup(argv[CLI_SKIP_ONE])) {
+            config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
         } else {
             cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);
@@ -11532,7 +11638,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
  * covers the flow through the activation test seam. */
 /* Build the download URL for the update command. */
 static void build_update_url(char *url, int url_sz, const char *os, const char *arch,
-                             const char *ext, bool want_ui) {
+                             const char *ext) {
     char base_url_buf[CLI_BUF_512];
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
@@ -11544,8 +11650,7 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
      * have no such variant. Keep in sync with install.sh / install.js / pypi
      * _cli.py. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s%s-%s%s.%s", base_url, want_ui ? "ui-" : "", os,
-             arch, portable, ext);
+    snprintf(url, url_sz, "%s/codebase-memory-mcp-%s-%s%s.%s", base_url, os, arch, portable, ext);
 }
 
 /* Confirm index deletion before network I/O, but defer the deletion itself to
@@ -11578,8 +11683,8 @@ static int update_prepare_clear_indexes(const char *home, bool dry_run, bool *de
 
 /* Download and verify before disruption, then activate under daemon locks. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
-                                   const char *arch, bool want_ui, const char *bin_dest,
-                                   const char *home, bool delete_indexes) {
+                                   const char *arch, const char *bin_dest, const char *home,
+                                   bool delete_indexes) {
     char tmp_archive[CLI_BUF_256];
     int archive_path_length =
         snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update-XXXXXX", cbm_tmpdir());
@@ -11610,8 +11715,8 @@ static int download_verify_install(const char *url, const char *ext, const char 
     char archive_name[CLI_BUF_256];
     /* Must match build_update_url: linux uses the static "-portable" asset. */
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
-    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s%s.%s",
-             want_ui ? "ui-" : "", os, arch, portable, ext);
+    snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s-%s%s.%s", os, arch,
+             portable, ext);
     /* Fail closed: install only a positively-verified download. A mismatch,
      * a missing checksum entry, or an unavailable hash tool (crc != 0) all
      * abort rather than install an unverified binary. */
@@ -11632,34 +11737,6 @@ static int download_verify_install(const char *url, const char *ext, const char 
         return CLI_TRUE;
     }
     return 0;
-}
-
-/* Select update variant. Returns 0=standard, 1=ui, -1=error. */
-static int select_update_variant(int variant_flag) {
-    if (variant_flag == VARIANT_A) {
-        return 0;
-    }
-    if (variant_flag == VARIANT_B) {
-        return CLI_TRUE;
-    }
-#ifndef _WIN32
-    if (!isatty(fileno(stdin))) {
-        (void)fprintf(stderr, "error: variant selection requires a terminal. "
-                              "Use --standard or --ui flag.\n");
-        return CLI_ERR;
-    }
-#endif
-    printf("Which binary variant do you want?\n");
-    printf("  1) standard  — MCP server only\n");
-    printf("  2) ui        — MCP server + embedded graph visualization\n");
-    printf("Choose (1/2): ");
-    (void)fflush(stdout);
-    char choice[CLI_BUF_16];
-    if (!fgets(choice, sizeof(choice), stdin)) {
-        (void)fprintf(stderr, "error: failed to read input\n");
-        return CLI_ERR;
-    }
-    return (choice[0] == '2') ? CLI_TRUE : 0;
 }
 
 /* Case-insensitive prefix match (portable — no strncasecmp dependency). */
@@ -11743,21 +11820,30 @@ int cbm_cmd_update(int argc, char **argv) {
 
     bool dry_run = false;
     bool force = false;
-    int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
+    bool legacy_variant_flag = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
-        } else if (strcmp(argv[i], "--standard") == 0) {
-            variant_flag = VARIANT_A;
-        } else if (strcmp(argv[i], "--ui") == 0) {
-            variant_flag = VARIANT_B;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
+        } else if (strcmp(argv[i], "--ui") == 0 || strcmp(argv[i], "--standard") == 0) {
+            /* v0.10.2 deleted the ui/standard chooser and, with it, these flags —
+             * which turned `update --ui` from a working command into a hard
+             * error for everyone who had it in a script, an alias, or muscle
+             * memory (#1544). Removing a CHOICE is fine; removing the WORDS
+             * people type is a break we owe them nothing for. Accept both,
+             * ignore them, and say once why they no longer mean anything. */
+            legacy_variant_flag = true;
         } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
                    strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
             (void)fprintf(stderr, "error: unknown update option: %s\n", argv[i]);
             return CLI_TRUE;
         }
+    }
+    if (legacy_variant_flag) {
+        (void)fprintf(stderr, "note: --ui/--standard are accepted but no longer do anything; since "
+                              "v0.10.0 there is one build per platform and it always includes the "
+                              "graph UI.\n");
     }
 
     /* Updates run from the install script, not from this process — on every
@@ -11784,7 +11870,6 @@ int cbm_cmd_update(int argc, char **argv) {
      * rejecting typos instead of silently accepting them. */
     (void)dry_run;
     (void)force;
-    (void)variant_flag;
 #endif
 #ifdef CBM_CLI_ENABLE_TEST_API
     if (g_cli_activation_test_ops_set) {
@@ -11840,7 +11925,8 @@ int cbm_cmd_update(int argc, char **argv) {
         }
         printf("It downloads the latest release, verifies its checksum, and replaces\n"
                "this binary in place. install.sh is idempotent, so re-running it IS\n"
-               "the update; pass --ui for the UI build.\n");
+               "the update. One build per platform — the graph UI is always\n"
+               "included.\n");
 #endif
         return 0;
     }
@@ -11869,26 +11955,17 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    /* Step 2: Determine variant */
-    int want_ui_rc = select_update_variant(variant_flag);
-    if (want_ui_rc < 0) {
-        return CLI_TRUE;
-    }
-    bool want_ui = (want_ui_rc == CLI_TRUE);
-    const char *variant = want_ui ? "ui-" : "";
-    const char *variant_label = want_ui ? "ui" : "standard";
-
     const char *os = detect_os();
     const char *arch = detect_arch();
     const char *ext = strcmp(os, "windows") == 0 ? "zip" : "tar.gz";
 
     char url[CLI_BUF_512];
-    build_update_url(url, sizeof(url), os, arch, ext, want_ui);
+    build_update_url(url, sizeof(url), os, arch, ext);
 
     if (dry_run) {
-        printf("\nWould download %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nWould download the binary for %s/%s ...\n", os, arch);
     } else {
-        printf("\nDownloading %s binary for %s/%s ...\n", variant_label, os, arch);
+        printf("\nDownloading the binary for %s/%s ...\n", os, arch);
     }
     printf("  %s\n", url);
 
@@ -11899,10 +11976,8 @@ int cbm_cmd_update(int argc, char **argv) {
 #else
         printf("  target: %s/.local/bin/codebase-memory-mcp\n", home);
 #endif
-        printf("  variant: %s\n", variant_label);
         printf("  os/arch: %s/%s\n", os, arch);
         printf("\nUpdate dry-run complete.\n");
-        (void)variant;
         return 0;
     }
 
@@ -11922,7 +11997,7 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    int rc = download_verify_install(url, ext, os, arch, want_ui, bin_dest, home, delete_indexes);
+    int rc = download_verify_install(url, ext, os, arch, bin_dest, home, delete_indexes);
     if (rc != 0) {
         return CLI_TRUE;
     }
@@ -11939,7 +12014,6 @@ int cbm_cmd_update(int argc, char **argv) {
     printf("automatically when you next use the MCP server.\n");
     printf("\nUpdate complete. Please restart your coding-agent sessions to "
            "properly take this into account.\n");
-    (void)variant;
     return 0;
 #endif /* CBM_CLI_ENABLE_TEST_API */
 }

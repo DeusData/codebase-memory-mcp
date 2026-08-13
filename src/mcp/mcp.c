@@ -301,35 +301,32 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
             yyjson_doc_free(structured_doc);
         }
     }
-    if (!has_structured_content) {
-        /* Every advertised MCP tool declares an object outputSchema, so a
-         * conforming structuredContent object is mandatory even for compact
-         * TOON/plain-text and error results. What is NOT mandatory is putting
-         * the whole payload in it a second time.
+    if (!has_structured_content && is_error) {
+        /* structuredContent has now been wrong in both directions, so the rule
+         * is spelled out here in full:
          *
-         * It used to. For any result that is not a JSON object — which is every
-         * TOON answer, i.e. the large ones — structuredContent was
-         * {"text": <the entire payload>} sitting beside an identical
-         * content[0].text. Measured at 2.05x the payload on a 20k-node
-         * query_graph, so half of every reply was redundant bytes: half the
-         * usable transport budget, and double the tokens billed to every LLM
-         * caller (#1375).
+         *   - JSON-object payload  -> structuredContent = the PARSED object
+         *     (the branch above; the spec's structured+serialized pattern).
+         *   - error                -> structuredContent = {"error": <text>} —
+         *     bounded, small, and the only machine-readable failure form.
+         *   - anything else       -> NO structuredContent key at all.
          *
-         * Nothing is lost by dropping it. structuredContent exists to carry
-         * STRUCTURE, and a string re-wrapped in a one-key object has none —
-         * a client parsing structuredContent.text learns exactly what
-         * content[0].text already told it. The empty object still satisfies
-         * outputSchema ({"type":"object","additionalProperties":true}), and the
-         * JSON branch above is untouched: when a tool really does return an
-         * object, callers still get it parsed.
+         * Pre-#1488 the "anything else" case duplicated the payload verbatim
+         * ({"text": <payload>} beside an identical content[0].text — 2.05x the
+         * bytes on a 20k-node query_graph, #1375). #1488 replaced that with an
+         * EMPTY object on the theory that it "still satisfies outputSchema" —
+         * but clients that honor a declared outputSchema treat structuredContent
+         * as THE authoritative result, so every tree-format reply rendered as
+         * literally "{}" in Claude Code and friends (#1522). An empty object
+         * beside a non-empty payload is not conservative; it is a wrong answer.
          *
-         * Errors keep their payload. They are bounded and small, the duplication
-         * costs nothing measurable, and structuredContent.error is the only
-         * machine-readable form of a failure a client has. */
+         * The key is therefore OMITTED for text-shaped payloads, and no tool
+         * declares an outputSchema anymore (see mcp_add_tool_def): output is
+         * format-parameter-polymorphic, so a static schema was never truthful.
+         * tests/test_mcp.c binds all three branches; scripts/smoke-test.sh
+         * asserts the same contract on the shipped binary. */
         yyjson_mut_val *structured = yyjson_mut_obj(doc);
-        if (is_error) {
-            yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
-        }
+        yyjson_mut_obj_add_str(doc, structured, "error", text ? text : "");
         yyjson_mut_obj_add_val(doc, root, "structuredContent", structured);
     }
     yyjson_mut_obj_add_bool(doc, root, "isError", is_error);
@@ -604,7 +601,7 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
-     "\",\"default\":10}},\"required\":[\"pattern\",\"project\"]}"},
+     "\",\"default\":10,\"minimum\":1}},\"required\":[\"pattern\",\"project\"]}"},
 
     {"list_projects", "List projects", "List all indexed projects",
      "{\"type\":\"object\",\"properties\":{}}"},
@@ -636,16 +633,19 @@ static const tool_def_t TOOLS[] = {
      "use scopes before negative/exhaustive claims because fully skipped files cannot appear in "
      "normal graph results. Returns coverage status separately from filesystem metadata freshness, "
      "plus structured parse-error ranges and direct-source fallback actions. The signal is "
-     "best-effort: indexed_no_recorded_gap is not a completeness guarantee.",
+     "best-effort: indexed_no_recorded_gap is not a completeness guarantee. At least one of "
+     "'paths' or 'scopes' is required; the call is rejected at runtime if both are omitted.",
      "{\"type\":\"object\",\"properties\":{"
      "\"project\":{\"type\":\"string\"},"
      "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":128,"
-     "\"description\":\"Repository-relative files to check exactly.\"},"
+     "\"description\":\"Repository-relative files to check exactly. Required if 'scopes' is "
+     "omitted.\"},"
      "\"scopes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"maxItems\":32,"
-     "\"description\":\"Repository-relative path prefixes; use . for the project root.\"},"
+     "\"description\":\"Repository-relative path prefixes; use . for the project root. Required "
+     "if 'paths' is omitted.\"},"
      "\"scope_limit\":{\"type\":\"integer\",\"default\":200,\"minimum\":1,\"maximum\":1000},"
      "\"scope_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0}},"
-     "\"required\":[\"project\"],\"anyOf\":[{\"required\":[\"paths\"]},{\"required\":[\"scopes\"]}]"
+     "\"required\":[\"project\"]"
      "}"},
 
     {"detect_changes", "Detect changes",
@@ -692,8 +692,6 @@ static const tool_def_t TOOLS[] = {
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
-
-static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 
 typedef struct {
     const char *name;
@@ -752,7 +750,13 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
     yyjson_mut_obj_add_str(doc, tool, "description", TOOLS[i].description);
 
     mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
-    mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+    /* Deliberately NO outputSchema. Tool output is format-parameter-polymorphic
+     * (tree text by default, a JSON object under format:"json"), so no static
+     * schema is truthful — and a declared schema makes spec-honoring clients
+     * read structuredContent as the authoritative result, which is exactly how
+     * the empty-object regression rendered every tree reply as "{}" (#1522).
+     * The blanket {"type":"object","additionalProperties":true} it replaced
+     * validated anything and informed nobody. */
 
     const tool_annotation_def_t *def = mcp_tool_annotations(TOOLS[i].name);
     yyjson_mut_val *annotations = yyjson_mut_obj(doc);
@@ -2152,9 +2156,34 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
             }
 
             /* The lease may have waited behind a publisher. Re-open and trust
-             * only the current generation, never the stale pre-wait verdict. */
+             * only the current generation, never the stale pre-wait verdict.
+             * Use the verdict API here — this is the point that decides whether
+             * a healthy DB gets quarantined. The plain bool check cannot tell
+             * corruption from a transient SQLITE_BUSY race (#1206: concurrent
+             * instances quarantining each other's DBs) and does not run
+             * quick_check, so page-torn DBs with an intact projects table sail
+             * through (#1037). Only a confirmed CORRUPT verdict is quarantined;
+             * TRANSIENT (lock/IO) falls through and retries on next access. */
             srv->store = cbm_store_open_path_query(path);
-            bool current_valid = srv->store && cbm_store_check_integrity(srv->store);
+            cbm_integrity_verdict_t verdict = srv->store
+                                                  ? cbm_store_check_integrity_verdict(srv->store)
+                                                  : CBM_INTEGRITY_TRANSIENT;
+            bool current_valid = (verdict == CBM_INTEGRITY_OK);
+            if (verdict == CBM_INTEGRITY_TRANSIENT) {
+                /* The DB could not be conclusively evaluated (lock contention,
+                 * busy writer, IO hiccup). Do NOT quarantine — close and let
+                 * the next resolve retry. A spurious quarantine here is exactly
+                 * what destroys healthy DBs under concurrent access. */
+                cbm_store_close(srv->store);
+                srv->store = NULL;
+                if (recovery_status) {
+                    *recovery_status = STORE_RECOVERY_BUSY;
+                }
+                if (!mutation_already_held) {
+                    mcp_project_mutation_end(srv, project);
+                }
+                return NULL;
+            }
             if (!current_valid) {
                 cbm_store_close(srv->store);
                 srv->store = NULL;
@@ -6174,13 +6203,22 @@ static int trace_watermark_index(const cbm_traverse_result_t *tr, int hop, int64
  * output — {cols, groups:[{qn_prefix, rows:[[name,hop,...]]}]}. Optional
  * risk/args columns mirror the flags. */
 static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result_t *tr,
-                                        bool risk_labels, bool include_tests, bool data_flow) {
+                                        bool risk_labels, bool include_tests, bool data_flow,
+                                        bool include_evidence) {
     yyjson_mut_val *leg = yyjson_mut_obj(doc);
     yyjson_mut_val *cols = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, cols, "name");
     yyjson_mut_arr_add_str(doc, cols, "hop");
     if (risk_labels) {
         yyjson_mut_arr_add_str(doc, cols, "risk");
+    }
+    /* #1542: include_evidence was implemented on the tree path only, so
+     * format:"json" silently returned cols ["name","hop"] while the schema and
+     * --help promised two more. A structured caller — the one most likely to
+     * ask for json — got no error, just missing fields. */
+    if (include_evidence) {
+        yyjson_mut_arr_add_str(doc, cols, "strategy");
+        yyjson_mut_arr_add_str(doc, cols, "confidence");
     }
     if (data_flow) {
         yyjson_mut_arr_add_str(doc, cols, "args");
@@ -6227,6 +6265,25 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
                 }
             } else {
                 yyjson_mut_arr_add_str(doc, row, "");
+            }
+        }
+        if (include_evidence) {
+            const char *ev_class = NULL;
+            double ev_conf = -1.0;
+            if (bfs_edge_evidence_for_hop(tr, tr->visited[i].node.id, &ev_class, &ev_conf)) {
+                yyjson_mut_arr_add_strcpy(doc, row, ev_class ? ev_class : "");
+                if (ev_conf >= 0.0) {
+                    yyjson_mut_arr_add_real(doc, row, ev_conf);
+                } else {
+                    yyjson_mut_arr_add_null(doc, row);
+                }
+            } else {
+                /* The root hop has no inbound edge and non-CALLS edges record
+                 * no strategy. The tree path emits "-" placeholders to keep the
+                 * column count fixed; json says null, which is the same promise
+                 * in a form a structured caller can test. */
+                yyjson_mut_arr_add_null(doc, row);
+                yyjson_mut_arr_add_null(doc, row);
             }
         }
         yyjson_mut_arr_add_val(cur_rows, row);
@@ -6681,15 +6738,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         }
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
-            yyjson_mut_obj_add_val(
-                doc, root, "callees",
-                bfs_to_tree_json(doc, &view_out, risk_labels, include_tests, data_flow));
+            yyjson_mut_obj_add_val(doc, root, "callees",
+                                   bfs_to_tree_json(doc, &view_out, risk_labels, include_tests,
+                                                    data_flow, include_evidence));
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
-            yyjson_mut_obj_add_val(
-                doc, root, "callers",
-                bfs_to_tree_json(doc, &view_in, risk_labels, include_tests, data_flow));
+            yyjson_mut_obj_add_val(doc, root, "callers",
+                                   bfs_to_tree_json(doc, &view_in, risk_labels, include_tests,
+                                                    data_flow, include_evidence));
         }
         if (more_rows) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
@@ -9577,6 +9634,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *path_filter = cbm_mcp_get_string_arg(args, "path_filter");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
+    /* #1511: a negative limit flowed straight into the result cap and came back
+     * as the reported count ("results: -5"), which reads to an agent as a real
+     * answer rather than a rejected argument. The schema now declares
+     * minimum:1, but a schema is a request to the client, never a guarantee to
+     * the server — clamp here too. */
+    if (limit < 1) {
+        limit = MCP_DEFAULT_LIMIT;
+    }
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();

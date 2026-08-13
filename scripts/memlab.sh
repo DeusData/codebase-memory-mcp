@@ -35,7 +35,30 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
     ! command -v winepath >/dev/null 2>&1; then
     WIN_ROOT=$(mktemp -d "$(cygpath "$USERPROFILE")/cbm-memlab.XXXXXX")
     WIN_ROOT_W="$(cygpath -w "$WIN_ROOT")"
-    ME="$(whoami | tr -d '\r')"
+    # Qualify with the domain: a bare name from coreutils `whoami` resolves
+    # against the machine first, so on a host whose name equals the user's the
+    # grant lands on an empty principal.
+    # Identify the account by SID, never by name. icacls resolves a bare name
+    # against the machine first, so a host whose name equals the user's grants
+    # to an empty principal (#1532); and a USERDOMAIN-qualified name is
+    # UNRESOLVABLE on a workgroup machine — "WORKGROUP\test: No mapping between
+    # account names and security IDs was done" — which fails the grant outright
+    # and silently leaves the tree writable by Authenticated Users. A SID has
+    # neither ambiguity, and the SYSTEM/Administrators grants below already use
+    # this form. Name lookup remains only as a fallback where PowerShell is
+    # unavailable.
+    ME="$(powershell.exe -NoProfile -NonInteractive -Command \
+        '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value' 2>/dev/null |
+        tr -d '\r\n')"
+    case "${ME}" in
+    S-1-*) ME="*${ME}" ;;
+    *)
+        ME="$(whoami | tr -d '\r')"
+        if [ -n "${USERDOMAIN:-}" ]; then
+            ME="${USERDOMAIN}\\${ME}"
+        fi
+        ;;
+    esac
     MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /reset /Q >/dev/null 2>&1 || true
     if ! MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /inheritance:r \
         /grant:r "${ME}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
