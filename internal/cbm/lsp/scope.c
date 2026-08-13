@@ -88,20 +88,6 @@ bool cbm_scope_bind_callable_checked(CBMScope *scope, const char *name, const CB
     return cbm_scope_bind_value(scope, name, type, callable_qn);
 }
 
-const CBMVarBinding *cbm_scope_lookup_binding(const CBMScope *scope, const char *name) {
-    if (!name)
-        return NULL;
-    for (const CBMScope* s = scope; s != NULL; s = s->parent) {
-        for (const CBMScopeChunk* c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0)
-                    return &c->bindings[i];
-            }
-        }
-    }
-    return NULL;
-}
-
 const CBMType* cbm_scope_lookup(const CBMScope* scope, const char* name) {
     const CBMVarBinding *binding = cbm_scope_lookup_binding(scope, name);
     if (binding)
