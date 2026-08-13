@@ -8649,7 +8649,6 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
         return;
     }
     int new_count = 0;
-
     for (int bi = 0; bi < *bind_count; bi++) {
         binding_t *b = &(*bindings)[bi];
         cbm_node_t *term = binding_get(b, patn->nodes[1].variable ? patn->nodes[1].variable : "");
@@ -8737,7 +8736,9 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
         }
         if (opt && match_count == 0) {
             /* No matching neighbour: keep the row with start_var left UNBOUND so
-             * `WHERE <start> IS NULL` correctly identifies the no-edge case. */
+             * `WHERE <start> IS NULL` correctly identifies the no-edge case. The
+             * shared append path fails the whole query if the working-row budget is
+             * exhausted; it never publishes a partial OPTIONAL result. */
             binding_t nb = {0};
             binding_copy(&nb, b);
             if (!binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb)) {

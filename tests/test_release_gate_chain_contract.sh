@@ -84,6 +84,31 @@ if "needs.soak.result" not in draft:
         "      legitimately skipped soak (soak_level=none) is distinguishable\n"
         "      from a soak that never ran.")
 
+# The MCP registry validates every package URL it is handed by FETCHING it, and
+# a DRAFT release's assets are not publicly readable. publish-final is the job
+# that un-drafts. Both jobs used to need only publish-registries, so they raced
+# and the registry was told its own .mcpb URL was a 404 (v0.10.3). The registry
+# must therefore run AFTER the release is public — while still never gating it.
+def needs(job):
+    """The job's `needs:` list as a single line."""
+    m = re.search(r"^    needs:\s*(.*)$", blocks.get(job, ""), re.M)
+    return m.group(1).strip() if m else ""
+
+if "publish-mcp-registry" not in blocks:
+    failures.append("publish-mcp-registry: job missing from release.yml — update this contract")
+elif "publish-final" not in needs("publish-mcp-registry"):
+    failures.append(
+        "publish-mcp-registry: must `needs:` publish-final. The registry fetches\n"
+        "      the .mcpb URLs it validates, and a draft release's assets 404 —\n"
+        "      running it in parallel with the un-draft is a race it loses.")
+
+# ...and the reverse must NEVER hold: a registry outage must not block shipping.
+if "publish-final" in blocks and "publish-mcp-registry" in needs("publish-final"):
+    failures.append(
+        "publish-final: must NOT depend on publish-mcp-registry. The binary\n"
+        "      release is the product and the registry entry is metadata; a\n"
+        "      registry-preview outage must never hold up a release.")
+
 if failures:
     for f in failures:
         print("FAIL: " + f, file=sys.stderr)

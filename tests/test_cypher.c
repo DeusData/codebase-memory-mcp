@@ -1393,6 +1393,147 @@ TEST(cypher_exec_optional_rel_leaf_fallback_survives) {
     PASS();
 }
 
+/* Bound-terminal counterpart to the leaf-fallback test above: the OPTIONAL
+ * start variable is unbound while the terminal came from an earlier MATCH.
+ * Upstream once tied this path's fallback to a local 10x write ceiling and
+ * silently lost later no-match rows. The merged executor instead uses the
+ * shared geometric working-row budget, so every fallback survives while the
+ * budget is sufficient and exhaustion is a query error. */
+TEST(cypher_exec_bound_terminal_optional_fallback_survives) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* The hub has 21 incoming CALLS edges and the leaf has none. Both the bound
+     * rows and the leaf fallback fit the default working budget; unordered label
+     * scan order must not change whether the fallback is present. */
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    cbm_node_t leaf = {
+        .project = "test", .label = "Function", .name = "leaf", .qualified_name = "test.leaf"};
+    cbm_store_upsert_node(s, &leaf);
+
+    /* Callers are non-Function so they do not inflate bind_count. Each CALLS the
+     * hub (source = caller, target = hub), so from the bound terminal `hub` the
+     * expansion binds the unbound start `c` to each caller. */
+    for (int i = 0; i < 21; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "caller%02d", i);
+        snprintf(qn, sizeof(qn), "test.caller%02d", i);
+        cbm_node_t caller = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &caller);
+        cbm_edge_t e = {.project = "test", .source_id = cid, .target_id = hub_id, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* max_rows 0 selects the configured default output and working budgets. */
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) RETURN f.name, c.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    /* The leaf terminal has no incoming CALLS edge, so it must yield one row with
+     * the start var `c` unbound (""). Also confirm the hub expanded to bound rows. */
+    bool leaf_fallback = false;
+    bool hub_expanded = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *f = r.rows[i][0];
+        const char *c = r.rows[i][1];
+        if (strcmp(f, "leaf") == 0 && c[0] == '\0') {
+            leaf_fallback = true;
+        }
+        if (strcmp(f, "hub") == 0 && c[0] != '\0') {
+            hub_expanded = true;
+        }
+    }
+    ASSERT_TRUE(leaf_fallback); /* the bound-terminal OPTIONAL no-match row survived */
+    ASSERT_TRUE(hub_expanded);  /* the expansion still produced bound rows */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Both hubs have real callers and the leaf has none. A complete execution may
+ * only null-extend the leaf; a bounded execution that cannot finish must fail
+ * loudly rather than publish a partial or fabricated dead-code answer. */
+TEST(cypher_exec_bound_terminal_match_truth_and_budget_error) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Three bound Function terminals drive the additional pattern. */
+    cbm_node_t hubA = {
+        .project = "test", .label = "Function", .name = "hubA", .qualified_name = "test.hubA"};
+    int64_t hubA_id = cbm_store_upsert_node(s, &hubA);
+    cbm_node_t hubB = {
+        .project = "test", .label = "Function", .name = "hubB", .qualified_name = "test.hubB"};
+    int64_t hubB_id = cbm_store_upsert_node(s, &hubB);
+    cbm_node_t leaf = {
+        .project = "test", .label = "Function", .name = "leaf", .qualified_name = "test.leaf"};
+    cbm_store_upsert_node(s, &leaf);
+
+    /* Both hubs get 35 callers; the leaf gets none. Callers are non-Function so
+     * they do not inflate the initial terminal scan. */
+    for (int i = 0; i < 70; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "caller%02d", i);
+        snprintf(qn, sizeof(qn), "test.caller%02d", i);
+        cbm_node_t caller = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &caller);
+        int64_t tgt = i < 35 ? hubA_id : hubB_id; /* 35 -> hubA, 35 -> hubB */
+        cbm_edge_t e = {.project = "test", .source_id = cid, .target_id = tgt, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) RETURN f.name, c.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    bool hub_expanded = false;
+    bool hub_false_deadcode = false;
+    bool leaf_deadcode = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *f = r.rows[i][0];
+        const char *c = r.rows[i][1];
+        bool is_hub = strcmp(f, "hubA") == 0 || strcmp(f, "hubB") == 0;
+        if (is_hub && c[0] != '\0') {
+            hub_expanded = true;
+        }
+        if (is_hub && c[0] == '\0') {
+            hub_false_deadcode = true;
+        }
+        if (strcmp(f, "leaf") == 0 && c[0] == '\0') {
+            leaf_deadcode = true;
+        }
+    }
+    ASSERT_TRUE(hub_expanded);           /* real relationships were materialized */
+    ASSERT_FALSE(hub_false_deadcode); /* live code with callers must never appear as dead */
+    ASSERT_TRUE(leaf_deadcode);       /* the genuine no-match row survives */
+
+    cbm_cypher_result_free(&r);
+
+    cbm_cypher_limits_t limits = {.max_output_rows = 3, .max_working_rows = 30};
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute_with_limits(
+        s, "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) RETURN f.name, c.name", "test",
+        &limits, &r);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "working-row budget (30)"));
+    ASSERT_EQ(r.row_count, 0); /* never expose a partial dead-code answer */
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -7010,6 +7151,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_optional_rel_output_limit_does_not_bound_matching);
     RUN_TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match);
     RUN_TEST(cypher_exec_optional_rel_leaf_fallback_survives);
+    RUN_TEST(cypher_exec_bound_terminal_optional_fallback_survives);
+    RUN_TEST(cypher_exec_bound_terminal_match_truth_and_budget_error);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_rejects_list_index_after_function_result);
     RUN_TEST(cypher_rejects_unconsumed_trailing_tokens);

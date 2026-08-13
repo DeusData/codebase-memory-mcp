@@ -409,11 +409,23 @@ jobs:
   # product, the registry entry is metadata. A registry-preview outage
   # must never block shipping. Re-run this job alone to retry — it does
   # not touch npm/PyPI, so retries are safe.
+  #
+  # It DOES depend on publish-final, which is the job that un-drafts the
+  # release. Both used to need only publish-registries, so they raced: the
+  # registry validates every package URL it is given by fetching it, and a
+  # DRAFT release's assets are not publicly readable. In v0.10.3 the registry
+  # ran 5s before the un-draft and was told its own .mcpb URL was a 404:
+  #   MCPB package '...codebase-memory-mcp-darwin-amd64.mcpb' is not publicly
+  #   accessible (status: 404)
+  # The same URL served 200 once the release went public, and the job passed on
+  # a plain re-run. Depending on publish-final keeps the documented intent
+  # exactly — the registry still cannot block the release, it just runs after
+  # the assets it validates actually exist to the outside world.
   publish-mcp-registry:
-    needs: [publish-registries]
+    needs: [publish-registries, publish-final]
     # Skipped for prereleases: the MCP Registry has no channel concept, so an
     # RC would present itself as the current version to every registry consumer.
-    if: ${{ !cancelled() && !failure() && needs.publish-registries.result == 'success' && !contains(inputs.version, '-') }}
+    if: ${{ !cancelled() && !failure() && needs.publish-registries.result == 'success' && needs.publish-final.result == 'success' && !contains(inputs.version, '-') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # GitHub OIDC auth to the MCP Registry
