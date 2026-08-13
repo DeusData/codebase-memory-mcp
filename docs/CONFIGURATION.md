@@ -153,9 +153,20 @@ Current format:
 }
 ```
 
+Read or change these values through the same public config command used for
+runtime settings:
+
+```bash
+codebase-memory-mcp config get ui_enabled
+codebase-memory-mcp config set ui_enabled false
+codebase-memory-mcp config set ui_port 9749
+codebase-memory-mcp config reset ui_port
+```
+
 Notes:
 
 - If a binary carries the embedded frontend and no UI config file exists yet, the UI auto-enables on first run. Development builds without the frontend keep the MCP/daemon service available and leave the UI disabled.
+- UI setting changes take effect after the daemon restarts.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 

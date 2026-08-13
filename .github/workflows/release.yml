@@ -459,15 +459,35 @@ jobs:
           scripts/ci/gen-mcpb-registry-entries.sh server.json checksums.txt "$RELEASE_VERSION"
           cat server.json
 
+      # Pinned by version AND content hash: `latest` would let an upstream
+      # release (or a compromised one) change what runs in the job that holds
+      # the registry publish credential, and piping curl straight into tar
+      # executes the payload before anything can verify it.
+      #
+      # One pin covers every platform. Upstream ships a checksums file for the
+      # whole release, so we pin that file's own SHA-256 and verify whichever
+      # asset this runner needs against it. Moving the job to a different OS or
+      # architecture therefore needs no change here, and an unlisted asset
+      # fails closed rather than installing unverified.
       - name: Install mcp-publisher
         env:
           MCP_PUBLISHER_VERSION: v1.8.1
-          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+          MCP_PUBLISHER_CHECKSUMS_SHA256: f7937a7908096f63147658e13f0f63a393a1c9fc722a2d10017593940d36e59e
         run: |
-          asset="mcp-publisher_linux_amd64.tar.gz"
-          curl -fsSLo "$asset" \
-            "https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION/$asset"
-          echo "$MCP_PUBLISHER_SHA256  $asset" | sha256sum -c -
+          base="https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION"
+          sums="registry_${MCP_PUBLISHER_VERSION#v}_checksums.txt"
+          asset="mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz"
+
+          curl -fsSLo "$sums" "$base/$sums"
+          echo "$MCP_PUBLISHER_CHECKSUMS_SHA256  $sums" | sha256sum -c -
+
+          curl -fsSLo "$asset" "$base/$asset"
+          # Exact filename match: a substring match would also accept the
+          # .sbom.json / .sigstore.json lines for the same asset.
+          awk -v a="$asset" '$2 == a' "$sums" > expected.sha256
+          test -s expected.sha256 || { echo "no checksum listed for $asset" >&2; exit 1; }
+          sha256sum -c expected.sha256
+
           tar xzf "$asset" mcp-publisher
 
       - name: Authenticate to MCP Registry (GitHub OIDC)

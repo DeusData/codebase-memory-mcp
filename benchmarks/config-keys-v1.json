@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "generated_by": "benchmarks/generate_config_keys.py",
-  "source_revision": "7433fee6bed3da5b5118983c3ee41e6c3f6a9b69",
+  "source_revision": "8112a5daa86a297eb835faf7b21d9f89ac598994",
   "note": "Allowlist for benchmark --config overrides. cbm_config_value_is_valid in src/cli/cli.c returns true for keys absent from CBM_CONFIG_REGISTRY, so the product cannot reject a typo; the harness rejects it instead.",
   "registry_note": "Listed in CBM_CONFIG_REGISTRY; `config set` range-validates these.",
   "consumed_note": "Read via cbm_config_get_*() but absent from CBM_CONFIG_REGISTRY, so `config set` accepts any value unvalidated. Real keys; still allowed.",
-  "registry_count": 54,
+  "registry_count": 56,
   "consumed_count": 6,
   "registry": [
     "arch_cluster_node_budget",
@@ -61,7 +61,9 @@
     "snippet_max_lines",
     "tool_mode",
     "trace_max_results",
-    "ui-lang"
+    "ui-lang",
+    "ui_enabled",
+    "ui_port"
   ],
   "consumed_unregistered": [
     "auto_index",
@@ -131,6 +133,8 @@
     "snippet_max_lines",
     "tool_mode",
     "trace_max_results",
-    "ui-lang"
+    "ui-lang",
+    "ui_enabled",
+    "ui_port"
   ]
 }

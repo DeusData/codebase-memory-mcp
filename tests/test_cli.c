@@ -28,6 +28,7 @@
 #include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
+#include <ui/config.h>
 #include <yyjson/yyjson.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -13115,6 +13116,87 @@ TEST(cli_secure_zero_overwrites_sensitive_storage) {
  * The rule is checked for EVERY skill, not just the one that broke: any
  * frontmatter scalar whose value contains ": " must be quoted. Pinning only
  * the current text would let the next added skill reintroduce it. */
+/* #1558: ui_enabled governs a loopback HTTP listener, and the only way to turn
+ * it off was hand-editing ~/.cache/codebase-memory-mcp/config.json. Keep both
+ * UI keys in the branch's shared registry and exercise the real config command
+ * so discoverability cannot pass while get/set/reset still route to the wrong
+ * backing store. */
+TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558) {
+    bool enabled_listed = false;
+    bool port_listed = false;
+    for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        const char *key = CBM_CONFIG_REGISTRY[i].key;
+        if (key && strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+            enabled_listed = true;
+        }
+        if (key && strcmp(key, CBM_CONFIG_UI_PORT) == 0) {
+            port_listed = true;
+        }
+    }
+    ASSERT_TRUE(enabled_listed);
+    ASSERT_TRUE(port_listed);
+    const char *configuration_doc = read_test_file("docs/CONFIGURATION.md");
+    ASSERT_NOT_NULL(configuration_doc);
+    ASSERT_NOT_NULL(strstr(configuration_doc, "config set ui_enabled false"));
+    ASSERT_NOT_NULL(strstr(configuration_doc, "config set ui_port 9749"));
+
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-ui-config-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    const char *prior_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = prior_cache ? strdup(prior_cache) : NULL;
+    if (prior_cache) {
+        ASSERT_NOT_NULL(saved_cache);
+    }
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+
+    char out[512];
+    char *list[] = {"list"};
+    ASSERT_EQ(cli_config_cmd_capture(1, list, out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, CBM_CONFIG_UI_ENABLED));
+    ASSERT_NOT_NULL(strstr(out, CBM_CONFIG_UI_PORT));
+
+    char *set_enabled[] = {"set", CBM_CONFIG_UI_ENABLED, "false"};
+    char *get_enabled[] = {"get", CBM_CONFIG_UI_ENABLED};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_enabled, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_enabled, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "false\n");
+
+    char *set_port[] = {"set", CBM_CONFIG_UI_PORT, "18432"};
+    char *get_port[] = {"get", CBM_CONFIG_UI_PORT};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_port, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_port, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "18432\n");
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    ASSERT_FALSE(ui.ui_enabled);
+    ASSERT_EQ(ui.ui_port, 18432);
+
+    char *bad_enabled[] = {"set", CBM_CONFIG_UI_ENABLED, "yes"};
+    char *bad_port[] = {"set", CBM_CONFIG_UI_PORT, "65536"};
+    ASSERT_NEQ(cli_config_cmd_capture(3, bad_enabled, out, sizeof(out)), 0);
+    ASSERT_NEQ(cli_config_cmd_capture(3, bad_port, out, sizeof(out)), 0);
+    cbm_ui_config_load(&ui);
+    ASSERT_FALSE(ui.ui_enabled);
+    ASSERT_EQ(ui.ui_port, 18432);
+
+    char *reset_port[] = {"reset", CBM_CONFIG_UI_PORT};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_port, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_port, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "9749\n");
+    cbm_ui_config_load(&ui);
+    ASSERT_EQ(ui.ui_port, 9749);
+
+    if (saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
     const cbm_skill_t *sk = cbm_get_skills();
     ASSERT_NOT_NULL(sk);
@@ -15163,6 +15245,7 @@ SUITE(cli) {
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
+    RUN_TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558);
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);

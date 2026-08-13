@@ -23,10 +23,21 @@ grep -Eq 'MCP_PUBLISHER_VERSION: v[0-9]+\.[0-9]+\.[0-9]+' \
     echo "FAIL: MCP Registry publisher version is not pinned" >&2
     exit 1
 }
-grep -Eq 'MCP_PUBLISHER_SHA256: [0-9a-f]{64}' "$ROOT/.github/workflows/release.yml" || {
-    echo "FAIL: MCP Registry publisher sha256 is not pinned" >&2
+grep -Eq 'MCP_PUBLISHER_CHECKSUMS_SHA256: [0-9a-f]{64}' \
+    "$ROOT/.github/workflows/release.yml" || {
+    echo "FAIL: MCP Registry publisher checksums file sha256 is not pinned" >&2
     exit 1
 }
+for required in \
+    'echo "$MCP_PUBLISHER_CHECKSUMS_SHA256  $sums" | sha256sum -c -' \
+    'awk -v a="$asset" '\''$2 == a'\'' "$sums" > expected.sha256' \
+    'test -s expected.sha256' \
+    'sha256sum -c expected.sha256'; do
+    grep -Fq "$required" "$ROOT/.github/workflows/release.yml" || {
+        echo "FAIL: MCP Registry publisher verification is missing: $required" >&2
+        exit 1
+    }
+done
 
 # "$BASH" by explicit argv — on native Windows a bare "bash" resolves to the
 # WSL stub (same trap the extractor contract documents).

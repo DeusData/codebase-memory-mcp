@@ -525,6 +525,10 @@ bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool defa
 int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default_val);
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+/* #1558: the graph UI's loopback listener. Stored in the UI config file rather
+ * than the key-value store, but surfaced through `config` so it is findable. */
+#define CBM_CONFIG_UI_ENABLED "ui_enabled"
+#define CBM_CONFIG_UI_PORT "ui_port"
 
 /* ── Binary activation safety ─────────────────────────────────── */
 

@@ -11,6 +11,7 @@
 #include "cli/config_json_like.h"
 #include "cli/config_text_edit.h"
 #include "cli/config_toml_edit.h"
+#include "ui/config.h"
 #include "cli/config_yaml_edit.h"
 #include "daemon/bootstrap.h"
 #include "daemon/ipc.h"
@@ -7244,7 +7245,8 @@ static bool cbm_config_numeric_range_is_contract(const cbm_config_entry_t *entry
            strcmp(entry->key, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS) == 0 ||
            strcmp(entry->key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0 ||
            strcmp(entry->key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 ||
-           strcmp(entry->key, CBM_CONFIG_DEP_MAX_FILES) == 0;
+           strcmp(entry->key, CBM_CONFIG_DEP_MAX_FILES) == 0 ||
+           strcmp(entry->key, CBM_CONFIG_UI_PORT) == 0;
 }
 
 static bool cbm_config_value_matches_declared_range(const cbm_config_entry_t *entry,
@@ -7410,6 +7412,37 @@ static int cbm_config_describe(const char *key) {
     return 0;
 }
 
+/* #1558: ui_enabled and ui_port were reachable only by hand-editing the UI
+ * JSON file. Keep their definitions in CBM_CONFIG_REGISTRY with every other
+ * public key, but route values through cbm_ui_config_load/save because that
+ * existing atomic file is the daemon's authoritative UI configuration. */
+static bool cbm_config_key_is_ui(const char *key) {
+    return key && (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0 || strcmp(key, CBM_CONFIG_UI_PORT) == 0);
+}
+
+static void cbm_config_ui_read(const char *key, char *out, size_t out_size) {
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    if (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+        (void)snprintf(out, out_size, "%s", ui.ui_enabled ? "true" : "false");
+    } else {
+        (void)snprintf(out, out_size, "%d", ui.ui_port);
+    }
+}
+
+static bool cbm_config_ui_write(const char *key, const char *value) {
+    cbm_ui_config_t ui;
+    cbm_ui_config_load(&ui);
+    if (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0) {
+        if (!cbm_ui_parse_enabled(value, &ui.ui_enabled)) {
+            return false;
+        }
+    } else if (!cbm_ui_parse_port(value, &ui.ui_port)) {
+        return false;
+    }
+    return cbm_ui_config_save(&ui);
+}
+
 static void cbm_config_print_unknown_key(const char *key) {
     (void)fprintf(stderr, "error: unknown config key: %s\n", key ? key : "");
 }
@@ -7437,6 +7470,10 @@ int cbm_cmd_config(int argc, char **argv) {
                "Register background git watcher on session connect");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_ENABLED, CBM_UI_DEFAULT_ENABLED_STR,
+               "Serve the graph UI on a loopback HTTP port");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_PORT, CBM_UI_DEFAULT_PORT_STR,
+               "Port for the graph UI listener when enabled");
         return 0;
     }
 
@@ -7475,6 +7512,10 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get_effective(cfg, CBM_CONFIG_UI_LANG, "auto"));
+        cbm_ui_config_t ui;
+        cbm_ui_config_load(&ui);
+        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_ENABLED, ui.ui_enabled ? "true" : "false");
+        printf("  %-25s = %-10d\n", CBM_CONFIG_UI_PORT, ui.ui_port);
     } else if (strcmp(argv[0], "preset") == 0) {
         if (argc == MIN_ARGC_GET && strcmp(argv[CLI_SKIP_ONE], "list") == 0) {
             cbm_config_print_presets();
@@ -7497,7 +7538,13 @@ int cbm_cmd_config(int argc, char **argv) {
                 /* Stored value or the key's real default — the same fallback
                  * the runtime readers use. `""` here was #1522's bug 2: every
                  * unset key read as empty with exit 0. */
-                printf("%s\n", cbm_config_get_effective(cfg, entry->key, entry->default_val));
+                if (cbm_config_key_is_ui(entry->key)) {
+                    char value[CBM_SZ_32];
+                    cbm_config_ui_read(entry->key, value, sizeof(value));
+                    printf("%s\n", value);
+                } else {
+                    printf("%s\n", cbm_config_get_effective(cfg, entry->key, entry->default_val));
+                }
             }
         }
     } else if (strcmp(argv[0], "set") == 0) {
@@ -7507,6 +7554,21 @@ int cbm_cmd_config(int argc, char **argv) {
         } else if (!cbm_config_registry_entry(argv[CLI_SKIP_ONE])) {
             cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
+        } else if (cbm_config_key_is_ui(argv[CLI_SKIP_ONE])) {
+            const cbm_config_entry_t *entry = cbm_config_registry_entry(argv[CLI_SKIP_ONE]);
+            if (!cbm_config_value_matches_declared_range(entry, argv[CLI_PAIR_LEN])) {
+                char reason[CLI_BUF_1K];
+                cbm_config_set_error(argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN], reason,
+                                     sizeof(reason));
+                (void)fprintf(stderr, "error: %s\n", reason);
+                rc = CLI_TRUE;
+            } else if (!cbm_config_ui_write(argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN])) {
+                (void)fprintf(stderr, "error: could not write the UI configuration file\n");
+                rc = CLI_TRUE;
+            } else {
+                printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
+                printf("  (restart the daemon for this to take effect)\n");
+            }
         } else {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
                 printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
@@ -7525,6 +7587,14 @@ int cbm_cmd_config(int argc, char **argv) {
         } else if (!cbm_config_registry_entry(argv[CLI_SKIP_ONE])) {
             cbm_config_print_unknown_key(argv[CLI_SKIP_ONE]);
             rc = CLI_TRUE;
+        } else if (cbm_config_key_is_ui(argv[CLI_SKIP_ONE])) {
+            const cbm_config_entry_t *entry = cbm_config_registry_entry(argv[CLI_SKIP_ONE]);
+            if (!cbm_config_ui_write(entry->key, entry->default_val)) {
+                (void)fprintf(stderr, "error: could not write the UI configuration file\n");
+                rc = CLI_TRUE;
+            } else {
+                printf("%s reset to default\n", entry->key);
+            }
         } else {
             cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);
             printf("%s reset to default\n", argv[CLI_SKIP_ONE]);
@@ -13970,6 +14040,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Graph UI language selection",
      "auto|en|zh",
      "Use auto to follow the client locale, or pin a supported language for consistent shared sessions."},
+    {CBM_CONFIG_UI_ENABLED, CBM_UI_DEFAULT_ENABLED_STR, NULL, "UI",
+     "Serve the graph UI on a loopback HTTP port",
+     "true|false",
+     "Changes are stored atomically in the UI configuration and take effect after the daemon restarts."},
+    {CBM_CONFIG_UI_PORT, CBM_UI_DEFAULT_PORT_STR, NULL, "UI",
+     "Port for the graph UI listener when enabled",
+     "1-65535",
+     "Choose an unoccupied loopback port; changes take effect after the daemon restarts."},
     {"store_idle_timeout_s", "60", NULL, "MCP",
      "Seconds an MCP server keeps an idle SQLite project store open",
      "1-65536",

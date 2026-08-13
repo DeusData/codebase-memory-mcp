@@ -11,7 +11,9 @@
 
 /* Default values */
 #define CBM_UI_DEFAULT_PORT 9749
+#define CBM_UI_DEFAULT_PORT_STR "9749"
 #define CBM_UI_DEFAULT_ENABLED false
+#define CBM_UI_DEFAULT_ENABLED_STR "false"
 #define CBM_UI_MAX_PORT 65535
 
 typedef struct {
