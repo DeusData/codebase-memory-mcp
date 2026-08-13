@@ -764,43 +764,6 @@ static void cbm_test_fault_inject(const char *rel_path) {
 }
 #endif
 
-/* Pre-parse nesting guard for pathologically nested input. tree-sitter's GLR
- * parser recurses once per nesting level inside stack_node_add_link
- * (vendored ts_runtime/src/stack.c) while merging ambiguous parse-stack heads.
- * The Perl grammar is genuinely ambiguous for `f(...)` (function call vs.
- * bareword), so a deeply nested call chain `f(f(f(...)))` drives that recursion
- * as deep as the nesting and overflows a small (1 MB Windows) stack *during the
- * parse* — before any of the LSP walk-depth guards can fire. Unambiguous
- * grammars (C/Java/Python) keep a single stack head and don't hit this, which is
- * why only Perl crashed on the Windows/ARM CI runners.
- *
- * This is a workaround: the proper fix is bounding the GLR stack-merge recursion
- * inside the vendored tree-sitter runtime, tracked upstream as #913. Remove this
- * guard once that lands.
- *
- * cbm_source_nesting_exceeds scans the raw bytes for the maximum bracket-nesting
- * depth and returns true as soon as it passes the cap (early-exit, O(n)). Real
- * source never nests brackets this deep, so a file that does is skipped as a
- * parse error (zero edges — graceful degradation, never a crash). Brackets in
- * strings/comments are counted too: the only consequence of a false positive is
- * skipping one absurd file, so string-awareness is not worth the cost. */
-#define CBM_PERL_MAX_PARSE_NESTING 128
-
-static bool cbm_source_nesting_exceeds(const char *source, int source_len, int cap) {
-    int depth = 0;
-    for (int i = 0; i < source_len; i++) {
-        char c = source[i];
-        if (c == '(' || c == '[' || c == '{') {
-            if (++depth > cap) {
-                return true;
-            }
-        } else if ((c == ')' || c == ']' || c == '}') && depth > 0) {
-            depth--;
-        }
-    }
-    return false;
-}
-
 static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                                             CBMLanguage language, const char *project,
                                             const char *rel_path, int64_t timeout_micros,
@@ -1382,17 +1345,6 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
         cbm_index_mark_done(rel_path);
-        return result;
-    }
-
-    // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
-    // merge overflows a small stack during the parse (see
-    // cbm_source_nesting_exceeds). Scoped to Perl: its ambiguous call grammar is
-    // the only one that drives that recursion to the nesting depth.
-    if (language == CBM_LANG_PERL &&
-        cbm_source_nesting_exceeds(source, source_len, CBM_PERL_MAX_PARSE_NESTING)) {
-        result->has_error = true;
-        result->error_msg = cbm_arena_strdup(a, "perl source nesting too deep; skipped");
         return result;
     }
 

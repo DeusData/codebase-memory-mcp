@@ -1323,6 +1323,32 @@ TEST(perl_function) {
     PASS();
 }
 
+TEST(perl_nested_calls_past_legacy_preparse_guard_are_extracted) {
+    enum { DEPTH = 160 };
+    size_t capacity = (size_t)DEPTH * 3 + CBM_SZ_256;
+    char *source = malloc(capacity);
+    ASSERT_NOT_NULL(source);
+    char *cursor = source;
+    cursor += snprintf(cursor, capacity, "sub f { return $_[0]; }\nsub g { return ");
+    for (int i = 0; i < DEPTH; i++) {
+        *cursor++ = 'f';
+        *cursor++ = '(';
+    }
+    *cursor++ = '1';
+    memset(cursor, ')', DEPTH);
+    cursor += DEPTH;
+    (void)snprintf(cursor, capacity - (size_t)(cursor - source), "; }\n");
+
+    CBMFileResult *result = extract(source, CBM_LANG_PERL, "t", "nested.pl");
+    free(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT_FALSE(result->has_error);
+    ASSERT_TRUE(has_def(result, "Function", "g"));
+    ASSERT_TRUE(has_call(result, "f"));
+    cbm_free_result(result);
+    PASS();
+}
+
 /* --- R --- */
 TEST(r_function) {
     CBMFileResult *r = extract("add <- function(x, y) x + y\nmultiply <- function(x, y) x * y\n",
@@ -6432,6 +6458,7 @@ SUITE(extraction) {
     RUN_TEST(lua_function);
     RUN_TEST(bash_function);
     RUN_TEST(perl_function);
+    RUN_TEST(perl_nested_calls_past_legacy_preparse_guard_are_extracted);
     RUN_TEST(r_function);
 
     /* Functional */
