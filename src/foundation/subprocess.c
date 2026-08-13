@@ -949,7 +949,11 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
 #else /* POSIX */
 
 /* Transient spawn-failure retry (see the EAGAIN note in cbm_darwin_spawn_managed). */
-enum { CBM_SPAWN_RETRY = 2, CBM_SPAWN_RETRY_ATTEMPTS = 6 };
+enum {
+    CBM_SPAWN_RETRY = 2,
+    CBM_SPAWN_RETRY_ATTEMPTS = 6,
+    CBM_SPAWN_RETRY_INITIAL_DELAY_MS = 10,
+};
 
 /* Exponential backoff: 10, 20, 40, 80, 160, 320ms — ~630ms of total patience.
  *
@@ -985,7 +989,8 @@ static bool cbm_spawn_eagain_injected(void) {
 #endif
 
 static void cbm_spawn_backoff(int attempt) {
-    long ms = 10L << (attempt < 6 ? attempt : 6);
+    int shift = attempt < CBM_SPAWN_RETRY_ATTEMPTS ? attempt : CBM_SPAWN_RETRY_ATTEMPTS;
+    long ms = (long)CBM_SPAWN_RETRY_INITIAL_DELAY_MS << shift;
     struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000L * 1000L};
     (void)cbm_nanosleep(&delay, NULL);
 }
