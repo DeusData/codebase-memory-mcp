@@ -248,6 +248,23 @@ static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const
                        "or use an owner-private directory for --dir/CBM_CACHE_DIR, then retry.",
                        note);
         diagnostic = attributed;
+    } else if (diagnostic == CLI_ACTIVATION_REFUSED_MESSAGE) {
+        /* #1537/#1416: the reservation-failure message told the reader to
+         * "check the errors above" — and nothing was above. The detail that
+         * names the failing component is recorded on the daemon side and was
+         * only ever surfaced by `daemon status`, so the CLI replaced a message
+         * that blamed the wrong thing with one that blamed nothing. Two
+         * reporters were left with no way forward. Print it here. */
+        const char *detail = cbm_daemon_ipc_validation_detail();
+        if (detail && detail[0]) {
+            (void)snprintf(attributed, sizeof(attributed),
+                           "error: activation could not reserve exclusive access; no activation "
+                           "was committed.\n"
+                           "error: this is NOT a running-session problem — nothing needs to be "
+                           "closed. The check that refused was: %s",
+                           detail);
+            diagnostic = attributed;
+        }
     }
     if (ops && ops->visible_diagnostic) {
         ops->visible_diagnostic(ops->context, diagnostic);

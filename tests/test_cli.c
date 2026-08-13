@@ -753,6 +753,38 @@ TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416) {
  * CBM sessions could not be stopped" sent a reporter hunting processes that a
  * reboot proved did not exist — and the remedy we printed told them to run a
  * cbm binary they had just uninstalled. Each condition now names itself. */
+/* #1537/#1416: the reservation-failure message told readers to "check the
+ * errors above" — and nothing was above. The detail naming the failing
+ * component is recorded on the daemon side and was only surfaced by
+ * `daemon status`, so the CLI replaced a message that blamed the WRONG thing
+ * with one that blamed NOTHING. Two reporters were left with no way forward.
+ *
+ * The assertion is the property, not the wording: the refusal must never point
+ * at evidence it does not show. */
+TEST(cli_activation_refusal_shows_the_detail_it_points_at_issue1537) {
+    cbm_activation_transaction_note_refusal_for_testing(NULL, 0UL);
+    cbm_daemon_ipc_set_validation_detail_for_testing(
+        "/home/u/.cache/codebase-memory-mcp: ancestor '.cache' is not a usable "
+        "private-directory parent");
+
+    cli_activation_fake_t failed = {
+        .mutation_reserve_result = -1,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &failed,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &failed), 1);
+
+    /* The named component must appear, and the dangling pointer must not. */
+    ASSERT_NOT_NULL(strstr(failed.diagnostic, "is not a usable private-directory parent"));
+    ASSERT_NULL(strstr(failed.diagnostic, "Check the errors above"));
+    cbm_daemon_ipc_set_validation_detail_for_testing("");
+    PASS();
+}
+
 TEST(cli_activation_distinguishes_busy_from_reservation_failure_issue1537) {
     cbm_activation_transaction_note_refusal_for_testing(NULL, 0UL);
 
@@ -15112,6 +15144,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_quiesces_active_cohort_before_mutation);
     RUN_TEST(cli_activation_refuses_when_cohort_does_not_drain);
     RUN_TEST(cli_activation_refusal_note_reaches_diagnostic_issue1416);
+    RUN_TEST(cli_activation_refusal_shows_the_detail_it_points_at_issue1537);
     RUN_TEST(cli_activation_distinguishes_busy_from_reservation_failure_issue1537);
     RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
     RUN_TEST(cli_activation_releases_maintenance_lease_after_success);

@@ -1542,22 +1542,20 @@ static bool main_semver_newer(const char *candidate, const char *active) {
     return false;
 }
 
-/* A client that cannot reach the daemon must SAY SO, in the caller's own
- * protocol. An MCP client speaks JSON-RPC over stdout, and the old path
- * returned EXIT_FAILURE having written nothing at all: agents saw a transport
- * that closed mid-handshake and reported "Connection closed" with no cause,
- * while the real reason (image rejection, startup timeout, conflict) sat in
- * bootstrap_result.message and was dropped on the floor (#1539).
+/* #1539/#1582: an MCP client that dies before the session exists must say why
+ * in its own protocol. The bootstrap path dropped bootstrap_result.message and
+ * surfaced only "Connection closed"; earlier exits wrote only to stderr, which
+ * MCP clients do not surface. A later reporter's log showed the whole failure as:
  *
- * stdout carries a JSON-RPC error object so the agent surfaces the reason;
- * id is null because the failure precedes reading any request. stderr carries
- * the same text for humans reading a terminal. */
-static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
-                                                 const cbm_daemon_bootstrap_result_t *result) {
-    const char *detail = (result && result->message[0])
-                             ? result->message
-                             : "CBM daemon connection failed before the session was established";
-    if (cbm_daemon_process_role_requires_client(role)) {
+ *   Server transport closed unexpectedly, this is likely due to the process
+ *   exiting early
+ *
+ * for a specific, nameable refusal. stdout therefore carries a JSON-RPC error
+ * with a null id before any request exists, while stderr keeps the same detail
+ * for terminal users. Hook clients are a different fail-open protocol and must
+ * never receive MCP framing. */
+static void main_report_client_failure(cbm_daemon_process_role_t role, const char *detail) {
+    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
         char escaped[CBM_DAEMON_CONFLICT_MESSAGE_SIZE * 2];
         size_t out = 0;
         for (size_t i = 0; detail[i] && out + 2 < sizeof(escaped); i++) {
@@ -1579,6 +1577,14 @@ static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
         (void)fflush(stdout);
     }
     (void)fprintf(stderr, "codebase-memory-mcp: %s\n", detail);
+}
+
+static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
+                                                 const cbm_daemon_bootstrap_result_t *result) {
+    main_report_client_failure(role, (result && result->message[0])
+                                         ? result->message
+                                         : "CBM daemon connection failed before the session was "
+                                           "established");
 }
 
 /* Client bootstrap with the upgrade policy: a CONFLICT against a PERMANENT
@@ -2526,8 +2532,8 @@ int main(int argc, char **argv) {
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
         cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) != 0) {
-        (void)fprintf(stderr, "codebase-memory-mcp: --tool-profile requires the supported value "
-                              "'analysis' or 'scout'\n");
+        main_report_client_failure(
+            role, "--tool-profile requires the supported value 'analysis' or 'scout'");
         return 2;
     }
     const char *hook_event = NULL;
@@ -2695,7 +2701,7 @@ int main(int argc, char **argv) {
         cleanup_ok = main_version_cohort_close(&cohort_lease, &cohort_manager) && cleanup_ok;
         cbm_daemon_ipc_endpoint_free(local_endpoint);
         if (!cleanup_ok) {
-            (void)fprintf(stderr, "codebase-memory-mcp: CLI coordination cleanup failed\n");
+            main_report_client_failure(role, "CLI coordination cleanup failed");
             return EXIT_FAILURE;
         }
         return exit_code;
@@ -2705,21 +2711,20 @@ int main(int argc, char **argv) {
     cbm_daemon_build_identity_t identity;
     main_build_fingerprint_cache_t fingerprint_cache;
     if (!main_resolve_executable(argv[0], executable_path)) {
-        (void)fprintf(stderr,
-                      "codebase-memory-mcp: exact executable identity could not be verified "
-                      "(executable-path)\n");
+        main_report_client_failure(
+            role, "exact executable identity could not be verified (executable-path)");
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     main_build_identity_status_t identity_status =
         main_build_identity(&identity, &fingerprint_cache);
     if (identity_status != MAIN_BUILD_IDENTITY_OK) {
         const char *validation_detail = cbm_daemon_ipc_validation_detail();
-        (void)fprintf(stderr,
-                      "codebase-memory-mcp: exact executable identity could not be verified "
-                      "(%s)%s%s%s\n",
-                      main_build_identity_status_name(identity_status),
-                      validation_detail[0] ? " - " : "", validation_detail,
-                      main_build_identity_status_guidance(identity_status));
+        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+        (void)snprintf(
+            message, sizeof(message), "exact executable identity could not be verified (%s)%s%s%s",
+            main_build_identity_status_name(identity_status), validation_detail[0] ? " - " : "",
+            validation_detail, main_build_identity_status_guidance(identity_status));
+        main_report_client_failure(role, message);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     cbm_http_server_set_binary_path(executable_path);
@@ -2860,8 +2865,16 @@ int main(int argc, char **argv) {
 
     cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     if (!endpoint) {
-        (void)fprintf(stderr, "codebase-memory-mcp: secure daemon endpoint could not be created\n");
-        return EXIT_FAILURE;
+        /* #1582: this is where an ownership/ancestry refusal lands, and it was
+         * the silent one — stderr only, so an MCP client saw a transport that
+         * closed with no explanation. Include the validation detail, which
+         * names the directory and the rule that refused. */
+        const char *why = cbm_daemon_ipc_validation_detail();
+        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+        (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s",
+                       (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+        main_report_client_failure(role, message);
+        return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (role == CBM_DAEMON_PROCESS_DAEMON_CTL) {
@@ -2920,8 +2933,8 @@ int main(int argc, char **argv) {
         if (client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
             (void)cbm_version_cohort_log_conflict(&client_cohort_conflict);
         }
-        (void)fprintf(stderr, "codebase-memory-mcp: %s\n",
-                      formatted ? message : "client exact-build admission failed");
+        main_report_client_failure(role,
+                                   formatted ? message : "client exact-build admission failed");
         if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
             client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
             main_hook_report_conflicted_daemon(hook_dialect);
@@ -2988,7 +3001,7 @@ int main(int argc, char **argv) {
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
         !main_set_client_context(g_daemon_client, NULL, tool_profile, NULL, NULL,
                                  MAIN_CONNECT_TIMEOUT_MS)) {
-        (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
+        main_report_client_failure(role, "daemon session context was rejected");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
@@ -3004,7 +3017,7 @@ int main(int argc, char **argv) {
             cbm_daemon_application_client_set_ui_config(
                 g_daemon_client, (uint8_t)ui_update_mask, requested_ui_enabled, requested_ui_port,
                 MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
-            (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
+            main_report_client_failure(role, "daemon UI configuration update failed");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
@@ -3018,7 +3031,7 @@ int main(int argc, char **argv) {
     }
 #ifndef _WIN32
     if (!client_start_parent_watchdog(process_initial_ppid)) {
-        (void)fprintf(stderr, "codebase-memory-mcp: parent-death watchdog could not start\n");
+        main_report_client_failure(role, "parent-death watchdog could not start");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);

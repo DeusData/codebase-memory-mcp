@@ -91,6 +91,10 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
  * validation refusal (empty string when none). Diagnostic only — callers
  * append it to their error messages; policy decisions never read it. */
 const char *cbm_daemon_ipc_validation_detail(void);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1537: seed the detail so a test can prove the CLI refusal surfaces it. */
+void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail);
+#endif
 
 /* Create/validate an owner-only directory and securely open one regular
  * owner-only append log within it. User-controlled path components may not be

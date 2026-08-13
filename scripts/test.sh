@@ -306,7 +306,12 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 echo "=== Step 5c: worker error-response transport regression ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.sh"
 
-# Step 5d (#1388) is DELIBERATELY NOT GATING HERE — see
+# Step 5d: failures before an MCP request exists still need a JSON-RPC error on
+# stdout, while hook-augment must remain fail-open and never emit MCP framing.
+echo "=== Step 5d: client startup failure protocol regression (#1582) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_client_startup_failure.sh"
+
+# Step 5e (#1388) is DELIBERATELY NOT GATING HERE — see
 # tests/test_hook_conflict_notice.sh for the full what-was-tried record.
 # Summary: the test forces a client/daemon build mismatch via the
 # CBM_TEST_HOOK_CLIENT_BUILD seam and asserts the stdout systemMessage. It is
@@ -319,11 +324,11 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 # skipping it silently would hide the gap. Run it by hand:
 #   make -f Makefile.cbm cbm TEST_SEAMS=1 && bash tests/test_hook_conflict_notice.sh
 
-# Step 5e: `daemon start --open` is the only UI startup operation that waits
+# Step 5f: `daemon start --open` is the only UI startup operation that waits
 # synchronously. Build the embedded UI with test seams and prove that readiness
 # is generation-bound, rejects a foreign occupied port, and is identical for a
 # newly started or already-active daemon.
-echo "=== Step 5e: embedded daemon UI --open readiness ==="
+echo "=== Step 5f: embedded daemon UI --open readiness ==="
 UI_OPEN_BUILD_DIR="${BUILD_DIR}-ui-open"
 make -j"$NPROC" -f Makefile.cbm cbm-with-ui TEST_SEAMS=1 BUILD_DIR="$UI_OPEN_BUILD_DIR" \
     ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
