@@ -20,6 +20,13 @@ void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command
  * this immediately before publication so idle sessions retain no SQLite DB. */
 bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv);
 
+/* Build search_code's platform command. Exposed only for white-box tests that
+ * pin producer-side
+ * filtering and output limits. */
+void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
+                                    const char *file_pattern, const char *tmpfile,
+                                    const char *filelist, const char *root_path);
+
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
  * On success replaces and frees *response_io; on failure it is unchanged. */
 bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice);

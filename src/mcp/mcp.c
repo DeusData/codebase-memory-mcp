@@ -8744,12 +8744,16 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
+enum { SEARCH_CODE_MAX_GREP_MATCHES = 500 };
+
 /* Build the grep/search command string based on scoped vs recursive mode.
- * On Windows, uses PowerShell Select-String with tab-delimited output.
- * On POSIX, uses grep with colon-delimited output. */
-static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
-                           const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
+ * On Windows, uses
+ * PowerShell Select-String with tab-delimited output.
+ * On POSIX, uses grep with colon-delimited
+ * output. */
+void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
+                                    const char *file_pattern, const char *tmpfile,
+                                    const char *filelist, const char *root_path) {
 #ifdef _WIN32
     const char *sm = use_regex ? "" : " -SimpleMatch";
     if (scoped) {
@@ -8761,8 +8765,9 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 "-LiteralPath $_ -Pattern $pat%s "
                 "-ErrorAction SilentlyContinue }"
                 " | Where-Object { $_.Path -like '*%s' }"
+                " | Select-Object -First %d"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm, file_pattern);
+                tmpfile, filelist, sm, file_pattern, SEARCH_CODE_MAX_GREP_MATCHES);
         } else {
             snprintf(
                 cmd, cmd_sz,
@@ -8770,8 +8775,9 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
                 "-LiteralPath $_ -Pattern $pat%s "
                 "-ErrorAction SilentlyContinue }"
+                " | Select-Object -First %d"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm);
+                tmpfile, filelist, sm, SEARCH_CODE_MAX_GREP_MATCHES);
         }
     } else {
         if (file_pattern) {
@@ -8781,8 +8787,9 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 "-ErrorAction SilentlyContinue"
                 " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
                 "-ErrorAction SilentlyContinue"
+                " | Select-Object -First %d"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
+                root_path, file_pattern, tmpfile, sm, SEARCH_CODE_MAX_GREP_MATCHES);
         } else {
             snprintf(
                 cmd, cmd_sz,
@@ -8790,8 +8797,9 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
                 "SilentlyContinue"
                 " | Select-String -Pattern (Get-Content -Encoding UTF8 -LiteralPath '%s')%s "
                 "-ErrorAction SilentlyContinue"
+                " | Select-Object -First %d"
                 " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
+                root_path, tmpfile, sm, SEARCH_CODE_MAX_GREP_MATCHES);
         }
     }
 #else
@@ -9767,11 +9775,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     const char *tmpfile = scratch.pattern_path;
     const char *filelist = scratch.filelist_path;
 
-    /* No grep-level match limit — let grep find all matches, then dedup and
-     * cap in our code. The -m flag caused results from large vendored files
-     * to exhaust the quota before reaching project source files. */
-    enum { GREP_MAX_MATCHES = 500 };
-    int grep_limit = GREP_MAX_MATCHES;
+    /* Bound accepted scanner records in C on every platform. Windows also
+     * applies this limit
+     * after its producer filters to avoid an unbounded
+     * PowerShell stream. POSIX deliberately
+     * avoids grep's per-file -m flag,
+     * which let large vendored files exhaust the quota
+     * before project source. */
+    int grep_limit = SEARCH_CODE_MAX_GREP_MATCHES;
 
     /* Scope grep to indexed files only — avoids scanning vendored/generated code.
      * Query the graph for distinct file paths, write them to a temp file,
@@ -9800,8 +9811,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         search_scratch_close(&scratch);
     } else {
         char cmd[CBM_SZ_4K];
-        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
-                       root_path);
+        cbm_search_code_build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile,
+                                       filelist, root_path);
 
         FILE *fp = cbm_popen(cmd, "r");
         if (!fp) {

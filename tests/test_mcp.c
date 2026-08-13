@@ -4190,10 +4190,32 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
 }
 
 #ifdef _WIN32
+static bool search_code_command_has_producer_cap(bool scoped, const char *file_pattern) {
+    char cmd[CBM_SZ_4K];
+    cbm_search_code_build_grep_cmd(cmd, sizeof(cmd), false, scoped, file_pattern,
+                                   "C:\\tmp\\pattern", "C:\\tmp\\files", "C:\\repo");
+
+    const char *filter =
+        scoped && file_pattern ? strstr(cmd, " | Where-Object ") : strstr(cmd, "Select-String ");
+    const char *cap = strstr(cmd, " | Select-Object -First 500");
+    const char *format = strstr(cmd, " | ForEach-Object { $_.Path +");
+    return filter && cap && format && filter < cap && cap < format &&
+           strstr(cmd, "Select-Object -First 4096") == NULL &&
+           strstr(cap + 1, " | Select-Object -First 500") == NULL;
+}
+
+TEST(search_code_windows_producer_cap_follows_filters) {
+    ASSERT_TRUE(search_code_command_has_producer_cap(true, "*.pas"));
+    ASSERT_TRUE(search_code_command_has_producer_cap(true, NULL));
+    ASSERT_TRUE(search_code_command_has_producer_cap(false, "*.pas"));
+    ASSERT_TRUE(search_code_command_has_producer_cap(false, NULL));
+    PASS();
+}
+
 /* Issue #903 follow-up: scoped search_code on Windows writes a UTF-8 filelist
- * containing absolute source paths, then reads it back through PowerShell.
- * Windows PowerShell 5.1 treats UTF-8 without BOM as ANSI unless told
- * otherwise, so a non-ASCII project root can be mojibaked before
+ * containing
+ * absolute source paths, then reads it back through PowerShell. Windows PowerShell 5.1 treats UTF-8
+ * without BOM as ANSI unless told otherwise, so a non-ASCII project root can be mojibaked before
  * Select-String sees the LiteralPath. */
 TEST(search_code_scoped_path_with_cjk_root_issue903) {
     char tmp[512];
@@ -10651,6 +10673,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
+    RUN_TEST(search_code_windows_producer_cap_follows_filters);
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
 #endif
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
