@@ -6771,8 +6771,8 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
 
     /* Structured output promises the same opt-in evidence as TOON. */
     char *ev_json = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\"," 
-             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\"," 
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
              "\"project\":\"ev-proj\",\"direction\":\"outbound\",\"include_evidence\":true,"
              "\"format\":\"json\"}}}");
     ASSERT_NOT_NULL(ev_json);
