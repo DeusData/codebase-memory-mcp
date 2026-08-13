@@ -64,7 +64,9 @@ Unblock-File .\install.ps1
 
 > **Note:** If you see a script execution policy error, run `Set-ExecutionPolicy -Scope Process Bypass` first, or invoke with `PowerShell -ExecutionPolicy Bypass -File .\install.ps1`.
 
-Options: `--skip-config` (binary only, no agent setup), `--dir=<path>` (custom location).
+Options: `--skip-config` (binary only), `--skip-binary` (agent setup only),
+`--force-binary` (copy even when a package manager owns the running binary), and
+`--dir=<path>` (custom location). `--skip-binary` leaves PATH unchanged.
 
 > **Antivirus note:** Microsoft Defender may flag a release binary as
 > `Trojan:Script/Wacatac.B!ml`. This is a known false positive — typically 61 of

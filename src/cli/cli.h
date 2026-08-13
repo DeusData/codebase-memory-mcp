@@ -207,6 +207,13 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+/* #1566: name the package manager that owns a binary path, or NULL when it is
+ * not recognisably foreign. Detection must be positive evidence — see the
+ * implementation comment. */
+const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
 int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool windows, char *command,
                                             size_t command_size, char *shell, size_t shell_size);
 int cbm_build_qoder_hook_command_for_testing(const char *binary_path, bool windows, char *command,

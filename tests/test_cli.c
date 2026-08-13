@@ -1163,6 +1163,84 @@ TEST(cli_install_dir_and_skip_config_stage_first_install_safely) {
     PASS();
 }
 
+/* #1566: --skip-binary must configure clients with the binary that is actually
+ * running. Pointing them at ~/.local/bin after deliberately skipping that copy
+ * leaves every refreshed client unable to start the server. */
+TEST(cli_install_skip_binary_uses_running_binary_for_configs) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-skip-binary-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *raw_shell = getenv("SHELL");
+    char *old_shell = raw_shell ? strdup(raw_shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+
+    char cache_dir[512];
+    char gemini_dir[512];
+    char gemini_config[640];
+    char bin_target[640];
+    char shell_rc[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(gemini_dir, sizeof(gemini_dir), "%s/.gemini", tmpdir);
+    snprintf(gemini_config, sizeof(gemini_config), "%s/settings.json", gemini_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    snprintf(shell_rc, sizeof(shell_rc), "%s/.zshrc", tmpdir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    ASSERT_EQ(test_mkdirp(gemini_dir), 0);
+    ASSERT_EQ(test_mkdirp(cache_dir), 0);
+    ASSERT_EQ(write_test_file(shell_rc, "# user shell config\n"), 0);
+    ASSERT_EQ(write_test_file(index_path, "stale index\n"), 0);
+    /* Model a prior native install whose managed JSON entry still points at
+     * the duplicate ~/.local/bin copy that --skip-binary is retiring. */
+    ASSERT_EQ(cbm_install_editor_mcp(bin_target, gemini_config), 0);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--skip-binary", "--reset-indexes", "--yes"};
+    int rc = cli_test_cmd_install(3, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *config = read_test_file(gemini_config);
+    bool config_uses_running_binary =
+        config && strstr(config, "test-runner") && strstr(config, bin_target) == NULL;
+    const char *shell = read_test_file(shell_rc);
+    struct stat target_status;
+    bool target_absent = stat(bin_target, &target_status) != 0;
+    bool index_removed = stat(index_path, &target_status) != 0;
+    bool path_untouched = shell && strstr(shell, "export PATH") == NULL;
+
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(target_absent);
+    ASSERT_TRUE(index_removed);
+    ASSERT_TRUE(config_uses_running_binary);
+    ASSERT_TRUE(path_untouched);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    PASS();
+}
+
 TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     cli_activation_fake_t fake = {
         .mutation_reserve_result = 1,
@@ -1172,11 +1250,13 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     char *missing_dir[] = {"--dir"};
     char *empty_dir[] = {"--dir="};
     char *bad_install[] = {"--skip-config=value"};
+    char *conflicting_binary_mode[] = {"--skip-binary", "--force-binary"};
     char *bad_update[] = {"--not-an-update-option"};
     char *bad_uninstall[] = {"--not-an-uninstall-option"};
     int missing_rc = cli_test_cmd_install(1, missing_dir);
     int empty_rc = cli_test_cmd_install(1, empty_dir);
     int install_rc = cli_test_cmd_install(1, bad_install);
+    int conflicting_rc = cli_test_cmd_install(2, conflicting_binary_mode);
     int update_rc = cli_test_cmd_update(1, bad_update);
     int uninstall_rc = cli_test_cmd_uninstall(1, bad_uninstall);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -1184,6 +1264,7 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     ASSERT_EQ(missing_rc, 1);
     ASSERT_EQ(empty_rc, 1);
     ASSERT_EQ(install_rc, 1);
+    ASSERT_EQ(conflicting_rc, 1);
     ASSERT_EQ(update_rc, 1);
     ASSERT_EQ(uninstall_rc, 1);
     ASSERT_EQ(fake.mutation_reserve_count, 0);
@@ -12896,6 +12977,33 @@ TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
     PASS();
 }
 
+/* #1566: a binary owned by mise/Homebrew/nix is not ours to relocate, and the
+ * detection must key on POSITIVE evidence — a recognised manager path — not on
+ * "outside our default install dir". The latter misreads an ordinary
+ * `install --dir=/opt/cbm` (and every test binary) as foreign, and would then
+ * REFUSE to update an installation we own. A false positive costs a working
+ * update; a false negative only leaves today's behaviour for an unrecognised
+ * manager, which --skip-binary covers explicitly. */
+TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
+    /* Recognised managers -> named. */
+    ASSERT_NOT_NULL(cbm_cli_external_manager_name_for_testing(
+        "/Users/x/.local/share/mise/installs/cbm/0.10.3/bin/codebase-memory-mcp"));
+    ASSERT_NOT_NULL(cbm_cli_external_manager_name_for_testing(
+        "/opt/homebrew/Cellar/codebase-memory-mcp/0.10.3/bin/codebase-memory-mcp"));
+    ASSERT_NOT_NULL(
+        cbm_cli_external_manager_name_for_testing("/nix/store/abc-cbm/bin/codebase-memory-mcp"));
+
+    /* Ours, or merely unusual, must NOT be claimed as externally managed. */
+    ASSERT_NULL(
+        cbm_cli_external_manager_name_for_testing("/Users/x/.local/bin/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/cbm/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("build/c/test-runner"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing(""));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing(NULL));
+    PASS();
+}
+
 /* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
  * so `update --ui` — a command people had in scripts and aliases — started
  * failing with "unknown update option". Retiring a choice is fine; breaking the
@@ -14740,6 +14848,7 @@ TEST(cli_main_help_lists_config_preset_subcommand) {
      * by runtime guidance, so top-level help must advertise it too. */
     ASSERT_NOT_NULL(strstr(help_buf, "daemon <start|stop|status>"));
     ASSERT_NOT_NULL(strstr(help_buf, "update [-y|-n] [--force] [--dry-run]"));
+    ASSERT_NOT_NULL(strstr(help_buf, "--skip-binary|--force-binary"));
     ASSERT_NULL(strstr(help_buf, "--standard|--ui"));
     /* Installed evidence guidance names this advanced tool, so help must too. */
     ASSERT_NOT_NULL(strstr(help_buf, "check_index_coverage"));
@@ -14778,6 +14887,7 @@ SUITE(cli) {
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
+    RUN_TEST(cli_install_skip_binary_uses_running_binary_for_configs);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
@@ -14786,6 +14896,7 @@ SUITE(cli) {
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
+    RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
