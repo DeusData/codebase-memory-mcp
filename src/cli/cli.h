@@ -207,6 +207,14 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+/* #1558: client-selector vocabulary, exposed so a test can prove every token
+ * resolves and an unknown one is rejected. */
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec, cbm_detected_agents_t *detected);
+size_t cbm_cli_clients_count_for_testing(void);
+const char *cbm_cli_clients_token_for_testing(size_t index);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
 /* #1566: name the package manager that owns a binary path, or NULL when it is
  * not recognisably foreign. Detection must be positive evidence — see the
  * implementation comment. */

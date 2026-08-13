@@ -14,6 +14,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/agent_profiles.h>
+#include <cli/agent_clients.h>
 #include <cli/activation_transaction.h>
 #include <cli/cli.h>
 #include <cli/progress_sink.h>
@@ -4591,6 +4592,70 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     PASS();
 }
 
+/* #1558: a selected-client plan must describe the same restricted writes as
+ * the real install. Otherwise the pre-mutation receipt approves files that the
+ * requested command should never touch. */
+TEST(cli_install_plan_honors_client_selection_issue1558) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-plan-clients-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.cursor", tmpdir);
+    test_mkdirp(path);
+    snprintf(path, sizeof(path), "%s/.codex", tmpdir);
+    test_mkdirp(path);
+    char qoder_config[512];
+    snprintf(path, sizeof(path), "%s/.qoder", tmpdir);
+    test_mkdirp(path);
+    snprintf(qoder_config, sizeof(qoder_config), "%s/.qoder/settings.json", tmpdir);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(fileno(stdout)) : -1;
+    bool redirected = capture && saved_stdout >= 0;
+    if (redirected) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), fileno(stdout)) >= 0;
+    }
+    char *argv[] = {"--plan", "--clients=codex"};
+    int rc = redirected ? cli_test_cmd_install(2, argv) : -1000;
+    if (redirected) {
+        fflush(stdout);
+        (void)dup2(saved_stdout, fileno(stdout));
+    }
+    if (saved_stdout >= 0)
+        close(saved_stdout);
+
+    char output[65536] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t got = fread(output, 1, sizeof(output) - 1U, capture);
+        output[got] = '\0';
+        fclose(capture);
+    }
+    char *default_plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(redirected);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(output, ".codex/config.toml"));
+    ASSERT_NULL(strstr(output, ".cursor/mcp.json"));
+    ASSERT_NULL(strstr(output, qoder_config));
+    ASSERT_NOT_NULL(default_plan);
+    ASSERT_NOT_NULL(strstr(default_plan, ".cursor/mcp.json"));
+    free(default_plan);
+    PASS();
+}
+
 /* Supported-agent metadata must track the real installer surface. */
 TEST(cli_supported_agent_surfaces_match_installers) {
     const char *const required_agents[] = {
@@ -8450,6 +8515,22 @@ TEST(cli_codex_session_hook_issue330) {
     ASSERT_NULL(strstr(d, "hooks.SubagentStart"));
     ASSERT(strstr(d, "[mcp_servers.other]") != NULL); /* still preserved after removal */
 
+    /* #1432: Codex may normalize the owned reminder to an inline assignment
+     * and discard our markers. Reinstall must replace that assignment instead
+     * of appending a duplicate TOML key. */
+    write_test_file(cfg, "[hooks]\n"
+                         "SessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = [{ "
+                         "type = \"command\", command = \"echo \\\"Code discovery: prefer "
+                         "codebase-memory-mcp\\\"\" }] }]\n\n"
+                         "[mcp_servers.codebase-memory-mcp]\n"
+                         "command = \"/Users/me/.local/bin/codebase-memory-mcp\"\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_NULL(strstr(d, "SessionStart = ["));
+    ASSERT_NOT_NULL(strstr(d, "[[hooks.SessionStart]]"));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -9366,30 +9447,100 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
     test_mkdirp(codex_dir);
 
+    char binary_dir[512];
+    char binary_path[640];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(binary_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    write_test_file(binary_path, "installed binary must survive failed cleanup\n");
+
+    char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CODEX_HOME");
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
     char hooks_path[640];
     char config_path[640];
     snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    int first_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *first = read_test_file_alloc(config_path);
+    int repeat_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *repeated = read_test_file_alloc(config_path);
+    int dry_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_dry = read_test_file_alloc(config_path);
+
+    write_test_file(config_path,
+                    "[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", "
+                    "hooks = [{ type = \"command\", command = \"echo \\\"Code discovery: "
+                    "prefer codebase-memory-mcp\\\"\" }] }]\n");
     write_test_file(hooks_path, "{}\n");
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int migration_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
 
     char *toml = read_test_file_alloc(config_path);
     char *hooks = read_test_file_alloc(hooks_path);
-    bool migrated = toml && !strstr(toml, "codebase-memory-mcp SessionStart") && hooks &&
+    bool lifecycle_ok = first_rc == 0 && repeat_rc == 0 && dry_rc == 0 && first && repeated &&
+                        after_dry && strcmp(first, repeated) == 0 && strcmp(first, after_dry) == 0;
+    bool migrated = migration_rc == 0 && toml && !strstr(toml, "SessionStart") && hooks &&
                     strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart");
+    free(first);
+    free(repeated);
+    free(after_dry);
     free(toml);
     free(hooks);
+
+    const char *ambiguous =
+        "[hooks]\nSessionStart = [{ matcher = \"startup|resume|clear|compact\", hooks = ["
+        "{ type = \"command\", command = 'echo \"Code discovery: prefer "
+        "codebase-memory-mcp\"' }, { type = \"command\", command = \"foreign\" }] }]\n";
+    write_test_file(config_path, ambiguous);
+    char *uninstall_argv[] = {"--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(1, uninstall_argv);
+    char skill_path[768];
+    char agent_path[768];
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_dir);
+    snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.toml", codex_dir);
+    struct stat state;
+    hooks = read_test_file_alloc(hooks_path);
+    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) == 0 &&
+                               stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0 &&
+                               hooks && !strstr(hooks, "hook-augment");
+    free(hooks);
+
+    char bad_home[256];
+    snprintf(bad_home, sizeof(bad_home), "/tmp/cli-codex-preflight-XXXXXX");
+    bool no_partial = false;
+    if (cbm_mkdtemp(bad_home)) {
+        char bad_codex[512];
+        char bad_config[640];
+        char bad_agents[640];
+        snprintf(bad_codex, sizeof(bad_codex), "%s/.codex", bad_home);
+        snprintf(bad_config, sizeof(bad_config), "%s/config.toml", bad_codex);
+        snprintf(bad_agents, sizeof(bad_agents), "%s/AGENTS.md", bad_codex);
+        test_mkdirp(bad_codex);
+        write_test_file(bad_config, ambiguous);
+        cbm_setenv("HOME", bad_home, 1);
+        cbm_setenv("PATH", bad_home, 1);
+        int bad_rc = cbm_install_agent_configs(bad_home, binary_path, false, false);
+        char *bad_after = read_test_file_alloc(bad_config);
+        no_partial = bad_rc != 0 && bad_after && strcmp(bad_after, ambiguous) == 0 &&
+                     stat(bad_agents, &state) != 0;
+        free(bad_after);
+        test_rmdir_r(bad_home);
+    }
+    restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!migrated)
-        FAIL("Codex install must leave exactly one lifecycle hook representation");
+    if (!lifecycle_ok || !migrated || !independent_cleanup || !no_partial)
+        FAIL("Codex lifecycle preflight must be idempotent, transactional, and independently "
+             "clean owned side files");
     PASS();
 }
 
@@ -13004,6 +13155,62 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
     PASS();
 }
 
+/* #1558: `install` configured EVERY detected client, so a user who wanted
+ * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
+ * install silently recreated them. The selector restricts it.
+ *
+ * The vocabulary is the part that makes it usable: fixed and registry clients
+ * include tokens nobody would guess (factory-droid, mistral-vibe, copilot-cli). A selector
+ * whose accepted values can only be learned by reading our source is not a
+ * usable selector, so this pins that every client is listed and that an unknown
+ * token is REJECTED rather than silently matching nothing. */
+TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
+    cbm_detected_agents_t all;
+    memset(&all, 1, sizeof(all)); /* every client "detected" */
+
+    /* A known token keeps its client and drops the rest. */
+    cbm_detected_agents_t sel = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("claude,codex", &sel));
+    ASSERT_TRUE(sel.claude_code);
+    ASSERT_TRUE(sel.codex);
+    ASSERT_FALSE(sel.claude_desktop);
+    ASSERT_FALSE(sel.cursor);
+    ASSERT_FALSE(sel.opencode);
+
+    /* Whitespace around tokens is tolerated — people type it. */
+    cbm_detected_agents_t spaced = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing(" claude , zed ", &spaced));
+    ASSERT_TRUE(spaced.claude_code);
+    ASSERT_TRUE(spaced.zed);
+    ASSERT_FALSE(spaced.codex);
+
+    /* An unknown token must FAIL. Silently treating a typo as "no such client"
+     * would configure nothing and report success. */
+    cbm_detected_agents_t typo = all;
+    ASSERT_FALSE(cbm_cli_clients_apply_selection_for_testing("claude,codx", &typo));
+    cbm_detected_agents_t empty = all;
+    ASSERT_FALSE(cbm_cli_clients_apply_selection_for_testing(" , , ", &empty));
+
+    cbm_detected_agents_t desktop = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("claude-desktop", &desktop));
+    ASSERT_TRUE(desktop.claude_desktop);
+    ASSERT_FALSE(desktop.claude_code);
+
+    /* Every token in the table must resolve — a client added to detection but
+     * forgotten here is invisible to the selector. */
+    for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
+        const char *token = cbm_cli_clients_token_for_testing(i);
+        ASSERT_NOT_NULL(token);
+        cbm_detected_agents_t one = all;
+        ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing(token, &one));
+    }
+    ASSERT_EQ(cbm_cli_clients_count_for_testing(), 26U + CBM_AGENT_CLIENT_COUNT);
+    cbm_detected_agents_t registry = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("qoder", &registry));
+    ASSERT_FALSE(registry.claude_code);
+    PASS();
+}
+
 /* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
  * so `update --ui` — a command people had in scripts and aliases — started
  * failing with "unknown update option". Retiring a choice is fine; breaking the
@@ -13015,10 +13222,38 @@ TEST(cli_update_accepts_retired_variant_flags_issue1544) {
     char *standard_argv[] = {"--dry-run", "--standard", "--yes"};
     char *bogus_argv[] = {"--dry-run", "--not-a-flag", "--yes"};
 
-    ASSERT_EQ(cbm_cmd_update(3, ui_argv), 0);
-    ASSERT_EQ(cbm_cmd_update(3, standard_argv), 0);
+    FILE *capture = tmpfile();
+    int saved_stderr = capture ? dup(fileno(stderr)) : -1;
+    bool redirected = capture && saved_stderr >= 0;
+    if (redirected) {
+        fflush(stderr);
+        redirected = dup2(fileno(capture), fileno(stderr)) >= 0;
+    }
+    int ui_rc = redirected ? cbm_cmd_update(3, ui_argv) : -1000;
+    int standard_rc = redirected ? cbm_cmd_update(3, standard_argv) : -1000;
     /* Unknown flags stay an error — the point is compatibility, not silence. */
-    ASSERT_TRUE(cbm_cmd_update(3, bogus_argv) != 0);
+    int bogus_rc = redirected ? cbm_cmd_update(3, bogus_argv) : 0;
+    if (redirected) {
+        fflush(stderr);
+        (void)dup2(saved_stderr, fileno(stderr));
+    }
+    if (saved_stderr >= 0)
+        close(saved_stderr);
+
+    char output[8192] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t got = fread(output, 1, sizeof(output) - 1U, capture);
+        output[got] = '\0';
+        fclose(capture);
+    }
+    const char *warning = "note: --ui/--standard are accepted but no longer do anything";
+    ASSERT_TRUE(redirected);
+    ASSERT_EQ(ui_rc, 0);
+    ASSERT_EQ(standard_rc, 0);
+    ASSERT_TRUE(bogus_rc != 0);
+    ASSERT_EQ(test_count_substring(output, warning), 2U);
+    ASSERT_NOT_NULL(strstr(output, "error: unknown update option: --not-a-flag"));
     PASS();
 }
 
@@ -14897,6 +15132,7 @@ SUITE(cli) {
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
+    RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
@@ -15029,6 +15265,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
+    RUN_TEST(cli_install_plan_honors_client_selection_issue1558);
     RUN_TEST(cli_supported_agent_surfaces_match_installers);
     RUN_TEST(cli_new_agent_install_plans_use_documented_paths);
     RUN_TEST(cli_new_agent_configs_use_documented_schemas);

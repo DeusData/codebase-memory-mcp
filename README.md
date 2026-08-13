@@ -66,7 +66,8 @@ Unblock-File .\install.ps1
 
 Options: `--skip-config` (binary only), `--skip-binary` (agent setup only),
 `--force-binary` (copy even when a package manager owns the running binary), and
-`--dir=<path>` (custom location). `--skip-binary` leaves PATH unchanged.
+`--dir=<path>` (custom location). Use `--clients` to list client tokens or
+`--clients=claude,codex` to restrict agent setup. `--skip-binary` leaves PATH unchanged.
 
 > **Antivirus note:** Microsoft Defender may flag a release binary as
 > `Trojan:Script/Wacatac.B!ml`. This is a known false positive — typically 61 of

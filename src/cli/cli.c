@@ -3568,43 +3568,22 @@ bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool window
 }
 #endif
 
-static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
-                                          const char *command_windows) {
+static int cbm_reconcile_codex_hooks_command(const char *config_path, const char *command,
+                                             const char *command_windows,
+                                             cbm_toml_codex_hook_action_t action, bool check_only) {
     if (!config_path || !command || !command_windows) {
         return CLI_ERR;
     }
-    char escaped[CLI_BUF_8K];
-    char escaped_windows[CLI_BUF_8K];
-    if (cbm_toml_escape_basic_string(command, escaped, sizeof(escaped)) != CLI_OK ||
-        cbm_toml_escape_basic_string(command_windows, escaped_windows, sizeof(escaped_windows)) !=
-            CLI_OK) {
-        return CLI_ERR;
-    }
-    char block[CLI_BUF_8K];
-    int written = snprintf(block, sizeof(block),
-                           "[[hooks.SessionStart]]\n"
-                           "matcher = \"startup|resume|clear|compact\"\n\n"
-                           "[[hooks.SessionStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n\n"
-                           "[[hooks.SubagentStart]]\n"
-                           "matcher = \"*\"\n\n"
-                           "[[hooks.SubagentStart.hooks]]\n"
-                           "type = \"command\"\n"
-                           "command = \"%s\"\n"
-                           "command_windows = \"%s\"\n"
-                           "timeout = 5\n",
-                           escaped, escaped_windows, escaped, escaped_windows);
-    if (written < 0 || (size_t)written >= sizeof(block)) {
-        return CLI_ERR;
-    }
-    return cbm_toml_upsert_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, block) == 0
+    return cbm_toml_reconcile_codex_hooks(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, command,
+                                          command_windows, action, check_only ? 1 : 0) == 0
                ? CLI_OK
                : CLI_ERR;
 }
-
+static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
+                                          const char *command_windows) {
+    return cbm_reconcile_codex_hooks_command(config_path, command, command_windows,
+                                             CBM_TOML_CODEX_HOOK_UPSERT, false);
+}
 /* Public path used by config-level regression tests and manual callers. */
 int cbm_upsert_codex_hooks(const char *config_path) {
     return cbm_upsert_codex_hooks_command(config_path, "codebase-memory-mcp hook-augment",
@@ -3612,10 +3591,9 @@ int cbm_upsert_codex_hooks(const char *config_path) {
 }
 
 int cbm_remove_codex_hooks(const char *config_path) {
-    return config_path &&
-                   cbm_toml_remove_managed_block(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END) == 0
-               ? CLI_OK
-               : CLI_ERR;
+    return cbm_reconcile_codex_hooks_command(config_path, "codebase-memory-mcp hook-augment",
+                                             "codebase-memory-mcp hook-augment",
+                                             CBM_TOML_CODEX_HOOK_REMOVE, false);
 }
 
 /* ── OpenCode MCP config (JSON with "mcp" key) ───────────────── */
@@ -7975,15 +7953,19 @@ static const char *detect_arch(void) {
 
 /* ── Agent config install/refresh (shared by install + update) ── */
 
-static void print_detected_registry_agents(const char *home, bool *any);
+static bool cli_clients_spec_has_token(const char *spec, const char *expected);
+static void print_detected_registry_agents(const char *home, const char *client_selection,
+                                           bool *any);
 
 /* Print detected agent names on a single line. */
-static void print_detected_agents(const cbm_detected_agents_t *a, const char *home) {
+static void print_detected_agents(const cbm_detected_agents_t *a, const char *home,
+                                  const char *client_selection) {
     struct {
         bool flag;
         const char *name;
     } agents[] = {
         {a->claude_code, "Claude-Code"},
+        {a->claude_desktop, "Claude-Desktop"},
         {a->codex, "Codex"},
         {a->gemini, "Gemini-CLI"},
         {a->zed, "Zed"},
@@ -8017,7 +7999,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a, const char *ho
             any = true;
         }
     }
-    print_detected_registry_agents(home, &any);
+    print_detected_registry_agents(home, client_selection, &any);
     if (!any) {
         printf(" (none)");
     }
@@ -8710,12 +8692,14 @@ static void cbm_init_agent_registry_context(const char *home,
     registry->options.probe_context = registry;
 }
 
-static void print_detected_registry_agents(const char *home, bool *any) {
+static void print_detected_registry_agents(const char *home, const char *client_selection,
+                                           bool *any) {
     cbm_agent_registry_context_t registry;
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (profile && cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (profile && cli_clients_spec_has_token(client_selection, profile->stable_id) &&
+            cbm_agent_client_detect(profile->id, &registry.options)) {
             printf(" %s", profile->display_name);
             *any = true;
         }
@@ -9073,12 +9057,14 @@ static void install_pochi_durable_context(const char *home, bool force, bool dry
 }
 
 static void install_agent_client_registry(const char *home, const char *binary_path,
-                                          bool inherit_claude_session, bool force, bool dry_run) {
+                                          bool inherit_claude_session, bool force, bool dry_run,
+                                          const char *client_selection) {
     cbm_agent_registry_context_t registry;
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (!profile || !cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (!profile || !cli_clients_spec_has_token(client_selection, profile->stable_id) ||
+            !cbm_agent_client_detect(profile->id, &registry.options)) {
             continue;
         }
         if (!g_install_plan) {
@@ -9202,6 +9188,23 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        char command[CLI_BUF_8K];
+        char command_windows[CLI_BUF_8K];
+        char hooks_json[CLI_BUF_1K];
+        snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
+        bool use_hooks_json = cbm_file_exists(hooks_json);
+        bool commands_ok =
+            cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
+            cbm_build_augment_command_windows(binary_path, command_windows,
+                                              sizeof(command_windows)) == CLI_OK;
+        cbm_toml_codex_hook_action_t preflight_action =
+            use_hooks_json ? CBM_TOML_CODEX_HOOK_REMOVE : CBM_TOML_CODEX_HOOK_UPSERT;
+        if (!commands_ok || cbm_reconcile_codex_hooks_command(cp, command, command_windows,
+                                                              preflight_action, true) != CLI_OK) {
+            record_agent_config_error(false, "Codex CLI",
+                                      commands_ok ? "hook_preflight" : "hook_command_build", cp);
+            goto codex_install_done;
+        }
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
         install_agent_skill("Codex CLI", skills_dir, force, dry_run);
@@ -9219,53 +9222,29 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
          * SessionStart reminder there instead of config.toml. Writing both
          * makes Codex warn about loading hooks from two representations (#570).
          * config.toml remains the mcp_config target above either way. */
-        char hooks_json[CLI_BUF_1K];
-        snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
-        bool use_hooks_json = cbm_file_exists(hooks_json);
         const char *hook_target = use_hooks_json ? hooks_json : cp;
         if (g_install_plan) {
             plan_record("Codex CLI", "hook", hook_target);
         } else {
             bool hook_ok = true;
-            if (!dry_run) {
-                char command[CLI_BUF_8K];
-                char command_windows[CLI_BUF_8K];
-                if (cbm_build_augment_command(binary_path, command, sizeof(command)) == CLI_OK &&
-                    cbm_build_augment_command_windows(binary_path, command_windows,
-                                                      sizeof(command_windows)) == CLI_OK) {
-                    if (use_hooks_json) {
-                        if (cbm_upsert_paired_lifecycle_hooks_json(
-                                hooks_json, command, command_windows, NULL, CMM_HOOK_TIMEOUT_SEC) ==
-                            CLI_OK) {
-                            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                                hook_ok = false;
-                                record_agent_config_error(false, "Codex CLI", "legacy_hook_cleanup",
-                                                          cp);
-                            }
-                        } else {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install",
-                                                      hooks_json);
-                        }
-                    } else {
-                        if (cbm_upsert_codex_hooks_command(cp, command, command_windows) !=
-                            CLI_OK) {
-                            hook_ok = false;
-                            record_agent_config_error(false, "Codex CLI", "hook_install", cp);
-                        }
-                    }
-                } else {
-                    hook_ok = false;
-                    record_agent_config_error(false, "Codex CLI", "hook_command_build",
-                                              hook_target);
-                }
+            if (!dry_run && use_hooks_json) {
+                hook_ok =
+                    cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
+                                                           NULL, CMM_HOOK_TIMEOUT_SEC) == CLI_OK &&
+                    cbm_reconcile_codex_hooks_command(cp, command, command_windows,
+                                                      CBM_TOML_CODEX_HOOK_REMOVE, false) == CLI_OK;
+            } else if (!dry_run) {
+                hook_ok = cbm_upsert_codex_hooks_command(cp, command, command_windows) == CLI_OK;
             }
-            if (hook_ok) {
+            if (!hook_ok) {
+                record_agent_config_error(false, "Codex CLI", "hook_install", hook_target);
+            } else {
                 printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+                printf("  note: non-managed hooks require /hooks trust; definition changes "
+                       "require re-trust\n");
             }
-            printf("  note: non-managed hooks require /hooks trust; definition changes require "
-                   "re-trust\n");
         }
+    codex_install_done:;
     }
     if (agents->gemini) {
         install_gemini_config(home, binary_path, dry_run);
@@ -9926,11 +9905,18 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     }
 }
 
-int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
+static void cli_clients_print_list(FILE *out);
+
+static int cbm_install_agent_configs_selected(const char *home, const char *binary_path, bool force,
+                                              bool dry_run, const char *client_selection) {
     g_agent_install_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
+    if (client_selection && !cli_clients_apply_selection(client_selection, &agents)) {
+        return CLI_ERR;
+    }
     if (!g_install_plan) {
-        print_detected_agents(&agents, home);
+        print_detected_agents(&agents, home, client_selection);
     }
 
     if (agents.claude_code) {
@@ -9941,16 +9927,23 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
     install_additional_agent_configs(&agents, home, binary_path, force, dry_run);
     bool inherit_claude_session =
         agents.claude_code && !dry_run && cbm_has_complete_claude_session_hooks(home);
-    install_agent_client_registry(home, binary_path, inherit_claude_session, force, dry_run);
+    install_agent_client_registry(home, binary_path, inherit_claude_session, force, dry_run,
+                                  client_selection);
     return g_agent_install_errors == 0 ? CLI_OK : CLI_ERR;
+}
+
+int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
+    return cbm_install_agent_configs_selected(home, binary_path, force, dry_run, NULL);
 }
 
 static int cbm_install_agent_configs_with_previous(const char *home, const char *binary_path,
                                                    const char *previous_managed_binary_path,
-                                                   bool force, bool dry_run) {
+                                                   bool force, bool dry_run,
+                                                   const char *client_selection) {
     const char *saved = g_previous_managed_mcp_command;
     g_previous_managed_mcp_command = previous_managed_binary_path;
-    int result = cbm_install_agent_configs(home, binary_path, force, dry_run);
+    int result =
+        cbm_install_agent_configs_selected(home, binary_path, force, dry_run, client_selection);
     g_previous_managed_mcp_command = saved;
     return result;
 }
@@ -10042,6 +10035,176 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
     }
     return prepare_result;
 }
+
+/* ── Client selection (#1558) ──────────────────────────────────
+ *
+ * `install` configured EVERY detected client. A user who wanted Claude and
+ * Codex had to revert the OpenCode and Cursor integrations by hand, and the
+ * next install silently recreated them. `--clients=claude,codex` restricts it.
+ *
+ * The fixed table plus the shared agent-client registry are the flag's
+ * vocabulary AND its documentation, including tokens nobody would guess (factory-droid,
+ * mistral-vibe, copilot-cli), so `--clients=help` prints every token. A selector whose accepted
+ * values can only be learned from the source is not a usable selector, and an unrecognised token
+ * fails loudly with the list rather than silently configuring nothing. */
+typedef struct {
+    const char *token;
+    size_t offset;
+    const char *display;
+} cli_client_def_t;
+
+#define CLI_CLIENT(field, token, display) \
+    { token, offsetof(cbm_detected_agents_t, field), display }
+
+static const cli_client_def_t CLI_CLIENTS[] = {
+    CLI_CLIENT(claude_code, "claude", "Claude Code"),
+    CLI_CLIENT(claude_desktop, "claude-desktop", "Claude Desktop"),
+    CLI_CLIENT(codex, "codex", "Codex"),
+    CLI_CLIENT(gemini, "gemini", "Gemini"),
+    CLI_CLIENT(zed, "zed", "Zed"),
+    CLI_CLIENT(opencode, "opencode", "OpenCode"),
+    CLI_CLIENT(antigravity, "antigravity", "Antigravity"),
+    CLI_CLIENT(aider, "aider", "Aider"),
+    CLI_CLIENT(kilocode, "kilocode", "Kilo Code"),
+    CLI_CLIENT(vscode, "vscode", "VS Code"),
+    CLI_CLIENT(cursor, "cursor", "Cursor"),
+    CLI_CLIENT(windsurf, "windsurf", "Windsurf"),
+    CLI_CLIENT(augment, "augment", "Augment"),
+    CLI_CLIENT(openclaw, "openclaw", "OpenClaw"),
+    CLI_CLIENT(kiro, "kiro", "Kiro"),
+    CLI_CLIENT(junie, "junie", "Junie"),
+    CLI_CLIENT(hermes, "hermes", "Hermes"),
+    CLI_CLIENT(openhands, "openhands", "OpenHands"),
+    CLI_CLIENT(cline, "cline", "Cline"),
+    CLI_CLIENT(warp, "warp", "Warp"),
+    CLI_CLIENT(qwen, "qwen", "Qwen"),
+    CLI_CLIENT(copilot_cli, "copilot-cli", "Copilot CLI"),
+    CLI_CLIENT(factory_droid, "factory-droid", "Factory Droid"),
+    CLI_CLIENT(crush, "crush", "Crush"),
+    CLI_CLIENT(goose, "goose", "Goose"),
+    CLI_CLIENT(mistral_vibe, "mistral-vibe", "Mistral Vibe"),
+};
+
+enum { CLI_CLIENT_COUNT = sizeof(CLI_CLIENTS) / sizeof(CLI_CLIENTS[0]) };
+
+static bool cli_clients_spec_has_token(const char *spec, const char *expected) {
+    if (!spec) {
+        return true;
+    }
+    if (!expected || !expected[0]) {
+        return false;
+    }
+    size_t expected_len = strlen(expected);
+    const char *cursor = spec;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == ',') {
+            cursor++;
+        }
+        const char *start = cursor;
+        while (*cursor && *cursor != ',') {
+            cursor++;
+        }
+        const char *end = cursor;
+        while (end > start && end[-1] == ' ') {
+            end--;
+        }
+        if ((size_t)(end - start) == expected_len && memcmp(start, expected, expected_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cli_clients_print_list(FILE *out) {
+    (void)fprintf(out, "Available --clients tokens:\n");
+    for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+        (void)fprintf(out, "  %-16s %s\n", CLI_CLIENTS[i].token, CLI_CLIENTS[i].display);
+    }
+    for (size_t i = 0U; i < cbm_agent_client_count(); ++i) {
+        const cbm_agent_client_profile_t *profile = cbm_agent_client_at(i);
+        if (profile) {
+            (void)fprintf(out, "  %-16s %s\n", profile->stable_id, profile->display_name);
+        }
+    }
+    (void)fprintf(out, "\nExample: --clients=claude,codex\n"
+                       "Omit --clients to configure every detected client.\n");
+}
+
+/* Restrict `detected` to the comma-separated token list. Returns false (after
+ * printing the vocabulary) when a token is unknown, so a typo can never be
+ * mistaken for "that client was not installed". */
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected) {
+    if (!spec || !detected || strlen(spec) >= CLI_BUF_1K) {
+        (void)fprintf(stderr, "error: --clients value is missing or too long\n\n");
+        cli_clients_print_list(stderr);
+        return false;
+    }
+    bool wanted[CLI_CLIENT_COUNT];
+    memset(wanted, 0, sizeof(wanted));
+    char buf[CLI_BUF_1K];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    bool any = false;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') {
+            tok++;
+        }
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') {
+            tok[--len] = '\0';
+        }
+        if (!tok[0]) {
+            continue;
+        }
+        any = true;
+        bool matched = false;
+        for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+            if (strcmp(tok, CLI_CLIENTS[i].token) == 0) {
+                wanted[i] = true;
+                matched = true;
+                break;
+            }
+        }
+        matched = matched || cbm_agent_client_by_stable_id(tok) != NULL;
+        if (!matched) {
+            (void)fprintf(stderr, "error: unknown client: %s\n\n", tok);
+            cli_clients_print_list(stderr);
+            return false;
+        }
+    }
+    if (!any) {
+        (void)fprintf(stderr, "error: --clients requires at least one client token\n\n");
+        cli_clients_print_list(stderr);
+        return false;
+    }
+    for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
+        if (!wanted[i]) {
+            *(bool *)((char *)detected + CLI_CLIENTS[i].offset) = false;
+        }
+    }
+    /* Kilo CLI and KiloCode share one installer/config surface. Keep the
+     * provenance bit only when that shared surface was selected so plans and
+     * mutations describe the same clients. */
+    detected->kilo_cli = detected->kilo_cli && detected->kilocode;
+    return true;
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+bool cbm_cli_clients_apply_selection_for_testing(const char *spec,
+                                                 cbm_detected_agents_t *detected) {
+    return cli_clients_apply_selection(spec, detected);
+}
+size_t cbm_cli_clients_count_for_testing(void) {
+    return CLI_CLIENT_COUNT + cbm_agent_client_count();
+}
+const char *cbm_cli_clients_token_for_testing(size_t index) {
+    if (index < CLI_CLIENT_COUNT) {
+        return CLI_CLIENTS[index].token;
+    }
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index - CLI_CLIENT_COUNT);
+    return profile ? profile->stable_id : NULL;
+}
+#endif
 
 /* ── Subcommand: install ──────────────────────────────────────── */
 
@@ -10148,7 +10311,7 @@ const char *cbm_cli_external_manager_name_for_testing(const char *self_path) {
  * running the real install dispatch in record-only mode (no mutation, no
  * network). Returns a heap JSON string (caller frees) or NULL. */
 static char *cbm_build_install_plan_json_options(const char *home, const char *binary_path,
-                                                 bool skip_config) {
+                                                 bool skip_config, const char *client_selection) {
     if (!home || !binary_path) {
         return NULL;
     }
@@ -10158,11 +10321,20 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     cbm_install_plan_t plan = {0};
     if (!skip_config) {
         g_install_plan = &plan;
-        cbm_install_agent_configs(home, binary_path, false, true);
+        int plan_result =
+            cbm_install_agent_configs_selected(home, binary_path, false, true, client_selection);
         g_install_plan = NULL;
+        if (plan_result != CLI_OK) {
+            free(plan.items);
+            return NULL;
+        }
     }
 
     cbm_detected_agents_t det = cbm_detect_agents(home);
+    if (client_selection && !cli_clients_apply_selection(client_selection, &det)) {
+        free(plan.items);
+        return NULL;
+    }
     struct {
         bool flag;
         const char *name;
@@ -10211,7 +10383,8 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (profile && cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (profile && cli_clients_spec_has_token(client_selection, profile->stable_id) &&
+            cbm_agent_client_detect(profile->id, &registry.options)) {
             yyjson_mut_arr_add_str(doc, agents, profile->stable_id);
         }
     }
@@ -10277,7 +10450,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
 }
 
 char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
-    return cbm_build_install_plan_json_options(home, binary_path, false);
+    return cbm_build_install_plan_json_options(home, binary_path, false, NULL);
 }
 
 typedef struct {
@@ -10286,6 +10459,7 @@ typedef struct {
     const char *bin_dir;
     const char *home;
     const char *shell_rc;
+    const char *client_selection;
     const char *prepared_candidate;
     cbm_activation_transaction_t *binary_transaction;
     cli_binary_validator_t binary_validator;
@@ -10369,7 +10543,7 @@ static int cli_install_activate(void *opaque) {
     if (!activation->skip_config) {
         agent_config_rc = cbm_install_agent_configs_with_previous(
             activation->home, activation->config_binary_path, previous_config_binary,
-            activation->force, activation->dry_run);
+            activation->force, activation->dry_run, activation->client_selection);
     }
     if (agent_config_rc != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
@@ -10443,6 +10617,7 @@ int cbm_cmd_install(int argc, char **argv) {
     bool skip_config = false;
     bool skip_binary = false;
     bool force_binary = false;
+    const char *requested_clients = NULL;
     const char *requested_bin_dir = NULL;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -10455,6 +10630,22 @@ int cbm_cmd_install(int argc, char **argv) {
             reset_indexes = true;
         } else if (strcmp(argv[i], "--skip-config") == 0) {
             skip_config = true;
+        } else if (strncmp(argv[i], "--clients=", SLEN("--clients=")) == 0) {
+            requested_clients = argv[i] + SLEN("--clients=");
+            if (!requested_clients[0]) {
+                (void)fprintf(stderr, "error: --clients requires a value\n\n");
+                cli_clients_print_list(stderr);
+                return CLI_TRUE;
+            }
+            if (strcmp(requested_clients, "help") == 0 || strcmp(requested_clients, "list") == 0) {
+                cli_clients_print_list(stdout);
+                return CLI_OK;
+            }
+        } else if (strcmp(argv[i], "--clients") == 0) {
+            /* Bare `--clients` (and `--clients=help`/`list`) print the complete
+             * fixed-table and registry vocabulary. */
+            cli_clients_print_list(stdout);
+            return 0;
         } else if (strcmp(argv[i], "--skip-binary") == 0) {
             /* #1566: the mirror of --skip-config. Configure the agents, leave
              * the binary and PATH alone. */
@@ -10511,11 +10702,22 @@ int cbm_cmd_install(int argc, char **argv) {
         return CLI_TRUE;
     }
 
+    /* Validate before plan generation or any mutation. The same selection is
+     * then passed explicitly through plan and activation paths, so repeated
+     * in-process invocations cannot inherit stale global state. */
+    if (requested_clients) {
+        cbm_detected_agents_t probe = cbm_detect_agents(home);
+        if (!cli_clients_apply_selection(requested_clients, &probe)) {
+            return CLI_TRUE;
+        }
+    }
+
     /* --plan: emit the machine-readable install receipt and exit WITHOUT
      * mutating anything (no config writes, no index deletion, no network) so
      * an agent can inspect exactly what install would touch first (#388). */
     if (plan) {
-        char *json = cbm_build_install_plan_json_options(home, bin_target, skip_config);
+        char *json =
+            cbm_build_install_plan_json_options(home, bin_target, skip_config, requested_clients);
         if (!json) {
             (void)fprintf(stderr, "error: failed to build install plan\n");
             return CLI_TRUE;
@@ -10727,6 +10929,7 @@ int cbm_cmd_install(int argc, char **argv) {
         .bin_dir = bin_dir,
         .home = home,
         .shell_rc = shell_rc,
+        .client_selection = requested_clients,
         .prepared_candidate = prepared_candidate[0] ? prepared_candidate : NULL,
         .binary_transaction = binary_transaction,
         .binary_validator = binary_validator,
@@ -11356,8 +11559,28 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+        char hook_command[CLI_BUF_8K];
+        char hook_command_windows[CLI_BUF_8K];
+        bool hook_command_ok = cbm_build_augment_command(installed_binary, hook_command,
+                                                         sizeof(hook_command)) == CLI_OK;
+        bool hook_preflight_ok =
+            hook_command_ok &&
+            cbm_build_augment_command_windows(installed_binary, hook_command_windows,
+                                              sizeof(hook_command_windows)) == CLI_OK &&
+            cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
+                                              CBM_TOML_CODEX_HOOK_REMOVE, true) == CLI_OK;
+        if (!hook_preflight_ok) {
+            record_agent_config_error(true, "Codex CLI", "hook_preflight", cp);
+            goto codex_toml_done;
+        }
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
                                   cbm_remove_codex_mcp_owned);
+        if (!dry_run &&
+            cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
+                                              CBM_TOML_CODEX_HOOK_REMOVE, false) != CLI_OK) {
+            record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
+        }
+    codex_toml_done:
         uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -11369,15 +11592,10 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             },
             dry_run);
         if (!dry_run) {
-            if (cbm_remove_codex_hooks(cp) != CLI_OK) {
-                record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
-            }
             char hooks_json[CLI_BUF_1K];
-            char hook_command[CLI_BUF_8K];
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
             if (cbm_file_exists(hooks_json) &&
-                (cbm_build_augment_command(installed_binary, hook_command, sizeof(hook_command)) !=
-                     CLI_OK ||
+                (!hook_command_ok ||
                  cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK)) {
                 record_agent_config_error(true, "Codex CLI", "json_hook_uninstall", hooks_json);
             }
@@ -12205,8 +12423,8 @@ static int cli_update_activate_binary(void *opaque) {
     printf("Refreshing agent configurations...\n");
     if (cbm_install_agent_configs_with_previous(
             activation->home, activation->bin_dest,
-            previous_managed_binary_exact ? previous_managed_binary : NULL, true,
-            false) != CLI_OK) {
+            previous_managed_binary_exact ? previous_managed_binary : NULL, true, false,
+            NULL) != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
             &activation->binary_transaction, "update_transaction_config_failure_finalize");
         (void)fprintf(stderr, "error: one or more agent configurations failed; the "
@@ -13925,6 +14143,7 @@ static bool cli_args_have_help(int argc, char **argv) {
 static void print_install_help(void) {
     puts("Usage: codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]");
     puts("                                   [--skip-binary|--force-binary]");
+    puts("                                   [--clients=TOKEN[,TOKEN...]]");
     puts("");
     puts("Install the current binary, MCP agent configs, skills, hooks, and PATH entries.");
     puts("");
@@ -13934,6 +14153,7 @@ static void print_install_help(void) {
     puts("  --force     Overwrite existing installed files where supported");
     puts("  --dry-run   Show actions without modifying files");
     puts("  --plan      Print JSON install plan and do not modify files");
+    puts("  --clients[=LIST]  List client tokens or configure only the selected clients");
     puts("  --skip-config  Install the binary without agent configuration");
     puts("  --skip-binary  Configure agents without copying the binary or changing PATH");
     puts("  --force-binary Copy the binary even when a package manager owns it");
