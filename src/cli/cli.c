@@ -2493,6 +2493,20 @@ static void cbm_opencode_config_path(const char *home_dir, char *out, size_t out
         snprintf(out, out_sz, "%s", custom);
         return;
     }
+    /* OpenCode reads either opencode.json or opencode.jsonc. We always wrote
+     * the .json name, so a user whose real config is .jsonc got a SECOND file
+     * that OpenCode ignores — their MCP server silently never appeared, and the
+     * install looked like it had succeeded (discussion #1560). Prefer whichever
+     * file already exists, .jsonc first since it is the one we used to miss;
+     * with neither present, create .json as before. Other clients in this file
+     * (pochi, kilo) already carry .jsonc paths — OpenCode was the gap. */
+    char candidate[CLI_BUF_1K];
+    int written = snprintf(candidate, sizeof(candidate), "%s/.config/opencode/opencode.jsonc",
+                           home_dir ? home_dir : "");
+    if (written > 0 && (size_t)written < sizeof(candidate) && cbm_file_exists(candidate)) {
+        snprintf(out, out_sz, "%s", candidate);
+        return;
+    }
     snprintf(out, out_sz, "%s/.config/opencode/opencode.json", home_dir);
 }
 

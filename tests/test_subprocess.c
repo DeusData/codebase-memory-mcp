@@ -275,7 +275,45 @@ TEST(subprocess_run_cancel_reaps_child) {
 #endif
 }
 
-/* A spawn of a non-existent binary fails cleanly (no child), not a crash. */
+/* The kernel refusing a spawn with EAGAIN means "not right now", not "never" —
+ * a momentarily full process table on a busy machine. We used to treat it as a
+ * permanent failure, so a git probe or LSP server refused to start for a reason
+ * the user could neither see nor act on, and `subprocess_run_spawn_failure`
+ * failed on loaded CI runners with the contract intact.
+ *
+ * These pin the retry itself rather than the constant. Injecting refusals is
+ * deterministic, so this proves the loop retries on EVERY machine instead of
+ * only on one that happens to be starved. */
+TEST(subprocess_retries_transient_spawn_refusal) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork/EAGAIN path");
+#else
+    /* Fewer refusals than the budget: the spawn must still succeed. */
+    cbm_subprocess_force_spawn_eagain_for_testing(3);
+    cbm_proc_result_t r = run_sh("exit 0", 0);
+    ASSERT_EQ(cbm_subprocess_pending_spawn_eagain_for_testing(), 0);
+    ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(r.exit_code, 0);
+    PASS();
+#endif
+}
+
+TEST(subprocess_gives_up_after_the_retry_budget) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork/EAGAIN path");
+#else
+    /* More refusals than the budget: it must fail rather than retry forever.
+     * A machine still refusing after ~0.6s is genuinely out of capacity, and
+     * failing fast beats hanging. */
+    cbm_subprocess_force_spawn_eagain_for_testing(50);
+    cbm_proc_result_t r = run_sh("exit 0", 0);
+    bool refused = r.outcome == CBM_PROC_SPAWN_FAILED;
+    cbm_subprocess_force_spawn_eagain_for_testing(0); /* never leak into later tests */
+    ASSERT_TRUE(refused);
+    PASS();
+#endif
+}
+
 TEST(subprocess_run_spawn_failure) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX exec semantics");
@@ -1398,6 +1436,8 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
     RUN_TEST(subprocess_run_cancel_reaps_child);
+    RUN_TEST(subprocess_retries_transient_spawn_refusal);
+    RUN_TEST(subprocess_gives_up_after_the_retry_budget);
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
     RUN_TEST(subprocess_spawn_returns_while_child_is_running);

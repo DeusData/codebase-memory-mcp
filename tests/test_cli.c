@@ -7560,6 +7560,40 @@ TEST(cli_opencode_honors_custom_config) {
     PASS();
 }
 
+/* Discussion #1560: OpenCode reads either opencode.json or opencode.jsonc, but
+ * we always wrote the .json name. A user whose real config is .jsonc got a
+ * SECOND file that OpenCode ignores — the MCP server silently never appeared
+ * while the install reported success. Prefer an existing .jsonc; with neither
+ * present, .json is still created, so fresh installs are unchanged. */
+TEST(cli_opencode_prefers_existing_jsonc_config_discussion1560) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-jsonc-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char config_dir[512];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/opencode", tmpdir);
+    test_mkdirp(config_dir);
+    char jsonc_path[640];
+    snprintf(jsonc_path, sizeof(jsonc_path), "%s/opencode.jsonc", config_dir);
+    write_test_file(jsonc_path, "{\n  // user's hand-written config\n  \"theme\": \"dark\"\n}\n");
+
+    char *saved_path = save_test_env("PATH");
+    char *saved_file = save_test_env("OPENCODE_CONFIG");
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("OPENCODE_CONFIG");
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool targets_jsonc = json && strstr(json, "/.config/opencode/opencode.jsonc") != NULL;
+
+    free(json);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("OPENCODE_CONFIG", saved_file);
+    test_rmdir_r(tmpdir);
+    if (!targets_jsonc)
+        FAIL("an existing opencode.jsonc must be the install target, not a new opencode.json");
+    PASS();
+}
+
 TEST(cli_opencode_config_dir_detects_without_retargeting_global_json) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-opencode-dir-XXXXXX");
@@ -14924,6 +14958,7 @@ SUITE(cli) {
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
     RUN_TEST(cli_antigravity_plan_uses_documented_global_files);
     RUN_TEST(cli_opencode_honors_custom_config);
+    RUN_TEST(cli_opencode_prefers_existing_jsonc_config_discussion1560);
     RUN_TEST(cli_opencode_config_dir_detects_without_retargeting_global_json);
     RUN_TEST(cli_kiro_and_hermes_homes_are_honored);
     RUN_TEST(cli_detect_agents_finds_official_kiro_cli_executable);
