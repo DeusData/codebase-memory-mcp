@@ -3056,16 +3056,17 @@ echo "OK 9b-8: double uninstall doesn't crash"
 retire_account_daemon "9b-8-cleanup"
 smoke_rmtree "$DBL_HOME"
 
-# 9b-9: retired release-variant flags must fail cleanly instead of being ignored.
+# 9b-9: retired release-variant flags remain accepted for script compatibility,
+# but must report visibly that they no longer select a different artifact.
 if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
   VARIANT_RC=0
   VARIANT_OUT=$("$BINARY" update --standard --dry-run 2>&1) || VARIANT_RC=$?
-  if [ "$VARIANT_RC" -eq 0 ] ||
-    ! echo "$VARIANT_OUT" | grep -Fqi 'error: unknown update option: --standard'; then
-    echo "FAIL 9b-9: update accepted retired --standard flag or returned no exact error"
+  if [ "$VARIANT_RC" -ne 0 ] ||
+    ! echo "$VARIANT_OUT" | grep -Fqi 'note: --ui/--standard are accepted but no longer do anything; since v0.10.0 there is one build per platform and it always includes the graph UI.'; then
+    echo "FAIL 9b-9: update did not preserve the retired --standard compatibility warning"
     exit 1
   fi
-  echo "OK 9b-9: update rejects retired release-variant flags"
+  echo "OK 9b-9: update accepts retired release-variant flags with an exact warning"
 fi
 
 # 9b-10: invalid persisted UI values must fail before daemon admission or mutation.

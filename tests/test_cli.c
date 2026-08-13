@@ -12843,12 +12843,6 @@ TEST(cli_secure_zero_overwrites_sensitive_storage) {
     PASS();
 }
 
-/* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
- * so `update --ui` — a command people had in scripts and aliases — started
- * failing with "unknown update option". Retiring a choice is fine; breaking the
- * words people already type is not. Both flags must be accepted, do nothing,
- * and say so once. A genuinely unknown flag must still be rejected, or this
- * degenerates into ignoring typos. */
 /* #1554: the skill's `description` contained "Triggers on: " — a colon-space,
  * which YAML reads as a nested-mapping indicator inside an UNQUOTED scalar.
  * Strict readers (js-yaml's load, the frontmatter parser in `npx skills`)
@@ -12902,6 +12896,12 @@ TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
     PASS();
 }
 
+/* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
+ * so `update --ui` — a command people had in scripts and aliases — started
+ * failing with "unknown update option". Retiring a choice is fine; breaking the
+ * words people already type is not. Both flags must be accepted, do nothing,
+ * and say so once. A genuinely unknown flag must still be rejected, or this
+ * degenerates into ignoring typos. */
 TEST(cli_update_accepts_retired_variant_flags_issue1544) {
     char *ui_argv[] = {"--dry-run", "--ui", "--yes"};
     char *standard_argv[] = {"--dry-run", "--standard", "--yes"};

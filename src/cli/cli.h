@@ -564,8 +564,8 @@ int cbm_cmd_install(int argc, char **argv);
 /* uninstall: remove skills, remove editor MCP configs, remove binary. */
 int cbm_cmd_uninstall(int argc, char **argv);
 
-/* update: check latest release, prompt for index deletion, prompt for ui/standard,
- * download and replace binary. */
+/* update: validate options and print the platform installer handoff. The product
+ * process does not download or replace its running binary. */
 int cbm_cmd_update(int argc, char **argv);
 
 /* config: get/set/list/reset runtime config values. */
