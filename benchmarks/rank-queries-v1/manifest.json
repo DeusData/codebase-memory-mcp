@@ -1,0 +1,626 @@
+{
+  "schema_version": 1,
+  "task_set_version": "rank-queries-v1",
+  "default_cutoff": 5,
+  "ground_truth_scope": "Graded judgments cover grep-first authored targets and planted canaries only. Workload-verbatim and adversarial probes are behavioral-only and are never rank-scored.",
+  "judgment_schema": {
+    "consumed_by": "score_ranked_relevance in benchmarks/run_benchmark.py",
+    "fields": {
+      "expected_substring": "required string; matched against the canonical JSON of each ranked item",
+      "required_substrings": "optional list; all must also appear in the same item",
+      "relevance": "required number > 0; graded gain (3 = primary target, 2 = acceptable, 1 = marginal)"
+    }
+  },
+  "authoring_policy": {
+    "rule": "CR-1 symmetric authoring, from upstream docs/EVALUATION_PLAN.md:834-846",
+    "applied": "Every graded target below was located by reading source at the pinned commit (GitHub contents API + text grep), never via the codebase-memory graph. A target the graph then fails to return is a finding, not a defective question.",
+    "verified_at_pin": true
+  },
+  "families": {
+    "A": "workload-realistic - verbatim patterns recovered from 12894 real graph-tool calls",
+    "B": "centrality - grep-first authored targets on real corpora",
+    "C": "adversarial/diagnostic - probes that attack a named hardcoded criterion; behavioral-only",
+    "D": "anti-regression - the existing synthetic fixture oracle, unchanged"
+  },
+  "detail_profiles": {
+    "note": "Crossed with the scorer arms to produce the recall-vs-token frontier. All keys validated against config-keys-v1.json.",
+    "detail-lean": {
+      "search_limit": "10",
+      "trace_max_results": "10",
+      "snippet_max_lines": "40"
+    },
+    "detail-default": {},
+    "detail-rich": {
+      "search_limit": "200",
+      "trace_max_results": "100",
+      "snippet_max_lines": "400"
+    },
+    "paging-compliant": {
+      "follow_has_more": true,
+      "note": "Control arm isolating issue #1382's measured recall collapse 0.723 -> 0.525 from genuine ranking effects."
+    }
+  },
+  "corpora": {
+    "synthetic-rank-v1": {
+      "note": "Family D. Byte-identical to the current hardcoded oracle so historical cells stay comparable.",
+      "queries": [
+        {
+          "id": "central_order_search",
+          "family": "D",
+          "tool": "search_graph",
+          "arguments": {
+            "label": "Function",
+            "name_pattern": "order",
+            "limit": 10
+          },
+          "criterion": "rank the structurally central order workflow ahead of lexical-only decoys",
+          "cutoff": 5,
+          "judgments": [
+            {
+              "expected_substring": "zz_order_core",
+              "relevance": 3
+            }
+          ]
+        }
+      ]
+    },
+    "cosign": {
+      "revision": "83d9ec8f4bdb25d680c2331528503cd85888868f",
+      "queries": [
+        {
+          "id": "attest_production_symbols",
+          "family": "B",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*Attest*",
+            "limit": 10
+          },
+          "criterion": "surface production attestation code despite its path containing the substring 'test'",
+          "cutoff": 5,
+          "judgments": [
+            {
+              "expected_substring": "AttestCommand",
+              "required_substrings": [
+                "cmd/cosign/cli/attest"
+              ],
+              "relevance": 3
+            },
+            {
+              "expected_substring": "attest.go",
+              "relevance": 2
+            }
+          ],
+          "grep_first_evidence": "cmd/cosign/cli/attest/attest.go:44 'type AttestCommand struct', :61 'func (c *AttestCommand) Exec' - read from source at the pinned tree",
+          "attacks": "strstr(file,\"test\") -> SCORE_TEST=-5 at src/mcp/mcp.c:15367; bare strstr(fp,\"test\") at src/store/store.c:14905-14910"
+        },
+        {
+          "id": "bare_test_probe",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "test",
+            "limit": 20
+          },
+          "behavioral_only": true,
+          "criterion": "diagnostic: measure how much of the top-20 for the bare token 'test' is production attestation code versus genuine tests",
+          "note": "The literal token 'test' appears ZERO times as a query in 12894 real calls. This is a diagnostic probe, not representative workload, and is reported as such.",
+          "judgments": []
+        },
+        {
+          "id": "script_coverage_probe",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*script*",
+            "limit": 20
+          },
+          "behavioral_only": true,
+          "criterion": "diagnostic: cosign keeps 49 files under doc/, hack/ and scripts/, all in FAST_SKIP_DIRS; compare recall across index modes",
+          "attacks": "FAST_SKIP_DIRS at src/discover/discover.c:61-68, gated at :448-452",
+          "issues": [
+            "#1406"
+          ],
+          "judgments": []
+        }
+      ]
+    },
+    "jest": {
+      "revision": "f49721c78e195558b40913977c9230f5b7f559d8",
+      "queries": [
+        {
+          "id": "test_is_the_product",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*test*",
+            "limit": 20
+          },
+          "behavioral_only": true,
+          "criterion": "polarity inversion: on a test framework, demoting paths containing 'test' demotes the product itself. A LOW scaffolding@K here is a DEFECT, reported with explicit sign.",
+          "attacks": "every global test penalty: #879 TEST_MUL=0.1, our edge_weight_tests=0.05, SCORE_TEST=-5",
+          "judgments": []
+        },
+        {
+          "id": "jest_coverage_probe",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*",
+            "limit": 50
+          },
+          "behavioral_only": true,
+          "criterion": "coverage: 1711 of 3317 files (51.6%) are predicted lost outside full mode via docs/, e2e/, examples/, scripts/",
+          "issues": [
+            "#1406"
+          ],
+          "judgments": []
+        }
+      ]
+    },
+    "runc": {
+      "revision": "0c87c02ff02123f1bc2cd1b3f850f94e5b8de983",
+      "queries": [
+        {
+          "id": "singular_script_probe",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*script*",
+            "limit": 20
+          },
+          "behavioral_only": true,
+          "criterion": "asymmetry control: runc uses script/ (singular), absent from FAST_SKIP_DIRS, while cosign uses scripts/ (plural), present. Same intent, opposite treatment.",
+          "attacks": "FAST_SKIP_DIRS plural-only entry at src/discover/discover.c:67",
+          "issues": [
+            "#1184",
+            "#1406"
+          ],
+          "judgments": []
+        },
+        {
+          "id": "vendor_absence_probe",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*",
+            "limit": 50
+          },
+          "behavioral_only": true,
+          "criterion": "coverage: 978 of 1305 files (74.9%) are dropped in EVERY mode via the single ALWAYS_SKIP_DIRS entry 'vendor'",
+          "attacks": "ALWAYS_SKIP_DIRS at src/discover/discover.c:31-54; SCORE_VENDORED=-50 at mcp.c:15362 targets the same intent twice",
+          "judgments": []
+        }
+      ]
+    },
+    "flask": {
+      "revision": "6a2f545bfd8ed31e19066a299296917e034aca58",
+      "queries": [
+        {
+          "id": "flask_public_api",
+          "family": "B",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "url_for",
+            "limit": 10
+          },
+          "criterion": "rank the documented public API entry point ahead of incidental matches",
+          "cutoff": 5,
+          "judgments": [
+            {
+              "expected_substring": "url_for",
+              "required_substrings": [
+                "src/flask/app.py"
+              ],
+              "relevance": 3
+            }
+          ],
+          "grep_first_evidence": "src/flask/app.py:1102 'def url_for(' and :109 'class Flask(App)' - read from source at the pinned tree"
+        },
+        {
+          "id": "flask_is_test_probe",
+          "family": "C",
+          "tool": "query_graph",
+          "arguments": {
+            "query": "MATCH (f:Function) WHERE f.is_test = true RETURN count(f) AS n"
+          },
+          "behavioral_only": true,
+          "criterion": "expected to return 0 on a pure pytest project: def.is_test is assigned only for Rust #[test] and C++ GoogleTest",
+          "attacks": "internal/cbm/extract_defs.c:3718,3723",
+          "issues": [
+            "#1294"
+          ],
+          "judgments": []
+        }
+      ]
+    },
+    "redis": {
+      "revision": "0708bdbc0086bea03c5a40d9b606b5fe73d7159d",
+      "queries": [
+        {
+          "id": "hub_utility_contamination",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*",
+            "limit": 20,
+            "sort_by": "relevance"
+          },
+          "behavioral_only": true,
+          "criterion": "H5, the maintainer's own claim: measure what fraction of each scorer's top-20 is a logging/allocation hub (zmalloc, zfree, serverLog, sds*). ORDER BY degree DESC ranks max-fan-in first by construction; PageRank damping redistributes.",
+          "utility_symbols": [
+            "zmalloc",
+            "zfree",
+            "zrealloc",
+            "serverLog",
+            "sdsnew",
+            "sdscatlen",
+            "addReply"
+          ],
+          "grep_first_evidence": "src/zmalloc.h declares 'void zfree(' - read from source at the pinned tree",
+          "attacks": "PR #151 maintainer claim: 'PageRank would rank log.Error() and fmt.Sprintf() as the most important functions'",
+          "judgments": []
+        },
+        {
+          "id": "latest_false_positive",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*latest*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "criterion": "false-positive probe: 1 path under the pinned tree contains 'latest', which bare strstr(fp,\"test\") classifies as a test file",
+          "attacks": "src/store/store.c:14905-14910",
+          "judgments": []
+        }
+      ]
+    },
+    "ripgrep": {
+      "revision": "435f59fc4b43af3ab32f34d53fa34978f393fe52",
+      "note": "Positive control. Rust is the one ecosystem where def.is_test is actually populated, and almost nothing here is in the skip lists, so a metric that moves is attributable to the score rather than to missing coverage.",
+      "queries": [
+        {
+          "id": "rust_is_test_populated",
+          "family": "C",
+          "tool": "query_graph",
+          "arguments": {
+            "query": "MATCH (f:Function) WHERE f.is_test = true RETURN count(f) AS n"
+          },
+          "behavioral_only": true,
+          "criterion": "expected to be NON-zero here, unlike flask: internal/cbm/extract_defs.c:3718 populates is_test for Rust #[test]. This is the control that proves the flask result is a language gap rather than a broken query.",
+          "judgments": []
+        },
+        {
+          "id": "ripgrep_clean_coverage",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*",
+            "limit": 50
+          },
+          "behavioral_only": true,
+          "criterion": "coverage control: only 2 of 237 files are predicted lost across all index modes, so mode-to-mode deltas here isolate score effects",
+          "judgments": []
+        }
+      ]
+    },
+    "codex": {
+      "note": "Family A. Smallest mined-workload source (54 recovered calls); contributes queries but little weight.",
+      "queries": [
+        {
+          "id": "wl_hook",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*on_hook_*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_session",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "Session",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_alternation_hooks",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "PreToolUse|Hook|run_hooks|hooks",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        }
+      ]
+    },
+    "codebase-memory-mcp": {
+      "note": "Family A. Patterns are verbatim from real recovered calls against this repository.",
+      "queries": [
+        {
+          "id": "wl_pagerank",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*pagerank*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_config_set",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*config*set*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_vector_search",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*vector_search*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_envscan",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*envscan*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_incremental",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*incremental*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_handle_prefix",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "handle_*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_alternation_quarantine",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "quarantine_corrupt_store|resolve_store_internal|cbm_store_check_integrity_full",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "note": "Alternation of 2-6 symbol names is the second most common real query shape.",
+          "judgments": []
+        },
+        {
+          "id": "wl_negative_control",
+          "family": "A",
+          "tool": "query_graph",
+          "arguments": {
+            "query": "MATCH (n:DefinitelyMissingLabel) RETURN n.name LIMIT 5"
+          },
+          "behavioral_only": true,
+          "note": "A deliberate zero-row probe already present in the recovered corpus; reused as the negative control.",
+          "judgments": []
+        }
+      ]
+    },
+    "ai-session-search": {
+      "note": "Family A plus the flaky-repeat set. 8558 real calls, the largest mined source.",
+      "queries": [
+        {
+          "id": "wl_message_search",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*MessageSearch*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_session_search",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*SessionSearch*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_run_search",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "run_search",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "flaky_max_hits_per_page",
+          "family": "A",
+          "tool": "search_code",
+          "arguments": {
+            "pattern": "max_hits_per_page",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "repetitions": 10,
+          "criterion": "stability: this exact call returned zero results 18 of 54 times against a fixed index in recovered history. Measures result-count stability, not relevance.",
+          "judgments": []
+        },
+        {
+          "id": "flaky_todo",
+          "family": "A",
+          "tool": "search_code",
+          "arguments": {
+            "pattern": "TODO",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "repetitions": 10,
+          "criterion": "stability: returned zero 10 of 20 times in recovered history",
+          "judgments": []
+        },
+        {
+          "id": "nl_query_timeout",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "timeout deadline busy wait interruption request timeout",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "criterion": "natural-language probe: all 3 natural-language queries in the entire recovered corpus returned zero results",
+          "judgments": []
+        }
+      ]
+    },
+    "autorun": {
+      "note": "Family A. 648 real calls; highest observed query_graph zero-result rate at 33.3%.",
+      "queries": [
+        {
+          "id": "wl_task",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*task*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_daemon",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*daemon*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_dedup",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*dedup*",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "wl_alternation_stop",
+          "family": "A",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "continue_running|enforce_stop|deliver_pending|pending_stop|deliver",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "judgments": []
+        },
+        {
+          "id": "nl_query_staleness",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "task staleness reminder injection tool_calls_since_task_update",
+            "limit": 10
+          },
+          "behavioral_only": true,
+          "criterion": "verbatim natural-language query from recovered history; returned zero results",
+          "judgments": []
+        }
+      ]
+    },
+    "scikit-learn": {
+      "queries": [
+        {
+          "id": "train_test_split_is_production_api",
+          "family": "B",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "*train_test_split*",
+            "limit": 10
+          },
+          "criterion": "surface the public train_test_split API despite its name containing the substring 'test'",
+          "cutoff": 5,
+          "judgments": [
+            {
+              "expected_substring": "train_test_split",
+              "required_substrings": [
+                "model_selection"
+              ],
+              "relevance": 3
+            }
+          ],
+          "grep_first_evidence": "sklearn/model_selection/_split.py defines train_test_split as public API and sklearn/model_selection/__init__.py exports it - read from source at the pinned tree, never through the graph",
+          "attacks": "strstr(file,\"test\") -> SCORE_TEST=-5 at src/mcp/mcp.c:15367; bare strstr(fp,\"test\") at src/store/store.c:14905-14910. Both fire on a public API symbol here."
+        },
+        {
+          "id": "bare_test_probe",
+          "family": "C",
+          "tool": "search_graph",
+          "arguments": {
+            "pattern": "test",
+            "limit": 20
+          },
+          "behavioral_only": true,
+          "criterion": "diagnostic: measure how much of the top-20 for the bare token 'test' is production estimator and model-selection API versus scaffolding",
+          "note": "Pairs with the identical probe on cosign and flask. Same query, three domains: cosign where 'test' is a substring of production names, flask where it is scaffolding, sklearn where it is API vocabulary.",
+          "judgments": []
+        }
+      ]
+    }
+  },
+  "authoring_backlog": {
+    "note": "Graded Family B judgments currently seed 2 corpora (cosign, flask). Before the campaign reports MRR/nDCG per corpus, each remaining popularity-cohort corpus needs grep-first authored targets.",
+    "pending": [
+      "jest",
+      "runc",
+      "redis",
+      "ripgrep"
+    ],
+    "procedure": "Read source at the pinned commit via text search only, never via the graph (CR-1). Record the file:line evidence in grep_first_evidence. Behavioral-only probes need no judgments and are unaffected."
+  }
+}

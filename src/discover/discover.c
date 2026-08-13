@@ -49,16 +49,24 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Deploy */
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
-    ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+    /* Vendored / third-party code (always skip — use CBM_MODE_DEP for dep source) */
+    "vendor", "vendored", "third_party", "thirdparty", "3rdparty", "external",
+    /* Misc */
+    ".codebase-memory", ".qdrant_code_embeddings", ".tmp", NULL};
+
+/* Prefix patterns for vendored directory names that vary (e.g. "vendored_libs",
+ * "vendor-bundle"). Checked when exact match fails. Kept short for performance. */
+static const char *VENDORED_DIR_PREFIXES[] = {"vendor", "3rdparty", "third_party", "thirdparty",
+                                              NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    "generated", "gen",           "auto-generated", "fixtures",     "testdata",   "test_data",
+    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",   "docs",
+    "doc",       "documentation", "examples",       "example",      "samples",    "sample",
+    "assets",    "static",        "public",         "media",        "migrations", "seeds",
+    "e2e",       "integration",   "locale",         "locales",      "i18n",       "l10n",
+    "scripts",   "tools",         "hack",           "bin",          "build",      "out",
+    NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
@@ -96,17 +104,17 @@ static const char *FAST_PATTERNS[] = {".d.ts",      ".bundle.", ".chunk.", ".gen
 
 /* ── Ignored JSON filenames ──────────────────────── */
 
+/* package.json and composer.json REMOVED — they contain dep declarations
+ * needed by pass_configlink and dep auto-discovery. Tree-sitter JSON
+ * grammar + extract_defs.c already handle them correctly. */
 static const char *IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
+    "package-lock.json", "tsconfig.json",     "jsconfig.json",      "composer.lock",
+    "yarn.lock",         "openapi.json",      "swagger.json",       "jest.config.json",
+    ".eslintrc.json",    ".prettierrc.json",  ".babelrc.json",      "tslint.json",
+    "angular.json",      "firebase.json",     "renovate.json",      "lerna.json",
+    "turbo.json",        ".stylelintrc.json", "pnpm-lock.json",     "deno.json",
+    "biome.json",        "devcontainer.json", ".devcontainer.json", "launch.json",
+    "settings.json",     "extensions.json",   "tasks.json",         NULL};
 
 /* ── Helper: check if string is in NULL-terminated array ─────────── */
 
@@ -337,16 +345,107 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
 
 /* ── Public filter functions ─────────────────────── */
 
+/* DEP mode: minimal skip list — only VCS, IDE, caches, test dirs.
+ * Keeps vendor/, dist/, bin/, scripts/, third_party/ for dep source. */
+static const char *DEP_SKIP_DIRS[] = {
+    ".git",    ".hg",         ".svn",        ".idea",         ".vs",
+    ".vscode", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".cache",  "htmlcov",     "coverage",    "node_modules",  ".next",
+    ".nuxt",   ".angular",    "__tests__",   "__mocks__",     "__snapshots__",
+    NULL};
+
+/* Check if dirname starts with any vendored prefix (e.g. "vendor-bundle",
+ * "vendored_libs", "third_party_deps"). Catches naming variations that
+ * exact match misses. */
+static bool has_vendored_prefix(const char *dirname) {
+    for (int i = 0; VENDORED_DIR_PREFIXES[i]; i++) {
+        size_t plen = strlen(VENDORED_DIR_PREFIXES[i]);
+        if (strncmp(dirname, VENDORED_DIR_PREFIXES[i], plen) == 0) {
+            /* Match if dirname equals prefix or next char is a separator */
+            char next = dirname[plen];
+            if (next == '\0' || next == '-' || next == '_' || next == '.') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* All three of these derive from CBM_INDEX_MODE_TABLE (src/discover/discover.h),
+ * so the emitted name, the accepted spelling, and the error text cannot drift. */
+
+const char *cbm_index_mode_name(cbm_index_mode_t mode) {
+#define CBM_INDEX_MODE_NAME_CASE(enum_value, spelling, caller_selectable) \
+    case enum_value:                                                      \
+        return spelling;
+    switch (mode) {
+        CBM_INDEX_MODE_TABLE(CBM_INDEX_MODE_NAME_CASE)
+    default:
+        return "unknown";
+    }
+#undef CBM_INDEX_MODE_NAME_CASE
+}
+
+bool cbm_index_mode_from_name(const char *name, cbm_index_mode_t *out,
+                              bool *caller_selectable_out) {
+    if (!name) {
+        return false;
+    }
+#define CBM_INDEX_MODE_PARSE_ARM(enum_value, spelling, caller_selectable) \
+    if (strcmp(name, spelling) == 0) {                                    \
+        if (out) {                                                        \
+            *out = (enum_value);                                          \
+        }                                                                 \
+        if (caller_selectable_out) {                                      \
+            *caller_selectable_out = (caller_selectable);                 \
+        }                                                                 \
+        return true;                                                      \
+    }
+    CBM_INDEX_MODE_TABLE(CBM_INDEX_MODE_PARSE_ARM)
+#undef CBM_INDEX_MODE_PARSE_ARM
+    return false;
+}
+
+int cbm_index_mode_accepted(char *buf, int bufsize) {
+    if (!buf || bufsize <= 0) {
+        return 0;
+    }
+    buf[0] = '\0';
+    int pos = 0;
+#define CBM_INDEX_MODE_ACCEPTED_ARM(enum_value, spelling, caller_selectable)                    \
+    if (caller_selectable) {                                                                    \
+        int written =                                                                           \
+            snprintf(buf + pos, (size_t)(bufsize - pos), "%s%s", pos > 0 ? "|" : "", spelling); \
+        if (written > 0 && written < bufsize - pos) {                                           \
+            pos += written;                                                                     \
+        }                                                                                       \
+    }
+    CBM_INDEX_MODE_TABLE(CBM_INDEX_MODE_ACCEPTED_ARM)
+#undef CBM_INDEX_MODE_ACCEPTED_ARM
+    return pos;
+}
+
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
     if (!dirname) {
         return false;
+    }
+
+    if (mode == CBM_MODE_DEP) {
+        return str_in_list(dirname, DEP_SKIP_DIRS);
     }
 
     if (str_in_list(dirname, ALWAYS_SKIP_DIRS)) {
         return true;
     }
 
-    /* Fast discovery applies to both MODERATE and FAST — only FULL keeps everything. */
+    /* Prefix-based vendored detection catches variations like
+     * "vendored_libs", "vendor-bundle", "third_party_deps". */
+    if (has_vendored_prefix(dirname)) {
+        return true;
+    }
+
+    /* Fast discovery applies to MODERATE, FAST (and DEP, though DEP already
+     * returned above via DEP_SKIP_DIRS) — only FULL keeps everything. */
     if (mode != CBM_MODE_FULL) {
         if (str_in_list(dirname, FAST_SKIP_DIRS)) {
             return true;
@@ -392,8 +491,30 @@ bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode) {
     return false;
 }
 
+/* DEP mode skip patterns: skip tests/mocks but NOT .d.ts (TS API surface) */
+static const char *DEP_SKIP_PATTERNS[] = {
+    ".spec.",         ".test.",      ".stories.", "mock_",   "_mock.",
+    "_test_helpers.", ".generated.", ".pb.go",    "_pb2.py", NULL};
+
 bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode) {
-    if (!filename || mode == CBM_MODE_FULL) {
+    /* DEP uses its own DEP_SKIP_PATTERNS (keeping the .d.ts TypeScript API
+     * surface), and only FAST runs the generic FAST_PATTERNS. MODERATE keeps
+     * .pb.go and friends while still getting breadth filtering from
+     * cbm_should_skip_dir/suffix/filename above. */
+    if (!filename) {
+        return false;
+    }
+
+    if (mode == CBM_MODE_DEP) {
+        for (int i = 0; DEP_SKIP_PATTERNS[i]; i++) {
+            if (str_contains(filename, DEP_SKIP_PATTERNS[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (mode != CBM_MODE_FAST) {
         return false;
     }
 
@@ -500,6 +621,20 @@ static void file_list_add_ignored(file_list_t *fl, const char *rel_path, const c
 
 static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, CBMLanguage lang,
                    int64_t size) {
+    /* Saturate the count at exactly max_files, then stop walking.
+     *
+     * The parents disagreed: the branch counted ONE PAST the cap, upstream stops
+     * AT it. Upstream's contract wins, so count is min(actual, max_files) — the
+     * standard saturating semantic. The branch's rationale was that "one past"
+     * lets a caller tell "over the limit" from "at the limit", but the returned
+     * STATUS already carries exactly that (CBM_DISCOVER_LIMIT_EXCEEDED vs
+     * CBM_DISCOVER_OK), so the extra count added no information while producing
+     * a value that is not a real count and that a caller could mistake for one.
+     *
+     * max_files == 0 DOES reach here and is honored as a limit of zero: the
+     * first indexable file sets limit_exceeded, which is what the published
+     * contract promises. "0 = unlimited" is applied by config-layer callers
+     * before this point, never by the walker. */
     if (fl->max_files >= 0 && fl->count >= fl->max_files) {
         fl->limit_exceeded = true;
         return;
@@ -593,11 +728,10 @@ static bool dir_is_cache_tree(const char *abs_path) {
     while (n > 1 && (cache[n - 1] == '/' || cache[n - 1] == '\\')) {
         n--;
     }
-    if (strncmp(abs_path, cache, n) != 0) {
-        return false;
-    }
-    /* Boundary-aware so "<cache>x" is not treated as living under "<cache>". */
-    return abs_path[n] == '\0' || abs_path[n] == '/' || abs_path[n] == '\\';
+    /* Prune the cache entry itself. The walker never reaches its descendants,
+     * while repositories that intentionally live below CBM_CACHE_DIR keep
+     * their own subdirectories discoverable. */
+    return strlen(abs_path) == n && strncmp(abs_path, cache, n) == 0;
 }
 
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
@@ -725,28 +859,6 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     return lang;
 }
 
-/* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */
-static int wide_stat(const char *path, struct stat *st) {
-#ifdef _WIN32
-    wchar_t *wpath = cbm_path_to_wide(path);
-    if (!wpath) {
-        return CBM_NOT_FOUND;
-    }
-    struct _stat64 wst;
-    int ret = _wstat64(wpath, &wst);
-    free(wpath);
-    if (ret != 0) {
-        return CBM_NOT_FOUND;
-    }
-    st->st_mode = wst.st_mode;
-    st->st_size = wst.st_size;
-    st->st_mtime = wst.st_mtime;
-    return 0;
-#else
-    return stat(path, st);
-#endif
-}
-
 /* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
  * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
  * discovery from walking through a junction that points outside the project
@@ -761,7 +873,7 @@ static int safe_stat(const char *abs_path, struct stat *st) {
             return CBM_NOT_FOUND;
         }
     }
-    return wide_stat(abs_path, st);
+    return cbm_stat(abs_path, st);
 #else
     if (lstat(abs_path, st) != 0) {
         return CBM_NOT_FOUND;
@@ -822,7 +934,7 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
     char gi_path[CBM_SZ_4K];
     snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", frame->dir);
     struct stat gi_st;
-    if (wide_stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
+    if (cbm_stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
         return cbm_gitignore_load(gi_path);
     }
     return NULL;
@@ -1020,7 +1132,7 @@ static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size
     char dot_git[CBM_SZ_4K];
     snprintf(dot_git, sizeof(dot_git), "%s/.git", repo_path);
     struct stat st;
-    if (wide_stat(dot_git, &st) != 0) {
+    if (cbm_stat(dot_git, &st) != 0) {
         return false;
     }
     if (S_ISDIR(st.st_mode)) {
@@ -1134,7 +1246,7 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
 
     /* Verify directory exists */
     struct stat st;
-    if (wide_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (cbm_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         return CBM_DISCOVER_ERROR;
     }
 
@@ -1163,7 +1275,7 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     gitignore = cbm_gitignore_load(gi_path);
     if (is_git_repo) {
         path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
-        has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
+        has_git_config = cbm_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
 
         char exc_path[CBM_SZ_4K];
         path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");
@@ -1195,7 +1307,21 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         cbmignore = cbm_gitignore_load(gi_path);
     }
 
-    /* Walk */
+    /* Walk.
+     *
+     * max_files 0 is a REAL limit of zero here, not a "no cap" sentinel. The
+     * published contract says LIMIT_EXCEEDED is returned when at least
+     * max_files + 1 indexable files exist (src/discover/discover.h), so with 0
+     * a single file is already over the limit. The "0 = unlimited" spelling is a
+     * CONFIGURATION convention (auto_index_limit, auto_dep_limit), and every
+     * config-layer caller already applies it before reaching this walker:
+     * cbm_mcp_auto_index_within_limit returns early when file_limit <= 0
+     * (src/mcp/mcp.c), and depindex guards on dependency_file_limit > 0
+     * (src/depindex/depindex.c). Mapping 0 to no-cap HERE inverted the meaning
+     * of an explicit zero limit, so auto_index_limit=0 admitted every repository
+     * instead of admitting none, and the daemon's admission control silently
+     * stopped enforcing anything. A caller wanting an uncapped exact count
+     * passes INT_MAX, or uses cbm_discover(). */
     file_list_t fl = {
         .max_files = count_only ? max_files : -1,
         .deadline_ms = count_only ? deadline_ms : 0,

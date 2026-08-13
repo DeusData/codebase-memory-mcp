@@ -14,6 +14,10 @@
 //   - Records: header (varint count + serial types) + body (column values)
 //   - Varints: 1-9 bytes, big-endian, MSB continuation
 
+#if !defined(_GNU_SOURCE) && (defined(__linux__) || defined(__GLIBC__))
+#define _GNU_SOURCE /* glibc qsort_r declaration */
+#endif
+
 #include "sqlite_writer.h"
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
@@ -460,7 +464,16 @@ typedef struct {
     PageRef *leaves;
     int leaf_count;
     int leaf_cap;
+    bool ok;
 } PageBuilder;
+
+static bool write_bytes_at(FILE *fp, long offset, const void *data, size_t len) {
+    return fp && data && fseek(fp, offset, SEEK_SET) == 0 && fwrite(data, SKIP_ONE, len, fp) == len;
+}
+
+static bool write_page_at(FILE *fp, uint32_t page_num, const uint8_t page[CBM_PAGE_SIZE]) {
+    return write_bytes_at(fp, (long)(page_num - SKIP_ONE) * CBM_PAGE_SIZE, page, CBM_PAGE_SIZE);
+}
 
 static void pb_init(PageBuilder *pb, FILE *fp, uint32_t start_page, bool is_index) {
     pb->fp = fp;
@@ -475,6 +488,7 @@ static void pb_init(PageBuilder *pb, FILE *fp, uint32_t start_page, bool is_inde
     pb->leaves = NULL;
     pb->leaf_count = 0;
     pb->leaf_cap = 0;
+    pb->ok = true;
 }
 
 static void pb_free(PageBuilder *pb) {
@@ -484,11 +498,17 @@ static void pb_free(PageBuilder *pb) {
         }
         free(pb->leaves);
     }
+    pb->leaves = NULL;
+    pb->leaf_count = 0;
+    pb->leaf_cap = 0;
 }
 
 // Flush current leaf page to file
 static void pb_flush_leaf(PageBuilder *pb) {
     if (pb->cell_count == 0) {
+        return;
+    }
+    if (!pb->ok) {
         return;
     }
 
@@ -504,8 +524,10 @@ static void pb_flush_leaf(PageBuilder *pb) {
     pb->next_page = cbm_skip_pending_byte(pb->next_page);
     uint32_t page_num = pb->next_page;
     long offset = (long)(page_num - SKIP_ONE) * CBM_PAGE_SIZE;
-    (void)fseek(pb->fp, offset, SEEK_SET);
-    (void)fwrite(pb->page, SKIP_ONE, CBM_PAGE_SIZE, pb->fp);
+    if (!write_bytes_at(pb->fp, offset, pb->page, CBM_PAGE_SIZE)) {
+        pb->ok = false;
+        return;
+    }
 
     // Record this leaf for interior page building
     if (pb->leaf_count >= pb->leaf_cap) {
@@ -513,15 +535,8 @@ static void pb_flush_leaf(PageBuilder *pb) {
         pb->leaf_cap = old_cap == 0 ? INITIAL_LEAF_CAP : old_cap * GROWTH_FACTOR;
         void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
         if (!tmp) {
-            /* Leave a CONSISTENT empty state: leaf_count stale at >=1 with a
-             * NULL leaves array walked pb_finalize_* straight into
-             * leaves[0] (null deref, clang-analyzer traced it) whenever the
-             * final cell block was already flushed. Empty state routes every
-             * finalize path to its existing root=0 failure return. */
-            free(pb->leaves);
-            pb->leaves = NULL;
-            pb->leaf_count = 0;
-            pb->leaf_cap = 0;
+            pb_free(pb);
+            pb->ok = false;
             return;
         }
         pb->leaves = (PageRef *)tmp;
@@ -552,6 +567,10 @@ static bool pb_cell_fits(PageBuilder *pb, int cell_len) {
 // For table leaves: varint(payload_len) + varint(rowid) + payload
 // For index leaves: varint(payload_len) + payload
 static void pb_add_cell(PageBuilder *pb, const uint8_t *cell, int cell_len) {
+    if (!pb->ok || !cell || cell_len <= 0 || !pb_cell_fits(pb, cell_len)) {
+        pb->ok = false;
+        return;
+    }
     // Write cell content (grows down)
     pb->content_offset -= cell_len;
     memcpy(pb->page + pb->content_offset, cell, cell_len);
@@ -586,8 +605,14 @@ static int build_interior_cell(const PageRef *child, bool is_index, uint8_t *cel
         put_u32(cell_buf, child->page_num);
         return BTREE_PTR_SIZE + put_varint(cell_buf + BTREE_PTR_SIZE, child->max_key);
     }
+    if (!child->sep_cell || child->sep_cell_len <= 0) {
+        return 0;
+    }
     int clen = BTREE_PTR_SIZE + child->sep_cell_len;
     uint8_t *data = (uint8_t *)malloc(clen);
+    if (!data) {
+        return 0;
+    }
     put_u32(data, child->page_num);
     memcpy(data + 4, child->sep_cell, child->sep_cell_len);
     *out_heap = data;
@@ -609,16 +634,23 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
     page[HDR_FRAGBYTES_OFF] = 0;
     put_u32(page + HDR_RIGHTCHILD_OFF, right_child_page);
 
-    (void)fseek(pb->fp, (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE, SEEK_SET);
-    (void)fwrite(page, SKIP_ONE, CBM_PAGE_SIZE, pb->fp);
+    if (!write_page_at(pb->fp, pnum, page)) {
+        pb->ok = false;
+        return CBM_NOT_FOUND;
+    }
 
     if (parent_count >= *parent_cap) {
         int old_pcap = *parent_cap;
         *parent_cap = old_pcap == 0 ? INITIAL_PARENT_CAP : old_pcap * GROWTH_FACTOR;
         PageRef *tmp = (PageRef *)realloc(*parents, *parent_cap * sizeof(PageRef));
         if (!tmp) {
+            for (int j = 0; j < parent_count; j++) {
+                free((*parents)[j].sep_cell);
+            }
             free(*parents);
             *parents = NULL;
+            *parent_cap = 0;
+            pb->ok = false;
             return CBM_NOT_FOUND;
         }
         *parents = tmp;
@@ -630,6 +662,10 @@ static int write_interior_page(PageBuilder *pb, uint8_t *page, int cell_count, i
     if (is_index && children[right_child_idx].sep_cell) {
         int slen = children[right_child_idx].sep_cell_len;
         (*parents)[parent_count].sep_cell = (uint8_t *)malloc(slen);
+        if (!(*parents)[parent_count].sep_cell) {
+            pb->ok = false;
+            return CBM_NOT_FOUND;
+        }
         memcpy((*parents)[parent_count].sep_cell, children[right_child_idx].sep_cell, slen);
         (*parents)[parent_count].sep_cell_len = slen;
     } else {
@@ -651,13 +687,16 @@ static void free_children(PageRef *children, int child_count, const PageRef *lea
 
 // Fill an interior page with cells from children[*idx..child_count-2].
 // Updates cell_count, content_offset, ptr_offset, and *idx.
-static void fill_interior_page(uint8_t *page, const PageRef *children, int child_count,
+static bool fill_interior_page(uint8_t *page, const PageRef *children, int child_count,
                                bool is_index, int *idx, int *cell_count, int *content_offset,
                                int *ptr_offset) {
     while (*idx < child_count - SKIP_ONE) {
         uint8_t tbuf[INTERIOR_CELL_BUF];
         uint8_t *heap_cell = NULL;
         int clen = build_interior_cell(&children[*idx], is_index, tbuf, &heap_cell);
+        if (clen <= 0) {
+            return false;
+        }
         uint8_t *cell_data = heap_cell ? heap_cell : tbuf;
 
         int available = *content_offset - *ptr_offset - CELL_PTR_SIZE;
@@ -674,6 +713,7 @@ static void fill_interior_page(uint8_t *page, const PageRef *children, int child
         free(heap_cell);
         (*idx)++;
     }
+    return true;
 }
 
 static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
@@ -700,8 +740,11 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
             int content_offset = CBM_PAGE_SIZE;
             int ptr_offset = BTREE_INTERIOR_HDR;
 
-            fill_interior_page(page, children, child_count, is_index, &i, &cell_count,
-                               &content_offset, &ptr_offset);
+            if (!fill_interior_page(page, children, child_count, is_index, &i, &cell_count,
+                                    &content_offset, &ptr_offset)) {
+                pb->ok = false;
+                break;
+            }
 
             int right_child_idx = (i < child_count - SKIP_ONE) ? i : child_count - SKIP_ONE;
             uint32_t right_child_page = 0;
@@ -718,11 +761,16 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
                                                right_child_page, children, right_child_idx,
                                                is_index, &parents, parent_count, &parent_cap);
             if (parent_count < 0) {
+                pb->ok = false;
                 break;
             }
         }
 
         free_children(children, child_count, pb->leaves);
+        if (!pb->ok) {
+            free_children(parents, parent_count > 0 ? parent_count : 0, pb->leaves);
+            return 0;
+        }
         children = parents;
         child_count = parent_count;
     }
@@ -879,6 +927,7 @@ static uint32_t write_overflow_pages(FILE *fp, uint32_t *next_page, const uint8_
 
     int offset = 0;
     while (offset < data_len) {
+        *next_page = cbm_skip_pending_byte(*next_page);
         uint32_t pnum = (*next_page)++;
         if (first_page == 0) {
             first_page = pnum;
@@ -888,8 +937,9 @@ static uint32_t write_overflow_pages(FILE *fp, uint32_t *next_page, const uint8_
         if (prev_next_ptr_offset >= 0) {
             uint8_t ptr[BTREE_PTR_SIZE];
             put_u32(ptr, pnum);
-            (void)fseek(fp, prev_next_ptr_offset, SEEK_SET);
-            (void)fwrite(ptr, SKIP_ONE, BTREE_PTR_SIZE, fp);
+            if (!write_bytes_at(fp, prev_next_ptr_offset, ptr, BTREE_PTR_SIZE)) {
+                return 0;
+            }
         }
 
         int chunk = data_len - offset;
@@ -904,8 +954,9 @@ static uint32_t write_overflow_pages(FILE *fp, uint32_t *next_page, const uint8_
 
         long page_offset = (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE;
         prev_next_ptr_offset = page_offset;
-        (void)fseek(fp, page_offset, SEEK_SET);
-        (void)fwrite(page, SKIP_ONE, CBM_PAGE_SIZE, fp);
+        if (!write_bytes_at(fp, page_offset, page, CBM_PAGE_SIZE)) {
+            return 0;
+        }
 
         offset += chunk;
     }
@@ -1057,14 +1108,13 @@ static bool pb_ensure_leaf_cap(PageBuilder *pb) {
     pb->leaf_cap = pb->leaf_cap == 0 ? INITIAL_LEAF_CAP : pb->leaf_cap * GROWTH_FACTOR;
     void *tmp = realloc(pb->leaves, (size_t)pb->leaf_cap * sizeof(PageRef));
     if (!tmp) {
-        /* Same consistent-empty contract as pb_flush_leaf's growth path. */
-        free(pb->leaves);
-        pb->leaves = NULL;
-        pb->leaf_count = 0;
-        pb->leaf_cap = 0;
+        pb_free(pb);
+        pb->ok = false;
         return false;
     }
     pb->leaves = (PageRef *)tmp;
+    memset(&pb->leaves[pb->leaf_count], 0,
+           ((size_t)pb->leaf_cap - (size_t)pb->leaf_count) * sizeof(PageRef));
     return true;
 }
 
@@ -1102,8 +1152,11 @@ static int get_varint(const uint8_t *buf, uint64_t *out) {
 // If an index cell's payload exceeds X, rewrite it to spill the tail to
 // overflow pages: varint(payload_len) + payload[0..local) + u32(first_ovfl).
 // Returns the (possibly new, malloc'd) cell; frees the original when replaced.
-static uint8_t *overflowize_index_cell(FILE *fp, uint32_t *next_page, uint8_t *cell,
-                                       int *cell_len) {
+static uint8_t *overflowize_index_cell(FILE *fp, uint32_t *next_page, uint8_t *cell, int *cell_len,
+                                       bool *ok) {
+    if (!*ok) {
+        return cell;
+    }
     uint64_t plen = 0;
     int vlen = get_varint(cell, &plen);
     if ((int64_t)plen <= INDEX_OVERFLOW_MAX_LOCAL) {
@@ -1114,10 +1167,15 @@ static uint8_t *overflowize_index_cell(FILE *fp, uint32_t *next_page, uint8_t *c
     int local = (k <= INDEX_OVERFLOW_MAX_LOCAL) ? (int)k : INDEX_OVERFLOW_MIN_LOCAL;
     uint32_t first_ovfl =
         write_overflow_pages(fp, next_page, cell + vlen + local, (int)plen - local);
+    if (first_ovfl == 0) {
+        *ok = false;
+        return cell;
+    }
     int nlen = vlen + local + BTREE_PTR_SIZE;
     uint8_t *data = (uint8_t *)malloc((size_t)nlen);
     if (!data) {
-        return cell; /* fall back to the (broken) inline form on OOM */
+        *ok = false;
+        return cell;
     }
     memcpy(data, cell, (size_t)(vlen + local));
     put_u32(data + vlen + local, first_ovfl);
@@ -1148,6 +1206,7 @@ static void pb_add_table_cell_with_flush(PageBuilder *pb, int64_t rowid, const u
         uint32_t overflow_page = write_overflow_pages(pb->fp, &pb->next_page, payload + local_len,
                                                       payload_len - local_len);
         if (overflow_page == 0) {
+            pb->ok = false;
             return; // overflow write failed
         }
 
@@ -1158,11 +1217,13 @@ static void pb_add_table_cell_with_flush(PageBuilder *pb, int64_t rowid, const u
     }
 
     if (!cell) {
+        pb->ok = false;
         return;
     }
 
     if (!pb_cell_fits(pb, cell_len) && pb->cell_count > 0) {
         if (!pb_ensure_leaf_cap(pb)) {
+            pb->ok = false;
             free(cell);
             return;
         }
@@ -1170,17 +1231,35 @@ static void pb_add_table_cell_with_flush(PageBuilder *pb, int64_t rowid, const u
         pb->leaves[pb->leaf_count].sep_cell = NULL;
         pb->leaves[pb->leaf_count].sep_cell_len = 0;
         pb_flush_leaf(pb);
+        if (!pb->ok) {
+            free(cell);
+            return;
+        }
     }
 
+    if (!pb_cell_fits(pb, cell_len)) {
+        pb->ok = false;
+        free(cell);
+        return;
+    }
     pb_add_cell(pb, cell, cell_len);
     free(cell);
 }
 
 // Finalize a table PageBuilder: flush last leaf and build interior pages.
 static uint32_t pb_finalize_table(PageBuilder *pb, uint32_t *next_page, int64_t last_rowid) {
+    if (!pb->ok) {
+        pb_free(pb);
+        return 0;
+    }
     if (pb->cell_count > 0) {
-        pb_ensure_leaf_cap(pb);
+        if (!pb_ensure_leaf_cap(pb)) {
+            pb->ok = false;
+            pb_free(pb);
+            return 0;
+        }
         if (!pb->leaves) {
+            pb->ok = false;
             pb_free(pb);
             return 0;
         }
@@ -1188,6 +1267,10 @@ static uint32_t pb_finalize_table(PageBuilder *pb, uint32_t *next_page, int64_t 
         pb->leaves[pb->leaf_count].sep_cell = NULL;
         pb->leaves[pb->leaf_count].sep_cell_len = 0;
         pb_flush_leaf(pb);
+        if (!pb->ok) {
+            pb_free(pb);
+            return 0;
+        }
     }
 
     *next_page = pb->next_page;
@@ -1221,9 +1304,7 @@ static uint32_t write_table_btree(FILE *fp, uint32_t *next_page, const uint8_t *
         put_u16(page + hdr + HDR_CELLCOUNT_OFF, 0);                     // 0 cells
         put_u16(page + hdr + HDR_CONTENT_OFF, (uint16_t)CBM_PAGE_SIZE); // content at end of page
         page[hdr + HDR_FRAGBYTES_OFF] = 0;                              // 0 fragmented bytes
-        (void)fseek(fp, (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE, SEEK_SET);
-        (void)fwrite(page, SKIP_ONE, CBM_PAGE_SIZE, fp);
-        return pnum;
+        return write_page_at(fp, pnum, page) ? pnum : 0;
     }
 
     PageBuilder pb;
@@ -1234,6 +1315,10 @@ static uint32_t write_table_btree(FILE *fp, uint32_t *next_page, const uint8_t *
     for (int i = 0; i < count; i++) {
         pb_add_table_cell_with_flush(&pb, rowids[i], records[i], record_lens[i],
                                      i > 0 ? rowids[i - SKIP_ONE] : 0);
+        if (!pb.ok) {
+            pb_free(&pb);
+            return 0;
+        }
     }
 
     return pb_finalize_table(&pb, next_page, rowids[count - SKIP_ONE]);
@@ -1246,6 +1331,10 @@ static bool pb_promote_and_flush(PageBuilder *pb, uint8_t **cells, int *cell_len
     }
     pb->leaves[pb->leaf_count].max_key = 0;
     pb->leaves[pb->leaf_count].sep_cell = (uint8_t *)malloc(cell_lens[prev_idx]);
+    if (!pb->leaves[pb->leaf_count].sep_cell) {
+        pb->ok = false;
+        return false;
+    }
     memcpy(pb->leaves[pb->leaf_count].sep_cell, cells[prev_idx], cell_lens[prev_idx]);
     pb->leaves[pb->leaf_count].sep_cell_len = cell_lens[prev_idx];
 
@@ -1271,9 +1360,7 @@ static uint32_t write_empty_index_leaf(FILE *fp, uint32_t *next_page) {
     put_u16(page + HDR_CELLCOUNT_OFF, 0);
     put_u16(page + HDR_CONTENT_OFF, (uint16_t)CBM_PAGE_SIZE);
     page[HDR_FRAGBYTES_OFF] = 0;
-    (void)fseek(fp, (long)(pnum - SKIP_ONE) * CBM_PAGE_SIZE, SEEK_SET);
-    (void)fwrite(page, SKIP_ONE, CBM_PAGE_SIZE, fp);
-    return pnum;
+    return write_page_at(fp, pnum, page) ? pnum : 0;
 }
 
 // Write leaf pages for an index, returns root page.
@@ -1287,8 +1374,12 @@ static uint32_t write_index_btree(FILE *fp, uint32_t *next_page, uint8_t **cells
      * every cell added below is within the local-payload limit (see
      * INDEX_OVERFLOW_MAX_LOCAL). Overflow pages are allocated from *next_page
      * ahead of the leaf pages, which is fine — page order is arbitrary. */
+    bool overflow_ok = true;
     for (int i = 0; i < count; i++) {
-        cells[i] = overflowize_index_cell(fp, next_page, cells[i], &cell_lens[i]);
+        cells[i] = overflowize_index_cell(fp, next_page, cells[i], &cell_lens[i], &overflow_ok);
+        if (!overflow_ok) {
+            return 0;
+        }
     }
 
     PageBuilder pb;
@@ -1298,6 +1389,11 @@ static uint32_t write_index_btree(FILE *fp, uint32_t *next_page, uint8_t **cells
         if (!pb_cell_fits(&pb, cell_lens[i])) {
             if (pb.cell_count > 0) {
                 if (!pb_promote_and_flush(&pb, cells, cell_lens, i - SKIP_ONE)) {
+                    pb_free(&pb);
+                    return 0;
+                }
+                if (!pb.ok) {
+                    pb_free(&pb);
                     return 0;
                 }
             }
@@ -1310,18 +1406,33 @@ static uint32_t write_index_btree(FILE *fp, uint32_t *next_page, uint8_t **cells
             }
         }
         pb_add_cell(&pb, cells[i], cell_lens[i]);
+        if (!pb.ok) {
+            pb_free(&pb);
+            return 0;
+        }
     }
 
     if (pb.cell_count > 0) {
         if (!pb_ensure_leaf_cap(&pb)) {
+            pb.ok = false;
+            pb_free(&pb);
             return 0;
         }
         pb.leaves[pb.leaf_count].max_key = 0;
         int last = count - SKIP_ONE;
         pb.leaves[pb.leaf_count].sep_cell = (uint8_t *)malloc(cell_lens[last]);
+        if (!pb.leaves[pb.leaf_count].sep_cell) {
+            pb.ok = false;
+            pb_free(&pb);
+            return 0;
+        }
         memcpy(pb.leaves[pb.leaf_count].sep_cell, cells[last], cell_lens[last]);
         pb.leaves[pb.leaf_count].sep_cell_len = cell_lens[last];
         pb_flush_leaf(&pb);
+        if (!pb.ok) {
+            pb_free(&pb);
+            return 0;
+        }
     }
 
     *next_page = pb.next_page;
@@ -1368,10 +1479,6 @@ static uint8_t *build_master_record(const MasterEntry *e, int *out_len) {
 }
 
 // --- qsort comparators for index sorting ---
-// Single-threaded writer: static context is safe.
-
-static const CBMDumpNode *g_sort_nodes;
-static const CBMDumpEdge *g_sort_edges;
 
 static inline int cmp_i64(int64_t a, int64_t b) {
     return (a > b) - (a < b);
@@ -1381,148 +1488,208 @@ static inline const char *safe_str(const char *s) {
     return s ? s : "";
 }
 
+typedef struct sqlite_sort_ctx sqlite_sort_ctx_t;
+typedef int (*sort_cmp_fn)(const sqlite_sort_ctx_t *ctx, int ia, int ib);
+
+struct sqlite_sort_ctx {
+    const CBMDumpNode *nodes;
+    const CBMDumpEdge *edges;
+    sort_cmp_fn cmp;
+};
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+/* qsort_r fixes this callback ABI; changing ctx to pointer-to-const would make
+ * the function type incompatible even though the callback treats it as const. */
+// cppcheck-suppress constParameterCallback
+static int cmp_perm_ctx_bsd(void *ctx, const void *a, const void *b) {
+    const sqlite_sort_ctx_t *sort_ctx = (const sqlite_sort_ctx_t *)ctx;
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return sort_ctx->cmp ? sort_ctx->cmp(sort_ctx, ia, ib) : 0;
+}
+#elif defined(__GLIBC__) || defined(__linux__)
+/* GNU qsort_r likewise requires a mutable void * callback parameter. */
+// cppcheck-suppress constParameterCallback
+static int cmp_perm_ctx_gnu(const void *a, const void *b, void *ctx) {
+    const sqlite_sort_ctx_t *sort_ctx = (const sqlite_sort_ctx_t *)ctx;
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return sort_ctx->cmp ? sort_ctx->cmp(sort_ctx, ia, ib) : 0;
+}
+#else
+typedef struct {
+    int idx;
+    const sqlite_sort_ctx_t *ctx;
+    sort_cmp_fn cmp;
+} SortItem;
+
+static int cmp_sort_item(const void *a, const void *b) {
+    const SortItem *ia = (const SortItem *)a;
+    const SortItem *ib = (const SortItem *)b;
+    return ia->cmp(ia->ctx, ia->idx, ib->idx);
+}
+#endif
+
+static int sort_perm_with_ctx(int *perm, int n, const sqlite_sort_ctx_t *ctx, sort_cmp_fn cmp) {
+    if (n <= 1) {
+        return 0;
+    }
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    sqlite_sort_ctx_t sort_ctx = *ctx;
+    sort_ctx.cmp = cmp;
+    qsort_r(perm, (size_t)n, sizeof(int), &sort_ctx, cmp_perm_ctx_bsd);
+    return 0;
+#elif defined(__GLIBC__) || defined(__linux__)
+    sqlite_sort_ctx_t sort_ctx = *ctx;
+    sort_ctx.cmp = cmp;
+    qsort_r(perm, (size_t)n, sizeof(int), cmp_perm_ctx_gnu, &sort_ctx);
+    return 0;
+#else
+    SortItem *items = (SortItem *)malloc((size_t)n * sizeof(*items));
+    if (!items) {
+        return ERR_SORT_FAILED;
+    }
+    for (int i = 0; i < n; i++) {
+        items[i].idx = perm[i];
+        items[i].ctx = ctx;
+        items[i].cmp = cmp;
+    }
+    qsort(items, (size_t)n, sizeof(*items), cmp_sort_item);
+    for (int i = 0; i < n; i++) {
+        perm[i] = items[i].idx;
+    }
+    free(items);
+    return 0;
+#endif
+}
+
 // Allocate permutation array [0, 1, ..., n-1], sort with comparator.
 // Returns NULL on allocation failure.
-static int *make_sorted_perm(int n, int (*cmp)(const void *, const void *)) {
+static int *make_sorted_perm(int n, const sqlite_sort_ctx_t *ctx, sort_cmp_fn cmp) {
     int *perm = (int *)malloc(n * sizeof(int));
     if (!perm) {
-        (void)fprintf(stderr, "cbm_write_db: perm malloc failed n=%d size=%zu\n", n,
-                      (size_t)n * sizeof(int));
         return NULL;
     }
     for (int i = 0; i < n; i++) {
         perm[i] = i;
     }
-    qsort(perm, n, sizeof(int), cmp);
+    /* BSD/GNU qsort_r cannot fail; the portable fallback allocates SortItem
+     * storage and can return ERR_SORT_FAILED. Preserve that cross-platform
+     * failure path even when cppcheck evaluates only a native qsort_r branch. */
+    // cppcheck-suppress knownConditionTrueFalse
+    if (sort_perm_with_ctx(perm, n, ctx, cmp) != 0) {
+        free(perm);
+        return NULL;
+    }
     return perm;
 }
 
 // --- Node index comparators (project is same for all, skip it) ---
 
-static int cmp_node_by_label(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].label), safe_str(g_sort_nodes[ib].label));
+static int cmp_node_by_label(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].label), safe_str(ctx->nodes[ib].label));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
-static int cmp_node_by_name(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].name), safe_str(g_sort_nodes[ib].name));
+static int cmp_node_by_name(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].name), safe_str(ctx->nodes[ib].name));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
-static int cmp_node_by_file(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].file_path), safe_str(g_sort_nodes[ib].file_path));
+static int cmp_node_by_file(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->nodes[ia].file_path), safe_str(ctx->nodes[ib].file_path));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
-static int cmp_node_by_qn(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].qualified_name),
-                   safe_str(g_sort_nodes[ib].qualified_name));
+static int cmp_node_by_qn(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c =
+        strcmp(safe_str(ctx->nodes[ia].qualified_name), safe_str(ctx->nodes[ib].qualified_name));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_nodes[ia].id, g_sort_nodes[ib].id);
+    return cmp_i64(ctx->nodes[ia].id, ctx->nodes[ib].id);
 }
 
 // --- Edge index comparators ---
 
 // idx_edges_source: (source_id, type) + rowid
-static int cmp_edge_by_source_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].source_id, g_sort_edges[ib].source_id);
+static int cmp_edge_by_source_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].source_id, ctx->edges[ib].source_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_target: (target_id, type) + rowid
-static int cmp_edge_by_target_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].target_id, g_sort_edges[ib].target_id);
+static int cmp_edge_by_target_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].target_id, ctx->edges[ib].target_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_type: (project, type) + rowid
-static int cmp_edge_by_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+static int cmp_edge_by_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_target_type: (project, target_id, type) + rowid
-static int cmp_edge_by_proj_target_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].target_id, g_sort_edges[ib].target_id);
+static int cmp_edge_by_proj_target_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].target_id, ctx->edges[ib].target_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_source_type: (project, source_id, type) + rowid
-static int cmp_edge_by_proj_source_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].source_id, g_sort_edges[ib].source_id);
+static int cmp_edge_by_proj_source_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].source_id, ctx->edges[ib].source_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // idx_edges_url_path: (project, url_path_gen) + rowid — NULL sorts first
-static int cmp_edge_by_url_path(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    const char *ua = g_sort_edges[ia].url_path;
-    const char *ub = g_sort_edges[ib].url_path;
+static int cmp_edge_by_url_path(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    const char *ua = ctx->edges[ia].url_path;
+    const char *ub = ctx->edges[ib].url_path;
     bool na = (!ua || ua[0] == '\0');
     bool nb = (!ub || ub[0] == '\0');
     if (na && nb) {
-        return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+        return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
     }
     if (na) {
         return CBM_NOT_FOUND;
@@ -1534,43 +1701,42 @@ static int cmp_edge_by_url_path(const void *a, const void *b) {
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // autoindex_edges_1: UNIQUE(source_id, target_id, type, local_name_gen) + rowid (#768)
-static int cmp_edge_by_src_tgt_type(const void *a, const void *b) {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    int c = cmp_i64(g_sort_edges[ia].source_id, g_sort_edges[ib].source_id);
+static int cmp_edge_by_src_tgt_type(const sqlite_sort_ctx_t *ctx, int ia, int ib) {
+    int c = cmp_i64(ctx->edges[ia].source_id, ctx->edges[ib].source_id);
     if (c) {
         return c;
     }
-    c = cmp_i64(g_sort_edges[ia].target_id, g_sort_edges[ib].target_id);
+    c = cmp_i64(ctx->edges[ia].target_id, ctx->edges[ib].target_id);
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    c = strcmp(safe_str(ctx->edges[ia].type), safe_str(ctx->edges[ib].type));
     if (c) {
         return c;
     }
-    c = strcmp(safe_str(g_sort_edges[ia].local_name), safe_str(g_sort_edges[ib].local_name));
+    c = strcmp(safe_str(ctx->edges[ia].local_name), safe_str(ctx->edges[ib].local_name));
     if (c) {
         return c;
     }
-    return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
+    return cmp_i64(ctx->edges[ia].id, ctx->edges[ib].id);
 }
 
 // --- Parallel sort support ---
 
 typedef struct {
     int count;
-    int (*cmp)(const void *, const void *);
+    sqlite_sort_ctx_t ctx;
+    sort_cmp_fn cmp;
     int *perm; // output: sorted permutation array, caller frees
 } SortJob;
 
 static void *sort_worker(void *arg) {
     SortJob *j = (SortJob *)arg;
-    j->perm = make_sorted_perm(j->count, j->cmp);
+    j->perm = make_sorted_perm(j->count, &j->ctx, j->cmp);
     return NULL;
 }
 
@@ -1805,7 +1971,7 @@ static int write_one_table(write_db_ctx_t *w, uint32_t *root, const void *items,
                            build_record_fn build_rec, get_rowid_fn get_id) {
     if (count <= 0 || !items) {
         *root = write_table_btree(w->fp, &w->next_page, NULL, NULL, NULL, 0, false);
-        return 0;
+        return *root == 0 ? ERR_WRITE_FAILED : 0;
     }
     PageBuilder pb;
     pb_init(&pb, w->fp, w->next_page, false);
@@ -1813,15 +1979,20 @@ static int write_one_table(write_db_ctx_t *w, uint32_t *root, const void *items,
         int rec_len;
         uint8_t *rec = build_rec(items, i, &rec_len);
         if (!rec) {
+            pb_free(&pb);
             return ERR_WRITE_FAILED;
         }
         int64_t rowid = get_id(items, i);
         int64_t prev_id = i > 0 ? get_id(items, i - SKIP_ONE) : 0;
         pb_add_table_cell_with_flush(&pb, rowid, rec, rec_len, prev_id);
         free(rec);
+        if (!pb.ok) {
+            pb_free(&pb);
+            return ERR_WRITE_FAILED;
+        }
     }
     *root = pb_finalize_table(&pb, &w->next_page, get_id(items, count - SKIP_ONE));
-    return 0;
+    return *root == 0 ? ERR_WRITE_FAILED : 0;
 }
 
 /* Adapter functions for write_one_table (nodes are written via the streaming
@@ -1846,21 +2017,30 @@ static int64_t adapt_token_vec_id(const void *items, int i) {
 }
 
 /* Phase 2: Write metadata tables (projects, file_hashes, summaries, sqlite_sequence). */
-static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
-                                  uint32_t *file_hashes_root, uint32_t *summaries_root,
-                                  uint32_t *sqlite_seq_root) {
+static int write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
+                                 uint32_t *file_hashes_root, uint32_t *summaries_root,
+                                 uint32_t *sqlite_seq_root) {
     int proj_rec_len;
     uint8_t *proj_rec =
         build_project_record(w->project, w->indexed_at, w->root_path, &proj_rec_len);
+    if (!proj_rec) {
+        return ERR_WRITE_FAILED;
+    }
     const uint8_t *proj_recs[] = {proj_rec};
     int proj_lens[] = {proj_rec_len};
     int64_t proj_rowids[] = {FIRST_ROWID};
     *projects_root =
         write_table_btree(w->fp, &w->next_page, proj_recs, proj_lens, proj_rowids, SKIP_ONE, false);
     free(proj_rec);
+    if (*projects_root == 0) {
+        return ERR_WRITE_FAILED;
+    }
 
     *file_hashes_root = write_table_btree(w->fp, &w->next_page, NULL, NULL, NULL, 0, false);
     *summaries_root = write_table_btree(w->fp, &w->next_page, NULL, NULL, NULL, 0, false);
+    if (*file_hashes_root == 0 || *summaries_root == 0) {
+        return ERR_WRITE_FAILED;
+    }
 
     RecordBuilder r1;
     RecordBuilder r2;
@@ -1870,6 +2050,9 @@ static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
     int seq1_len;
     uint8_t *seq1 = rec_finalize(&r1, &seq1_len);
     rec_free(&r1);
+    if (!seq1) {
+        return ERR_WRITE_FAILED;
+    }
 
     rec_init(&r2);
     rec_add_text(&r2, "edges");
@@ -1877,6 +2060,10 @@ static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
     int seq2_len;
     uint8_t *seq2 = rec_finalize(&r2, &seq2_len);
     rec_free(&r2);
+    if (!seq2) {
+        free(seq1);
+        return ERR_WRITE_FAILED;
+    }
 
     const uint8_t *seq_recs[] = {seq1, seq2};
     int seq_lens[] = {seq1_len, seq2_len};
@@ -1885,6 +2072,7 @@ static void write_metadata_tables(write_db_ctx_t *w, uint32_t *projects_root,
         write_table_btree(w->fp, &w->next_page, seq_recs, seq_lens, seq_rowids, PAIR_LEN, false);
     free(seq1);
     free(seq2);
+    return *sqlite_seq_root == 0 ? ERR_WRITE_FAILED : 0;
 }
 
 /* Write the SQLite file header on page 1 with master entries. */
@@ -1916,12 +2104,22 @@ static void write_sqlite_file_header(uint8_t *page1, uint32_t total_pages) {
 
 /* Build master records, write page 1 B-tree + file header. */
 static int write_master_page1(FILE *fp, MasterEntry *master, int master_count, uint32_t next_page) {
-    const uint8_t **master_records = (const uint8_t **)malloc(master_count * sizeof(uint8_t *));
-    int *master_lens = (int *)malloc(master_count * sizeof(int));
-    int64_t *master_rowids = (int64_t *)malloc(master_count * sizeof(int64_t));
+    const uint8_t **master_records =
+        (const uint8_t **)calloc((size_t)master_count, sizeof(uint8_t *));
+    int *master_lens = (int *)calloc((size_t)master_count, sizeof(int));
+    int64_t *master_rowids = (int64_t *)calloc((size_t)master_count, sizeof(int64_t));
+    int rc = 0;
+    if (!master_records || !master_lens || !master_rowids) {
+        rc = ERR_WRITE_FAILED;
+        goto cleanup;
+    }
     for (int i = 0; i < master_count; i++) {
         master_rowids[i] = i + SKIP_ONE;
         master_records[i] = build_master_record(&master[i], &master_lens[i]);
+        if (!master_records[i]) {
+            rc = ERR_WRITE_FAILED;
+            goto cleanup;
+        }
     }
 
     uint8_t page1[CBM_PAGE_SIZE];
@@ -1939,13 +2137,8 @@ static int write_master_page1(FILE *fp, MasterEntry *master, int master_count, u
         int available = content_off - ptr_off - CELL_PTR_SIZE;
         if (!cell || cell_len > available) {
             free(cell);
-            for (int j = 0; j < master_count; j++) {
-                free((void *)master_records[j]);
-            }
-            free(master_records);
-            free(master_lens);
-            free(master_rowids);
-            return ERR_MASTER_OVERFLOW;
+            rc = ERR_MASTER_OVERFLOW;
+            goto cleanup;
         }
         content_off -= cell_len;
         memcpy(page1 + content_off, cell, cell_len);
@@ -1962,28 +2155,40 @@ static int write_master_page1(FILE *fp, MasterEntry *master, int master_count, u
 
     write_sqlite_file_header(page1, next_page - SKIP_ONE);
 
-    (void)fseek(fp, 0, SEEK_SET);
-    (void)fwrite(page1, SKIP_ONE, CBM_PAGE_SIZE, fp);
+    if (!write_bytes_at(fp, 0, page1, CBM_PAGE_SIZE)) {
+        rc = ERR_WRITE_FAILED;
+        goto cleanup;
+    }
 
+cleanup:
     for (int i = 0; i < master_count; i++) {
-        free((void *)master_records[i]);
+        if (master_records) {
+            free((void *)master_records[i]);
+        }
     }
     free(master_records);
     free(master_lens);
     free(master_rowids);
-    return 0;
+    return rc;
 }
 
 /* Pad file to exact page boundary. */
-static void pad_file_to_page_boundary(FILE *fp, uint32_t next_page) {
-    (void)fseek(fp, 0, SEEK_END);
+static int pad_file_to_page_boundary(FILE *fp, uint32_t next_page) {
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        return ERR_WRITE_FAILED;
+    }
     long file_size = ftell(fp);
+    if (file_size < 0) {
+        return ERR_WRITE_FAILED;
+    }
     long expected_size = (long)(next_page - SKIP_ONE) * CBM_PAGE_SIZE;
     if (file_size < expected_size) {
         uint8_t zero = 0;
-        (void)fseek(fp, expected_size - SKIP_ONE, SEEK_SET);
-        (void)fwrite(&zero, SKIP_ONE, SKIP_ONE, fp);
+        if (!write_bytes_at(fp, expected_size - SKIP_ONE, &zero, SKIP_ONE)) {
+            return ERR_WRITE_FAILED;
+        }
     }
+    return 0;
 }
 
 /* Build all 4 node index B-trees. Returns 0 on success, ERR_SORT_FAILED on failure. */
@@ -1998,7 +2203,7 @@ static int build_node_indexes(FILE *fp, uint32_t *next_page, CBMDumpNode *nodes,
                                          ncol_file);
     *qn_root =
         build_node_index_sorted(fp, next_page, nodes, node_count, nsorts[NSORT_QN].perm, ncol_qn);
-    if (node_count > 0 && (!*label_root || !*name_root || !*file_root || !*qn_root)) {
+    if (!*label_root || !*name_root || !*file_root || !*qn_root) {
         return ERR_SORT_FAILED;
     }
     return 0;
@@ -2023,29 +2228,60 @@ static int build_edge_indexes(FILE *fp, uint32_t *next_page, CBMDumpEdge *edges,
                                              esorts[ESORT_URL_PATH].perm, ecell_url_path);
     *auto_root = build_edge_index_sorted(fp, next_page, edges, edge_count,
                                          esorts[ESORT_SRC_TGT_TYPE].perm, ecell_src_tgt_type);
-    if (edge_count > 0 && (!*source_root || !*target_root || !*type_root || !*tgt_type_root ||
-                           !*src_type_root || !*url_path_root || !*auto_root)) {
+    if (!*source_root || !*target_root || !*type_root || !*tgt_type_root || !*src_type_root ||
+        !*url_path_root || !*auto_root) {
         return ERR_SORT_FAILED;
     }
     return 0;
 }
 
 /* Launch parallel sort threads for all index permutations. */
-static void parallel_sort_indexes(SortJob *nsorts, int n_node, SortJob *esorts, int n_edge) {
+static int maybe_start_sort_job(SortJob *job, cbm_thread_t *threads, int *thread_count) {
+    if (job->count <= 0) {
+        return 0;
+    }
+    if (cbm_thread_create(&threads[*thread_count], 0, sort_worker, job) == 0) {
+        (*thread_count)++;
+        return 0;
+    }
+    (void)sort_worker(job);
+    return job->perm ? 0 : ERR_SORT_FAILED;
+}
+
+static int parallel_sort_indexes(SortJob *nsorts, int n_node, SortJob *esorts, int n_edge) {
     cbm_thread_t st[TOTAL_SORT_THREADS];
     int nt = 0;
+    int rc = 0;
     for (int i = 0; i < n_node; i++) {
-        if (nsorts[i].count > 0) {
-            cbm_thread_create(&st[nt++], 0, sort_worker, &nsorts[i]);
+        if (maybe_start_sort_job(&nsorts[i], st, &nt) != 0) {
+            rc = ERR_SORT_FAILED;
         }
     }
     for (int i = 0; i < n_edge; i++) {
-        if (esorts[i].count > 0) {
-            cbm_thread_create(&st[nt++], 0, sort_worker, &esorts[i]);
+        if (maybe_start_sort_job(&esorts[i], st, &nt) != 0) {
+            rc = ERR_SORT_FAILED;
         }
     }
     for (int i = 0; i < nt; i++) {
         cbm_thread_join(&st[i]);
+    }
+    for (int i = 0; i < n_node; i++) {
+        if (nsorts[i].count > 0 && !nsorts[i].perm) {
+            rc = ERR_SORT_FAILED;
+        }
+    }
+    for (int i = 0; i < n_edge; i++) {
+        if (esorts[i].count > 0 && !esorts[i].perm) {
+            rc = ERR_SORT_FAILED;
+        }
+    }
+    return rc;
+}
+
+static void free_sort_perms(SortJob *jobs, int count) {
+    for (int i = 0; i < count; i++) {
+        free(jobs[i].perm);
+        jobs[i].perm = NULL;
     }
 }
 
@@ -2084,42 +2320,49 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
 
     // Phase 2: Metadata tables (projects, file_hashes, summaries, sqlite_sequence)
     CBM_PROF_START(t_meta);
-    uint32_t projects_root;
-    uint32_t file_hashes_root;
-    uint32_t summaries_root;
-    uint32_t sqlite_seq_root;
-    write_metadata_tables(w, &projects_root, &file_hashes_root, &summaries_root, &sqlite_seq_root);
+    uint32_t projects_root = 0;
+    uint32_t file_hashes_root = 0;
+    uint32_t summaries_root = 0;
+    uint32_t sqlite_seq_root = 0;
+    rc = write_metadata_tables(w, &projects_root, &file_hashes_root, &summaries_root,
+                               &sqlite_seq_root);
     uint32_t next_page = w->next_page;
     CBM_PROF_END("write_db", "2_metadata_tables", t_meta);
+    if (rc != 0) {
+        return discard_writer_output(w, rc);
+    }
 
     // --- Build indexes (all sorted by key columns before writing) ---
-
-    // Set sort contexts for qsort comparators.
-    g_sort_nodes = nodes;
-    g_sort_edges = edges;
 
     // Parallel sort: all 11 index permutations sorted simultaneously.
     // Sorting is O(N log N) per index — the dominant CPU cost in index building.
     // Cell building + B-tree writing remains serial (sequential page allocation).
+    const sqlite_sort_ctx_t node_sort_ctx = {.nodes = nodes, .edges = NULL, .cmp = NULL};
+    const sqlite_sort_ctx_t edge_sort_ctx = {.nodes = NULL, .edges = edges, .cmp = NULL};
     SortJob nsorts[] = {
-        {node_count, cmp_node_by_label, NULL},
-        {node_count, cmp_node_by_name, NULL},
-        {node_count, cmp_node_by_file, NULL},
-        {node_count, cmp_node_by_qn, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_label, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_name, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_file, NULL},
+        {node_count, node_sort_ctx, cmp_node_by_qn, NULL},
     };
     SortJob esorts[] = {
-        {edge_count, cmp_edge_by_source_type, NULL},
-        {edge_count, cmp_edge_by_target_type, NULL},
-        {edge_count, cmp_edge_by_type, NULL},
-        {edge_count, cmp_edge_by_proj_target_type, NULL},
-        {edge_count, cmp_edge_by_proj_source_type, NULL},
-        {edge_count, cmp_edge_by_url_path, NULL},
-        {edge_count, cmp_edge_by_src_tgt_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_source_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_target_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_proj_target_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_proj_source_type, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_url_path, NULL},
+        {edge_count, edge_sort_ctx, cmp_edge_by_src_tgt_type, NULL},
     };
 
     CBM_PROF_START(t_sort);
-    parallel_sort_indexes(nsorts, NODE_SORT_THREADS, esorts, EDGE_SORT_THREADS);
+    rc = parallel_sort_indexes(nsorts, NODE_SORT_THREADS, esorts, EDGE_SORT_THREADS);
     CBM_PROF_END_N("write_db", "3_parallel_sort_indexes", t_sort, node_count + edge_count);
+    if (rc != 0) {
+        free_sort_perms(nsorts, NODE_SORT_THREADS);
+        free_sort_perms(esorts, EDGE_SORT_THREADS);
+        return discard_writer_output(w, rc);
+    }
 
     /* Phase 4-5: Build node + edge index B-trees */
     CBM_PROF_START(t_node_idx);
@@ -2131,6 +2374,7 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
                                  &idx_nodes_name_root, &idx_nodes_file_root, &autoindex_nodes_root);
     CBM_PROF_END_N("write_db", "4_node_indexes_seq", t_node_idx, node_count * NODE_SORT_THREADS);
     if (nrc != 0) {
+        free_sort_perms(esorts, EDGE_SORT_THREADS);
         return discard_writer_output(w, nrc);
     }
 
@@ -2162,9 +2406,16 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
         int plen = 0;
         uint8_t *payload = rec_finalize(&r, &plen);
         rec_free(&r);
+        if (!payload) {
+            return discard_writer_output(w, ERR_WRITE_FAILED);
+        }
         int vl = varint_len(plen);
         int total = vl + plen;
         uint8_t *cell = (uint8_t *)malloc(total);
+        if (!cell) {
+            free(payload);
+            return discard_writer_output(w, ERR_WRITE_FAILED);
+        }
         int pos = put_varint(cell, plen);
         memcpy(cell + pos, payload, plen);
         free(payload);
@@ -2179,6 +2430,10 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
 
     // Autoindex for project_summaries(project TEXT PK) — empty (0 rows)
     uint32_t autoindex_summaries_root = write_index_btree(fp, &next_page, NULL, NULL, 0);
+    if (autoindex_projects_root == 0 || autoindex_file_hashes_root == 0 ||
+        autoindex_summaries_root == 0) {
+        return discard_writer_output(w, ERR_WRITE_FAILED);
+    }
 
     // --- sqlite_master table (page 1) ---
     // This must be written last because it references root pages of all other tables/indexes.
@@ -2261,7 +2516,10 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     if (rc2 != 0) {
         return discard_writer_output(w, rc2);
     }
-    pad_file_to_page_boundary(fp, next_page);
+    rc2 = pad_file_to_page_boundary(fp, next_page);
+    if (rc2 != 0) {
+        return discard_writer_output(w, rc2);
+    }
     return publish_writer_output(w);
 }
 
@@ -2317,6 +2575,10 @@ int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int co
          * the one-shot write_one_table loop — so output is byte-identical. */
         pb_add_table_cell_with_flush(&w->nodes_pb, nodes[i].id, rec, rec_len, w->last_node_rowid);
         free(rec);
+        if (!w->nodes_pb.ok) {
+            w->err = ERR_WRITE_FAILED;
+            return w->err;
+        }
         w->last_node_rowid = nodes[i].id;
         w->node_rows_written++;
     }
@@ -2332,13 +2594,22 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     }
     int err = w->err;
     uint32_t nodes_root = 0;
+    bool nodes_pb_done = false;
     if (err == 0) {
         if (w->node_rows_written == 0) {
             pb_free(&w->nodes_pb);
+            nodes_pb_done = true;
             nodes_root = write_table_btree(w->wc.fp, &w->wc.next_page, NULL, NULL, NULL, 0, false);
         } else {
             nodes_root = pb_finalize_table(&w->nodes_pb, &w->wc.next_page, w->last_node_rowid);
+            nodes_pb_done = true;
         }
+        if (nodes_root == 0) {
+            err = ERR_WRITE_FAILED;
+        }
+    }
+    if (err != 0 && !nodes_pb_done) {
+        pb_free(&w->nodes_pb);
     }
     w->wc.project = project;
     w->wc.root_path = root_path;

@@ -1,5 +1,6 @@
 /* Transactional binary activation. See activation_transaction.h. */
 #include "cli/activation_transaction.h"
+#include "foundation/compat_fs_internal.h"
 #include "foundation/log.h"
 #include "foundation/macos_acl.h"
 
@@ -342,25 +343,36 @@ static wchar_t *activation_utf8_to_wide(const char *value) {
     return prefixed;
 }
 
-static bool activation_windows_user(void **information_out, PSID *sid_out) {
+static bool activation_windows_token_information(TOKEN_INFORMATION_CLASS information_class,
+                                                 void **information_out) {
     *information_out = NULL;
-    *sid_out = NULL;
     HANDLE token = NULL;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         return false;
     }
     DWORD needed = 0;
-    (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    (void)GetTokenInformation(token, information_class, NULL, 0, &needed);
     if (needed == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
         (void)CloseHandle(token);
         return false;
     }
     void *information = calloc(1, needed);
-    bool ok =
-        information && GetTokenInformation(token, TokenUser, information, needed, &needed) != 0;
+    bool ok = information &&
+              GetTokenInformation(token, information_class, information, needed, &needed) != 0;
     (void)CloseHandle(token);
     if (!ok) {
         free(information);
+        return false;
+    }
+    *information_out = information;
+    return true;
+}
+
+static bool activation_windows_user(void **information_out, PSID *sid_out) {
+    *information_out = NULL;
+    *sid_out = NULL;
+    void *information = NULL;
+    if (!activation_windows_token_information(TokenUser, &information)) {
         return false;
     }
     PSID sid = ((TOKEN_USER *)information)->User.Sid;
@@ -394,12 +406,10 @@ static bool activation_windows_security_init(activation_windows_security_t *secu
          * created with these attributes inherits the token's DEFAULT owner,
          * which under an Administrators-default-owner policy (standard on
          * Windows Server and GitHub's elevated runners) is BUILTIN\
-         * Administrators, not this user. Every staged file is then validated
-         * with a strict owner-is-current-user check (activation_windows_owner_
-         * is_current), so an unstamped file is rejected and private staging
-         * fails. The daemon stamps the owner identically for the same reason
-         * (see src/daemon/ipc.c). Setting the owner to our own token user
-         * needs no extra privilege. */
+         * Administrators, not this user. Staged files are validated against
+         * the exact TokenUser or TokenOwner SID, so stamping TokenUser remains
+         * the narrow primary path. The daemon stamps the owner identically
+         * for the same reason (see src/daemon/ipc.c). */
         SetSecurityDescriptorOwner(&security->descriptor, security->user_sid, FALSE) &&
         SetSecurityDescriptorControl(&security->descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
     if (!ok) {
@@ -429,7 +439,7 @@ static void activation_windows_security_destroy(activation_windows_security_t *s
  * (Administrators on GitHub-runner-class images). Its integrity is enforced
  * by identity snapshot/recheck plus the caller's build-fingerprint check,
  * not by exact ownership. Staging targets created by this transaction keep
- * the exact-current-owner rule. */
+ * the narrower exact-process-owner rule. */
 static bool activation_windows_owner_is_trusted(HANDLE handle) {
     void *information = NULL;
     PSID user_sid = NULL;
@@ -453,9 +463,9 @@ static bool activation_windows_owner_is_trusted(HANDLE handle) {
     return trusted;
 }
 
-/* The SID Windows will stamp as OWNER on objects this process creates.
+/* The default SID Windows may stamp as OWNER on objects this process creates.
  *
- * That is TokenOwner, NOT TokenUser, and the two differ exactly when it matters:
+ * That is TokenOwner, not necessarily TokenUser, and the two differ when it matters:
  * for a member of the Administrators group the default owner is
  * BUILTIN\Administrators (the "System objects: Default owner for objects
  * created by members of the Administrators group" policy, default on Server and
@@ -464,29 +474,16 @@ static bool activation_windows_owner_is_trusted(HANDLE handle) {
  * written ourselves (#1580), and the daemon path failed the same way, exiting
  * before it could say anything (#1582).
  *
- * Reading TokenOwner is STRICTER-or-equal, never looser: it is the one SID this
- * process stamps. On a non-elevated account TokenOwner == TokenUser and nothing
- * changes. It does not accept "anything an administrator owns" — only the exact
- * SID our own creations carry. */
+ * The transaction explicitly requests TokenUser for its own files; accepting
+ * TokenOwner as a fallback covers systems that still expose the default owner.
+ * On a non-elevated account TokenOwner == TokenUser and nothing changes. This
+ * does not accept "anything an administrator owns" — only the process token's
+ * exact default-owner SID. */
 static bool activation_windows_token_owner(void **information_out, PSID *sid_out) {
     *information_out = NULL;
     *sid_out = NULL;
-    HANDLE token = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-        return false;
-    }
-    DWORD needed = 0;
-    (void)GetTokenInformation(token, TokenOwner, NULL, 0, &needed);
-    if (needed == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        (void)CloseHandle(token);
-        return false;
-    }
-    void *information = calloc(1, needed);
-    bool ok =
-        information && GetTokenInformation(token, TokenOwner, information, needed, &needed) != 0;
-    (void)CloseHandle(token);
-    if (!ok) {
-        free(information);
+    void *information = NULL;
+    if (!activation_windows_token_information(TokenOwner, &information)) {
         return false;
     }
     PSID sid = ((TOKEN_OWNER *)information)->Owner;
@@ -1280,10 +1277,6 @@ static bool activation_sync_directory(const cbm_activation_transaction_t *transa
 
 static unsigned int activation_rename_failures_for_test;
 
-static bool activation_rename_error_is_transient(DWORD error) {
-    return error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED ||
-           error == ERROR_LOCK_VIOLATION;
-}
 #endif
 
 void cbm_activation_transaction_rename_failures_set_for_test(unsigned int count) {
@@ -1313,7 +1306,7 @@ static bool activation_rename(const cbm_activation_transaction_t *transaction, c
         } else if (MoveFileExW(wide_source, wide_destination, flags) != 0) {
             moved = true;
             break;
-        } else if (!activation_rename_error_is_transient(GetLastError())) {
+        } else if (!cbm_windows_replace_error_is_transient(GetLastError())) {
             break;
         }
         if (attempt + 1U < ACTIVATION_RENAME_ATTEMPTS) {
@@ -1544,7 +1537,7 @@ static bool activation_source_open(const char *path, activation_native_file_t *f
      * default-owner policy; its bytes are pinned by identity recheck plus the
      * staged copy's build-fingerprint validation, so a trusted owner
      * (user/Administrators/SYSTEM) is sufficient here. Targets keep the
-     * exact-current-owner rule. */
+     * narrower exact-process-owner rule. */
     bool snapshot_ok =
         src_dir_ok && activation_external_snapshot_with_owner(path, false, &exists, &expected);
     if (!src_dir_ok || !snapshot_ok || !exists) {

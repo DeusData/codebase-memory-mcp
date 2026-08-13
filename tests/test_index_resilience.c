@@ -97,12 +97,15 @@ static cbm_store_t *ri_index_capture(RProj *lp, char **out_resp) {
     if (!lp->project) {
         return NULL;
     }
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
+    /* Resolve the cache dir the same way the pipeline does (honors the
+     * CBM_CACHE_DIR isolation dir test_main.c sets for every run). A
+     * hardcoded ~/.cache here reads a DIFFERENT store than the one the
+     * pipeline writes — the "815 empty-store failures" mismatch documented
+     * at the isolation setup in test_main.c. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return NULL;
     }
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
@@ -391,6 +394,29 @@ TEST(index_parse_partial_reported) {
     cbm_store_free_coverage(rows, cov_count);
     ASSERT_TRUE(marked);
 
+    /* The metadata describing HOW COMPLETELY this run recorded coverage is
+     * written by the same publish that wrote those rows (#963). Asserting it
+     * here is what makes losing it loud. cbm_store_coverage_replace() forwards
+     * a NULL meta and a NULL meta CLEARS the metadata, so a publish route that
+     * skips it still returns coverage rows and still reports success, while
+     * check_index_coverage silently loses the ability to tell "recorded
+     * complete coverage" from "never recorded coverage" — the exact
+     * distinction the metadata exists to carry. Asserting the effect, not the
+     * absence of an error. */
+    cbm_coverage_meta_t cov_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, lp.project, &cov_meta), CBM_STORE_OK);
+    ASSERT_NOT_NULL(cov_meta.recording_status);
+    ASSERT_STR_EQ("complete", cov_meta.recording_status);
+    /* Not merely non-NULL: "unknown" is what an index mode the writer does not
+     * recognize serializes to, so it would pass a null check while telling a
+     * reader nothing. */
+    ASSERT_NOT_NULL(cov_meta.index_mode);
+    ASSERT_TRUE(strcmp(cov_meta.index_mode, "unknown") != 0);
+    ASSERT_NOT_NULL(cov_meta.generation);
+    ASSERT_TRUE(cov_meta.hash_records_complete);
+    ASSERT_EQ(cov_meta.coverage_version, CBM_COVERAGE_VERSION);
+    cbm_store_coverage_meta_clear(&cov_meta);
+
     char qargs[900];
     snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
     char *qresp = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
@@ -635,6 +661,9 @@ TEST(index_not_indexed_by_design_reported) {
     char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
     ASSERT_NOT_NULL(resp2);
     free(resp2);
+    /* qargs was repurposed for query_graph above. Rebuild the index_status
+     * request instead of accidentally testing strict rejection of graph/query. */
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
     char *sresp2 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(sresp2);
     ASSERT_NOT_NULL(strstr(sresp2, "secret.py"));
@@ -698,12 +727,11 @@ TEST(index_relative_repo_path_canonicalized) {
         FAIL("project name derivation failed");
     }
 
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
+    /* Same CBM_CACHE_DIR-honoring resolution as ri_index_capture above. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        FAIL("cache dir resolution failed");
     }
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp.dbpath, sizeof(lp.dbpath), "%s/%s.db", cache_dir, lp.project);
     unlink(lp.dbpath);

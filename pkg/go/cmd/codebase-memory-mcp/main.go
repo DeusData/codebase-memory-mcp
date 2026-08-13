@@ -192,7 +192,7 @@ func printPortableMutationGuidance(args []string) {
 	packageCommand := "Remove-Item (Get-Command codebase-memory-mcp).Source"
 	fmt.Fprintf(
 		os.Stderr,
-		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed installation with coordinated self-update/uninstall.\n",
+		"This Go Windows copy is portable. Use %q for package maintenance, or run %q once to create a managed installation with coordinated install/update/uninstall.\n",
 		packageCommand,
 		"codebase-memory-mcp install --yes",
 	)
@@ -2150,7 +2150,7 @@ func createMutationRuntimeSnapshot(
 	names, ok := runtimeSetNames(sourceDirectory, binaryName)
 	if !ok {
 		return "", "", fmt.Errorf(
-			"cached runtime assets changed before mutation snapshot",
+			"cached executable changed before mutation snapshot",
 		)
 	}
 
@@ -2190,7 +2190,7 @@ func createMutationRuntimeSnapshot(
 			!pathMatchesSHA256(sourcePath, expectedDigest) {
 			_ = os.Remove(stagedPath)
 			return "", "", fmt.Errorf(
-				"cached runtime asset changed while mutation snapshot was copied: %s",
+				"cached executable changed while mutation snapshot was copied: %s",
 				name,
 			)
 		}
@@ -2258,7 +2258,7 @@ func execBinaryWithRuntimeLockAndRunner(
 	if !runtimeSetReady(
 		directory, filepath.Base(executable), verifier,
 	) {
-		return fmt.Errorf("cached runtime assets changed before mutation launch")
+		return fmt.Errorf("cached executable changed before mutation launch")
 	}
 	snapshotDirectory, snapshotExecutable, err := createMutationRuntimeSnapshot(
 		executable,

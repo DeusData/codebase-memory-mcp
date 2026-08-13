@@ -3,7 +3,8 @@
 # content-bound scan set produced by extract-release-archives.sh.
 #
 # Required: VT_API_KEY, VT_ANALYSIS, VT_EXPECTED_SCAN_SET, VT_ASSOCIATIONS
-# Workflow policy: MIN_ENGINES=50, zero malicious, zero suspicious.
+# Workflow policy: MIN_ENGINES=50, zero suspicious, and no malicious verdict
+# except one sole Microsoft label ending in !ml.
 # Optional: VT_RESULTS_PATH, VT_REQUEST_INTERVAL_SECONDS,
 #           VT_POLL_TIMEOUT_SECONDS, VT_CURL_TIMEOUT_SECONDS.
 set -euo pipefail

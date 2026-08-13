@@ -198,8 +198,10 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
     }
     (void)fclose(f);
 
-    /* The scans must now fail LOUDLY (CBM_STORE_ERR), not truncate. */
-    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    /* Open through the read-only query route so schema/index maintenance does
+     * not reject the fixture before the row-scan contract is exercised. The
+     * scans themselves must fail LOUDLY (CBM_STORE_ERR), not truncate. */
+    cbm_store_t *s2 = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(s2);
     /* The scan must CROSS the corrupt band: request every row. */
     cbm_search_params_t all_params = {

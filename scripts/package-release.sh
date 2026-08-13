@@ -227,6 +227,10 @@ build_mcpb_bundle() {
     cp "$PACK_DIR/LICENSE" "$PACK_DIR/THIRD_PARTY_NOTICES.md" "$stage/server/"
     local mcpb_version="${VERSION:-0.0.0-dev}"
     mcpb_version="${mcpb_version#v}"
+    if [[ ! "$mcpb_version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+        echo "package-release: VERSION contains characters unsafe for manifest.json" >&2
+        return 1
+    fi
     # ${__dirname} is the MCPB host's substitution variable, not shell —
     # hence the escapes. Hosts append .exe themselves where needed, but the
     # manifest names the actual member so non-normalizing hosts also work.

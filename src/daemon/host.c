@@ -283,7 +283,18 @@ static int host_lifetime_reservation_acquire(
 }
 
 static void *host_watcher_thread(void *opaque) {
-    cbm_watcher_run(opaque, HOST_WATCH_INTERVAL_MS);
+    host_state_t *host = opaque;
+    /* Honor the configured poll cadence: watcher_poll_base_ms and
+     * watcher_poll_max_ms bound the adaptive interval for large repositories.
+     * Zero lets cbm_watcher_run() apply its own compiled-in defaults instead of
+     * restating them here. */
+    int base_ms = host->runtime_config
+                      ? cbm_config_get_int(host->runtime_config, "watcher_poll_base_ms", 0)
+                      : 0;
+    int max_ms = host->runtime_config
+                     ? cbm_config_get_int(host->runtime_config, "watcher_poll_max_ms", 0)
+                     : 0;
+    cbm_watcher_run(host->watcher, base_ms, max_ms);
     return NULL;
 }
 
@@ -824,7 +835,7 @@ bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void) {
 }
 
 static bool host_background_start(host_state_t *host) {
-    if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
+    if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host) != 0) {
         return false;
     }
     host->watcher_started = true;
@@ -1020,6 +1031,8 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
         .identity = config->identity,
         .conflict_log_path = conflict_log,
         .conflict_log_cap_bytes = HOST_CONFLICT_LOG_CAP,
+        .build_fingerprint_cache_path = config->build_fingerprint_cache_path,
+        .build_fingerprint_cache_enabled = config->build_fingerprint_cache_enabled,
         .max_clients = HOST_MAX_CLIENTS,
         .lease_timeout_ms = HOST_LEASE_TIMEOUT_MS,
         .request_timeout_ms = HOST_REQUEST_TIMEOUT_MS,

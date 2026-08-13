@@ -16,18 +16,30 @@
 #include "discover/userconfig.h"
 #include "git/git_context.h"
 #include "foundation/hash_table.h"
+#include "foundation/str_util.h"
+#include "foundation/platform.h"
 #include "cbm.h"
+#include "service_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Maximum tree-sitter parse time per file. Instrumented builds may override
+ * this at compile time because sanitizer bookkeeping materially slows parsing. */
+#ifndef CBM_EXTRACT_BUDGET
 #define CBM_EXTRACT_BUDGET 5000000
+#endif
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
+#define CBM_ROUTE_DEFAULT_METHOD "ANY"
+#define CBM_ROUTE_DEFAULT_ASYNC_BROKER "async"
+#define CBM_PYTHON_SUPER_INIT_CALLEE "super().__init__"
+#define CBM_REGISTRY_STRATEGY_SUFFIX_MATCH "suffix_match"
 
 /* Incremental integrity failure: abort the run and preserve the existing DB.
  * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
@@ -43,6 +55,146 @@
  * canonicalize to "/u/{}"). The result never exceeds the input length, so
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
+
+/* Build the deterministic Route qualified_name and JSON properties for
+ * HTTP/async service edges. This keeps sequential, parallel, and post-merge
+ * Route-node paths on the same canonicalization and properties schema. */
+bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t svc,
+                                               const char *method, const char *broker,
+                                               const char *source, char *route_qn,
+                                               size_t route_qn_sz, char *route_props,
+                                               size_t route_props_sz);
+
+/* Strip "scheme://host[:port]" from a URL, returning the path ("/" when the
+ * URL has no path after the host); bare paths pass through unchanged. Shared
+ * by route minting and cross-repo matching so client-side full URLs and
+ * server-side registrations converge on the same route path. (#523) */
+const char *cbm_pipeline_route_url_path(const char *url);
+
+int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_svc_kind_t svc,
+                                          const char *method, const char *broker,
+                                          const char *source, const char *file_path);
+
+void cbm_pipeline_detect_url_arg_routes(cbm_gbuf_t *gb, const cbm_gbuf_node_t *source,
+                                        const CBMCall *call, const char *rel_path,
+                                        CBMLanguage lang);
+
+static inline bool cbm_pipeline_call_arg_is_route_path_keyword(const char *keyword) {
+    static const char *const path_keywords[] = {"prefix",     "path",     "route", "pattern",
+                                                "url",        "endpoint", "rule",  "mount_path",
+                                                "route_path", "url_path", "uri",   NULL};
+    if (!keyword) {
+        return false;
+    }
+    for (const char *const *kw = path_keywords; *kw; kw++) {
+        if (strcmp(keyword, *kw) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Locate the path literal and optional handler reference for route registration
+ * APIs. Shared by sequential and parallel call passes to keep FastAPI/Starlette,
+ * Express-style, and keyword-argument registrations on the same semantics. */
+static inline const char *cbm_pipeline_call_route_path_and_handler(const CBMCall *call,
+                                                                   const char **out_handler) {
+    if (out_handler) {
+        *out_handler = NULL;
+    }
+    if (!call) {
+        return NULL;
+    }
+    if (call->first_string_arg && call->first_string_arg[0] == '/') {
+        if (out_handler) {
+            *out_handler = call->second_arg_name;
+        }
+        return call->first_string_arg;
+    }
+
+    const char *found = NULL;
+    for (int ai = 0; ai < call->arg_count && !found; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        const char *val = ca->value ? ca->value : ca->expr;
+        if (!val || val[0] != '/') {
+            continue;
+        }
+        if ((ca->keyword && cbm_pipeline_call_arg_is_route_path_keyword(ca->keyword)) ||
+            (!ca->keyword && ca->index == 0)) {
+            found = val;
+        }
+    }
+    if (!found) {
+        return NULL;
+    }
+
+    if (out_handler) {
+        for (int ai = 0; ai < call->arg_count; ai++) {
+            const CBMCallArg *ca = &call->args[ai];
+            if (!ca->expr || ca->expr[0] == '/' || ca->expr[0] == '"' || ca->expr[0] == '\'') {
+                continue;
+            }
+            if (ca->keyword &&
+                (strcmp(ca->keyword, "prefix") == 0 || strcmp(ca->keyword, "name") == 0 ||
+                 strcmp(ca->keyword, "tags") == 0)) {
+                continue;
+            }
+            *out_handler = ca->expr;
+            break;
+        }
+    }
+    return found;
+}
+
+static inline bool cbm_pipeline_label_is_registry_symbol(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+                     strcmp(label, "Field") == 0);
+}
+
+static inline bool cbm_pipeline_label_is_import_target(const char *label) {
+    return label && (cbm_label_is_type_like(label) || strcmp(label, "Function") == 0 ||
+                     strcmp(label, "Method") == 0 || strcmp(label, "Module") == 0 ||
+                     strcmp(label, "File") == 0);
+}
+
+static inline bool cbm_pipeline_node_is_callable_scope(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0);
+}
+
+/* Weak registry fallbacks may resolve a call to an unrelated Variable or Field
+ * with the same short name, including symbols extracted from another language.
+ * Preserve type-like constructor targets and strong same-module/import matches,
+ * which can legitimately identify callable variables such as C callbacks. */
+static inline bool cbm_pipeline_should_suppress_weak_noncallable_call_target(
+    const cbm_gbuf_node_t *target, const char *strategy) {
+    if (!target || !target->label || !cbm_registry_strategy_is_weak_short_name(strategy)) {
+        return false;
+    }
+    return strcmp(target->label, "Function") != 0 && strcmp(target->label, "Method") != 0 &&
+           !cbm_label_is_type_like(target->label);
+}
+
+/* A textual `super().__init__` does not identify a local constructor without
+ * receiver-type information. A registry suffix match can therefore select an
+ * unrelated project Method merely because it is named `__init__`. Keep
+ * higher-confidence same-module/import matches and indexed LSP targets; reject
+ * only this ambiguous fallback identically in sequential and parallel passes. */
+static inline bool cbm_pipeline_should_suppress_python_super_init_suffix_match(
+    const CBMCall *call, CBMLanguage language, const cbm_resolution_t *resolution) {
+    return language == CBM_LANG_PYTHON && call && call->callee_name && resolution &&
+           resolution->strategy && strcmp(call->callee_name, CBM_PYTHON_SUPER_INIT_CALLEE) == 0 &&
+           strcmp(resolution->strategy, CBM_REGISTRY_STRATEGY_SUFFIX_MATCH) == 0;
+}
+
+/* Normalize the extractor's cross-language member-call signal for resolver
+ * guards. TS/JS sets is_method; Rust retains receiver.method in callee_name
+ * without setting that flag. Rust `::` qualified free calls are not members. */
+static inline bool cbm_pipeline_call_is_member(const CBMCall *call, CBMLanguage language) {
+    return call && (call->is_method || (language == CBM_LANG_RUST && call->callee_name &&
+                                        strchr(call->callee_name, '.') != NULL));
+}
 
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
@@ -63,6 +215,224 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
+/* Internal alias retained for the existing exact-delta code vocabulary. */
+enum { CBM_PIPELINE_COMPAT_GENERATION = CBM_PIPELINE_FILE_DELTA_GENERATION };
+enum { CBM_PIPELINE_FIELD_TYPE_HINT_CSHARP_M_PREFIX_LEN = 2 };
+/* Matches the historical parallel resolver confidence for type-name field hints. */
+#define CBM_PIPELINE_FIELD_TYPE_HINT_CONFIDENCE 0.85
+
+enum {
+    CBM_CALL_ARG_EXPR_MAX = 120,
+    CBM_CALL_ARG_JSON_MARGIN = 20,
+    CBM_CALL_ARG_JSON_GUARD = CBM_SZ_32,
+    CBM_CALL_LINE_MARGIN = 24,
+};
+
+static inline void cbm_pipeline_sanitize_call_arg_expr(char *expr_buf, size_t expr_buf_sz,
+                                                       const char *expr) {
+    if (!expr_buf || expr_buf_sz == 0) {
+        return;
+    }
+    if (expr) {
+        snprintf(expr_buf, expr_buf_sz, "%.*s", CBM_CALL_ARG_EXPR_MAX, expr);
+        for (char *p = expr_buf; *p; p++) {
+            if (*p == '"') {
+                *p = '\'';
+            }
+            if (*p == '\n' || *p == '\r') {
+                *p = ' ';
+            }
+        }
+    } else {
+        expr_buf[0] = '\0';
+    }
+}
+
+static inline int cbm_pipeline_format_call_arg_json(char *buf, size_t bufsize,
+                                                    const CBMCallArg *arg, const char *expr) {
+    if (!buf || !arg || bufsize == 0) {
+        return 0;
+    }
+    char esc_keyword[CBM_SZ_128];
+    char esc_expr[CBM_SZ_128];
+    char esc_value[CBM_SZ_128];
+    cbm_json_escape(esc_expr, sizeof(esc_expr), expr);
+    if (arg->keyword && arg->value) {
+        cbm_json_escape(esc_keyword, sizeof(esc_keyword), arg->keyword);
+        cbm_json_escape(esc_value, sizeof(esc_value), arg->value);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\",\"v\":\"%s\"}",
+                        arg->index, esc_keyword, esc_expr, esc_value);
+    }
+    if (arg->keyword) {
+        cbm_json_escape(esc_keyword, sizeof(esc_keyword), arg->keyword);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"k\":\"%s\",\"e\":\"%s\"}", arg->index,
+                        esc_keyword, esc_expr);
+    }
+    if (arg->value) {
+        cbm_json_escape(esc_value, sizeof(esc_value), arg->value);
+        return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}", arg->index, esc_expr,
+                        esc_value);
+    }
+    return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", arg->index, esc_expr);
+}
+
+static inline size_t cbm_pipeline_append_call_args_json(char *buf, size_t bufsize, size_t pos,
+                                                        const CBMCall *call) {
+    if (!buf || !call || call->arg_count == 0 || bufsize <= CBM_CALL_ARG_JSON_MARGIN ||
+        pos >= bufsize - CBM_CALL_ARG_JSON_MARGIN) {
+        return pos;
+    }
+    int n = snprintf(buf + pos, bufsize - pos, ",\"args\":[");
+    if (n <= 0 || (size_t)n >= bufsize - pos) {
+        return pos;
+    }
+    pos += (size_t)n;
+    for (int i = 0; i < call->arg_count && pos < bufsize - CBM_CALL_ARG_JSON_GUARD; i++) {
+        const CBMCallArg *arg = &call->args[i];
+        size_t mark = pos;
+        if (i > 0 && pos < bufsize - SKIP_ONE) {
+            buf[pos++] = ',';
+        }
+        char expr_buf[CBM_SZ_128];
+        cbm_pipeline_sanitize_call_arg_expr(expr_buf, sizeof(expr_buf), arg->expr);
+        n = cbm_pipeline_format_call_arg_json(buf + pos, bufsize - pos, arg, expr_buf);
+        if (n <= 0 || (size_t)n >= bufsize - pos) {
+            pos = mark;
+            break;
+        }
+        pos += (size_t)n;
+    }
+    if (pos < bufsize - SKIP_ONE) {
+        buf[pos++] = ']';
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+static inline void cbm_pipeline_close_call_edge_props(char *props, size_t props_sz, size_t pos,
+                                                      const CBMCall *call, bool include_line) {
+    if (!props || props_sz == 0 || pos >= props_sz - SKIP_ONE) {
+        return;
+    }
+    pos = cbm_pipeline_append_call_args_json(props, props_sz, pos, call);
+    if (include_line && call && call->start_line > 0 && pos < props_sz - CBM_CALL_LINE_MARGIN) {
+        int n = snprintf(props + pos, props_sz - pos, ",\"line\":%d", call->start_line);
+        if (n > 0 && (size_t)n < props_sz - pos) {
+            pos += (size_t)n;
+        }
+    }
+    if (pos < props_sz - SKIP_ONE) {
+        props[pos] = '}';
+        props[pos + SKIP_ONE] = '\0';
+    }
+}
+
+typedef const cbm_gbuf_node_t *(*cbm_pipeline_field_hint_find_fn)(void *ctx, const char *qn);
+
+static inline const cbm_gbuf_node_t *cbm_pipeline_field_hint_find_in_gbuf(void *ctx,
+                                                                          const char *qn) {
+    return cbm_gbuf_find_by_qn((const cbm_gbuf_t *)ctx, qn);
+}
+
+static inline void cbm_pipeline_try_field_type_hint_with_finder(
+    const cbm_registry_t *registry, cbm_resolution_t *res, const char *callee_name,
+    int64_t source_id, cbm_pipeline_field_hint_find_fn find_node, void *find_ctx) {
+    if (!registry || !res || !res->qualified_name || res->candidate_count <= SKIP_ONE ||
+        !callee_name || !find_node) {
+        return;
+    }
+    const char *dot = strchr(callee_name, '.');
+    if (!dot) {
+        return;
+    }
+
+    size_t prefix_len = (size_t)(dot - callee_name);
+    char object_name[CBM_SZ_256];
+    if (prefix_len >= sizeof(object_name)) {
+        return;
+    }
+    memcpy(object_name, callee_name, prefix_len);
+    object_name[prefix_len] = '\0';
+
+    const char *type_hint = object_name;
+    if (type_hint[0] == '_') {
+        type_hint++;
+    }
+    if (type_hint[0] == 'm' && type_hint[SKIP_ONE] == '_') {
+        type_hint += CBM_PIPELINE_FIELD_TYPE_HINT_CSHARP_M_PREFIX_LEN;
+    }
+
+    char type_name[CBM_SZ_256];
+    int n = snprintf(type_name, sizeof(type_name), "%s", type_hint);
+    if (n < 0 || (size_t)n >= sizeof(type_name)) {
+        return;
+    }
+    if (type_name[0] >= 'a' && type_name[0] <= 'z') {
+        type_name[0] -= ('a' - 'A');
+    }
+
+    char interface_name[CBM_SZ_256];
+    n = snprintf(interface_name, sizeof(interface_name), "I%s", type_name);
+    if (n < 0 || (size_t)n >= sizeof(interface_name)) {
+        return;
+    }
+
+    const char *method = dot + SKIP_ONE;
+    const char **candidates = NULL;
+    int candidate_count = 0;
+    cbm_registry_find_by_name(registry, method, &candidates, &candidate_count);
+    for (int i = 0; i < candidate_count; i++) {
+        if (!candidates[i] ||
+            (!strstr(candidates[i], type_name) && !strstr(candidates[i], interface_name))) {
+            continue;
+        }
+        const cbm_gbuf_node_t *better = find_node(find_ctx, candidates[i]);
+        if (better && better->id != source_id) {
+            res->qualified_name = candidates[i];
+            res->confidence = CBM_PIPELINE_FIELD_TYPE_HINT_CONFIDENCE;
+            res->strategy = "field_type_hint";
+            return;
+        }
+    }
+}
+
+static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *registry,
+                                                    const cbm_gbuf_t *gbuf, cbm_resolution_t *res,
+                                                    const char *callee_name, int64_t source_id) {
+    if (!gbuf) {
+        return;
+    }
+    cbm_pipeline_try_field_type_hint_with_finder(
+        registry, res, callee_name, source_id, cbm_pipeline_field_hint_find_in_gbuf, (void *)gbuf);
+}
+
+/* Test-only incremental fault injection. Values name internal phases and are
+ * intentionally not user configuration. */
+#define CBM_TEST_FAIL_INCREMENTAL_EXTRACT "incr_extract"
+#define CBM_TEST_FAIL_INCREMENTAL_REGISTRY "incr_registry"
+#define CBM_TEST_FAIL_INCREMENTAL_RESOLVE "incr_resolve"
+#define CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED "classify_deleted"
+#define CBM_TEST_FAIL_INCREMENTAL_POSTPASS "postpass"
+#define CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST "hash_persist"
+#define CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH "overlay_publish"
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+#define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
+#define CBM_TEST_FAIL_INCREMENTAL_DISABLED "0"
+
+static inline bool cbm_pipeline_test_fail_phase_enabled(const char *phase) {
+    char buf[CBM_SZ_64];
+    const char *val = cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, CBM_TEST_FAIL_INCREMENTAL_DISABLED) != 0 && phase &&
+           strcmp(val, phase) == 0;
+}
+#else
+/* Production must not accept an environment variable that injects pipeline
+ * failures. The argument is intentionally unused so its test-only identifier
+ * is not expanded into the release image. */
+#define cbm_pipeline_test_fail_phase_enabled(phase) false
+#endif
+
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
 /* Per-worker manifest collection entry. */
@@ -81,19 +451,27 @@ typedef struct {
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
+enum { CBM_PIPELINE_STORE_BACKED_LSP_SCOPE_DEFAULT_CAP = CBM_SZ_64 };
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
-    const char *project_name; /* borrowed from pipeline */
-    const char *repo_path;    /* borrowed from pipeline */
-    cbm_gbuf_t *gbuf;         /* owned by pipeline */
-    cbm_registry_t *registry; /* owned by pipeline */
-    atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
-    cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
-                               * (Stage 2 / Track B). May be NULL on paths that
-                               * don't record; cbm_pipeline_add_file_error is
-                               * NULL-safe. */
-    int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
+    const char *project_name;       /* borrowed from pipeline */
+    const char *repo_path;          /* borrowed from pipeline */
+    cbm_gbuf_t *gbuf;               /* owned by pipeline */
+    cbm_registry_t *registry;       /* owned by pipeline */
+    atomic_int *cancelled;          /* pointer to pipeline's cancelled flag */
+    cbm_pipeline_t *pipeline;       /* back-pointer for recording per-file skips
+                                     * (Stage 2 / Track B). May be NULL on paths that
+                                     * don't record; cbm_pipeline_add_file_error is
+                                     * NULL-safe. */
+    double similarity_threshold;    /* Jaccard threshold for SIMILAR edges; <=0 means
+                                     * use the CBM_MINHASH_JACCARD_THRESHOLD default (#41). */
+    double httplink_min_confidence; /* <=0 uses httplink pass default 0.25 */
+    double semantic_threshold;      /* <=0 uses semantic default 0.75 */
+    double githistory_min_coupling; /* <=0 uses git-history default 0.3 */
+    double lsp_confidence_floor;    /* <=0 uses LSP default 0.6 */
+    int64_t extract_timeout_micros; /* bounded tree-sitter parse deadline */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -106,44 +484,165 @@ typedef struct {
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
 
+    /* Scoped incremental optimization: resolvers may materialize referenced
+     * unchanged nodes from the store on demand. */
+    cbm_store_t *store_backed_node_lookup;
+    const char *const *store_backed_changed_paths;
+    const cbm_file_info_t *store_backed_all_files;
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
-    int excluded_count;
-
-    /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
-     * shared per-language registries here; resolved_calls entries may BORROW
-     * strings owned by these registries, and the later calls pass still
-     * reads them — so the arena is OWNED and destroyed by
-     * run_sequential_pipeline AFTER all passes, never by the lsp_cross pass
-     * itself (destroying at pass end was a use-after-free in pass_calls).
-     * Mirrors the parallel path, where cross_lsp_arena outlives the fused
-     * resolve. */
-    CBMArena seq_cross_arena;
-    bool seq_cross_arena_live;
-    /* Sequential lsp_cross only: the per-file module-QN strings the collected
+    /* Sequential lsp_cross only: per-file module-QN strings the collected
      * defs (and through them the shared cross registries in seq_cross_arena)
      * borrow. The registries outlive the pass so pass_calls can read borrowed
      * strings -- these must too. Ownership transfers here at the end of the
      * pass; released beside the arena. Freeing them at pass end was a
      * use-after-free first observable on the real-repo corpus tier. */
     char **seq_cross_def_modules;
-    int seq_cross_def_module_count;
-
     /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
      * no ObjectScript include files were found). Owned by pipeline.c. */
     const CBMMacroTable *macro_table;
-
     /* ObjectScript method-return-type table built from extracted definitions
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
+
+    /* Sequential cross-LSP registry arena. Resolved calls may borrow strings
+     * from it until all sequential passes finish. */
+    CBMArena seq_cross_arena;
+
+    int mode;                     /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=dep) */
+    int githistory_max_couplings; /* bounded FILE_CHANGES_WITH output budget */
+    /* Scoped incremental optimization scalar companions. The path arrays above
+     * prevent stale stored nodes from re-entering the scratch graph. A positive
+     * LSP scope cap requires a fresh-equivalence proof; leave these zero on
+     * full, dependency, and parallel worker paths. */
+    int store_backed_changed_path_count;
+    int store_backed_all_file_count;
+    int store_backed_lsp_scope_cap;
+    int excluded_count;             /* directory subtrees excluded during discovery */
+    int seq_cross_def_module_count; /* owned entries in seq_cross_def_modules */
+    bool pkgmap_preseeded;          /* caller owns the installed repo-wide package map */
+    bool seq_cross_arena_live;
 } cbm_pipeline_ctx_t;
+
+static inline int64_t cbm_pipeline_ctx_extract_timeout(const cbm_pipeline_ctx_t *ctx) {
+    return ctx && ctx->extract_timeout_micros > 0 ? ctx->extract_timeout_micros
+                                                  : CBM_EXTRACT_BUDGET;
+}
+
+int64_t cbm_pipeline_extract_timeout_micros(const cbm_pipeline_t *p);
+
+/* Release ObjectScript extraction tables owned by a pipeline context. This is
+ * shared by full and incremental routes so every exit path uses one ownership
+ * authority. NULL fields are accepted and cleared. */
+void cbm_pipeline_release_objectscript_tables(cbm_pipeline_ctx_t *ctx);
+void cbm_pipeline_release_seq_cross_state(cbm_pipeline_ctx_t *ctx);
+
+static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
+    return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;
+}
+
+static inline bool cbm_pipeline_mode_extracts_macro_nodes(int mode) {
+    return mode == CBM_MODE_FULL;
+}
+
+static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store,
+                                                              const char *project, int mode,
+                                                              bool semantic_edges_refreshed) {
+    static const char *const complete_graph_views[] = {
+        CBM_STORE_DERIVED_VIEW_ROUTES,
+        CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+    };
+    static const char *const semantic_views[] = {
+        CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+    };
+
+    int rc =
+        cbm_store_mark_rank_derived_views_stale(store, project, CBM_PIPELINE_COMPAT_GENERATION);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    rc = cbm_store_mark_derived_views_complete(
+        store, project, CBM_PIPELINE_COMPAT_GENERATION, complete_graph_views,
+        (int)(sizeof(complete_graph_views) / sizeof(complete_graph_views[0])));
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (cbm_pipeline_mode_builds_global_semantic_edges(mode) && semantic_edges_refreshed) {
+        return cbm_store_mark_derived_views_complete(
+            store, project, CBM_PIPELINE_COMPAT_GENERATION, semantic_views,
+            (int)(sizeof(semantic_views) / sizeof(semantic_views[0])));
+    }
+    return cbm_store_mark_derived_views_stale(
+        store, project, CBM_PIPELINE_COMPAT_GENERATION, semantic_views,
+        (int)(sizeof(semantic_views) / sizeof(semantic_views[0])));
+}
+
+typedef struct {
+    cbm_store_file_delta_t delta;
+    cbm_file_hash_t file_hash;
+    cbm_file_state_t file_state;
+    char file_content_hash[CBM_SZ_32];
+    char file_indexed_at[CBM_SZ_32];
+    cbm_node_t *context_nodes;
+    cbm_store_delta_edge_t *context_edges;
+    cbm_node_t *nodes;
+    cbm_store_delta_edge_t *edges;
+    cbm_store_symbol_export_t *exports;
+    cbm_store_import_ref_t *imports;
+    int unsupported_edge_count;
+    enum {
+        CBM_PIPELINE_DELTA_CHANGE_UPSERT = 0,
+        CBM_PIPELINE_DELTA_CHANGE_DELETE = 1,
+        CBM_PIPELINE_DELTA_CHANGE_RENAME = 2,
+    } change_kind;
+    const char *old_rel_path; /* borrowed; set for rename preflight only */
+} cbm_pipeline_file_delta_t;
+
+typedef enum {
+    CBM_PIPELINE_DELTA_ROUTE_FALLBACK = 0,
+    CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE = 1,
+} cbm_pipeline_delta_route_t;
+
+typedef struct {
+    cbm_pipeline_delta_route_t route;
+    const char *reason;
+    char **affected_paths;
+    int affected_count;
+} cbm_pipeline_file_delta_plan_t;
+
+#define CBM_PIPELINE_EDGE_CONTAINS_FILE "CONTAINS_FILE"
+#define CBM_PIPELINE_EDGE_CONTAINS_FOLDER "CONTAINS_FOLDER"
+#define CBM_PIPELINE_EDGE_DATA_FLOWS "DATA_FLOWS"
+#define CBM_PIPELINE_EDGE_FILE_CHANGES_WITH "FILE_CHANGES_WITH"
+#define CBM_PIPELINE_EDGE_SEMANTICALLY_RELATED "SEMANTICALLY_RELATED"
+#define CBM_PIPELINE_EDGE_SIMILAR_TO "SIMILAR_TO"
+#define CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR "frontier_error"
+#define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
+#define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
+#define CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP "scoped_lsp_gap"
+#define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
+#define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER "c_family_header"
+#define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE "c_family_source"
+#define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
+#define CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION "cross_file_node_qn_collision"
+#define CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR "header_type_impl_pair"
+#define CBM_PIPELINE_DELTA_REASON_ADDITIVE_SUBSET_REQUIRED "additive_subset_required"
+
+/* Conservative default exact-delta caps. Larger affected sets fall back to the
+ * containment path unless config opts into a benchmarked frontier size. */
+enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_32 };
+/* Default changed-file batch cap. Larger batches need explicit config and
+ * same-batch parity coverage for deletes, renames, folders, and derived views. */
+enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS = CBM_SZ_2 };
 
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
  * extraction arenas and is released with the ordinary cbm_free_result(). */
 CBMFileResult *cbm_pipeline_extract_objectscript_export(
     const char *source, int source_len, const char *project_name, const char *rel_path,
-    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table);
+    int64_t timeout_micros, bool extract_macros, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table);
 
 /* Materialize CONFIGURES edges from one extracted file's env-access carriers.
  * Shared by sequential definition processing and the parallel cache registry. */
@@ -167,7 +666,6 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
     }
     return 0;
 }
-
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
@@ -192,11 +690,159 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  *
  * `namespace_map` may be NULL (skips step 2).  `source_file_qn` is the importing
  * file's __file__ QN, used to avoid self-imports in step 3. */
-const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
+const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
+
+/* Insert an IMPORTS edge with canonical JSON properties.
+ * Shared by sequential and parallel definition passes so escaping and
+ * self-edge filtering cannot drift. Returns 1 when an edge is emitted. */
+int cbm_pipeline_insert_import_edge(cbm_pipeline_ctx_t *ctx, int64_t source_id,
+                                    const cbm_gbuf_node_t *target, const char *local_name);
+
+/* Resolve and insert all IMPORTS edges for one file.
+ * Shared by sequential and parallel definition passes so source-file lookup,
+ * resolver order, JSON properties, and self-edge filtering cannot drift. */
+int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                              const char *rel_path, CBMHashTable *namespace_map);
+
+/* Extract IMPORTS edge local_name from the canonical edge JSON. Caller frees. */
+char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);
+
+/* Build a per-file import map from already-resolved IMPORTS edges.
+ * Returned keys are heap strings; values are borrowed graph-buffer QNs. */
+int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
+                                             const char *rel_path, const char ***out_keys,
+                                             const char ***out_vals, int *out_count);
+bool cbm_pipeline_import_map_entry_is_reexport(const cbm_gbuf_t *gbuf, const char *project_name,
+                                               const char *rel_path, const char *local_name,
+                                               const char *resolved_qn);
+void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
+
+/* Build a store-level per-file delta descriptor from graph-buffer facts.
+ * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
+ * back instead of publishing when unsupported edges are present. */
+const char *cbm_pipeline_file_delta_pass_fingerprint(void);
+int cbm_pipeline_format_file_delta_pass_fingerprint(
+    char *out, size_t out_sz, int mode, double similarity_threshold, double httplink_min_confidence,
+    double semantic_threshold, double githistory_min_coupling, int githistory_max_couplings,
+    double lsp_confidence_floor);
+int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, size_t out_sz);
+int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
+bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
+                                                  const cbm_file_info_t *file,
+                                                  const char *pass_fingerprint);
+bool cbm_pipeline_file_state_content_matches_current(cbm_store_t *store, const char *project,
+                                                     const cbm_file_info_t *file,
+                                                     const char *pass_fingerprint);
+/* Persists file_state rows in its own transaction. */
+int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
+                                     const cbm_file_info_t *files, int file_count,
+                                     int64_t generation, const char *pass_fingerprint);
+
+/* Replace the project's coverage rows AND the metadata describing how
+ * completely this run recorded them (#963), in one transaction.
+ *
+ * EVERY publish route must go through this, not just the full-index one.
+ * cbm_store_coverage_replace() forwards a NULL meta, and a NULL meta CLEARS
+ * whatever metadata was there (store.h:1008-1012) — so a route that used the
+ * plain call would leave check_index_coverage unable to distinguish "recorded
+ * complete coverage and found nothing missing" from "never recorded coverage
+ * at all". Those two are reported identically and both look like success,
+ * which is exactly the ambiguity the metadata exists to remove.
+ *
+ * rows_available is false when the caller could not assemble the row set (an
+ * allocation failure, not an empty repository); it is what makes the recorded
+ * status "unavailable" rather than a truthful-looking "complete". Passing p as
+ * NULL is only for callers with no pipeline in hand: the mode and the
+ * ignored-file counts are then omitted rather than guessed. */
+int cbm_pipeline_coverage_replace_with_meta(const cbm_pipeline_t *p, cbm_store_t *store,
+                                            const char *project, const cbm_coverage_row_t *rows,
+                                            int count, bool rows_available,
+                                            bool hash_records_complete);
+bool cbm_pipeline_store_coverage_readable(cbm_store_t *store, const char *project);
+/* True when stored coverage is at least as comprehensive as the requested
+ * mode. This keeps a full graph eligible for a cheaper fast refresh without
+ * allowing a fast graph to masquerade as full. */
+bool cbm_pipeline_coverage_mode_satisfies(const char *stored_mode, cbm_index_mode_t requested_mode);
+int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
+                                            const char *rel_path, int64_t generation,
+                                            cbm_pipeline_file_delta_t *out);
+bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path);
+bool cbm_pipeline_is_c_family_source(CBMLanguage lang, const char *rel_path);
+bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
+int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst);
+int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src, cbm_store_delta_edge_t *dst);
+int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(cbm_store_t *store,
+                                                             const cbm_pipeline_file_delta_t *delta,
+                                                             bool *out_collision);
+int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
+                                                        cbm_pipeline_file_delta_t *delta,
+                                                        int *out_added);
+int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_delta_t *delta,
+                                                             const cbm_file_info_t *file,
+                                                             const char *pass_fingerprint);
+int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
+                                            const cbm_file_info_t *file);
+/* Stamp the reserved generation after exact-delta planning and before publish. */
+int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta, int64_t generation);
+void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta);
+
+/* Preflight an exact-delta publish candidate. This never writes the store. */
+int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
+                                 int max_affected_paths, cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
+                                       const cbm_pipeline_file_delta_t *const *deltas,
+                                       int delta_count, int max_affected_paths,
+                                       cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
+                                        const cbm_pipeline_file_delta_t *const *deltas,
+                                        int delta_count, int max_affected_paths,
+                                        cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                  const cbm_pipeline_file_delta_t *const *deltas,
+                                                  int delta_count, int64_t base_generation,
+                                                  const char *dirty_source,
+                                                  int64_t *out_overlay_generation);
+int cbm_pipeline_publish_overlay_file_delta_additions_batch(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas, int delta_count,
+    int64_t base_generation, const char *dirty_source, int64_t *out_overlay_generation);
+void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
+
+/* Seed a scratch graph with persisted unchanged nodes needed by import and
+ * symbol resolution. Used to build exact-delta descriptors without loading the
+ * full stored graph. `changed_paths` entries are borrowed and skipped. */
+int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
+                                                    cbm_registry_t *registry, const char *project,
+                                                    const char *const *changed_paths,
+                                                    int changed_path_count);
+const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, const char *qn);
+
+static inline const cbm_gbuf_node_t *cbm_pipeline_field_hint_find_in_ctx(void *ctx,
+                                                                         const char *qn) {
+    return cbm_pipeline_find_node_by_qn((cbm_pipeline_ctx_t *)ctx, qn);
+}
+
+static inline void cbm_pipeline_try_field_type_hint_ctx(cbm_pipeline_ctx_t *ctx,
+                                                        cbm_resolution_t *res,
+                                                        const char *callee_name,
+                                                        int64_t source_id) {
+    if (!ctx) {
+        return;
+    }
+    cbm_pipeline_try_field_type_hint_with_finder(ctx->registry, res, callee_name, source_id,
+                                                 cbm_pipeline_field_hint_find_in_ctx, ctx);
+}
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
@@ -210,6 +856,11 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
                           int source_len, cbm_pkg_entries_t *entries);
+
+/* Join an owned package-map walker path without a semantic length ceiling.
+ * For P output bytes: O(P) runtime and returned memory, O(1) auxiliary memory.
+ * Caller frees the result. */
+char *cbm_pkgmap_join_path(const char *dir, const char *name);
 
 /* Merge per-worker entries into a hash table. Returns NULL if no entries. */
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
@@ -245,8 +896,8 @@ bool cbm_is_test_func_name(const char *name);
 
 /* Coupling result from computeChangeCoupling */
 typedef struct {
-    char file_a[CBM_SZ_512];
-    char file_b[CBM_SZ_512];
+    char *file_a;
+    char *file_b;
     int co_change_count;
     double coupling_score;
     /* Unix epoch of the most recent commit that touched both files together.
@@ -254,6 +905,14 @@ typedef struct {
      * without %ct). */
     long long last_co_change;
 } cbm_change_coupling_t;
+
+typedef struct {
+    int written;
+    int eligible;
+    int omitted;
+    int path_too_long;
+    int allocation_failed;
+} cbm_change_coupling_result_t;
 
 /* Commit data for coupling analysis */
 typedef struct {
@@ -268,16 +927,29 @@ typedef struct {
  * nodes can carry change_count and last_modified for hotspot / risk
  * analysis queries. */
 typedef struct {
-    char file_path[CBM_SZ_512];
+    char *file_path; /* exact owned path; release with cbm_file_temporal_free */
     int change_count;
     long long last_modified; /* unix epoch of most recent commit */
 } cbm_file_temporal_t;
 
 /* Compute change coupling from commit history.
  * Returns number of couplings written to out (up to max_out).
- * Caller owns out[]. */
+ * Each written row owns its exact file_a/file_b strings; release them with
+ * cbm_change_coupling_paths_free before releasing or reusing the row array. */
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
                                 cbm_change_coupling_t *out, int max_out);
+int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits, int commit_count,
+                                               cbm_change_coupling_t *out, int max_out,
+                                               double min_coupling_score);
+cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit_files_t *commits,
+                                                                int commit_count,
+                                                                cbm_change_coupling_t *out,
+                                                                int max_out,
+                                                                double min_coupling_score);
+void cbm_change_coupling_paths_free(cbm_change_coupling_t *items, int count);
+int cbm_compute_file_temporal(const cbm_commit_files_t *commits, int commit_count,
+                              cbm_file_temporal_t **out, int *out_count);
+void cbm_file_temporal_free(cbm_file_temporal_t *items, int count);
 
 /* Go-style implicit interface satisfaction on graph buffer.
  * Finds Interface nodes, matches method sets against Class nodes,
@@ -514,6 +1186,11 @@ typedef struct {
     size_t retain_per_file_max_bytes;
 } cbm_parallel_extract_opts_t;
 
+/* Shared ObjectScript include context for sequential, parallel, and
+ * incremental extraction. The caller owns the returned table. */
+CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
+                                                const char *repo_path);
+
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts);
@@ -563,7 +1240,11 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 /* Post-merge: create Route nodes for HTTP_CALLS/ASYNC_CALLS edges that
  * have url_path in properties but point to library functions instead of routes.
  * Re-targets these edges to Route nodes for cross-service traversal. */
+void cbm_pipeline_clear_route_derived_edges(cbm_gbuf_t *gb);
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
+
+int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project, const char *root_qn,
+                                       const char *rel_path, CBMHashTable *seen_dirs);
 
 /* ── Pass function prototypes ────────────────────────────────────── */
 
@@ -607,6 +1288,9 @@ typedef struct {
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
 int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result);
+int cbm_pipeline_githistory_compute_with_limits(const char *repo_path,
+                                                cbm_githistory_result_t *result,
+                                                double min_coupling_score, int max_couplings);
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);
@@ -617,6 +1301,17 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* K8s / Kustomize pass: emits Module nodes for kustomization.yaml overlays and
+ * Resource nodes for generic Kubernetes manifests. */
+int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
+
+/* Pre-dump pass: structural invariant enforcement (Method→Class, Field→Class edges). */
+void cbm_pipeline_pass_normalize(cbm_gbuf_t *gb);
+
+/* HTTP endpoint discovery pass (fork-only; upstream dropped httplinks). Extracts HTTP
+ * routes from Go/Express/Laravel/Ktor/Python frameworks and links them into the graph. */
+int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx);
+
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 
@@ -624,11 +1319,25 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
  * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
 
+typedef struct {
+    int function_index;
+    uint8_t band_matches;
+} cbm_semantic_candidate_t;
+
+/* Rank bounded LSH candidates by descending band matches, then canonical
+ * function index, before exact vector scoring. Runtime is O(count log count);
+ * count is bounded by the accepted LSH bucket working set. Returns the number
+ * selected (at most limit) and places them first. */
+int cbm_pipeline_rank_semantic_candidates(cbm_semantic_candidate_t *candidates, int count,
+                                          int limit);
+
 /* Pre-dump pass: interprocedural complexity propagation (Tier B).
  * Propagates per-function loop_depth along CALLS edges into a transitive
  * worst-case nested-loop estimate (transitive_loop_depth) and flags call-graph
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
+void cbm_pipeline_pass_complexity_for_paths(cbm_pipeline_ctx_t *ctx, const char *const *paths,
+                                            int path_count);
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
@@ -650,22 +1359,27 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
 int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
                                        char **excluded_dirs, int excluded_count);
 
+/* Free all compiled regex patterns used by cbm_scan_project_env_urls.
+ * Patterns are compiled lazily on first use and cached for the process lifetime.
+ * Call this in test teardown to release ~26KB of regex memory cleanly. */
+void cbm_envscan_free_patterns(void);
+
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
 /* Run incremental re-index on an existing disk DB.
- * Classifies files by mtime+size, deletes changed nodes, re-parses changed
- * files, merges into disk DB. Returns 0 on success. */
+ * Classifies files by metadata, hash-confirms metadata-equal files when
+ * compatible file_state rows exist, loads the current DB into a graph buffer,
+ * reparses changed files, and republishes the graph. Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count, const cbm_file_hash_t *baseline_manifest,
-                                 int baseline_count);
+                                 int file_count);
 
-/* Exact semantic inputs for no-op/forced-full routing. The manifest contains
- * every discovered source plus repository controls actually consumed by
- * discovery, package mapping, path aliases, and extension overrides. */
+/* Exact semantic inputs used to reject a mixed source/config generation at
+ * the destination writer's atomic publication boundary. */
 #define CBM_SEMANTIC_INPUT_PREFIX ".codebase-memory/.semantic-input/"
 #define CBM_SEMANTIC_INPUT_GIT_CONTEXT CBM_SEMANTIC_INPUT_PREFIX "git-context-v1"
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
+#define CBM_SEMANTIC_INPUT_CONTROLS CBM_SEMANTIC_INPUT_PREFIX "controls-v1"
 
 int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
                                          const cbm_file_info_t *files, int file_count,
@@ -676,92 +1390,21 @@ int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_p
 void cbm_pipeline_free_semantic_manifest(cbm_file_hash_t *manifest, int count);
 bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left_count,
                                            const cbm_file_hash_t *right, int right_count);
-/* Re-run discovery and hash its exact semantic inputs. Used at the publication
- * boundary so late additions/deletions cannot escape a frozen file list. */
 int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
                                                cbm_file_hash_t **out, int *out_count);
-
-/* Compatibility contract persisted in coverage metadata. Increment when a
- * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
-
-typedef struct {
-    cbm_gbuf_t *gbuf;
-    const char *final_db_path;
-    const char *project;
-    atomic_int *cancelled;
-    const cbm_file_hash_t *manifest;
-    int manifest_count;
-    const char *adr_content;
-    const cbm_coverage_row_t *coverage;
-    int coverage_count;
-    cbm_coverage_meta_t coverage_meta;
-    /* Per-file LSP surfaces for the generation being published (may be NULL:
-     * cross-LSP disabled, or a caller that has none). Written into the
-     * staging store alongside the manifest so surface data and graph always
-     * belong to the same generation. */
-    const cbm_lsp_surface_row_t *surface_rows;
-    int surface_row_count;
-    /* True when the caller already wrote this generation's surface rows
-     * into the staging store (delta patch); publish then skips the
-     * wholesale delete+rewrite. */
-    bool surfaces_in_place;
-} cbm_pipeline_generation_t;
-
-/* Serialize and fully populate a sibling staging database, then atomically
- * replace final_db_path. The old generation is untouched on every failure or
- * cancellation observed before the rename commit point. */
-int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation);
-/* Final leg shared by the dump-built and delta-patched publication paths:
- * sidecar removal, previous-generation quarantine, atomic rename. The stage
- * must be complete and sealed with its store handle closed. Discards the
- * stage on every failure. Does NOT free stage_path. */
-int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_db_path,
-                                            atomic_int *cancelled, bool destination_known_healthy);
-/* Metadata writes + FTS policy + integrity + seal + finalize for an
- * already-materialized staging DB. Takes ownership of stage_path. The dump
- * path passes fts_wholesale=true; the delta path passes false (its patch
- * wrote row-level FTS inserts). generation->gbuf is not read here. */
-int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_t *generation,
-                                bool fts_wholesale, bool destination_known_healthy);
-
-/* mkstemp-minted staging sibling of final_path (exported for the delta
- * executor; the dump path uses it internally). malloc'd, caller frees. */
-char *cbm_pipeline_create_staging_path(const char *final_path);
-
-/* ── Delta-repair staging primitives (pipeline_delta.c) ──────────
- * Closure-route-only subsystem: clone the live generation, patch exactly
- * the repaired node/edge set, publish through the shared finalize leg. */
-typedef struct {
-    char *source_qn;
-    char *target_qn;
-    char *type;
-    char *props;
-} cbm_delta_saved_edge_t;
-
-int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path);
-int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const char *const *paths,
-                               int path_count, cbm_delta_saved_edge_t **out, int *out_count);
-void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count);
-int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
-                    int path_count);
-/* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
- * watermark above MAX(id); returns that max id, or -1 on failure. */
-int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);
-int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, int64_t max_db_id,
-                    const cbm_delta_saved_edge_t *snapshot, int snapshot_count);
-/* discard helper shared with the delta executor (unlink stage + sidecars). */
-void cbm_pipeline_discard_stage(const char *stage_path);
-/* The SQLite generation is authoritative. An explicitly requested artifact is
- * part of the caller-visible operation and its export error is returned;
- * automatic refresh of an already-existing artifact remains best-effort. */
-int cbm_pipeline_refresh_artifact(cbm_pipeline_t *p, const char *db_path);
+int cbm_pipeline_prepare_semantic_inputs(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                         int file_count);
+const char *cbm_pipeline_semantic_controls_digest(const cbm_pipeline_t *p);
+int cbm_pipeline_persist_semantic_control_hashes(cbm_pipeline_t *p, cbm_store_t *store,
+                                                 const cbm_file_info_t *files, int file_count);
 
 /* Hand the pipeline the per-file LSP-surface rows serialized at the
  * collect_all_defs seam (the only moment the result cache is alive).
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+void cbm_pipeline_get_lsp_surfaces(const cbm_pipeline_t *p, const cbm_lsp_surface_row_t **rows,
+                                   int *count);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
@@ -769,6 +1412,20 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+void cbm_pipeline_set_graph_changed(cbm_pipeline_t *p, bool changed);
+void cbm_pipeline_set_publish_kind(cbm_pipeline_t *p, cbm_pipeline_publish_kind_t kind);
+void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason);
+bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p);
+bool cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(
+    const cbm_pipeline_t *p);
+bool cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(
+    const cbm_pipeline_t *p);
+void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths, int affected_paths,
+                                        int published_paths);
+void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
+                                                   int affected_paths, int published_paths,
+                                                   int affected_paths_limit,
+                                                   bool affected_paths_truncated);
 
 /* Test seam: invoked after a complete staging DB is sealed and immediately
  * before the cancellation check + atomic replace. Not part of the public API. */
@@ -818,18 +1475,15 @@ typedef enum {
     CBM_INCREMENTAL_ROUTE_NONE = 0,
     CBM_INCREMENTAL_ROUTE_NOOP,
     CBM_INCREMENTAL_ROUTE_FORCED_FULL,
-    CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL,
     CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR,
 } cbm_incremental_route_t;
 
-/* Deterministic one-shot fault injection for the incremental-parallel result
- * cache allocation. Reset explicitly so one test cannot affect another. */
-void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
-void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void);
 void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
+void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
+bool cbm_pipeline_incremental_test_take_result_cache_alloc_failure(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);

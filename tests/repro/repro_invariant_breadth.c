@@ -585,8 +585,8 @@ TEST(repro_invariant_breadth_callable_sourcing) {
     }
 
     fprintf(stderr,
-            "  [INV-BREADTH] %d langs checked: %d FAILURES "
-            "(each = callable-sourcing invariant violated or no CALLS at all)\n",
+            "  [INV-BREADTH] %d languages checked; observed gaps=%d "
+            "(gap = callable-sourcing invariant violated or no CALLS)\n",
             IB_CASES_COUNT, failures);
 
     ASSERT_EQ(failures, 0);

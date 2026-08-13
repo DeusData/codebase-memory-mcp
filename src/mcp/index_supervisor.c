@@ -86,7 +86,7 @@ size_t cbm_index_worker_memory_budget_bytes(void) {
 
 static bool worker_fingerprint_valid(const char *fingerprint);
 
-bool cbm_index_supervisor_capture_build_fingerprint(void) {
+static bool supervisor_capture_build_fingerprint(const char *cache_path, bool allow_cache) {
     if (g_build_fingerprint_capture_attempted) {
         return g_build_fingerprint[0] != '\0';
     }
@@ -109,11 +109,25 @@ bool cbm_index_supervisor_capture_build_fingerprint(void) {
     }
 #endif
     char captured[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE] = {0};
-    if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)worker_getpid(), captured)) {
+    bool captured_ok =
+        cache_path
+            ? cbm_daemon_runtime_process_build_fingerprint_cached(
+                  (uint64_t)worker_getpid(), cache_path, allow_cache, captured, NULL)
+            : cbm_daemon_runtime_process_build_fingerprint((uint64_t)worker_getpid(), captured);
+    if (!captured_ok) {
         return false;
     }
     (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", captured);
     return true;
+}
+
+bool cbm_index_supervisor_capture_build_fingerprint(void) {
+    return supervisor_capture_build_fingerprint(NULL, false);
+}
+
+bool cbm_index_supervisor_capture_build_fingerprint_cached(const char *cache_path,
+                                                           bool allow_cache) {
+    return supervisor_capture_build_fingerprint(cache_path, allow_cache);
 }
 
 const char *cbm_index_supervisor_build_fingerprint(void) {
@@ -292,7 +306,7 @@ static bool supervisor_disable_requested(void) {
  * repo that keeps making progress is never falsely killed. Default: 15 min (a
  * genuinely stuck file emits nothing, so this fires only on a real hang). The
  * CBM_INDEX_WORKER_TIMEOUT_S override (seconds → ms) tightens it for tests. */
-static int worker_quiet_timeout_ms(void) {
+int cbm_index_worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
     char timeout_seconds[CBM_SZ_32] = {0};
     if (cbm_safe_getenv("CBM_INDEX_WORKER_TIMEOUT_S", timeout_seconds, sizeof(timeout_seconds),
@@ -666,7 +680,7 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
      * child cannot strand a bounded tail backlog. */
     options.on_log_line = NULL;
     options.log_ud = NULL;
-    options.quiet_timeout_ms = worker_quiet_timeout_ms();
+    options.quiet_timeout_ms = cbm_index_worker_quiet_timeout_ms();
     options.delete_log_on_exit = false;
     if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
         (void)cbm_unlink(handle->response_path);

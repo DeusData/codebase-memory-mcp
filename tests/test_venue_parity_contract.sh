@@ -312,11 +312,39 @@ LOCAL_REQUIRED = [
      "the VM preflight enforces Defender-ON parity"),
     ("test-infrastructure/vm/win.sh", r"scripts/ci/smoke-artifact\.sh",
      "the VM driver exposes the artifact-flow smoke lane"),
+    ("test-infrastructure/vm/vm-run-tests.sh", r"new-protected-temp-root\.ps1[\s\S]*-ProtectDir",
+     "the VM runner delegates build-directory ACL ownership to the shared current-SID helper"),
+    ("test-infrastructure/vm/vm-run-tests.sh", r"FAIL: VM runner child DACL reset",
+     "the VM runner fails loudly when existing children cannot inherit the protected parent ACL"),
+    ("scripts/memlab.sh", r"FAIL: memlab DACL normalize",
+     "memlab fails loudly when its Windows root cannot be normalized before protection"),
+    ("scripts/memlab.sh", r"FAIL: memlab child DACL reset",
+     "memlab fails loudly when existing children cannot inherit the protected root ACL"),
 ]
 for local, pattern, why in LOCAL_REQUIRED:
     path = root / local
     if path.exists() and not re.search(pattern, path.read_text()):
         failures.append(f"{local}: missing required `{pattern}` — {why}")
+
+vm_runner = root / "test-infrastructure/vm/vm-run-tests.sh"
+if vm_runner.exists():
+    text = vm_runner.read_text(encoding="utf-8")
+    if re.search(r"whoami|icacls[^\n]*?/grant", text, re.IGNORECASE):
+        failures.append(
+            "test-infrastructure/vm/vm-run-tests.sh: build-directory ownership must come "
+            "only from new-protected-temp-root.ps1 -ProtectDir; account-name grants are "
+            "ambiguous and duplicate the shared current-SID policy"
+        )
+    if re.search(r"icacls[^\n]*/reset[^\n]*\|\|\s*true", text, re.IGNORECASE):
+        failures.append(
+            "test-infrastructure/vm/vm-run-tests.sh: required child ACL reset must fail loudly"
+        )
+
+memlab = root / "scripts/memlab.sh"
+if memlab.exists():
+    text = memlab.read_text(encoding="utf-8")
+    if re.search(r"icacls[^\n]*/reset[^\n]*\|\|\s*true", text, re.IGNORECASE):
+        failures.append("scripts/memlab.sh: required Windows ACL resets must fail loudly")
 
 # Native Windows process lookup searches system locations before PATH. A bare
 # `bash` argv launched by embedded Python can therefore select the WSL alias

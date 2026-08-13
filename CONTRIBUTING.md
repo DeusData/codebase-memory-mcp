@@ -26,19 +26,101 @@ The binary is output to `build/c/codebase-memory-mcp`.
 scripts/test.sh
 ```
 
-This builds with ASan + UBSan and runs the full C test suite. Key test files:
+This is the local maintainer gate used by the project scripts. It cleans the C build, runs the
+full ASan + UBSan C test suite, builds the production binary, and then runs the parent-watchdog
+and security-string regression scripts. The exact test count changes as suites are added; use the
+runner summary as the source of truth. Key test files:
 - `tests/test_pipeline.c` — pipeline integration tests
 - `tests/test_httplink.c` — HTTP route extraction and linking
 - `tests/test_mcp.c` — MCP protocol and tool handler tests
 - `tests/test_store_*.c` — SQLite graph store tests
 
+Useful script options and environment:
+
+```bash
+scripts/test.sh --arch arm64             # macOS: force target architecture
+scripts/test.sh CC=clang CXX=clang++     # override compiler
+CBM_RUN_HANG_TEST=1 scripts/test.sh      # include the slower C++ index-hang guard
+```
+
+## Run C Server Tests
+
+The MCP server core is written in C and has its own test suite under `tests/`:
+
+```bash
+make -f Makefile.cbm test          # full suite with ASan + UBSan
+make -f Makefile.cbm test-tsan     # thread-sensitive suites with ThreadSanitizer
+make -f Makefile.cbm test-leak     # heap leak check (see below)
+make -f Makefile.cbm test-memory   # macOS MallocScribble/PreScribble nosan run
+make -f Makefile.cbm test-gmalloc  # macOS Guard Malloc nosan run
+make -f Makefile.cbm test-analyze  # Clang static analyzer (requires clang, not gcc)
+```
+
+Focused runs are opt-in. Leave these unset for the complete suite:
+
+```bash
+CBM_ONLY_SUITE=pipeline make -f Makefile.cbm test
+CBM_ONLY_SUITE=pipeline CBM_ONLY_TEST=exact build/c/test-runner
+```
+
+By default, tests isolate `CBM_CACHE_DIR` in a temporary directory so local indexes are not
+polluted. Set `CBM_TEST_NO_ISOLATE=1` only when intentionally testing the user's configured cache.
+
+### Build profiles
+
+Use `scripts/build.sh` for a clean local release build. It is the same entry point used by the
+release workflow and produces the default installable binary with `-O2`. For a faster incremental
+release rebuild, use `make -f Makefile.cbm cbm`; `make -f Makefile.cbm install` installs that same
+optimized artifact.
+
+Use `scripts/test.sh` for normal development validation. Its C test binary uses `-g -O1` with
+ASan and UBSan, then it builds the production binary for the parent/worker watchdog checks. Use
+the dedicated `test-tsan`, `test-leak`, `test-memory`, and `test-gmalloc` targets above when
+diagnosing concurrency or allocator lifetime behavior. These diagnostic binaries are not valid
+performance-benchmark inputs.
+
+For performance changes, use the canonical fact tables and comparison rules in
+[`docs/BENCHMARK_EXPERIMENTS.md`](docs/BENCHMARK_EXPERIMENTS.md). Field, step,
+concurrency, and lifecycle meanings come from the generated
+[`docs/BENCHMARK_TERMINOLOGY.md`](docs/BENCHMARK_TERMINOLOGY.md), whose source of
+truth is `benchmarks/terminology.json`.
+
+Additional build flags follow the Makefile conventions:
+
+```bash
+make -f Makefile.cbm test SANITIZE=      # disable ASan/UBSan, mainly for unsupported toolchains
+make -f Makefile.cbm cbm CFLAGS_EXTRA=-DCBM_VERSION=dev
+make -f Makefile.cbm cbm STATIC=1        # static link where supported
+```
+
+**Memory leak detection:**
+
+On **macOS**, `test-leak` builds a sanitizer-free binary (`test-runner-nosan`) and runs Apple's
+`leaks --atExit` on allocation-owning store, pipeline, ranker, and parallel-worker
+suites. ASan replaces malloc, so the standard `test-runner` cannot be inspected by `leaks` — the
+separate nosan build is required. Deliberate crash tests are excluded because Apple's debugger
+stops their child processes before the parent can reap them; this includes the subprocess,
+stack-overflow, MCP crash-quarantine, and HTTP socket-inheritance suites.
+
+On **Linux**, `test-leak` runs the regular `test-runner` with `ASAN_OPTIONS=detect_leaks=1` to
+activate LSan.
+
+In both cases the full report is written to `build/c/leak-report.txt`. A clean run ends with:
+```
+Process NNNNN: 0 leaks for 0 total leaked bytes.
+```
+
 ## Run Linter
 
 ```bash
 scripts/lint.sh
+make -f Makefile.cbm lint-source-safety
 ```
 
-Runs clang-tidy, cppcheck, and clang-format. All must pass before committing (also enforced by pre-commit hook).
+Runs clang-tidy, cppcheck, and clang-format. `lint-source-safety` runs the source guard and its
+self-tests; it blocks new MCP stdout writes, insecure string APIs, raw env/filesystem calls in
+reviewed paths, and other regressions that should use existing CBM helpers instead. All must pass
+before committing (also enforced by pre-commit hook).
 
 ## Run Security Audit
 
@@ -55,7 +137,7 @@ src/
   foundation/       Arena allocator, hash table, string utils, platform compat
   store/            SQLite graph storage (WAL mode, FTS5)
   cypher/           Cypher query → SQL translation
-  mcp/              MCP server (JSON-RPC 2.0 over stdio, 14 tools)
+  mcp/              MCP server and tools (JSON-RPC 2.0 over stdio)
   pipeline/         Multi-pass indexing pipeline
     pass_*.c        Individual pipeline passes (definitions, calls, usages, etc.)
     httplink.c      HTTP route extraction (Go/Express/Laravel/Ktor/Python)

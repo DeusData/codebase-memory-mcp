@@ -1,563 +1,1854 @@
-/*
- * pipeline_delta.c — delta-repair staging primitives (closure route only).
- *
- * The dedicated incremental subsystem: instead of loading the whole previous
- * graph into RAM and dumping a complete new generation, the closure route
- * CLONES the live database (copy-on-write where the filesystem offers it),
- * PATCHES exactly the repaired node/edge set into the clone inside one
- * transaction, and publishes through the same sealed-staging finalize leg as
- * the dump path. The general indexing pipeline is untouched; these
- * primitives exist only for the closure orchestration in
- * pipeline_incremental.c.
- *
- * Id discipline carries the design: node ids are AUTOINCREMENT and never
- * reused, the small in-RAM gbuf is pre-seeded with PROXY nodes carrying
- * their real database ids, and fresh nodes are numbered above the previous
- * generation's MAX(id) — so "id > max_db_id" is the complete, marker-free
- * definition of what the patch inserts, and every edge endpoint id is
- * database-valid by construction.
- *
- * FTS policy: the nodes_fts table is contentless, so purged rows cannot be
- * deleted individually on existing databases; their rowids can never alias
- * a live node again (AUTOINCREMENT), so dead entries simply drop out of the
- * rowid join at query time. The patch inserts rows for exactly the new
- * nodes, via the same cbm_camel_split SQL function the wholesale rebuild
- * uses.
- */
-#include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
 
+#include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/constants.h"
+#include "foundation/log.h"
+#include "foundation/str_util.h"
+
+#include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <yyjson/yyjson.h>
 
-#include "foundation/compat_fs.h"
-#include "foundation/log.h"
-#include "sqlite3.h"
-#include "store/store.h"
+static const char cbm_delta_edge_imports[] = "IMPORTS";
+static const char cbm_delta_edge_usage[] = "USAGE";
+static const char cbm_delta_edge_contains_file[] = CBM_PIPELINE_EDGE_CONTAINS_FILE;
+static const char cbm_delta_label_module[] = "Module";
+static const char cbm_delta_file_hash_legacy_empty[] = "";
+static const char cbm_delta_prop_is_exported[] = "is_exported";
+static const char cbm_delta_pass_fingerprint_v1[] = "pipeline-file-delta-v1";
+static const char cbm_delta_reason_candidate[] = "candidate";
+static const char cbm_delta_reason_delete_batch_requires_full[] = "delete_batch_requires_full";
+static const char cbm_delta_reason_frontier_error[] = CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR;
+static const char cbm_delta_reason_frontier_requires_batch[] =
+    CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH;
+static const char cbm_delta_reason_frontier_too_large[] =
+    CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE;
+static const char cbm_delta_reason_inbound_edges_require_full[] =
+    CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+static const char cbm_delta_reason_invalid_input[] = "invalid_input";
+static const char cbm_delta_reason_missing_generation[] = "missing_generation";
+static const char cbm_delta_reason_missing_existing_ownership[] = "missing_existing_ownership";
+static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
+static const char cbm_delta_reason_preflight_error[] = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
+static const char cbm_delta_reason_publish_error[] = "publish_error";
+static const char cbm_delta_reason_cross_file_node_qn_collision[] =
+    CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION;
+static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_full";
+static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge_endpoint";
+static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
+static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
+static const char cbm_delta_debug_inbound_env[] = "CBM_DEBUG_DELTA_INBOUND";
 
-enum { DELTA_IN_CHUNK = 200 };
+static const char *const cbm_delta_scratch_graph_seed_labels[] = {
+    "Project", "Branch", "Folder", "File", "Module", NULL,
+};
 
-/* Assemble "?,?,...,?" for a chunked IN list. buf must hold 2*count. */
-static void delta_placeholders(char *buf, int count) {
-    int pos = 0;
+static const char *const cbm_delta_scratch_registry_seed_labels[] = {
+    "Struct", "Enum",      "Trait",    "Type",  "Function", "Method",
+    "Class",  "Interface", "Variable", "Field", NULL,
+};
+
+enum {
+    CBM_DELTA_GROWTH = 2,
+    CBM_DELTA_ISO8601_UTC_LEN = 20,
+};
+
+typedef struct {
+    cbm_pipeline_file_delta_t *out;
+    const cbm_gbuf_t *gbuf;
+    const char *project;
+    const char *rel_path;
+    int context_node_cap;
+    int context_edge_cap;
+    int node_cap;
+    int edge_cap;
+    int export_cap;
+    int import_cap;
+    int rc;
+} cbm_delta_build_ctx_t;
+
+static char *delta_strdup(const char *s) {
+    return cbm_strdup(s ? s : "");
+}
+
+static bool cbm_pipeline_is_c_lsp_family_language(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA;
+}
+
+bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    if (lang != CBM_LANG_COUNT && !cbm_pipeline_is_c_lsp_family_language(lang)) {
+        return false;
+    }
+    return cbm_str_ends_with(rel_path, ".h") || cbm_str_ends_with(rel_path, ".hh") ||
+           cbm_str_ends_with(rel_path, ".hpp") || cbm_str_ends_with(rel_path, ".hxx") ||
+           cbm_str_ends_with(rel_path, ".cuh");
+}
+
+bool cbm_pipeline_is_c_family_source(CBMLanguage lang, const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    if (cbm_pipeline_is_c_family_header(lang, rel_path)) {
+        return false;
+    }
+    if (cbm_pipeline_is_c_lsp_family_language(lang)) {
+        return true;
+    }
+    if (lang != CBM_LANG_COUNT) {
+        return false;
+    }
+    return cbm_str_ends_with(rel_path, ".c") || cbm_str_ends_with(rel_path, ".cc") ||
+           cbm_str_ends_with(rel_path, ".ccm") || cbm_str_ends_with(rel_path, ".cpp") ||
+           cbm_str_ends_with(rel_path, ".cppm") || cbm_str_ends_with(rel_path, ".cxx") ||
+           cbm_str_ends_with(rel_path, ".ixx") || cbm_str_ends_with(rel_path, ".cu");
+}
+
+const char *cbm_pipeline_file_delta_pass_fingerprint(void) {
+    return cbm_delta_pass_fingerprint_v1;
+}
+
+static uint64_t delta_double_bits(double value) {
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+int cbm_pipeline_format_file_delta_pass_fingerprint(
+    char *out, size_t out_sz, int mode, double similarity_threshold, double httplink_min_confidence,
+    double semantic_threshold, double githistory_min_coupling, int githistory_max_couplings,
+    double lsp_confidence_floor) {
+    if (!out || out_sz == 0) {
+        return CBM_STORE_ERR;
+    }
+    int n =
+        snprintf(out, out_sz,
+                 "%s|mode=%d|sim=%016" PRIx64 "|http=%016" PRIx64 "|sem=%016" PRIx64
+                 "|gh=%016" PRIx64 "|ghmax=%d|lsp=%016" PRIx64,
+                 cbm_delta_pass_fingerprint_v1, mode, delta_double_bits(similarity_threshold),
+                 delta_double_bits(httplink_min_confidence), delta_double_bits(semantic_threshold),
+                 delta_double_bits(githistory_min_coupling), githistory_max_couplings,
+                 delta_double_bits(lsp_confidence_floor));
+    if (n < 0 || (size_t)n >= out_sz) {
+        out[0] = '\0';
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static bool delta_same_path(const char *a, const char *b) {
+    return a && b && strcmp(a, b) == 0;
+}
+
+static bool delta_path_in_list(const char *path, const char *const *paths, int count) {
+    if (!path || !paths || count <= 0) {
+        return false;
+    }
     for (int i = 0; i < count; i++) {
-        buf[pos++] = '?';
-        if (i + 1 < count) {
-            buf[pos++] = ',';
+        if (delta_same_path(path, paths[i])) {
+            return true;
         }
     }
-    buf[pos] = '\0';
+    return false;
 }
 
-int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path) {
-    *out_stage_path = NULL;
-    char *stage = cbm_pipeline_create_staging_path(final_db_path);
-    if (!stage) {
-        return CBM_NOT_FOUND;
+static int delta_seed_store_node(cbm_gbuf_t *gbuf, cbm_registry_t *registry,
+                                 const cbm_node_t *node) {
+    if (!gbuf || !node || !node->label || !node->qualified_name) {
+        return CBM_STORE_ERR;
     }
-    if (cbm_clone_or_copy_file(final_db_path, stage) != 0) {
-        cbm_pipeline_discard_stage(stage);
-        free(stage);
-        return CBM_NOT_FOUND;
+    int64_t id =
+        cbm_gbuf_upsert_node(gbuf, node->label, node->name ? node->name : "", node->qualified_name,
+                             node->file_path ? node->file_path : "", node->start_line,
+                             node->end_line, node->properties_json ? node->properties_json : "{}");
+    if (id <= 0) {
+        return CBM_STORE_ERR;
     }
-    *out_stage_path = stage;
-    return 0;
+    if (registry && cbm_pipeline_label_is_registry_symbol(node->label) && node->name) {
+        cbm_registry_add(registry, node->name, node->qualified_name, node->label);
+    }
+    return CBM_STORE_OK;
 }
 
-/* Snapshot inbound cross-file edges into the given files from OUTSIDE them,
- * keyed by endpoint qualified names — the same semantics as the gbuf-based
- * capture, expressed as one indexed query per chunk. Edge types a full
- * reindex recomputes wholesale are excluded for the same reasons recorded
- * there (restoring a stale copy could produce edges a full build would not). */
-static bool delta_edge_type_is_recomputed(const char *type) {
-    return type && (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
-                    strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
+static bool delta_can_materialize_store_node(const cbm_node_t *node) {
+    return node && node->label &&
+           (cbm_pipeline_label_is_registry_symbol(node->label) ||
+            cbm_pipeline_label_is_import_target(node->label));
 }
 
-int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const char *const *paths,
-                               int path_count, cbm_delta_saved_edge_t **out, int *out_count) {
-    *out = NULL;
-    *out_count = 0;
-    if (path_count <= 0) {
-        return 0;
+typedef struct {
+    cbm_registry_t *registry;
+    const char *const *changed_paths;
+    int changed_path_count;
+} cbm_delta_registry_seed_ctx_t;
+
+static int delta_seed_registry_row(const char *label, const char *name, const char *qualified_name,
+                                   const char *file_path, void *userdata) {
+    cbm_delta_registry_seed_ctx_t *ctx = (cbm_delta_registry_seed_ctx_t *)userdata;
+    if (!ctx || !ctx->registry || !label || !name || !qualified_name ||
+        delta_path_in_list(file_path, ctx->changed_paths, ctx->changed_path_count)) {
+        return CBM_STORE_OK;
     }
-    sqlite3 *db = cbm_store_get_db(store);
-    if (!db) {
-        return CBM_NOT_FOUND;
+    cbm_registry_add(ctx->registry, name, qualified_name, label);
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf_t *gbuf,
+                                                    cbm_registry_t *registry, const char *project,
+                                                    const char *const *changed_paths,
+                                                    int changed_path_count) {
+    if (!store || !gbuf || !project || changed_path_count < 0 ||
+        (changed_path_count > 0 && !changed_paths)) {
+        return CBM_STORE_ERR;
     }
-    cbm_delta_saved_edge_t *items = NULL;
-    int count = 0;
-    int cap = 0;
-    for (int off = 0; off < path_count; off += DELTA_IN_CHUNK) {
-        int chunk = path_count - off;
-        if (chunk > DELTA_IN_CHUNK) {
-            chunk = DELTA_IN_CHUNK;
+    for (const char *const *label = cbm_delta_scratch_graph_seed_labels; *label; label++) {
+        cbm_node_t *nodes = NULL;
+        int node_count = 0;
+        int rc = cbm_store_find_nodes_by_label(store, project, *label, &nodes, &node_count);
+        if (rc != CBM_STORE_OK) {
+            return rc;
         }
-        char ph[2 * DELTA_IN_CHUNK + 1];
-        delta_placeholders(ph, chunk);
-        char sql[CBM_SZ_4K];
-        int n = snprintf(sql, sizeof(sql),
-                         /* CROSS JOIN pins nodes-first: the planner otherwise walks
-                          * EVERY project edge through the url_path index prefix
-                          * (measured 14.6s vs 4ms at kernel scale). */
-                         "SELECT src.qualified_name, tgt.qualified_name, e.type, e.properties"
-                         " FROM nodes tgt"
-                         " CROSS JOIN edges e ON e.target_id = tgt.id"
-                         " CROSS JOIN nodes src ON e.source_id = src.id"
-                         " WHERE tgt.project = ?1 AND tgt.file_path IN (%s)"
-                         " AND src.file_path NOT IN (%s)"
-                         " AND src.file_path <> '' AND src.file_path IS NOT NULL",
-                         ph, ph);
-        if (n < 0 || (size_t)n >= sizeof(sql)) {
-            cbm_delta_free_snapshot(items, count);
-            return CBM_NOT_FOUND;
-        }
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-            cbm_delta_free_snapshot(items, count);
-            return CBM_NOT_FOUND;
-        }
-        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        for (int i = 0; i < chunk; i++) {
-            sqlite3_bind_text(stmt, 2 + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2 + chunk + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        }
-        int step_rc;
-        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            const char *type = (const char *)sqlite3_column_text(stmt, 2);
-            if (delta_edge_type_is_recomputed(type)) {
+        for (int i = 0; i < node_count; i++) {
+            if (delta_path_in_list(nodes[i].file_path, changed_paths, changed_path_count)) {
                 continue;
             }
-            if (count >= cap) {
-                int ncap = cap ? cap * 2 : 64;
-                cbm_delta_saved_edge_t *grown = realloc(items, (size_t)ncap * sizeof(*items));
-                if (!grown) {
-                    sqlite3_finalize(stmt);
-                    cbm_delta_free_snapshot(items, count);
-                    return CBM_NOT_FOUND;
-                }
-                items = grown;
-                cap = ncap;
+            if (delta_seed_store_node(gbuf, NULL, &nodes[i]) != CBM_STORE_OK) {
+                cbm_store_free_nodes(nodes, node_count);
+                return CBM_STORE_ERR;
             }
-            const char *sq = (const char *)sqlite3_column_text(stmt, 0);
-            const char *tq = (const char *)sqlite3_column_text(stmt, 1);
-            const char *props = (const char *)sqlite3_column_text(stmt, 3);
-            cbm_delta_saved_edge_t *e = &items[count];
-            e->source_qn = strdup(sq ? sq : "");
-            e->target_qn = strdup(tq ? tq : "");
-            e->type = strdup(type ? type : "");
-            e->props = strdup(props ? props : "{}");
-            if (!e->source_qn || !e->target_qn || !e->type || !e->props) {
-                free(e->source_qn);
-                free(e->target_qn);
-                free(e->type);
-                free(e->props);
-                sqlite3_finalize(stmt);
-                cbm_delta_free_snapshot(items, count);
-                return CBM_NOT_FOUND;
-            }
-            count++;
         }
-        sqlite3_finalize(stmt);
-        if (step_rc != SQLITE_DONE) {
-            cbm_delta_free_snapshot(items, count);
-            return CBM_NOT_FOUND;
+        cbm_store_free_nodes(nodes, node_count);
+    }
+    cbm_delta_registry_seed_ctx_t seed_ctx = {
+        .registry = registry,
+        .changed_paths = changed_paths,
+        .changed_path_count = changed_path_count,
+    };
+    for (const char *const *label = cbm_delta_scratch_registry_seed_labels; *label; label++) {
+        int rc = cbm_store_visit_nodes_by_label(store, project, *label, delta_seed_registry_row,
+                                                &seed_ctx);
+        if (rc != CBM_STORE_OK) {
+            return rc;
         }
     }
-    *out = items;
-    *out_count = count;
-    return 0;
+    return CBM_STORE_OK;
 }
 
-void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count) {
-    if (!items) {
+const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, const char *qn) {
+    if (!ctx || !ctx->gbuf || !qn || !qn[0]) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+    if (found || !ctx->store_backed_node_lookup || !ctx->project_name) {
+        return found;
+    }
+
+    cbm_node_t stored = {0};
+    int rc =
+        cbm_store_find_node_by_qn(ctx->store_backed_node_lookup, ctx->project_name, qn, &stored);
+    if (rc != CBM_STORE_OK) {
+        return NULL;
+    }
+    if (delta_path_in_list(stored.file_path, ctx->store_backed_changed_paths,
+                           ctx->store_backed_changed_path_count) ||
+        !delta_can_materialize_store_node(&stored) ||
+        delta_seed_store_node(ctx->gbuf, NULL, &stored) != CBM_STORE_OK) {
+        cbm_node_free_fields(&stored);
+        return NULL;
+    }
+    cbm_node_free_fields(&stored);
+    return cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+}
+
+static bool delta_node_is_exported(const cbm_gbuf_node_t *node) {
+    if (!node || !node->properties_json) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *value = root ? yyjson_obj_get(root, cbm_delta_prop_is_exported) : NULL;
+    bool exported = value && yyjson_is_bool(value) && yyjson_get_bool(value);
+    yyjson_doc_free(doc);
+    return exported;
+}
+
+static int delta_grow(void **items, int *cap, size_t item_sz) {
+    if (!items || !cap || item_sz == 0) {
+        return CBM_STORE_ERR;
+    }
+    if (*cap > INT_MAX / CBM_DELTA_GROWTH) {
+        return CBM_STORE_ERR;
+    }
+    int new_cap = (*cap > 0) ? *cap * CBM_DELTA_GROWTH : CBM_SZ_8;
+    void *tmp = realloc(*items, (size_t)new_cap * item_sz);
+    if (!tmp) {
+        return CBM_STORE_ERR;
+    }
+    *items = tmp;
+    *cap = new_cap;
+    return CBM_STORE_OK;
+}
+
+static void delta_edge_free_fields(cbm_store_delta_edge_t *edge) {
+    if (!edge) {
         return;
     }
+    free((void *)edge->source_qn);
+    free((void *)edge->target_qn);
+    free((void *)edge->type);
+    free((void *)edge->properties_json);
+    *edge = (cbm_store_delta_edge_t){0};
+}
+
+int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst) {
+    if (!src || !dst) {
+        return CBM_STORE_ERR;
+    }
+    *dst = (cbm_node_t){
+        .id = CBM_STORE_NO_NODE_ID,
+        .project = delta_strdup(src->project),
+        .label = delta_strdup(src->label),
+        .name = delta_strdup(src->name),
+        .qualified_name = delta_strdup(src->qualified_name),
+        .file_path = delta_strdup(src->file_path),
+        .start_line = src->start_line,
+        .end_line = src->end_line,
+        .properties_json = delta_strdup(src->properties_json ? src->properties_json : "{}"),
+    };
+    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name || !dst->file_path ||
+        !dst->properties_json) {
+        cbm_node_free_fields(dst);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src, cbm_store_delta_edge_t *dst) {
+    if (!src || !dst) {
+        return CBM_STORE_ERR;
+    }
+    *dst = (cbm_store_delta_edge_t){
+        .source_qn = delta_strdup(src->source_qn),
+        .target_qn = delta_strdup(src->target_qn),
+        .type = delta_strdup(src->type),
+        .properties_json = delta_strdup(src->properties_json ? src->properties_json : "{}"),
+        .derived_kind = src->derived_kind ? src->derived_kind : CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!dst->source_qn || !dst->target_qn || !dst->type || !dst->properties_json) {
+        delta_edge_free_fields(dst);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static void delta_import_free_fields(cbm_store_import_ref_t *import) {
+    if (!import) {
+        return;
+    }
+    free((void *)import->import_text);
+    free((void *)import->local_name);
+    free((void *)import->target_qn);
+    *import = (cbm_store_import_ref_t){0};
+}
+
+static int delta_append_node(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *node) {
+    if (ctx->out->delta.node_count >= ctx->node_cap &&
+        delta_grow((void **)&ctx->out->nodes, &ctx->node_cap, sizeof(*ctx->out->nodes)) !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t row = {.project = ctx->project,
+                      .label = node->label,
+                      .name = node->name,
+                      .qualified_name = node->qualified_name,
+                      .file_path = node->file_path,
+                      .start_line = node->start_line,
+                      .end_line = node->end_line,
+                      .properties_json = node->properties_json};
+    if (cbm_pipeline_copy_delta_node(&row, &ctx->out->nodes[ctx->out->delta.node_count]) !=
+        CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    ctx->out->delta.node_count++;
+    return CBM_STORE_OK;
+}
+
+static bool delta_path_is_ancestor_dir(const char *dir, const char *rel_path) {
+    if (!dir || !dir[0] || !rel_path || !rel_path[0]) {
+        return false;
+    }
+    size_t dir_len = strlen(dir);
+    return strncmp(rel_path, dir, dir_len) == 0 && rel_path[dir_len] == '/';
+}
+
+static bool delta_node_is_structure_context(const cbm_gbuf_node_t *node, const char *rel_path) {
+    return node && node->label && strcmp(node->label, "Folder") == 0 &&
+           delta_path_is_ancestor_dir(node->file_path, rel_path);
+}
+
+static bool delta_node_is_structure_root(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Project") == 0 || strcmp(node->label, "Branch") == 0);
+}
+
+static int delta_append_context_node(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *node) {
+    if (ctx->out->delta.context_node_count >= ctx->context_node_cap &&
+        delta_grow((void **)&ctx->out->context_nodes, &ctx->context_node_cap,
+                   sizeof(*ctx->out->context_nodes)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t row = {.project = ctx->project,
+                      .label = node->label,
+                      .name = node->name,
+                      .qualified_name = node->qualified_name,
+                      .file_path = node->file_path,
+                      .start_line = node->start_line,
+                      .end_line = node->end_line,
+                      .properties_json = node->properties_json};
+    if (cbm_pipeline_copy_delta_node(
+            &row, &ctx->out->context_nodes[ctx->out->delta.context_node_count]) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    ctx->out->delta.context_node_count++;
+    return CBM_STORE_OK;
+}
+
+static int delta_append_export(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *node) {
+    if (ctx->out->delta.export_count >= ctx->export_cap &&
+        delta_grow((void **)&ctx->out->exports, &ctx->export_cap, sizeof(*ctx->out->exports)) !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_symbol_export_t row = {.qualified_name = delta_strdup(node->qualified_name),
+                                     .node_id = CBM_STORE_NO_NODE_ID};
+    if (!row.qualified_name) {
+        return CBM_STORE_ERR;
+    }
+    ctx->out->exports[ctx->out->delta.export_count++] = row;
+    return CBM_STORE_OK;
+}
+
+static int delta_append_context_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *src,
+                                     const cbm_gbuf_node_t *tgt, const cbm_gbuf_edge_t *edge) {
+    if (ctx->out->delta.context_edge_count >= ctx->context_edge_cap &&
+        delta_grow((void **)&ctx->out->context_edges, &ctx->context_edge_cap,
+                   sizeof(*ctx->out->context_edges)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_delta_edge_t row = {
+        .source_qn = delta_strdup(src->qualified_name),
+        .target_qn = delta_strdup(tgt->qualified_name),
+        .type = delta_strdup(edge->type),
+        .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
+        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!row.source_qn || !row.target_qn || !row.type || !row.properties_json) {
+        delta_edge_free_fields(&row);
+        return CBM_STORE_ERR;
+    }
+    ctx->out->context_edges[ctx->out->delta.context_edge_count++] = row;
+    return CBM_STORE_OK;
+}
+
+static int delta_append_edge(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *src,
+                             const cbm_gbuf_node_t *tgt, const cbm_gbuf_edge_t *edge) {
+    if (ctx->out->delta.edge_count >= ctx->edge_cap &&
+        delta_grow((void **)&ctx->out->edges, &ctx->edge_cap, sizeof(*ctx->out->edges)) !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_delta_edge_t row = {
+        .source_qn = delta_strdup(src->qualified_name),
+        .target_qn = delta_strdup(tgt->qualified_name),
+        .type = delta_strdup(edge->type),
+        .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
+        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!row.source_qn || !row.target_qn || !row.type || !row.properties_json) {
+        delta_edge_free_fields(&row);
+        return CBM_STORE_ERR;
+    }
+    ctx->out->edges[ctx->out->delta.edge_count++] = row;
+    return CBM_STORE_OK;
+}
+
+static int delta_append_import(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *tgt,
+                               const cbm_gbuf_edge_t *edge) {
+    if (ctx->out->delta.import_count >= ctx->import_cap &&
+        delta_grow((void **)&ctx->out->imports, &ctx->import_cap, sizeof(*ctx->out->imports)) !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    char *local = cbm_pipeline_import_edge_local_name_dup(edge);
+    /* The graph edge preserves local_name and target_qn, not the original import
+     * specifier. target_qn is the stable key needed for reverse closure. */
+    cbm_store_import_ref_t row = {
+        .import_text = delta_strdup(tgt->qualified_name),
+        .local_name = local ? local : delta_strdup(""),
+        .target_qn = delta_strdup(tgt->qualified_name),
+    };
+    if (!row.import_text || !row.local_name || !row.target_qn) {
+        delta_import_free_fields(&row);
+        return CBM_STORE_ERR;
+    }
+    ctx->out->imports[ctx->out->delta.import_count++] = row;
+    return CBM_STORE_OK;
+}
+
+static void delta_visit_node(const cbm_gbuf_node_t *node, void *userdata) {
+    cbm_delta_build_ctx_t *ctx = (cbm_delta_build_ctx_t *)userdata;
+    if (ctx->rc != CBM_STORE_OK) {
+        return;
+    }
+    if (delta_same_path(node->file_path, ctx->rel_path)) {
+        ctx->rc = delta_append_node(ctx, node);
+        if (ctx->rc == CBM_STORE_OK && delta_node_is_exported(node)) {
+            ctx->rc = delta_append_export(ctx, node);
+        }
+    } else if (delta_node_is_structure_context(node, ctx->rel_path)) {
+        ctx->rc = delta_append_context_node(ctx, node);
+    }
+}
+
+static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
+    cbm_delta_build_ctx_t *ctx = (cbm_delta_build_ctx_t *)userdata;
+    if (ctx->rc != CBM_STORE_OK || !edge) {
+        return;
+    }
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_id(ctx->gbuf, edge->target_id);
+    if (!src || !tgt || !src->qualified_name || !tgt->qualified_name || !edge->type) {
+        ctx->out->unsupported_edge_count++;
+        return;
+    }
+    bool source_owned = delta_same_path(src->file_path, ctx->rel_path);
+    bool target_owned = delta_same_path(tgt->file_path, ctx->rel_path);
+    bool source_context = delta_node_is_structure_context(src, ctx->rel_path);
+    bool target_context = delta_node_is_structure_context(tgt, ctx->rel_path);
+    bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) && tgt->label &&
+                                  strcmp(tgt->label, "File") == 0;
+    bool context_structure_edge = strcmp(edge->type, CBM_PIPELINE_EDGE_CONTAINS_FOLDER) == 0 &&
+                                  target_context &&
+                                  (source_context || delta_node_is_structure_root(src));
+    bool regenerated_file_structure = !source_owned &&
+                                      strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
+                                      target_is_changed_file;
+    bool target_owned_usage = !source_owned && target_owned &&
+                              cbm_pipeline_is_c_family_header(CBM_LANG_COUNT, ctx->rel_path) &&
+                              src->label && strcmp(src->label, cbm_delta_label_module) == 0 &&
+                              strcmp(edge->type, cbm_delta_edge_usage) == 0;
+    if (context_structure_edge) {
+        ctx->rc = delta_append_context_edge(ctx, src, tgt, edge);
+        return;
+    }
+    if (!source_owned && !regenerated_file_structure && !target_owned_usage) {
+        return;
+    }
+    ctx->rc = delta_append_edge(ctx, src, tgt, edge);
+    if (source_owned && ctx->rc == CBM_STORE_OK &&
+        strcmp(edge->type, cbm_delta_edge_imports) == 0) {
+        ctx->rc = delta_append_import(ctx, tgt, edge);
+    }
+}
+
+int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
+                                            const char *rel_path, int64_t generation,
+                                            cbm_pipeline_file_delta_t *out) {
+    if (!gbuf || !project || !rel_path || generation < 0 || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    out->delta = (cbm_store_file_delta_t){
+        .project = project,
+        .rel_path = rel_path,
+        .generation = generation,
+        .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+        .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE,
+    };
+    cbm_delta_build_ctx_t ctx = {
+        .out = out,
+        .gbuf = gbuf,
+        .project = project,
+        .rel_path = rel_path,
+        .rc = CBM_STORE_OK,
+    };
+    cbm_gbuf_foreach_node(gbuf, delta_visit_node, &ctx);
+    if (ctx.rc == CBM_STORE_OK) {
+        cbm_gbuf_foreach_edge(gbuf, delta_visit_edge, &ctx);
+    }
+    out->delta.nodes = out->nodes;
+    out->delta.edges = out->edges;
+    out->delta.exports = out->exports;
+    out->delta.imports = out->imports;
+    out->delta.context_nodes = out->context_nodes;
+    out->delta.context_edges = out->context_edges;
+    if (ctx.rc != CBM_STORE_OK) {
+        cbm_pipeline_file_delta_free(out);
+    }
+    return ctx.rc;
+}
+
+static int delta_iso_now(char *buf, size_t sz) {
+    if (!buf || sz <= CBM_DELTA_ISO8601_UTC_LEN) {
+        return CBM_STORE_ERR;
+    }
+    time_t t = time(NULL);
+    struct tm tm;
+    cbm_gmtime_r(&t, &tm);
+    return strftime(buf, sz, "%Y-%m-%dT%H:%M:%SZ", &tm) == CBM_DELTA_ISO8601_UTC_LEN
+               ? CBM_STORE_OK
+               : CBM_STORE_ERR;
+}
+
+int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz) {
+    return cbm_file_content_hash(path, out, out_sz) == 0 ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+static bool file_state_content_matches_current(cbm_store_t *store, const char *project,
+                                               const cbm_file_info_t *file,
+                                               const char *pass_fingerprint,
+                                               bool missing_is_legacy_current) {
+    if (!store || !project || !project[0] || !file || !file->path || !file->rel_path) {
+        return missing_is_legacy_current;
+    }
+
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(store, project, file->rel_path, &state);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return missing_is_legacy_current;
+    }
+    const char *current_pass =
+        pass_fingerprint ? pass_fingerprint : cbm_pipeline_file_delta_pass_fingerprint();
+    bool matches = false;
+    if (rc == CBM_STORE_OK && state.content_hash && state.content_hash[0] &&
+        state.pass_fingerprint && strcmp(state.pass_fingerprint, current_pass) == 0) {
+        char current_hash[CBM_SZ_32];
+        matches = (cbm_pipeline_content_hash_file(file->path, current_hash, sizeof(current_hash)) ==
+                       CBM_STORE_OK &&
+                   strcmp(current_hash, state.content_hash) == 0);
+    }
+    cbm_store_file_state_free_fields(&state);
+    return matches;
+}
+
+bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
+                                                  const cbm_file_info_t *file,
+                                                  const char *pass_fingerprint) {
+    return file_state_content_matches_current(store, project, file, pass_fingerprint, true);
+}
+
+bool cbm_pipeline_file_state_content_matches_current(cbm_store_t *store, const char *project,
+                                                     const cbm_file_info_t *file,
+                                                     const char *pass_fingerprint) {
+    return file_state_content_matches_current(store, project, file, pass_fingerprint, false);
+}
+
+int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
+                                     const cbm_file_info_t *files, int file_count,
+                                     int64_t generation, const char *pass_fingerprint) {
+    if (!store || !project || !project[0] || file_count < 0 || (file_count > 0 && !files) ||
+        generation < 0) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_begin(store);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (!files[i].path || !files[i].rel_path || !files[i].rel_path[0]) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        struct stat st;
+        if (cbm_stat(files[i].path, &st) != 0) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        char content_hash[CBM_SZ_32];
+        if (cbm_pipeline_content_hash_file(files[i].path, content_hash, sizeof(content_hash)) !=
+            CBM_STORE_OK) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        char indexed_at[CBM_SZ_32];
+        if (delta_iso_now(indexed_at, sizeof(indexed_at)) != CBM_STORE_OK) {
+            (void)cbm_store_rollback(store);
+            return CBM_STORE_ERR;
+        }
+        cbm_file_state_t state = {.project = project,
+                                  .rel_path = files[i].rel_path,
+                                  .content_hash = content_hash,
+                                  .git_oid = NULL,
+                                  .mtime_ns = cbm_stat_mtime_ns(&st),
+                                  .size = st.st_size,
+                                  .language = cbm_language_name(files[i].language),
+                                  .pass_fingerprint =
+                                      pass_fingerprint ? pass_fingerprint
+                                                       : cbm_pipeline_file_delta_pass_fingerprint(),
+                                  .generation = generation,
+                                  .indexed_at = indexed_at};
+        rc = cbm_store_upsert_file_state(store, &state);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(store);
+            return rc;
+        }
+    }
+    rc = cbm_store_commit(store);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(store);
+        return rc;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_delta_t *delta,
+                                                             const cbm_file_info_t *file,
+                                                             const char *pass_fingerprint) {
+    if (!delta || !file || !file->path || !delta->delta.project || !delta->delta.rel_path ||
+        delta->delta.generation < 0) {
+        return CBM_STORE_ERR;
+    }
+    struct stat st;
+    if (cbm_stat(file->path, &st) != 0) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_pipeline_content_hash_file(file->path, delta->file_content_hash,
+                                       sizeof(delta->file_content_hash)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (delta_iso_now(delta->file_indexed_at, sizeof(delta->file_indexed_at)) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    int64_t mtime_ns = cbm_stat_mtime_ns(&st);
+    delta->file_hash = (cbm_file_hash_t){.project = delta->delta.project,
+                                         .rel_path = delta->delta.rel_path,
+                                         .sha256 = cbm_delta_file_hash_legacy_empty,
+                                         .mtime_ns = mtime_ns,
+                                         .size = st.st_size};
+    delta->file_state = (cbm_file_state_t){
+        .project = delta->delta.project,
+        .rel_path = delta->delta.rel_path,
+        .content_hash = delta->file_content_hash,
+        .git_oid = NULL,
+        .mtime_ns = mtime_ns,
+        .size = st.st_size,
+        .language = cbm_language_name(file->language),
+        .pass_fingerprint =
+            pass_fingerprint ? pass_fingerprint : cbm_pipeline_file_delta_pass_fingerprint(),
+        .generation = delta->delta.generation,
+        .indexed_at = delta->file_indexed_at};
+    delta->delta.file_hash = &delta->file_hash;
+    delta->delta.file_state = &delta->file_state;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_attach_file_delta_metadata(cbm_pipeline_file_delta_t *delta,
+                                            const cbm_file_info_t *file) {
+    return cbm_pipeline_attach_file_delta_metadata_with_fingerprint(
+        delta, file, cbm_pipeline_file_delta_pass_fingerprint());
+}
+
+int cbm_pipeline_file_delta_stamp_generation(cbm_pipeline_file_delta_t *delta, int64_t generation) {
+    if (!delta || generation <= 0) {
+        return CBM_STORE_ERR;
+    }
+    const cbm_file_state_t *attached_state = delta->delta.file_state;
+    if (attached_state && attached_state != &delta->file_state) {
+        delta->file_state = *attached_state;
+    }
+    delta->delta.generation = generation;
+    delta->file_state.generation = generation;
+    if (attached_state) {
+        delta->delta.file_state = &delta->file_state;
+    }
+    return CBM_STORE_OK;
+}
+
+void cbm_pipeline_file_delta_free(cbm_pipeline_file_delta_t *delta) {
+    if (!delta) {
+        return;
+    }
+    for (int i = 0; i < delta->delta.node_count; i++) {
+        free((void *)delta->nodes[i].project);
+        free((void *)delta->nodes[i].label);
+        free((void *)delta->nodes[i].name);
+        free((void *)delta->nodes[i].qualified_name);
+        free((void *)delta->nodes[i].file_path);
+        free((void *)delta->nodes[i].properties_json);
+    }
+    for (int i = 0; i < delta->delta.context_node_count; i++) {
+        free((void *)delta->context_nodes[i].project);
+        free((void *)delta->context_nodes[i].label);
+        free((void *)delta->context_nodes[i].name);
+        free((void *)delta->context_nodes[i].qualified_name);
+        free((void *)delta->context_nodes[i].file_path);
+        free((void *)delta->context_nodes[i].properties_json);
+    }
+    for (int i = 0; i < delta->delta.context_edge_count; i++) {
+        free((void *)delta->context_edges[i].source_qn);
+        free((void *)delta->context_edges[i].target_qn);
+        free((void *)delta->context_edges[i].type);
+        free((void *)delta->context_edges[i].properties_json);
+    }
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        free((void *)delta->edges[i].source_qn);
+        free((void *)delta->edges[i].target_qn);
+        free((void *)delta->edges[i].type);
+        free((void *)delta->edges[i].properties_json);
+    }
+    for (int i = 0; i < delta->delta.export_count; i++) {
+        free((void *)delta->exports[i].qualified_name);
+    }
+    for (int i = 0; i < delta->delta.import_count; i++) {
+        free((void *)delta->imports[i].import_text);
+        free((void *)delta->imports[i].local_name);
+        free((void *)delta->imports[i].target_qn);
+    }
+    free(delta->context_nodes);
+    free(delta->context_edges);
+    free(delta->nodes);
+    free(delta->edges);
+    free(delta->exports);
+    free(delta->imports);
+    memset(delta, 0, sizeof(*delta));
+}
+
+static void delta_plan_set_fallback(cbm_pipeline_file_delta_plan_t *plan, const char *reason) {
+    plan->route = CBM_PIPELINE_DELTA_ROUTE_FALLBACK;
+    plan->reason = reason;
+}
+
+static bool delta_field_matches(const char *actual, const char *expected) {
+    return actual && expected && strcmp(actual, expected) == 0;
+}
+
+static bool delta_file_metadata_complete(const cbm_store_file_delta_t *delta) {
+    return delta && delta->file_hash && delta->file_state &&
+           delta_field_matches(delta->file_hash->project, delta->project) &&
+           delta_field_matches(delta->file_hash->rel_path, delta->rel_path) &&
+           delta->file_hash->sha256 &&
+           delta_field_matches(delta->file_state->project, delta->project) &&
+           delta_field_matches(delta->file_state->rel_path, delta->rel_path) &&
+           delta->file_state->content_hash && delta->file_state->indexed_at;
+}
+
+static bool delta_derived_view_supported(const cbm_store_file_delta_t *delta) {
+    return delta && (!delta->derived_view_name ||
+                     strcmp(delta->derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS) == 0);
+}
+
+bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type) {
+    return type && (strcmp(type, CBM_PIPELINE_EDGE_SIMILAR_TO) == 0 ||
+                    strcmp(type, CBM_PIPELINE_EDGE_SEMANTICALLY_RELATED) == 0 ||
+                    strcmp(type, CBM_PIPELINE_EDGE_FILE_CHANGES_WITH) == 0 ||
+                    strcmp(type, CBM_PIPELINE_EDGE_DATA_FLOWS) == 0);
+}
+
+static bool delta_existing_or_insert_ownership_supported(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *file_delta,
+    cbm_pipeline_file_delta_plan_t *plan) {
+    const cbm_store_file_delta_t *delta = &file_delta->delta;
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(store, delta->project, delta->rel_path, &state);
+    cbm_store_file_state_free_fields(&state);
+    bool existing_state = true;
+    if (rc == CBM_STORE_NOT_FOUND) {
+        existing_state = false;
+    } else if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    rc = cbm_store_count_file_delta_owners(store, delta->project, delta->rel_path, &node_owners,
+                                           &edge_owners);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+    if (!existing_state && node_owners == 0 && edge_owners == 0 &&
+        file_delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_UPSERT && delta->node_count > 0) {
+        return true;
+    }
+    if (node_owners <= 0) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_missing_existing_ownership);
+        return false;
+    }
+    return true;
+}
+
+int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(cbm_store_t *store,
+                                                             const cbm_pipeline_file_delta_t *delta,
+                                                             bool *out_collision) {
+    if (out_collision) {
+        *out_collision = false;
+    }
+    if (!store || !delta || !delta->delta.project || !delta->delta.rel_path || !out_collision) {
+        return CBM_STORE_ERR;
+    }
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < delta->delta.node_count; i++) {
+        const cbm_node_t *node = &delta->delta.nodes[i];
+        if (!node->qualified_name || node->qualified_name[0] == '\0') {
+            continue;
+        }
+        cbm_node_t existing = {0};
+        int rc =
+            cbm_store_find_node_by_qn(store, delta->delta.project, node->qualified_name, &existing);
+        if (rc == CBM_STORE_NOT_FOUND) {
+            continue;
+        }
+        if (rc != CBM_STORE_OK) {
+            cbm_node_free_fields(&existing);
+            return rc;
+        }
+        const char *node_file = node->file_path ? node->file_path : delta->delta.rel_path;
+        bool source_span_selectable = cbm_label_uses_source_span_selection(existing.label) ||
+                                      cbm_label_uses_source_span_selection(node->label);
+        bool collision = existing.file_path && node_file &&
+                         !delta_field_matches(existing.file_path, node_file) &&
+                         !source_span_selectable;
+        cbm_node_free_fields(&existing);
+        if (collision) {
+            *out_collision = true;
+            return CBM_STORE_OK;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static bool delta_cross_file_node_qns_supported(cbm_store_t *store,
+                                                const cbm_pipeline_file_delta_t *delta,
+                                                cbm_pipeline_file_delta_plan_t *plan) {
+    bool collision = false;
+    int rc = cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, delta, &collision);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+    if (collision) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_cross_file_node_qn_collision);
+        return false;
+    }
+    return true;
+}
+
+static bool delta_path_in_batch(const char *path, const cbm_pipeline_file_delta_t *const *deltas,
+                                int delta_count) {
+    if (!path || !*path || !deltas) {
+        return false;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        if (deltas[i] && deltas[i]->delta.rel_path &&
+            strcmp(path, deltas[i]->delta.rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Store and graph-buffer uniqueness distinguish sibling IMPORTS edges by
+ * local_name.  Exact-delta preflight/preservation must use the same identity;
+ * otherwise preserving the first import to a shared target suppresses every
+ * subsequent named import with the same source, target, and type. */
+static bool delta_import_local_name_equal(const char *lhs_properties, const char *rhs_properties) {
+    const char *lhs_json = lhs_properties ? lhs_properties : "{}";
+    const char *rhs_json = rhs_properties ? rhs_properties : "{}";
+    if (strcmp(lhs_json, rhs_json) == 0) {
+        return true;
+    }
+
+    yyjson_doc *lhs_doc = yyjson_read(lhs_json, strlen(lhs_json), 0);
+    yyjson_doc *rhs_doc = yyjson_read(rhs_json, strlen(rhs_json), 0);
+    yyjson_val *lhs_root = lhs_doc ? yyjson_doc_get_root(lhs_doc) : NULL;
+    yyjson_val *rhs_root = rhs_doc ? yyjson_doc_get_root(rhs_doc) : NULL;
+    yyjson_val *lhs_value = lhs_root ? yyjson_obj_get(lhs_root, "local_name") : NULL;
+    yyjson_val *rhs_value = rhs_root ? yyjson_obj_get(rhs_root, "local_name") : NULL;
+    const char *lhs_name = yyjson_is_str(lhs_value) ? yyjson_get_str(lhs_value) : "";
+    const char *rhs_name = yyjson_is_str(rhs_value) ? yyjson_get_str(rhs_value) : "";
+    bool equal = strcmp(lhs_name, rhs_name) == 0;
+    if (lhs_doc) {
+        yyjson_doc_free(lhs_doc);
+    }
+    if (rhs_doc) {
+        yyjson_doc_free(rhs_doc);
+    }
+    return equal;
+}
+
+static bool delta_edge_identity_equal(const cbm_store_delta_edge_t *edge, const char *source_qn,
+                                      const char *target_qn, const char *type,
+                                      const char *properties_json) {
+    if (!edge || !edge->source_qn || !edge->target_qn || !edge->type ||
+        strcmp(edge->source_qn, source_qn) != 0 || strcmp(edge->target_qn, target_qn) != 0 ||
+        strcmp(edge->type, type) != 0) {
+        return false;
+    }
+    return strcmp(type, cbm_delta_edge_imports) != 0 ||
+           delta_import_local_name_equal(edge->properties_json, properties_json);
+}
+
+static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *deltas,
+                                      int delta_count, const char *source_qn, const char *target_qn,
+                                      const char *type, const char *properties_json) {
+    if (!deltas || !source_qn || !target_qn || !type) {
+        return false;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        if (!delta) {
+            continue;
+        }
+        for (int j = 0; j < delta->delta.edge_count; j++) {
+            const cbm_store_delta_edge_t *edge = &delta->delta.edges[j];
+            if (delta_edge_identity_equal(edge, source_qn, target_qn, type, properties_json)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const char *qn);
+
+static bool delta_inbound_edge_is_regenerated_by_batch(
+    const cbm_store_inbound_edge_t *edge, const cbm_pipeline_file_delta_t *const *deltas,
+    int delta_count) {
+    return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' &&
+           delta_path_in_batch(edge->edge_rel_path, deltas, delta_count) &&
+           delta_batch_contains_edge(deltas, delta_count, edge->source_qn, edge->target_qn,
+                                     edge->type, edge->properties_json);
+}
+
+static void delta_inbound_debug_unsupported(const cbm_store_file_delta_t *delta,
+                                            const cbm_store_inbound_edge_t *edge, int delta_count) {
+    char env[CBM_SZ_16];
+    if (!delta || !edge ||
+        cbm_safe_getenv(cbm_delta_debug_inbound_env, env, sizeof(env), NULL) == NULL ||
+        env[0] == '\0' || env[0] == '0') {
+        return;
+    }
+    char delta_count_buf[CBM_SZ_16];
+    if (snprintf(delta_count_buf, sizeof(delta_count_buf), "%d", delta_count) < 0) {
+        return;
+    }
+    cbm_log_debug("delta.inbound.unsupported", "project", delta->project, "rel_path",
+                  delta->rel_path, "source_path", edge->source_rel_path, "edge_path",
+                  edge->edge_rel_path, "target_path", edge->target_rel_path, "type", edge->type,
+                  "source_qn", edge->source_qn, "target_qn", edge->target_qn, "delta_count",
+                  delta_count_buf);
+}
+
+static bool delta_owned_inbound_edge_is_deleted(const cbm_store_inbound_edge_t *edge,
+                                                const cbm_pipeline_file_delta_t *delta) {
+    return edge && delta && delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE &&
+           delta_field_matches(edge->edge_rel_path, delta->delta.rel_path);
+}
+
+static bool delta_inbound_edges_supported(cbm_store_t *store,
+                                          const cbm_pipeline_file_delta_t *delta,
+                                          const cbm_pipeline_file_delta_t *const *deltas,
+                                          int delta_count, cbm_pipeline_file_delta_plan_t *plan) {
+    cbm_store_inbound_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_store_list_file_delta_inbound_edges(store, delta->delta.project,
+                                                     delta->delta.rel_path, &edges, &edge_count);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < edge_count; i++) {
+        if (!delta_path_in_batch(edges[i].source_rel_path, deltas, delta_count) &&
+            !delta_batch_contains_edge(deltas, delta_count, edges[i].source_qn, edges[i].target_qn,
+                                       edges[i].type, edges[i].properties_json) &&
+            !delta_inbound_edge_is_regenerated_by_batch(&edges[i], deltas, delta_count) &&
+            !delta_owned_inbound_edge_is_deleted(&edges[i], delta)) {
+            delta_inbound_debug_unsupported(&delta->delta, &edges[i], delta_count);
+            ok = false;
+            break;
+        }
+    }
+    cbm_store_free_inbound_edges(edges, edge_count);
+    if (!ok) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_inbound_edges_require_full);
+    }
+    return ok;
+}
+
+static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const char *qn) {
+    if (!delta || !qn) {
+        return false;
+    }
+    for (int i = 0; i < delta->context_node_count; i++) {
+        if (delta->context_nodes[i].qualified_name &&
+            strcmp(delta->context_nodes[i].qualified_name, qn) == 0) {
+            return true;
+        }
+    }
+    for (int i = 0; i < delta->node_count; i++) {
+        if (delta->nodes[i].qualified_name && strcmp(delta->nodes[i].qualified_name, qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int delta_append_preserved_inbound_edge(cbm_pipeline_file_delta_t *delta,
+                                               const cbm_store_inbound_edge_t *edge) {
+    if (!delta || !edge || !edge->source_qn || !edge->target_qn || !edge->type) {
+        return CBM_STORE_ERR;
+    }
+    if (delta->delta.edge_count >= INT_MAX) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_delta_edge_t *next =
+        realloc(delta->edges, (size_t)(delta->delta.edge_count + 1) * sizeof(*next));
+    if (!next) {
+        return CBM_STORE_ERR;
+    }
+    delta->edges = next;
+    delta->delta.edges = next;
+    cbm_store_delta_edge_t row = {
+        .source_qn = delta_strdup(edge->source_qn),
+        .target_qn = delta_strdup(edge->target_qn),
+        .type = delta_strdup(edge->type),
+        .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
+        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!row.source_qn || !row.target_qn || !row.type || !row.properties_json) {
+        delta_edge_free_fields(&row);
+        return CBM_STORE_ERR;
+    }
+    delta->edges[delta->delta.edge_count++] = row;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
+                                                        cbm_pipeline_file_delta_t *delta,
+                                                        int *out_added) {
+    if (out_added) {
+        *out_added = 0;
+    }
+    if (!store || !delta || !delta->delta.project || !delta->delta.rel_path) {
+        return CBM_STORE_ERR;
+    }
+    if (delta->change_kind != CBM_PIPELINE_DELTA_CHANGE_UPSERT) {
+        return CBM_STORE_OK;
+    }
+
+    cbm_store_inbound_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_store_list_file_delta_inbound_edges(store, delta->delta.project,
+                                                     delta->delta.rel_path, &edges, &edge_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    const cbm_pipeline_file_delta_t *single_delta[] = {delta};
+    int added = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_store_inbound_edge_t *edge = &edges[i];
+        if (cbm_pipeline_delta_edge_type_is_recomputed(edge->type) ||
+            !delta_node_qn_present(&delta->delta, edge->target_qn) ||
+            delta_batch_contains_edge(single_delta, 1, edge->source_qn, edge->target_qn, edge->type,
+                                      edge->properties_json)) {
+            continue;
+        }
+        rc = delta_append_preserved_inbound_edge(delta, edge);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_inbound_edges(edges, edge_count);
+            return rc;
+        }
+        added++;
+    }
+    cbm_store_free_inbound_edges(edges, edge_count);
+    if (out_added) {
+        *out_added = added;
+    }
+    return CBM_STORE_OK;
+}
+
+static bool delta_qn_list_contains(const char **qns, int count, const char *qn) {
     for (int i = 0; i < count; i++) {
-        free(items[i].source_qn);
-        free(items[i].target_qn);
-        free(items[i].type);
-        free(items[i].props);
+        if (strcmp(qns[i], qn) == 0) {
+            return true;
+        }
     }
-    free(items);
+    return false;
 }
 
-int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
-                    int path_count) {
-    if (path_count <= 0) {
-        return 0;
+static bool delta_plan_precheck_common(const cbm_pipeline_file_delta_t *delta,
+                                       cbm_pipeline_file_delta_plan_t *plan) {
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_RENAME) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_rename_requires_full);
+        return false;
     }
-    sqlite3 *db = cbm_store_get_db(store);
-    if (!db) {
-        return CBM_NOT_FOUND;
+    if (delta->unsupported_edge_count > 0) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_unsupported_edges);
+        return false;
     }
-    for (int off = 0; off < path_count; off += DELTA_IN_CHUNK) {
-        int chunk = path_count - off;
-        if (chunk > DELTA_IN_CHUNK) {
-            chunk = DELTA_IN_CHUNK;
-        }
-        char ph[2 * DELTA_IN_CHUNK + 1];
-        delta_placeholders(ph, chunk);
-        char sql[CBM_SZ_1K];
-        int n = snprintf(sql, sizeof(sql),
-                         "DELETE FROM nodes WHERE project = ?1 AND file_path IN (%s)", ph);
-        if (n < 0 || (size_t)n >= sizeof(sql)) {
-            return CBM_NOT_FOUND;
-        }
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-            return CBM_NOT_FOUND;
-        }
-        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        for (int i = 0; i < chunk; i++) {
-            sqlite3_bind_text(stmt, 2 + i, paths[off + i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        }
-        int rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        if (rc != SQLITE_DONE) {
-            return CBM_NOT_FOUND;
-        }
+    if (!delta_derived_view_supported(&delta->delta)) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_unsupported_derived_view);
+        return false;
     }
-    return 0;
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        if (delta->delta.generation <= 0) {
+            delta_plan_set_fallback(plan, cbm_delta_reason_missing_generation);
+            return false;
+        }
+        return true;
+    }
+    if (!delta_file_metadata_complete(&delta->delta)) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_missing_file_metadata);
+        return false;
+    }
+    return true;
 }
 
-/* Every project node becomes a proxy. The first cut filtered by label and
- * the fail-closed patch immediately found the counterexamples (synthetic
- * Decorator nodes on django; Macro is six of the kernel's 8.5M nodes) — any
- * node the resolvers or restricted post-passes can target as an edge
- * endpoint must carry its real id in RAM, and curating that set by label is
- * guessing. The proxy load stays edge-free and property-free, which is
- * where the old full load actually spent its time. */
-
-int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
-    sqlite3 *db = cbm_store_get_db(store);
-    if (!db) {
-        return -1;
-    }
-    int64_t max_id = 0;
-    {
-        sqlite3_stmt *stmt = NULL;
-        /* Global MAX, not project-scoped: node ids are one keyspace for the
-         * whole database, and the watermark must clear every row in it. */
-        if (sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(id), 0) FROM nodes", CBM_NOT_FOUND, &stmt,
-                               NULL) != SQLITE_OK) {
-            return -1;
-        }
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            max_id = sqlite3_column_int64(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
-
-    /* Proxy only what resolution can reach by NAME or QN: the registry
-     * symbols (cbm_label_is_type_like + Function/Method/Variable/Field, the
-     * exact set incr_label_is_registry_symbol admits) plus the structural
-     * nodes edges attach to. Everything else -- overwhelmingly Macro, six of
-     * the kernel's 8.5M nodes -- is never a lookup target, and a proxy for it
-     * would be pure load cost.
-     *
-     * Safety net for the labels this list does not anticipate: a resolver
-     * that upserts an unproxied QN now produces a fresh node that the patch
-     * maps back onto its existing row by qualified name, rather than the
-     * UNIQUE violation the pre-remap patch would have raised. A resolver that
-     * only LOOKS UP still needs its target resident, which is why the list
-     * mirrors the registry's own membership rule instead of guessing. */
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db,
-                           "SELECT id, label, name, qualified_name, file_path FROM nodes"
-                           " WHERE project = ?1 AND label NOT IN"
-                           " ('Macro','Comment','Section','Branch','Commit','Tag')"
-                           " ORDER BY id",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return -1;
-    }
-    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    int step_rc;
-    int64_t seeded = 0;
-    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int64_t id = sqlite3_column_int64(stmt, 0);
-        const char *label = (const char *)sqlite3_column_text(stmt, 1);
-        const char *name = (const char *)sqlite3_column_text(stmt, 2);
-        const char *qn = (const char *)sqlite3_column_text(stmt, 3);
-        const char *fp = (const char *)sqlite3_column_text(stmt, 4);
-        /* Pin the gbuf id to the database id: proxies ARE their rows. */
-        cbm_gbuf_set_next_id(gbuf, id);
-        int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", 0, 0, "{}");
-        if (got != id) {
-            /* A QN collision inside the preseed set would silently split
-             * identity between RAM and disk; the run cannot be trusted. */
-            sqlite3_finalize(stmt);
-            cbm_log_error("delta.preseed_id_mismatch", "qn", qn ? qn : "");
-            return -1;
-        }
-        seeded++;
-    }
-    sqlite3_finalize(stmt);
-    if (step_rc != SQLITE_DONE) {
-        return -1;
-    }
-    cbm_gbuf_set_next_id(gbuf, max_id + 1);
-    char seeded_buf[32];
-    snprintf(seeded_buf, sizeof(seeded_buf), "%lld", (long long)seeded);
-    cbm_log_info("delta.preseed", "proxies", seeded_buf);
-    return max_id;
-}
-
-/* Patch visitor state: inserts everything above the id watermark. */
-typedef struct {
-    sqlite3 *db;
-    const char *project;
-    int64_t max_db_id;
-    sqlite3_stmt *node_stmt;
-    sqlite3_stmt *edge_stmt;
-    sqlite3_stmt *qn_lookup;
-    /* gbuf id -> real database id for any fresh node whose qualified
-     * name turns out to already exist on disk: a resolver referenced
-     * a symbol the narrowed proxy set did not pre-load, so it upserted
-     * a stand-in. Mapping it back keeps the existing row authoritative
-     * and every edge endpoint database-valid. Appended in ascending
-     * gbuf-id order (nodes are visited that way), so lookups binary
-     * search -- CBMHashTable stores key POINTERS without copying,
-     * which a stack-formatted integer key cannot satisfy. */
-    struct {
-        int64_t from;
-        int64_t to;
-    } *remap;
-    int remap_count;
-    int remap_cap;
-    bool failed;
-    int64_t nodes;
-    int64_t edges;
-    int64_t remapped;
-} delta_patch_ctx_t;
-
-static void delta_remap_put(delta_patch_ctx_t *ctx, int64_t from, int64_t to) {
-    if (ctx->remap_count >= ctx->remap_cap) {
-        int ncap = ctx->remap_cap ? ctx->remap_cap * 2 : 256;
-        void *grown = realloc(ctx->remap, (size_t)ncap * sizeof(*ctx->remap));
-        if (!grown) {
-            ctx->failed = true;
-            return;
-        }
-        ctx->remap = grown;
-        ctx->remap_cap = ncap;
-    }
-    ctx->remap[ctx->remap_count].from = from;
-    ctx->remap[ctx->remap_count].to = to;
-    ctx->remap_count++;
-}
-
-static int64_t delta_remap_get(const delta_patch_ctx_t *ctx, int64_t id) {
-    if (id <= ctx->max_db_id || ctx->remap_count == 0) {
-        return id;
-    }
-    int lo = 0;
-    int hi = ctx->remap_count - 1;
-    while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (ctx->remap[mid].from == id) {
-            return ctx->remap[mid].to;
-        }
-        if (ctx->remap[mid].from < id) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    return id;
-}
-
-static void delta_patch_node(const cbm_gbuf_node_t *node, void *userdata) {
-    delta_patch_ctx_t *ctx = (delta_patch_ctx_t *)userdata;
-    if (ctx->failed || node->id <= ctx->max_db_id) {
-        return;
-    }
-    if (node->qualified_name) {
-        sqlite3_reset(ctx->qn_lookup);
-        sqlite3_bind_text(ctx->qn_lookup, 1, ctx->project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ctx->qn_lookup, 2, node->qualified_name, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        if (sqlite3_step(ctx->qn_lookup) == SQLITE_ROW) {
-            /* Already on disk: an unchanged file's symbol. A node from a
-             * CHANGED file cannot appear here -- the purge removed it --
-             * so repaired files still receive fresh rows. */
-            delta_remap_put(ctx, node->id, sqlite3_column_int64(ctx->qn_lookup, 0));
-            ctx->remapped++;
-            return;
-        }
-    }
-    sqlite3_reset(ctx->node_stmt);
-    sqlite3_bind_int64(ctx->node_stmt, 1, node->id);
-    sqlite3_bind_text(ctx->node_stmt, 2, ctx->project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ctx->node_stmt, 3, node->label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ctx->node_stmt, 4, node->name, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ctx->node_stmt, 5, node->qualified_name, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ctx->node_stmt, 6, node->file_path ? node->file_path : "", CBM_NOT_FOUND,
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_int(ctx->node_stmt, 7, node->start_line);
-    sqlite3_bind_int(ctx->node_stmt, 8, node->end_line);
-    sqlite3_bind_text(ctx->node_stmt, 9, node->properties_json ? node->properties_json : "{}",
-                      CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    if (sqlite3_step(ctx->node_stmt) != SQLITE_DONE) {
-        ctx->failed = true;
-        char id_buf[32];
-        snprintf(id_buf, sizeof(id_buf), "%lld", (long long)node->id);
-        cbm_log_error("delta.patch_node_failed", "qn",
-                      node->qualified_name ? node->qualified_name : "", "err",
-                      sqlite3_errmsg(ctx->db));
-        cbm_log_error("delta.patch_node_id", "id", id_buf);
-        sqlite3_stmt *who = NULL;
-        if (sqlite3_prepare_v2(ctx->db, "SELECT label, qualified_name FROM nodes WHERE id = ?1",
-                               CBM_NOT_FOUND, &who, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(who, 1, node->id);
-            if (sqlite3_step(who) == SQLITE_ROW) {
-                cbm_log_error("delta.patch_id_owner", "label",
-                              (const char *)sqlite3_column_text(who, 0), "qn",
-                              (const char *)sqlite3_column_text(who, 1));
+static int delta_collect_edge_endpoint_qns(const cbm_store_file_delta_t *delta,
+                                           const cbm_store_delta_edge_t *edges, int edge_count,
+                                           const char **qns, int *qn_count) {
+    for (int i = 0; i < edge_count; i++) {
+        const char *edge_qns[PAIR_LEN] = {edges[i].source_qn, edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                return CBM_STORE_NOT_FOUND;
             }
-            sqlite3_finalize(who);
+            if (!delta_node_qn_present(delta, qn) && !delta_qn_list_contains(qns, *qn_count, qn)) {
+                qns[(*qn_count)++] = qn;
+            }
         }
-        return;
     }
-    ctx->nodes++;
+    return CBM_STORE_OK;
 }
 
-static void delta_patch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
-    delta_patch_ctx_t *ctx = (delta_patch_ctx_t *)userdata;
-    if (ctx->failed) {
-        return;
+static int delta_edge_endpoints_resolve(cbm_store_t *store, const cbm_store_file_delta_t *delta) {
+    if (!delta || (delta->edge_count <= 0 && delta->context_edge_count <= 0)) {
+        return CBM_STORE_OK;
     }
-    int64_t src = delta_remap_get(ctx, edge->source_id);
-    int64_t tgt = delta_remap_get(ctx, edge->target_id);
-    if (src <= ctx->max_db_id && tgt <= ctx->max_db_id && src == edge->source_id &&
-        tgt == edge->target_id) {
-        return; /* both endpoints pre-existed unremapped: already recorded */
+    if (delta->context_edge_count > INT_MAX / PAIR_LEN ||
+        delta->edge_count > (INT_MAX / PAIR_LEN) - delta->context_edge_count) {
+        return CBM_STORE_ERR;
     }
-    sqlite3_reset(ctx->edge_stmt);
-    sqlite3_bind_text(ctx->edge_stmt, 1, ctx->project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(ctx->edge_stmt, 2, src);
-    sqlite3_bind_int64(ctx->edge_stmt, 3, tgt);
-    sqlite3_bind_text(ctx->edge_stmt, 4, edge->type, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ctx->edge_stmt, 5, edge->properties_json ? edge->properties_json : "{}",
-                      CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    if (sqlite3_step(ctx->edge_stmt) != SQLITE_DONE) {
-        ctx->failed = true;
-        cbm_log_error("delta.patch_edge_failed", "type", edge->type ? edge->type : "");
-        return;
+    int qn_cap = (delta->edge_count + delta->context_edge_count) * PAIR_LEN;
+    const char **qns = malloc((size_t)qn_cap * sizeof(*qns));
+    if (!qns) {
+        return CBM_STORE_ERR;
     }
-    ctx->edges++;
+    int qn_count = 0;
+    int rc = delta_collect_edge_endpoint_qns(delta, delta->context_edges, delta->context_edge_count,
+                                             qns, &qn_count);
+    if (rc == CBM_STORE_OK) {
+        rc =
+            delta_collect_edge_endpoint_qns(delta, delta->edges, delta->edge_count, qns, &qn_count);
+    }
+    if (rc != CBM_STORE_OK) {
+        free(qns);
+        return rc;
+    }
+    if (qn_count == 0) {
+        free(qns);
+        return CBM_STORE_OK;
+    }
+    int64_t *ids = calloc((size_t)qn_count, sizeof(*ids));
+    if (!ids) {
+        free(qns);
+        return CBM_STORE_ERR;
+    }
+    int found = cbm_store_find_node_ids_by_qns(store, delta->project, qns, qn_count, ids);
+    free(ids);
+    free(qns);
+    if (found < 0) {
+        return CBM_STORE_ERR;
+    }
+    return found == qn_count ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
 }
 
-int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, int64_t max_db_id,
-                    const cbm_delta_saved_edge_t *snapshot, int snapshot_count) {
-    sqlite3 *db = cbm_store_get_db(store);
-    if (!db) {
-        return CBM_NOT_FOUND;
+static bool delta_batch_node_qn_present(const cbm_pipeline_file_delta_t *const *deltas,
+                                        int delta_count, const char *qn) {
+    if (!deltas || !qn) {
+        return false;
     }
-    if (cbm_store_begin(store) != CBM_STORE_OK) {
-        return CBM_NOT_FOUND;
+    for (int i = 0; i < delta_count; i++) {
+        if (deltas[i] && delta_node_qn_present(&deltas[i]->delta, qn)) {
+            return true;
+        }
     }
-    delta_patch_ctx_t ctx = {.db = db, .project = project, .max_db_id = max_db_id};
-    if (sqlite3_prepare_v2(db,
-                           "SELECT id FROM nodes WHERE project = ?1"
-                           " AND qualified_name = ?2",
-                           CBM_NOT_FOUND, &ctx.qn_lookup, NULL) != SQLITE_OK) {
-        cbm_store_rollback(store);
-        return CBM_NOT_FOUND;
-    }
-    if (sqlite3_prepare_v2(db,
-                           "INSERT INTO nodes (id, project, label, name, qualified_name,"
-                           " file_path, start_line, end_line, properties)"
-                           " VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                           CBM_NOT_FOUND, &ctx.node_stmt, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(db,
-                           "INSERT OR IGNORE INTO edges (project, source_id, target_id, type,"
-                           " properties) VALUES (?1,?2,?3,?4,?5)",
-                           CBM_NOT_FOUND, &ctx.edge_stmt, NULL) != SQLITE_OK) {
-        sqlite3_finalize(ctx.node_stmt);
-        sqlite3_finalize(ctx.edge_stmt);
-        sqlite3_finalize(ctx.qn_lookup);
-        free(ctx.remap);
-        cbm_store_rollback(store);
-        return CBM_NOT_FOUND;
-    }
-    cbm_gbuf_foreach_node(gbuf, delta_patch_node, &ctx);
-    if (!ctx.failed) {
-        cbm_gbuf_foreach_edge(gbuf, delta_patch_edge, &ctx);
-    }
-    sqlite3_finalize(ctx.node_stmt);
-    sqlite3_finalize(ctx.edge_stmt);
-    sqlite3_finalize(ctx.qn_lookup);
+    return false;
+}
 
-    /* Re-link the snapshotted inbound edges by qualified name. A target
-     * whose QN no longer exists simply matches no row — full-reindex
-     * semantics for deleted symbols, dedup by the UNIQUE edge constraint. */
-    if (!ctx.failed && snapshot_count > 0) {
-        sqlite3_stmt *relink = NULL;
-        if (sqlite3_prepare_v2(db,
-                               "INSERT OR IGNORE INTO edges (project, source_id, target_id,"
-                               " type, properties)"
-                               " SELECT ?1, s.id, t.id, ?2, ?3 FROM nodes s, nodes t"
-                               " WHERE s.project = ?1 AND s.qualified_name = ?4"
-                               " AND t.project = ?1 AND t.qualified_name = ?5",
-                               CBM_NOT_FOUND, &relink, NULL) != SQLITE_OK) {
-            ctx.failed = true;
-        } else {
-            for (int i = 0; i < snapshot_count && !ctx.failed; i++) {
-                sqlite3_reset(relink);
-                sqlite3_bind_text(relink, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 2, snapshot[i].type, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 3, snapshot[i].props, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 4, snapshot[i].source_qn, CBM_NOT_FOUND,
-                                  SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 5, snapshot[i].target_qn, CBM_NOT_FOUND,
-                                  SQLITE_TRANSIENT);
-                if (sqlite3_step(relink) != SQLITE_DONE) {
-                    ctx.failed = true;
-                }
+static int delta_collect_batch_edge_endpoint_qns(const cbm_pipeline_file_delta_t *const *deltas,
+                                                 int delta_count,
+                                                 const cbm_store_delta_edge_t *edges,
+                                                 int edge_count, const char **qns, int *qn_count) {
+    for (int i = 0; i < edge_count; i++) {
+        const char *edge_qns[PAIR_LEN] = {edges[i].source_qn, edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                return CBM_STORE_NOT_FOUND;
             }
-            sqlite3_finalize(relink);
+            if (!delta_batch_node_qn_present(deltas, delta_count, qn) &&
+                !delta_qn_list_contains(qns, *qn_count, qn)) {
+                qns[(*qn_count)++] = qn;
+            }
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static int delta_batch_edge_endpoints_resolve(cbm_store_t *store,
+                                              const cbm_store_file_delta_t *delta,
+                                              const cbm_pipeline_file_delta_t *const *deltas,
+                                              int delta_count) {
+    if (!delta || (delta->edge_count <= 0 && delta->context_edge_count <= 0)) {
+        return CBM_STORE_OK;
+    }
+    if (delta->context_edge_count > INT_MAX / PAIR_LEN ||
+        delta->edge_count > (INT_MAX / PAIR_LEN) - delta->context_edge_count) {
+        return CBM_STORE_ERR;
+    }
+    int qn_cap = (delta->edge_count + delta->context_edge_count) * PAIR_LEN;
+    const char **qns = malloc((size_t)qn_cap * sizeof(*qns));
+    if (!qns) {
+        return CBM_STORE_ERR;
+    }
+    int qn_count = 0;
+    int rc = delta_collect_batch_edge_endpoint_qns(deltas, delta_count, delta->context_edges,
+                                                   delta->context_edge_count, qns, &qn_count);
+    if (rc == CBM_STORE_OK) {
+        rc = delta_collect_batch_edge_endpoint_qns(deltas, delta_count, delta->edges,
+                                                   delta->edge_count, qns, &qn_count);
+    }
+    if (rc != CBM_STORE_OK) {
+        free(qns);
+        return rc;
+    }
+    if (qn_count == 0) {
+        free(qns);
+        return CBM_STORE_OK;
+    }
+    int64_t *ids = calloc((size_t)qn_count, sizeof(*ids));
+    if (!ids) {
+        free(qns);
+        return CBM_STORE_ERR;
+    }
+    int found = cbm_store_find_node_ids_by_qns(store, delta->project, qns, qn_count, ids);
+    free(ids);
+    free(qns);
+    if (found < 0) {
+        return CBM_STORE_ERR;
+    }
+    return found == qn_count ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
+}
+
+static int delta_plan_append_affected_path(cbm_pipeline_file_delta_plan_t *plan, const char *path) {
+    if (!plan || !path) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < plan->affected_count; i++) {
+        if (strcmp(plan->affected_paths[i], path) == 0) {
+            return CBM_STORE_OK;
+        }
+    }
+    char *dup = delta_strdup(path);
+    if (!dup) {
+        return CBM_STORE_ERR;
+    }
+    if (plan->affected_count == INT_MAX) {
+        free(dup);
+        return CBM_STORE_ERR;
+    }
+    char **next = realloc(plan->affected_paths, (size_t)(plan->affected_count + 1) * sizeof(*next));
+    if (!next) {
+        free(dup);
+        return CBM_STORE_ERR;
+    }
+    plan->affected_paths = next;
+    plan->affected_paths[plan->affected_count++] = dup;
+    return CBM_STORE_OK;
+}
+
+static int delta_plan_append_frontier(cbm_pipeline_file_delta_plan_t *plan, char **paths,
+                                      int count) {
+    for (int i = 0; i < count; i++) {
+        if (delta_plan_append_affected_path(plan, paths[i]) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static int delta_collect_batch_affected_paths(cbm_store_t *store,
+                                              const cbm_pipeline_file_delta_t *const *deltas,
+                                              const bool *frontier_noop_mask, int delta_count,
+                                              cbm_pipeline_file_delta_plan_t *out) {
+    if (!store || !deltas || delta_count <= 0 || !out) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
+        const cbm_store_file_delta_t *delta = deltas[i] ? &deltas[i]->delta : NULL;
+        if (!delta || !delta->project || !delta->rel_path) {
+            return CBM_STORE_ERR;
+        }
+        const char **new_export_qns = NULL;
+        if (delta->export_count > 0) {
+            new_export_qns = malloc((size_t)delta->export_count * sizeof(*new_export_qns));
+            if (!new_export_qns) {
+                return CBM_STORE_ERR;
+            }
+            for (int j = 0; j < delta->export_count; j++) {
+                new_export_qns[j] = delta->exports[j].qualified_name;
+            }
+        }
+
+        char **paths = NULL;
+        int path_count = 0;
+        int rc = cbm_store_list_file_delta_affected_paths(store, delta->project, delta->rel_path,
+                                                          new_export_qns, delta->export_count,
+                                                          &paths, &path_count);
+        free(new_export_qns);
+        if (rc != CBM_STORE_OK ||
+            delta_plan_append_frontier(out, paths, path_count) != CBM_STORE_OK) {
+            for (int j = 0; j < path_count; j++) {
+                free(paths[j]);
+            }
+            free(paths);
+            return CBM_STORE_ERR;
+        }
+        for (int j = 0; j < path_count; j++) {
+            free(paths[j]);
+        }
+        free(paths);
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
+                                 int max_affected_paths, cbm_pipeline_file_delta_plan_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    delta_plan_set_fallback(out, cbm_delta_reason_invalid_input);
+    if (!store || !delta || !delta->delta.project || !delta->delta.rel_path ||
+        max_affected_paths <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (!delta_plan_precheck_common(delta, out)) {
+        return CBM_STORE_OK;
+    }
+    if (!delta_existing_or_insert_ownership_supported(store, delta, out)) {
+        return CBM_STORE_OK;
+    }
+    if (!delta_cross_file_node_qns_supported(store, delta, out)) {
+        return CBM_STORE_OK;
+    }
+    enum { CBM_DELTA_SINGLE_COUNT = 1 };
+    const cbm_pipeline_file_delta_t *single_delta[] = {delta};
+    if (!delta_inbound_edges_supported(store, delta, single_delta, CBM_DELTA_SINGLE_COUNT, out)) {
+        return CBM_STORE_OK;
+    }
+    int endpoint_rc = delta_edge_endpoints_resolve(store, &delta->delta);
+    if (endpoint_rc == CBM_STORE_NOT_FOUND) {
+        delta_plan_set_fallback(out, cbm_delta_reason_unresolved_edge_endpoint);
+        return CBM_STORE_OK;
+    }
+    if (endpoint_rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+        return CBM_STORE_OK;
+    }
+
+    const char **new_export_qns = NULL;
+    if (delta->delta.export_count > 0) {
+        new_export_qns = malloc((size_t)delta->delta.export_count * sizeof(*new_export_qns));
+        if (!new_export_qns) {
+            delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+            return CBM_STORE_OK;
+        }
+        for (int i = 0; i < delta->delta.export_count; i++) {
+            new_export_qns[i] = delta->delta.exports[i].qualified_name;
         }
     }
 
-    /* Row-level FTS for exactly the new nodes, through the same tokenizer
-     * function the wholesale rebuild uses. */
-    if (!ctx.failed) {
-        sqlite3_stmt *fts = NULL;
-        if (sqlite3_prepare_v2(db,
-                               "INSERT INTO nodes_fts (rowid, name, qualified_name, label,"
-                               " file_path)"
-                               " SELECT id, cbm_camel_split(name), qualified_name, label,"
-                               " file_path FROM nodes WHERE project = ?1 AND id > ?2",
-                               CBM_NOT_FOUND, &fts, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(fts, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(fts, 2, max_db_id);
-            if (sqlite3_step(fts) != SQLITE_DONE) {
-                ctx.failed = true;
-            }
-            sqlite3_finalize(fts);
+    int rc = cbm_store_list_file_delta_affected_paths(
+        store, delta->delta.project, delta->delta.rel_path, new_export_qns,
+        delta->delta.export_count, &out->affected_paths, &out->affected_count);
+    free(new_export_qns);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+        return CBM_STORE_OK;
+    }
+    if (out->affected_count > max_affected_paths) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
+        return CBM_STORE_OK;
+    }
+
+    out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;
+    out->reason = cbm_delta_reason_candidate;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
+                                       const cbm_pipeline_file_delta_t *const *deltas,
+                                       int delta_count, int max_affected_paths,
+                                       cbm_pipeline_file_delta_plan_t *out) {
+    return cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+        store, deltas, NULL, delta_count, max_affected_paths, out);
+}
+
+int cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    delta_plan_set_fallback(out, cbm_delta_reason_invalid_input);
+    if (!store || !deltas || delta_count <= 0 || max_affected_paths <= 0) {
+        return CBM_STORE_OK;
+    }
+
+    const char *project = NULL;
+    int delete_count = 0;
+    int upsert_count = 0;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        if (!delta || !delta->delta.project || !delta->delta.rel_path) {
+            return CBM_STORE_OK;
+        }
+        if (!project) {
+            project = delta->delta.project;
+        } else if (strcmp(project, delta->delta.project) != 0) {
+            return CBM_STORE_OK;
+        }
+        if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+            delete_count++;
         } else {
-            /* FTS5 may be compiled out; the table then never existed and
-             * search runs without it — matching the dump path's behavior. */
-            cbm_log_warn("delta.fts_insert_unavailable", "project", project);
+            upsert_count++;
+        }
+    }
+    if (delete_count > 0 && upsert_count == 0 && delta_count != 1) {
+        delta_plan_set_fallback(out, cbm_delta_reason_delete_batch_requires_full);
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
+        if (!delta_plan_precheck_common(delta, out)) {
+            return CBM_STORE_OK;
+        }
+        if (!delta_existing_or_insert_ownership_supported(store, delta, out)) {
+            return CBM_STORE_OK;
+        }
+        if (!delta_cross_file_node_qns_supported(store, delta, out)) {
+            return CBM_STORE_OK;
+        }
+        if (!delta_inbound_edges_supported(store, delta, deltas, delta_count, out)) {
+            return CBM_STORE_OK;
+        }
+        int endpoint_rc =
+            delta_batch_edge_endpoints_resolve(store, &delta->delta, deltas, delta_count);
+        if (endpoint_rc == CBM_STORE_NOT_FOUND) {
+            delta_plan_set_fallback(out, cbm_delta_reason_unresolved_edge_endpoint);
+            return CBM_STORE_OK;
+        }
+        if (endpoint_rc != CBM_STORE_OK) {
+            delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+            return CBM_STORE_OK;
         }
     }
 
-    if (ctx.failed) {
-        free(ctx.remap);
-        cbm_store_rollback(store);
-        return CBM_NOT_FOUND;
+    if (delta_collect_batch_affected_paths(store, deltas, frontier_noop_mask, delta_count, out) !=
+        CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+        return CBM_STORE_OK;
     }
-    free(ctx.remap);
-    if (cbm_store_commit(store) != CBM_STORE_OK) {
-        return CBM_NOT_FOUND;
+    if (out->affected_count > max_affected_paths) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
+        return CBM_STORE_OK;
     }
-    char nodes_buf[32];
-    char edges_buf[32];
-    snprintf(nodes_buf, sizeof(nodes_buf), "%lld", (long long)ctx.nodes);
-    snprintf(edges_buf, sizeof(edges_buf), "%lld", (long long)ctx.edges);
-    char remap_buf[32];
-    snprintf(remap_buf, sizeof(remap_buf), "%lld", (long long)ctx.remapped);
-    cbm_log_info("delta.patch", "nodes", nodes_buf, "edges", edges_buf, "remapped", remap_buf);
-    return 0;
+
+    out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;
+    out->reason = cbm_delta_reason_candidate;
+    return CBM_STORE_OK;
+}
+
+static bool delta_plan_affected_paths_in_batch(const cbm_pipeline_file_delta_plan_t *plan,
+                                               const cbm_pipeline_file_delta_t *const *deltas,
+                                               int delta_count) {
+    if (!plan || !deltas) {
+        return false;
+    }
+    for (int i = 0; i < plan->affected_count; i++) {
+        if (!delta_path_in_batch(plan->affected_paths[i], deltas, delta_count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool delta_batch_has_positive_generation(const cbm_pipeline_file_delta_t *const *deltas,
+                                                int delta_count) {
+    if (!deltas || delta_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        if (!deltas[i] || deltas[i]->delta.generation <= 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
+                                        const cbm_pipeline_file_delta_t *const *deltas,
+                                        int delta_count, int max_affected_paths,
+                                        cbm_pipeline_file_delta_plan_t *out) {
+    return cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+        store, deltas, NULL, delta_count, max_affected_paths, out);
+}
+
+int cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out) {
+    int rc = cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+        store, deltas, frontier_noop_mask, delta_count, max_affected_paths, out);
+    if (rc != CBM_STORE_OK || !out || out->route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        return rc;
+    }
+    if (!delta_plan_affected_paths_in_batch(out, deltas, delta_count)) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_requires_batch);
+        return CBM_STORE_OK;
+    }
+    if (!delta_batch_has_positive_generation(deltas, delta_count)) {
+        delta_plan_set_fallback(out, cbm_delta_reason_missing_generation);
+        return CBM_STORE_OK;
+    }
+    if (delta_count == 1 && deltas[0] &&
+        deltas[0]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        rc = cbm_store_delete_file_delta_complete(
+            store, deltas[0]->delta.project, deltas[0]->delta.rel_path, deltas[0]->delta.generation,
+            deltas[0]->delta.derived_view_name);
+        if (rc != CBM_STORE_OK) {
+            delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
+            return CBM_STORE_OK;
+        }
+        return CBM_STORE_OK;
+    }
+
+    int delete_count = 0;
+    int upsert_count = 0;
+    for (int i = 0; i < delta_count; i++) {
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
+        if (deltas[i] && deltas[i]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+            delete_count++;
+        } else {
+            upsert_count++;
+        }
+    }
+    if (delete_count > 0) {
+        const cbm_store_file_delta_t **delete_deltas =
+            malloc((size_t)delete_count * sizeof(*delete_deltas));
+        const cbm_store_file_delta_t **upsert_deltas =
+            upsert_count > 0 ? malloc((size_t)upsert_count * sizeof(*upsert_deltas)) : NULL;
+        if (!delete_deltas || (upsert_count > 0 && !upsert_deltas)) {
+            free(delete_deltas);
+            free(upsert_deltas);
+            delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+            return CBM_STORE_OK;
+        }
+        int di = 0;
+        int ui = 0;
+        for (int i = 0; i < delta_count; i++) {
+            if (frontier_noop_mask && frontier_noop_mask[i]) {
+                continue;
+            }
+            if (deltas[i]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+                delete_deltas[di++] = &deltas[i]->delta;
+            } else {
+                upsert_deltas[ui++] = &deltas[i]->delta;
+            }
+        }
+        rc = cbm_store_apply_file_delta_batch_complete(store, delete_deltas, delete_count,
+                                                       upsert_deltas, upsert_count);
+        free(delete_deltas);
+        free(upsert_deltas);
+        if (rc != CBM_STORE_OK) {
+            delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
+        }
+        return CBM_STORE_OK;
+    }
+
+    if (upsert_count <= 0) {
+        delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+        return CBM_STORE_OK;
+    }
+    const cbm_store_file_delta_t **publish_deltas =
+        malloc((size_t)upsert_count * sizeof(*publish_deltas));
+    if (!publish_deltas) {
+        delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+        return CBM_STORE_OK;
+    }
+    int publish_count = 0;
+    for (int i = 0; i < delta_count; i++) {
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
+        publish_deltas[publish_count++] = &deltas[i]->delta;
+    }
+    rc = cbm_store_publish_file_delta_batch_complete(store, publish_deltas, publish_count);
+    free(publish_deltas);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_publish_error);
+        return CBM_STORE_OK;
+    }
+    return CBM_STORE_OK;
+}
+
+static int pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                     const cbm_pipeline_file_delta_t *const *deltas,
+                                                     int delta_count, int64_t base_generation,
+                                                     const char *dirty_source,
+                                                     int64_t *out_overlay_generation,
+                                                     bool replace_files) {
+    if (out_overlay_generation) {
+        *out_overlay_generation = 0;
+    }
+    if (!store || !deltas || delta_count <= 0 || base_generation < 0 || !out_overlay_generation) {
+        return CBM_STORE_ERR;
+    }
+
+    const char *project = NULL;
+    for (int i = 0; i < delta_count; i++) {
+        if (!deltas[i] || !deltas[i]->delta.project || !deltas[i]->delta.rel_path) {
+            return CBM_STORE_ERR;
+        }
+        if (!project) {
+            project = deltas[i]->delta.project;
+        } else if (strcmp(project, deltas[i]->delta.project) != 0) {
+            return CBM_STORE_ERR;
+        }
+        bool collision = false;
+        int rc =
+            cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, deltas[i], &collision);
+        if (rc != CBM_STORE_OK || collision) {
+            return rc == CBM_STORE_OK ? CBM_STORE_NOT_FOUND : rc;
+        }
+    }
+
+    int64_t overlay_generation = 0;
+    int rc =
+        cbm_store_reserve_overlay_generation(store, project, base_generation, &overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH)) {
+        (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED);
+        return CBM_STORE_ERR;
+    }
+
+    const cbm_store_file_delta_t **store_deltas =
+        malloc((size_t)delta_count * sizeof(*store_deltas));
+    if (!store_deltas) {
+        (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        store_deltas[i] = &deltas[i]->delta;
+    }
+
+    rc = replace_files ? cbm_store_publish_overlay_file_delta_batch(store, store_deltas,
+                                                                    delta_count, overlay_generation)
+                       : cbm_store_publish_overlay_file_delta_additions_batch(
+                             store, store_deltas, delta_count, overlay_generation);
+    free(store_deltas);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED);
+        return rc;
+    }
+
+    const char *source = dirty_source ? dirty_source : CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        const cbm_file_state_t *file_state = delta->delta.file_state;
+        const cbm_file_hash_t *file_hash = delta->delta.file_hash;
+        cbm_dirty_file_state_t dirty = {
+            .project = delta->delta.project,
+            .rel_path = delta->delta.rel_path,
+            .observed_hash = file_state && file_state->content_hash
+                                 ? file_state->content_hash
+                                 : (file_hash && file_hash->sha256 ? file_hash->sha256 : ""),
+            .observed_mtime_ns =
+                file_state ? file_state->mtime_ns : (file_hash ? file_hash->mtime_ns : 0),
+            .observed_size = file_state ? file_state->size : (file_hash ? file_hash->size : 0),
+            .observed_generation = overlay_generation,
+            .source = source,
+            .status = CBM_STORE_DIRTY_STATUS_OVERLAY_READY,
+        };
+        if (cbm_store_upsert_dirty_file(store, &dirty) != CBM_STORE_OK) {
+            (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                          CBM_STORE_OVERLAY_STATUS_FAILED);
+            return CBM_STORE_ERR;
+        }
+    }
+
+    *out_overlay_generation = overlay_generation;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                  const cbm_pipeline_file_delta_t *const *deltas,
+                                                  int delta_count, int64_t base_generation,
+                                                  const char *dirty_source,
+                                                  int64_t *out_overlay_generation) {
+    return pipeline_publish_overlay_file_delta_batch(store, deltas, delta_count, base_generation,
+                                                     dirty_source, out_overlay_generation, true);
+}
+
+int cbm_pipeline_publish_overlay_file_delta_additions_batch(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas, int delta_count,
+    int64_t base_generation, const char *dirty_source, int64_t *out_overlay_generation) {
+    return pipeline_publish_overlay_file_delta_batch(store, deltas, delta_count, base_generation,
+                                                     dirty_source, out_overlay_generation, false);
+}
+
+void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan) {
+    if (!plan) {
+        return;
+    }
+    for (int i = 0; i < plan->affected_count; i++) {
+        free(plan->affected_paths[i]);
+    }
+    free(plan->affected_paths);
+    memset(plan, 0, sizeof(*plan));
 }

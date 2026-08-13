@@ -1,4 +1,5 @@
 #include "go_lsp.h"
+#include "foundation/platform.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <string.h>
@@ -42,10 +43,7 @@ void go_lsp_init(GoLSPContext* ctx, CBMArena* arena, const char* source, int sou
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL); // root scope
 
-    {
-        const char* debug_env = getenv("CBM_LSP_DEBUG");
-        ctx->debug = (debug_env && debug_env[0]);
-    }
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void go_lsp_add_import(GoLSPContext* ctx, const char* local_name, const char* pkg_qn) {
@@ -3373,7 +3371,8 @@ int cbm_go_fast_resolve_qualified_calls(
          * stays (harmless duplicate) but our resolved entry wins. */
         CBMResolvedCall rc = {0};
         rc.caller_qn = uc->caller_qn;
-        rc.callee_qn = f->qualified_name; /* borrowed from pipeline arena */
+        rc.callee_qn = cbm_arena_strdup(&result->arena, f->qualified_name);
+        if (!rc.callee_qn) continue;
         rc.strategy = "lsp_strategy_cross_file";
         rc.confidence = 0.92f;
         rc.reason = NULL;

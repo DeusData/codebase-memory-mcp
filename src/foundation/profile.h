@@ -1,7 +1,8 @@
 /*
  * profile.h — Activatable fine-grained performance profiling.
  *
- * Enable via environment variable: CBM_PROFILE=1 (or any non-empty non-"0" value)
+ * Enable via environment variable: CBM_PROFILE=1 (or any present value except
+ * explicit false values such as 0, false, off, or no).
  * Init is called once at program startup (from main.c).
  *
  * When disabled (default), the CBM_PROF_* macros cost one load + branch,
@@ -9,6 +10,12 @@
  *
  * Output format (structured log lines, parseable):
  *   level=info msg=prof phase=<pass> sub=<subphase> ms=<N> us=<N> items=<N> rate_per_s=<N>
+ *
+ * Stable benchmark terms and proposed step IDs are defined in
+ * benchmarks/terminology.json and generated into
+ * src/foundation/profile_terms_generated.h. Profile call sites must use that
+ * registry before adding machine-readable step IDs; concurrent occurrences
+ * remain distinct and their elapsed spans are not implicitly additive.
  *
  * Grep for `msg=prof` to get a full profile report.
  */

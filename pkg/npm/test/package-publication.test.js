@@ -14,6 +14,15 @@ const {
   validateExactTarMemberListing,
 } = require('../install.js');
 
+test('npm wrapper selects the one unsuffixed release archive', () => {
+  const installer = fs.readFileSync(path.join(__dirname, '..', 'install.js'), 'utf8');
+  assert.doesNotMatch(installer, /CBM_VARIANT|codebase-memory-mcp-\$\{ui\}/);
+  assert.match(
+    installer,
+    /codebase-memory-mcp-\$\{platform\}-\$\{arch\}\$\{variant\}\.\$\{ext\}/,
+  );
+});
+
 function exactUnixListing(extra = []) {
   return [...UNIX_ARCHIVE_NAMES, ...extra].join('\n') + '\n';
 }

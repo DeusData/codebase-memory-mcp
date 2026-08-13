@@ -91,13 +91,20 @@ stamp_windows_build_dir() {
     # SIDs' own entries). /reset drops every explicit ACE and restores pure
     # inheritance, so the protect-and-grant below starts from a known shape
     # regardless of image provisioning.
-    norm_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /reset /Q 2>&1) ||
-        echo "WARN: build-dir DACL normalize ($when) failed: $norm_out"
-    stamp_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
+    if ! norm_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /reset /Q 2>&1); then
+        echo "FAIL: build-dir DACL normalize ($when) failed: $norm_out" >&2
+        exit 1
+    fi
+    if ! stamp_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
         /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
-        /Q 2>&1) || echo "WARN: build-dir DACL stamp ($when) failed (user=$me dir=$runner_dir_w): $stamp_out"
-    reset_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q 2>&1) ||
-        echo "WARN: build-dir child DACL reset ($when) failed: $(printf '%s' "$reset_out" | tail -2)"
+        /Q 2>&1); then
+        echo "FAIL: build-dir DACL stamp ($when) failed (user=$me dir=$runner_dir_w): $stamp_out" >&2
+        exit 1
+    fi
+    if ! reset_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q 2>&1); then
+        echo "FAIL: build-dir child DACL reset ($when) failed: $(printf '%s' "$reset_out" | tail -2)" >&2
+        exit 1
+    fi
     # The stamp is load-bearing for the install-flow suites: verify it and say
     # so, in either direction — a silent stamp once cost a full CI round to
     # even see WHETHER it had run.
@@ -193,7 +200,9 @@ shard_filter() {
 # index_supervisor); the saturated 3-core macOS CI runners starve those
 # deadlines into deterministic failures while an idle machine passes 6/6.
 # They also all rendezvous through the shared per-account runtime namespace,
-# which the quiet tail keeps free of cross-suite admission traffic.
+# which the quiet tail keeps free of cross-suite admission traffic. The three
+# LSP benchmark suites enforce absolute wall-clock ceilings, so their measured
+# work must likewise run without cross-suite CPU or allocator contention.
 # extraction carries the wide-flat SCALING-RATIO guard, which grows the input
 # 20x and asserts the time grows ~20x (linear) rather than ~128x (quadratic),
 # with a bound of 40x between them. Contention does not cancel out of that
@@ -209,7 +218,7 @@ SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp 
     extraction \
     stack_overflow_a stack_overflow_b stack_overflow_c \
     index_supervisor daemon_application daemon_runtime daemon_frontend \
-    daemon_bootstrap daemon_ipc"
+    daemon_bootstrap daemon_ipc cs_lsp_bench py_lsp_bench py_lsp_scale"
 is_serial() {
     case " $SERIAL_SUITES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
@@ -282,14 +291,17 @@ run_wave "$PAR_FILE" "$JOBS"
 # idle cores into wall time — the old fully-serial tail ran them one at a
 # time on an idle machine. The EXCL group (daemon-family plus the suites
 # that drive daemon one-shots or supervisor rendezvous) then runs strictly
-# sequentially on a machine exactly as quiet as the old tail gave it.
+# sequentially on a machine exactly as quiet as the old tail gave it. Absolute
+# wall-clock LSP benchmarks share that lane so their existing ceilings measure
+# the implementation rather than unrelated suite load.
 # extraction is in this group for a DIFFERENT reason than the rest: it does not
 # rendezvous through the daemon namespace, it measures a scaling ratio, and even
 # the FLEX group's small fixed overlap is load the measurement would absorb.
 # Strictly sequential is what makes its verdict a function of the code instead
 # of the scheduler.
 TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
-    daemon_frontend daemon_bootstrap daemon_ipc extraction"
+    daemon_frontend daemon_bootstrap daemon_ipc extraction \
+    cs_lsp_bench py_lsp_bench py_lsp_scale"
 is_tail_excl() {
     case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
@@ -339,6 +351,9 @@ grep -v ' rc=0 ' "$RESULTS_FILE" || true
 for f in $(grep -v ' rc=0 ' "$RESULTS_FILE" | awk '{print $1}'); do
     echo "──── $f: every failure site ────"
     grep -B2 -A8 "FAIL" "$LOGDIR/$f.log" | head -120
+    echo "──── $f: sanitizer failure site ────"
+    grep -B3 -A120 -E 'ERROR: AddressSanitizer|SUMMARY: AddressSanitizer|runtime error:' \
+        "$LOGDIR/$f.log" | head -160
     echo "──── $f: last 15 lines ────"
     tail -15 "$LOGDIR/$f.log"
 done

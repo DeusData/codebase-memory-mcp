@@ -4,7 +4,7 @@
 
 codebase-memory-mcp interacts deeply with your filesystem. It reads source files across your entire codebase, writes to agent configuration files, and spawns background processes. This is inherent to what it does — not a bug.
 
-**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each archive contains a native executable and its authenticated release-owned runtime assets.
+**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each platform runtime is one self-contained native executable; the graph UI and integration templates are embedded.
 
 We are humans and can make mistakes. We take security seriously — it is Priority #1 for this project — but we cannot guarantee perfection. By using this software you accept responsibility for evaluating whether it meets your own security requirements.
 
@@ -29,9 +29,11 @@ check is ignored. The request is also bounded with `curl --max-time 5`; a
 process shutting down immediately while the check is still running may wait for
 that bounded background thread to finish.
 
-Explicit install, package-manager, and `codebase-memory-mcp update` flows are
-separate user-initiated network operations that download release assets and
-checksums from GitHub.
+Explicit install and package-manager flows are separate user-initiated network
+operations that download release archives and checksums from GitHub.
+`codebase-memory-mcp update` performs no network or replacement work itself; it
+prints the platform installer command, and downloading begins only if the user
+runs that command.
 
 ## Help Us Stay Secure
 
@@ -126,7 +128,7 @@ Releases are created as **drafts** (invisible to users) and only published after
 2. **Sigstore cosign signing** — keyless digital signatures verifiable by anyone
 3. **SBOM** — Software Bill of Materials (SPDX) listing all vendored dependencies
 4. **SHA-256 checksums** — published with every release
-5. **VirusTotal scanning** — every distinct extracted member and unpacked UI asset is scanned; downloadable `.tar.gz`/`.zip` containers are not submitted. Each completed analysis must contain at least 50 decisive engine results, zero malicious verdicts, and zero suspicious verdicts. Release notes retain archive SHA-256 provenance and link durable public association, exact-scan-set, per-object-result, and evidence-checksum assets.
+5. **VirusTotal scanning** — every distinct extracted release object is scanned; downloadable `.tar.gz`/`.zip` containers are not submitted. Each completed analysis must contain at least 50 decisive engine results and no suspicious verdicts. Malicious verdicts block unless the result contains exactly one detection from Microsoft and its label ends in `!ml`; release notes publish that exception and retain archive SHA-256 provenance plus the exact association, scan-set, result, and evidence-checksum assets.
 6. **OpenSSF Scorecard** — repository security health score
 
 Scope of the SLSA claim: this is a build provenance claim for release
@@ -137,9 +139,8 @@ not mean the source code is vulnerability-free or that maintainers cannot change
 source. Consumers should verify the signer workflow, not only repository
 ownership.
 
-If any antivirus engine flags any scanned release object, the release stays as a
-draft and is not published until the issue is investigated and resolved. There
-is no exception path in this release gate.
+Any antivirus finding outside the narrow single-Microsoft-`!ml` policy keeps the
+release as a draft until the issue is investigated and resolved.
 
 ### Code-Level Defenses
 
@@ -153,7 +154,7 @@ is no exception path in this release gate.
 
 ### Verification
 
-Users can independently verify any release archive and the runtime set it contains:
+Users can independently verify any release archive and the executable it contains:
 
 ```bash
 # SLSA Build Level 3 provenance for release archives

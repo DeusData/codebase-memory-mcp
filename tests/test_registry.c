@@ -5,10 +5,35 @@
  * resolution strategies, and qualified name computation.
  */
 #include "test_framework.h"
+#include "lsp/type_registry.h"
 #include "pipeline/pipeline.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+enum {
+    REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT = 300,
+    REGISTRY_LONG_IDENTITY_FILL_BYTES = CBM_SZ_512 + CBM_SZ_64,
+    REGISTRY_DISTINCT_LABEL_FIXTURE_COUNT = CBM_SZ_64 + 1,
+};
+
+static char *registry_long_identity(const char *prefix, char fill, const char *suffix) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    if (prefix_len > SIZE_MAX - REGISTRY_LONG_IDENTITY_FILL_BYTES ||
+        prefix_len + REGISTRY_LONG_IDENTITY_FILL_BYTES > SIZE_MAX - suffix_len - SKIP_ONE) {
+        return NULL;
+    }
+    size_t size = prefix_len + REGISTRY_LONG_IDENTITY_FILL_BYTES + suffix_len + SKIP_ONE;
+    char *result = malloc(size);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, prefix, prefix_len);
+    memset(result + prefix_len, fill, REGISTRY_LONG_IDENTITY_FILL_BYTES);
+    memcpy(result + prefix_len + REGISTRY_LONG_IDENTITY_FILL_BYTES, suffix, suffix_len + SKIP_ONE);
+    return result;
+}
 
 /* ── FQN computation ──────────────────────────────────────────────── */
 
@@ -326,6 +351,40 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
     PASS();
 }
 
+TEST(resolve_qualified_imported_external_rejects_unreachable_suffix) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "Message", "proj.docs.additional.Message", "Class");
+    cbm_registry_add(r, "Message", "proj.models.Message", "Class");
+    cbm_registry_add(r, "Message", "proj.other.Message", "Class");
+
+    const char *keys[] = {"email.message"};
+    const char *vals[] = {"email.message"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "email.message.Message", "proj.fastapi.routing", keys, vals, 1);
+    ASSERT_TRUE(!res.qualified_name || res.qualified_name[0] == '\0');
+    ASSERT_TRUE(!res.strategy || res.strategy[0] == '\0');
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(resolve_dotted_receiver_rejects_unreachable_suffix_when_imports_exist) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "get", "proj.fastapi.routing.APIRouter.get", "Method");
+    cbm_registry_add(r, "get", "proj.datastructures.Headers.get", "Method");
+    cbm_registry_add(r, "get", "proj.other.Mapping.get", "Method");
+
+    const char *keys[] = {"Request"};
+    const char *vals[] = {"starlette.requests.Request"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "response.get", "proj.fastapi.routing", keys, vals, 1);
+    ASSERT_TRUE(!res.qualified_name || res.qualified_name[0] == '\0');
+    ASSERT_TRUE(!res.strategy || res.strategy[0] == '\0');
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
@@ -470,16 +529,36 @@ TEST(resolve_suffix_match) {
     PASS();
 }
 
-/* A name with more than REG_MAX_CANDIDATES (256) registered definitions is
- * unresolvable by name alone: the candidate penalty floors its confidence to
- * ~3/count (noise), while walking the candidate array per file dominated
- * usage-resolution CPU on the Linux kernel ("flags"/"dev"/"list_head" have
- * 4-7k definitions each). resolve must bail out with an empty result instead
- * of scanning and emitting a near-zero-confidence edge. */
+TEST(resolve_suffix_match_tie_is_insertion_order_independent) {
+    cbm_registry_t *forward = cbm_registry_new();
+    cbm_registry_t *reverse = cbm_registry_new();
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+
+    cbm_registry_add(forward, "store", "proj.alpha.Widget.store", "Field");
+    cbm_registry_add(forward, "store", "proj.beta.Widget.store", "Field");
+    cbm_registry_add(reverse, "store", "proj.beta.Widget.store", "Field");
+    cbm_registry_add(reverse, "store", "proj.alpha.Widget.store", "Field");
+
+    cbm_resolution_t a = cbm_registry_resolve(forward, "store", "proj.header", NULL, NULL, 0);
+    cbm_resolution_t b = cbm_registry_resolve(reverse, "store", "proj.header", NULL, NULL, 0);
+    ASSERT_STR_EQ(a.strategy, "suffix_match");
+    ASSERT_STR_EQ(b.strategy, "suffix_match");
+    ASSERT_STR_EQ(a.qualified_name, "proj.alpha.Widget.store");
+    ASSERT_STR_EQ(b.qualified_name, a.qualified_name);
+
+    cbm_registry_free(forward);
+    cbm_registry_free(reverse);
+    PASS();
+}
+
+/* A high-cardinality bare name with no exact qualified/import signal remains
+ * unresolved: its confidence is noise, while scanning these names dominated
+ * usage-resolution CPU on the Linux kernel. */
 TEST(resolve_caps_unresolvably_ambiguous_names) {
     cbm_registry_t *r = cbm_registry_new();
-    for (int i = 0; i < 300; i++) {
-        char qn[64];
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
         snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
         cbm_registry_add(r, "flags", qn, "Variable");
     }
@@ -492,6 +571,154 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
     ASSERT_STR_EQ(res.strategy, "same_module");
 
     cbm_registry_free(r);
+    PASS();
+}
+
+/* Candidate cardinality is not a reason to discard an exact qualified-tail
+ * signal. The parent cap executes before Strategy 3.5 and loses this match. */
+TEST(resolve_high_cardinality_qualified_tail) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "proj.ns%d.run", i);
+        cbm_registry_add(r, "run", qn, "Function");
+    }
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "ns299.run", "proj.caller", NULL, NULL, 0);
+    bool exact = res.qualified_name && strcmp(res.qualified_name, "proj.ns299.run") == 0 &&
+                 res.strategy && strcmp(res.strategy, "qualified_suffix") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+/* An import-reachability signal can reduce an arbitrarily large by-name set to
+ * one exact candidate. The parent cap discards the signal before filtering. */
+TEST(resolve_high_cardinality_unique_import_reachable) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
+        cbm_registry_add(r, "flags", qn, "Variable");
+    }
+    const char *import_keys[] = {"target"};
+    const char *import_values[] = {"proj.mod299"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "flags", "proj.caller", import_keys, import_values, 1);
+    bool exact = res.qualified_name && strcmp(res.qualified_name, "proj.mod299.flags") == 0 &&
+                 res.strategy && strcmp(res.strategy, "suffix_match") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_fuzzy_high_cardinality_unique_import_reachable) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_HIGH_CARDINALITY_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
+        cbm_registry_add(r, "flags", qn, "Variable");
+    }
+    const char *import_values[] = {"proj.mod299"};
+    cbm_fuzzy_result_t result =
+        cbm_registry_fuzzy_resolve(r, "unknown.flags", "proj.caller", NULL, import_values, 1);
+    bool exact = result.ok && result.result.qualified_name &&
+                 strcmp(result.result.qualified_name, "proj.mod299.flags") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(registry_retains_more_than_parent_label_pool) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < REGISTRY_DISTINCT_LABEL_FIXTURE_COUNT; i++) {
+        char qn[CBM_SZ_64];
+        char label[CBM_SZ_32];
+        snprintf(qn, sizeof(qn), "proj.symbol%d", i);
+        snprintf(label, sizeof(label), "Label%d", i);
+        cbm_registry_add(r, "symbol", qn, label);
+    }
+    const char *last_label = cbm_registry_label_of(r, "proj.symbol64");
+    bool exact = cbm_registry_size(r) == REGISTRY_DISTINCT_LABEL_FIXTURE_COUNT && last_label &&
+                 strcmp(last_label, "Label64") == 0;
+    cbm_registry_free(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_import_map_preserves_long_key_and_target) {
+    char *alias = registry_long_identity("alias", 'a', "");
+    char *callee = registry_long_identity("alias", 'a', ".run");
+    char *resolved = registry_long_identity("proj.", 'r', "");
+    char *target = registry_long_identity("proj.", 'r', ".run");
+    if (!alias || !callee || !resolved || !target) {
+        free(target);
+        free(resolved);
+        free(callee);
+        free(alias);
+        FAIL("long import fixture allocation");
+    }
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "run", target, "Function");
+    const char *keys[] = {alias};
+    const char *values[] = {resolved};
+    cbm_resolution_t result = cbm_registry_resolve(r, callee, "proj.caller", keys, values, 1);
+    bool exact = result.qualified_name && strcmp(result.qualified_name, target) == 0 &&
+                 result.strategy && strcmp(result.strategy, "import_map") == 0;
+    cbm_registry_free(r);
+    free(target);
+    free(resolved);
+    free(callee);
+    free(alias);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_same_module_preserves_long_identity) {
+    char *module = registry_long_identity("proj.", 'm', "");
+    char *target = registry_long_identity("proj.", 'm', ".run");
+    if (!module || !target) {
+        free(target);
+        free(module);
+        FAIL("long same-module fixture allocation");
+    }
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "run", target, "Function");
+    cbm_resolution_t result = cbm_registry_resolve(r, "run", module, NULL, NULL, 0);
+    bool exact = result.qualified_name && strcmp(result.qualified_name, target) == 0 &&
+                 result.strategy && strcmp(result.strategy, "same_module") == 0;
+    cbm_registry_free(r);
+    free(target);
+    free(module);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(resolve_qualified_tail_preserves_long_identity) {
+    char *callee = registry_long_identity("ns.", 'q', ".run");
+    char *target = registry_long_identity("proj.ns.", 'q', ".run");
+    if (!callee || !target) {
+        free(target);
+        free(callee);
+        FAIL("long qualified-tail fixture allocation");
+    }
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "run", target, "Function");
+    cbm_registry_add(r, "run", "proj.other.run", "Function");
+    cbm_resolution_t result = cbm_registry_resolve(r, callee, "proj.caller", NULL, NULL, 0);
+    bool exact = result.qualified_name && strcmp(result.qualified_name, target) == 0 &&
+                 result.strategy && strcmp(result.strategy, "qualified_suffix") == 0;
+    cbm_registry_free(r);
+    free(target);
+    free(callee);
+    ASSERT_TRUE(exact);
     PASS();
 }
 
@@ -768,10 +995,18 @@ TEST(tsjs_suppress_drops_weak_method_matches) {
      * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
      * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
      * resolvers today) so a future wiring cannot silently reintroduce it. */
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "suffix_match"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "unique_name"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "field_type_hint"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "fuzzy"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 1, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_JAVASCRIPT, true, false, 1, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_TSX, true, false, 2, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "fuzzy"));
+    PASS();
+}
+
+TEST(registry_strategy_identifies_direct_import_map) {
+    ASSERT_TRUE(cbm_registry_strategy_is_import_map("import_map"));
+    ASSERT_FALSE(cbm_registry_strategy_is_import_map("import_map_suffix"));
+    ASSERT_FALSE(cbm_registry_strategy_is_import_map("same_module"));
+    ASSERT_FALSE(cbm_registry_strategy_is_import_map(NULL));
     PASS();
 }
 
@@ -783,23 +1018,42 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
      * enumerates the resolver's non-weak strategies: registry
      * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
      * {callee_suffix, service_pattern}, and lsp_*. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "same_module"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "qualified_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "callee_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "service_pattern"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_method"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_cross"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_local"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "import_map"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "import_map_suffix"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "qualified_suffix"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "callee_suffix"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "service_pattern"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "lsp_ts_method"));
+    ASSERT_FALSE(
+        cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "lsp_method_dispatch"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, "lsp_ts_local"));
     /* A bare call (is_method=false) is a free-function call → never suppressed. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "unique_name"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, false, false, 2, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, false, 2, "suffix_match"));
     /* Non-TS/JS languages are never affected. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(false, true, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_GO, true, false, 2, "suffix_match"));
     /* No match (NULL/empty strategy) → nothing to suppress. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, NULL));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, ""));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_TYPESCRIPT, true, false, 2, ""));
+    PASS();
+}
+
+TEST(rust_suppress_drops_only_ambiguous_weak_member_matches) {
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "fuzzy"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 2, "field_type_hint"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 1, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, true, false, 1, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, true, 1, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, true, 2, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_call_match(CBM_LANG_RUST, false, true, 2, "lsp_macro"));
     PASS();
 }
 
@@ -824,6 +1078,56 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     ASSERT_STR_EQ(res.qualified_name, "proj.auth.signals.user_logged_in.send");
     ASSERT_STR_EQ(res.strategy, "import_map");
     cbm_registry_free(r);
+    PASS();
+}
+
+/* A cfg predicate is part of a Rust definition's graph identity, but not its
+ * source-level call name.  Index both cfg-gated twins under the supplied name
+ * so a local call cannot make an unrelated cross-module definition appear to
+ * be the sole candidate. */
+TEST(resolve_cfg_gated_twins_by_source_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "has_permission",
+                     "proj.scripts.helpers.has_permission#cfg(target_os=\"macos\")", "Function");
+    cbm_registry_add(r, "has_permission",
+                     "proj.scripts.helpers.has_permission#cfg(not(target_os=\"macos\"))",
+                     "Function");
+    cbm_registry_add(r, "has_permission", "proj.engine.permissions.has_permission", "Function");
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "has_permission", "proj.scripts.helpers", NULL, NULL, 0);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_NOT_NULL(strstr(res.qualified_name, "proj.scripts.helpers.has_permission#cfg("));
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_EQ(res.candidate_count, 3);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(type_registry_finalize_into_keeps_indexes_in_scratch_arena) {
+    CBMArena data_arena;
+    CBMArena scratch_arena;
+    cbm_arena_init(&data_arena);
+    cbm_arena_init(&scratch_arena);
+
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &data_arena);
+    CBMRegisteredFunc method = {
+        .qualified_name = "pkg.Type.method",
+        .receiver_type = "pkg.Type",
+        .short_name = "method",
+    };
+    cbm_registry_add_func(&registry, method);
+    size_t data_bytes = data_arena.total_alloc;
+
+    cbm_registry_finalize_into(&registry, &scratch_arena);
+    ASSERT_EQ(data_arena.total_alloc, data_bytes);
+    ASSERT(scratch_arena.total_alloc > 0);
+
+    cbm_arena_destroy(&scratch_arena);
+    cbm_arena_destroy(&data_arena);
     PASS();
 }
 
@@ -857,10 +1161,14 @@ SUITE(registry) {
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(resolve_qualified_imported_external_rejects_unreachable_suffix);
+    RUN_TEST(resolve_dotted_receiver_rejects_unreachable_suffix_when_imports_exist);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
+    RUN_TEST(resolve_cfg_gated_twins_by_source_name);
+    RUN_TEST(type_registry_finalize_into_keeps_indexes_in_scratch_arena);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
@@ -870,7 +1178,15 @@ SUITE(registry) {
     RUN_TEST(confidence_band_speculative);
     /* Suffix match + import map suffix */
     RUN_TEST(resolve_suffix_match);
+    RUN_TEST(resolve_suffix_match_tie_is_insertion_order_independent);
     RUN_TEST(resolve_caps_unresolvably_ambiguous_names);
+    RUN_TEST(resolve_high_cardinality_qualified_tail);
+    RUN_TEST(resolve_high_cardinality_unique_import_reachable);
+    RUN_TEST(resolve_fuzzy_high_cardinality_unique_import_reachable);
+    RUN_TEST(registry_retains_more_than_parent_label_pool);
+    RUN_TEST(resolve_import_map_preserves_long_key_and_target);
+    RUN_TEST(resolve_same_module_preserves_long_identity);
+    RUN_TEST(resolve_qualified_tail_preserves_long_identity);
     RUN_TEST(resolve_import_map_suffix);
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);
@@ -894,5 +1210,7 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
+    RUN_TEST(registry_strategy_identifies_direct_import_map);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(rust_suppress_drops_only_ambiguous_weak_member_matches);
 }

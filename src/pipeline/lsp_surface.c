@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "foundation/compat.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
@@ -157,13 +158,13 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
         char sha[CBM_SHA256_HEX_LEN + 1];
         cbm_sha256_hex(json, strlen(json), sha);
         cbm_lsp_surface_row_t *r = &rows[n];
-        r->project = strdup(project);
-        r->rel_path = strdup(files[i].rel_path);
-        r->surface_sha = strdup(sha);
+        r->project = cbm_strdup(project);
+        r->rel_path = cbm_strdup(files[i].rel_path);
+        r->surface_sha = cbm_strdup(sha);
         r->defs_json = json;
         r->ref_bloom = NULL;
         r->ref_bloom_len = 0;
-        r->config_ctx = strdup("");
+        r->config_ctx = cbm_strdup("");
         if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
             n++;
             cbm_store_free_lsp_surfaces(rows, n);

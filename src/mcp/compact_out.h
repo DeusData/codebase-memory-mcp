@@ -34,21 +34,35 @@ char *cbm_sb_finish(cbm_sb_t *sb);
 void cbm_sb_free(cbm_sb_t *sb);
 
 /* `key: value` scalar lines (top-level, no indent). */
-void cbm_tree_scalar_str(cbm_sb_t *sb, const char *key, const char *val);
-void cbm_tree_scalar_int(cbm_sb_t *sb, const char *key, long long v);
-void cbm_tree_scalar_bool(cbm_sb_t *sb, const char *key, bool v);
+void cbm_toon_scalar_str(cbm_sb_t *sb, const char *key, const char *val);
+void cbm_toon_scalar_int(cbm_sb_t *sb, const char *key, long long v);
+void cbm_toon_scalar_bool(cbm_sb_t *sb, const char *key, bool v);
 
 /* `key[n]{col1,col2,...}:` table header; rows follow at 2-space indent. */
-void cbm_tree_table_header(cbm_sb_t *sb, const char *key, int n, const char *const *cols,
+void cbm_toon_table_header(cbm_sb_t *sb, const char *key, int n, const char *const *cols,
                            int ncols);
 
 /* Row cells: call row_begin, then cell_* per column (first=true for the
  * first cell), then row_end. Empty/NULL strings emit as empty cells. */
-void cbm_tree_row_begin(cbm_sb_t *sb);
-void cbm_tree_cell_str(cbm_sb_t *sb, const char *val, bool first);
-void cbm_tree_cell_int(cbm_sb_t *sb, long long v, bool first);
-void cbm_tree_cell_real(cbm_sb_t *sb, double v, bool first);
-void cbm_tree_cell_bool(cbm_sb_t *sb, bool v, bool first);
-void cbm_tree_row_end(cbm_sb_t *sb);
+void cbm_toon_row_begin(cbm_sb_t *sb);
+void cbm_toon_cell_str(cbm_sb_t *sb, const char *val, bool first);
+void cbm_toon_cell_int(cbm_sb_t *sb, long long v, bool first);
+void cbm_toon_cell_real(cbm_sb_t *sb, double v, bool first);
+void cbm_toon_cell_bool(cbm_sb_t *sb, bool v, bool first);
+void cbm_toon_row_end(cbm_sb_t *sb);
+
+/* Source compatibility for call sites merged from the short-lived tree
+ * spelling. Both names deliberately emit canonical TOON; the externally
+ * configured compact format remains `toon`, not a third response format. */
+#define cbm_tree_scalar_str cbm_toon_scalar_str
+#define cbm_tree_scalar_int cbm_toon_scalar_int
+#define cbm_tree_scalar_bool cbm_toon_scalar_bool
+#define cbm_tree_table_header cbm_toon_table_header
+#define cbm_tree_row_begin cbm_toon_row_begin
+#define cbm_tree_cell_str cbm_toon_cell_str
+#define cbm_tree_cell_int cbm_toon_cell_int
+#define cbm_tree_cell_real cbm_toon_cell_real
+#define cbm_tree_cell_bool cbm_toon_cell_bool
+#define cbm_tree_row_end cbm_toon_row_end
 
 #endif /* CBM_MCP_COMPACT_OUT_H */

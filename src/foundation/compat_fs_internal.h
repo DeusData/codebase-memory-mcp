@@ -1,17 +1,39 @@
 /*
- * compat_fs_internal.h — Internal helpers exposed for testing.
+ * compat_fs_internal.h — Internal platform helpers.
  *
- * These functions are implementation details of compat_fs.c; they are
- * declared here only so that the test suite can drive them directly.
- * Production code outside compat_fs.c should use the public APIs in
- * compat_fs.h instead.
+ * These functions are implementation details shared by the few production
+ * modules that must retain a native handle across an operation and by focused
+ * tests. Other production code should use the portable APIs in compat_fs.h.
  */
 #ifndef CBM_FOUNDATION_COMPAT_FS_INTERNAL_H
 #define CBM_FOUNDATION_COMPAT_FS_INTERNAL_H
 
 #ifdef _WIN32
 
+#include <stdbool.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <wchar.h>
+
+/*
+ * Windows reports the same short-lived rename conflicts at multiple
+ * publication surfaces. Keep their classification in one place so callers
+ * cannot drift on which errors are safe to retry or route through the
+ * handle-based POSIX-semantics fallback.
+ */
+bool cbm_windows_replace_error_is_transient(DWORD error);
+
+/*
+ * Atomically replace destination_path with the already-open source handle
+ * using FileRenameInfoEx POSIX semantics. The source handle must include
+ * DELETE access. This is the Windows compatibility seam for destinations
+ * whose previous generation is still open with FILE_SHARE_DELETE. It never
+ * closes source; the caller retains handle ownership on success and failure.
+ */
+bool cbm_windows_replace_open_file(HANDLE source, const wchar_t *destination_path,
+                                   DWORD *platform_error);
 
 /*
  * Build a properly-quoted Windows command line from a NULL-terminated

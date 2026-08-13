@@ -27,7 +27,14 @@ static int saved_stderr;
 static int pipe_fds[2];
 
 static void test_log_sink(const char *line) {
-    snprintf(sink_buf, sizeof(sink_buf), "%s", line ? line : "");
+    if (!line) {
+        return;
+    }
+    size_t used = strlen(sink_buf);
+    if (used >= sizeof(sink_buf) - 1) {
+        return;
+    }
+    snprintf(sink_buf + used, sizeof(sink_buf) - used, "%s\n", line);
 }
 
 static void capture_start(void) {
@@ -114,6 +121,40 @@ TEST(log_int_helper) {
     cbm_log_set_level(CBM_LOG_INFO);
 
     ASSERT(cbm_str_contains_raw(output, "elapsed_ms=42"));
+    PASS();
+}
+
+TEST(log_profile_mirror_is_opt_in_and_prof_only) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_profile_stderr_mirror(false);
+    sink_buf[0] = '\0';
+    cbm_log_set_sink(test_log_sink);
+
+    capture_start();
+    cbm_log_info("prof", "phase", "unit", "sub", "sink_only");
+    const char *output = capture_end();
+    ASSERT_EQ(strlen(output), 0);
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=prof"));
+
+    sink_buf[0] = '\0';
+    cbm_log_set_profile_stderr_mirror(true);
+    capture_start();
+    cbm_log_info("prof", "phase", "unit", "sub", "mirrored");
+    output = capture_end();
+    ASSERT(cbm_str_contains_raw(output, "msg=prof"));
+    ASSERT(cbm_str_contains_raw(output, "sub=mirrored"));
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=prof"));
+
+    sink_buf[0] = '\0';
+    capture_start();
+    cbm_log_info("not.prof", "key", "value");
+    output = capture_end();
+    ASSERT_EQ(strlen(output), 0);
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=not.prof"));
+
+    cbm_log_set_sink(NULL);
+    cbm_log_set_profile_stderr_mirror(false);
+    cbm_log_set_level(CBM_LOG_INFO);
     PASS();
 }
 
@@ -207,7 +248,6 @@ TEST(log_format_unset_keeps_current) {
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     cbm_log_init_from_env();
     ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_TEXT);
-
     PASS();
 }
 
@@ -290,6 +330,7 @@ SUITE(log) {
     RUN_TEST(log_filtered_by_level);
     RUN_TEST(log_error_output);
     RUN_TEST(log_int_helper);
+    RUN_TEST(log_profile_mirror_is_opt_in_and_prof_only);
     RUN_TEST(log_json_output);
     RUN_TEST(log_text_sanitizes_control_chars);
     RUN_TEST(log_sink_tee_keeps_stderr);

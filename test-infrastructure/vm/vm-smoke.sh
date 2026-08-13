@@ -28,8 +28,8 @@ Run inside the VM's CLANGARM64 shell (or a CI msys2 shell) from the repo root.
 
 Environment:
   SMOKE_ARCH      arm64 (default) | amd64 — selects the served artifact name.
-                  Phase 15's "no assets" SKIP becomes a FAILURE, so a standard
-                  binary cannot pass a ui run.
+  SMOKE_REQUIRE_UI=1
+                  Phase 15's "no embedded assets" SKIP becomes a FAILURE.
   CBM_SMOKE_ARTIFACT_DIR
                   Release mode: an EXTRACTED windows release artifact
                   (codebase-memory-mcp.exe + LICENSE + install.ps1 +

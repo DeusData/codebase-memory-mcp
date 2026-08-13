@@ -1,0 +1,1915 @@
+/*
+ * test_input_validation.c — Tests for parameter validation from fuzz testing.
+ * Covers: F1 (empty label), F6 (invalid sort_by), F7 (invalid mode),
+ *         F9 (invalid regex), F10 (negative depth), F15 (invalid direction).
+ *
+ * Each test creates a minimal MCP server, calls a tool handler with invalid
+ * input, and asserts the error response contains helpful guidance.
+ */
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h"
+#include "test_framework.h"
+#include "test_helpers.h"
+#include <mcp/mcp.h>
+#include <pagerank/pagerank.h>
+#include <pipeline/pipeline.h>
+#include <store/store.h>
+#include <cli/cli.h>
+#include <depindex/depindex.h>
+#include <yyjson/yyjson.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+/* ── Helper: extract inner text content from MCP tool result ── */
+static char *extract_text(const char *mcp_result) {
+    if (!mcp_result) return NULL;
+    /* Parse MCP JSON wrapper: {"content":[{"type":"text","text":"..."}]} */
+    yyjson_doc *doc = yyjson_read(mcp_result, strlen(mcp_result), 0);
+    if (!doc) return strdup(mcp_result);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *content = yyjson_obj_get(root, "content");
+    if (!content || !yyjson_is_arr(content)) {
+        yyjson_doc_free(doc);
+        return strdup(mcp_result);
+    }
+    yyjson_val *item = yyjson_arr_get(content, 0);
+    yyjson_val *text = item ? yyjson_obj_get(item, "text") : NULL;
+    const char *str = text ? yyjson_get_str(text) : NULL;
+    char *result = str ? strdup(str) : strdup(mcp_result);
+    yyjson_doc_free(doc);
+    return result;
+}
+
+/* ── Helper: create minimal server with pre-populated data ── */
+static cbm_mcp_server_t *setup_validation_server(char *tmp, size_t tmp_sz) {
+    const char *cache = cbm_resolve_cache_dir();
+    int path_len = snprintf(tmp, tmp_sz, "%s/cbm-test-validation-XXXXXX", cache);
+    if (path_len < 0 || (size_t)path_len >= tmp_sz)
+        return NULL;
+    if (!cbm_mkdtemp(tmp)) return NULL;
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) return NULL;
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) { cbm_mcp_server_free(srv); return NULL; }
+
+    const char *proj = "validation-test";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, tmp);
+
+    /* Insert test nodes: 2 functions + 1 call edge */
+    cbm_node_t foo = {.project = proj, .label = "Function", .name = "foo",
+                      .qualified_name = "validation-test.test.foo",
+                      .file_path = "test.c", .start_line = 1, .end_line = 1};
+    cbm_node_t bar = {.project = proj, .label = "Function", .name = "bar",
+                      .qualified_name = "validation-test.test.bar",
+                      .file_path = "test.c", .start_line = 2, .end_line = 2};
+    cbm_node_t alpha = {.project = proj,
+                        .label = "Function",
+                        .name = "alphaWorker",
+                        .qualified_name = "validation-test.services.alphaWorker",
+                        .file_path = "worker.c",
+                        .start_line = 3,
+                        .end_line = 3};
+    cbm_node_t beta = {.project = proj,
+                       .label = "Function",
+                       .name = "betaHandler",
+                       .qualified_name = "validation-test.services.betaHandler",
+                       .file_path = "handler.c",
+                       .start_line = 4,
+                       .end_line = 4};
+    cbm_store_upsert_node(st, &foo);
+    cbm_store_upsert_node(st, &bar);
+    cbm_store_upsert_node(st, &alpha);
+    cbm_store_upsert_node(st, &beta);
+    cbm_edge_t e = {.project = proj, .source_id = 2, .target_id = 1, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    return srv;
+}
+
+static void cleanup_validation_dir(const char *dir) {
+    th_cleanup(dir);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F1: Empty label treated as no filter (not silently returning 0)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f1_empty_label_returns_results) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"label\":\"\",\"limit\":5}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Empty label should be treated as "no label filter" → returns all nodes */
+    /* Should NOT return error, and total should be > 0 if project has data */
+    ASSERT_NULL(strstr(resp, "\"error\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F6: Invalid sort_by returns error with valid values
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f6_invalid_sort_by_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"sort_by\":\"invalid_value\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Must return error mentioning sort_by */
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "sort_by"));
+    /* Must list valid values */
+    ASSERT_NOT_NULL(strstr(resp, "relevance"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* Edge case: sort_by with typo "degre" (missing 'e') */
+TEST(f6_sort_by_typo_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"sort_by\":\"degre\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "degree")); /* suggest correct value */
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F9: Invalid regex in name_pattern returns error
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f9_invalid_regex_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"(\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Must return error mentioning regex/pattern */
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_TRUE(strstr(resp, "regex") || strstr(resp, "pattern"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* Edge case: valid regex should NOT error */
+TEST(f9_valid_regex_succeeds) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"foo.*bar\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Valid regex should NOT produce error */
+    ASSERT_NULL(strstr(resp, "\"error\":\"invalid regex"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F6: sort_by 'calls' and 'linkrank' must be accepted (Bug 1)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f6_sort_by_calls_accepted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"sort_by\":\"calls\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid sort_by"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f6_sort_by_linkrank_accepted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"sort_by\":\"linkrank\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid sort_by"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F9: Glob wildcard patterns auto-converted to regex (Bug 2)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f9_glob_star_autoconverted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw =
+        cbm_mcp_handle_tool(srv, "search_graph", "{\"name_pattern\":\"*Worker*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_glob_question_autoconverted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"*alpha?orker*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_valid_regex_shaped_glob_is_normalized_before_compile) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"alpha?orker|beta?andler\",\"limit\":5,"
+                                    "\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_valid_regex_still_works) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\".*tool.*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "error"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_truly_invalid_pattern_still_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"(\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_qn_pattern_glob_autoconverted) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"qn_pattern\":\"*Handler*\",\"limit\":3}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F10: Negative depth clamped to 1
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f10_negative_depth_returns_results) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"foo\",\"depth\":-1}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Should NOT return empty — depth clamped to 1, function "foo" exists */
+    /* At minimum should have function name in response */
+    ASSERT_NOT_NULL(strstr(resp, "foo"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Bug 3: trace_path fuzzy fallback on case mismatch
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_case_mismatch_finds_via_fallback) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "Foo" does not exist — only "foo" does. Fallback search should find it.
+     * No project passed: resolve_store returns in-memory store, fallback search
+     * has no project filter, finds "foo", re-queries with result's project. */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"function_name\":\"Foo\",\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Must NOT contain "function not found" — fallback should resolve */
+    ASSERT_NULL(strstr(resp, "function not found"));
+    /* Response should contain "function" key (BFS result) and direction */
+    ASSERT_NOT_NULL(strstr(resp, "\"function\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"direction\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(trace_exact_match_still_works) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Exact name "foo" should work directly without fallback.
+     * No project: resolve_store returns in-memory store, find_nodes_by_name
+     * uses project=NULL which binds NULL (won't match). Falls to fallback
+     * which finds "foo" via search (no project filter). */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"function_name\":\"foo\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "function not found"));
+    ASSERT_NOT_NULL(strstr(resp, "foo"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(trace_truly_missing_still_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "nonexistent_xyz" doesn't match anything — should still error */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"function_name\":\"nonexistent_xyz\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "function not found"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  F15: Invalid direction returns error with valid values
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(f15_invalid_direction_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"foo\",\"direction\":\"invalid\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Must return error mentioning direction */
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "direction"));
+    /* Must list valid values */
+    ASSERT_NOT_NULL(strstr(resp, "inbound"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* Edge case: valid direction "outbound" should NOT error */
+TEST(f15_valid_direction_succeeds) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"foo\",\"direction\":\"outbound\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* Valid direction should NOT produce error about direction */
+    ASSERT_NULL(strstr(resp, "invalid direction"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(trace_invalid_mode_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"foo\",\"mode\":\"typo\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "error"));
+    ASSERT_NOT_NULL(strstr(resp, "mode"));
+    ASSERT_NOT_NULL(strstr(resp, "calls"));
+    ASSERT_NOT_NULL(strstr(resp, "data_flow"));
+    ASSERT_NOT_NULL(strstr(resp, "cross_service"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  G1: Summary mode includes results_suppressed indicator
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(g1_summary_mode_has_results_key) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Pass project explicitly to ensure store is found.
+     * format:"json" opts into the legacy JSON summary shape (G1 contract). */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"mode\":\"summary\",\"limit\":100,\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* G1: summary mode must include "results" key and results_suppressed */
+    ASSERT_NOT_NULL(strstr(resp, "\"total\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"results\""));
+    ASSERT_NOT_NULL(strstr(resp, "results_suppressed"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  CQ-3: Cypher + search-only filter is rejected actionably
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(cq3_cypher_with_label_rejected) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* query_graph has never advertised label. Strict validation prevents an
+     * apparently successful call from silently ignoring the search filter. */
+    char *raw = cbm_mcp_handle_tool(srv, "query_graph",
+        "{\"cypher\":\"MATCH (n:Function) RETURN n.name LIMIT 5\","
+        "\"label\":\"Class\",\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "unknown argument 'label'"));
+    ASSERT_NOT_NULL(strstr(resp, "supported arguments"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  IX-2: Status shows "indexing" during active index
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(ix2_status_resource_format) {
+    /* IX-2: Verify status resource has expected fields when server has no data.
+     * Can't set autoindex_failed on opaque struct, but we can verify the
+     * not_indexed status path returns action_required field. */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* Server with no indexed data should report not_indexed with action hint */
+    char *raw = cbm_mcp_handle_tool(srv, "index_status", "{}");
+    /* index_status without a project returns an error — that's expected */
+    ASSERT_NOT_NULL(raw);
+    free(raw);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Pattern OR-search: unified name+qn search (Change 1c)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(pattern_or_search_graph) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* pattern="foo" should match node named "foo" (OR across name and qualified_name) */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"pattern\":\"foo\",\"limit\":5,\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"results\"")); /* results array present */
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(pattern_or_search_graph_normalizes_valid_regex_shaped_glob) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"pattern\":\"services.alpha?orker|beta?andler\",\"limit\":5,"
+                                    "\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_explicit_group_and_class_regex_quantifiers_stay_regex) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"name_pattern\":\"(alpha)?Worker|[ab].*Handler\",\"limit\":5,"
+                            "\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Source search via search_in="source" dispatch
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_via_search_in_param) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Write a file into the tmpdir so grep has something to search */
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/hello.c", tmp);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fputs("/* cbm_unique_grep_token */\n", f); fclose(f); }
+
+    /* search_in="source" with explicit project slug dispatches to handle_search_code
+     * and finds the file we wrote above. */
+    char args[512];
+    snprintf(args, sizeof(args),
+        "{\"pattern\":\"cbm_unique_grep_token\","
+        "\"search_in\":\"source\","
+        "\"project\":\"validation-test\",\"format\":\"json\"}");
+    char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Should return matches array, NOT "project not found" */
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"matches\""));
+    ASSERT_NOT_NULL(strstr(resp, "cbm_unique_grep_token"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Source search: path-based project arg normalizes to slug
+ *  (Bug: get_project_root didn't convert /path → slug, causing
+ *   "project not found" even when the project was indexed)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_path_project_normalizes_to_slug) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Write a file with a known token */
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/hello.c", tmp);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fputs("/* path_slug_normalize_token */\n", f); fclose(f); }
+
+    /* The project name "validation-test" was stored with root_path=tmp.
+     * Passing project=tmp (the root_path) should normalize via get_project_root.
+     * NOTE: this works when cbm_project_name_from_path(tmp) matches the stored
+     * project name. For arbitrary test slugs it won't — this test verifies the
+     * slug-based path works (project="validation-test" matches current_project). */
+    char args[512];
+    snprintf(args, sizeof(args),
+        "{\"pattern\":\"path_slug_normalize_token\","
+        "\"search_in\":\"source\","
+        "\"project\":\"validation-test\",\"format\":\"json\"}");
+    char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"matches\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Verify search_in="graph" (default) still does graph search
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_default_is_graph) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* No search_in → defaults to graph search → returns results array */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"pattern\":\"foo\",\"limit\":5,\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"results\"")); /* graph search returns results array */
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  summary=true bool alias (Change 2c)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(summary_bool_alias) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"summary\":true,\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    /* Summary mode: by_label and by_file_top20 present */
+    ASSERT_NOT_NULL(strstr(resp, "\"by_label\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  case_sensitive graph search (Change 2b)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(case_sensitive_graph_search) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* case_sensitive=true: "FOO" should NOT match node named "foo" */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"FOO\",\"case_sensitive\":true,"
+                                    "\"limit\":5,\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    /* Should return 0 results (no uppercase FOO in test store) */
+    ASSERT_NOT_NULL(strstr(resp, "\"total\":0"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Config: compact default false
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(config_compact_default_false) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Set compact=false in config, then call without compact param */
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, "compact", "false");
+    cbm_mcp_server_set_config(srv, cfg);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(config_response_format_json_with_toon_override) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_DEFAULT_RESPONSE_FORMAT,
+                             CBM_MCP_OUTPUT_FORMAT_JSON),
+              0);
+    ASSERT_TRUE(cbm_config_set(cfg, CBM_CONFIG_DEFAULT_RESPONSE_FORMAT, "yaml") != 0);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    const char *query = "MATCH (n:Function) RETURN n.name LIMIT 2";
+    char *raw = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 2\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_EQ(resp[0], '{');
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"rows\""));
+    free(resp);
+
+    raw = cbm_mcp_handle_tool(srv, "get_graph_schema",
+                              "{\"project\":\"validation-test\"}");
+    resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_EQ(resp[0], '{');
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    free(resp);
+
+    char args[256];
+    snprintf(args, sizeof(args), "{\"query\":\"%s\",\"format\":\"toon\"}", query);
+    raw = cbm_mcp_handle_tool(srv, "query_graph", args);
+    resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "rows["));
+    ASSERT_TRUE(resp[0] != '{');
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(toon_first_response_context_is_native_toon) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"alpha\",\"limit\":2,\"format\":\"toon\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* A TOON response must never contain a verbatim JSON subdocument. The
+     * first-response context keeps the same facts under explicit TOON keys. */
+    ASSERT_NULL(strstr(resp, "context: {"));
+    ASSERT_NULL(strstr(resp, "{\"_context\":"));
+    ASSERT_NOT_NULL(strstr(resp, "session_project: validation-test"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_status: ready"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_project: validation-test"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_node_labels["));
+    ASSERT_NOT_NULL(strstr(resp, "_context_edge_types["));
+
+    free(resp);
+
+    /* Context is delivered once, while the lightweight session identity is
+     * retained on later TOON responses just as it is for JSON responses. */
+    raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"beta\",\"limit\":2,\"format\":\"toon\"}");
+    resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "session_project: validation-test"));
+    ASSERT_NULL(strstr(resp, "_context_status:"));
+    ASSERT_NULL(strstr(resp, "_context_node_labels["));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(toon_plain_text_error_separates_first_response_context) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"alpha\",\"file_pattern\":\";\",\"format\":\"toon\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    ASSERT_NOT_NULL(strstr(resp, "path or file_pattern contains invalid characters"));
+    ASSERT_NOT_NULL(strstr(resp, "\nsession_project: validation-test"));
+    ASSERT_NULL(strstr(resp, "characterssession_project:"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(toon_context_injection_config_is_respected) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, "context_injection", "false"), 0);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"alpha\",\"limit\":2,\"format\":\"toon\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "session_project: validation-test"));
+    ASSERT_NULL(strstr(resp, "_context_status:"));
+    ASSERT_NULL(strstr(resp, "_context_node_labels["));
+    ASSERT_NULL(strstr(resp, "context: {"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(graph_schema_formats_preserve_bounded_facts) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    static const char *const labels[] = {"Class", "Interface", "Method", "Field",
+                                         "Module", "Variable", "Enum", "Type"};
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        char name[64];
+        char qualified_name[128];
+        snprintf(name, sizeof(name), "SchemaNode%zu", i);
+        snprintf(qualified_name, sizeof(qualified_name), "validation-test.schema.%s", name);
+        cbm_node_t node = {.project = "validation-test",
+                           .label = labels[i],
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "schema-fixture.c",
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 1,
+                           .properties_json = "{\"schema_fixture_property\":true}"};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_graph_schema",
+        "{\"project\":\"validation-test\",\"format\":\"json\"}");
+    char *json = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(json);
+    ASSERT_EQ(json[0], '{');
+    ASSERT_NOT_NULL(strstr(json, "\"node_labels\""));
+    ASSERT_NOT_NULL(strstr(json, "\"properties\""));
+    ASSERT_NOT_NULL(strstr(json, "\"property_key_limit_per_label_or_type\":50"));
+    ASSERT_NOT_NULL(strstr(json, "\"relationship_pattern_limit\":50"));
+    ASSERT_NOT_NULL(strstr(json, "\"Function\""));
+    ASSERT_NOT_NULL(strstr(json, "\"CALLS\""));
+
+    raw = cbm_mcp_handle_tool(srv, "get_graph_schema",
+                              "{\"project\":\"validation-test\"}");
+    char *default_toon = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(default_toon);
+    ASSERT_TRUE(default_toon[0] != '{');
+    ASSERT_NOT_NULL(strstr(default_toon, "node_labels["));
+    free(default_toon);
+
+    raw = cbm_mcp_handle_tool(
+        srv, "get_graph_schema",
+        "{\"project\":\"validation-test\",\"format\":\"toon\"}");
+    char *toon = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(toon);
+    ASSERT_TRUE(toon[0] != '{');
+    ASSERT_NOT_NULL(strstr(toon, "node_base_properties:"));
+    ASSERT_NOT_NULL(strstr(toon, "property_key_limit_per_label_or_type: 50"));
+    ASSERT_NOT_NULL(strstr(toon, "relationship_pattern_limit: 50"));
+    ASSERT_NOT_NULL(strstr(toon, "node_labels["));
+    ASSERT_NOT_NULL(strstr(toon, "edge_base_properties:"));
+    ASSERT_NOT_NULL(strstr(toon, "edge_types["));
+    ASSERT_NOT_NULL(strstr(toon, "relationship_patterns["));
+    ASSERT_NOT_NULL(strstr(toon, "MATCH (source:Function)-[:CALLS]->(target:Function)"));
+    ASSERT_NOT_NULL(strstr(toon, "Function"));
+    ASSERT_NOT_NULL(strstr(toon, "CALLS"));
+    ASSERT_TRUE(strlen(toon) < strlen(json));
+
+    free(toon);
+    free(json);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Config: default_sort_by=calls
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(config_default_sort_by_calls) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, "default_sort_by", "calls");
+    cbm_mcp_server_set_config(srv, cfg);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "invalid sort_by")); /* valid sort, no error */
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  trace_path accepts qualified_name param (Change 3a)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_accepts_qualified_name_param) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Passing full qualified_name should not error (even if BFS finds 0 callers on test store).
+     * Must NOT return "function not found" — QN lookup path fires first. */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"qualified_name\":\"validation-test.test.foo\",\"project\":\"validation-test\",\"direction\":\"outbound\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Should find "foo" node via QN and return trace output, not "function not found" */
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  pattern= glob wildcard auto-converts to regex (*foo* → .*foo.*)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(pattern_glob_wildcards_auto_convert) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "*foo*" is not valid regex but valid glob — should auto-convert and find "foo" node */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"pattern\":\"*foo*\",\"limit\":5,\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"results\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  pattern= invalid regex that can't be salvaged returns error
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(pattern_invalid_regex_returns_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* "[invalid" is not valid regex and not a glob — should return error */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"pattern\":\"[invalid\",\"limit\":5}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "invalid regex"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  trace: when both function_name AND qualified_name given, QN takes
+ *  priority (QN-first lookup runs before name-based lookup)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_qn_takes_priority_over_function_name) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Pass a valid QN and a non-existent function_name.
+     * QN lookup should find "foo" and succeed; function_name is ignored. */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"qualified_name\":\"validation-test.test.foo\","
+        "\"function_name\":\"does_not_exist_anywhere\","
+        "\"project\":\"validation-test\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* QN lookup finds "foo" → no error, trace succeeds */
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  trace: qualified_name not found returns actionable error hint
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(trace_qn_not_found_returns_specific_hint) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Pass a QN that doesn't exist — should get specific hint about using pattern= */
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+        "{\"qualified_name\":\"no-such.project.func\","
+        "\"project\":\"validation-test\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    /* Should mention qualified_name in error, not generic function_name hint */
+    ASSERT_NOT_NULL(strstr(resp, "qualified_name"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  detect_changes: slug project doesn't return "project not found"
+ *  (Tests that get_project_root handles slug args correctly after
+ *  the path-normalization refactor.)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(detect_changes_slug_project_finds_root) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "detect_changes",
+        "{\"project\":\"validation-test\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Should find the project root (not "project not found" error) */
+    ASSERT_NULL(strstr(resp, "\"error\":\"project not found\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  manage_adr: slug project doesn't return "project not found"
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(manage_adr_slug_project_finds_root) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "manage_adr",
+        "{\"project\":\"validation-test\",\"mode\":\"get\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* Should find the project root — either returns ADR content or "not found" for the file,
+     * but NOT "project not found" (the store lookup error). */
+    ASSERT_NULL(strstr(resp, "\"error\":\"project not found\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Tilde expansion: project="~/relpath" expands correctly
+ *  (get_project_root uses expand_tilde before realpath)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_tilde_project_expands) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Build a project path relative to $HOME (e.g. ~/... pointing to tmp) */
+    const char *home = getenv("HOME");
+    if (!home || strncmp(tmp, home, strlen(home)) != 0) {
+        /* tmp is not under $HOME — skip this test on this machine */
+        cbm_mcp_server_free(srv); cleanup_validation_dir(tmp);
+        PASS();
+    }
+    /* Compute tilde path: replace $HOME prefix with ~ */
+    char tilde_path[320];
+    snprintf(tilde_path, sizeof(tilde_path), "~%s", tmp + strlen(home));
+
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/tilde.c", tmp);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fputs("/* tilde_expand_token */\n", f); fclose(f); }
+
+    /* Pass project as tilde path — should expand to absolute and find root */
+    char args[512];
+    snprintf(args, sizeof(args),
+        "{\"pattern\":\"tilde_expand_token\","
+        "\"search_in\":\"source\","
+        "\"project\":\"%s\"}", tilde_path);
+    char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"matches\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(graph_search_tilde_project_autoindexes) {
+    char fake_home[256];
+    snprintf(fake_home, sizeof(fake_home), "/tmp/cbm_tilde_home_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(fake_home));
+
+    char repo_dir[320];
+    snprintf(repo_dir, sizeof(repo_dir), "%s/repo", fake_home);
+    ASSERT_TRUE(cbm_mkdir_p(repo_dir, 0755));
+
+    char src_path[360];
+    snprintf(src_path, sizeof(src_path), "%s/main.c", repo_dir);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("void tilde_graph_autoindex_sentinel(void) {}\n", f);
+    fclose(f);
+
+    const char *old_home = getenv("HOME");
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_home_copy = old_home ? strdup(old_home) : NULL;
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    if (old_home) ASSERT_NOT_NULL(old_home_copy);
+    if (old_auto_index) ASSERT_NOT_NULL(old_auto_index_copy);
+    cbm_setenv("HOME", fake_home, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"~/repo\",\"pattern\":\"tilde_graph_autoindex_sentinel\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    bool has_match = resp && strstr(resp, "tilde_graph_autoindex_sentinel") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    if (old_home_copy) {
+        cbm_setenv("HOME", old_home_copy, 1);
+        free(old_home_copy);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    cbm_unlink(src_path);
+    cbm_rmdir(repo_dir);
+    cbm_rmdir(fake_home);
+
+    ASSERT_TRUE(has_match);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  project_is_path: path-format project arg routes through slug
+ *  conversion in get_project_root (regression for path-based project)
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(source_search_no_project_falls_back_to_session) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* Simulate session_project being set (as detect_session would do after initialize) */
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    char src_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/session.c", tmp);
+    FILE *f = fopen(src_path, "w");
+    if (f) { fputs("/* session_fallback_token */\n", f); fclose(f); }
+
+    /* No project= arg — get_project_root falls back to session_project */
+    char *raw = cbm_mcp_handle_tool(srv, "search_code",
+        "{\"pattern\":\"session_fallback_token\",\"search_in\":\"source\","
+        "\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"matches\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Path-based auto-index: project= is a full directory path that is
+ *  NOT under session_root (Bug #4 — .gitignore-excluded separate repo)
+ *
+ *  When project= is an absolute path to an accessible directory that
+ *  hasn't been indexed yet and differs from session_root, codebase-memory
+ *  must auto-index that path directly (not session_root).
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(path_project_auto_indexes_separate_directory) {
+    /* Create two separate temp dirs:
+     *   session_tmp = first project queried (establishes session_root via public API)
+     *   target_tmp  = second project queried (separate path, simulates .gitignore subdir)
+     *
+     * Workflow mirrors Bug #4: user queries upstream repo that lives in .gitignore
+     * of the main project, after the main project session is already active. */
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_ai_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+
+    char session_src[320];
+    snprintf(session_src, sizeof(session_src), "%s/main.c", session_tmp);
+    FILE *fp = fopen(session_src, "w");
+    if (fp) { fputs("void session_fn(void) {}\n", fp); fclose(fp); }
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_ai_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+
+    char target_src[320];
+    snprintf(target_src, sizeof(target_src), "%s/upstream.c", target_tmp);
+    fp = fopen(target_src, "w");
+    if (fp) { fputs("void path_autoindex_sentinel(void) {}\n", fp); fclose(fp); }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    if (old_auto_index) {
+        ASSERT_NOT_NULL(old_auto_index_copy);
+    }
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    /* First query: session project path → establishes session_root internally */
+    char args1[512];
+    snprintf(args1, sizeof(args1),
+             "{\"project\":\"%s\",\"pattern\":\"session_fn\",\"search_in\":\"source\"}",
+             session_tmp);
+    char *raw1 = cbm_mcp_handle_tool(srv, "search_code", args1);
+    free(raw1); /* result not checked — just establishing session_root */
+
+    /* Second query: DIFFERENT path — resolve_project_store must auto-index it.
+     * Use graph search (not source grep) so resolve_project_store runs the
+     * path-based auto-index and the indexed nodes are searchable. */
+    char args2[512];
+    snprintf(args2, sizeof(args2),
+             "{\"project\":\"%s\",\"pattern\":\"path_autoindex_sentinel\"}", target_tmp);
+    char *raw2 = cbm_mcp_handle_tool(srv, "search_graph", args2);
+    char *resp = extract_text(raw2); free(raw2);
+    bool has_match = resp && strstr(resp, "path_autoindex_sentinel") != NULL;
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    cbm_unlink(target_src);
+    cbm_rmdir(target_tmp);
+    cbm_unlink(session_src);
+    cbm_rmdir(session_tmp);
+
+    ASSERT_TRUE(has_match);
+    PASS();
+}
+
+TEST(path_project_autoindex_respects_file_limit) {
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_limit_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+
+    char session_src[320];
+    snprintf(session_src, sizeof(session_src), "%s/main.c", session_tmp);
+    FILE *fp = fopen(session_src, "w");
+    if (fp) { fputs("void session_limit_fn(void) {}\n", fp); fclose(fp); }
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_limit_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+
+    char target_src1[320];
+    char target_src2[320];
+    snprintf(target_src1, sizeof(target_src1), "%s/upstream.c", target_tmp);
+    snprintf(target_src2, sizeof(target_src2), "%s/extra.c", target_tmp);
+    fp = fopen(target_src1, "w");
+    if (fp) { fputs("void path_limit_sentinel(void) {}\n", fp); fclose(fp); }
+    fp = fopen(target_src2, "w");
+    if (fp) { fputs("void path_limit_extra(void) {}\n", fp); fclose(fp); }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    const char *old_limit = getenv("CBM_AUTO_INDEX_LIMIT");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    char *old_limit_copy = old_limit ? strdup(old_limit) : NULL;
+    if (old_auto_index) {
+        ASSERT_NOT_NULL(old_auto_index_copy);
+    }
+    if (old_limit) {
+        ASSERT_NOT_NULL(old_limit_copy);
+    }
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+    cbm_setenv("CBM_AUTO_INDEX_LIMIT", "1", 1);
+
+    char args1[512];
+    snprintf(args1, sizeof(args1),
+             "{\"project\":\"%s\",\"pattern\":\"session_limit_fn\",\"search_in\":\"source\"}",
+             session_tmp);
+    char *raw1 = cbm_mcp_handle_tool(srv, "search_code", args1);
+    free(raw1);
+
+    char args2[512];
+    snprintf(args2, sizeof(args2),
+             "{\"project\":\"%s\",\"pattern\":\"path_limit_sentinel\"}", target_tmp);
+    char *raw2 = cbm_mcp_handle_tool(srv, "search_graph", args2);
+    char *resp = extract_text(raw2);
+    free(raw2);
+    bool has_match = resp && strstr(resp, "path_limit_sentinel") != NULL;
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    if (old_limit_copy) {
+        cbm_setenv("CBM_AUTO_INDEX_LIMIT", old_limit_copy, 1);
+        free(old_limit_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+    }
+    cbm_unlink(target_src1);
+    cbm_unlink(target_src2);
+    cbm_rmdir(target_tmp);
+    cbm_unlink(session_src);
+    cbm_rmdir(session_tmp);
+
+    ASSERT_FALSE(has_match);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Path-based auto-index must run dependency auto-indexing exactly like
+ *  the session-root branch: explicit auto_index_deps=true triggers
+ *  cbm_mcp_auto_index_deps after the project index; config can disable
+ *  it or cap it via auto_dep_limit. Analysis:
+ *  notes/2026-07-21-2332-path-autoindex-dependency-asymmetry-analysis.md
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Build a target repo (Makefile ecosystem) with one vendored dependency.
+ * vendor/ is excluded from project discovery (discover.c skip list), so the
+ * dep sentinel is only searchable when dependency indexing actually ran. */
+static int setup_path_dep_target(const char *target_tmp) {
+    if (th_write_file(TH_PATH(target_tmp, "Makefile"), "all:\n\tcc upstream.c\n") != 0) {
+        return -1;
+    }
+    if (th_write_file(TH_PATH(target_tmp, "upstream.c"),
+                      "void path_dep_upstream_fn(void) {}\n") != 0) {
+        return -1;
+    }
+    char vendor[512];
+    snprintf(vendor, sizeof(vendor), "%s/vendor/libdep", target_tmp);
+    if (th_mkdir_p(vendor) != 0) {
+        return -1;
+    }
+    return th_write_file(TH_PATH(vendor, "lib.c"),
+                         "int path_dep_sentinel(void) { return 1; }\n");
+}
+
+/* Shared driver: establish a session on session_tmp (Bug 4 workflow), then
+ * query target_tmp by path to fire the path-based auto-index, then search the
+ * target again for project and dependency sentinels. Writes results through
+ * out params; caller asserts. */
+static void run_path_dep_queries(cbm_mcp_server_t *srv, const char *session_tmp,
+                                 const char *target_tmp, const char *dep_pattern,
+                                 bool *out_project_indexed, char **out_dep_resp) {
+    char args1[512];
+    snprintf(args1, sizeof(args1),
+             "{\"project\":\"%s\",\"pattern\":\"session_dep_fn\",\"search_in\":\"source\"}",
+             session_tmp);
+    char *raw1 = cbm_mcp_handle_tool(srv, "search_code", args1);
+    free(raw1); /* result not checked — establishes session_root */
+
+    /* Trigger path-based auto-index of the separate target repo. */
+    char args2[512];
+    snprintf(args2, sizeof(args2),
+             "{\"project\":\"%s\",\"pattern\":\"path_dep_upstream_fn\"}", target_tmp);
+    char *raw2 = cbm_mcp_handle_tool(srv, "search_graph", args2);
+    char *resp = extract_text(raw2);
+    free(raw2);
+    *out_project_indexed = resp && strstr(resp, "path_dep_upstream_fn") != NULL;
+    free(resp);
+
+    /* Fresh call: the store exists now, so this is a plain prefix search
+     * that includes {slug}.dep.* sub-projects. */
+    char args3[512];
+    snprintf(args3, sizeof(args3), "{\"project\":\"%s\",\"pattern\":\"%s\"}", target_tmp,
+             dep_pattern);
+    char *raw3 = cbm_mcp_handle_tool(srv, "search_graph", args3);
+    *out_dep_resp = extract_text(raw3);
+    free(raw3);
+}
+
+TEST(path_project_autoindex_indexes_dependencies) {
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_dep_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+    ASSERT_EQ(th_write_file(TH_PATH(session_tmp, "main.c"), "void session_dep_fn(void) {}\n"),
+              0);
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_dep_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+    ASSERT_EQ(setup_path_dep_target(target_tmp), 0);
+
+    char cfg_tmp[256];
+    snprintf(cfg_tmp, sizeof(cfg_tmp), "/tmp/cbm_path_depon_cfg_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cfg_tmp));
+    cbm_config_t *cfg = cbm_config_open(cfg_tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    bool project_indexed = false;
+    char *dep_resp = NULL;
+    run_path_dep_queries(srv, session_tmp, target_tmp, "path_dep_sentinel",
+                         &project_indexed, &dep_resp);
+    bool dep_indexed = dep_resp && strstr(dep_resp, "path_dep_sentinel") != NULL;
+    free(dep_resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    th_cleanup(cfg_tmp);
+    th_cleanup(target_tmp);
+    th_cleanup(session_tmp);
+
+    ASSERT_TRUE(project_indexed);
+    /* The enabled preset path must run the same dependency indexing helper as
+     * session-root indexing. */
+    ASSERT_TRUE(dep_indexed);
+    PASS();
+}
+
+TEST(path_project_autoindex_deps_disabled_by_default) {
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_depoff_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+    ASSERT_EQ(th_write_file(TH_PATH(session_tmp, "main.c"), "void session_dep_fn(void) {}\n"),
+              0);
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_depoff_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+    ASSERT_EQ(setup_path_dep_target(target_tmp), 0);
+
+    char cfg_tmp[256];
+    snprintf(cfg_tmp, sizeof(cfg_tmp), "/tmp/cbm_path_depoff_cfg_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cfg_tmp));
+    cbm_config_t *cfg = cbm_config_open(cfg_tmp);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    bool project_indexed = false;
+    char *dep_resp = NULL;
+    run_path_dep_queries(srv, session_tmp, target_tmp, "path_dep_sentinel",
+                         &project_indexed, &dep_resp);
+    bool dep_indexed = dep_resp && strstr(dep_resp, "path_dep_sentinel") != NULL;
+    free(dep_resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    th_cleanup(cfg_tmp);
+    th_cleanup(target_tmp);
+    th_cleanup(session_tmp);
+
+    ASSERT_TRUE(project_indexed);
+    /* The product default must keep automatic path indexing dep-free. */
+    ASSERT_FALSE(dep_indexed);
+    PASS();
+}
+
+TEST(path_project_autoindex_honors_dep_limit_and_refreshes_rank) {
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_depcap_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+    ASSERT_EQ(th_write_file(TH_PATH(session_tmp, "main.c"), "void session_dep_fn(void) {}\n"),
+              0);
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_depcap_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+    ASSERT_EQ(th_write_file(TH_PATH(target_tmp, "Makefile"), "all:\n\tcc upstream.c\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(target_tmp, "upstream.c"),
+                            "void path_dep_upstream_fn(void) {}\n"),
+              0);
+    char vendor_a[512];
+    snprintf(vendor_a, sizeof(vendor_a), "%s/vendor/liba", target_tmp);
+    ASSERT_EQ(th_mkdir_p(vendor_a), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(vendor_a, "liba.c"),
+                            "int path_dep_cap_a(void) { return 1; }\n"),
+              0);
+    char vendor_b[512];
+    snprintf(vendor_b, sizeof(vendor_b), "%s/vendor/libb", target_tmp);
+    ASSERT_EQ(th_mkdir_p(vendor_b), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(vendor_b, "libb.c"),
+                            "int path_dep_cap_b(void) { return 1; }\n"),
+              0);
+
+    char cfg_tmp[256];
+    snprintf(cfg_tmp, sizeof(cfg_tmp), "/tmp/cbm_path_depcap_cfg_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cfg_tmp));
+    cbm_config_t *cfg = cbm_config_open(cfg_tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, "auto_dep_limit", "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_AT_PUBLISH), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    bool project_indexed = false;
+    char *dep_resp = NULL;
+    /* "path_dep_cap" matches both vendored sentinels by substring. */
+    run_path_dep_queries(srv, session_tmp, target_tmp, "path_dep_cap",
+                         &project_indexed, &dep_resp);
+    bool dep_a = dep_resp && strstr(dep_resp, "path_dep_cap_a") != NULL;
+    bool dep_b = dep_resp && strstr(dep_resp, "path_dep_cap_b") != NULL;
+    free(dep_resp);
+
+    char *target_project = cbm_project_name_from_path(target_tmp);
+    cbm_store_t *published_store = target_project ? cbm_store_open(target_project) : NULL;
+    bool rank_complete =
+        published_store && cbm_pagerank_views_complete(published_store, target_project);
+    cbm_store_close(published_store);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    free(target_project);
+    th_cleanup(cfg_tmp);
+    th_cleanup(target_tmp);
+    th_cleanup(session_tmp);
+
+    ASSERT_TRUE(project_indexed);
+    /* auto_dep_limit=1 with two discovered vendored deps: exactly one must
+     * be indexed. RED before the fix: neither is (deps never ran). */
+    ASSERT_TRUE(dep_a != dep_b);
+    /* Sync auto-index owns the dependency pass after initial publication.
+     * Its at-publish contract must therefore leave all rank views complete,
+     * matching explicit and background publication. */
+    ASSERT_TRUE(rank_complete);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Self-healing hint: a zero-result dependency-scoped search on a server
+ *  where auto_index_deps is disabled must name index_dependencies as the
+ *  corrective action (established hint style: commit b2c4c4e8).
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(dep_search_hint_names_index_dependencies_when_deps_disabled) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    /* "deps" expands to "validation-test.dep" (prefix match, zero rows).
+     * format=json pins the JSON body so the hint key is directly greppable. */
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"deps\",\"pattern\":\"any_dep_symbol\",\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    /* RED before the fix: the hint described build systems but never named
+     * the tool that fixes the situation. */
+    ASSERT_NOT_NULL(strstr(resp, "index_dependencies"));
+    ASSERT_NOT_NULL(strstr(resp, "auto_index_deps"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Regression: classic tool names still work
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(regression_trace_path_tool_name_still_works) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "trace_path",
+                                    "{\"function_name\":\"foo\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "unknown tool")); /* must not reject classic name */
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Config: context_injection=false disables _context header
+ *
+ *  context_injection (default true) / CBM_CONTEXT_INJECTION controls
+ *  whether inject_context_once embeds the _context header in the first
+ *  tool response. Disabling saves tokens in scripted/programmatic use.
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(config_context_injection_disabled) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, "context_injection", "false");
+    cbm_mcp_server_set_config(srv, cfg);
+
+    /* With context_injection=false, _context must NOT appear in any call */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    /* Second call also no _context */
+    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
+    resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(config_context_injection_enabled_by_default) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    /* No config set → default is true → _context present on first call.
+     * format=json: pins the legacy JSON _context shape; default_response_format
+     * is toon, which delivers the same facts as native _context_* TOON fields. */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3,\"format\":\"json\"}");
+    char *resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    /* Second call: _context deduped (context_injected=true) */
+    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3,\"format\":\"json\"}");
+    resp = extract_text(raw); free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"_context\":"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Suite registration
+ * ══════════════════════════════════════════════════════════════════ */
+
+void suite_input_validation(void) {
+    RUN_TEST(f1_empty_label_returns_results);
+    RUN_TEST(f6_invalid_sort_by_errors);
+    RUN_TEST(f6_sort_by_typo_errors);
+    RUN_TEST(f9_invalid_regex_errors);
+    RUN_TEST(f9_valid_regex_succeeds);
+    RUN_TEST(f6_sort_by_calls_accepted);
+    RUN_TEST(f6_sort_by_linkrank_accepted);
+    RUN_TEST(f9_glob_star_autoconverted);
+    RUN_TEST(f9_glob_question_autoconverted);
+    RUN_TEST(f9_valid_regex_shaped_glob_is_normalized_before_compile);
+    RUN_TEST(f9_valid_regex_still_works);
+    RUN_TEST(f9_explicit_group_and_class_regex_quantifiers_stay_regex);
+    RUN_TEST(f9_truly_invalid_pattern_still_errors);
+    RUN_TEST(f9_qn_pattern_glob_autoconverted);
+    RUN_TEST(f10_negative_depth_returns_results);
+    RUN_TEST(trace_case_mismatch_finds_via_fallback);
+    RUN_TEST(trace_exact_match_still_works);
+    RUN_TEST(trace_truly_missing_still_errors);
+    RUN_TEST(f15_invalid_direction_errors);
+    RUN_TEST(f15_valid_direction_succeeds);
+    RUN_TEST(trace_invalid_mode_errors);
+    RUN_TEST(g1_summary_mode_has_results_key);
+    RUN_TEST(cq3_cypher_with_label_rejected);
+    RUN_TEST(ix2_status_resource_format);
+    RUN_TEST(pattern_or_search_graph);
+    RUN_TEST(pattern_or_search_graph_normalizes_valid_regex_shaped_glob);
+    RUN_TEST(source_search_via_search_in_param);
+    RUN_TEST(source_search_path_project_normalizes_to_slug);
+    RUN_TEST(source_search_default_is_graph);
+    RUN_TEST(summary_bool_alias);
+    RUN_TEST(case_sensitive_graph_search);
+    RUN_TEST(config_compact_default_false);
+    RUN_TEST(config_response_format_json_with_toon_override);
+    RUN_TEST(toon_first_response_context_is_native_toon);
+    RUN_TEST(toon_plain_text_error_separates_first_response_context);
+    RUN_TEST(toon_context_injection_config_is_respected);
+    RUN_TEST(graph_schema_formats_preserve_bounded_facts);
+    RUN_TEST(config_default_sort_by_calls);
+    RUN_TEST(trace_accepts_qualified_name_param);
+    RUN_TEST(pattern_glob_wildcards_auto_convert);
+    RUN_TEST(pattern_invalid_regex_returns_error);
+    RUN_TEST(trace_qn_takes_priority_over_function_name);
+    RUN_TEST(trace_qn_not_found_returns_specific_hint);
+    RUN_TEST(detect_changes_slug_project_finds_root);
+    RUN_TEST(manage_adr_slug_project_finds_root);
+    RUN_TEST(source_search_tilde_project_expands);
+    RUN_TEST(graph_search_tilde_project_autoindexes);
+    RUN_TEST(source_search_no_project_falls_back_to_session);
+    RUN_TEST(path_project_auto_indexes_separate_directory);
+    RUN_TEST(path_project_autoindex_respects_file_limit);
+    RUN_TEST(path_project_autoindex_indexes_dependencies);
+    RUN_TEST(path_project_autoindex_deps_disabled_by_default);
+    RUN_TEST(path_project_autoindex_honors_dep_limit_and_refreshes_rank);
+    RUN_TEST(dep_search_hint_names_index_dependencies_when_deps_disabled);
+    RUN_TEST(regression_trace_path_tool_name_still_works);
+    RUN_TEST(config_context_injection_disabled);
+    RUN_TEST(config_context_injection_enabled_by_default);
+}

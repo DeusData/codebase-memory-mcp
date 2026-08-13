@@ -28,7 +28,7 @@ Arguments:
   --agent-config-only   only version + agent-config install/uninstall phases
 
 Environment (set by the wrappers): SMOKE_DOWNLOAD_URL, SMOKE_UPDATE_FIXTURE_DIR,
-SMOKE_TEMP_ROOT, SMOKE_ARCH, SMOKE_REQUIRE_UI (ui variant: Phase 15 skip => FAIL).
+SMOKE_TEMP_ROOT, SMOKE_ARCH, SMOKE_REQUIRE_UI (embedded UI: Phase 15 skip => FAIL).
 HELPEOF
   exit 0
   ;;
@@ -143,14 +143,21 @@ run_no_crash() {
 }
 
 TMPDIR=$(smoke_mktemp_dir)
+SMOKE_STATE=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
+    SMOKE_STATE=$(cygpath -m "$SMOKE_STATE")
 fi
-trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
+SMOKE_CACHE="$SMOKE_STATE/cache"
+SMOKE_CONFIG="$SMOKE_STATE/config"
+mkdir -p "$SMOKE_CACHE" "$SMOKE_CONFIG"
+export CBM_CACHE_DIR="$SMOKE_CACHE"
+export XDG_CONFIG_HOME="$SMOKE_CONFIG"
+trap 'smoke_rmtree "$TMPDIR" "$SMOKE_STATE" "${DRYRUN_HOME:-}"' EXIT
 
-CLI_STDERR=$(smoke_mktemp_file)
+CLI_STDERR="$SMOKE_STATE/cli-stderr.log"
 # 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
 # `set -euo pipefail` a non-zero exit there kills the smoke with NOTHING
 # printed: no FAIL line, no stderr, just an abort indistinguishable from a hang,
@@ -171,6 +178,9 @@ cli() {
     } >&2
   fi
   return "$rc"
+}
+skill_has_delegation_contract() {
+  grep -qF 'When handing work to another agent' "$1" 2>/dev/null
 }
 
 echo "=== Phase 1: version ==="
@@ -574,8 +584,10 @@ if [ "$CALLERS" -lt 1 ]; then
 fi
 echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
-# 3c: get_graph_schema — verify labels exist
-if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT"); then
+# 3c: get_graph_schema — verify labels exist. Request JSON explicitly because
+# this programmatic consumer parses an object, while the user-facing default is
+# configurable and currently emits compact TOON.
+if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT" --format json); then
   echo "FAIL: get_graph_schema (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
@@ -646,9 +658,11 @@ echo "OK: query_graph count(DISTINCT f.label) returned 1 aggregate row"
 cyp_first_cell() {
   # $1 = query; echoes rows[0][0] (or empty). Flag form passes the query as ONE
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
-  # metacharacters {}|=~<>" need no JSON escaping.
+  # metacharacters {}|=~<>" need no JSON escaping. TOON table headers carry
+  # their row count and columns as rows[N]{...}:; read the first data row.
   cli query_graph --project "$PROJECT" --query "$1" |
-    sed -n '/^rows: /{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
+    sed -n '/^rows\[[0-9][0-9]*\].*:/{n;p;}' |
+    sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -736,7 +750,7 @@ LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
 
 # NOT EXISTS dead-code query (functions with no caller)
 CYPHER_NX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name")
-NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows: [0-9]+' && echo "True" || echo "False")
+NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows\[[0-9]+\]' && echo "True" || echo "False")
 [ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
 
 # CASE expression in RETURN
@@ -760,7 +774,7 @@ if ! ARCH=$(cli get_architecture --project "$PROJECT" --aspects clusters); then
   echo "FAIL: get_architecture (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 # get_architecture default output is TOON: clusters[N]{...} header carries the count
-NCLUST=$(echo "$ARCH" | sed -n 's/^clusters: \([0-9]*\).*/\1/p' | head -1)
+NCLUST=$(echo "$ARCH" | sed -n 's/^clusters\[\([0-9]*\)\].*/\1/p' | head -1)
 NCLUST=${NCLUST:-0}
 if [ "$NCLUST" -lt 1 ]; then
   echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
@@ -801,7 +815,7 @@ echo "=== Phase 3h: CLI input-mode guards (flags / stdin / --args-file / --help 
 assert_json_obj() { python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d,dict) else 1)" 2>/dev/null; }
 # search_graph emits TOON by default: a results/semantic table header proves
 # the tool parsed its typed flags and produced a well-formed response.
-assert_toon_table() { grep -qE '^(results|semantic): [0-9]+'; }
+assert_toon_table() { grep -qE '^(results|semantic)\[[0-9]+\]'; }
 
 # B1: INTEGER flag — --limit is schema-typed integer; must parse and answer.
 if ! IM_INT=$(cli search_graph --project "$PROJECT" --name-pattern compute --limit 5); then
@@ -828,7 +842,7 @@ fi
 if ! IM_ARR=$(cli search_graph --project "$PROJECT" --semantic-query send --semantic-query publish); then
   echo "FAIL B3: search_graph repeated --semantic-query exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_ARR" | grep -qE '^semantic: [0-9]+'; then
+if echo "$IM_ARR" | grep -qE '^semantic\[[0-9]+\]'; then
   echo "OK B3: ARRAY flag (repeated --semantic-query) → semantic TOON table"
 else
   echo "FAIL B3: repeated --semantic-query did not produce a semantic table"; echo "$IM_ARR" | head -c 300
@@ -839,7 +853,8 @@ else
 fi
 
 # B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
-IM_STDIN=$(echo "{\"project\":\"$PROJECT\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
+# Pin the response format independently of the user's configured default.
+IM_STDIN=$(echo "{\"project\":\"$PROJECT\",\"format\":\"json\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
 if ! echo "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
   echo "FAIL B4: stdin get_graph_schema did not resolve"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
 fi
@@ -850,7 +865,7 @@ echo "OK B4: STDIN input resolves, no deprecation warning"
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
 IM_ARGS_FILE=$(smoke_mktemp_file)
-echo "{\"project\":\"$PROJECT\"}" > "$IM_ARGS_FILE"
+echo "{\"project\":\"$PROJECT\",\"format\":\"json\"}" > "$IM_ARGS_FILE"
 if ! IM_AF=$(cli get_graph_schema --args-file "$IM_ARGS_FILE"); then
   echo "FAIL B5: get_graph_schema --args-file exited non-zero"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
 fi
@@ -952,7 +967,9 @@ echo "=== Phase 5: MCP stdio transport (agent handshake) ==="
 # Test the actual MCP protocol as an agent (Claude Code, OpenCode, etc.) would use it.
 # Uses background process + kill instead of timeout (portable across macOS/Linux).
 
-# Helper: run binary in background with input, wait up to N seconds, collect output
+# Helper: run binary in background with input, wait up to N seconds, collect output.
+# Set the tool mode explicitly so a user's persistent config cannot change which
+# MCP surface an individual protocol scenario is validating.
 mcp_run() {
   local input_file="$1" output_file="$2" max_wait="${3:-45}"
   # Keep the frontend's stderr instead of discarding it: with the daemon
@@ -993,6 +1010,8 @@ cat > "$MCP_INPUT" << 'MCPEOF'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"_hidden_tools","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}
 MCPEOF
 
 mcp_run "$MCP_INPUT" "$MCP_OUTPUT" 45
@@ -1018,18 +1037,46 @@ if ! grep -q '"id":2' "$MCP_OUTPUT"; then
   exit 1
 fi
 echo "OK: tools/list response received (id:2)"
+MCP_DEFAULT_TOOLS=$(grep '"id":2' "$MCP_OUTPUT" | head -n 1)
 
-# 5c: Verify expected tools are present
-for TOOL in index_repository search_graph trace_path get_code_snippet search_code; do
-  if ! grep -q "\"$TOOL\"" "$MCP_OUTPUT"; then
-    echo "FAIL: tool '$TOOL' not found in tools/list response"
+# 5c: Verify the streamlined default surface is present. Advanced tools are
+# intentionally absent until _hidden_tools reveals them (progressive disclosure).
+for TOOL in search_graph query_graph search_code trace_path get_code _hidden_tools; do
+  if ! echo "$MCP_DEFAULT_TOOLS" | grep -q "\"$TOOL\""; then
+    echo "FAIL: streamlined tool '$TOOL' not found in tools/list response"
     rm -f "$MCP_INPUT" "$MCP_OUTPUT"
     exit 1
   fi
 done
-echo "OK: all 5 core MCP tools present in tools/list"
+for TOOL in index_repository get_code_snippet; do
+  if echo "$MCP_DEFAULT_TOOLS" | grep -q "\"$TOOL\""; then
+    echo "FAIL: advanced tool '$TOOL' leaked into streamlined tools/list"
+    rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+    exit 1
+  fi
+done
+echo "OK: streamlined MCP tools present in tools/list"
 
-# 5d: Verify protocol version in initialize response
+# 5d: The reveal call must complete and the next tools/list must expose classic
+# tools such as index_repository and get_code_snippet on the same connection.
+for ID in 3 4; do
+  if ! grep -q "\"id\":$ID" "$MCP_OUTPUT"; then
+    echo "FAIL: no progressive-disclosure response (id:$ID)"
+    rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+    exit 1
+  fi
+done
+MCP_REVEALED_TOOLS=$(grep '"id":4' "$MCP_OUTPUT" | head -n 1)
+for TOOL in index_repository get_code_snippet; do
+  if ! echo "$MCP_REVEALED_TOOLS" | grep -q "\"$TOOL\""; then
+    echo "FAIL: revealed tool '$TOOL' not found after _hidden_tools"
+    rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+    exit 1
+  fi
+done
+echo "OK: _hidden_tools reveals classic MCP tools"
+
+# 5e: Verify protocol version in initialize response
 if ! grep -q '"protocolVersion"' "$MCP_OUTPUT"; then
   echo "FAIL: protocolVersion missing from initialize response"
   rm -f "$MCP_INPUT" "$MCP_OUTPUT"
@@ -1039,7 +1086,7 @@ echo "OK: protocolVersion present in initialize response"
 
 rm -f "$MCP_INPUT" "$MCP_OUTPUT"
 
-# 5e: MCP tool call via JSON-RPC (index + search round-trip)
+# 5f: MCP tool call via JSON-RPC (index + search round-trip)
 echo ""
 echo "--- Phase 5e: MCP tool call round-trip ---"
 MCP_TOOL_OUTPUT=$(smoke_mktemp_file)
@@ -1068,7 +1115,7 @@ if ! grep -q '"id":3' "$MCP_TOOL_OUTPUT"; then
 fi
 echo "OK: MCP tool call round-trip (index + search) succeeded"
 
-# 5f: Content-Length framing (OpenCode compatibility)
+# 5g: Content-Length framing (OpenCode compatibility)
 echo ""
 echo "--- Phase 5f: Content-Length framing ---"
 MCP_CL_INPUT=$(smoke_mktemp_file)
@@ -2289,7 +2336,7 @@ KIMI_HOOK_COUNT=$(grep -cF '[[hooks]]' "$KIMI_CONFIG" 2>/dev/null || true)
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Kimi guidance$' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
    ! grep -q 'search_graph' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$KIMI_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$KIMI_SKILL" ||
    ! grep -q '^theme = "dark"$' "$KIMI_CONFIG" 2>/dev/null ||
    [ "$KIMI_HOOK_COUNT" != "1" ] ||
    ! grep -q '^event = "UserPromptSubmit"$' "$KIMI_CONFIG" 2>/dev/null ||
@@ -2306,7 +2353,7 @@ echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hoo
 PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
 PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
 if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$PI_SKILL" ||
    [ -e "$FAKE_HOME/.pi/agent/mcp.json" ]; then
   echo "FAIL 8al: Pi durable context missing or unsupported MCP config created"
   exit 1
@@ -2315,7 +2362,7 @@ echo "OK 8al: Pi durable context only (no MCP config)"
 
 # 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
 WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
-if ! grep -q 'Sessions and Subagents' "$WARP_SKILL" 2>/dev/null ||
+if ! skill_has_delegation_contract "$WARP_SKILL" ||
    [ -e "$FAKE_HOME/.warp/mcp.json" ] ||
    [ -e "$FAKE_HOME/.config/warp-terminal/mcp.json" ]; then
   echo "FAIL 8am: Warp shared skill missing or unsupported MCP config created"
@@ -2340,7 +2387,7 @@ if ! path_match "$CMD" "$SELF_PATH" ||
    ! path_match "$JUNIE_ANALYSIS_CMD" "$SELF_PATH" ||
    [ "$JUNIE_SCOUT_ARGS" != "['--tool-profile=scout']" ] ||
    [ "$JUNIE_ANALYSIS_ARGS" != "['--tool-profile=analysis']" ] ||
-   ! grep -q 'Sessions and Subagents' "$JUNIE_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$JUNIE_SKILL" ||
    ! grep -q 'description: "Default task-directed graph verification' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'tools: \["Read", "Grep", "Glob"\]' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'mcpServers: \["codebase-memory-analysis"\]' "$JUNIE_AGENT" 2>/dev/null ||
@@ -2411,7 +2458,7 @@ CMD=$(json_get "$DEVIN_CONFIG" "d['mcpServers']['codebase-memory-mcp']['command'
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Devin guidance$' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$DEVIN_SKILL" 2>/dev/null; then
+   ! skill_has_delegation_contract "$DEVIN_SKILL"; then
   echo "FAIL 8aq: Devin MCP, AGENTS.md, or skill missing"
   exit 1
 fi
@@ -2452,7 +2499,7 @@ CODEBUDDY_KEEP=$(json_get "$CODEBUDDY_MCP" "d.get('keep', '')")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$CODEBUDDY_KEEP" != "codebuddy" ] ||
    ! grep -q '^# Personal CodeBuddy guidance$' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$CODEBUDDY_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$CODEBUDDY_SKILL" ||
    ! grep -q '^permissionMode: plan$' "$CODEBUDDY_AGENT" 2>/dev/null ||
    ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
    ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CODEBUDDY_AGENT" 2>/dev/null ||
@@ -2477,7 +2524,7 @@ if ! path_match "$BOB_IDE_CMD" "$SELF_PATH" ||
    [ "$BOB_IDE_KEEP" != "bob-ide" ] || [ "$BOB_SHELL_KEEP" != "bob-shell" ] ||
    ! grep -q '^# Personal Bob guidance$' "$BOB_RULE" 2>/dev/null ||
    ! grep -q 'search_graph' "$BOB_RULE" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$BOB_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$BOB_SKILL" ||
    [ -e "$BOB_AGENT" ]; then
   echo "FAIL 8as: Bob IDE/Shell MCP, shared rules, or IDE skill is wrong"
   exit 1
@@ -2494,7 +2541,7 @@ if ! path_match "$POCHI_CMD" "$SELF_PATH" ||
    ! grep -q '"keep": "pochi"' "$POCHI_MCP" 2>/dev/null ||
    ! grep -q '^# Personal Pochi guidance$' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$POCHI_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$POCHI_SKILL" ||
    ! grep -q '^  - readFile$' "$POCHI_AGENT" 2>/dev/null ||
    [ "$POCHI_TOOL_COUNT" != "1" ] ||
    ! grep -q 'parent agent' "$POCHI_AGENT" 2>/dev/null ||
@@ -2511,7 +2558,7 @@ ROVO_CMD=$(json_get "$ROVO_MCP" "d['mcpServers']['codebase-memory-mcp']['command
 if ! path_match "$ROVO_CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Rovo guidance$' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$ROVO_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$ROVO_SKILL" ||
    ! grep -q 'parent agent' "$ROVO_AGENT" 2>/dev/null ||
    [ -e "$FAKE_HOME/.rovodev/hooks.json" ]; then
   echo "FAIL 8au: Rovo MCP, global memory, skill, or handoff agent is incomplete"
@@ -2564,10 +2611,7 @@ echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
 
 # Run uninstall (same FAKE_HOME with all configs present)
-UNINSTALL_BINARY="$BINARY"
-if [[ "$BINARY" == *.exe ]]; then
-  UNINSTALL_BINARY="$SELF_PATH"
-fi
+UNINSTALL_BINARY="$SELF_PATH"
 HOME="$FAKE_HOME" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
@@ -2966,8 +3010,14 @@ smoke_rmtree "$IDEM_HOME"
 # 9b-3: Uninstall without prior install
 CLEAN_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CLEAN_HOME/.claude" "$CLEAN_HOME/.local/bin"
+CLEAN_UNINSTALLER="$CLEAN_HOME/cbm-uninstall-driver"
+if [[ "$BINARY" == *.exe ]]; then
+  CLEAN_UNINSTALLER="$CLEAN_UNINSTALLER.exe"
+fi
+copy_smoke_binary "$CLEAN_UNINSTALLER"
+chmod 755 "$CLEAN_UNINSTALLER"
 UNINSTALL_RC=0
-UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$BINARY" uninstall -y -n 2>&1) || UNINSTALL_RC=$?
+UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$CLEAN_UNINSTALLER" uninstall -y -n 2>&1) || UNINSTALL_RC=$?
 if [ "$UNINSTALL_RC" -ge 128 ]; then
   echo "FAIL 9b-3: uninstall crashed (rc=$UNINSTALL_RC)"
   exit 1
@@ -2990,28 +3040,62 @@ smoke_rmtree "$CORRUPT_HOME"
 # 9b-8: Double uninstall
 DBL_HOME=$(smoke_mktemp_dir)
 mkdir -p "$DBL_HOME/.claude" "$DBL_HOME/.local/bin"
-copy_smoke_binary "$DBL_HOME/.local/bin/codebase-memory-mcp"
-run_no_crash 9b-8-install env HOME="$DBL_HOME" "$BINARY" install -y
-DBL_UNINSTALLER="$BINARY"
+DBL_UNINSTALLER="$DBL_HOME/.local/bin/codebase-memory-mcp"
+DBL_RETRY_UNINSTALLER="$DBL_HOME/cbm-uninstall-retry"
 if [[ "$BINARY" == *.exe ]]; then
-  DBL_UNINSTALLER="$DBL_HOME/.local/bin/codebase-memory-mcp.exe"
+  DBL_UNINSTALLER="$DBL_UNINSTALLER.exe"
+  DBL_RETRY_UNINSTALLER="$DBL_RETRY_UNINSTALLER.exe"
 fi
+copy_smoke_binary "$DBL_UNINSTALLER"
+copy_smoke_binary "$DBL_RETRY_UNINSTALLER"
+chmod 755 "$DBL_UNINSTALLER" "$DBL_RETRY_UNINSTALLER"
+run_no_crash 9b-8-install env HOME="$DBL_HOME" "$BINARY" install -y
 run_no_crash 9b-8-first env HOME="$DBL_HOME" "$DBL_UNINSTALLER" uninstall -y -n
-run_no_crash 9b-8-second env HOME="$DBL_HOME" "$BINARY" uninstall -y -n
+run_no_crash 9b-8-second env HOME="$DBL_HOME" "$DBL_RETRY_UNINSTALLER" uninstall -y -n
 echo "OK 9b-8: double uninstall doesn't crash"
 retire_account_daemon "9b-8-cleanup"
 smoke_rmtree "$DBL_HOME"
 
-# 9b-9: Non-interactive update must not hang (no variant prompt exists since #1538)
+# 9b-9: retired release-variant flags remain accepted for script compatibility,
+# but must report visibly that they no longer select a different artifact.
 if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
-  NONINT_OUT=$(echo "" | "$BINARY" update --dry-run 2>&1) || true
-  if echo "$NONINT_OUT" | grep -qi 'terminal\|requires.*flag\|error'; then
-    echo "OK 9b-9: non-interactive update fails with clear error"
-  else
-    # Dry-run may still complete if no variant prompt needed
-    echo "OK 9b-9: non-interactive update handled gracefully"
+  VARIANT_RC=0
+  VARIANT_OUT=$("$BINARY" update --standard --dry-run 2>&1) || VARIANT_RC=$?
+  if [ "$VARIANT_RC" -ne 0 ] ||
+    ! echo "$VARIANT_OUT" | grep -Fqi 'note: --ui/--standard are accepted but no longer do anything; since v0.10.0 there is one build per platform and it always includes the graph UI.'; then
+    echo "FAIL 9b-9: update did not preserve the retired --standard compatibility warning"
+    exit 1
   fi
+  echo "OK 9b-9: update accepts retired release-variant flags with an exact warning"
 fi
+
+# 9b-10: invalid persisted UI values must fail before daemon admission or mutation.
+for INVALID_ARG in "--ui=maybe" "--port=0"; do
+  case "$INVALID_ARG" in
+    --ui=*) EXPECTED_ERROR='invalid --ui value' ;;
+    *) EXPECTED_ERROR='invalid --port value' ;;
+  esac
+  INVALID_RC=0
+  INVALID_OUT=$(HOME="$FAKE_HOME" CBM_CACHE_DIR="$FAKE_HOME/.cache/codebase-memory-mcp" \
+    "$BINARY" "$INVALID_ARG" < /dev/null 2>&1) || INVALID_RC=$?
+  if [ "$INVALID_RC" -ne 2 ] || ! echo "$INVALID_OUT" | grep -Fq "$EXPECTED_ERROR"; then
+    echo "FAIL 9b-10: $INVALID_ARG did not fail before daemon admission with an exact error"
+    exit 1
+  fi
+done
+echo "OK 9b-10: invalid UI values fail before daemon admission"
+
+# The daemon-control surface shares the same exact parser; numeric prefixes
+# must not reach status/start handling as a valid port.
+DAEMON_INVALID_RC=0
+DAEMON_INVALID_OUT=$(HOME="$FAKE_HOME" CBM_CACHE_DIR="$FAKE_HOME/.cache/codebase-memory-mcp" \
+  "$BINARY" daemon status --port=9749x < /dev/null 2>&1) || DAEMON_INVALID_RC=$?
+if [ "$DAEMON_INVALID_RC" -ne 1 ] || \
+   ! echo "$DAEMON_INVALID_OUT" | grep -Fxq 'error: --port requires a value between 1 and 65535'; then
+  echo "FAIL 9b-11: daemon control accepted a numeric port prefix"
+  exit 1
+fi
+echo "OK 9b-11: daemon control rejects numeric port prefixes before endpoint access"
 
 retire_account_daemon "9-cleanup"
 smoke_rmtree "$FAKE_HOME" "$EMPTY_HOME"
@@ -3226,7 +3310,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
     'import json, os; print(json.dumps({"mcpServers":{"codebase-memory-mcp":{"command":os.environ["STALE_CMD"]}}}))' \
     > "$UPDATE_HOME/.claude.json"
 
-  # 14a: Run actual update command (one composition ships — no variant flag)
+  # 14a: Run the one-composition update handoff.
   UPDATE_LOG=$(smoke_mktemp_file)
   # Hash the driver BEFORE the run and compare it against itself afterwards.
   # Comparing against "$BINARY" instead looks equivalent but is not: the POSIX
@@ -3551,6 +3635,9 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   PS1_TEST_HOME=$(smoke_mktemp_dir)
   PS1_TEST_DIR=$(smoke_mktemp_dir)
   mkdir -p "$PS1_TEST_HOME/.claude"
+  # Seed an existing install so the E2E path exercises rename-aside replacement
+  # and proves the successful installer does not orphan its rollback binary.
+  cp "$BINARY" "$PS1_TEST_DIR/codebase-memory-mcp.exe"
 
   # Convert MSYS paths to Windows paths for PowerShell
   if command -v cygpath &>/dev/null; then
@@ -3599,6 +3686,13 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
     exit 1
   fi
 
+  # 13i: successful replacement must consume its rollback candidate.
+  if [ -e "$PS1_TEST_DIR/codebase-memory-mcp.exe.old" ]; then
+    echo "FAIL 13i: install.ps1 left an orphaned .old binary"
+    exit 1
+  fi
+  echo "OK 13i: install.ps1 cleaned replacement backup"
+
   smoke_rmtree "$PS1_TEST_HOME" "$PS1_TEST_DIR"
 else
   echo "SKIP Phase 13: no install script available for this platform"
@@ -3615,14 +3709,24 @@ fi
 # SMOKE_REQUIRE_UI=1 makes the no-assets outcome a FAILURE instead of a SKIP.
 # scripts/ci/smoke-artifact.sh sets it because that lane builds --with-ui and
 # packages the real archive, so a binary serving no frontend is a defect there.
-# The fast PR lane builds without the frontend on purpose and leaves it unset --
-# a skip that cannot fail is not a gate, but neither is asserting a property the
-# lane deliberately does not produce.
+# The fast PR lane builds without the frontend on purpose and leaves it unset.
 SMOKE_REQUIRE_UI="${SMOKE_REQUIRE_UI:-0}"
+UI_INPUT=""
+UI_PID=""
+smoke_ui_stop() {
+  # Close the held-open writer before reaping the server. Explicit ownership of
+  # both ends leaves no timer child delaying the next phase after the server exits.
+  exec 7>&- 2>/dev/null || true
+  if [ -n "$UI_PID" ]; then
+    kill "$UI_PID" 2>/dev/null || true
+    wait "$UI_PID" 2>/dev/null || true
+  fi
+  [ -z "$UI_INPUT" ] || rm -f "$UI_INPUT"
+}
 smoke_ui_missing() {
   if [ "$SMOKE_REQUIRE_UI" = "1" ]; then
     echo "FAIL $1: SMOKE_REQUIRE_UI=1 but this binary serves no embedded UI assets"
-    kill "$UI_PID" 2>/dev/null || true
+    smoke_ui_stop
     exit 1
   fi
   echo "SKIP $1: $2"
@@ -3638,13 +3742,21 @@ UI_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0
 # --ui=true is REQUIRED: the HTTP UI is a persisted, default-off setting, so
 # on any fresh profile (every CI runner, every smoke HOME) a bare --port
 # invocation can never serve — the probe then misread "UI disabled" as "no
-# embedded assets" on binaries that carry them (first exposed when the
-# ui-variant no-skip guard made Phase 15 mandatory). Stdin must be HELD OPEN:
+# embedded assets" on binaries that carry them. Stdin must be HELD OPEN:
 # the UI does not pin the process, so stdio EOF ends it cleanly (rc=0) before
 # the poll can see it serve — the drive-listing guard holds a pipe for the
 # same reason. Equals-form flags match that guard's proven invocation.
-sleep 300 | "$BINARY" --ui=true --port="$UI_PORT" > /dev/null 2>&1 &
+UI_INPUT=$(smoke_mktemp_file)
+rm -f "$UI_INPUT"
+if ! mkfifo "$UI_INPUT"; then
+  echo "FAIL Phase 15: could not create held-open UI stdin"
+  exit 1
+fi
+"$BINARY" --ui=true --port="$UI_PORT" < "$UI_INPUT" > /dev/null 2>&1 &
 UI_PID=$!
+# Opening the writer unblocks the server's stdin redirect and keeps stdin live.
+# Fixed fd 7 works in macOS Bash 3.2, Linux Bash, and MSYS2 Bash.
+exec 7>"$UI_INPUT"
 # Readiness poll instead of a fixed sleep: SKIP is legitimate ONLY when the
 # process exited (the documented no-embedded-assets case); a slow start on a
 # loaded runner must not masquerade as it. The UI binds ~6s after launch even
@@ -3666,7 +3778,7 @@ if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
     smoke_ui_missing "15a" "UI not reachable (binary may not have embedded assets)"
   else
     echo "FAIL 15a: UI root did not return HTML"
-    kill "$UI_PID" 2>/dev/null || true
+    smoke_ui_stop
     exit 1
   fi
 
@@ -3682,15 +3794,14 @@ if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
     smoke_ui_missing "15b" "/api/ui-config not reachable"
   else
     echo "FAIL 15b: /api/ui-config did not return JSON"
-    kill "$UI_PID" 2>/dev/null || true
+    smoke_ui_stop
     exit 1
   fi
 
-  kill "$UI_PID" 2>/dev/null || true
-  wait "$UI_PID" 2>/dev/null || true
 else
   smoke_ui_missing "Phase 15" "binary exited immediately (no UI assets embedded)"
 fi
+smoke_ui_stop
 
 echo ""
 echo "=== Phase 16: stdio server leaves no orphan after shutdown ==="

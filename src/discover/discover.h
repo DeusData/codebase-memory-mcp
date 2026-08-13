@@ -88,10 +88,39 @@ bool cbm_gitignore_merge(cbm_gitignore_t *dst, const cbm_gitignore_t *src);
 #ifndef CBM_INDEX_MODE_T_DEFINED
 #define CBM_INDEX_MODE_T_DEFINED
 typedef enum {
-    CBM_MODE_FULL = 0,     /* parse everything supported */
-    CBM_MODE_MODERATE = 1, /* aggressive filtering + similarity/semantic edges */
-    CBM_MODE_FAST = 2,     /* aggressive filtering + no similarity/semantic edges */
+    CBM_MODE_FULL = 0,     /* Full: parse everything supported */
+    CBM_MODE_MODERATE = 1, /* Moderate: aggressive filtering + similarity/semantic edges */
+    CBM_MODE_FAST = 2,     /* Fast: aggressive filtering, no similarity/semantic edges */
+    CBM_MODE_DEP = 3, /* Dep: like FAST but keeps vendor/, .d.ts, third_party/ (fork depindex) */
 } cbm_index_mode_t;
+
+/* Single source of truth for the caller-facing spelling of each mode, kept
+ * adjacent to the enum on purpose: the comment above records a prior defect where
+ * two definitions of this vocabulary drifted and fast-mode filtering silently
+ * no-opped. Adding a mode is one edit here; the name lookup, the parser, and the
+ * accepted-value list in error messages all derive from it and cannot disagree.
+ * The third column marks whether a caller may select the mode by name: dependency
+ * indexing picks CBM_MODE_DEP internally (src/depindex/depindex.c) and is not a
+ * spelling the index tool accepts. */
+#define CBM_INDEX_MODE_TABLE(X)            \
+    X(CBM_MODE_FULL, "full", true)         \
+    X(CBM_MODE_MODERATE, "moderate", true) \
+    X(CBM_MODE_FAST, "fast", true)         \
+    X(CBM_MODE_DEP, "dep", false)
+
+/* Caller-facing name for a mode; "unknown" for a value outside the table. */
+const char *cbm_index_mode_name(cbm_index_mode_t mode);
+
+/* Parse a caller-supplied mode spelling. Returns false and leaves *out unchanged
+ * when the spelling is absent from the table, so callers reject loudly instead of
+ * silently falling back to CBM_MODE_FULL. caller_selectable_out, when non-NULL,
+ * reports whether the spelling is one a caller is allowed to request. */
+bool cbm_index_mode_from_name(const char *name, cbm_index_mode_t *out, bool *caller_selectable_out);
+
+/* Write the caller-selectable spellings as "full|moderate|fast" for error
+ * messages, derived from the table rather than restated. Returns the number of
+ * characters written excluding the NUL; output is always NUL-terminated. */
+int cbm_index_mode_accepted(char *buf, int bufsize);
 #endif
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).

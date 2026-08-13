@@ -11,14 +11,19 @@
  * Requires network access for initial clone. Skips gracefully if offline.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
 #include "test_framework.h"
+#include "test_graph_diff.h"
 #include "test_helpers.h"
+#include <cli/cli.h>
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
 #include <foundation/platform.h>
+#include <foundation/str_util.h>
 
 #include <stdarg.h>
 #include <string.h>
@@ -34,6 +39,7 @@ static char g_tmpdir[256];
 static char g_repodir[512];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
+static cbm_config_t *g_cfg = NULL;
 static char *g_project = NULL;
 
 /* Baseline counts after full index */
@@ -45,6 +51,52 @@ static int g_full_imports = 0;
 /* Performance: track peak RSS and timing per test phase */
 static size_t g_rss_before_full = 0;
 static double g_full_index_ms = 0;
+
+enum {
+    INCR_ACCURACY_NODE_TOLERANCE = 2,
+    INCR_ACCURACY_EDGE_TOLERANCE = 50,
+    INCR_ACCURACY_CALL_TOLERANCE = 2,
+    INCR_FORMATTER_MAX_FILES = 50,
+    /* Measured FastAPI 0.99.1 production-build budgets: x86 peaks around
+     * 2050-2072 MiB; ARM/16 KiB-page runners peak around 2385 MiB. */
+    INCR_FULL_INDEX_BASE_MAX_RSS_DELTA_MB = 2304,
+    INCR_FULL_INDEX_LARGE_PAGE_MAX_RSS_DELTA_MB = 2816,
+    INCR_LARGE_PAGE_MIN_BYTES = 16384,
+    INCR_INSTRUMENTED_TIMEOUT_MULTIPLIER = 4,
+};
+
+static const char *INCR_TEST_ARTIFACT_ENV = "CBM_TEST_ARTIFACT_DIR";
+static const char *INCR_TEST_FASTAPI_REPO_ENV = "CBM_TEST_FASTAPI_REPO";
+static const char *INCR_TEST_FASTAPI_CACHE_ENV = "CBM_TEST_FASTAPI_CACHE";
+static const char *INCR_TEST_FASTAPI_URL = "https://github.com/fastapi/fastapi.git";
+static const char *INCR_TEST_FASTAPI_TAG = "0.99.1";
+static const char *INCR_TEST_FASTAPI_COMMIT = "dd4e78ca7b09abdf0d4646fe4697316c021a8b2e";
+static const char *INCR_TEST_FASTAPI_DEFAULT_CACHE_NAME = "cbm-test-fastapi-0.99.1-cache";
+
+static bool incr_memory_instrumentation_active(void) {
+    if (TF_SANITIZER_ACTIVE) {
+        return true;
+    }
+    const char *scribble = getenv("MallocScribble");
+    const char *pre_scribble = getenv("MallocPreScribble");
+    const char *guard_malloc = getenv("DYLD_INSERT_LIBRARIES");
+    return (scribble && strcmp(scribble, "1") == 0) ||
+           (pre_scribble && strcmp(pre_scribble, "1") == 0) ||
+           (guard_malloc && strstr(guard_malloc, "libgmalloc") != NULL);
+}
+
+static int incr_full_index_rss_limit_mb(void) {
+    int rss_limit_mb = INCR_FULL_INDEX_BASE_MAX_RSS_DELTA_MB;
+#ifndef _WIN32
+    if (sysconf(_SC_PAGESIZE) >= INCR_LARGE_PAGE_MIN_BYTES) {
+        rss_limit_mb = INCR_FULL_INDEX_LARGE_PAGE_MAX_RSS_DELTA_MB;
+    }
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__)
+    rss_limit_mb = INCR_FULL_INDEX_LARGE_PAGE_MAX_RSS_DELTA_MB;
+#endif
+    return rss_limit_mb;
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -156,6 +208,52 @@ static cbm_store_t *open_store(void) {
     return cbm_store_open_path_existing(g_dbpath);
 }
 
+static int dump_current_store_to_file(const char *dest_path) {
+    cbm_store_t *s = open_store();
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_dump_to_file(s, dest_path);
+    cbm_store_close(s);
+    return rc;
+}
+
+static int dump_store_file_to_file(const char *src_path, const char *dest_path) {
+    cbm_store_t *s = cbm_store_open_path(src_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_dump_to_file(s, dest_path);
+    cbm_store_close(s);
+    return rc;
+}
+
+static void preserve_accuracy_artifacts(const char *incr_snapshot_path, const char *reason) {
+    char artifact_dir[CBM_SZ_512];
+    const char *dir =
+        cbm_safe_getenv(INCR_TEST_ARTIFACT_ENV, artifact_dir, sizeof(artifact_dir), cbm_tmpdir());
+    if (!dir || dir[0] == '\0') {
+        dir = cbm_tmpdir();
+    }
+
+    char incr_out[CBM_SZ_1K];
+    char full_out[CBM_SZ_1K];
+    int pid = (int)getpid();
+    int n1 = snprintf(incr_out, sizeof(incr_out), "%s/cbm-incr-accuracy-%d-incremental.db", dir,
+                      pid);
+    int n2 = snprintf(full_out, sizeof(full_out), "%s/cbm-incr-accuracy-%d-full.db", dir, pid);
+    if (n1 <= 0 || n2 <= 0 || (size_t)n1 >= sizeof(incr_out) ||
+        (size_t)n2 >= sizeof(full_out)) {
+        printf("    [accuracy:artifacts] skipped: artifact path too long\n");
+        return;
+    }
+
+    int incr_rc = dump_store_file_to_file(incr_snapshot_path, incr_out);
+    int full_rc = dump_current_store_to_file(full_out);
+    printf("    [accuracy:artifacts] reason=%s incremental=%s rc=%d full=%s rc=%d\n",
+           reason ? reason : "canonical-diff", incr_out, incr_rc, full_out, full_rc);
+}
+
 static int get_node_count(void) {
     cbm_store_t *s = open_store();
     if (!s)
@@ -183,6 +281,126 @@ static int get_edge_count_by_type(const char *type) {
     return c;
 }
 
+static int get_lsp_surface_count(void) {
+    cbm_store_t *s = open_store();
+    if (!s)
+        return -1;
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = 0;
+    int rc = cbm_store_get_lsp_surfaces(s, g_project, &rows, &count);
+    cbm_store_free_lsp_surfaces(rows, count);
+    cbm_store_close(s);
+    return rc == CBM_STORE_OK ? count : -1;
+}
+
+static const char *const k_accuracy_edge_types[] = {
+    "CALLS",
+    "IMPORTS",
+    "DEFINES",
+    "CONTAINS_FILE",
+    "CONTAINS_FOLDER",
+    "HAS_BRANCH",
+    "DEFINES_METHOD",
+    "MEMBER_OF",
+    "HAS_FIELD",
+    "HANDLES",
+    "HTTP_CALLS",
+    "ASYNC_CALLS",
+    "DATA_FLOWS",
+    "INFRA_MAPS",
+    "CONFIGURES",
+    "DEPENDS_ON",
+    "FILE_CHANGES_WITH",
+    "SIMILAR_TO",
+    "SEMANTICALLY_RELATED",
+    "TESTS",
+    "TESTS_FILE",
+    "USAGE",
+    "THROWS",
+    "RAISES",
+    "WRITES",
+    "READS",
+    "INHERITS",
+    "DECORATES",
+    "IMPLEMENTS",
+    "EMITS",
+    "LISTENS_ON",
+    "GRPC_CALLS",
+    "GRAPHQL_CALLS",
+    "TRPC_CALLS",
+};
+
+enum { ACCURACY_EDGE_TYPE_COUNT = sizeof(k_accuracy_edge_types) / sizeof(k_accuracy_edge_types[0]) };
+
+static int accuracy_edge_type_count(void) {
+    return ACCURACY_EDGE_TYPE_COUNT;
+}
+
+static void capture_accuracy_edge_counts(int counts[ACCURACY_EDGE_TYPE_COUNT]) {
+    int n = accuracy_edge_type_count();
+    for (int i = 0; i < n; i++) {
+        counts[i] = get_edge_count_by_type(k_accuracy_edge_types[i]);
+    }
+}
+
+static void print_accuracy_edge_diff(const int incr_counts[ACCURACY_EDGE_TYPE_COUNT],
+                                     const int full_counts[ACCURACY_EDGE_TYPE_COUNT]) {
+    int n = accuracy_edge_type_count();
+    printf("    [accuracy:edge-types] type incr full delta\n");
+    for (int i = 0; i < n; i++) {
+        int delta = incr_counts[i] - full_counts[i];
+        if (delta != 0) {
+            printf("    [accuracy:edge-types] %s %d %d %+d\n", k_accuracy_edge_types[i],
+                   incr_counts[i], full_counts[i], delta);
+        }
+    }
+}
+
+typedef struct {
+    int total;
+    int handler;
+    int prefix_bridge;
+    int infra_match;
+    int empty;
+    int other;
+} handle_breakdown_t;
+
+static handle_breakdown_t capture_handle_breakdown(void) {
+    handle_breakdown_t b = {0};
+    cbm_store_t *s = open_store();
+    if (!s) {
+        return b;
+    }
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    if (cbm_store_find_edges_by_type(s, g_project, "HANDLES", &edges, &count) == CBM_STORE_OK) {
+        b.total = count;
+        for (int i = 0; i < count; i++) {
+            const char *props = edges[i].properties_json ? edges[i].properties_json : "{}";
+            if (strstr(props, "\"source\":\"prefix_decorator_bridge\"")) {
+                b.prefix_bridge++;
+            } else if (strstr(props, "\"source\":\"infra_match\"")) {
+                b.infra_match++;
+            } else if (strstr(props, "\"handler\"")) {
+                b.handler++;
+            } else if (strcmp(props, "{}") == 0) {
+                b.empty++;
+            } else {
+                b.other++;
+            }
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    cbm_store_close(s);
+    return b;
+}
+
+static void print_handle_breakdown(const char *label, handle_breakdown_t b) {
+    printf("    [accuracy:handles:%s] total=%d handler=%d prefix_bridge=%d infra_match=%d "
+           "empty=%d other=%d\n",
+           label, b.total, b.handler, b.prefix_bridge, b.infra_match, b.empty, b.other);
+}
+
 static int has_function(const char *name_pattern) {
     char *resp = call_tool("search_graph",
                            "{\"project\":\"%s\",\"label\":\"Function\",\"name_pattern\":\"%s\"}",
@@ -200,6 +418,163 @@ static int count_by_label(const char *label) {
     return total;
 }
 
+static int incr_join_path(char *out, size_t out_sz, const char *base, const char *rel) {
+    if (!out || out_sz == 0 || !base || !base[0] || !rel || !rel[0]) {
+        return -1;
+    }
+    int n = snprintf(out, out_sz, "%s/%s", base, rel);
+    return (n >= 0 && (size_t)n < out_sz) ? 0 : -1;
+}
+
+static bool incr_shell_path_ok(const char *path) {
+    return path && path[0] && cbm_validate_shell_arg(path);
+}
+
+static bool incr_fastapi_fixture_has_required_files(const char *repo) {
+    char path[CBM_SZ_1K];
+    if (incr_join_path(path, sizeof(path), repo, "fastapi/applications.py") != 0 ||
+        !cbm_file_exists(path)) {
+        return false;
+    }
+    if (incr_join_path(path, sizeof(path), repo, "tests/test_application.py") != 0 ||
+        !cbm_file_exists(path)) {
+        return false;
+    }
+    if (incr_join_path(path, sizeof(path), repo, "docs/en/docs/release-notes.md") != 0 ||
+        !cbm_file_exists(path)) {
+        return false;
+    }
+    return true;
+}
+
+static bool incr_fastapi_fixture_at_expected_commit(const char *repo) {
+    if (!incr_shell_path_ok(repo)) {
+        return false;
+    }
+    char cmd[CBM_SZ_1K];
+    int n = snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse --verify HEAD 2>/dev/null", repo);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return false;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    char head[CBM_SZ_128] = {0};
+    bool ok = fgets(head, sizeof(head), fp) != NULL;
+    (void)cbm_pclose(fp);
+    if (!ok) {
+        return false;
+    }
+    head[strcspn(head, "\r\n")] = '\0';
+    return strcmp(head, INCR_TEST_FASTAPI_COMMIT) == 0;
+}
+
+static bool incr_fastapi_fixture_valid(const char *repo) {
+    return incr_fastapi_fixture_has_required_files(repo) &&
+           incr_fastapi_fixture_at_expected_commit(repo);
+}
+
+static int incr_clone_fastapi_fixture_from(const char *source) {
+    if (!incr_shell_path_ok(source) || !incr_shell_path_ok(g_repodir)) {
+        return -1;
+    }
+    char cmd[CBM_SZ_2K];
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git clone --quiet --no-hardlinks '%s' '%s' 2>&1", source,
+                     g_repodir);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        return rc;
+    }
+    if (getenv("CI")) {
+        n = snprintf(cmd, sizeof(cmd),
+                     "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' "
+                     "2>&1",
+                     g_repodir);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            return -1;
+        }
+        rc = system(cmd);
+    }
+    return rc;
+}
+
+static int incr_clone_fastapi_fixture_from_network(const char *dest, bool sparse_on_ci) {
+    if (!incr_shell_path_ok(dest)) {
+        return -1;
+    }
+    char cmd[CBM_SZ_2K];
+    int n = 0;
+    if (sparse_on_ci && getenv("CI")) {
+        n = snprintf(cmd, sizeof(cmd),
+                     "git clone --depth=1 --branch %s --quiet --filter=blob:none --sparse "
+                     "%s '%s' 2>&1 && cd '%s' && git sparse-checkout set --no-cone '/*' "
+                     "'!/docs' '!/tests' 2>&1",
+                     INCR_TEST_FASTAPI_TAG, INCR_TEST_FASTAPI_URL, dest, dest);
+    } else {
+        n = snprintf(cmd, sizeof(cmd), "git clone --depth=1 --branch %s --quiet %s '%s' 2>&1",
+                     INCR_TEST_FASTAPI_TAG, INCR_TEST_FASTAPI_URL, dest);
+    }
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    return system(cmd);
+}
+
+static const char *incr_fastapi_cache_path(char *buf, size_t buf_sz) {
+    const char *cache = cbm_safe_getenv(INCR_TEST_FASTAPI_CACHE_ENV, buf, buf_sz, NULL);
+    if (cache && cache[0]) {
+        return cache;
+    }
+    int n = snprintf(buf, buf_sz, "%s/%s", cbm_tmpdir(), INCR_TEST_FASTAPI_DEFAULT_CACHE_NAME);
+    return (n >= 0 && (size_t)n < buf_sz) ? buf : NULL;
+}
+
+static int incr_prepare_managed_fastapi_cache(const char *cache) {
+    if (!incr_shell_path_ok(cache)) {
+        return -1;
+    }
+    if (incr_fastapi_fixture_valid(cache)) {
+        return 0;
+    }
+
+    th_rmtree(cache);
+    int rc = incr_clone_fastapi_fixture_from_network(cache, false);
+    if (rc != 0) {
+        th_rmtree(cache);
+        return rc;
+    }
+    if (!incr_fastapi_fixture_valid(cache)) {
+        th_rmtree(cache);
+        return -1;
+    }
+    return 0;
+}
+
+static int incr_clone_fastapi_fixture(void) {
+    char source_buf[CBM_SZ_1K];
+    const char *source = cbm_safe_getenv(INCR_TEST_FASTAPI_REPO_ENV, source_buf,
+                                         sizeof(source_buf), NULL);
+    if (source && source[0] && incr_fastapi_fixture_valid(source)) {
+        printf("  using FastAPI fixture source: %s\n", source);
+        return incr_clone_fastapi_fixture_from(source);
+    }
+
+    char cache_buf[CBM_SZ_1K];
+    const char *cache = incr_fastapi_cache_path(cache_buf, sizeof(cache_buf));
+    int rc = incr_prepare_managed_fastapi_cache(cache);
+    if (rc == 0) {
+        printf("  using FastAPI fixture cache: %s\n", cache);
+        return incr_clone_fastapi_fixture_from(cache);
+    }
+
+    return incr_clone_fastapi_fixture_from_network(g_repodir, true);
+}
+
 /* ── Setup / Teardown ─────────────────────────────────────────────── */
 
 static int incremental_setup(void) {
@@ -209,45 +584,13 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
-    /* The fixture is cloned from the network at most once per machine, into a
-     * persistent cache; every run local-clones from there (seconds, offline).
-     * The one-time clone is staged and committed with an atomic rename so a
-     * torn download can never masquerade as a valid cache. */
-    const char *cache_home = getenv("CBM_TEST_FIXTURE_CACHE");
-    char cache_root[512];
-    if (cache_home && cache_home[0]) {
-        snprintf(cache_root, sizeof(cache_root), "%s", cache_home);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || !home[0])
-            home = ".";
-        snprintf(cache_root, sizeof(cache_root), "%s/.cache/cbm-test-fixtures", home);
-    }
-    char cache_repo[640];
-    snprintf(cache_repo, sizeof(cache_repo), "%s/fastapi-0.99.1", cache_root);
-    char cmd[1600];
-    if (!cbm_is_dir(cache_repo)) {
-        (void)cbm_mkdir_p(cache_root, 0700);
-        char cache_stage[700];
-        snprintf(cache_stage, sizeof(cache_stage), "%s.stage", cache_repo);
-        th_rmtree(cache_stage);
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet "
-                 "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 cache_stage);
-        int fetch_rc = system(cmd);
-        if (fetch_rc != 0 || rename(cache_stage, cache_repo) != 0) {
-            th_rmtree(cache_stage);
-            if (!cbm_is_dir(cache_repo)) {
-                printf("  fixture clone failed (rc=%d) — network offline?\n", fetch_rc);
-                return -1;
-            }
-        }
-    }
-    snprintf(cmd, sizeof(cmd), "git clone --quiet '%s' '%s' 2>&1", cache_repo, g_repodir);
-    int rc = system(cmd);
+    /* incr_clone_fastapi_fixture() implements the same once-per-machine cache
+     * upstream inlined here, and validates the cached tree (required files plus
+     * the expected commit) instead of only testing for the directory, so a torn
+     * download cannot masquerade as a valid cache. */
+    int rc = incr_clone_fastapi_fixture();
     if (rc != 0) {
-        printf("  fixture local clone failed (rc=%d)\n", rc);
+        printf("  FastAPI fixture setup failed (rc=%d) — cache invalid and network offline?\n", rc);
         return -1;
     }
     /* Index the same corpus everywhere: CI historically indexed a sparse
@@ -265,6 +608,10 @@ static int incremental_setup(void) {
     if (!g_project)
         return -1;
 
+    /* Resolve the cache dir via cbm_resolve_cache_dir() so it honors CBM_CACHE_DIR
+     * and matches the index WRITE path (pipeline.c). Hardcoding ~/.cache here
+     * made get_node_count read from a different dir than the index wrote under
+     * CBM_TEST_ISOLATE, yielding 0-node indexes (and a div-by-zero). */
     const char *cache_dir = cbm_resolve_cache_dir();
     int dbpath_length =
         cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
@@ -273,11 +620,25 @@ static int incremental_setup(void) {
         return -1;
     }
 
-    unlink(g_dbpath);
+    cbm_unlink(g_dbpath);
 
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
         return -1;
+    g_cfg = cbm_config_open(cache_dir);
+    if (!g_cfg) {
+        cbm_mcp_server_free(g_srv);
+        g_srv = NULL;
+        return -1;
+    }
+    cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "always");
+    if (incr_memory_instrumentation_active()) {
+        char timeout_ms[CBM_SZ_32];
+        snprintf(timeout_ms, sizeof(timeout_ms), "%d",
+                 CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS * INCR_INSTRUMENTED_TIMEOUT_MULTIPLIER);
+        cbm_config_set(g_cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, timeout_ms);
+    }
+    cbm_mcp_server_set_config(g_srv, g_cfg);
 
     g_rss_before_full = cbm_mem_rss();
 
@@ -289,6 +650,8 @@ static void incremental_teardown(void) {
         cbm_mcp_server_free(g_srv);
         g_srv = NULL;
     }
+    cbm_config_close(g_cfg);
+    g_cfg = NULL;
     if (g_project) {
         unlink(g_dbpath);
         char wal[520], shm[520];
@@ -334,55 +697,18 @@ TEST(incr_full_index) {
         printf("    [PERF WARNING] full index: %.0fms (>30s)\n", ms);
     }
 
-    /* Memory: bounded budget for a 1100-file Python project. ARM (and other
-     * large-page) Linux/macOS use 16KB pages vs x86's 4KB; per-allocation page
-     * rounding inflates RSS ~25-30% for the SAME logical footprint (not a leak —
-     * ARM ~2385MB on the same index). Scale the budget by page size so the guard
-     * still catches real runaway memory (a leak would be GBs over) without
-     * false-failing on large-page architectures. The x86 base budget is 2304MB:
-     * after the retention/source-text-cap and RAM-tiering work the x86 peak for
-     * this index settled at ~2050-2072MB (measured across CI runs), so the old
-     * 2048 limit sat right on the line and flaked; 2304 restores headroom while a
-     * genuine leak (GBs over) still trips it. */
+    /* Memory: use the measured architecture/page-size budget. Diagnostic
+     * allocators intentionally inflate RSS, so they report instead of failing
+     * this production-build resource guard. */
     size_t rss_delta_mb = peak_mb - (g_rss_before_full / (1024 * 1024));
-    int rss_limit_mb = 2304;
-#ifndef _WIN32
-    if (sysconf(_SC_PAGESIZE) >= 16384) {
-        rss_limit_mb = 2816;
+    int rss_limit_mb = incr_full_index_rss_limit_mb();
+    if (incr_memory_instrumentation_active()) {
+        printf("    [perf note] full index rss_delta=%zuMB under memory instrumentation "
+               "(normal limit=%dMB)\n",
+               rss_delta_mb, rss_limit_mb);
+    } else {
+        ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
     }
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__)
-    /* ARM Linux uses 4KB pages, so the page-size bump above does NOT fire there,
-     * yet glibc's per-CPU malloc arenas + allocation rounding still inflate RSS
-     * to the documented ~2385MB for this index (the same inflation Apple silicon
-     * shows, which the page-size check catches via its 16KB pages). Apply the
-     * higher ARM budget on any ARM target so the guard still catches a real leak
-     * (GBs over) without false-failing on 4KB-page ARM Linux (e.g. CI's
-     * ubuntu-22.04-arm, which measured 2386MB against the un-bumped 2048 limit). */
-    if (rss_limit_mb < 2816) {
-        rss_limit_mb = 2816;
-    }
-#endif
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-#define CBM_TEST_RSS_BUDGET_UNMEASURABLE 1
-#endif
-#endif
-#if defined(CBM_TEST_RSS_BUDGET_UNMEASURABLE)
-    /* MSan maps shadow (and with origins, a second) mapping for every
-     * allocation, inflating RSS by construction: this index measured 3054MB
-     * against the 2304MB budget on the x86-64 lane. The budget exists to catch
-     * a REAL leak (GBs over) in a normal build; under MSan it cannot separate a
-     * leak from shadow, so the number is not evidence either way. Skipped here
-     * rather than inflated, so the guard keeps its teeth on every other
-     * platform -- inflating it would blind the check where it does work. The
-     * rest of this test (node/edge correctness) still runs under MSan, which is
-     * the uninitialized-read coverage the lane exists for. */
-    (void)rss_delta_mb;
-    (void)rss_limit_mb;
-#else
-    ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
-#endif
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",
@@ -501,35 +827,76 @@ TEST(incr_formatter_run) {
     int nodes_before = get_node_count();
     int edges_before = get_edge_count();
     int calls_before = get_edge_count_by_type("CALLS");
+    int surfaces_before = get_lsp_surface_count();
 
-    /* Simulate formatter: touch 50 files */
-    reformat_files("fastapi", 50);
+    /* Simulate a semantics-preserving formatter batch. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    int reformat_rc = reformat_files("fastapi", INCR_FORMATTER_MAX_FILES);
 
     double ms = 0;
     size_t peak_mb = 0;
     resp = index_repo_timed(&ms, &peak_mb);
-    ASSERT(resp != NULL);
-    ASSERT(strstr(resp, "indexed") != NULL);
+    int incremental_response_ok = resp != NULL && strstr(resp, "indexed") != NULL;
     free(resp);
 
-    /* Graph should be nearly identical — formatter adds no functions.
-     * Warn on >10% variance (can happen with sparse checkout / smaller repos). */
+    /* Counts diagnose drift, but canonical incremental/full identity below is
+     * the pass/fail contract. Appending comments does not change semantics. */
     int node_diff = abs(get_node_count() - nodes_before);
     int edge_diff = abs(get_edge_count() - edges_before);
-    if (node_diff > nodes_before / 10 || edge_diff > edges_before / 10) {
-        printf("    [PERF WARNING] formatter drift: node_diff=%d (max %d), edge_diff=%d (max %d)\n",
-               node_diff, nodes_before / 10, edge_diff, edges_before / 10);
-    }
-
-    /* CALLS edges: reformatting changes line numbers which affects resolution. */
     int calls_diff = abs(get_edge_count_by_type("CALLS") - calls_before);
-    if (calls_diff > calls_before / 4) {
-        printf("    [PERF WARNING] CALLS drift: %d (max %d)\n", calls_diff, calls_before / 4);
+    int surfaces_after_incremental = get_lsp_surface_count();
+
+    char incremental_snapshot_path[CBM_SZ_512];
+    int snapshot_path_len = snprintf(incremental_snapshot_path, sizeof(incremental_snapshot_path),
+                                     "%s/incr_formatter_incremental.db", g_tmpdir);
+    int snapshot_path_ok =
+        snapshot_path_len > 0 && (size_t)snapshot_path_len < sizeof(incremental_snapshot_path);
+    int snapshot_rc = CBM_STORE_ERR;
+    int full_response_ok = 0;
+    int canonical_graph_diff_rc = CBM_NOT_FOUND;
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+
+    if (incremental_response_ok && snapshot_path_ok) {
+        cbm_unlink(incremental_snapshot_path);
+        snapshot_rc = dump_current_store_to_file(incremental_snapshot_path);
+    }
+    if (snapshot_rc == CBM_STORE_OK) {
+        cbm_unlink(g_dbpath);
+        resp = index_repo();
+        full_response_ok = resp != NULL && strstr(resp, "indexed") != NULL;
+        free(resp);
+    }
+    int surfaces_after_full = full_response_ok ? get_lsp_surface_count() : -1;
+    if (full_response_ok) {
+        canonical_graph_diff_rc = cbm_test_compare_canonical_graphs(
+            incremental_snapshot_path, g_dbpath, g_project, canonical_graph_diff_error,
+            sizeof(canonical_graph_diff_error));
+    }
+    if (canonical_graph_diff_rc != 0 && snapshot_rc == CBM_STORE_OK && full_response_ok) {
+        printf("    [formatter:canonical-diff] %s\n", canonical_graph_diff_error);
+        preserve_accuracy_artifacts(incremental_snapshot_path, "formatter-canonical-diff");
     }
 
-    printf("    [perf] reformat 50 files: %.0fms, node_diff=%d edge_diff=%d\n", ms, node_diff,
-           edge_diff);
+    cbm_unlink(incremental_snapshot_path);
+    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                                           CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
 
+    printf("    [perf] reformat up to %d files: %.0fms, node_diff=%d edge_diff=%d "
+           "calls_diff=%d\n",
+           INCR_FORMATTER_MAX_FILES, ms, node_diff, edge_diff, calls_diff);
+
+    ASSERT_EQ(reformat_rc, 0);
+    ASSERT(incremental_response_ok);
+    ASSERT(snapshot_path_ok);
+    ASSERT_EQ(snapshot_rc, CBM_STORE_OK);
+    ASSERT(full_response_ok);
+    ASSERT_GT(surfaces_before, 0);
+    ASSERT_EQ(surfaces_after_incremental, surfaces_before);
+    ASSERT_EQ(surfaces_after_full, surfaces_before);
+    ASSERT_EQ(restore_config_rc, 0);
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 
@@ -838,9 +1205,29 @@ TEST(incr_batch_add_delete) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(incr_db_deleted_recovery) {
-    int nodes_before = get_node_count();
+    /* Recovery is an exact graph oracle, so refresh derived results at publish
+     * instead of comparing the configured deferred view with a clean rebuild
+     * that necessarily refreshes global semantic edges. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    write_file_at("tests/incr_recovery_refresh.py",
+                  "def incr_recovery_refresh():\n    return 'recovery'\n");
+    char *baseline_response = index_repo();
+    ASSERT(baseline_response != NULL);
+    ASSERT(strstr(baseline_response, "indexed") != NULL);
+    free(baseline_response);
 
-    unlink(g_dbpath);
+    char recovery_baseline_path[CBM_SZ_512];
+    int recovery_baseline_path_len =
+        snprintf(recovery_baseline_path, sizeof(recovery_baseline_path),
+                 "%s/incr_db_deleted_recovery_baseline.db", g_tmpdir);
+    ASSERT_GT(recovery_baseline_path_len, 0);
+    ASSERT_LT((size_t)recovery_baseline_path_len, sizeof(recovery_baseline_path));
+    cbm_unlink(recovery_baseline_path);
+    ASSERT_EQ(dump_current_store_to_file(recovery_baseline_path), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_unlink(g_dbpath), 0);
 
     double ms = 0;
     size_t peak_mb = 0;
@@ -849,17 +1236,35 @@ TEST(incr_db_deleted_recovery) {
     ASSERT(strstr(resp, "indexed") != NULL);
     free(resp);
 
-    /* Full reindex must produce similar count */
-    int nodes_after = get_node_count();
-    int diff_pct = abs(nodes_after - nodes_before) * 100 / nodes_before;
-    ASSERT_LT(diff_pct, 5);
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+    int canonical_graph_diff_rc = cbm_test_compare_canonical_graphs(
+        recovery_baseline_path, g_dbpath, g_project, canonical_graph_diff_error,
+        sizeof(canonical_graph_diff_error));
+    if (canonical_graph_diff_rc != 0) {
+        printf("    [db-recovery:canonical-diff] %s\n", canonical_graph_diff_error);
+        preserve_accuracy_artifacts(recovery_baseline_path, "db-recovery-canonical-diff");
+    }
+    cbm_unlink(recovery_baseline_path);
+    delete_file_at("tests/incr_recovery_refresh.py");
+    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                                           CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
 
     printf("    [perf] db recovery (full reindex): %.0fms, peak=%zuMB\n", ms, peak_mb);
 
+    ASSERT_EQ(restore_config_rc, 0);
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 
 TEST(incr_accuracy_vs_full) {
+    /* This test is the strict canonical full-vs-incremental oracle. The
+     * production default may intentionally defer global semantic-derived edges,
+     * so opt into derived-results refresh at publish here instead of weakening the graph
+     * comparison. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+
     /* Modify a file to create a known incremental state */
     write_file_at("fastapi/incr_accuracy.py", "def accuracy_a():\n    return 1\n"
                                               "def accuracy_b():\n    return accuracy_a() + 1\n");
@@ -871,6 +1276,17 @@ TEST(incr_accuracy_vs_full) {
     int incr_nodes = get_node_count();
     int incr_edges = get_edge_count();
     int incr_calls = get_edge_count_by_type("CALLS");
+    int incr_type_counts[ACCURACY_EDGE_TYPE_COUNT] = {0};
+    capture_accuracy_edge_counts(incr_type_counts);
+    handle_breakdown_t incr_handles = capture_handle_breakdown();
+
+    char incr_snapshot_path[CBM_SZ_512];
+    int snap_len = snprintf(incr_snapshot_path, sizeof(incr_snapshot_path),
+                            "%s/incr_accuracy_incremental.db", g_tmpdir);
+    ASSERT_GT(snap_len, 0);
+    ASSERT_LT((size_t)snap_len, sizeof(incr_snapshot_path));
+    cbm_unlink(incr_snapshot_path);
+    ASSERT_EQ(dump_current_store_to_file(incr_snapshot_path), CBM_STORE_OK);
 
     /* Delete DB, force full reindex */
     unlink(g_dbpath);
@@ -881,16 +1297,47 @@ TEST(incr_accuracy_vs_full) {
     int full_nodes = get_node_count();
     int full_edges = get_edge_count();
     int full_calls = get_edge_count_by_type("CALLS");
+    int full_type_counts[ACCURACY_EDGE_TYPE_COUNT] = {0};
+    capture_accuracy_edge_counts(full_type_counts);
+    handle_breakdown_t full_handles = capture_handle_breakdown();
 
-    /* Within tight tolerance (±2 for dedup timing differences) */
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 2);
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 50);
-    ASSERT_LTE(abs(full_calls - incr_calls), 2);
+    /* Counts remain useful diagnostics, but canonical graph equality below is
+     * the pass/fail contract. */
+    if (abs(full_nodes - incr_nodes) > INCR_ACCURACY_NODE_TOLERANCE) {
+        printf("    [accuracy:nodes] incr=%d full=%d delta=%+d\n", incr_nodes, full_nodes,
+               incr_nodes - full_nodes);
+    }
+    if (abs(full_edges - incr_edges) > INCR_ACCURACY_EDGE_TOLERANCE) {
+        print_accuracy_edge_diff(incr_type_counts, full_type_counts);
+        print_handle_breakdown("incr", incr_handles);
+        print_handle_breakdown("full", full_handles);
+    }
+    if (abs(full_calls - incr_calls) > INCR_ACCURACY_CALL_TOLERANCE) {
+        printf("    [accuracy:calls] incr=%d full=%d delta=%+d\n", incr_calls, full_calls,
+               incr_calls - full_calls);
+    }
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int graph_diff_rc =
+        cbm_test_compare_canonical_graphs(incr_snapshot_path, g_dbpath, g_project, diff_err,
+                                          sizeof(diff_err));
+    if (graph_diff_rc != 0) {
+        print_accuracy_edge_diff(incr_type_counts, full_type_counts);
+        print_handle_breakdown("incr", incr_handles);
+        print_handle_breakdown("full", full_handles);
+        printf("    [accuracy:canonical-diff] %s\n", diff_err);
+        preserve_accuracy_artifacts(incr_snapshot_path, "canonical-diff");
+    }
 
     printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges\n", incr_nodes,
            incr_edges, full_nodes, full_edges);
 
     delete_file_at("fastapi/incr_accuracy.py");
+    cbm_unlink(incr_snapshot_path);
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT),
+              0);
+    ASSERT_EQ(graph_diff_rc, 0);
     PASS();
 }
 
@@ -2107,6 +2554,21 @@ TEST(tool_index_mode_fast) {
     PASS();
 }
 
+TEST(tool_index_publish_metadata) {
+    double ms;
+    char *r = call_tool_timed("index_repository", &ms, "{\"repo_path\":\"%s\",\"mode\":\"fast\"}",
+                              g_repodir);
+    ASSERT(r != NULL);
+    ASSERT(strstr(r, "\\\"publish_kind\\\":\\\"") != NULL);
+    ASSERT(strstr(r, "\\\"graph_changed\\\":") != NULL);
+    ASSERT(strstr(r, "\\\"publish_kind\\\":\\\"full\\\"") != NULL ||
+           strstr(r, "\\\"publish_kind\\\":\\\"incremental_noop\\\"") != NULL ||
+           strstr(r, "\\\"publish_kind\\\":\\\"incremental_exact\\\"") != NULL ||
+           strstr(r, "\\\"publish_kind\\\":\\\"incremental_containment\\\"") != NULL);
+    free(r);
+    PASS();
+}
+
 TEST(tool_index_invalid_path) {
     double ms;
     char *r = call_tool_timed("index_repository", &ms, "{\"repo_path\":\"/nonexistent/path/xyz\"}");
@@ -3199,6 +3661,7 @@ SUITE(incremental) {
 
     /* Phase 19: index_repository params */
     RUN_TEST(tool_index_mode_fast);
+    RUN_TEST(tool_index_publish_metadata);
     RUN_TEST(tool_index_invalid_path);
     RUN_TEST(tool_index_missing_param);
 

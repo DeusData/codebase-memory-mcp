@@ -12,12 +12,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="${CBM_TEST_BINARY:-${ROOT}/build/c/codebase-memory-mcp}"
+CHILD_START_ATTEMPTS=50
+CHILD_START_POLL_SECONDS=0.1
+CHILD_READY_LOG_PATTERN='msg=mem.init'
+WATCHDOG_EXIT_TIMEOUT_SECONDS=6
+WATCHDOG_EXIT_POLL_SECONDS=0.2
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     echo "skipping parent watchdog test on Windows"
     exit 0
     ;;
+  Darwin*) runtime_root="/private/tmp" ;;
+  *) runtime_root="/tmp" ;;
 esac
 
 if [[ ! -x "${BINARY}" ]]; then
@@ -26,6 +33,9 @@ if [[ ! -x "${BINARY}" ]]; then
 fi
 
 tmpdir="$(mktemp -d)"
+runtime_parent="$(mktemp -d "${runtime_root}/cbm-watchdog.XXXXXX")"
+mkdir "${runtime_parent}/cbm-daemon-$(id -u)"
+chmod 700 "${runtime_parent}/cbm-daemon-$(id -u)"
 wrapper_pid=""
 cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
@@ -35,6 +45,7 @@ cleanup() {
   fi
   [[ -n "${wrapper_pid}" ]] && kill "${wrapper_pid}" 2>/dev/null || true
   rm -rf "${tmpdir}"
+  rm -rf "${runtime_parent}"
 }
 trap cleanup EXIT
 
@@ -52,13 +63,14 @@ chmod +x "${tmpdir}/wrapper.sh"
 mkfifo "${tmpdir}/stdin"
 
 CBM_BINARY="${BINARY}" FIFO="${tmpdir}/stdin" TMPDIR_PATH="${tmpdir}" \
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!
 
 # Wait for the child PID file to appear.
-for _ in {1..50}; do
+for ((attempt = 0; attempt < CHILD_START_ATTEMPTS; attempt++)); do
   [[ -s "${tmpdir}/child.pid" ]] && break
-  sleep 0.1
+  sleep "${CHILD_START_POLL_SECONDS}"
 done
 
 if [[ ! -s "${tmpdir}/child.pid" ]]; then
@@ -85,7 +97,7 @@ for _ in {1..150}; do
     grep -Eq '"id"[[:space:]]*:[[:space:]]*1' "${tmpdir}/child.out"; then
     break
   fi
-  sleep 0.1
+  sleep "${CHILD_START_POLL_SECONDS}"
 done
 if ! grep -Eq '"id"[[:space:]]*:[[:space:]]*1' "${tmpdir}/child.out" 2>/dev/null; then
   echo "child did not reach watchdog-ready startup point" >&2
@@ -98,7 +110,7 @@ fi
 kill -9 "${wrapper_pid}"
 wait "${wrapper_pid}" 2>/dev/null || true
 
-deadline=$((SECONDS + 15))
+deadline=$((SECONDS + WATCHDOG_EXIT_TIMEOUT_SECONDS))
 while (( SECONDS < deadline )); do
   if ! kill -0 "${child_pid}" 2>/dev/null; then
     echo "ok: child ${child_pid} exited after parent death"
@@ -111,7 +123,7 @@ while (( SECONDS < deadline )); do
     echo "ok: child ${child_pid} exited after parent death (zombie awaiting reap)"
     exit 0
   fi
-  sleep 0.2
+  sleep "${WATCHDOG_EXIT_POLL_SECONDS}"
 done
 
 echo "codebase-memory-mcp child ${child_pid} survived parent death" >&2

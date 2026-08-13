@@ -87,6 +87,46 @@ function Invoke-CbmDownload {
     }
 }
 
+function New-CbmExclusiveSiblingTemp {
+    param([Parameter(Mandatory=$true)][string]$Destination)
+
+    $directory = [System.IO.Path]::GetDirectoryName($Destination)
+    $leaf = [System.IO.Path]::GetFileName($Destination)
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $random = [System.IO.Path]::GetRandomFileName()
+        $candidate = Join-Path $directory ".$leaf.tmp-$random"
+        try {
+            $reservation = [System.IO.File]::Open(
+                $candidate,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+            $reservation.Dispose()
+            return $candidate
+        } catch [System.IO.IOException] {
+            # A collision belongs to another process; reserve a fresh sibling.
+        }
+    }
+    throw "could not reserve an exclusive temporary sibling for $Destination"
+}
+
+function New-CbmExclusiveTempDirectory {
+    param([Parameter(Mandatory=$true)][string]$ParentDirectory)
+
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $candidate = Join-Path $ParentDirectory (
+            "cbm-install-" + [guid]::NewGuid().ToString("N")
+        )
+        try {
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+            return $candidate
+        } catch [System.IO.IOException] {
+            # Never adopt or remove a colliding path owned by another process.
+        }
+    }
+    throw "could not reserve an exclusive installer temporary directory"
+}
+
 $SkipConfig = $false
 foreach ($arg in $args) {
     if ($arg -eq "--skip-config") { $SkipConfig = $true }
@@ -125,8 +165,8 @@ $Archive = "codebase-memory-mcp-windows-$Arch.zip"
 $Url = "$BaseUrl/$Archive"
 
 # Download
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+$TmpDir = New-CbmExclusiveTempDirectory -ParentDirectory ([System.IO.Path]::GetTempPath())
+try {
 
 Write-Host "Downloading $Archive..."
 try {
@@ -302,25 +342,29 @@ if ($LASTEXITCODE -ne 0) {
 $DownloadedInstaller = Join-Path $TmpDir "install.ps1"
 if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
     $InstallerDest = Join-Path $InstallDir "install.ps1"
-    $InstallerTmp = "$InstallerDest.new"
+    $InstallerTmp = $null
     try {
+        $InstallerTmp = New-CbmExclusiveSiblingTemp -Destination $InstallerDest
         Copy-Item -LiteralPath $DownloadedInstaller -Destination $InstallerTmp -Force -ErrorAction Stop
         Move-Item -LiteralPath $InstallerTmp -Destination $InstallerDest -Force -ErrorAction Stop
+        $InstallerTmp = $null
         Write-Host "Installed updater -> $InstallerDest"
     } catch {
-        Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        if ($InstallerTmp) {
+            Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "note: could not place install.ps1 in $InstallDir (update will explain where to find it)"
     }
 }
 
-# Verify
+# Verify the executable after its native activation transaction has published
+# the complete runtime set.
 try {
     $ver = & $Dest --version 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) { throw "installed binary exited with code $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {
-    Write-Host "error: installed binary failed to run" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir
+    Write-Host "error: installed binary failed to run: $_" -ForegroundColor Red
     exit 1
 }
 
@@ -334,8 +378,8 @@ if ($SkipConfig) {
 # coordinated activation lease. Do not perform a second registry mutation here
 # after running sessions have been allowed to restart.
 
-# Cleanup
-Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-
 Write-Host ""
 Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp."
+} finally {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+}

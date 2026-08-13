@@ -70,9 +70,9 @@ typedef struct {
  * come from the same monotonic clock domain. */
 cbm_daemon_coordinator_t *cbm_daemon_coordinator_new(uint64_t lease_timeout_ms);
 
-/* A PERMANENT coordinator (backing a `daemon start` generation) never
- * self-transitions to STOPPING when its client count reaches zero; only the
- * explicit stop/drain paths end it. */
+/* A held-open coordinator never self-transitions to STOPPING when its client
+ * count reaches zero. Releasing the hold with no clients transitions it now;
+ * otherwise the final later disconnect does. */
 void cbm_daemon_coordinator_set_permanent(cbm_daemon_coordinator_t *coordinator, bool permanent);
 /* The caller must first quiesce coordinator calls and hook invocations. */
 void cbm_daemon_coordinator_free(cbm_daemon_coordinator_t *coordinator);

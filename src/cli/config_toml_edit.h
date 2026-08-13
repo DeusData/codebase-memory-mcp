@@ -27,6 +27,12 @@ int cbm_toml_escape_basic_string(const char *input, char *out, size_t out_size);
  * without changing the file. */
 int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker, const char *block);
+/* Permit existing descendant tables of a table declared by block. TOML permits
+ * child-before-parent ordering; installers use this to own a parent table while
+ * preserving user-owned child policy. */
+int cbm_toml_upsert_managed_block_preserve_descendants(const char *file_path,
+                                                       const char *begin_marker,
+                                                       const char *end_marker, const char *block);
 int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker);
 

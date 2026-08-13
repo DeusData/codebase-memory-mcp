@@ -7,19 +7,22 @@
 int tf_pass_count = 0;
 int tf_fail_count = 0;
 int tf_skip_count = 0;
+int tf_filter_count = 0;
 
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "foundation/constants.h"
+#include "foundation/profile.h"
+#include "foundation/compat.h"    /* cbm_setenv — #845 supervisor kill switch */
+#include "foundation/compat_fs.h" /* cbm_fopen — worker response file */
+#include "foundation/mem.h"       /* cbm_mem_init — worker budget */
+#include "foundation/platform.h"  /* system RAM-aware worker budget */
+#include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
+#include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
 #include "test_daemon_runtime_contract.h"
-#include "foundation/compat.h"     /* cbm_setenv — #845 supervisor kill switch */
-#include "foundation/compat_fs.h"  /* cbm_fopen — worker response file */
-#include "foundation/mem.h"        /* cbm_mem_init — worker budget */
-#include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
-#include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
-#include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -274,6 +277,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     if (!srv) {
         return 1;
     }
+    cbm_mcp_server_set_response_context(srv, false);
     char *result = cbm_mcp_handle_tool(srv, "index_repository", invocation.args_json);
     if (result) {
         const char *ro = cbm_index_worker_response_out();
@@ -439,6 +443,9 @@ static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
     if (argc != 6 || strcmp(argv[1], "__cbm_runtime_hello_client") != 0) {
         return -1;
     }
+#ifndef _WIN32
+    (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
+#endif
     cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_ipc_endpoint_new(argv[3], argv[2]);
     cbm_daemon_build_identity_t identity = {
         .semantic_version = argv[4],
@@ -468,6 +475,9 @@ static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
     if (argc != 7 || strcmp(argv[1], "__cbm_runtime_activation_client") != 0) {
         return -1;
     }
+#ifndef _WIN32
+    (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
+#endif
     char *action_end = NULL;
     unsigned long action_value = strtoul(argv[6], &action_end, 10);
     bool action_valid = action_end != argv[6] && *action_end == '\0' &&
@@ -544,8 +554,15 @@ static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
+static const char *g_suite_env_filter = NULL;
+static bool g_suite_env_matched = false;
 
 static bool suite_requested(const char *name) {
+    if (g_suite_env_filter) {
+        bool requested = strstr(name, g_suite_env_filter) != NULL;
+        g_suite_env_matched = g_suite_env_matched || requested;
+        return requested;
+    }
     if (g_suite_argc <= 1) {
         return true;
     }
@@ -575,12 +592,16 @@ static bool g_list_only = false;
  * the shard union guard stays consistent. */
 static bool g_skip_perf = false;
 
+/* These two spell the suite name exactly once, into BOTH the list branch and
+ * the run branch, which is what makes --list-suites incapable of drifting from
+ * what executes. They call TF_RUN_SUITE_RAW rather than RUN_SUITE so the
+ * full-run path below can poison RUN_SUITE without disabling them. */
 #define RUN_SELECTED_SUITE(name)             \
     do {                                     \
         if (g_list_only) {                   \
             printf("%s\n", #name);           \
         } else if (suite_requested(#name)) { \
-            RUN_SUITE(name);                 \
+            TF_RUN_SUITE_RAW(name);          \
         }                                    \
     } while (0)
 
@@ -592,7 +613,7 @@ static bool g_skip_perf = false;
         if (g_list_only) {                   \
             printf("%s\n", #name);           \
         } else if (suite_requested(#name)) { \
-            RUN_SUITE(name);                 \
+            TF_RUN_SUITE_RAW(name);          \
         }                                    \
     } while (0)
 
@@ -620,6 +641,7 @@ extern void suite_ac(void);
 extern void suite_store_nodes(void);
 extern void suite_store_edges(void);
 extern void suite_store_search(void);
+extern void suite_store_bulk(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
 extern void suite_mcp_mutation_guard(void);
@@ -670,7 +692,7 @@ extern void suite_java_lsp_coverage(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_rust_lsp(void);
 extern void suite_store_arch(void);
-extern void suite_store_bulk(void);
+extern void suite_httplink(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
@@ -705,6 +727,11 @@ extern void suite_repro_runner_filter(void);
 extern void suite_call_reference_contract(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
+extern void suite_token_reduction(void);
+extern void suite_depindex(void);
+extern void suite_pagerank(void);
+extern void suite_tool_consolidation(void);
+extern void suite_input_validation(void);
 extern void suite_httpd(void);
 extern void suite_security(void);
 extern void suite_yaml(void);
@@ -735,11 +762,124 @@ extern void suite_stack_overflow_b(void);
 extern void suite_stack_overflow_c(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
+extern void suite_schema_declared_property_keys(void);
 
 /* Free the main thread's thread-local node-type bitset cache before exit so
  * LeakSanitizer (Linux x64) doesn't report it. Worker threads free their own
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
+
+/* Capacity for the per-run isolated cache dir path. */
+#define TEST_CACHE_DIR_CAP CBM_PATH_MAX
+/* cbm_setenv() overwrite flag: nonzero = replace an existing value. */
+#define ENV_OVERWRITE 1
+/* Test-only injection used to prove cleanup failures make the runner red. */
+#define TEST_CACHE_CLEANUP_FAIL_ENV "CBM_TEST_FAIL_CACHE_CLEANUP"
+/* Existing integration-test artifact root: setting it opts failed runs into
+ * retaining their isolated cache alongside other diagnostic evidence. */
+#define TEST_ARTIFACT_DIR_ENV "CBM_TEST_ARTIFACT_DIR"
+
+static char test_cache_dir[TEST_CACHE_DIR_CAP];
+static char test_repository_root[CBM_PATH_MAX];
+
+static bool tf_source_checkout_at(const char *candidate) {
+    if (!candidate || !candidate[0]) {
+        return false;
+    }
+    char makefile_path[CBM_PATH_MAX];
+    char fixture_path[CBM_PATH_MAX];
+    int makefile_written =
+        snprintf(makefile_path, sizeof(makefile_path), "%s/Makefile.cbm", candidate);
+    int fixture_written = snprintf(fixture_path, sizeof(fixture_path),
+                                   "%s/vendored/xxhash/xxhash.h", candidate);
+    return makefile_written > 0 && (size_t)makefile_written < sizeof(makefile_path) &&
+           fixture_written > 0 && (size_t)fixture_written < sizeof(fixture_path) &&
+           cbm_file_exists(makefile_path) && cbm_file_exists(fixture_path);
+}
+
+static bool tf_find_source_checkout_upward(char *candidate) {
+    while (candidate && candidate[0]) {
+        if (tf_source_checkout_at(candidate)) {
+            return true;
+        }
+        char *slash = strrchr(candidate, '/');
+        char *backslash = strrchr(candidate, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (!slash) {
+            break;
+        }
+        if (slash == candidate) {
+            candidate[1] = '\0';
+            return tf_source_checkout_at(candidate);
+        }
+        *slash = '\0';
+    }
+    return false;
+}
+
+static void tf_capture_repository_root(const char *runner_path) {
+    test_repository_root[0] = '\0';
+    if (runner_path && runner_path[0] &&
+        cbm_canonical_path(runner_path, test_repository_root, sizeof(test_repository_root))) {
+        char *slash = strrchr(test_repository_root, '/');
+        char *backslash = strrchr(test_repository_root, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (slash) {
+            *slash = '\0';
+            if (tf_find_source_checkout_upward(test_repository_root)) {
+                return;
+            }
+        }
+    }
+    if (!cbm_canonical_path(".", test_repository_root, sizeof(test_repository_root)) ||
+        !tf_find_source_checkout_upward(test_repository_root)) {
+        test_repository_root[0] = '\0';
+    }
+}
+
+const char *tf_repository_root(void) {
+    return test_repository_root[0] ? test_repository_root : NULL;
+}
+
+static int cleanup_test_cache(void) {
+    if (!test_cache_dir[0]) {
+        return 0;
+    }
+    /* Retention is explicit. Ordinary red and green runs both clean the exact
+     * runner-owned root; CBM_TEST_ARTIFACT_DIR opts a failed run into keeping
+     * its cache for debugging. Forked children use _exit() and cannot run this
+     * inherited atexit handler. */
+    const char *artifact_dir = getenv(TEST_ARTIFACT_DIR_ENV);
+    if (tf_fail_count != 0 && artifact_dir && artifact_dir[0] != '\0') {
+        fprintf(stderr, "retained failed test cache: %s\n", test_cache_dir);
+        return 0;
+    }
+    if (getenv(TEST_CACHE_CLEANUP_FAIL_ENV)) {
+        return -1;
+    }
+    if (th_rmtree(test_cache_dir) != 0) {
+        return -1;
+    }
+    test_cache_dir[0] = '\0';
+    return 0;
+}
+
+static void cleanup_test_cache_at_exit(void) {
+    if (cleanup_test_cache() != 0) {
+        fprintf(stderr, "warning: failed to remove test cache: %s\n", test_cache_dir);
+    }
+}
+
+static void require_test_cache_cleanup(void) {
+    if (cleanup_test_cache() != 0) {
+        fprintf(stderr, "failed to remove test cache: %s\n", test_cache_dir);
+        tf_fail_count++;
+    }
+}
 
 int main(int argc, char **argv) {
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
@@ -753,6 +893,7 @@ int main(int argc, char **argv) {
         (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
                          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
     }
+    tf_capture_repository_root(argc > 0 ? argv[0] : NULL);
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
         return blocking_git_rc;
@@ -824,9 +965,16 @@ int main(int argc, char **argv) {
 
     const char *skip_perf_env = getenv("CBM_SKIP_PERF");
     g_skip_perf = skip_perf_env != NULL && strcmp(skip_perf_env, "1") == 0;
+    const char *only_suite = getenv("CBM_ONLY_SUITE");
+    g_suite_env_filter = only_suite && only_suite[0] ? only_suite : NULL;
     if (argc == 2 && strcmp(argv[1], "--list-suites") == 0) {
         g_list_only = true;
         g_suite_argc = 1; /* no suite-name args to match */
+    } else if (g_suite_env_filter) {
+        /* The environment substring selector and argv exact-name selector are
+         * alternate interfaces to the same canonical suite registry below. */
+        g_suite_argc = 1;
+        g_suite_argv = argv;
     } else {
         g_suite_argc = argc;
         g_suite_argv = argv;
@@ -841,6 +989,55 @@ int main(int argc, char **argv) {
     if (!g_list_only) {
         printf("\n  codebase-memory-mcp  C test suite\n");
     }
+
+    /* DEFAULT-ON store isolation: redirect every test index into a per-run
+     * temp dir so the suite never pollutes the user's real
+     * ~/.cache/codebase-memory-mcp. Opt out with CBM_TEST_NO_ISOLATE=1 (e.g.
+     * to debug against the real store).
+     *
+     * Works because every test helper now builds its db path via
+     * cbm_resolve_cache_dir() (honors CBM_CACHE_DIR), matching the pipeline
+     * write path. Earlier these helpers hardcoded ~/.cache and mismatched the
+     * CBM_CACHE_DIR-honoring write → 815 empty-store failures. The production
+     * path (pipeline.c + mcp.c) honors CBM_CACHE_DIR regardless. */
+    const char *no_iso = getenv("CBM_TEST_NO_ISOLATE");
+    if (!no_iso || no_iso[0] == '\0') {
+        const char *artifact_dir = getenv(TEST_ARTIFACT_DIR_ENV);
+        const char *cache_parent =
+            artifact_dir && artifact_dir[0] != '\0' ? artifact_dir : cbm_tmpdir();
+        if (artifact_dir && artifact_dir[0] != '\0' && !cbm_mkdir_p(artifact_dir, 0755)) {
+            fprintf(stderr, "failed to create test artifact directory: %s\n", artifact_dir);
+            return 1;
+        }
+        int n = snprintf(test_cache_dir, sizeof(test_cache_dir), "%s/cbm-test-cache-XXXXXX",
+                         cache_parent);
+        if (n < 0 || (size_t)n >= sizeof(test_cache_dir) || !cbm_mkdtemp(test_cache_dir)) {
+            fprintf(stderr, "failed to create isolated test cache\n");
+            return 1;
+        }
+        if (cbm_setenv("CBM_CACHE_DIR", test_cache_dir, ENV_OVERWRITE) != 0 ||
+            atexit(cleanup_test_cache_at_exit) != 0) {
+            fprintf(stderr, "failed to initialize isolated test cache\n");
+            th_cleanup(test_cache_dir);
+            return 1;
+        }
+    }
+
+/* Every suite from here down MUST go through RUN_SELECTED_SUITE. A bare
+ * RUN_SUITE would still execute the suite while leaving it out of
+ * --list-suites, and that failure returns success at every layer: the shard
+ * union guard in scripts/run-tests-parallel.sh builds both the slices and the
+ * expected result set from --list-suites, so it would compare the list against
+ * itself and pass, while the unlisted suite ran inside every other suite's
+ * invocation — unselectable by argv, counted against whichever suite was
+ * nominally running, and executed once per shard instead of once per leg. It
+ * would also run under `make test-tsan`, which passes TEST_TSAN_SUITES as argv
+ * (Makefile.cbm:997), defeating that list's documented exclusions.
+ * Poisoning the raw spelling turns that into a compile error naming the fix.
+ * CBM_ONLY_SUITE and argv selection both flow through this registry. */
+#undef RUN_SUITE
+#define RUN_SUITE(name) \
+    RUN_SUITE_is_poisoned_in_the_full_run_path__use_RUN_SELECTED_SUITE(name)
 
     /* Foundation */
     RUN_SELECTED_SUITE(arena);
@@ -875,6 +1072,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(store_pragmas);
     RUN_SELECTED_SUITE(store_checkpoint);
     RUN_SELECTED_SUITE(dump_verify_io);
+    RUN_SELECTED_SUITE(schema_declared_property_keys);
 
     /* Cypher (M6) */
     RUN_SELECTED_SUITE(cypher);
@@ -964,6 +1162,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(store_arch);
 
     /* HTTP link */
+    RUN_SELECTED_SUITE(httplink);
 
     /* Traces helpers */
     RUN_SELECTED_SUITE(traces);
@@ -998,8 +1197,23 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
 
-    /* UI (config, external asset pack, layout) */
+    /* UI (config, embedded assets, layout) */
     RUN_SELECTED_SUITE(ui);
+
+    /* Token reduction */
+    RUN_SELECTED_SUITE(token_reduction);
+
+    /* Dependency indexing */
+    RUN_SELECTED_SUITE(depindex);
+
+    /* PageRank (node + edge ranking) */
+    RUN_SELECTED_SUITE(pagerank);
+
+    /* Tool consolidation (Phase 9) */
+    RUN_SELECTED_SUITE(tool_consolidation);
+
+    /* Input validation (fuzz-derived) */
+    RUN_SELECTED_SUITE(input_validation);
 
     /* UI HTTP server (transport + routing) */
     RUN_SELECTED_SUITE(httpd);
@@ -1064,11 +1278,16 @@ int main(int argc, char **argv) {
     if (g_suite_argc > 1 && !any_suite_matched) {
         fprintf(stderr, "No matching test suites requested\n");
     }
+    if (g_suite_env_filter && !g_suite_env_matched) {
+        fprintf(stderr, "Unknown CBM_ONLY_SUITE selector: %s\n", g_suite_env_filter);
+        tf_fail_count++;
+    }
     free(g_suite_arg_matched);
     g_suite_arg_matched = NULL;
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();
     sqlite3_shutdown();
+    require_test_cache_cleanup();
     TEST_SUMMARY();
 }

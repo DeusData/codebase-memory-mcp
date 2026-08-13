@@ -59,6 +59,19 @@ static int find_resolved(const CBMFileResult *r, const char *callerSub, const ch
     return -1;
 }
 
+static int find_resolved_strategy(const CBMFileResult *r, const char *callerSub,
+                                  const char *calleeSub, const char *strategy) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->confidence > 0 && rc->caller_qn && rc->callee_qn && rc->strategy &&
+            strstr(rc->caller_qn, callerSub) && strstr(rc->callee_qn, calleeSub) &&
+            strcmp(rc->strategy, strategy) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int require_resolved(const CBMFileResult *r, const char *callerSub, const char *calleeSub) {
     int idx = find_resolved(r, callerSub, calleeSub);
     if (idx < 0) {
@@ -1181,6 +1194,16 @@ TEST(tslsp_jsx_nested_component) {
                     "function Outer(): JSX.Element { return <div><Inner/></div>; }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, "Outer", "Inner"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_jsx_relative_import_waits_for_cross_file_qn) {
+    CBMFileResult *r =
+        extract_tsx("import { Widget } from './widget';\n"
+                    "function App(): JSX.Element { return <Widget />; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved_strategy(r, "App", "./widget.Widget", "lsp_ts_jsx_import"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -2703,6 +2726,35 @@ TEST(tslsp_baseline_vs_lsp_simple) {
 
     /* LSP must resolve at least 1 more call than baseline (the typed dispatch). */
     ASSERT(lr >= br + 1);
+    PASS();
+}
+
+static bool lsp_disabled_false_value_keeps_ts_lsp_enabled(const char *value) {
+    const char *source = "class Conn { ping(): void {} }\n"
+                         "function go(c: Conn) { c.ping(); }\n";
+
+    cbm_setenv("CBM_LSP_DISABLED", "1", 1);
+    CBMFileResult *base = extract_ts(source);
+    int br = 0, bu = 0, bt = 0;
+    count_calls(base, &br, &bu, &bt);
+    cbm_free_result(base);
+
+    cbm_setenv("CBM_LSP_DISABLED", value, 1);
+    CBMFileResult *lsp = extract_ts(source);
+    int lr = 0, lu = 0, lt = 0;
+    count_calls(lsp, &lr, &lu, &lt);
+    cbm_free_result(lsp);
+
+    cbm_unsetenv("CBM_LSP_DISABLED");
+    return lr >= br + 1;
+}
+
+TEST(tslsp_disabled_false_values_keep_lsp_enabled) {
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("0"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("false"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("False"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("off"));
+    ASSERT(lsp_disabled_false_value_keeps_ts_lsp_enabled("NO"));
     PASS();
 }
 
@@ -4325,6 +4377,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_jsx_local_tag_shadow_blocks_module_component);
     RUN_TEST(tslsp_jsx_intrinsic_skipped);
     RUN_TEST(tslsp_jsx_nested_component);
+    RUN_TEST(tslsp_jsx_relative_import_waits_for_cross_file_qn);
 
     /* Category 23: TSX combined */
     RUN_TEST(tslsp_tsx_typed_props_method_call);
@@ -4516,6 +4569,7 @@ SUITE(ts_lsp) {
 
     /* LSP vs baseline comparison (requires CBM_LSP_DISABLED knob in resolver) */
     RUN_TEST(tslsp_baseline_vs_lsp_simple);
+    RUN_TEST(tslsp_disabled_false_values_keep_lsp_enabled);
     RUN_TEST(tslsp_baseline_vs_lsp_chained);
     RUN_TEST(tslsp_baseline_vs_lsp_callbacks);
     RUN_TEST(tslsp_baseline_vs_lsp_narrowing);

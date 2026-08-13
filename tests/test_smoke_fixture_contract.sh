@@ -47,6 +47,8 @@ pr_workflow = read(".github/workflows/pr.yml")
 test_driver = read("scripts/test.sh")
 cli_source = read("src/cli/cli.c")
 helper_source = read(helper_relative)
+windows_installer = read("install.ps1")
+release_workflow = read(".github/workflows/release.yml")
 
 # The server owns the ephemeral bind. A parent-side socket probe followed by
 # python -m http.server would reintroduce the close/rebind race this guards.
@@ -160,6 +162,12 @@ require(
     "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" in smoke_local
     and "${SUFFIX}" not in smoke_local,
     "smoke-local.sh must create the single canonical archive with no variant alias",
+)
+require(
+    "Usage: scripts/smoke-local.sh <binary>" in smoke_local
+    and "[standard|ui]" not in smoke_local
+    and "if [ $# -gt 1 ]" in smoke_local,
+    "smoke-local.sh must reject the retired release-variant argument",
 )
 require(
     "codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz" in smoke_local,
@@ -323,6 +331,45 @@ require(
     "PR Windows smoke must call vm-smoke.sh with SMOKE_ARCH=amd64",
 )
 smoke_test = read("scripts/smoke-test.sh")
+require(
+    'get_graph_schema --project "$PROJECT" --format json' in smoke_test
+    and r'\"format\":\"json\"' in smoke_test,
+    "JSON-parsed schema assertions must request JSON independently of the configured default",
+)
+require(
+    r"rows\[[0-9][0-9]*\]" in smoke_test
+    and r"clusters\[\([0-9]*\)\]" in smoke_test
+    and r"semantic\[[0-9]+\]" in smoke_test,
+    "TOON assertions must recognize current table[N]{columns}: headers",
+)
+require(
+    "sleep 300 |" not in smoke_test
+    and 'mkfifo "$UI_INPUT"' in smoke_test
+    and 'exec 7>"$UI_INPUT"' in smoke_test
+    and "smoke_ui_stop" in smoke_test,
+    "Phase 15 must own and close its UI stdin FIFO instead of leaving a timer child",
+)
+require(
+    'UNINSTALL_BINARY="$SELF_PATH"' in smoke_test
+    and '"$CLEAN_UNINSTALLER" uninstall -y -n' in smoke_test
+    and '"$DBL_UNINSTALLER" uninstall -y -n' in smoke_test
+    and '"$DBL_RETRY_UNINSTALLER" uninstall -y -n' in smoke_test,
+    "smoke uninstall cases must run disposable fixture executables, never delete the "
+    "build input needed by later phases",
+)
+require(
+    "GetRandomFileName" in windows_installer
+    and "[System.IO.FileMode]::CreateNew" in windows_installer
+    and windows_installer.count("New-CbmExclusiveSiblingTemp") == 2
+    and '$Destination.new-$PID' not in windows_installer
+    and '$InstallerDest.new' not in windows_installer,
+    "install.ps1 must reserve an unpredictable sibling temp exclusively for the updater only",
+)
+require(
+    'ARCHIVE_DIR="$RUNNER_TEMP/release-archives"' in release_workflow
+    and 'scripts/ci/extract-release-archives.sh "$ARCHIVE_DIR" binaries' in release_workflow,
+    "release verification must feed the canonical extractor from an isolated archive directory",
+)
 require(
     "MSYS2_ARG_CONV_EXCL='*'" in smoke_test
     and 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File' in smoke_test

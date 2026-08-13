@@ -31,6 +31,7 @@ static _Atomic CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
  * in a static initializer. The cast makes it an address constant. */
 static _Atomic cbm_log_sink_fn g_log_sink = (cbm_log_sink_fn)NULL;
 static _Atomic CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
+static atomic_bool g_profile_stderr_mirror = false;
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
@@ -96,6 +97,10 @@ void cbm_log_set_sink_ex(cbm_log_sink_fn fn, CBMLogSinkMode mode) {
      * never see the mode belonging to the PREVIOUS sink. */
     atomic_store_explicit(&g_log_sink_mode, mode, memory_order_relaxed);
     atomic_store_explicit(&g_log_sink, fn, memory_order_relaxed);
+}
+
+void cbm_log_set_profile_stderr_mirror(bool enabled) {
+    atomic_store_explicit(&g_profile_stderr_mirror, enabled, memory_order_relaxed);
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
@@ -275,6 +280,12 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
 
     finish_line(line_buf, sizeof(line_buf), pos);
     emit_line(line_buf);
+    cbm_log_sink_fn sink = atomic_load_explicit(&g_log_sink, memory_order_relaxed);
+    CBMLogSinkMode sink_mode = atomic_load_explicit(&g_log_sink_mode, memory_order_relaxed);
+    if (sink && sink_mode == CBM_LOG_SINK_REPLACE && msg && strcmp(msg, "prof") == 0 &&
+        atomic_load_explicit(&g_profile_stderr_mirror, memory_order_relaxed)) {
+        (void)fprintf(stderr, "%s\n", line_buf);
+    }
 }
 
 void cbm_log_control_record(const char *msg, ...) {

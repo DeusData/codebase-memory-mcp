@@ -174,7 +174,9 @@ static cbm_store_t *es_lang_open_indexed(ES_LangProj *lp) {
         home = "/tmp";
     }
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    /* Honor CBM_CACHE_DIR so this matches the pipeline write path (test isolation). */
+    snprintf(cache_dir, sizeof(cache_dir), "%s",
+             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp");
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
@@ -497,7 +499,7 @@ TEST(es_inherits_crossfile_cpp) {
 /* Python cross-file INHERITS — expected RED (extraction bug: base_classes
  * holds "(Animal)" with parens, not "Animal").
  * Reproduction: confirms the end-to-end gap from extraction to graph edge. */
-TEST(es_inherits_crossfile_python_red) {
+TEST(es_inherits_crossfile_python) {
     static const ES_LangFile f[] = {
         {"animal.py",
          "class Animal:\n    def speak(self):\n        return 0\n"},
@@ -512,11 +514,14 @@ TEST(es_inherits_crossfile_python_red) {
     cbm_store_t *store = es_lang_index_files(&lp, f, 2);
     int got = store ? cbm_store_count_edges_by_type(store, lp.project, "INHERITS") : -1;
     if (got >= 1) {
-        fprintf(stderr, "  [ES-EDGE] UNEXPECTED PASS: Python cross-file INHERITS got=%d "
-                        "(extraction bug may have been fixed — promote to GREEN)\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] Python cross-file INHERITS CAPABILITY PRESENT "
+                "(baseline expected absent) got=%d\n",
+                got);
     } else {
-        fprintf(stderr, "  [ES-EDGE] CONFIRMED RED: Python cross-file INHERITS got=%d "
-                        "(extraction bug reproduces end-to-end)\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] Python cross-file INHERITS OBSERVED GAP (assertion follows) got=%d\n",
+                got);
     }
     es_lang_cleanup(&lp, store);
     /* Assert the CORRECT outcome: edge should be present.
@@ -527,7 +532,7 @@ TEST(es_inherits_crossfile_python_red) {
 
 /* TypeScript cross-file INHERITS — expected RED (extractor stores "extends"
  * keyword instead of the base type name). */
-TEST(es_inherits_crossfile_typescript_red) {
+TEST(es_inherits_crossfile_typescript) {
     static const ES_LangFile f[] = {
         {"base.ts",
          "export class Base {\n    value(): number { return 0; }\n}\n"},
@@ -543,10 +548,15 @@ TEST(es_inherits_crossfile_typescript_red) {
     cbm_store_t *store = es_lang_index_files(&lp, f, 2);
     int got = store ? cbm_store_count_edges_by_type(store, lp.project, "INHERITS") : -1;
     if (got >= 1) {
-        fprintf(stderr, "  [ES-EDGE] UNEXPECTED PASS: TypeScript cross-file INHERITS got=%d "
-                        "(promote to GREEN if extraction fixed)\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] TypeScript cross-file INHERITS CAPABILITY PRESENT "
+                "(baseline expected absent) got=%d\n",
+                got);
     } else {
-        fprintf(stderr, "  [ES-EDGE] CONFIRMED RED: TypeScript cross-file INHERITS got=%d\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] TypeScript cross-file INHERITS OBSERVED GAP (assertion follows) "
+                "got=%d\n",
+                got);
     }
     es_lang_cleanup(&lp, store);
     ASSERT_TRUE(got >= 1); /* FAILS (RED) until TS extraction fixed */
@@ -554,7 +564,7 @@ TEST(es_inherits_crossfile_typescript_red) {
 }
 
 /* PHP cross-file INHERITS — expected RED (base_classes never populated). */
-TEST(es_inherits_crossfile_php_red) {
+TEST(es_inherits_crossfile_php) {
     static const ES_LangFile f[] = {
         {"Base.php",
          "<?php\nclass Base {\n    public function value() { return 0; }\n}\n"},
@@ -568,10 +578,14 @@ TEST(es_inherits_crossfile_php_red) {
     cbm_store_t *store = es_lang_index_files(&lp, f, 2);
     int got = store ? cbm_store_count_edges_by_type(store, lp.project, "INHERITS") : -1;
     if (got >= 1) {
-        fprintf(stderr, "  [ES-EDGE] UNEXPECTED PASS: PHP cross-file INHERITS got=%d "
-                        "(promote to GREEN)\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] PHP cross-file INHERITS CAPABILITY PRESENT "
+                "(baseline expected absent) got=%d\n",
+                got);
     } else {
-        fprintf(stderr, "  [ES-EDGE] CONFIRMED RED: PHP cross-file INHERITS got=%d\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] PHP cross-file INHERITS OBSERVED GAP (assertion follows) got=%d\n",
+                got);
     }
     es_lang_cleanup(&lp, store);
     ASSERT_TRUE(got >= 1); /* FAILS (RED) until PHP extraction fixed */
@@ -579,7 +593,7 @@ TEST(es_inherits_crossfile_php_red) {
 }
 
 /* Kotlin cross-file INHERITS — expected RED (`:` supertype syntax not parsed). */
-TEST(es_inherits_crossfile_kotlin_red) {
+TEST(es_inherits_crossfile_kotlin) {
     static const ES_LangFile f[] = {
         {"Base.kt",
          "open class Base {\n    open fun value(): Int = 0\n}\n"},
@@ -592,10 +606,14 @@ TEST(es_inherits_crossfile_kotlin_red) {
     cbm_store_t *store = es_lang_index_files(&lp, f, 2);
     int got = store ? cbm_store_count_edges_by_type(store, lp.project, "INHERITS") : -1;
     if (got >= 1) {
-        fprintf(stderr, "  [ES-EDGE] UNEXPECTED PASS: Kotlin cross-file INHERITS got=%d "
-                        "(promote to GREEN)\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] Kotlin cross-file INHERITS CAPABILITY PRESENT "
+                "(baseline expected absent) got=%d\n",
+                got);
     } else {
-        fprintf(stderr, "  [ES-EDGE] CONFIRMED RED: Kotlin cross-file INHERITS got=%d\n", got);
+        fprintf(stderr,
+                "  [ES-EDGE] Kotlin cross-file INHERITS OBSERVED GAP (assertion follows) got=%d\n",
+                got);
     }
     es_lang_cleanup(&lp, store);
     ASSERT_TRUE(got >= 1); /* FAILS (RED) until Kotlin extraction fixed */
@@ -920,10 +938,10 @@ SUITE(edge_structural) {
     RUN_TEST(es_inherits_crossfile_csharp);
     RUN_TEST(es_inherits_crossfile_cpp);
     /* RED: Python, TypeScript, PHP, Kotlin (extraction bugs). */
-    RUN_TEST(es_inherits_crossfile_python_red);
-    RUN_TEST(es_inherits_crossfile_typescript_red);
-    RUN_TEST(es_inherits_crossfile_php_red);
-    RUN_TEST(es_inherits_crossfile_kotlin_red);
+    RUN_TEST(es_inherits_crossfile_python);
+    RUN_TEST(es_inherits_crossfile_typescript);
+    RUN_TEST(es_inherits_crossfile_php);
+    RUN_TEST(es_inherits_crossfile_kotlin);
 
     /* ── FAMILY 3: IMPLEMENTS cross-file (Rust) ──────────────── */
     /* Expected GREEN: project-wide registry covers both files. */

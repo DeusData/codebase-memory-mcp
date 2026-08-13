@@ -206,7 +206,7 @@ typedef struct {
     int loop_depth;           // max nested-loop depth (bottleneck proxy)
     bool is_recursive;        // body contains a direct self-call (seed for "recursive")
     int param_count;          // number of parameters (large = complexity smell)
-    int max_access_depth;     // deepest chained member/subscript access (a.b.c.d)
+    int max_access_depth;     // deepest chained member/subscript sequence, such as a.b.c.d
     int linear_scan_in_loop;  // count of linear-scan calls (find/contains/indexOf) inside loops
     int alloc_in_loop;        // count of allocation/append calls inside loops
     bool recursion_in_loop;   // a self-call occurs inside a loop body
@@ -257,6 +257,8 @@ typedef struct {
     uint32_t site_start_byte;           // exact AST occurrence span; end > start when present
     uint32_t site_end_byte;             // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;      // raw source or C-family preprocessed buffer
+    bool is_macro_invocation;           // call syntax is a language macro invocation (e.g. Rust
+                                        // `matches!`), not an ordinary function/member call
     bool is_method;                     // method/member call with a non-self receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
                                         // x.foo() whose receiver is not this/super. Default false.
@@ -582,6 +584,7 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
+    bool extract_macros;                         // C/C++ #define Macro nodes for full mode
     EFCache ef_cache;                            // enclosing function cache
     const char *enclosing_class_qn;              // for nested class QN computation
     CBMStringConstantMap string_constants;       // module-level NAME = "value" pairs
@@ -639,6 +642,21 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char **extra_defines, // NULL-terminated, or NULL
                                 const char **include_paths  // NULL-terminated, or NULL
 );
+CBMFileResult *cbm_extract_file_with_options(const char *source, int source_len,
+                                             CBMLanguage language, const char *project,
+                                             const char *rel_path, int64_t timeout_micros,
+                                             const char **extra_defines, const char **include_paths,
+                                             bool extract_macros);
+
+/* Canonical compositional entry point for pipeline extraction. Every option is
+ * explicit so concurrent pipelines never depend on process-global settings. */
+CBMFileResult *cbm_extract_file_with_options_ex(const char *source, int source_len,
+                                                CBMLanguage language, const char *project,
+                                                const char *rel_path, int64_t timeout_micros,
+                                                const char **extra_defines,
+                                                const char **include_paths, bool extract_macros,
+                                                const CBMMacroTable *macro_table,
+                                                const CBMReturnTypeTable *return_type_table);
 
 // Pipeline-internal variant of cbm_extract_file() carrying ObjectScript
 // per-project tables (macro table + method-return-type table). The public
@@ -684,6 +702,8 @@ uint64_t cbm_get_preprocess_ns(void);
 uint64_t cbm_get_files_preprocessed(void);
 void cbm_reset_profile(void);
 
+// Toggle the default for direct cbm_extract_file() callers. Pipelines pass this
+// explicitly via cbm_extract_file_with_options(), avoiding cross-pipeline races.
 #if defined(CBM_KOTLIN_DEDUP_TEST_API) && CBM_KOTLIN_DEDUP_TEST_API
 // Test-build-only operation counter for Kotlin operator-carrier deduplication.
 // Production builds do not expose or retain this instrumentation.
@@ -706,6 +726,12 @@ void cbm_set_macro_extraction(int enabled);
 int cbm_macro_extraction_enabled(void);
 
 // --- Internal helpers used by extractors ---
+
+// True for labels that describe user-defined types and can be registry targets.
+bool cbm_label_is_type_like(const char *label);
+
+// True for definition labels where duplicate QNs should keep the richest source span.
+bool cbm_label_uses_source_span_selection(const char *label);
 
 // Growable array push functions (arena-allocated, no individual free needed).
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);

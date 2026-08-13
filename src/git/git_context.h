@@ -21,6 +21,9 @@ typedef struct {
 
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
+/* Resolve only the current branch for branch-only callers. Returns a heap
+ * string (including "DETACHED") through out_branch on success. */
+int cbm_git_current_branch(const char *path, char **out_branch);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
 

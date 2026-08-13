@@ -23,7 +23,7 @@ Exit code: 0 == all drives advertised in roots and reachable (green),
 2 == precondition not met (no UI build / server down).
 
 Usage:
-    python test_ui_drive_listing.py <path-to-codebase-memory-mcp-ui[.exe]> [port]
+    python test_ui_drive_listing.py <path-to-codebase-memory-mcp[.exe]> [port]
 """
 import json
 import os
@@ -94,7 +94,7 @@ def norm(s):
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: python test_ui_drive_listing.py <ui-binary> [port]")
+        print("usage: python test_ui_drive_listing.py <codebase-memory-mcp.exe> [port]")
         return 2
     binary = os.path.abspath(sys.argv[1])
     if not os.path.exists(binary):

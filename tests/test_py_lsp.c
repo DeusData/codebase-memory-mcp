@@ -637,6 +637,43 @@ TEST(pylsp_fused_self_attr_chain_via_overlay) {
     PASS();
 }
 
+TEST(pylsp_module_class_epoch_survives_reversed_registry_order) {
+    const char *source = "External()\n"
+                         "LocalB()\n"
+                         "class LocalB:\n"
+                         "    pass\n"
+                         "LocalA()\n"
+                         "class LocalA:\n"
+                         "    pass\n";
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    const char *names[] = {"LocalA", "External", "LocalB"};
+    const char *qns[] = {"test.mod.LocalA", "test.mod.External", "test.mod.LocalB"};
+    for (int i = 0; i < 3; i++) {
+        defs[i].qualified_name = qns[i];
+        defs[i].short_name = names[i];
+        defs[i].label = "Class";
+        defs[i].def_module_qn = "test.mod";
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 3);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.mod", reg, NULL,
+                                       NULL, 0, NULL, &out, NULL);
+
+    ASSERT_GTE(find_resolved_arr(&out, "__module__", "External"), 0);
+    ASSERT_EQ(find_resolved_arr(&out, "__module__", "LocalA"), -1);
+    ASSERT_EQ(find_resolved_arr(&out, "__module__", "LocalB"), -1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Issue #228: a class/static method invoked directly on a CROSS-FILE imported
  * class name — ActionRecordX.build_from_text(...) — produced no CALLS edge, so
  * the method showed in/out degree 0 and was flagged as dead code. Distinct from
@@ -672,6 +709,61 @@ TEST(pylsp_crossfile_classmethod_on_class_issue228) {
 
     ASSERT_GTE(find_resolved_arr(&out, "run_plain_flow", "build_from_text"), 0);
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(pylsp_crossfile_apirouter_self_method_registry_parity) {
+    const char *source =
+        "class APIRouter:\n"
+        "    def add_api_route(self):\n"
+        "        return None\n"
+        "    def include_router(self):\n"
+        "        self.add_api_route()\n";
+
+    enum { APIROUTER_DEF_COUNT = 3 };
+    CBMLSPDef defs[APIROUTER_DEF_COUNT];
+    memset(defs, 0, sizeof(defs));
+
+    defs[0].qualified_name = "fastapi.routing.APIRouter";
+    defs[0].short_name = "APIRouter";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "fastapi.routing";
+    defs[0].lang = CBM_LANG_PYTHON;
+
+    defs[1].qualified_name = "fastapi.routing.APIRouter.add_api_route";
+    defs[1].short_name = "add_api_route";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "fastapi.routing.APIRouter";
+    defs[1].def_module_qn = "fastapi.routing";
+    defs[1].lang = CBM_LANG_PYTHON;
+
+    defs[2].qualified_name = "fastapi.routing.APIRouter.include_router";
+    defs[2].short_name = "include_router";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "fastapi.routing.APIRouter";
+    defs[2].def_module_qn = "fastapi.routing";
+    defs[2].lang = CBM_LANG_PYTHON;
+
+    CBMArena direct_arena;
+    cbm_arena_init(&direct_arena);
+    CBMResolvedCallArray direct_out = {0};
+    cbm_run_py_lsp_cross(&direct_arena, source, (int)strlen(source), "fastapi.routing", defs,
+                         APIROUTER_DEF_COUNT, NULL, NULL, 0, NULL, &direct_out, NULL);
+    ASSERT_GTE(find_resolved_arr(&direct_out, "include_router", "add_api_route"), 0);
+
+    CBMArena registry_arena;
+    cbm_arena_init(&registry_arena);
+    CBMTypeRegistry *reg =
+        cbm_py_build_cross_registry(&registry_arena, defs, APIROUTER_DEF_COUNT);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray registry_out = {0};
+    cbm_run_py_lsp_cross_with_registry(&registry_arena, source, (int)strlen(source),
+                                       "fastapi.routing", reg, NULL, NULL, 0, NULL,
+                                       &registry_out, NULL);
+    ASSERT_GTE(find_resolved_arr(&registry_out, "include_router", "add_api_route"), 0);
+
+    cbm_arena_destroy(&registry_arena);
+    cbm_arena_destroy(&direct_arena);
     PASS();
 }
 
@@ -2194,7 +2286,9 @@ SUITE(py_lsp) {
     /* Phase 9 — cross-file + batch */
     RUN_TEST(pylsp_crossfile_method_dispatch);
     RUN_TEST(pylsp_fused_self_attr_chain_via_overlay);
+    RUN_TEST(pylsp_module_class_epoch_survives_reversed_registry_order);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
+    RUN_TEST(pylsp_crossfile_apirouter_self_method_registry_parity);
     RUN_TEST(pylsp_crossfile_inheritance);
     RUN_TEST(pylsp_batch_two_files);
     RUN_TEST(pylsp_from_import_alias_equal_module_leaf_targets_imported_member);

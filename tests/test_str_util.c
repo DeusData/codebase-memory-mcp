@@ -103,6 +103,22 @@ TEST(str_contains) {
     PASS();
 }
 
+TEST(str_copy_fixed_buffer) {
+    char buf[6] = {'x', 'x', 'x', 'x', 'x', 'x'};
+    ASSERT_TRUE(cbm_str_copy(buf, sizeof(buf), "hello"));
+    ASSERT_STR_EQ(buf, "hello");
+
+    ASSERT_FALSE(cbm_str_copy(buf, sizeof(buf), "hello world"));
+    ASSERT_STR_EQ(buf, "hello");
+
+    ASSERT_TRUE(cbm_str_copy(buf, sizeof(buf), NULL));
+    ASSERT_STR_EQ(buf, "");
+
+    ASSERT_FALSE(cbm_str_copy(NULL, sizeof(buf), "x"));
+    ASSERT_FALSE(cbm_str_copy(buf, 0, "x"));
+    PASS();
+}
+
 TEST(str_tolower) {
     setup();
     ASSERT_STR_EQ(cbm_str_tolower(&a, "Hello World"), "hello world");
@@ -352,6 +368,11 @@ TEST(path_base_trailing_slash) {
     PASS();
 }
 
+TEST(path_base_backslash_separator) {
+    ASSERT_STR_EQ(cbm_path_base("dir\\package.json"), "package.json");
+    PASS();
+}
+
 /* ── validate_shell_arg tests ─────────────────────────────────── */
 
 TEST(validate_shell_arg_null) {
@@ -424,15 +445,38 @@ TEST(validate_shell_arg_spaces) {
     PASS();
 }
 
-/* ── JSON Escaping tests ──────────────────────────────────────── */
-
 TEST(json_escape_control_chars) {
     char buf[64];
-    const char *input = "A\x01"
-                        "B\n";
+    const char input[] = {'A', 0x01, 'B', '\n', 0x1f, '\0'};
+
     int len = cbm_json_escape(buf, sizeof(buf), input);
-    ASSERT_STR_EQ(buf, "A\\u0001B\\n");
-    ASSERT_EQ(len, 10);
+
+    ASSERT_STR_EQ(buf, "A\\u0001B\\n\\u001f");
+    ASSERT_EQ(len, 16);
+    PASS();
+}
+
+TEST(json_escaped_len_matches_writer) {
+    const char input[] = {'A', '"', '\\', '\n', '\r', '\t', 0x01, 0x1f, 'Z', '\0'};
+    char buf[64];
+
+    size_t needed = cbm_json_escaped_len(input);
+    int written = cbm_json_escape(buf, sizeof(buf), input);
+
+    ASSERT_EQ(needed, 24);
+    ASSERT_EQ((size_t)written, needed);
+    ASSERT_EQ(strlen(buf), needed);
+    ASSERT_EQ(cbm_json_escaped_len(""), 0);
+    ASSERT_EQ(cbm_json_escaped_len(NULL), 0);
+
+    for (int byte = 1; byte <= 0xff; byte++) {
+        char single[] = {(char)byte, '\0'};
+        char escaped[8];
+        size_t single_needed = cbm_json_escaped_len(single);
+        int single_written = cbm_json_escape(escaped, sizeof(escaped), single);
+        ASSERT_EQ((size_t)single_written, single_needed);
+        ASSERT_EQ(strlen(escaped), single_needed);
+    }
     PASS();
 }
 
@@ -493,6 +537,7 @@ SUITE(str_util) {
     RUN_TEST(str_starts_with);
     RUN_TEST(str_ends_with);
     RUN_TEST(str_contains);
+    RUN_TEST(str_copy_fixed_buffer);
     RUN_TEST(str_tolower);
     RUN_TEST(str_replace_char);
     RUN_TEST(str_strip_ext);
@@ -531,6 +576,7 @@ SUITE(str_util) {
     RUN_TEST(path_base_empty);
     RUN_TEST(path_base_just_filename);
     RUN_TEST(path_base_trailing_slash);
+    RUN_TEST(path_base_backslash_separator);
     /* validate_shell_arg */
     RUN_TEST(validate_shell_arg_null);
     RUN_TEST(validate_shell_arg_safe);
@@ -547,6 +593,7 @@ SUITE(str_util) {
     RUN_TEST(validate_shell_arg_spaces);
     /* JSON Escaping */
     RUN_TEST(json_escape_control_chars);
+    RUN_TEST(json_escaped_len_matches_writer);
     /* SNPRINTF_APPEND */
     RUN_TEST(snprintf_append_basic);
     RUN_TEST(snprintf_append_fills_exactly);

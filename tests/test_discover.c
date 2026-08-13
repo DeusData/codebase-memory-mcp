@@ -7,6 +7,7 @@
 #include "test_helpers.h"
 #include "discover/discover.h"
 #include "foundation/platform.h"
+#include <limits.h> /* INT_MAX: the uncapped spelling for cbm_discover_count_bounded */
 
 typedef struct {
     char *home;
@@ -95,6 +96,10 @@ TEST(skip_idea) {
 }
 TEST(skip_claude) {
     ASSERT_TRUE(cbm_should_skip_dir(".claude", CBM_MODE_FULL));
+    PASS();
+}
+TEST(skip_claude_worktrees) {
+    ASSERT_TRUE(cbm_should_skip_dir(".claude-worktrees", CBM_MODE_FULL));
     PASS();
 }
 
@@ -364,6 +369,53 @@ TEST(discover_simple) {
 
     cbm_discover_free(files, count);
     th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_count_bounded_non_git_uses_discover_filters) {
+    char *base = th_mktempdir("cbm_disc_count");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/a.go"), "package main\n");
+    th_write_file(TH_PATH(base, "src/b.py"), "print(1)\n");
+    th_write_file(TH_PATH(base, "src/icon.png"), "binary\n");
+    th_write_file(TH_PATH(base, "node_modules/ignored.js"), "console.log(1)\n");
+
+    cbm_discover_opts_t opts = {0};
+    int count = 0;
+    /* An uncapped exact count is still expressible, and is what this test was
+     * really protecting: pass INT_MAX. Previously it spelled that as max_files 0,
+     * but the two parents disagreed and only one contract can hold. The published
+     * contract (src/discover/discover.h) says LIMIT_EXCEEDED is returned when at
+     * least max_files + 1 indexable files exist, which makes 0 a limit of zero,
+     * and upstream's daemon admission tests depend on exactly that
+     * (tests/test_daemon_application.c passes 0 expecting rejection). The
+     * "0 = unlimited" spelling is a CONFIGURATION convention applied by callers
+     * before this API: cbm_mcp_auto_index_within_limit returns early on
+     * file_limit <= 0, and depindex guards on dependency_file_limit > 0. Treating
+     * 0 as no-cap inside the walker inverted an explicit zero limit, so
+     * auto_index_limit=0 admitted every repository instead of none. */
+    ASSERT_EQ(cbm_discover_count_bounded(base, &opts, INT_MAX, 0, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 2);
+
+    count = 0;
+    /* A limit of zero is a real limit: the first indexable file exceeds it. */
+    ASSERT_EQ(cbm_discover_count_bounded(base, &opts, 0, 0, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT_EQ(count, 0);
+
+    count = 0;
+    /* Capped below the real count: reported as LIMIT_EXCEEDED, and the count
+     * SATURATES at the limit, so count == min(actual, max_files).
+     *
+     * This assertion previously expected 2, "one past the limit". The two
+     * parents disagreed on exactly this and only one contract can hold:
+     * discover_bounded_count_is_allocation_free_and_limit_exact asserts
+     * limited_count == 1 for the same shape of input. Saturating wins — the
+     * returned STATUS already distinguishes "over the limit" from "within it",
+     * which was the entire argument for counting one past, so the extra value
+     * carried no information while not being a real count. */
+    ASSERT_EQ(cbm_discover_count_bounded(base, &opts, 1, 0, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT_EQ(count, 1);
     PASS();
 }
 
@@ -1412,6 +1464,7 @@ SUITE(discover) {
     RUN_TEST(skip_coverage);
     RUN_TEST(skip_idea);
     RUN_TEST(skip_claude);
+    RUN_TEST(skip_claude_worktrees);
 
     /* Not skipped */
     RUN_TEST(no_skip_src);
@@ -1469,6 +1522,7 @@ SUITE(discover) {
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
+    RUN_TEST(discover_count_bounded_non_git_uses_discover_filters);
     RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);

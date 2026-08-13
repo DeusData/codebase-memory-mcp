@@ -500,6 +500,54 @@ static int yaml_lock_acquire(const char *path, yaml_config_lock_t *lock) {
     return 0;
 }
 
+int cbm_yaml_remove_lock_sidecar(const char *file_path) {
+    char *lock_path = NULL;
+    if (yaml_build_lock_path(file_path, &lock_path) != 0) {
+        return YAML_ERROR;
+    }
+#ifdef _WIN32
+    /* Windows locks are delete-on-close directories; nothing persists. */
+    free(lock_path);
+    return 0;
+#else
+#ifndef O_NOFOLLOW
+    free(lock_path);
+    return YAML_ERROR;
+#else
+    int flags = O_RDWR | O_NOFOLLOW | O_NONBLOCK;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int descriptor = open(lock_path, flags);
+    if (descriptor < 0) {
+        int result = errno == ENOENT ? 0 : YAML_ERROR;
+        free(lock_path);
+        return result;
+    }
+
+    struct stat opened_state;
+    bool safe = fstat(descriptor, &opened_state) == 0 &&
+                yaml_lock_file_state_is_safe(&opened_state) &&
+                yaml_flock_nointr(descriptor, LOCK_EX | LOCK_NB) == 0;
+    /* Validate through the opened descriptor rather than lstat(path), then
+     * remove the directory entry while holding the same advisory lock used by
+     * every YAML editor. O_NOFOLLOW preserves an existing symlink collision;
+     * fstat preserves hard-linked, foreign-owner, and wrong-mode files. POSIX
+     * has no portable unlink-by-handle primitive, so the user-owned parent
+     * directory remains the trust boundary against a malicious same-user
+     * pathname replacement. This is one O(1) open/stat/lock/unlink lifecycle
+     * with no pathname check/use pair. */
+    int result = safe && cbm_unlink(lock_path) == 0 ? 0 : YAML_ERROR;
+    if (safe) {
+        (void)yaml_flock_nointr(descriptor, LOCK_UN);
+    }
+    (void)close(descriptor);
+    free(lock_path);
+    return result;
+#endif
+#endif
+}
+
 static int yaml_lock_release(yaml_config_lock_t *lock) {
     int result = YAML_ERROR;
 #ifdef _WIN32
@@ -836,7 +884,7 @@ static int yaml_replace_file(const char *temp_path, const char *path, bool desti
         }
         return yaml_sync_parent_directory(path);
     }
-    if (rename(temp_path, path) != 0) {
+    if (cbm_replace_file(temp_path, path) != 0) {
         return YAML_ERROR;
     }
     return yaml_sync_parent_directory(path);
@@ -2371,7 +2419,11 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
         if (value == '#' && (i == start || doc->data[i - YAML_UNIT] == ' ')) {
             break;
         }
-        if (value == '[' || value == ']' || value == '|' || value == '>') {
+        /* Flow sequences do not alter indentation or mapping boundaries, so
+         * unrelated settings such as Hermes' `plugins.enabled: []` are safe
+         * to preserve while editing hooks.pre_llm_call. Block scalars can
+         * absorb later lines, so they remain unsupported and fail closed. */
+        if (value == '|' || value == '>') {
             return YAML_MATCH;
         }
     }

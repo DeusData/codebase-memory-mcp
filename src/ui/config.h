@@ -11,7 +11,10 @@
 
 /* Default values */
 #define CBM_UI_DEFAULT_PORT 9749
+#define CBM_UI_DEFAULT_PORT_STR "9749"
 #define CBM_UI_DEFAULT_ENABLED false
+#define CBM_UI_DEFAULT_ENABLED_STR "false"
+#define CBM_UI_MAX_PORT 65535
 
 typedef struct {
     bool ui_enabled;
@@ -24,6 +27,10 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg);
 /* Atomically save one complete config generation. Creates the directory if
  * needed and reports write/sync/replace failures. */
 bool cbm_ui_config_save(const cbm_ui_config_t *cfg);
+
+/* Parse exact command-line values without changing the output on failure. */
+bool cbm_ui_parse_enabled(const char *value, bool *enabled_out);
+bool cbm_ui_parse_port(const char *value, int *port_out);
 
 /* Get the config file path. Writes to buf (up to bufsz bytes).
  * Exposed for testing. */

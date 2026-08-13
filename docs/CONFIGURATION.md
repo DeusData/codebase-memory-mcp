@@ -75,17 +75,66 @@ Inspect or change values with the CLI:
 ```bash
 codebase-memory-mcp config list
 codebase-memory-mcp config get auto_index
+codebase-memory-mcp config describe pagerank_damping
 codebase-memory-mcp config set auto_index true
 codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config reset auto_index
 ```
 
-Current keys:
+Important keys (`config list` shows common effective values; use `config get <key>`
+for any registry key):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
+| `build_fingerprint_mode` | `cached_exact` | Exact-build verification cost policy: reuse a checksummed SHA-256 only for an unchanged kernel-bound native file (`cached_exact`), or hash the complete process image at every startup (`always_rehash`). Installer/update and Windows launcher payload verification always rehash. |
+| `auto_index` | `true` | Automatically index new projects at MCP startup or first graph use. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `auto_watch` | `true` | Register indexed projects for automatic background Git-change refresh. |
+| `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
+| `context_injection` | `true` | Include bounded project/index status, recovery guidance, freshness, coverage, schema, and graph stats automatically in the first tool response; later responses include only `session_project`. |
+| `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
+| `auto_index_deps` | `false` | Automatically index installed dependency source for cross-package search and tracing. |
+| `auto_dep_limit` | `20` | Import-ranked automatic dependency package cap; `0` is unlimited. |
+| `dep_max_files` | `1000` | Maximum source files per automatically indexed dependency package; larger packages are skipped atomically, and `0` is unlimited. |
+| `similarity_enabled` | `true` | Create MinHash similarity edges in applicable index modes. |
+| `semantic_edges_enabled` | `true` | Create semantic-related edges in applicable index modes. |
+| `githistory_enabled` | `true` | Create Git co-change coupling edges. |
+| `httplinks_enabled` | `true` | Link HTTP clients to discovered routes. |
+| `default_response_format` | `toon` | Tool-response encoding when a call omits `format`: `toon` (compact tables) or `json` (full objects). A per-call `format` argument always wins. |
+
+Normal streamlined exploration uses `search_graph`, `trace_path`, `get_code`, and
+`query_graph` as needed; automatic indexing and first-response context follow their
+settings. Classic structural discovery uses `search_graph`, then `trace_path`, then
+`get_code_snippet`; use `query_graph` or `get_architecture` for broader structure.
+Classic mode advertises advanced tools directly.
+
+### Named presets
+
+Presets atomically apply exact capability sets, so a prior manual setting cannot
+silently leak into a comparison:
+
+```bash
+codebase-memory-mcp config preset list
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-disabled
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-enabled
+codebase-memory-mcp config preset apply classic-automatic-dependency-source-indexing-disabled
+codebase-memory-mcp config preset apply classic-automatic-dependency-source-indexing-enabled
+```
+
+The four product presets pair the `streamlined` or `classic` tool surface with an
+explicit automatic dependency-source indexing state. All four enable the same rank,
+similarity, semantic-edge, Git-history, and HTTP-link capabilities. The disabled
+variants bound default indexing latency, CPU, memory, and stored graph size; the
+enabled variants add installed dependency-source coverage up to `auto_dep_limit`;
+`dep_max_files` skips oversized packages rather than publishing partial API coverage.
+`index_dependencies` remains available for explicit packages. Disabling automation
+stops future automatic dependency indexing but does not delete dependency projects
+already indexed. `rank-disabled` and `minimal-indexing` are benchmark ablations, and
+the CLI labels them accordingly. The `minimal-indexing` preset disables optional graph
+passes and dependency-source automation; the post-edit reindex strategy is unchanged.
+Environment variables remain higher priority than stored preset values, and preset
+application returns nonzero when an active override prevents the requested effective
+configuration.
 
 ## 3. UI Settings
 
@@ -104,9 +153,20 @@ Current format:
 }
 ```
 
+Read or change these values through the same public config command used for
+runtime settings:
+
+```bash
+codebase-memory-mcp config get ui_enabled
+codebase-memory-mcp config set ui_enabled false
+codebase-memory-mcp config set ui_port 9749
+codebase-memory-mcp config reset ui_port
+```
+
 Notes:
 
-- If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- If a binary carries the embedded frontend and no UI config file exists yet, the UI auto-enables on first run. Development builds without the frontend keep the MCP/daemon service available and leave the UI disabled.
+- UI setting changes take effect after the daemon restarts.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
@@ -119,7 +179,7 @@ These environment variables affect runtime behavior:
 | `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction — but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
-| `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
+| `CBM_DOWNLOAD_URL` | GitHub releases | Override the install-script download base URL; also used by local release-fixture tests. |
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
@@ -146,7 +206,7 @@ not name is permitted.
 
 ## 5. Agent and Editor Integration Files
 
-The `install` command can also write MCP entries and instruction blocks into agent/editor config files such as Claude Code, Codex, Gemini, VS Code, Cursor, Zed, and others.
+The `install` command can also write MCP entries and owned instruction blocks into detected agent/editor config files. Supported targets include Claude Code, Claude Desktop, Codex, Gemini, Qwen Code, ForgeCode, Antigravity, OpenCode, Zed, VS Code and its profiles, Cursor, Windsurf, KiloCode, OpenClaw, Kiro, and Junie; Aider receives CLI-form instructions because it does not expose MCP.
 
 Those target paths vary by tool and platform, so the easiest way to inspect the exact files for your machine is:
 
@@ -155,3 +215,4 @@ codebase-memory-mcp install --dry-run
 ```
 
 That prints the specific config files the installer would modify without writing anything.
+`uninstall --dry-run` is also read-only, including when combined with `-y`; it reports the index action that would occur without prompting or deleting indexes.

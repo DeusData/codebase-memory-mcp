@@ -13,6 +13,34 @@
 
 /* ── System Info Tests ────────────────────────────────────────────── */
 
+typedef struct {
+    cbm_system_info_t *infos;
+} system_info_parallel_ctx_t;
+
+static void system_info_parallel_worker(int idx, void *ctx_ptr) {
+    system_info_parallel_ctx_t *ctx = ctx_ptr;
+    ctx->infos[idx] = cbm_system_info();
+}
+
+TEST(system_info_parallel_first_call_consistent) {
+    enum { SYSINFO_PARALLEL_CALLS = 64, SYSINFO_PARALLEL_WORKERS = 4 };
+    cbm_system_info_t infos[SYSINFO_PARALLEL_CALLS];
+    memset(infos, 0, sizeof(infos));
+    system_info_parallel_ctx_t ctx = {.infos = infos};
+
+    cbm_parallel_for_opts_t opts = {.max_workers = SYSINFO_PARALLEL_WORKERS,
+                                    .force_pthreads = false};
+    cbm_parallel_for(SYSINFO_PARALLEL_CALLS, system_info_parallel_worker, &ctx, opts);
+
+    ASSERT_GT(infos[0].total_cores, 0);
+    for (int i = 1; i < SYSINFO_PARALLEL_CALLS; i++) {
+        ASSERT_EQ(infos[i].total_cores, infos[0].total_cores);
+        ASSERT_EQ(infos[i].perf_cores, infos[0].perf_cores);
+        ASSERT_EQ(infos[i].total_ram, infos[0].total_ram);
+    }
+    PASS();
+}
+
 TEST(system_info_total_cores) {
     cbm_system_info_t info = cbm_system_info();
     ASSERT(info.total_cores > 0);
@@ -204,6 +232,50 @@ TEST(parallel_for_actually_parallel) {
     PASS();
 }
 
+typedef struct {
+    _Atomic int concurrent_max;
+    _Atomic int concurrent_now;
+    _Atomic int arrived;
+    int target_arrivals;
+} concurrency_bound_ctx_t;
+
+static void concurrency_bound_worker(int idx, void *ctx_ptr) {
+    (void)idx;
+    enum { BOUND_SPINS = 5000000 };
+    concurrency_bound_ctx_t *cc = ctx_ptr;
+    int cur = atomic_fetch_add(&cc->concurrent_now, 1) + 1;
+    atomic_fetch_add(&cc->arrived, 1);
+
+    int prev_max = atomic_load(&cc->concurrent_max);
+    while (cur > prev_max) {
+        if (atomic_compare_exchange_weak(&cc->concurrent_max, &prev_max, cur)) {
+            break;
+        }
+    }
+
+    for (int spins = 0; spins < BOUND_SPINS; spins++) {
+        if (atomic_load(&cc->arrived) >= cc->target_arrivals) {
+            break;
+        }
+    }
+    atomic_fetch_sub(&cc->concurrent_now, 1);
+}
+
+TEST(parallel_for_max_workers_is_total_concurrency) {
+    enum { MAX_WORKERS = 2, ITERATIONS = 3 };
+    concurrency_bound_ctx_t cc;
+    atomic_init(&cc.concurrent_max, 0);
+    atomic_init(&cc.concurrent_now, 0);
+    atomic_init(&cc.arrived, 0);
+    cc.target_arrivals = ITERATIONS;
+
+    cbm_parallel_for_opts_t opts = {.max_workers = MAX_WORKERS, .force_pthreads = false};
+    cbm_parallel_for(ITERATIONS, concurrency_bound_worker, &cc, opts);
+
+    ASSERT_LTE(atomic_load(&cc.concurrent_max), MAX_WORKERS);
+    PASS();
+}
+
 static void tls_worker(int idx, void *ctx_ptr) {
     (void)idx;
     static _Thread_local int tls_val = 0;
@@ -330,6 +402,26 @@ TEST(parallel_for_no_duplicates) {
     PASS();
 }
 
+TEST(parallel_for_workers_above_count_visits_each_index_once) {
+    enum {
+        OVERWORKER_COUNT = 2,
+        OVERWORKER_MAX_WORKERS = 64,
+    };
+    _Atomic int counts[OVERWORKER_COUNT];
+    for (int i = 0; i < OVERWORKER_COUNT; i++) {
+        atomic_init(&counts[i], 0);
+    }
+
+    cbm_parallel_for_opts_t opts = {.max_workers = OVERWORKER_MAX_WORKERS,
+                                    .force_pthreads = false};
+    cbm_parallel_for(OVERWORKER_COUNT, count_visit_worker, counts, opts);
+
+    for (int i = 0; i < OVERWORKER_COUNT; i++) {
+        ASSERT_EQ(atomic_load(&counts[i]), 1);
+    }
+    PASS();
+}
+
 /* Helper for single_iteration_idx_zero test */
 static int g_received_idx = -1;
 
@@ -368,6 +460,7 @@ TEST(parallel_for_serial_matches_parallel) {
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(system_info) {
+    RUN_TEST(system_info_parallel_first_call_consistent);
     RUN_TEST(system_info_total_cores);
     RUN_TEST(system_info_total_cores_sane);
     RUN_TEST(system_info_perf_cores);
@@ -387,6 +480,7 @@ SUITE(worker_pool) {
     RUN_TEST(parallel_for_force_pthreads);
     RUN_TEST(parallel_for_per_slot_write);
     RUN_TEST(parallel_for_actually_parallel);
+    RUN_TEST(parallel_for_max_workers_is_total_concurrency);
     RUN_TEST(tls_persistence_across_dispatch);
     /* Resource management & edge cases */
     RUN_TEST(parallel_for_negative_count);
@@ -397,6 +491,7 @@ SUITE(worker_pool) {
     RUN_TEST(parallel_for_immediate_return_callback);
     RUN_TEST(parallel_for_context_passed_correctly);
     RUN_TEST(parallel_for_no_duplicates);
+    RUN_TEST(parallel_for_workers_above_count_visits_each_index_once);
     RUN_TEST(parallel_for_single_iteration_idx_zero);
     RUN_TEST(parallel_for_serial_matches_parallel);
 }

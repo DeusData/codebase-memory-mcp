@@ -10,12 +10,13 @@
  * get a CROSS_* edge so the link is visible from either side.
  */
 #include "pipeline/pass_cross_repo.h"
-#include "pipeline/pipeline_internal.h" // cbm_route_canon_path
+#include "pipeline/pipeline_internal.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "service_patterns.h"
 #include "foundation/str_util.h"
 
 #include <sqlite3/sqlite3.h>
@@ -31,7 +32,6 @@ enum {
     CR_PATH_BUF = 4096,
     CR_QN_BUF = 512,
     CR_PROPS_BUF = 2048,
-    CR_MAX_EDGES = 4096,
     CR_DB_EXT_LEN = 3, /* strlen(".db") */
     CR_INIT_CAP = 32,
     CR_MAX_PROJECTS = 4096,
@@ -256,24 +256,6 @@ static bool insert_cross_edge(cbm_store_t *store, const char *project, int64_t f
     return inserted;
 }
 
-/* Strip "scheme://host[:port]" from a stored HTTP_CALLS url, returning the
- * path. url_path property values are stored raw from the call's first string
- * argument, so they can be full URLs ("scheme://host:port/v2/x") — and
- * cbm_route_canon_path only canonicalizes placeholder syntax, never strips
- * authorities. Returns "/" for a URL with no path after the host (a request
- * against the bare base URL targets the root route). (#523) */
-static const char *cr_url_path(const char *url) {
-    if (!url) {
-        return url;
-    }
-    const char *scheme_end = strstr(url, "://");
-    if (!scheme_end) {
-        return url; /* already a bare path */
-    }
-    const char *path_start = strchr(scheme_end + CR_SCHEME_SKIP, '/');
-    return path_start ? path_start : "/";
-}
-
 /* Look up a node's name and file_path by id. */
 static bool lookup_node_info(struct sqlite3 *db, int64_t node_id, char *name_out, size_t name_sz,
                              char *file_out, size_t file_sz) {
@@ -432,35 +414,41 @@ static bool cr_path_matches_template(const char *concrete, const char *templ) {
  * and segment-match the concrete path against each template. On a match, copy
  * the route QN into out_qn and return the handler id; returns 0 on no match.
  *
- * COST: this scans every Route node of the target project once per unmatched
- * HTTP_CALLS edge — O(calls × routes) per project pair. Acceptable while both
- * factors stay small (calls are capped at CR_MAX_EDGES and it only runs for
- * edges the exact lookup missed); revisit with a prepared template index if
- * cross-repo matching ever shows up in profiles. (#523) */
-static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *concrete_path,
-                                        const char *method, char *out_qn, size_t out_qn_sz,
-                                        char *handler_name, size_t name_sz, char *handler_file,
-                                        size_t file_sz, bool *failed, cr_run_context_t *ctx) {
+ * COST: this streams every Route node of the target project once per unmatched
+ * HTTP_CALLS edge through idx_nodes_label(project, label) — O(calls × routes)
+ * time and O(1) auxiliary memory per lookup. The scan is cancellable but must
+ * not stop at an arbitrary prefix: doing so publishes a graph that silently
+ * depends on insertion order. Revisit with a prepared template index if this
+ * fallback shows up in profiles. (#523) */
+static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *target_project,
+                                        const char *concrete_path, const char *method, char *out_qn,
+                                        size_t out_qn_sz, char *handler_name, size_t name_sz,
+                                        char *handler_file, size_t file_sz, bool *failed,
+                                        cr_run_context_t *ctx) {
     *failed = false;
     struct sqlite3 *db = cbm_store_get_db(target_store);
-    if (!db || !concrete_path || !concrete_path[0]) {
-        if (!db) {
+    if (!db || !target_project || !target_project[0] || !concrete_path || !concrete_path[0]) {
+        if (!db || !target_project || !target_project[0]) {
             *failed = true;
         }
         return 0;
     }
     sqlite3_stmt *s = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT qualified_name FROM nodes WHERE label = 'Route' ORDER BY id",
+    if (sqlite3_prepare_v2(db,
+                           "SELECT qualified_name FROM nodes "
+                           "WHERE project = ?1 AND label = 'Route' ORDER BY id",
                            CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
         *failed = true;
         return 0;
     }
+    if (sqlite3_bind_text(s, SKIP_ONE, target_project, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK) {
+        sqlite3_finalize(s);
+        *failed = true;
+        return 0;
+    }
     int64_t found = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(s, 0);
         if (!qn || strncmp(qn, "__route__", CR_ROUTE_PREFIX_LEN) != 0) {
             continue;
@@ -502,7 +490,7 @@ static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *c
             break;
         }
     }
-    if (!cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         *failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -569,6 +557,11 @@ static bool emit_cross_route_bidirectional(
     return insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev, ctx);
 }
 
+/* Matchers below consume SQLite rows one at a time and retain only the current
+ * row, so scanning the complete source set is O(1) auxiliary memory. Keep the
+ * cancellation check in every loop; do not add a fixed row prefix because the
+ * pass publishes CROSS_* edges as graph facts and cannot label an omitted
+ * suffix as a valid partial graph. */
 static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *src_project,
                                            cbm_store_t *tgt_store, const char *tgt_project,
                                            cr_run_context_t *ctx) {
@@ -591,12 +584,9 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -608,14 +598,20 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         if (!url_path[0]) {
             continue;
         }
+        if (!cbm_service_pattern_is_http_route_literal(url_path, NULL)) {
+            continue;
+        }
 
-        /* Build the expected Route QN in the target project (authority-stripped
-         * and param-canonicalized so client url_path matches the server handler
-         * regardless of base URL and framework placeholder syntax). */
-        char route_qn[CR_QN_BUF];
-        char cpath[CBM_SZ_256];
-        const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
+        const char *route_path = cbm_pipeline_route_url_path(url_path);
+        char canonical_path[CBM_SZ_256];
+        cbm_route_canon_path(route_path, canonical_path, sizeof(canonical_path));
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_props[CBM_SZ_256];
+        if (!cbm_pipeline_build_service_route_identity(
+                route_path, CBM_SVC_HTTP, method[0] ? method : NULL, NULL, NULL, route_qn,
+                sizeof(route_qn), route_props, sizeof(route_props))) {
+            continue;
+        }
 
         char handler_name[CBM_SZ_256] = {0};
         char handler_file[CBM_SZ_512] = {0};
@@ -625,7 +621,11 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
                                handler_file, sizeof(handler_file), &query_failed);
         if (!query_failed && handler_id == 0) {
             /* Try without method (ANY) */
-            snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s", curl);
+            if (!cbm_pipeline_build_service_route_identity(route_path, CBM_SVC_HTTP, NULL, NULL,
+                                                           NULL, route_qn, sizeof(route_qn),
+                                                           route_props, sizeof(route_props))) {
+                continue;
+            }
             handler_id = find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
                                             handler_file, sizeof(handler_file), &query_failed);
         }
@@ -633,10 +633,10 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
             /* Exact QN lookup missed. A concrete client path ("/v2/orders/123")
              * never exact-matches a templated route ("/v2/orders/{}"), so fall
              * back to segment-wise template matching. (#523) */
-            handler_id =
-                find_route_handler_fuzzy(tgt_store, curl, method[0] ? method : NULL, route_qn,
-                                         sizeof(route_qn), handler_name, sizeof(handler_name),
-                                         handler_file, sizeof(handler_file), &query_failed, ctx);
+            handler_id = find_route_handler_fuzzy(
+                tgt_store, tgt_project, canonical_path, method[0] ? method : NULL, route_qn,
+                sizeof(route_qn), handler_name, sizeof(handler_name), handler_file,
+                sizeof(handler_file), &query_failed, ctx);
         }
         if (query_failed) {
             failed = true;
@@ -660,7 +660,7 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
 
         count++;
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -692,12 +692,9 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -710,9 +707,13 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
             continue;
         }
 
-        char route_qn[CR_QN_BUF];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", broker[0] ? broker : "async",
-                 url_path);
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_props[CBM_SZ_256];
+        if (!cbm_pipeline_build_service_route_identity(
+                url_path, CBM_SVC_ASYNC, NULL, broker[0] ? broker : NULL, NULL, route_qn,
+                sizeof(route_qn), route_props, sizeof(route_props))) {
+            continue;
+        }
 
         char handler_name[CBM_SZ_256] = {0};
         char handler_file[CBM_SZ_512] = {0};
@@ -742,7 +743,7 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
         }
         count++;
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -857,12 +858,9 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         const char *channel_name = (const char *)sqlite3_column_text(s, SKIP_ONE);
         const char *channel_qn = (const char *)sqlite3_column_text(s, PAIR_LEN);
         if (!channel_name || !channel_qn) {
@@ -895,7 +893,7 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
             count++;
         }
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -972,12 +970,9 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
     }
 
     int count = 0;
-    int scanned = 0;
     int step_rc = SQLITE_DONE;
     bool failed = false;
-    while (scanned < CR_MAX_EDGES && !cr_cancel_requested(ctx) &&
-           (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
-        scanned++;
+    while (!cr_cancel_requested(ctx) && (step_rc = sqlite3_step(s)) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -991,7 +986,7 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
         }
 
         /* Look up the Route QN from the target node (already points to the Route). */
-        char route_qn[CR_QN_BUF] = {0};
+        char route_qn[CBM_ROUTE_QN_SIZE] = {0};
         bool query_failed = false;
         if (!lookup_node_qn(src_db, route_id, route_qn, sizeof(route_qn), &query_failed)) {
             if (query_failed) {
@@ -1027,7 +1022,7 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
         }
         count++;
     }
-    if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
+    if (!failed && !cr_cancel_requested(ctx) && step_rc != SQLITE_DONE) {
         failed = true;
     }
     if (sqlite3_finalize(s) != SQLITE_OK) {
@@ -1193,8 +1188,15 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     if (!project || !cbm_validate_project_name(project) || !target_projects || target_count <= 0 ||
-        (target_count == SKIP_ONE && !target_projects[0]) || !cr_project_exists(project)) {
+        (target_count == SKIP_ONE && !target_projects[0])) {
         result.failed = true;
+        return result;
+    }
+    /* A never-indexed source name (a typo or a mis-quoted target list) is
+     * reported as missing rather than as a failure, and must never be satisfied
+     * by silently creating an empty store. */
+    if (!cr_project_exists(project)) {
+        result.source_missing = true;
         return result;
     }
     if (cr_cancel_requested(&run)) {
@@ -1222,10 +1224,12 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
             free_project_list(resolved, resolved_count);
             return result;
         }
+        /* A named target with no indexed database is skipped and counted, not a
+         * hard failure: matching still runs for the targets that do exist, and
+         * targets_missing lets callers surface the miss. The read-write opens
+         * below omit CREATE, so a skipped name can never become a ghost store. */
         if (strcmp(resolved[i], project) != 0 && !cr_project_exists(resolved[i])) {
-            result.failed = true;
-            free_project_list(resolved, resolved_count);
-            return result;
+            result.targets_missing++;
         }
     }
 
@@ -1266,6 +1270,12 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         const char *tgt = resolved[i];
         if (strcmp(tgt, project) == 0) {
             continue; /* skip self */
+        }
+
+        /* Counted as missing in the resolve loop above; skip it here so the
+         * remaining targets still run. */
+        if (!cr_project_exists(tgt)) {
+            continue;
         }
 
         /* Open target store read-write (for bidirectional edge writes) */

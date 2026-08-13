@@ -21,6 +21,57 @@
         free(_r);                    \
     } while (0)
 
+enum { FQN_DEEP_SEGMENT_COUNT = 300, FQN_LONG_RELATIVE_FILL = 1100 };
+
+static char *fqn_deep_path(const char *tail) {
+    size_t tail_len = strlen(tail);
+    size_t path_len = (size_t)FQN_DEEP_SEGMENT_COUNT * 2U + tail_len;
+    char *path = malloc(path_len + 1U);
+    if (!path) {
+        return NULL;
+    }
+    char *p = path;
+    for (int i = 0; i < FQN_DEEP_SEGMENT_COUNT; i++) {
+        *p++ = 'a';
+        *p++ = '/';
+    }
+    memcpy(p, tail, tail_len + 1U);
+    return path;
+}
+
+static char *fqn_expected_from_path(const char *path, const char *symbol, bool strip_extension) {
+    const char prefix[] = "proj.";
+    size_t path_len = strlen(path);
+    size_t symbol_len = symbol ? strlen(symbol) : 0U;
+    char *expected = malloc(sizeof(prefix) + path_len + symbol_len + 1U);
+    if (!expected) {
+        return NULL;
+    }
+    char *p = expected;
+    memcpy(p, prefix, sizeof(prefix) - 1U);
+    p += sizeof(prefix) - 1U;
+    memcpy(p, path, path_len + 1U);
+    for (char *c = p; *c; c++) {
+        if (*c == '/') {
+            *c = '.';
+        }
+    }
+    if (strip_extension) {
+        char *extension = strrchr(p, '.');
+        if (!extension) {
+            free(expected);
+            return NULL;
+        }
+        *extension = '\0';
+    }
+    p += strlen(p);
+    if (symbol_len > 0U) {
+        *p++ = '.';
+        memcpy(p, symbol, symbol_len + 1U);
+    }
+    return expected;
+}
+
 /* ================================================================
  * cbm_pipeline_fqn_compute
  * ================================================================ */
@@ -104,6 +155,21 @@ TEST(fqn_compute_nested_three_levels) {
 
 TEST(fqn_compute_nested_deep) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/d/e/f/g.ts", "fn"), "proj.a.b.c.d.e.f.g.fn");
+    PASS();
+}
+
+TEST(fqn_compute_retains_every_deep_path_segment) {
+    char *path = fqn_deep_path("tail.go");
+    ASSERT_NOT_NULL(path);
+    char *expected = fqn_expected_from_path(path, "Symbol", true);
+    ASSERT_NOT_NULL(expected);
+    char *actual = cbm_pipeline_fqn_compute("proj", path, "Symbol");
+    ASSERT_NOT_NULL(actual);
+    ASSERT_STR_EQ(actual, expected);
+    ASSERT_NOT_NULL(strstr(actual, ".tail.Symbol"));
+    free(actual);
+    free(expected);
+    free(path);
     PASS();
 }
 
@@ -253,6 +319,16 @@ TEST(fqn_compute_spec_ext) {
     PASS();
 }
 
+TEST(fqn_compute_file_nodes_keep_extension_identity) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/ui/http_server.c", "__file__"),
+               "proj.src.ui.http_server.c.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/ui/http_server.h", "__file__"),
+               "proj.src.ui.http_server.h.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "__file__"),
+               "proj.pkg.__init__.py.__file__");
+    PASS();
+}
+
 /* ── Leading / trailing slashes ───────────────────────────────── */
 
 TEST(fqn_compute_leading_slash) {
@@ -346,6 +422,83 @@ TEST(fqn_module_deep) {
     PASS();
 }
 
+TEST(fqn_relative_import_preserves_language_forms) {
+    struct {
+        const char *source;
+        const char *module;
+        const char *expected;
+    } cases[] = {
+        {"src/features/consumer.ts", "./nested/util.js", "src/features/nested/util"},
+        {"src/features/consumer.ts", "../shared/helpers.ts", "src/shared/helpers"},
+        {"src/features/consumer.ts", "./foo.test.ts", "src/features/foo.test"},
+        {"src/features/consumer.ts", "./.hidden", "src/features/.hidden"},
+        {"src/features/consumer.py", ".helpers", "src/features/helpers"},
+        {"src/features/consumer.py", "..shared.helpers", "src/shared/helpers"},
+        {"src/features/consumer.py", "...shared", "shared"},
+        {"src/features/consumer.py", ".", "src/features"},
+        {"src/features/consumer.py", "..", "src"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *actual = cbm_pipeline_resolve_relative_import(cases[i].source, cases[i].module);
+        ASSERT_NOT_NULL(actual);
+        ASSERT_STR_EQ(actual, cases[i].expected);
+        free(actual);
+    }
+    PASS();
+}
+
+/* Relative-import resolution must preserve both a long importing directory
+ * and a long imported segment. The former 1,024-byte staging buffer either
+ * dropped the importer's directory suffix or returned NULL before the caller
+ * could construct the module QN. This logical-path test is intentionally
+ * independent of any host filesystem component limit. */
+TEST(fqn_relative_import_preserves_exact_long_paths) {
+    char *fill = malloc((size_t)FQN_LONG_RELATIVE_FILL + 1U);
+    ASSERT_NOT_NULL(fill);
+    memset(fill, 'd', FQN_LONG_RELATIVE_FILL);
+    fill[FQN_LONG_RELATIVE_FILL] = '\0';
+
+    size_t source_size = strlen("root//consumer.ts") + strlen(fill) + 1U;
+    size_t expected_source_size = strlen("root//helpers") + strlen(fill) + 1U;
+    size_t module_size = strlen("./.ts") + strlen(fill) + 1U;
+    size_t expected_module_size = strlen("src/") + strlen(fill) + 1U;
+    char *source = malloc(source_size);
+    char *expected_source = malloc(expected_source_size);
+    char *module = malloc(module_size);
+    char *expected_module = malloc(expected_module_size);
+    if (!source || !expected_source || !module || !expected_module) {
+        free(expected_module);
+        free(module);
+        free(expected_source);
+        free(source);
+        free(fill);
+        FAIL("long relative-import fixture allocation");
+    }
+    snprintf(source, source_size, "root/%s/consumer.ts", fill);
+    snprintf(expected_source, expected_source_size, "root/%s/helpers", fill);
+    snprintf(module, module_size, "./%s.ts", fill);
+    snprintf(expected_module, expected_module_size, "src/%s", fill);
+
+    char *from_long_source = cbm_pipeline_resolve_relative_import(source, "./helpers.ts");
+    char *from_long_js_module = cbm_pipeline_resolve_relative_import("src/consumer.ts", module);
+    snprintf(module, module_size, ".%s", fill);
+    char *from_long_python_module = cbm_pipeline_resolve_relative_import("src/consumer.py", module);
+    bool exact = from_long_source && strcmp(from_long_source, expected_source) == 0 &&
+                 from_long_js_module && strcmp(from_long_js_module, expected_module) == 0 &&
+                 from_long_python_module && strcmp(from_long_python_module, expected_module) == 0;
+
+    free(from_long_python_module);
+    free(from_long_js_module);
+    free(from_long_source);
+    free(expected_module);
+    free(module);
+    free(expected_source);
+    free(source);
+    free(fill);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
 /* ================================================================
  * cbm_pipeline_fqn_folder
  * ================================================================ */
@@ -397,6 +550,41 @@ TEST(fqn_folder_leading_slash) {
 
 TEST(fqn_folder_double_slash) {
     ASSERT_FQN(cbm_pipeline_fqn_folder("proj", "a//b"), "proj.a.b");
+    PASS();
+}
+
+TEST(fqn_folder_retains_every_deep_path_segment) {
+    char *path = fqn_deep_path("tail");
+    ASSERT_NOT_NULL(path);
+    char *expected = fqn_expected_from_path(path, NULL, false);
+    ASSERT_NOT_NULL(expected);
+    char *actual = cbm_pipeline_fqn_folder("proj", path);
+    ASSERT_NOT_NULL(actual);
+    ASSERT_STR_EQ(actual, expected);
+    ASSERT_NOT_NULL(strstr(actual, ".tail"));
+    free(actual);
+    free(expected);
+    free(path);
+    PASS();
+}
+
+TEST(fqn_without_project_exact_prefix) {
+    ASSERT_STR_EQ(cbm_pipeline_fqn_without_project("tmp-a.b", "tmp-a.b.pkg.worker.run"),
+                  "pkg.worker.run");
+    PASS();
+}
+
+TEST(fqn_without_project_rejects_partial_prefix) {
+    const char *qn = "tmp-a.bc.pkg.worker.run";
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project("tmp-a.b", qn) == qn);
+    PASS();
+}
+
+TEST(fqn_without_project_preserves_project_node_and_nulls) {
+    const char *project = "tmp-a.b";
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project(project, project) == project);
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project(NULL, project) == project);
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project(project, NULL) == NULL);
     PASS();
 }
 
@@ -600,6 +788,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_compute_nested_two_levels);
     RUN_TEST(fqn_compute_nested_three_levels);
     RUN_TEST(fqn_compute_nested_deep);
+    RUN_TEST(fqn_compute_retains_every_deep_path_segment);
 
     /* fqn_compute: Python __init__.py */
     RUN_TEST(fqn_compute_init_py_with_name);
@@ -636,6 +825,7 @@ SUITE(fqn) {
     /* fqn_compute: multiple extensions */
     RUN_TEST(fqn_compute_double_ext);
     RUN_TEST(fqn_compute_spec_ext);
+    RUN_TEST(fqn_compute_file_nodes_keep_extension_identity);
 
     /* fqn_compute: leading / trailing slashes */
     RUN_TEST(fqn_compute_leading_slash);
@@ -657,6 +847,8 @@ SUITE(fqn) {
     RUN_TEST(fqn_module_null_path);
     RUN_TEST(fqn_module_null_project);
     RUN_TEST(fqn_module_deep);
+    RUN_TEST(fqn_relative_import_preserves_language_forms);
+    RUN_TEST(fqn_relative_import_preserves_exact_long_paths);
 
     /* fqn_folder */
     RUN_TEST(fqn_folder_basic);
@@ -669,6 +861,10 @@ SUITE(fqn) {
     RUN_TEST(fqn_folder_trailing_slash);
     RUN_TEST(fqn_folder_leading_slash);
     RUN_TEST(fqn_folder_double_slash);
+    RUN_TEST(fqn_folder_retains_every_deep_path_segment);
+    RUN_TEST(fqn_without_project_exact_prefix);
+    RUN_TEST(fqn_without_project_rejects_partial_prefix);
+    RUN_TEST(fqn_without_project_preserves_project_node_and_nulls);
 
     /* project_name_from_path */
     RUN_TEST(project_name_unix_path);

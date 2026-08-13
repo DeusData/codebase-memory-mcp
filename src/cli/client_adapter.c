@@ -27,9 +27,17 @@ static void sb_append(adapter_sb_t *sb, const char *s) {
         return;
     }
     size_t add = strlen(s);
-    if (sb->len + add + 1 > sb->cap) {
+    if (add == 0U) {
+        return;
+    }
+    if (sb->len == SIZE_MAX || add > SIZE_MAX - sb->len - 1U) {
+        sb->failed = true;
+        return;
+    }
+    size_t required = sb->len + add + 1U;
+    if (!sb->buf || required > sb->cap) {
         size_t want = sb->cap ? sb->cap : CBM_SZ_2K;
-        while (want < sb->len + add + 1) {
+        while (want < required) {
             if (want > SIZE_MAX / PAIR_LEN) {
                 sb->failed = true;
                 return;

@@ -108,20 +108,6 @@ static bool is_checked_exception(const char *name) {
     return true; /* Default: treat as checked */
 }
 
-/* Build the same semantic import map used by cross-LSP and parallel resolution.
- * The old sequential-only shortcut treated raw paths such as `./types` as QNs,
- * so duplicate symbol names fell through to an ambiguous unique-name lookup. */
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
-                            const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count, CBMLanguage lang) {
-    return cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result, out_keys,
-                                    out_vals, out_count);
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    cbm_pxc_free_import_map(keys, vals, count);
-}
-
 /* Find the graph buffer node for an enclosing function QN, falling back to file node. */
 static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const char *func_qn,
                                                   const char *rel_path) {
@@ -174,8 +160,11 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 semantic_reference = NULL;
             }
             if (semantic_reference) {
-                tgt = cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
-                                                   semantic_reference->callee_qn, allow_tail);
+                tgt = cbm_pipeline_find_node_by_qn(ctx, semantic_reference->callee_qn);
+                if (!tgt) {
+                    tgt = cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
+                                                       semantic_reference->callee_qn, allow_tail);
+                }
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
             }
         }
@@ -201,7 +190,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                                    imp_keys, imp_count)) {
                 continue;
             }
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -229,6 +218,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count) {
+    (void)rel; /* Throws intentionally match the parallel pass: no file-node fallback. */
     int resolved = 0;
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
@@ -236,8 +226,8 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        const cbm_gbuf_node_t *src = find_enclosing_node(ctx, thr->enclosing_func_qn, rel);
-        if (!src) {
+        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(ctx->gbuf, thr->enclosing_func_qn);
+        if (!cbm_pipeline_node_is_callable_scope(src)) {
             continue;
         }
 
@@ -247,7 +237,7 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 
         const cbm_gbuf_node_t *tgt = NULL;
         if (res.qualified_name && res.qualified_name[0]) {
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         }
         if (!tgt || src->id == tgt->id) {
             continue;
@@ -281,7 +271,7 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
             continue;
         }
@@ -322,8 +312,10 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+            result = cbm_extract_file_with_options(
+                source, source_len, files[i].language, ctx->project_name, rel,
+                cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
             free(source);
             if (!result) {
                 errors++;
@@ -342,7 +334,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count, files[i].language);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel, files[i].language, result,
+                                 &imp_keys, &imp_vals, &imp_count);
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pu_module_is_dir(files[i].language));
@@ -354,7 +347,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);
         }

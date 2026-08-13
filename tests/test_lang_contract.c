@@ -27,6 +27,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -76,17 +77,10 @@ static cbm_store_t *lang_open_indexed(LangProj *lp) {
         return NULL;
     }
     char cache_dir[512];
-    const char *configured_cache = getenv("CBM_CACHE_DIR");
-    if (configured_cache && configured_cache[0]) {
-        snprintf(cache_dir, sizeof(cache_dir), "%s", configured_cache);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home) {
-            home = "/tmp";
-        }
-        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    }
-    cbm_mkdir_p(cache_dir, 0755);
+    /* Honor CBM_CACHE_DIR so this matches the pipeline write path (test isolation). */
+    snprintf(cache_dir, sizeof(cache_dir), "%s",
+             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp");
+    cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
@@ -247,7 +241,16 @@ static bool extract_crashes(const char *content, CBMLanguage lang, const char *r
         _exit(0);
     }
     int status = 0;
-    (void)waitpid(pid, &status, 0);
+    /* leaks --atExit (macOS) SIGSTOPs the forked child during heap inspection;
+     * WUNTRACED+SIGCONT avoids the hang (mirrors test_store_bulk.c, b336466). */
+    for (;;) {
+        if (waitpid(pid, &status, WUNTRACED) < 0) break;
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
     return WIFSIGNALED(status);
 #endif
 }
@@ -298,6 +301,41 @@ TEST(contract_c_calls_attributed_to_function) {
     lang_cleanup(&lp, store);
     ASSERT_TRUE(calls >= 1);      /* run() -> helper() */
     ASSERT_TRUE(fn_callers >= 1); /* the CALLS must hang off a Function, not Module */
+    PASS();
+}
+
+TEST(contract_c_nested_calls_keep_enclosing_function_qn) {
+    const char *src = "static int is_streamlined_default_tool(const char *name) {\n"
+                      "    return name && name[0];\n"
+                      "}\n"
+                      "static void emit_tool(int i) { (void)i; }\n"
+                      "char *cbm_mcp_tools_list(void *srv) {\n"
+                      "    (void)srv;\n"
+                      "    for (int i = 0; i < 3; i++) {\n"
+                      "        if (is_streamlined_default_tool(\"search_graph\")) {\n"
+                      "            emit_tool(i);\n"
+                      "        }\n"
+                      "    }\n"
+                      "    return 0;\n"
+                      "}\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_C, "lc", "mcp.c", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+
+    int scoped_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->callee_name || !call->enclosing_func_qn) {
+            continue;
+        }
+        if ((strcmp(call->callee_name, "is_streamlined_default_tool") == 0 ||
+             strcmp(call->callee_name, "emit_tool") == 0) &&
+            strstr(call->enclosing_func_qn, "cbm_mcp_tools_list")) {
+            scoped_calls++;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_GTE(scoped_calls, 2);
     PASS();
 }
 
@@ -634,7 +672,7 @@ static const CallCase CALL_CASES[] = {
      "print(value)\n}\n",
      true, NULL},
     {"dart", "a.dart", "void helper() {\n  print('helper');\n}\n\nvoid run() {\n  helper();\n}\n",
-     false, "selector call node carries no callee field; no dart branch in extract_calls.c"},
+     true, NULL},
     {"scala", "a.scala", "def helper(): Int =\n  21 + 21\n\ndef run(): Int =\n  helper() * 2\n",
      true, NULL},
     {"bash", "a.sh", "helper() {\n  echo \"doing work\"\n}\n\nrun() {\n  helper\n}\n", true, NULL},
@@ -822,8 +860,8 @@ TEST(contract_calls_breadth) {
         }
     }
     fprintf(stderr,
-            "  [CALLS-BREADTH] %d langs: %d FAILURES (each = a language that does not "
-            "resolve a same-file CALLS edge)\n",
+            "  [CALLS-BREADTH] %d languages checked; observed gaps=%d "
+            "(gap = no same-file CALLS edge)\n",
             n, failures);
     ASSERT_EQ(failures, 0);
     PASS();
@@ -927,13 +965,18 @@ TEST(contract_edge_defines) {
     PASS();
 }
 
-/* DEFINES_METHOD — Class -> Method when the method's parent_class resolves. */
+/* DEFINES_METHOD — Class -> Method when the method's parent_class resolves.
+ * MEMBER_OF — the reverse Method -> Class edge (fork addition; consumed by
+ * pagerank.c member_rank_factor). Asserting BOTH directions locks in the
+ * function<->class tie (§4c): a class-scoped callable must link to its class
+ * both ways. The reverse edge previously had no test coverage anywhere. */
 TEST(contract_edge_defines_method) {
     static const LangFile f[] = {{"greeter.py",
                                   "class Greeter:\n    def hello(self):\n        return \"hi\"\n\n"
                                   "    def bye(self):\n        return \"bye\"\n\n\n"
                                   "def main():\n    g = Greeter()\n    return g.hello()\n"}};
-    ASSERT_TRUE(edge_present(f, 1, "DEFINES_METHOD", 1)); /* Greeter.hello, Greeter.bye */
+    ASSERT_TRUE(edge_present(f, 1, "DEFINES_METHOD", 1)); /* Class -> Method: Greeter.hello, Greeter.bye */
+    ASSERT_TRUE(edge_present(f, 1, "MEMBER_OF", 1));      /* Method -> Class: reverse edge feeding PageRank */
     PASS();
 }
 
@@ -1470,6 +1513,27 @@ TEST(contract_edge_commonjs_require_call_resolves_issue871) {
     PASS();
 }
 
+/* A weak short-name call match must not bind executable source to a Variable
+ * extracted from an unrelated data file. This exact shape previously made
+ * incremental and clean benchmark graphs depend on registry insertion order. */
+TEST(contract_call_weak_match_rejects_noncallable_data_symbol) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"caller.c", "void caller(void) {\n    format();\n}\n"},
+        {"benchmarks/schema/example.schema.json",
+         "{\"type\":\"object\",\"properties\":{\"format\":{\"type\":\"string\"}}}\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    int false_target = calls_edge_targets(store, lp.project, "Variable", ".format");
+    if (false_target) {
+        fprintf(stderr,
+                "  weak call resolution must not target unrelated JSON Variable `format`\n");
+    }
+    ASSERT_TRUE(!false_target);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* DEPENDS_ON — Helm Chart.yaml `dependencies:` -> per-dependency Chart node.
  * Basename must be exactly "Chart.yaml"; pass_k8s runs in both pipeline paths. */
 TEST(contract_edge_depends_on) {
@@ -1638,6 +1702,7 @@ SUITE(lang_contract) {
      * tier; these fast contracts still guard against regressions. */
     RUN_TEST(contract_kotlin_imports_extracted);
     RUN_TEST(contract_c_calls_attributed_to_function);
+    RUN_TEST(contract_c_nested_calls_keep_enclosing_function_qn);
     RUN_TEST(contract_java_extract_no_crash);
 
     /* Rich per-language invariants (P3). */
@@ -1683,6 +1748,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
     RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
+    RUN_TEST(contract_call_weak_match_rejects_noncallable_data_symbol);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);

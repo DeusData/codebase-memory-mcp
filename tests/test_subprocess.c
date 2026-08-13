@@ -9,9 +9,11 @@
  *      (SKIP_PLATFORM on Windows, which lacks it).
  */
 #include "test_framework.h"
+#include "../src/foundation/platform.h"
+#include "../src/foundation/platform_internal.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/compat.h"
-#include "../src/foundation/platform.h"
+#include "../src/foundation/compat_fs.h" /* cbm_fopen */
 
 #include <errno.h>
 #include <limits.h>
@@ -21,6 +23,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -109,6 +112,70 @@ TEST(subprocess_run_clean) {
 #endif
 }
 
+TEST(subprocess_short_child_uses_fast_reap_window) {
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(0, 100), 5);
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(249, 100), 5);
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 100), 100);
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 200), 200);
+#ifdef _WIN32
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL), 200);
+#else
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL), 100);
+#endif
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh latency canary; poll policy assertions ran");
+#elif defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+    SKIP_PLATFORM("wall-clock fork/exec canary is invalid under TSan; poll policy assertions ran");
+#else
+    /* Coarse regression canary only: the old path unconditionally slept a full
+     * steady interval after observing a still-running child. Exact policy is
+     * covered by the deterministic assertions above.
+     *
+     * Two things this deliberately does NOT do, because both made it fail on
+     * correct behavior:
+     *  - it does not bound elapsed time by the steady interval itself. The child
+     *    sleeps CANARY_CHILD_SLEEP_MS and the regression ADDS a steady interval,
+     *    so the discriminating threshold is their SUM. Bounding by the interval
+     *    alone left zero margin for fork/exec overhead and rejected a correct
+     *    run that measured exactly on the boundary ("elapsed_ms (100) not < 100").
+     *  - it does not trust a single sample. Under concurrent build and suite load
+     *    scheduler delay alone exceeded the budget (168 ms observed). The MINIMUM
+     *    of a few attempts approximates the true latency, while a real regression
+     *    slows every attempt and is still caught. */
+    enum {
+        CANARY_CHILD_SLEEP_MS = 20,  /* matches "sleep 0.02" below */
+        CANARY_STEADY_SLEEP_MS = 100, /* CBM_PROC_POSIX_STEADY_POLL_MS */
+        /* GROSS-regression guard only, and the margin is the point. Under the
+         * sanitizer, fork/exec overhead on macOS is itself of the same order as
+         * CANARY_STEADY_SLEEP_MS, so a budget set AT child+steady cannot separate
+         * "slept one steady interval" from "paid sanitizer overhead": a correct
+         * run was measured at exactly 120 ms against a 120 ms budget. Doubling
+         * the steady term buys margin that overhead cannot cross, while a real
+         * regression -- which sleeps a steady interval on EVERY poll, not once --
+         * still blows through it. Precise policy is pinned deterministically by
+         * the cbm_subprocess_poll_interval_ms assertions above; this check exists
+         * only so a wholesale return to sleep-per-poll cannot pass unnoticed. */
+        CANARY_BUDGET_MS = CANARY_CHILD_SLEEP_MS + (2 * CANARY_STEADY_SLEEP_MS),
+        CANARY_ATTEMPTS = 3,
+    };
+    uint64_t best_ms = UINT64_MAX;
+    for (int attempt = 0; attempt < CANARY_ATTEMPTS; attempt++) {
+        uint64_t started_ms = cbm_now_ms();
+        cbm_proc_result_t r = run_sh("sleep 0.02", 0);
+        uint64_t elapsed_ms = cbm_now_ms() - started_ms;
+        ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
+        if (elapsed_ms < best_ms) {
+            best_ms = elapsed_ms;
+        }
+        if (best_ms < CANARY_BUDGET_MS) {
+            break; /* already proved the fast path; no need to pay for more runs */
+        }
+    }
+    ASSERT_LT(best_ms, CANARY_BUDGET_MS);
+    PASS();
+#endif
+}
+
 TEST(subprocess_run_exit_nonzero) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX /bin/sh spawn");
@@ -168,7 +235,46 @@ TEST(subprocess_run_hang_is_hang) {
 #endif
 }
 
-/* A spawn of a non-existent binary fails cleanly (no child), not a crash. */
+/* A cancellation request must terminate and reap a live child without waiting
+ * for the quiet-timeout.
+ *
+ * Migrated from the retired opts.cancel_requested flag: the merged subprocess
+ * API moves cancellation onto the OWNED HANDLE (cbm_subprocess_request_cancel),
+ * so the flag no longer exists. The assertion is unchanged -- a cancelled
+ * `sleep 30` is reaped promptly and classified CBM_PROC_KILLED -- and the handle
+ * form additionally proves cancel works on an ALREADY-RUNNING child, which the
+ * pre-set flag could not: it was only ever observed on the first poll. */
+TEST(subprocess_run_cancel_reaps_child) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    const char *argv[] = {"/bin/sh", "-c", "sleep 30", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
+    ASSERT_NOT_NULL(process);
+    ASSERT_TRUE(cbm_subprocess_request_cancel(process));
+
+    cbm_proc_result_t r = {0};
+    cbm_proc_poll_t polled = CBM_PROC_POLL_RUNNING;
+    /* Bounded: a cancelled child must reach terminal well inside `sleep 30`, so
+     * a timeout here is a real failure rather than a slow machine. */
+    for (int i = 0; i < 2000 && polled == CBM_PROC_POLL_RUNNING; i++) {
+        polled = cbm_subprocess_poll(process, &r);
+        if (polled == CBM_PROC_POLL_RUNNING) {
+            cbm_usleep(5000);
+        }
+    }
+    cbm_subprocess_destroy(process);
+
+    ASSERT_EQ(polled, CBM_PROC_POLL_TERMINAL);
+    ASSERT_EQ(r.outcome, CBM_PROC_KILLED);
+    PASS();
+#endif
+}
+
 /* The kernel refusing a spawn with EAGAIN means "not right now", not "never" —
  * a momentarily full process table on a busy machine. We used to treat it as a
  * permanent failure, so a git probe or LSP server refused to start for a reason
@@ -253,6 +359,42 @@ static void subprocess_test_pause(void) {
     (void)cbm_nanosleep(&delay, NULL);
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && defined(__APPLE__)
+enum { CBM_DARWIN_ZOMBIE_OBSERVE_TIMEOUT_MS = 1000 };
+static bool darwin_post_spawn_observed_zombie;
+
+static void hold_darwin_managed_child_as_zombie(long child_pid) {
+    uint64_t deadline = cbm_now_ms() + CBM_DARWIN_ZOMBIE_OBSERVE_TIMEOUT_MS;
+    do {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (waitid(P_PID, (id_t)child_pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            info.si_pid == (pid_t)child_pid) {
+            darwin_post_spawn_observed_zombie = true;
+            return;
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline);
+}
+
+TEST(subprocess_darwin_managed_spawn_accepts_immediate_exit_zombie) {
+    darwin_post_spawn_observed_zombie = false;
+    cbm_subprocess_set_darwin_post_spawn_hook_for_testing(hold_darwin_managed_child_as_zombie);
+
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/usr/bin/true";
+    cbm_proc_result_t result = {0};
+    int run_rc = cbm_subprocess_run(&opts, &result);
+
+    cbm_subprocess_set_darwin_post_spawn_hook_for_testing(NULL);
+    ASSERT_TRUE(darwin_post_spawn_observed_zombie);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(result.tree_quiesced);
+    PASS();
+}
+#endif
+
 static bool poll_until_terminal(cbm_subprocess_t *process, int timeout_ms, cbm_proc_result_t *out) {
     uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
     do {
@@ -275,7 +417,7 @@ static bool make_tree_pid_path(char path[64]) {
         return false;
     }
     (void)close(fd);
-    return unlink(path) == 0; /* child creates it only after both traps are installed */
+    return unlink(path) == 0; /* probe recreates it only after its signal traps are installed */
 }
 
 static bool wait_for_tree_pids(const char *path, cbm_subprocess_t *process, pid_t *parent_pid,
@@ -291,6 +433,29 @@ static bool wait_for_tree_pids(const char *path, cbm_subprocess_t *process, pid_
             if (fields == 2 && parent_value > 1 && grandchild_value > 1) {
                 *parent_pid = (pid_t)parent_value;
                 *grandchild_pid = (pid_t)grandchild_value;
+                return true;
+            }
+        }
+        cbm_proc_result_t ignored;
+        if (cbm_subprocess_poll(process, &ignored) != CBM_PROC_POLL_RUNNING) {
+            return false;
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline);
+    return false;
+}
+
+static bool wait_for_process_pid(const char *path, cbm_subprocess_t *process, pid_t *pid,
+                                 int timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + (uint64_t)timeout_ms;
+    do {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            long value = 0;
+            int fields = fscanf(f, "%ld", &value);
+            fclose(f);
+            if (fields == 1 && value > 1) {
+                *pid = (pid_t)value;
                 return true;
             }
         }
@@ -344,6 +509,70 @@ static int spawn_ignoring_tree(const char *pid_path, int quiet_timeout_ms, int c
     opts.quiet_timeout_ms = quiet_timeout_ms;
     opts.cancel_grace_ms = cancel_grace_ms;
     return cbm_subprocess_spawn(&opts, out);
+}
+
+static int spawn_ignoring_process(const char *pid_path, int cancel_grace_ms,
+                                  cbm_subprocess_t **out) {
+    /* Keep this probe to one owned process. The zombie-only assertion must not
+     * depend on when the host init process reaps an orphaned grandchild. Ignored
+     * signal dispositions survive exec, so /bin/sleep remains TERM-resistant. */
+    const char *script = "trap '' TERM; echo \"$$\" > \"$1\"; exec /bin/sleep 60";
+    const char *argv[] = {"/bin/sh", "-c", script, "cbm-process", pid_path, NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    opts.cancel_grace_ms = cancel_grace_ms;
+    return cbm_subprocess_spawn(&opts, out);
+}
+
+static pid_t create_zombie_group_member(pid_t pgid) {
+    int gate[2];
+    if (pipe(gate) != 0) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        (void)close(gate[0]);
+        (void)close(gate[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        (void)close(gate[1]);
+        char ignored;
+        ssize_t received;
+        do {
+            received = read(gate[0], &ignored, sizeof(ignored));
+        } while (received < 0 && errno == EINTR);
+        (void)close(gate[0]);
+        _exit(received == 0 ? 0 : 101);
+    }
+    (void)close(gate[0]);
+    if (setpgid(pid, pgid) != 0) {
+        (void)close(gate[1]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return -1;
+    }
+    (void)close(gate[1]); /* EOF releases the child; deliberately do not reap it yet */
+
+    uint64_t deadline = cbm_now_ms() + 1000U;
+    do {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            info.si_pid == pid) {
+            return pid;
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline);
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, NULL, 0);
+    return -1;
+}
+
+static bool subprocess_zombie_process_table_available(void) {
+    return cbm_platform_process_group_state((int64_t)getpgrp()) ==
+           CBM_PLATFORM_PROCESS_GROUP_ACTIVE;
 }
 
 typedef struct {
@@ -594,6 +823,55 @@ TEST(subprocess_cancel_grace_is_hard_capped) {
 #endif
 }
 
+TEST(subprocess_zombie_only_group_is_quiesced_without_extending_settle) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX zombie/process-group probe; Windows Job Objects exclude exited processes");
+#else
+    if (!subprocess_zombie_process_table_available()) {
+        SKIP_PLATFORM("host denies the process-table query required to classify zombie-only groups");
+    }
+    char pid_path[64];
+    ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(spawn_ignoring_process(pid_path, 100, &process), 0);
+    ASSERT_NOT_NULL(process);
+
+    pid_t parent_pid = -1;
+    bool ready = wait_for_process_pid(pid_path, process, &parent_pid, 1000);
+    /* This direct test child joins the owned PGID, exits, and remains deliberately
+     * unreaped. kill(-pgid, 0) therefore keeps succeeding past the force deadline
+     * after the single owned process is reaped and no group member can execute. */
+    pid_t zombie_pid = ready ? create_zombie_group_member(parent_pid) : -1;
+    bool cancel_accepted = zombie_pid > 1 && cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result = {0};
+    bool terminal = cancel_accepted && poll_until_terminal(process, 2500, &result);
+    int zombie_status = 0;
+    bool zombie_reaped = zombie_pid > 1 && waitpid(zombie_pid, &zombie_status, 0) == zombie_pid;
+    if (!terminal) {
+        force_probe_cleanup(parent_pid, -1);
+        cbm_proc_result_t cleanup_result;
+        if (poll_until_terminal(process, 1000, &cleanup_result)) {
+            cbm_subprocess_destroy(process);
+        }
+    } else {
+        cbm_subprocess_destroy(process);
+    }
+    (void)unlink(pid_path);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(zombie_pid > 1);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(result.forced);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(zombie_reaped);
+    ASSERT_TRUE(WIFEXITED(zombie_status));
+    ASSERT_EQ(WEXITSTATUS(zombie_status), 0);
+    PASS();
+#endif
+}
+
 TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX shell log budget probe; native Windows coverage pending");
@@ -767,6 +1045,50 @@ TEST(subprocess_posix_child_closes_unrelated_descriptors) {
     ASSERT_EQ(run_rc, 0);
     ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
     ASSERT_EQ(result.exit_code, 0);
+    PASS();
+#endif
+}
+
+TEST(subprocess_posix_fd_close_limit_is_finite) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX descriptor-close bound");
+#else
+    long close_limit = cbm_subprocess_posix_fd_close_limit();
+    ASSERT_TRUE(close_limit > STDERR_FILENO);
+    ASSERT_TRUE(close_limit <= INT_MAX);
+    PASS();
+#endif
+}
+
+TEST(subprocess_posix_child_resets_signal_disposition_and_mask) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX signal disposition/mask probe");
+#else
+    struct sigaction ignored = {0};
+    struct sigaction original_action;
+    ignored.sa_handler = SIG_IGN;
+    ASSERT_EQ(sigemptyset(&ignored.sa_mask), 0);
+    ASSERT_EQ(sigaction(SIGTERM, &ignored, &original_action), 0);
+    sigset_t blocked;
+    sigset_t original_mask;
+    ASSERT_EQ(sigemptyset(&blocked), 0);
+    ASSERT_EQ(sigaddset(&blocked, SIGTERM), 0);
+    ASSERT_EQ(sigprocmask(SIG_BLOCK, &blocked, &original_mask), 0);
+
+    const char *argv[] = {"/bin/sh", "-c", "kill -TERM $$; exit 42", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    cbm_proc_result_t result = {0};
+    int run_rc = cbm_subprocess_run(&opts, &result);
+
+    int mask_restore = sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    int action_restore = sigaction(SIGTERM, &original_action, NULL);
+    ASSERT_EQ(mask_restore, 0);
+    ASSERT_EQ(action_restore, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_KILLED);
+    ASSERT_EQ(result.term_signal, SIGTERM);
     PASS();
 #endif
 }
@@ -1019,7 +1341,84 @@ TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths) {
     PASS();
 }
 
+#ifndef _WIN32
+/* Read a whole log file so both directions can be asserted on its exact bytes. */
+static bool subprocess_read_log(const char *path, char *out, size_t out_size) {
+    FILE *f = cbm_fopen(path, "r"); /* project wrapper: wide-path handling on Windows */
+    if (!f) {
+        return false;
+    }
+    size_t n = fread(out, 1, out_size - 1, f);
+    out[n] = '\0';
+    (void)fclose(f);
+    return true;
+}
+
+/* Run a child that writes one line to stdout and a different line to stderr. */
+static bool subprocess_run_two_stream_child(const char *log_path, bool discard_stderr,
+                                            cbm_proc_result_t *result) {
+    const char *script = "echo CBM_STDOUT_LINE; echo CBM_STDERR_LINE 1>&2";
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    opts.log_file = log_path;
+    opts.discard_stderr = discard_stderr;
+    opts.cancel_grace_ms = 100;
+    return cbm_subprocess_run(&opts, result) == 0;
+}
+#endif
+
+/* discard_stderr exists so a caller that PARSES child output cannot read a
+ * diagnostic as a result: src/git/git_command.c captures a command's first line
+ * and must never return "warning: ..." as, say, a rev-parse value. Both
+ * directions are asserted, because the DEFAULT merged stream is itself a
+ * capability -- the index supervisor tails child logs and needs stderr in them. */
+TEST(subprocess_discard_stderr_keeps_stdout_and_drops_diagnostics) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX two-stream probe; native Windows coverage pending");
+#else
+    char merged_path[] = "/tmp/cbm-subprocess-stderr-merged-XXXXXX";
+    int merged_fd = cbm_mkstemp(merged_path);
+    ASSERT_TRUE(merged_fd >= 0);
+    (void)close(merged_fd);
+    char split_path[] = "/tmp/cbm-subprocess-stderr-split-XXXXXX";
+    int split_fd = cbm_mkstemp(split_path);
+    ASSERT_TRUE(split_fd >= 0);
+    (void)close(split_fd);
+
+    /* Default: both streams reach the log, which log tailing depends on. */
+    cbm_proc_result_t merged_result = {0};
+    bool merged_ran = subprocess_run_two_stream_child(merged_path, false, &merged_result);
+    char merged_text[1024] = "";
+    bool merged_read = merged_ran && subprocess_read_log(merged_path, merged_text,
+                                                         sizeof(merged_text));
+
+    /* discard_stderr: stdout survives, the diagnostic is gone. */
+    cbm_proc_result_t split_result = {0};
+    bool split_ran = subprocess_run_two_stream_child(split_path, true, &split_result);
+    char split_text[1024] = "";
+    bool split_read = split_ran && subprocess_read_log(split_path, split_text,
+                                                       sizeof(split_text));
+
+    (void)unlink(merged_path);
+    (void)unlink(split_path);
+
+    ASSERT_TRUE(merged_ran);
+    ASSERT_TRUE(merged_read);
+    ASSERT_NOT_NULL(strstr(merged_text, "CBM_STDOUT_LINE"));
+    ASSERT_NOT_NULL(strstr(merged_text, "CBM_STDERR_LINE"));
+
+    ASSERT_TRUE(split_ran);
+    ASSERT_TRUE(split_read);
+    ASSERT_NOT_NULL(strstr(split_text, "CBM_STDOUT_LINE"));
+    ASSERT_NULL(strstr(split_text, "CBM_STDERR_LINE"));
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
+    RUN_TEST(subprocess_discard_stderr_keeps_stdout_and_drops_diagnostics);
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
     RUN_TEST(subprocess_classify_windows_crash_codes);
@@ -1028,10 +1427,15 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_classify_timeout_dominates);
     RUN_TEST(subprocess_outcome_str);
     RUN_TEST(subprocess_run_clean);
+    RUN_TEST(subprocess_short_child_uses_fast_reap_window);
+#if defined(CBM_ENABLE_TEST_SEAMS) && defined(__APPLE__)
+    RUN_TEST(subprocess_darwin_managed_spawn_accepts_immediate_exit_zombie);
+#endif
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_resolves_literal_binary_name_from_path);
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
+    RUN_TEST(subprocess_run_cancel_reaps_child);
     RUN_TEST(subprocess_retries_transient_spawn_refusal);
     RUN_TEST(subprocess_gives_up_after_the_retry_budget);
     RUN_TEST(subprocess_run_spawn_failure);
@@ -1041,9 +1445,12 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
+    RUN_TEST(subprocess_zombie_only_group_is_quiesced_without_extending_settle);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_posix_fd_close_limit_is_finite);
+    RUN_TEST(subprocess_posix_child_resets_signal_disposition_and_mask);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);

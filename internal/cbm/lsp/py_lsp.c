@@ -11,6 +11,8 @@
  *                                          resolved_calls entries
  */
 #include "py_lsp.h"
+#include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "../cbm.h"
 #include "../helpers.h"
 #include "tree_sitter/api.h"
@@ -191,20 +193,15 @@ static void py_disable_callable_value_proof(PyLSPContext *ctx) {
 
 static void py_scope_bind(PyLSPContext *ctx, const char *name, const CBMType *type) {
     ctx->type_cache_gen++;
-    cbm_scope_bind(ctx->current_scope, name, type);
-    if (name && !cbm_scope_contains(ctx->current_scope, name))
+    if (!cbm_scope_bind_checked(ctx->current_scope, name, type))
         py_disable_callable_value_proof(ctx);
 }
 
 static void py_scope_bind_callable(PyLSPContext *ctx, const char *name, const CBMType *type,
                                    const char *callable_qn) {
     ctx->type_cache_gen++;
-    cbm_scope_bind_callable(ctx->current_scope, name, type, callable_qn);
-    const char *bound = name ? cbm_scope_lookup_callable(ctx->current_scope, name) : NULL;
-    if (name && (!cbm_scope_contains(ctx->current_scope, name) ||
-                 (callable_qn && (!bound || strcmp(bound, callable_qn) != 0)))) {
+    if (!cbm_scope_bind_callable_checked(ctx->current_scope, name, type, callable_qn))
         py_disable_callable_value_proof(ctx);
-    }
 }
 
 static CBMScope *py_scope_push_checked(PyLSPContext *ctx) {
@@ -241,8 +238,7 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
     ctx->current_scope = py_scope_push_checked(ctx);
-    const char *dbg = getenv("CBM_LSP_DEBUG");
-    ctx->debug = dbg && dbg[0] && dbg[0] != '0';
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *module_qn) {
@@ -944,8 +940,9 @@ static const char *py_exact_callable_target_ex(PyLSPContext *ctx, TSNode node,
         char *name = py_node_text(ctx, node);
         if (!name)
             return NULL;
-        if (cbm_scope_contains(ctx->current_scope, name)) {
-            const char *bound = cbm_scope_lookup_callable(ctx->current_scope, name);
+        const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
+        if (binding) {
+            const char *bound = binding->callable_qn;
             if (bound && lexical_alias_out) {
                 /* A lexical binding that does NOT simply name the module symbol
                  * of the same spelling is an alias introduced in this body. Only
@@ -1024,12 +1021,13 @@ static void py_resolve_value_references_at(PyLSPContext *ctx, TSNode call) {
         const char *candidate = strcmp(kind, "identifier") == 0
                                     ? py_exact_imported_reference_candidate(ctx, source_name)
                                     : NULL;
-        if (candidate && cbm_scope_contains(ctx->current_scope, source_name)) {
-            const CBMType *binding =
-                cbm_type_resolve_alias(cbm_scope_lookup(ctx->current_scope, source_name));
-            if (binding && binding->kind == CBM_TYPE_NAMED &&
-                binding->data.named.qualified_name &&
-                strcmp(binding->data.named.qualified_name, candidate) == 0) {
+        const CBMVarBinding *scope_binding =
+            candidate ? cbm_scope_lookup_binding(ctx->current_scope, source_name) : NULL;
+        if (scope_binding) {
+            const CBMType *type = cbm_type_resolve_alias(scope_binding->type);
+            if (type && type->kind == CBM_TYPE_NAMED &&
+                type->data.named.qualified_name &&
+                strcmp(type->data.named.qualified_name, candidate) == 0) {
                 py_emit_unresolved_reference(ctx, candidate, arg);
             }
         }
@@ -1511,9 +1509,9 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
         char *name = py_node_text(ctx, node);
         if (!name)
             return cbm_type_unknown();
-        const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
-        if (cbm_scope_contains(ctx->current_scope, name))
-            return t ? t : cbm_type_unknown();
+        const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
+        if (binding)
+            return binding->type ? binding->type : cbm_type_unknown();
         // Builtin globals: True / False / None at top level.
         if (strcmp(name, "True") == 0 || strcmp(name, "False") == 0)
             return cbm_type_builtin(ctx->arena, "bool");
@@ -1779,8 +1777,11 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
                 }
             }
             // Constructor call: ClassName() returns NAMED(ClassName).
-            const CBMType *in_scope = cbm_scope_lookup(ctx->current_scope, fname);
-            const char *callable_qn = cbm_scope_lookup_callable(ctx->current_scope, fname);
+            const CBMVarBinding *binding =
+                cbm_scope_lookup_binding(ctx->current_scope, fname);
+            const CBMType *in_scope =
+                binding && binding->type ? binding->type : cbm_type_unknown();
+            const char *callable_qn = binding ? binding->callable_qn : NULL;
             if (callable_qn) {
                 return py_func_return_type(ctx, callable_qn);
             }
@@ -1808,7 +1809,7 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
             }
             /* Even an UNKNOWN local/parameter is a real lexical shadow. Do
              * not borrow the return type of a same-named module function. */
-            if (cbm_scope_contains(ctx->current_scope, fname))
+            if (binding)
                 return cbm_type_unknown();
             // Module-local function call.
             const CBMRegisteredFunc *f =
@@ -2578,14 +2579,16 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
          * An ordinary local binding is also a hard shadow: if it is not a
          * proven callable alias, do not fall through and fabricate a direct
          * call to a module-level function with the same spelling. */
-        if (cbm_scope_contains(ctx->current_scope, fname)) {
-            const char *alias_target = cbm_scope_lookup_callable(ctx->current_scope, fname);
+        const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, fname);
+        if (binding) {
+            const char *alias_target = binding->callable_qn;
             if (alias_target) {
                 py_emit_resolved_call_reason(ctx, alias_target, "lsp_callable_alias", 0.97f, fname,
                                              call_node);
                 return;
             }
-            const CBMType *in_scope = cbm_scope_lookup(ctx->current_scope, fname);
+            const CBMType *in_scope =
+                binding->type ? binding->type : cbm_type_unknown();
             if (!cbm_type_is_unknown(in_scope) && in_scope->kind == CBM_TYPE_NAMED) {
                 const char *qn = in_scope->data.named.qualified_name;
                 const char *tail = qn ? strrchr(qn, '.') : NULL;
@@ -2615,13 +2618,6 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     py_emit_resolved_call(ctx, qn, "lsp_constructor", 0.85f, call_node);
                 }
             }
-            return;
-        }
-        // Constructor call (ClassName())
-        const CBMType *in_scope = cbm_scope_lookup(ctx->current_scope, fname);
-        if (!cbm_type_is_unknown(in_scope) && in_scope->kind == CBM_TYPE_NAMED) {
-            const char *qn = in_scope->data.named.qualified_name;
-            py_emit_resolved_call(ctx, qn, "lsp_constructor", 0.85f, call_node);
             return;
         }
         // Module-local function
@@ -2758,12 +2754,13 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
                     if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
-                        char *qual_mod = (char *)cbm_arena_alloc(ctx->arena, root_len + 1 +
-                                                                                strlen(mod) + 1);
+                        size_t mod_len = strlen(mod);
+                        char *qual_mod = (char *)cbm_arena_alloc(
+                            ctx->arena, root_len + SKIP_ONE + mod_len + SKIP_ONE);
                         if (qual_mod) {
                             memcpy(qual_mod, ctx->module_qn, root_len);
                             qual_mod[root_len] = '.';
-                            strcpy(qual_mod + root_len + 1, mod);
+                            memcpy(qual_mod + root_len + SKIP_ONE, mod, mod_len + SKIP_ONE);
                             const CBMRegisteredFunc *qf =
                                 cbm_registry_lookup_symbol(ctx->registry, qual_mod, attr_name);
                             if (qf) {
@@ -4171,22 +4168,33 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
 /* Module bindings are replayed in source order before deferred function bodies
  * are analyzed. Class definitions always replace an earlier callable identity;
  * the registry decides whether the resulting class type is known precisely. */
-static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const char *name) {
-    uint32_t count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_named_child(root, i);
-        const char *kind = ts_node_type(node);
-        if (strcmp(kind, "decorated_definition") == 0) {
-            node = ts_node_child_by_field_name(node, "definition", 10);
-            kind = ts_node_is_null(node) ? "" : ts_node_type(node);
+static bool py_root_cursor_defines_class_named(PyLSPContext *ctx, TSNode root,
+                                               TSTreeCursor *cursor, const char *name) {
+    TSNode start = ts_tree_cursor_current_node(cursor);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(cursor);
+        bool found = false;
+        if (ts_node_is_named(node)) {
+            const char *kind = ts_node_type(node);
+            if (strcmp(kind, "decorated_definition") == 0) {
+                node = ts_node_child_by_field_name(node, "definition", 10);
+                kind = ts_node_is_null(node) ? "" : ts_node_type(node);
+            }
+            if (strcmp(kind, "class_definition") == 0) {
+                TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+                found = py_import_node_text_equals(ctx, name_node, name);
+            }
         }
-        if (strcmp(kind, "class_definition") != 0)
-            continue;
-        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
-        if (py_import_node_text_equals(ctx, name_node, name))
+        if (!ts_tree_cursor_goto_next_sibling(cursor)) {
+            ts_tree_cursor_reset(cursor, root);
+            if (!ts_tree_cursor_goto_first_child(cursor))
+                return found;
+        }
+        if (found)
             return true;
+        if (ts_node_eq(ts_tree_cursor_current_node(cursor), start))
+            return false;
     }
-    return false;
 }
 
 /* A project registry can contain another file's class in the same logical
@@ -4196,17 +4204,22 @@ static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const ch
 static void py_bind_external_module_classes(PyLSPContext *ctx, TSNode root) {
     if (!ctx || !ctx->registry || !ctx->module_qn)
         return;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool root_has_children = ts_tree_cursor_goto_first_child(&cursor);
     size_t prefix_len = strlen(ctx->module_qn);
     for (int i = 0; i < ctx->registry->type_count; i++) {
         const CBMRegisteredType *type = &ctx->registry->types[i];
         const char *qn = type->qualified_name;
         const char *name = type->short_name;
         if (!qn || !name || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
-            qn[prefix_len] != '.' || py_root_defines_class_named(ctx, root, name)) {
+            qn[prefix_len] != '.' ||
+            (root_has_children &&
+             py_root_cursor_defines_class_named(ctx, root, &cursor, name))) {
             continue;
         }
         py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static void py_bind_module_class(PyLSPContext *ctx, TSNode class_node) {

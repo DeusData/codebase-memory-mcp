@@ -13,6 +13,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pipeline.h"
+#include "cli/cli.h"
 #include "store/store.h"
 #include "foundation/compat.h"
 
@@ -39,6 +40,63 @@ static const CBMDefinition *find_def(const CBMFileResult *r, const char *name) {
         }
     }
     return NULL;
+}
+
+/* Build two functions with an identical, structurally meaningful prefix whose
+ * leaf-token count exceeds the former 4096-token MinHash prefix. The optional
+ * suffix then proves that structure after that boundary affects the result. */
+static char *build_long_minhash_source(const char *name, bool add_distinct_suffix) {
+    enum { MINHASH_LONG_PREFIX_STATEMENTS = 1800 };
+    char *source = malloc(CBM_SZ_64K);
+    if (!source) {
+        return NULL;
+    }
+    int n = snprintf(source, CBM_SZ_64K,
+                     "package main\n"
+                     "func %s(x int) int {\n"
+                     "    if x > 0 { x-- } else { x++ }\n"
+                     "    for i := 0; i < 8; i++ { x += i }\n"
+                     "    switch x {\n"
+                     "    case 1: x *= 2\n"
+                     "    case 2: x /= 2\n"
+                     "    default: x %%= 3\n"
+                     "    }\n"
+                     "    values := []int{1, 2, 3}\n"
+                     "    for _, value := range values { x += value }\n"
+                     "    defer func() { x++ }()\n",
+                     name);
+    if (n <= 0 || (size_t)n >= CBM_SZ_64K) {
+        free(source);
+        return NULL;
+    }
+    size_t used = (size_t)n;
+    for (int i = 0; i < MINHASH_LONG_PREFIX_STATEMENTS; i++) {
+        n = snprintf(source + used, CBM_SZ_64K - used, "    x += 1\n");
+        if (n <= 0 || (size_t)n >= CBM_SZ_64K - used) {
+            free(source);
+            return NULL;
+        }
+        used += (size_t)n;
+    }
+    const char *suffix =
+        add_distinct_suffix
+            ? "    ch := make(chan int, 1)\n"
+              "    select {\n"
+              "    case ch <- x: x = <-ch\n"
+              "    default: close(ch)\n"
+              "    }\n"
+              "    labels := map[string]int{\"value\": x}\n"
+              "    for key, value := range labels {\n"
+              "        if len(key) > 0 && value != 0 { x += value }\n"
+              "    }\n"
+              "    go func(value int) { _ = value }(x)\n"
+            : "";
+    n = snprintf(source + used, CBM_SZ_64K - used, "%s    return x\n}\n", suffix);
+    if (n <= 0 || (size_t)n >= CBM_SZ_64K - used) {
+        free(source);
+        return NULL;
+    }
+    return source;
 }
 
 /* Count SIMILAR_TO edges in graph buffer. */
@@ -395,6 +453,38 @@ TEST(minhash_type_annotation_normalized) {
     PASS();
 }
 
+TEST(minhash_reads_structure_after_former_token_prefix) {
+    char *src_without_suffix = build_long_minhash_source("LongPrefixOnly", false);
+    char *src_with_suffix = build_long_minhash_source("LongPrefixWithSuffix", true);
+    ASSERT_NOT_NULL(src_without_suffix);
+    ASSERT_NOT_NULL(src_with_suffix);
+
+    CBMFileResult *without_result =
+        extract_one(src_without_suffix, CBM_LANG_GO, "test", "without_suffix.go");
+    CBMFileResult *with_result =
+        extract_one(src_with_suffix, CBM_LANG_GO, "test", "with_suffix.go");
+    ASSERT_NOT_NULL(without_result);
+    ASSERT_NOT_NULL(with_result);
+
+    const CBMDefinition *without_def = find_def(without_result, "LongPrefixOnly");
+    const CBMDefinition *with_def = find_def(with_result, "LongPrefixWithSuffix");
+    ASSERT_NOT_NULL(without_def);
+    ASSERT_NOT_NULL(with_def);
+    ASSERT_NOT_NULL(without_def->fingerprint);
+    ASSERT_NOT_NULL(with_def->fingerprint);
+
+    double jaccard =
+        cbm_minhash_jaccard((const cbm_minhash_t *)without_def->fingerprint,
+                            (const cbm_minhash_t *)with_def->fingerprint);
+    ASSERT_LT(jaccard, 1.0);
+
+    cbm_free_result(without_result);
+    cbm_free_result(with_result);
+    free(src_without_suffix);
+    free(src_with_suffix);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite 2: Jaccard + LSH
  * ═══════════════════════════════════════════════════════════════════ */
@@ -551,6 +641,74 @@ TEST(lsh_index_build_and_query) {
     PASS();
 }
 
+TEST(lsh_query_into_reports_exact_partial_result) {
+    cbm_minhash_t fp;
+    for (int i = 0; i < CBM_MINHASH_K; i++) {
+        fp.values[i] = (uint32_t)(i * 17 + 3);
+    }
+    cbm_lsh_index_t *idx = cbm_lsh_new();
+    ASSERT_NOT_NULL(idx);
+    for (int i = 0; i < 3; i++) {
+        cbm_lsh_entry_t entry = {
+            .node_id = i + 1,
+            .fingerprint = &fp,
+            .file_path = "partial.go",
+            .file_ext = ".go",
+        };
+        cbm_lsh_insert(idx, &entry);
+    }
+
+    const cbm_lsh_entry_t *out[2] = {NULL, NULL};
+    cbm_lsh_query_result_t result = cbm_lsh_query_into_result(idx, &fp, out, 2);
+    ASSERT_EQ(result.written, 2);
+    ASSERT_EQ(result.omitted, 1);
+    ASSERT_EQ(result.noisy_buckets, 0);
+    ASSERT_FALSE(result.allocation_failed);
+    ASSERT_NOT_NULL(out[0]);
+    ASSERT_NOT_NULL(out[1]);
+    ASSERT_TRUE(out[0]->node_id != out[1]->node_id);
+
+    cbm_lsh_entry_t sentinel = {0};
+    const cbm_lsh_entry_t *compat_out[3] = {NULL, NULL, &sentinel};
+    ASSERT_EQ(cbm_lsh_query_into(idx, &fp, compat_out, 2), 2);
+    ASSERT_NOT_NULL(compat_out[0]);
+    ASSERT_NOT_NULL(compat_out[1]);
+    ASSERT_TRUE(compat_out[2] == &sentinel);
+
+    cbm_lsh_free(idx);
+    PASS();
+}
+
+TEST(lsh_query_into_reports_every_noisy_bucket) {
+    enum { LSH_NOISY_ENTRY_COUNT = CBM_LSH_MAX_BUCKET_SIZE + 1 };
+    cbm_minhash_t fp;
+    for (int i = 0; i < CBM_MINHASH_K; i++) {
+        fp.values[i] = (uint32_t)(i * 19 + 5);
+    }
+    cbm_lsh_index_t *idx = cbm_lsh_new();
+    ASSERT_NOT_NULL(idx);
+    for (int i = 0; i < LSH_NOISY_ENTRY_COUNT; i++) {
+        cbm_lsh_entry_t entry = {
+            .node_id = i + 1,
+            .fingerprint = &fp,
+            .file_path = "noisy.go",
+            .file_ext = ".go",
+        };
+        cbm_lsh_insert(idx, &entry);
+    }
+
+    const cbm_lsh_entry_t *out[1] = {NULL};
+    cbm_lsh_query_result_t result = cbm_lsh_query_into_result(idx, &fp, out, 1);
+    ASSERT_EQ(result.written, 0);
+    ASSERT_EQ(result.omitted, 0);
+    ASSERT_EQ(result.noisy_buckets, CBM_LSH_BANDS);
+    ASSERT_FALSE(result.allocation_failed);
+    ASSERT_NULL(out[0]);
+
+    cbm_lsh_free(idx);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite 3: Edge Generation (pass_similarity on graph buffer)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -650,6 +808,7 @@ TEST(pass_similarity_same_file_tagged) {
 
     cbm_pipeline_pass_similarity(&ctx);
 
+    ASSERT_EQ(count_similar_to_edges(gb), 1);
     /* Pair ownership is canonical by qualified name (determinism fix):
      * "test.a.bar" < "test.a.foo", so bar owns the pair and is the source. */
     const cbm_gbuf_edge_t **edges = NULL;
@@ -1153,8 +1312,15 @@ TEST(pipeline_minhash_incremental_new_clone) {
         "}\n");
 
     /* Step 3: Reindex (will be incremental if DB exists, or full) */
+    cbm_config_t *cfg = cbm_config_open(g_sim_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(
+                  cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                  CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
     cbm_pipeline_t *p2 = cbm_pipeline_new(g_sim_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
+    cbm_pipeline_apply_config(p2, cfg);
     rc = cbm_pipeline_run(p2);
     ASSERT_EQ(rc, 0);
 
@@ -1169,6 +1335,7 @@ TEST(pipeline_minhash_incremental_new_clone) {
     }
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
+    cbm_config_close(cfg);
 
     teardown_sim_test_repo();
     PASS();
@@ -1186,6 +1353,7 @@ SUITE(simhash) {
     RUN_TEST(minhash_minor_edit_high_jaccard);
     RUN_TEST(minhash_empty_body_skipped);
     RUN_TEST(minhash_type_annotation_normalized);
+    RUN_TEST(minhash_reads_structure_after_former_token_prefix);
 
     /* Suite 2: Jaccard + LSH */
     RUN_TEST(jaccard_identical);
@@ -1195,6 +1363,8 @@ SUITE(simhash) {
     RUN_TEST(lsh_same_bucket_similar);
     RUN_TEST(lsh_different_bucket_dissimilar);
     RUN_TEST(lsh_index_build_and_query);
+    RUN_TEST(lsh_query_into_reports_exact_partial_result);
+    RUN_TEST(lsh_query_into_reports_every_noisy_bucket);
 
     /* Suite 3: Edge Generation */
     RUN_TEST(pass_similarity_creates_edges);

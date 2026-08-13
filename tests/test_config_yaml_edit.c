@@ -378,6 +378,46 @@ TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar) {
     PASS();
 }
 
+/* The persistent lock sidecar is reused across edits by design, but an
+ * uninstall must not leave it behind. cbm_yaml_remove_lock_sidecar removes a
+ * safe sidecar, treats an absent one as success, and preserves entries that do
+ * not have the exact shape owned by the editor. */
+TEST(config_yaml_edit_remove_lock_sidecar) {
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, "model: fast\n"), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), 0);
+    char lock_path[1024];
+    ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
+    struct stat state;
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+
+    ASSERT_EQ(cbm_yaml_remove_lock_sidecar(fixture.path), 0);
+    ASSERT(lstat(lock_path, &state) != 0);
+
+    /* Absent sidecar: success (idempotent). */
+    ASSERT_EQ(cbm_yaml_remove_lock_sidecar(fixture.path), 0);
+
+    /* Symlinked sidecar: refuse and preserve both link and target. */
+    char decoy[1024];
+    ASSERT(snprintf(decoy, sizeof(decoy), "%s.decoy", fixture.path) > 0);
+    ASSERT_EQ(th_write_file(decoy, "keep\n"), 0);
+    ASSERT_EQ(symlink(decoy, lock_path), 0);
+    ASSERT(cbm_yaml_remove_lock_sidecar(fixture.path) != 0);
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+    ASSERT_EQ(lstat(decoy, &state), 0);
+    ASSERT_EQ(unlink(lock_path), 0);
+
+    /* A colliding regular file with non-editor permissions is foreign too. */
+    ASSERT_EQ(th_write_file(lock_path, "foreign\n"), 0);
+    ASSERT_EQ(chmod(lock_path, 0644), 0);
+    ASSERT(cbm_yaml_remove_lock_sidecar(fixture.path) != 0);
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_rejects_symlink_lock_sidecar) {
     const char *original = "model: fast\n";
     yaml_fixture_t fixture;
@@ -1366,6 +1406,32 @@ TEST(config_yaml_edit_nested_sequence_creates_missing_file_section_and_list) {
     PASS();
 }
 
+TEST(config_yaml_edit_nested_sequence_preserves_unrelated_flow_sequence) {
+    const char *initial = "plugins:\n"
+                          "  enabled: []\n"
+                          "mcp_servers:\n"
+                          "  codebase-memory-mcp:\n"
+                          "    command: \"/opt/codebase-memory-mcp\"\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *installed = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_NOT_NULL(strstr(installed, "plugins:\n  enabled: []\n"));
+    ASSERT_NOT_NULL(strstr(installed, "mcp_servers:\n"
+                                      "  codebase-memory-mcp:\n"
+                                      "    command: \"/opt/codebase-memory-mcp\"\n"));
+    ASSERT_NOT_NULL(strstr(installed, "hooks:\n"
+                                      "  pre_llm_call:\n"
+                                      "    - id: \"codebase-memory-mcp\"\n"));
+    free(installed);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_preserves_crlf) {
     const char *initial = "hooks:\r\n"
                           "  pre_llm_call:\r\n"
@@ -1535,6 +1601,7 @@ SUITE(config_yaml_edit) {
 #ifndef _WIN32
     RUN_TEST(config_yaml_edit_lock_postcreate_verification_failure_preserves_unsafe_sidecar);
     RUN_TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar);
+    RUN_TEST(config_yaml_edit_remove_lock_sidecar);
     RUN_TEST(config_yaml_edit_rejects_symlink_lock_sidecar);
     RUN_TEST(config_yaml_edit_rejects_hard_linked_lock_sidecar);
     RUN_TEST(config_yaml_edit_rejects_unsafe_mode_lock_sidecar);
@@ -1568,6 +1635,7 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_list_ambiguity_fails_unchanged);
     RUN_TEST(config_yaml_edit_nested_sequence_preserves_siblings_comments_and_is_idempotent);
     RUN_TEST(config_yaml_edit_nested_sequence_creates_missing_file_section_and_list);
+    RUN_TEST(config_yaml_edit_nested_sequence_preserves_unrelated_flow_sequence);
     RUN_TEST(config_yaml_edit_nested_sequence_preserves_crlf);
     RUN_TEST(config_yaml_edit_nested_sequence_foreign_identity_is_preserved);
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);

@@ -2,8 +2,9 @@
  * dump_verify.h — Post-dump plausibility gate (#334 design b).
  *
  * Compares committed in-memory node counts against persisted SQLite rows
- * after index_repository completes. Nodes-only gate (edges shrink legitimately
- * at dump when endpoints fail to resolve).
+ * after index_repository completes. Nodes-only gate: edge counts can change for
+ * legitimate derivation reasons, while malformed dump endpoints are rejected by
+ * graph-buffer invariants before writer handoff.
  */
 #ifndef CBM_DUMP_VERIFY_H
 #define CBM_DUMP_VERIFY_H

@@ -16,12 +16,10 @@
  * TSX, PHP, C#, and JVM (Java/Kotlin via the shared filter helper).
  * Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
- * Previously this work ran as a separate sequential pipeline pass
- * (cbm_pipeline_pass_lsp_cross) that re-read every source file from
- * disk and re-parsed each tree-sitter tree on a single thread — a 50×
- * regression vs the parallel extract pass on large repos. The pass was
- * deleted; the resolve worker now invokes these helpers directly using
- * the source bytes retained in result->arena during extract.
+ * Full-repo FAST mode runs this work inside the parallel resolve worker
+ * using source bytes retained in result->arena during extract. The
+ * sequential pass remains available for small or scoped pipelines, but
+ * its precision depends on the caller-provided cache/def universe.
  */
 #ifndef CBM_PIPELINE_PASS_LSP_CROSS_H
 #define CBM_PIPELINE_PASS_LSP_CROSS_H
@@ -57,6 +55,12 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
 CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, int *out_def_starts);
+
+/* Build one cross-LSP def row from a persisted graph node. String fields in
+ * out borrow from arena. Returns 0 when the node maps to an LSP def label,
+ * -1 when the node is invalid or not a supported symbol label. */
+int cbm_pxc_build_lsp_def_from_node(CBMArena *arena, const cbm_node_t *node, CBMLanguage lang,
+                                    CBMLSPDef *out);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -109,6 +113,13 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
                                         int imp_count, int *out_count, bool *out_success);
+
+/* Return arena-owned import values refined from module QNs to imported symbol
+ * QNs when defs prove `module_qn.local_name` exists. Returns NULL when no
+ * values need refinement; callers should then keep using imp_vals. */
+const char **cbm_pxc_refine_import_values_from_defs(CBMArena *arena, CBMLSPDef *defs, int def_count,
+                                                    const char **imp_keys, const char **imp_vals,
+                                                    int imp_count);
 
 /* ── Tier 2 full: pre-built per-language cross-LSP registries ─────
  *

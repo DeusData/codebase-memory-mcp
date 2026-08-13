@@ -1,4 +1,4 @@
-/* compact_out.c — tree-format emission helpers. See compact_out.h for the contract. */
+/* compact_out.c — TOON emission helpers. See compact_out.h for the contract. */
 #include "mcp/compact_out.h"
 
 #include <ctype.h>
@@ -72,7 +72,7 @@ void cbm_sb_free(cbm_sb_t *sb) {
     cbm_sb_init(sb);
 }
 
-/* ── Tree quoting ────────────────────────────────────────────────── */
+/* ── TOON quoting ───────────────────────────────────────────────── */
 
 /* True when `s` parses as an integer or real literal (sign, digits, one dot). */
 static bool looks_numeric(const char *s) {
@@ -133,16 +133,17 @@ static size_t utf8_sequence_length(const unsigned char *p) {
 
 static bool needs_quotes(const char *s) {
     if (!s || !*s) {
-        return false; /* empty cells emit as the "-" placeholder, not quotes */
+        return true; /* empty cell must be visible as "" */
+    }
+    if (isspace((unsigned char)s[0]) || isspace((unsigned char)s[strlen(s) - 1])) {
+        return true;
     }
     for (const char *p = s; *p; p++) {
         unsigned char c = (unsigned char)*p;
-        /* Space-delimited rows: any internal whitespace or quote forces
-         * quoting so column positions stay parseable. Control bytes and
-         * invalid UTF-8 force the quoted path too, which sanitizes them —
-         * one raw byte otherwise makes line-oriented consumers (BSD grep)
-         * treat the ENTIRE tool output as unmatchable binary. */
-        if (isspace(c) || *p == '"' || *p == '\r' || c < 0x20 || c == 0x7f) {
+        /* Comma-delimited rows need quoting for commas, quotes, and line
+         * breaks. Control bytes and invalid UTF-8 also force the sanitizing
+         * quoted path so one malformed cell cannot poison the full response. */
+        if (*p == ',' || *p == '"' || isspace(c) || c < 0x20 || c == 0x7f) {
             return true;
         }
         if (c >= 0x80) {
@@ -153,8 +154,7 @@ static bool needs_quotes(const char *s) {
             p += len - 1;
         }
     }
-    if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0 || strcmp(s, "null") == 0 ||
-        strcmp(s, "-") == 0) {
+    if (strcmp(s, "true") == 0 || strcmp(s, "false") == 0 || strcmp(s, "null") == 0) {
         return true;
     }
     return looks_numeric(s);
@@ -204,10 +204,6 @@ static void append_quoted(cbm_sb_t *sb, const char *s) {
 }
 
 static void append_value(cbm_sb_t *sb, const char *s) {
-    if (!s || !*s) {
-        cbm_sb_append_n(sb, "-", 1); /* stable column positions for empties */
-        return;
-    }
     if (needs_quotes(s)) {
         append_quoted(sb, s);
     } else {
@@ -217,14 +213,14 @@ static void append_value(cbm_sb_t *sb, const char *s) {
 
 /* ── Scalars ────────────────────────────────────────────────────── */
 
-void cbm_tree_scalar_str(cbm_sb_t *sb, const char *key, const char *val) {
+void cbm_toon_scalar_str(cbm_sb_t *sb, const char *key, const char *val) {
     cbm_sb_append(sb, key);
     cbm_sb_append_n(sb, ": ", 2);
     append_value(sb, val);
     cbm_sb_append_n(sb, "\n", 1);
 }
 
-void cbm_tree_scalar_int(cbm_sb_t *sb, const char *key, long long v) {
+void cbm_toon_scalar_int(cbm_sb_t *sb, const char *key, long long v) {
     char num[32];
     snprintf(num, sizeof(num), "%lld", v);
     cbm_sb_append(sb, key);
@@ -233,7 +229,7 @@ void cbm_tree_scalar_int(cbm_sb_t *sb, const char *key, long long v) {
     cbm_sb_append_n(sb, "\n", 1);
 }
 
-void cbm_tree_scalar_bool(cbm_sb_t *sb, const char *key, bool v) {
+void cbm_toon_scalar_bool(cbm_sb_t *sb, const char *key, bool v) {
     cbm_sb_append(sb, key);
     cbm_sb_append_n(sb, ": ", 2);
     cbm_sb_append(sb, v ? "true" : "false");
@@ -242,57 +238,57 @@ void cbm_tree_scalar_bool(cbm_sb_t *sb, const char *key, bool v) {
 
 /* ── Tables ─────────────────────────────────────────────────────── */
 
-/* Tree-syntax table header: `key: N  (cols: a b c)` — count first (agents
- * read scale before rows), column names once, rows indented beneath. */
-void cbm_tree_table_header(cbm_sb_t *sb, const char *key, int n, const char *const *cols,
+void cbm_toon_table_header(cbm_sb_t *sb, const char *key, int n, const char *const *cols,
                            int ncols) {
     char num[32];
-    snprintf(num, sizeof(num), ": %d  (cols:", n);
+    snprintf(num, sizeof(num), "[%d]{", n);
     cbm_sb_append(sb, key);
     cbm_sb_append(sb, num);
     for (int i = 0; i < ncols; i++) {
-        cbm_sb_append_n(sb, " ", 1);
+        if (i > 0) {
+            cbm_sb_append_n(sb, ",", 1);
+        }
         cbm_sb_append(sb, cols[i]);
     }
-    cbm_sb_append_n(sb, ")\n", 2);
+    cbm_sb_append_n(sb, "}:\n", 3);
 }
 
-void cbm_tree_row_begin(cbm_sb_t *sb) {
+void cbm_toon_row_begin(cbm_sb_t *sb) {
     cbm_sb_append_n(sb, "  ", 2);
 }
 
-void cbm_tree_cell_str(cbm_sb_t *sb, const char *val, bool first) {
+void cbm_toon_cell_str(cbm_sb_t *sb, const char *val, bool first) {
     if (!first) {
-        cbm_sb_append_n(sb, " ", 1);
+        cbm_sb_append_n(sb, ",", 1);
     }
     append_value(sb, val ? val : "");
 }
 
-void cbm_tree_cell_int(cbm_sb_t *sb, long long v, bool first) {
+void cbm_toon_cell_int(cbm_sb_t *sb, long long v, bool first) {
     char num[32];
     snprintf(num, sizeof(num), "%lld", v);
     if (!first) {
-        cbm_sb_append_n(sb, " ", 1);
+        cbm_sb_append_n(sb, ",", 1);
     }
     cbm_sb_append(sb, num);
 }
 
-void cbm_tree_cell_real(cbm_sb_t *sb, double v, bool first) {
+void cbm_toon_cell_real(cbm_sb_t *sb, double v, bool first) {
     char num[48];
     snprintf(num, sizeof(num), "%.4g", v);
     if (!first) {
-        cbm_sb_append_n(sb, " ", 1);
+        cbm_sb_append_n(sb, ",", 1);
     }
     cbm_sb_append(sb, num);
 }
 
-void cbm_tree_cell_bool(cbm_sb_t *sb, bool v, bool first) {
+void cbm_toon_cell_bool(cbm_sb_t *sb, bool v, bool first) {
     if (!first) {
-        cbm_sb_append_n(sb, " ", 1);
+        cbm_sb_append_n(sb, ",", 1);
     }
     cbm_sb_append(sb, v ? "true" : "false");
 }
 
-void cbm_tree_row_end(cbm_sb_t *sb) {
+void cbm_toon_row_end(cbm_sb_t *sb) {
     cbm_sb_append_n(sb, "\n", 1);
 }
