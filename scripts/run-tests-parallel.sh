@@ -91,13 +91,20 @@ stamp_windows_build_dir() {
     # SIDs' own entries). /reset drops every explicit ACE and restores pure
     # inheritance, so the protect-and-grant below starts from a known shape
     # regardless of image provisioning.
-    norm_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /reset /Q 2>&1) ||
-        echo "WARN: build-dir DACL normalize ($when) failed: $norm_out"
-    stamp_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
+    if ! norm_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /reset /Q 2>&1); then
+        echo "FAIL: build-dir DACL normalize ($when) failed: $norm_out" >&2
+        exit 1
+    fi
+    if ! stamp_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
         /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
-        /Q 2>&1) || echo "WARN: build-dir DACL stamp ($when) failed (user=$me dir=$runner_dir_w): $stamp_out"
-    reset_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q 2>&1) ||
-        echo "WARN: build-dir child DACL reset ($when) failed: $(printf '%s' "$reset_out" | tail -2)"
+        /Q 2>&1); then
+        echo "FAIL: build-dir DACL stamp ($when) failed (user=$me dir=$runner_dir_w): $stamp_out" >&2
+        exit 1
+    fi
+    if ! reset_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q 2>&1); then
+        echo "FAIL: build-dir child DACL reset ($when) failed: $(printf '%s' "$reset_out" | tail -2)" >&2
+        exit 1
+    fi
     # The stamp is load-bearing for the install-flow suites: verify it and say
     # so, in either direction — a silent stamp once cost a full CI round to
     # even see WHETHER it had run.

@@ -59,7 +59,10 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
         fi
         ;;
     esac
-    MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /reset /Q >/dev/null 2>&1 || true
+    if ! DACL_OUTPUT=$(MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /reset /Q 2>&1); then
+        echo "FAIL: memlab DACL normalize failed (dir=$WIN_ROOT_W): $DACL_OUTPUT" >&2
+        exit 1
+    fi
     if ! MSYS2_ARG_CONV_EXCL='*' icacls "$WIN_ROOT_W" /inheritance:r \
         /grant:r "${ME}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
         /Q >/dev/null 2>&1; then
@@ -69,7 +72,10 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
     cp "$BINARY" "$WIN_ROOT/codebase-memory-mcp.exe"
     BINARY="$WIN_ROOT/codebase-memory-mcp.exe"
     WORK="$WIN_ROOT"
-    MSYS2_ARG_CONV_EXCL='*' icacls "${WIN_ROOT_W}\\*" /reset /T /C /Q >/dev/null 2>&1 || true
+    if ! DACL_OUTPUT=$(MSYS2_ARG_CONV_EXCL='*' icacls "${WIN_ROOT_W}\\*" /reset /T /C /Q 2>&1); then
+        echo "FAIL: memlab child DACL reset failed (dir=$WIN_ROOT_W): $DACL_OUTPUT" >&2
+        exit 1
+    fi
 fi
 PROFILE_OUT="$PWD/memlab-${LABEL}.jsonl"
 RUN_LOG="$PWD/memlab-${LABEL}.log"

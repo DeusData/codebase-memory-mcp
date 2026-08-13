@@ -29,6 +29,19 @@ if ! grep -Fq 'run-test-wave.py' "$driver"; then
     echo "FAIL: parallel harness is not wired to the parent-owned scheduler" >&2
     exit 1
 fi
+for required in \
+    'FAIL: build-dir DACL normalize' \
+    'FAIL: build-dir DACL stamp' \
+    'FAIL: build-dir child DACL reset'; do
+    if ! grep -Fq "$required" "$driver"; then
+        echo "FAIL: parallel harness must fail closed at every required DACL operation: $required" >&2
+        exit 1
+    fi
+done
+if grep -Fq 'WARN: build-dir DACL' "$driver"; then
+    echo "FAIL: parallel harness must not continue after a required DACL operation fails" >&2
+    exit 1
+fi
 
 assignment_body() {
     local name="$1"

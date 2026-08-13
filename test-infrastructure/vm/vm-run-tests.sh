@@ -111,7 +111,11 @@ export TEMP TMP TMPDIR
 # Reset existing children afterward so they inherit that protected parent;
 # protecting the directory alone cannot rewrite already-created child ACLs.
 runner_dir_w="$(cygpath -w "$(dirname "$artifact")")"
-MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q >/dev/null 2>&1 || true
+if ! child_acl_output=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" \
+    /reset /T /C /Q 2>&1); then
+    echo "FAIL: VM runner child DACL reset failed (dir=$runner_dir_w): $child_acl_output" >&2
+    exit 1
+fi
 
 echo "=== vm-run-tests: runner=$RUNNER temp=$TEMP suites: $* ==="
 
