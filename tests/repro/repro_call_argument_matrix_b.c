@@ -1,5 +1,5 @@
 /*
- * Exhaustive call-argument reproduction matrix, CBMLanguage 80..162.
+ * Exhaustive call-argument reproduction matrix, CBMLanguage 80..163.
  *
  * Every language in this numeric range whose live spec has call-node metadata
  * owns one TEST row below. Semantic applications are exercised twice: once as
@@ -843,6 +843,21 @@ static const char OBJECTSCRIPT_ROUTINE_BARE[] = "SAMPLE\n"
                                                 "    Quit\n"
                                                 "Run(watched)\n"
                                                 "    Quit watched\n";
+static const char VISUALBASIC_INSIDE[] = "Module Sample\n"
+                                         "    Function Accept(value As Object) As Object\n"
+                                         "        Return value\n"
+                                         "    End Function\n"
+                                         "\n"
+                                         "    Function Run(watched As Object) As Object\n"
+                                         "        Dim result = Accept(watched)\n"
+                                         "        Return result\n"
+                                         "    End Function\n"
+                                         "End Module\n";
+static const char VISUALBASIC_BARE[] = "Module Sample\n"
+                                       "    Function Run(watched As Object) As Object\n"
+                                       "        Return watched\n"
+                                       "    End Function\n"
+                                       "End Module\n";
 
 #define ROUTINE_ARGUMENT_CASE(tag_value, language_value, filename_value, inside_value, bare_value, \
                               kind_value, caller_value, callee_value, argument_value, defs_value,  \
@@ -984,6 +999,10 @@ static const RoutineArgumentCase OBJECTSCRIPT_ROUTINE_CASE = ROUTINE_ARGUMENT_CA
     "OBJECTSCRIPT_ROUTINE", CBM_LANG_OBJECTSCRIPT_ROUTINE, "Sample.mac",
     OBJECTSCRIPT_ROUTINE_INSIDE, OBJECTSCRIPT_ROUTINE_BARE, "extrinsic_function", "Run", "Accept",
     "watched", 1, 1, 0, "ObjectScript routine extrinsic application with a value argument");
+static const RoutineArgumentCase VISUALBASIC_CASE = ROUTINE_ARGUMENT_CASE(
+    "VISUALBASIC", CBM_LANG_VISUALBASIC, "Sample.vb", VISUALBASIC_INSIDE, VISUALBASIC_BARE,
+    "invocation", "Run", "Accept", "watched", 1, 1, 0,
+    "VB.NET Module function application with a value argument");
 
 static const ModuleArgumentCase JUST_CASE = MODULE_ARGUMENT_CASE(
     "JUST", CBM_LANG_JUST, "justfile", JUST_INSIDE, JUST_BARE, "function_call", "uppercase",
@@ -1174,6 +1193,7 @@ DEFINE_ROUTINE_ARGUMENT_TEST(cfml, CFML_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(mojo, MOJO_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_udl, OBJECTSCRIPT_UDL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_routine, OBJECTSCRIPT_ROUTINE_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(visualbasic, VISUALBASIC_CASE)
 
 #undef DEFINE_ROUTINE_ARGUMENT_TEST
 
@@ -1243,15 +1263,15 @@ TEST(repro_call_argument_matrix_b_domain_bitbake) {
 }
 
 enum {
-    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 36,
+    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 37,
     MODULE_ARGUMENT_LANGUAGE_COUNT = 4,
     DOMAIN_CONTROL_LANGUAGE_COUNT = 6,
     MATRIX_LANGUAGE_COUNT = ROUTINE_ARGUMENT_LANGUAGE_COUNT + MODULE_ARGUMENT_LANGUAGE_COUNT +
                             DOMAIN_CONTROL_LANGUAGE_COUNT,
 };
 
-_Static_assert(MATRIX_LANGUAGE_COUNT == 46,
-               "RACKET..OBJECTSCRIPT_ROUTINE call-capable matrix must contain exactly 46 "
+_Static_assert(MATRIX_LANGUAGE_COUNT == 47,
+               "RACKET..VISUALBASIC call-capable matrix must contain exactly 47 "
                "language rows");
 
 #define MATRIX_B_LANGUAGE_ROWS(X)                                                               \
@@ -1293,6 +1313,7 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 46,
       OBJECTSCRIPT_UDL_CASE.identity.language)                                                  \
     X(repro_call_argument_matrix_b_routine_objectscript_routine,                                \
       OBJECTSCRIPT_ROUTINE_CASE.identity.language)                                              \
+    X(repro_call_argument_matrix_b_routine_visualbasic, VISUALBASIC_CASE.identity.language)     \
     X(repro_call_argument_matrix_b_module_just, JUST_CASE.identity.language)                    \
     X(repro_call_argument_matrix_b_module_gotemplate, GOTEMPLATE_CASE.identity.language)        \
     X(repro_call_argument_matrix_b_module_linkerscript, LINKERSCRIPT_CASE.identity.language)    \
