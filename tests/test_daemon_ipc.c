@@ -12,6 +12,7 @@
 #include "daemon/ipc.h"
 #include "daemon/ipc_internal.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
@@ -918,6 +919,212 @@ TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor)
     ASSERT_TRUE(secured);
     ASSERT_TRUE(cache_created);
     PASS();
+}
+
+/* #1624: the CBM_SKIP_DACL_HARDENING kill switch is read from a fresh flag
+ * cache, so it is effective on the very first run (before any config store
+ * exists). */
+TEST(daemon_ipc_windows_dacl_hardening_env_contract) {
+#ifndef _WIN32
+    PASS();
+#else
+    static const wchar_t env_name[] = L"CBM_SKIP_DACL_HARDENING";
+    ipc_test_win_env_t saved = {0};
+    bool saved_ok = ipc_test_win_env_capture(env_name, &saved);
+    bool disabled_seen = false;
+    bool enabled_seen = false;
+    bool restored = false;
+
+    if (saved_ok) {
+        cbm_windows_dacl_hardening_reset_for_testing();
+        disabled_seen =
+            SetEnvironmentVariableW(env_name, L"1") != 0 && !cbm_windows_dacl_hardening_enabled();
+    }
+    if (saved_ok && disabled_seen) {
+        cbm_windows_dacl_hardening_reset_for_testing();
+        enabled_seen =
+            SetEnvironmentVariableW(env_name, NULL) != 0 && cbm_windows_dacl_hardening_enabled();
+    }
+    if (saved_ok) {
+        restored = ipc_test_win_env_restore(env_name, &saved);
+    }
+    cbm_windows_dacl_hardening_reset_for_testing();
+
+    ASSERT_TRUE(saved_ok);
+    ASSERT_TRUE(disabled_seen);
+    ASSERT_TRUE(enabled_seen);
+    ASSERT_TRUE(restored);
+    PASS();
+#endif
+}
+
+/* #1624: with hardening disabled the stamp path keeps the exact-owner stamp
+ * (owner validators stay active) but leaves the OS-default inherited DACL —
+ * no SE_DACL_PROTECTED. */
+TEST(daemon_ipc_windows_dacl_hardening_stamp_skips_protected_dacl) {
+#ifndef _WIN32
+    PASS();
+#else
+    static const wchar_t env_name[] = L"CBM_SKIP_DACL_HARDENING";
+    ipc_test_win_env_t saved = {0};
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool saved_ok = ipc_test_win_env_capture(env_name, &saved);
+    bool disabled = saved_ok && SetEnvironmentVariableW(env_name, L"1") != 0;
+    bool paths_ok = false;
+    bool created = false;
+    bool dacl_unprotected = false;
+    bool owner_exact = false;
+    bool restored = false;
+
+    if (disabled) {
+        cbm_windows_dacl_hardening_reset_for_testing();
+        if (ipc_test_parent_new(parent, "win-dacl-skip")) {
+            int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+            paths_ok = written > 0 && written < (int)sizeof(cache);
+        }
+    }
+    if (paths_ok) {
+        created = cbm_mkdir_p(cache, 0700);
+    }
+    if (created) {
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        PSID owner = NULL;
+        SECURITY_DESCRIPTOR_CONTROL control = 0;
+        DWORD revision = 0;
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT,
+                                  OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
+                                  NULL, &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            descriptor && dacl && GetSecurityDescriptorControl(descriptor, &control, &revision)) {
+            dacl_unprotected = (control & SE_DACL_PROTECTED) == 0;
+            HANDLE token = NULL;
+            TOKEN_USER *user = NULL;
+            DWORD needed = 0;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+                !GetTokenInformation(token, TokenUser, NULL, 0U, &needed) &&
+                GetLastError() == ERROR_INSUFFICIENT_BUFFER && (user = malloc(needed)) != NULL &&
+                GetTokenInformation(token, TokenUser, user, needed, &needed)) {
+                owner_exact = owner && EqualSid(owner, user->User.Sid) != 0;
+            }
+            free(user);
+            if (token) {
+                (void)CloseHandle(token);
+            }
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+    if (saved_ok) {
+        restored = ipc_test_win_env_restore(env_name, &saved);
+    }
+    cbm_windows_dacl_hardening_reset_for_testing();
+
+    ASSERT_TRUE(saved_ok);
+    ASSERT_TRUE(disabled);
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(created);
+    ASSERT_TRUE(dacl_unprotected);
+    ASSERT_TRUE(owner_exact);
+    ASSERT_TRUE(restored);
+    PASS();
+#endif
+}
+
+/* #1624: opting out on an already-hardened directory must self-heal — the
+ * runtime-directory walk accepts the inherited DACL and clears
+ * SE_DACL_PROTECTED (icacls /inheritance:e equivalent). */
+TEST(daemon_ipc_windows_dacl_hardening_unprotect_previously_hardened) {
+#ifndef _WIN32
+    PASS();
+#else
+    static const wchar_t env_name[] = L"CBM_SKIP_DACL_HARDENING";
+    ipc_test_win_env_t saved = {0};
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool saved_ok = ipc_test_win_env_capture(env_name, &saved);
+    bool hardening_on = false;
+    bool hardened = false;
+    bool protected_before = false;
+    bool hardening_off = false;
+    bool accepted_after = false;
+    bool protected_after = true;
+    bool dacl_valid_after = false;
+    bool restored = false;
+
+    if (saved_ok) {
+        hardening_on = SetEnvironmentVariableW(env_name, NULL) != 0;
+    }
+    if (hardening_on) {
+        cbm_windows_dacl_hardening_reset_for_testing();
+        if (ipc_test_parent_new(parent, "win-dacl-unprotect")) {
+            int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+            if (written > 0 && written < (int)sizeof(cache)) {
+                hardened = cbm_daemon_ipc_private_directory_secure(cache);
+            }
+        }
+    }
+    if (hardened) {
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        SECURITY_DESCRIPTOR_CONTROL control = 0;
+        DWORD revision = 0;
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                  &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            GetSecurityDescriptorControl(descriptor, &control, &revision)) {
+            protected_before = (control & SE_DACL_PROTECTED) != 0;
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+    if (protected_before) {
+        hardening_off = SetEnvironmentVariableW(env_name, L"1") != 0;
+    }
+    if (hardening_off) {
+        cbm_windows_dacl_hardening_reset_for_testing();
+        accepted_after = cbm_daemon_ipc_private_directory_secure(cache);
+    }
+    if (accepted_after) {
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        SECURITY_DESCRIPTOR_CONTROL control = 0;
+        DWORD revision = 0;
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                  &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            GetSecurityDescriptorControl(descriptor, &control, &revision)) {
+            protected_after = (control & SE_DACL_PROTECTED) != 0;
+            /* The unprotect must leave a REAL inherited DACL (the parent's),
+             * never a NULL DACL (which grants full access to everyone). */
+            dacl_valid_after = dacl != NULL && IsValidAcl(dacl) != 0;
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+    if (saved_ok) {
+        restored = ipc_test_win_env_restore(env_name, &saved);
+    }
+    cbm_windows_dacl_hardening_reset_for_testing();
+
+    ASSERT_TRUE(saved_ok);
+    ASSERT_TRUE(hardening_on);
+    ASSERT_TRUE(hardened);
+    ASSERT_TRUE(protected_before);
+    ASSERT_TRUE(hardening_off);
+    ASSERT_TRUE(accepted_after);
+    ASSERT_FALSE(protected_after);
+    ASSERT_TRUE(dacl_valid_after);
+    ASSERT_TRUE(restored);
+    PASS();
+#endif
 }
 
 TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime) {
@@ -4800,6 +5007,9 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
+    RUN_TEST(daemon_ipc_windows_dacl_hardening_env_contract);
+    RUN_TEST(daemon_ipc_windows_dacl_hardening_stamp_skips_protected_dacl);
+    RUN_TEST(daemon_ipc_windows_dacl_hardening_unprotect_previously_hardened);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
     RUN_TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader);

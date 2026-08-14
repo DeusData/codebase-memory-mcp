@@ -1228,6 +1228,28 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
         return MAIN_BUILD_IDENTITY_CACHE_CANONICALIZE;
     }
     cbm_normalize_path_sep(canonical_cache);
+#ifdef _WIN32
+    /* Resolve the DACL-hardening opt-out before the cache dir is secured.
+     * The config store lives inside the cache dir, so on the very first run
+     * it does not exist yet: the env kill switch is the only run-1 lever.
+     * When the env var is unset the persisted windows-dacl-hardening key
+     * applies from run 2 on (env > config, D2/D5). */
+    {
+        char skip_buf[CBM_SZ_16];
+        const char *skip_env =
+            cbm_safe_getenv("CBM_SKIP_DACL_HARDENING", skip_buf, sizeof(skip_buf), NULL);
+        if (skip_env == NULL || skip_buf[0] != '1') {
+            /* Kill switch inactive (unset or not exactly "1", matching the
+             * accessor): the persisted key applies. */
+            cbm_config_t *cfg = cbm_config_open(canonical_cache);
+            if (cfg) {
+                cbm_windows_dacl_hardening_set(
+                    cbm_config_get_bool(cfg, CBM_CONFIG_WINDOWS_DACL_HARDENING, true));
+                cbm_config_close(cfg);
+            }
+        }
+    }
+#endif
     /* Admission is account-scoped, so its storage authority must be too.
      * Harden the canonical object before hashing it. Replacement of this
      * owner-only path by the same already-compromised OS account is outside

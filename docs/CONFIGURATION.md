@@ -86,6 +86,9 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `windows-dacl-hardening` | `true` | Windows only: keep the cache-directory DACL hardened (owner-only, inheritance disabled). Set `false` to opt out; owner validation stays active. |
+
+`windows-dacl-hardening` is effective from the **second run**: the config store (`_config.db`) lives inside the cache directory, so it does not exist when the first run creates that directory. On the second run the directory is no longer re-protected, and a DACL hardened by the previous run has inheritance restored automatically. For an effect from the very first run, set `CBM_SKIP_DACL_HARDENING=1` instead (it overrides the config key). Disabling the hardening is intended for hosts where the protected DACL breaks index publication (`MoveFileExW` rename-replace fails with `ERROR_ACCESS_DENIED`, surfacing as the generic "Pipeline failed"); it is not recommended on multi-user or terminal-server hosts, where the owner-only DACL is the protection against other local accounts.
 
 ## 3. UI Settings
 
@@ -121,6 +124,7 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
+| `CBM_SKIP_DACL_HARDENING` | *(unset)* | Windows only: set to `1` to disable cache-directory DACL hardening from the **very first run**, before any config store exists (the `windows-dacl-hardening` key only applies from run 2). Overrides the config key; owner validation of the cache directory stays active. Use it on hosts where the protected DACL breaks index publication. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.

@@ -6592,6 +6592,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
+    {CBM_CONFIG_WINDOWS_DACL_HARDENING, "true",
+     "Protect Windows cache-dir DACL (ownership kept when off)"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing

@@ -59,6 +59,20 @@ int cbm_pclose(FILE *f);
 /* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
 bool cbm_mkdir_p(const char *path, int mode);
 
+/* Windows cache-directory DACL hardening opt-out (#1624). The accessor
+ * reflects CBM_SKIP_DACL_HARDENING (env-only, safe before the config store
+ * exists); the setter applies the persisted windows-dacl-hardening key once
+ * the store is readable (env wins over config). POSIX builds compile the
+ * accessor to the default (hardening on) and the setter to a no-op — every
+ * DACL site is Windows-only. */
+bool cbm_windows_dacl_hardening_enabled(void);
+void cbm_windows_dacl_hardening_set(bool enabled);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Reset the lazily-cached flag so a test can re-resolve CBM_SKIP_DACL_HARDENING
+ * regardless of earlier calls in the same process. */
+void cbm_windows_dacl_hardening_reset_for_testing(void);
+#endif
+
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);
 /* Remove <db_path>-wal/-shm/-journal. MUST be called by any path installing a fresh
