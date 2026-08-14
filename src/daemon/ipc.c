@@ -1387,9 +1387,15 @@ static bool posix_directory_parent_secure(int directory_fd) {
     struct stat status;
     if (directory_fd < 0 || fstat(directory_fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
         !posix_directory_owner_trusted(status.st_uid) ||
-        !cbm_macos_extended_acl_fd_is_deny_only(directory_fd)) {
+        ) {
         return false;
     }
+    /* Note: historically this required ancestors to carry only deny-only ACLs,
+     * which caused failures on macOS where /private/tmp carries allow-type ACLs.
+     * Allowing allow-ACLs on ancestors (e.g. /private/tmp) keeps the shared
+     * tmp area usable while the final cbm-daemon-<uid> directory is still
+     * hardened (0700 and ACL-cleared) by private_directory_tree_open.
+     */
     /* #1537: this ANCESTOR check refused any group-write bit, which is the same
      * rule #1535 removed on the activation side — and the sibling that decision
      * covers but that never got changed. A group-writable ~ or ~/.cache is
