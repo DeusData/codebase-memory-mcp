@@ -36,10 +36,17 @@ if [[ ! "${BUILD_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 tmpdir="$(mktemp -d)"
+case "$(uname -s)" in
+  Darwin) runtime_root="/private/tmp" ;;
+  *) runtime_root="/tmp" ;;
+esac
+runtime_parent="$(mktemp -d "${runtime_root}/cbm-worker-error-runtime.XXXXXX")"
 cleanup() {
+  CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
   CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
     "${BINARY}" daemon stop >/dev/null 2>&1 || true
   rm -rf "${tmpdir}"
+  rm -rf "${runtime_parent}"
 }
 trap cleanup EXIT
 
@@ -47,7 +54,8 @@ missing="${tmpdir}/repository-does-not-exist"
 response="${tmpdir}/worker.response"
 args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\"}"
 
-if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
+if ! CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
+  CBM_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \
   --index-worker-build "${BUILD_FINGERPRINT}" \
   index_repository "${args}" \
@@ -64,7 +72,8 @@ if [[ ! -s "${response}" ]] || ! grep -q 'Pipeline failed' "${response}"; then
 fi
 
 set +e
-CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+CBM_TEST_DAEMON_RUNTIME_PARENT="${runtime_parent}" \
+  CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
   "${BINARY}" cli index_repository --repo-path "${missing}" --mode fast \
   >"${tmpdir}/supervisor.out" 2>"${tmpdir}/supervisor.err"
 cli_rc=$?

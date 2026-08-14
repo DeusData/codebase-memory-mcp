@@ -6,7 +6,8 @@ Guards the PR #1139 daemon-control surface at the product level:
 * ``daemon start`` launches a PERMANENT daemon: it reports a pid, and the
   daemon survives its clients (a one-shot ``cli`` command recycles it without
   printing the cold-start hint, and the daemon is still active afterwards).
-* A cold one-shot ``cli`` command (no daemon) prints the startup-tax hint.
+* A cold one-shot ``cli`` command is quiet by default; ``cli --verbose`` opts
+  into the startup-tax hint.
 * ``daemon stop`` on an idle daemon stops it; a second ``stop`` is idempotent.
 
 Every path carries a kill-by-pid backstop so a stuck daemon can never hang the
@@ -66,11 +67,23 @@ def main():
 
         cold = run_cli(binary, cache, ["cli", "list_projects", "{}"])
         cold_text = output_text(cold)
-        if cold.returncode != 0 or "daemon start" not in cold_text:
-            print("RED: a cold one-shot cli command should succeed and hint at "
-                  "`daemon start`:\n%s" % cold_text[:400])
+        if cold.returncode != 0 or "daemon start" in cold_text:
+            print("RED: a cold one-shot cli command should succeed without default "
+                  "startup chatter:\n%s" % cold_text[:400])
             return 1
-        print("PASS: cold cli one-shot succeeded and printed the startup-tax hint")
+        print("PASS: cold cli one-shot succeeded quietly")
+
+        # Use an isolated rendezvous namespace to guarantee a cold verbose call.
+        verbose_cache = os.path.join(work, "cache-verbose")
+        os.makedirs(verbose_cache, exist_ok=True)
+        verbose = run_cli(binary, verbose_cache,
+                          ["cli", "--verbose", "list_projects", "{}"])
+        verbose_text = output_text(verbose)
+        if verbose.returncode != 0 or "daemon start" not in verbose_text:
+            print("RED: `cli --verbose` should expose the cold-start hint:\n%s"
+                  % verbose_text[:400])
+            return 1
+        print("PASS: verbose cold cli exposed the startup-tax hint")
 
         start = run_cli(binary, cache, ["daemon", "start"])
         start_text = output_text(start)

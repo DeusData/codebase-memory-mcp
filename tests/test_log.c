@@ -55,15 +55,50 @@ static const char *capture_end(void) {
 }
 
 TEST(log_level_default) {
-    /* Default level should be INFO */
+    /* Raw startup is quiet until main applies its role-aware policy. */
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+    PASS();
+}
+
+TEST(log_level_env_keeps_info_and_debug_opt_in) {
+    cbm_setenv("CBM_LOG_LEVEL", "info", 1);
+    cbm_log_init_from_env();
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_set_level(CBM_LOG_WARN);
+    PASS();
+}
+
+TEST(log_startup_policy_keeps_frontends_quiet_and_workers_live) {
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_init_for_process(true, false);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_log_init_for_process(false, true);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "none", 1);
+    cbm_log_init_for_process(false, true);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_for_process(true, false);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_set_level(CBM_LOG_WARN);
     PASS();
 }
 
 TEST(log_level_set) {
     cbm_log_set_level(CBM_LOG_WARN);
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
-    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    cbm_log_set_level(CBM_LOG_WARN); /* restore */
     PASS();
 }
 
@@ -72,7 +107,7 @@ TEST(log_info_output) {
     capture_start();
     cbm_log_info("test.msg", "key1", "val1", "key2", "val2");
     const char *output = capture_end();
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "level=info"));
     ASSERT(cbm_str_contains_raw(output, "msg=test.msg"));
@@ -86,7 +121,7 @@ TEST(log_filtered_by_level) {
     capture_start();
     cbm_log_info("should.not.appear");
     const char *output = capture_end();
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     /* Should be empty — info is below warn threshold */
     ASSERT_EQ(strlen(output), 0);
@@ -98,7 +133,7 @@ TEST(log_error_output) {
     capture_start();
     cbm_log_error("critical.fail", "err", "OOM");
     const char *output = capture_end();
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "level=error"));
     ASSERT(cbm_str_contains_raw(output, "msg=critical.fail"));
@@ -111,7 +146,7 @@ TEST(log_int_helper) {
     capture_start();
     cbm_log_int(CBM_LOG_INFO, "pass.timing", "elapsed_ms", 42);
     const char *output = capture_end();
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "elapsed_ms=42"));
     PASS();
@@ -124,7 +159,7 @@ TEST(log_json_output) {
     cbm_log_info("test.msg", "key1", "val1", "key2", "line\nbreak");
     const char *output = capture_end();
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "\"level\":\"info\""));
     ASSERT(cbm_str_contains_raw(output, "\"event\":\"test.msg\""));
@@ -139,7 +174,7 @@ TEST(log_text_sanitizes_control_chars) {
     capture_start();
     cbm_log_info("test\nmsg", "key", "line\r\nbreak\tvalue");
     const char *output = capture_end();
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "msg=test_msg"));
     ASSERT(cbm_str_contains_raw(output, "key=line__break_value"));
@@ -157,7 +192,7 @@ TEST(log_sink_tee_keeps_stderr) {
     cbm_log_info("tee.msg", "key", "val");
     const char *output = capture_end();
     cbm_log_set_sink(NULL);
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "msg=tee.msg"));
     ASSERT(cbm_str_contains_raw(sink_buf, "msg=tee.msg"));
@@ -171,7 +206,7 @@ TEST(log_operational_helpers) {
     cbm_log_mcp_request("tools/call", "search_graph", false, 1250);
     cbm_log_http_request("graph_ui", "GET", "/api/layout", 200, 7, 0, 42);
     const char *output = capture_end();
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(CBM_LOG_WARN);
 
     ASSERT(cbm_str_contains_raw(output, "msg=mcp.request"));
     ASSERT(cbm_str_contains_raw(output, "protocol=jsonrpc"));
@@ -235,7 +270,7 @@ TEST(log_level_from_env_textual) {
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
 
     cbm_unsetenv("CBM_LOG_LEVEL");
-    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    cbm_log_set_level(CBM_LOG_WARN); /* restore */
     PASS();
 }
 
@@ -260,7 +295,7 @@ TEST(log_level_from_env_numeric) {
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
 
     cbm_unsetenv("CBM_LOG_LEVEL");
-    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    cbm_log_set_level(CBM_LOG_WARN); /* restore */
     PASS();
 }
 
@@ -279,12 +314,14 @@ TEST(log_level_from_env_invalid_ignored) {
     cbm_log_init_from_env();
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
 
-    cbm_log_set_level(CBM_LOG_INFO); /* restore */
+    cbm_log_set_level(CBM_LOG_WARN); /* restore */
     PASS();
 }
 
 SUITE(log) {
     RUN_TEST(log_level_default);
+    RUN_TEST(log_level_env_keeps_info_and_debug_opt_in);
+    RUN_TEST(log_startup_policy_keeps_frontends_quiet_and_workers_live);
     RUN_TEST(log_level_set);
     RUN_TEST(log_info_output);
     RUN_TEST(log_filtered_by_level);

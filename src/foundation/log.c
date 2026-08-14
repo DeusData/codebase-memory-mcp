@@ -23,7 +23,7 @@
  * Relaxed ordering is the right level: each is an independent scalar with no
  * happens-before relationship to publish alongside it, and the log path must
  * stay cheap enough that nobody is tempted to route around it. */
-static _Atomic CBMLogLevel g_log_level = CBM_LOG_INFO;
+static _Atomic CBMLogLevel g_log_level = CBM_LOG_WARN;
 static _Atomic CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
 /* Cast, not bare NULL: NULL is ((void*)0) and the implicit void*-to-
  * function-pointer conversion is not a compile-time constant, which
@@ -85,6 +85,14 @@ parse_format:;
     /* Format is intentionally explicit-only. Logs stay local to stderr and the
      * optional in-process sink; deployment environment variables must not
      * silently change the operator-selected output shape. */
+}
+
+void cbm_log_init_for_process(bool quiet_by_default, bool require_info_liveness) {
+    cbm_log_set_level(quiet_by_default ? CBM_LOG_WARN : CBM_LOG_INFO);
+    cbm_log_init_from_env();
+    if (require_info_liveness && cbm_log_get_level() > CBM_LOG_INFO) {
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
 }
 
 void cbm_log_set_sink(cbm_log_sink_fn fn) {

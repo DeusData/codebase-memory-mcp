@@ -392,7 +392,7 @@ TEST(index_parse_partial_reported) {
     ASSERT_TRUE(marked);
 
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *qresp = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(qresp);
     ASSERT_NOT_NULL(strstr(qresp, "split.c"));
@@ -488,7 +488,7 @@ TEST(index_parse_partial_clears_on_fix) {
 
     /* Flagged after the first (full) index. */
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *cov1 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(cov1);
     ASSERT_NOT_NULL(strstr(cov1, "flaky.c"));
@@ -607,7 +607,7 @@ TEST(index_not_indexed_by_design_reported) {
 
     /* index_status carries the persisted by-design section. */
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *sresp = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(sresp);
     ASSERT_NOT_NULL(strstr(sresp, "not_indexed"));
@@ -635,6 +635,7 @@ TEST(index_not_indexed_by_design_reported) {
     char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
     ASSERT_NOT_NULL(resp2);
     free(resp2);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *sresp2 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(sresp2);
     ASSERT_NOT_NULL(strstr(sresp2, "secret.py"));

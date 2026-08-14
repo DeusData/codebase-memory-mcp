@@ -1766,6 +1766,16 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     }
     cbm_log_info("publish.timing", "block", "fts", "elapsed_ms", itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
+    /* This is the shared commit tail for complete rebuilds and isolated
+     * deltas. Stamp only after every graph/metadata/FTS mutation: a fresh
+     * staging file receives a new uid, while a cloned delta keeps its uid and
+     * advances the mutation counter. A failure discards the private stage. */
+    if (ok && cbm_store_generation_advance(store) != CBM_STORE_OK) {
+        ok = false;
+    }
+    cbm_log_info("publish.timing", "block", "generation", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t_pub)));
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     if (ok && !cbm_store_check_integrity(store)) {
         ok = false;
     }

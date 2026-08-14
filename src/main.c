@@ -6,6 +6,8 @@
  *   cli <tool> <json>  Run a single tool call and print result
  *   --version       Print version and exit
  *   --help          Print usage and exit
+ *   cli --quiet     Show errors only; disable automatic terminal progress
+ *   cli --verbose   Include informational logs for one-shot commands
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
  *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
@@ -533,7 +535,13 @@ static bool client_start_parent_watchdog(pid_t initial_ppid) {
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
+#define CLI_USAGE                                                                             \
+    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
+    "[json_args]\n"                                                                           \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
+    "  --json      Print the raw MCP result envelope\n"
 
 /* Extract text content from MCP tool result envelope and print it.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
@@ -659,10 +667,21 @@ static bool cli_first_nonspace_is_brace(const char *s) {
     return *s == '{';
 }
 
-static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json);
+static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json,
+                                           bool quiet_requested);
 
 static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                    main_local_maintenance_context_t *maintenance_context) {
+    cbm_cli_output_flags_t output_flags;
+    char output_error[CBM_SZ_512] = {0};
+    if (!cbm_cli_output_flags_parse(&argc, argv, &output_flags, output_error,
+                                    sizeof(output_error))) {
+        (void)fprintf(stderr, "error: %s\n",
+                      output_error[0] ? output_error : "invalid output mode");
+        (void)fprintf(stderr, CLI_USAGE);
+        return SKIP_ONE;
+    }
+    cbm_cli_diagnostics_configure(output_flags.quiet_requested, output_flags.verbose_requested);
     if (argc == 1 && argv && (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0)) {
         (void)fputs(CLI_USAGE, stdout);
         return 0;
@@ -672,7 +691,6 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         return SKIP_ONE;
     }
 
-    bool progress_requested = cli_strip_flag(&argc, argv, "--progress");
     bool raw_json = cli_strip_flag(&argc, argv, "--json");
 
     /* Supervisor worker role: when this process was spawned as a supervised index
@@ -740,11 +758,13 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     } else if (rem_argc >= SKIP_ONE && cli_first_nonspace_is_brace(rem_argv[0])) {
         /* raw-JSON back-compat: cli <tool> '{"k":"v"}' (deprecated path). Warn on
          * STDERR only — stdout must stay clean JSON for piping. */
-        (void)fprintf(stderr,
-                      "warning: passing raw JSON to 'cli %s' is deprecated and "
-                      "will be removed in a future release; use flags (run 'cli "
-                      "%s --help'), --args-file <path>, or piped stdin.\n",
-                      tool_name, tool_name);
+        if (!output_flags.quiet_requested) {
+            (void)fprintf(stderr,
+                          "warning: passing raw JSON to 'cli %s' is deprecated and "
+                          "will be removed in a future release; use flags (run 'cli "
+                          "%s --help'), --args-file <path>, or piped stdin.\n",
+                          tool_name, tool_name);
+        }
         args_json = rem_argv[0];
     } else if (rem_argc >= SKIP_ONE && strncmp(rem_argv[0], "--", 2) == 0) {
         /* flag form: cli <tool> --flag value --bare-bool ... */
@@ -769,7 +789,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     }
 
     bool progress =
-        !index_worker && cbm_cli_progress_enabled(progress_requested, cli_isatty(2) != 0);
+        !index_worker && cbm_cli_progress_enabled(output_flags.progress_requested,
+                                                  output_flags.quiet_requested, cli_isatty(2) != 0);
     uint64_t progress_started_ms = cbm_now_ms();
     if (progress) {
         cbm_progress_sink_init(stderr);
@@ -789,7 +810,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     bool maintenance_binding_failed = false;
     bool maintenance_cancelled = false;
     if (!index_worker) {
-        result = main_local_cli_daemon_execute(tool_name, args_json);
+        result = main_local_cli_daemon_execute(tool_name, args_json, output_flags.quiet_requested);
     } else {
         srv = cbm_mcp_server_new(NULL);
         if (srv) {
@@ -890,7 +911,8 @@ static void print_help(void) {
     printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
-    printf("  codebase-memory-mcp cli [--progress] [--json] <tool> [args]\n");
+    printf("  codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool> "
+           "[args]\n");
     printf("                                      Run one tool locally, then exit\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] "
            "[--dir=<path>] [--skip-config]\n");
@@ -899,6 +921,12 @@ static void print_help(void) {
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
+    printf("\nCLI output options:\n");
+    printf("  --quiet       Show errors only; disable automatic terminal progress\n");
+    printf("  --progress    Show lifecycle progress even with redirected stderr\n");
+    printf("  --verbose     Include informational diagnostics\n");
+    printf("  --json        Print the raw MCP result envelope\n");
+    printf("  --quiet cannot be combined with --progress or outer --verbose.\n");
     printf("\nUI options:\n");
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
@@ -1275,15 +1303,23 @@ static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
     return cbm_daemon_bootstrap_endpoint_new(runtime_parent);
 }
 
-static bool main_local_cli_feedback_enabled(int argc, char **argv) {
-    bool requested = false;
+static bool main_cli_flag_present(int argc, char **argv, const char *flag) {
+    if (!argv || !flag) {
+        return false;
+    }
     for (int index = 1; index < argc; index++) {
-        if (argv[index] && strcmp(argv[index], "--progress") == 0) {
-            requested = true;
-            break;
+        if (argv[index] && strcmp(argv[index], flag) == 0) {
+            return true;
         }
     }
-    return cbm_cli_progress_enabled(requested, cli_isatty(2) != 0);
+    return false;
+}
+
+static bool main_local_cli_feedback_enabled(int argc, char **argv) {
+    bool requested = false;
+    requested = main_cli_flag_present(argc, argv, "--progress");
+    bool quiet = main_cli_flag_present(argc, argv, "--quiet");
+    return cbm_cli_progress_enabled(requested, quiet, cli_isatty(2) != 0);
 }
 
 static int main_local_transition_acquire(const cbm_daemon_ipc_endpoint_t *endpoint, FILE *feedback,
@@ -1503,7 +1539,8 @@ static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
  * lifecycle used to, instead of deadlocking behind the pinned daemon. Same-
  * or newer-build daemons and dev builds are never auto-drained. */
 static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
-    const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result) {
+    const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result,
+    bool report_lifecycle) {
     cbm_daemon_bootstrap_status_t status = cbm_daemon_bootstrap_execute(config, result);
     if (status != CBM_DAEMON_BOOTSTRAP_CONFLICT) {
         return status;
@@ -1515,11 +1552,13 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
         !main_semver_newer(config->identity->semantic_version, active.semantic_version)) {
         return status;
     }
-    (void)fprintf(stderr,
-                  "codebase-memory-mcp: retiring the active permanent daemon (%s, pid %lu) for "
-                  "this newer build (%s)\n",
-                  active.semantic_version, (unsigned long)active.daemon_pid,
-                  config->identity->semantic_version);
+    if (report_lifecycle) {
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp: retiring the active permanent daemon (%s, pid %lu) "
+                      "for this newer build (%s)\n",
+                      active.semantic_version, (unsigned long)active.daemon_pid,
+                      config->identity->semantic_version);
+    }
     cbm_daemon_runtime_activation_result_t drain;
     if (!cbm_daemon_runtime_request_activation_shutdown(config->endpoint, config->identity,
                                                         CBM_DAEMON_RUNTIME_ACTIVATION_UPDATE,
@@ -1536,8 +1575,9 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
  * sessions and hooks: an active daemon (any starter) is recycled, an absent
  * one is spawned for this command — with a hint that `daemon start` removes
  * that per-command cost. Only supervised index workers stay in-process. */
-static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json) {
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json,
+                                           bool quiet_requested) {
+    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     char executable_path[MAIN_PATH_CAP] = {0};
     cbm_daemon_build_identity_t identity;
     bool prepared =
@@ -1558,7 +1598,8 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
     };
     cbm_daemon_bootstrap_result_t bootstrap;
-    cbm_daemon_bootstrap_status_t status = main_client_bootstrap_with_upgrade(&config, &bootstrap);
+    cbm_daemon_bootstrap_status_t status =
+        main_client_bootstrap_with_upgrade(&config, &bootstrap, !quiet_requested);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap.client) {
         (void)fprintf(stderr, "error: %s\n",
@@ -1567,9 +1608,10 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         return NULL;
     }
     if (bootstrap.daemon_spawned) {
-        (void)fprintf(stderr, "hint: this command started a temporary CBM daemon. "
-                              "`codebase-memory-mcp daemon start` keeps one warm and removes this "
-                              "startup cost from every CLI command.\n");
+        /* Routine cold-start advice is informational. Default one-shot CLI
+         * output stays pipe-clean; `cli --verbose ...` opts into this detail. */
+        cbm_log_info("cli.daemon.spawned", "hint",
+                     "codebase-memory-mcp daemon start keeps one warm");
     }
     char session_root[MAIN_PATH_CAP];
     char allowed_root[MAIN_PATH_CAP];
@@ -2324,7 +2366,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     };
     cbm_daemon_bootstrap_result_t start_result;
     cbm_daemon_bootstrap_status_t start_status =
-        main_client_bootstrap_with_upgrade(&start_config, &start_result);
+        main_client_bootstrap_with_upgrade(&start_config, &start_result, true);
     if (start_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !start_result.client) {
         (void)fprintf(stderr, "error: %s\n",
                       start_result.message[0] ? start_result.message
@@ -2410,7 +2452,17 @@ int main(int argc, char **argv) {
 
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init();
-    cbm_log_init_from_env();
+    /* The raw logger starts WARN so allocator setup cannot pollute protocol or
+     * CLI output before argv is classified. Detached daemons retain INFO
+     * lifecycle records; physical workers require INFO because those records
+     * are their supervisor's quiet-timeout heartbeat. */
+    bool quiet_log_default = role != CBM_DAEMON_PROCESS_DAEMON && role != CBM_DAEMON_PROCESS_WORKER;
+    cbm_log_init_for_process(quiet_log_default, role == CBM_DAEMON_PROCESS_WORKER);
+    if (role == CBM_DAEMON_PROCESS_LOCAL_CLI && main_cli_flag_present(argc, argv, "--quiet")) {
+        /* Apply quiet before local coordination begins, not only once tool
+         * dispatch is reached, so pre-dispatch WARN chatter is suppressed. */
+        cbm_cli_diagnostics_configure(true, false);
+    }
 
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
@@ -2450,7 +2502,7 @@ int main(int argc, char **argv) {
             (void)fputs("Preparing one-shot local CBM command...\n", feedback);
             (void)fflush(feedback);
         }
-        cbm_daemon_ipc_endpoint_t *local_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+        cbm_daemon_ipc_endpoint_t *local_endpoint = main_daemon_endpoint_new();
         char local_executable[MAIN_PATH_CAP];
         cbm_daemon_build_identity_t local_identity;
         cbm_project_lock_manager_t *project_locks =
@@ -2610,7 +2662,7 @@ int main(int argc, char **argv) {
                           cbm_index_worker_argv_status_message(worker_status));
             return EXIT_FAILURE;
         }
-        cbm_daemon_ipc_endpoint_t *worker_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+        cbm_daemon_ipc_endpoint_t *worker_endpoint = main_daemon_endpoint_new();
         cbm_project_lock_manager_t *worker_project_locks =
             worker_endpoint ? cbm_project_lock_manager_new(worker_endpoint) : NULL;
         cbm_version_cohort_manager_t *worker_cohort_manager =
@@ -2857,7 +2909,7 @@ int main(int argc, char **argv) {
     };
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =
-        main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result);
+        main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result, true);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
         main_report_client_bootstrap_failure(role, &bootstrap_result);

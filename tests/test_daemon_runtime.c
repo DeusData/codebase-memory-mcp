@@ -2076,6 +2076,8 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
     bool second_interrupted = false;
     bool exited = false;
     atomic_store_explicit(&runtime_activation_shutdown_log_seen, false, memory_order_release);
+    CBMLogLevel previous_log_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
     cbm_log_set_sink(runtime_test_activation_shutdown_sink);
 
     if (started) {
@@ -2092,6 +2094,7 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
         second_interrupted = !cbm_daemon_runtime_client_heartbeat(second, RUNTIME_TEST_TIMEOUT_MS);
     }
     cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_log_level);
     if (first) {
         (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
         first = NULL;

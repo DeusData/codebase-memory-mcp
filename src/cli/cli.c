@@ -322,6 +322,10 @@ void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent) 
     g_cli_activation_runtime_parent_for_test = runtime_parent;
 }
 
+const char *cbm_cli_activation_runtime_parent_for_test(void) {
+    return g_cli_activation_runtime_parent_for_test;
+}
+
 static const char *cli_activation_action_text(cbm_daemon_runtime_activation_action_t action) {
     switch (action) {
     case CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL:
@@ -12397,6 +12401,18 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
     return result;
 }
 
+static void cli_print_schema_value(const yyjson_val *value) {
+    if (yyjson_is_str(value)) {
+        fputs(yyjson_get_str(value), stdout);
+        return;
+    }
+    char *json = yyjson_val_write(value, 0, NULL);
+    if (json) {
+        fputs(json, stdout);
+        free(json);
+    }
+}
+
 int cbm_cli_print_tool_help(const char *tool_name) {
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
@@ -12427,6 +12443,8 @@ int cbm_cli_print_tool_help(const char *tool_name) {
             }
             const char *type = "string";
             const char *desc = "";
+            yyjson_val *choices = NULL;
+            yyjson_val *default_value = NULL;
             if (yyjson_is_obj(pval)) {
                 yyjson_val *t = yyjson_obj_get(pval, "type");
                 if (t && yyjson_is_str(t)) {
@@ -12436,12 +12454,36 @@ int cbm_cli_print_tool_help(const char *tool_name) {
                 if (d && yyjson_is_str(d)) {
                     desc = yyjson_get_str(d);
                 }
+                choices = yyjson_obj_get(pval, "enum");
+                default_value = yyjson_obj_get(pval, "default");
             }
             char flag[CLI_BUF_256];
             snprintf(flag, sizeof(flag), "%s", name);
             cli_snake_to_kebab(flag);
             bool req = cli_schema_required_has(required, name);
-            printf("  --%s <%s>%s", flag, type, req ? " [required]" : "");
+            printf("  --%s <", flag);
+            if (choices && yyjson_is_arr(choices) && yyjson_arr_size(choices) > 0) {
+                size_t idx;
+                size_t max;
+                yyjson_val *choice;
+                yyjson_arr_foreach(choices, idx, max, choice) {
+                    if (idx > 0) {
+                        fputc('|', stdout);
+                    }
+                    cli_print_schema_value(choice);
+                }
+            } else {
+                fputs(type, stdout);
+            }
+            fputc('>', stdout);
+            if (req) {
+                fputs(" [required]", stdout);
+            }
+            if (default_value) {
+                fputs(" [default: ", stdout);
+                cli_print_schema_value(default_value);
+                fputc(']', stdout);
+            }
             if (desc[0]) {
                 printf("  %s", desc);
             }

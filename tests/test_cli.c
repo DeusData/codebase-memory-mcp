@@ -21,6 +21,7 @@
 #include <daemon/runtime.h>
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
+#include <foundation/log.h>
 #include <foundation/platform.h>
 #include <mcp/mcp.h>
 #include <foundation/yaml.h>
@@ -53,10 +54,138 @@ void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled);
 int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 bool cbm_cli_activation_test_ops_installed(void);
 
+/* CLI config lifecycle tests exercise the real activation guard on POSIX. Keep
+ * that protocol coverage, but bind it to this suite's private endpoint so an
+ * editor using the developer's installed CBM cannot make an unrelated cleanup
+ * assertion fail. One focused activation-order test temporarily overrides this
+ * parent and restores it before the remaining suite continues. */
+static char g_cli_suite_runtime_parent[512];
+
+TEST(cli_suite_uses_private_activation_runtime) {
+    const char *runtime_parent = cbm_cli_activation_runtime_parent_for_test();
+    ASSERT_NOT_NULL(runtime_parent);
+    ASSERT_STR_EQ(runtime_parent, g_cli_suite_runtime_parent);
+    PASS();
+}
+
 TEST(cli_progress_visibility_policy) {
-    ASSERT_TRUE(cbm_cli_progress_enabled(true, false));
-    ASSERT_TRUE(cbm_cli_progress_enabled(false, true));
-    ASSERT_FALSE(cbm_cli_progress_enabled(false, false));
+    ASSERT_TRUE(cbm_cli_progress_enabled(true, false, false));
+    ASSERT_TRUE(cbm_cli_progress_enabled(false, false, true));
+    ASSERT_FALSE(cbm_cli_progress_enabled(false, false, false));
+    ASSERT_FALSE(cbm_cli_progress_enabled(false, true, true));
+    ASSERT_FALSE(cbm_cli_progress_enabled(true, true, true));
+    PASS();
+}
+
+TEST(cli_quiet_is_stripped_before_tool_argument_forwarding) {
+    char *argv[] = {"search_graph", "--project", "demo", "--quiet"};
+    int argc = (int)(sizeof(argv) / sizeof(argv[0]));
+    cbm_cli_output_flags_t flags;
+    char error[256] = {0};
+
+    ASSERT_TRUE(cbm_cli_output_flags_parse(&argc, argv, &flags, error, sizeof(error)));
+    ASSERT_TRUE(flags.quiet_requested);
+    ASSERT_FALSE(flags.progress_requested);
+    ASSERT_FALSE(flags.verbose_requested);
+    ASSERT_EQ(argc, 3);
+    ASSERT_STR_EQ(argv[0], "search_graph");
+    ASSERT_STR_EQ(argv[1], "--project");
+    ASSERT_STR_EQ(argv[2], "demo");
+
+    char *build_error = NULL;
+    char *json = cbm_cli_build_args_json(argv[0], argc - 1, argv + 1, &build_error);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(build_error);
+    ASSERT_NOT_NULL(strstr(json, "\"project\":\"demo\""));
+    ASSERT_NULL(strstr(json, "quiet"));
+    free(json);
+    PASS();
+}
+
+TEST(cli_quiet_rejects_other_outer_output_modes_with_guidance) {
+    char *progress_argv[] = {"--quiet", "--progress", "search_graph"};
+    int progress_argc = (int)(sizeof(progress_argv) / sizeof(progress_argv[0]));
+    cbm_cli_output_flags_t progress_flags;
+    char progress_error[256] = {0};
+    ASSERT_FALSE(cbm_cli_output_flags_parse(&progress_argc, progress_argv, &progress_flags,
+                                            progress_error, sizeof(progress_error)));
+    ASSERT_NOT_NULL(strstr(progress_error, "--quiet"));
+    ASSERT_NOT_NULL(strstr(progress_error, "--progress"));
+    ASSERT_NOT_NULL(strstr(progress_error, "errors-only"));
+
+    char *verbose_argv[] = {"--quiet", "--verbose", "index_status"};
+    int verbose_argc = (int)(sizeof(verbose_argv) / sizeof(verbose_argv[0]));
+    cbm_cli_output_flags_t verbose_flags;
+    char verbose_error[256] = {0};
+    ASSERT_FALSE(cbm_cli_output_flags_parse(&verbose_argc, verbose_argv, &verbose_flags,
+                                            verbose_error, sizeof(verbose_error)));
+    ASSERT_NOT_NULL(strstr(verbose_error, "--verbose"));
+    ASSERT_NOT_NULL(strstr(verbose_error, "informational diagnostics"));
+
+    /* Existing progress plus verbose behavior remains valid; only quiet is
+     * exclusive with the two output-expanding controls. */
+    char *compatible_argv[] = {"--progress", "--verbose", "search_graph"};
+    int compatible_argc = (int)(sizeof(compatible_argv) / sizeof(compatible_argv[0]));
+    cbm_cli_output_flags_t compatible_flags;
+    char compatible_error[256] = {0};
+    ASSERT_TRUE(cbm_cli_output_flags_parse(&compatible_argc, compatible_argv, &compatible_flags,
+                                           compatible_error, sizeof(compatible_error)));
+    ASSERT_TRUE(compatible_flags.progress_requested);
+    ASSERT_TRUE(compatible_flags.verbose_requested);
+    ASSERT_FALSE(compatible_flags.quiet_requested);
+    ASSERT_EQ(compatible_argc, 1);
+    ASSERT_STR_EQ(compatible_argv[0], "search_graph");
+    PASS();
+}
+
+TEST(cli_quiet_preserves_tool_level_verbose_argument) {
+    char *argv[] = {"--quiet", "index_status", "--verbose"};
+    int argc = (int)(sizeof(argv) / sizeof(argv[0]));
+    cbm_cli_output_flags_t flags;
+    char error[256] = {0};
+
+    ASSERT_TRUE(cbm_cli_output_flags_parse(&argc, argv, &flags, error, sizeof(error)));
+    ASSERT_TRUE(flags.quiet_requested);
+    ASSERT_FALSE(flags.verbose_requested);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(argv[0], "index_status");
+    ASSERT_STR_EQ(argv[1], "--verbose");
+    PASS();
+}
+
+static FILE *s_cli_quiet_log_capture;
+
+static void cli_quiet_log_capture(const char *line) {
+    if (s_cli_quiet_log_capture && line) {
+        (void)fprintf(s_cli_quiet_log_capture, "%s\n", line);
+    }
+}
+
+TEST(cli_quiet_suppresses_ordinary_diagnostics_but_preserves_errors) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    CBMLogLevel previous_level = cbm_log_get_level();
+    CBMLogFormat previous_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    s_cli_quiet_log_capture = out;
+    cbm_log_set_sink(cli_quiet_log_capture);
+
+    cbm_cli_diagnostics_configure(true, false);
+    cbm_log_info("quiet.info", "detail", "drop");
+    cbm_log_warn("quiet.warning", "detail", "drop");
+    cbm_log_error("quiet.error", "detail", "keep");
+
+    cbm_log_set_sink(NULL);
+    s_cli_quiet_log_capture = NULL;
+    cbm_log_set_level(previous_level);
+    cbm_log_set_format(previous_format);
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[512] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_STR_EQ(rendered, "level=error msg=quiet.error detail=keep\n");
     PASS();
 }
 
@@ -96,6 +225,75 @@ TEST(cli_progress_sink_accepts_worker_json_logs) {
     ASSERT_TRUE(rendered_size > 0);
     ASSERT_NOT_NULL(strstr(rendered, "Discovering files (3 found)"));
     ASSERT_NOT_NULL(strstr(rendered, "[1/9] Building file structure"));
+    PASS();
+}
+
+TEST(cli_progress_sink_enables_lifecycle_info_then_restores_quiet_default) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    cbm_log_set_level(CBM_LOG_WARN);
+
+    cbm_progress_sink_init(out);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+    cbm_log_info("pipeline.discover", "files", "3");
+    cbm_progress_sink_fini();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[256] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_NOT_NULL(strstr(rendered, "Discovering files (3 found)"));
+    PASS();
+}
+
+TEST(cli_progress_sink_suppresses_noise_and_preserves_failures) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+
+    cbm_progress_sink_init(out);
+    cbm_progress_sink_fn("level=info msg=parallel.extract.progress done=1 total=2");
+    cbm_progress_sink_fn("level=debug msg=worker.detail value=drop-debug");
+    cbm_progress_sink_fn(
+        "{\"level\":\"info\",\"event\":\"worker.detail\",\"value\":\"drop-info\"}");
+    cbm_progress_sink_fn("level=warn msg=worker.warning detail=keep-text");
+    cbm_progress_sink_fn(
+        "{\"level\":\"error\",\"event\":\"worker.failure\",\"detail\":\"keep-json\"}");
+    cbm_progress_sink_fini();
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[1024] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_STR_EQ(rendered,
+                  "\r  Extracting: 1/2 files (50%)\n"
+                  "level=warn msg=worker.warning detail=keep-text\n"
+                  "{\"level\":\"error\",\"event\":\"worker.failure\",\"detail\":\"keep-json\"}\n");
+    PASS();
+}
+
+TEST(cli_progress_sink_preserves_explicit_verbose_diagnostics) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+
+    cbm_progress_sink_init(out);
+    cbm_log_info("cli.daemon.spawned", "hint", "keep-info");
+    cbm_log_debug("cli.detail", "value", "keep-debug");
+    cbm_progress_sink_fini();
+    cbm_log_set_level(previous_level);
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[1024] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_NOT_NULL(strstr(rendered, "msg=cli.daemon.spawned"));
+    ASSERT_NOT_NULL(strstr(rendered, "msg=cli.detail"));
     PASS();
 }
 
@@ -977,7 +1175,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
     int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
-    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
     int child_status = 0;
@@ -7849,6 +8047,57 @@ TEST(cli_hook_session_resolves_custom_named_index_by_root_path) {
     PASS();
 }
 
+TEST(cli_hook_session_exhausts_project_registry_pages) {
+    enum { DECOY_DATABASES = 500 };
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-project-pages-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char decoy_root[512];
+    char target_root[512];
+    char decoy_db[640];
+    char target_db[640];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(decoy_root, sizeof(decoy_root), "%s/decoy", tmpdir);
+    snprintf(target_root, sizeof(target_root), "%s/target", tmpdir);
+    snprintf(decoy_db, sizeof(decoy_db), "%s/decoy-000.db", cache);
+    snprintf(target_db, sizeof(target_db), "%s/target.db", cache);
+    test_mkdirp(cache);
+    test_mkdirp(decoy_root);
+    test_mkdirp(target_root);
+
+    cbm_store_t *store = cbm_store_open_path(decoy_db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "aaa-decoy", decoy_root), CBM_STORE_OK);
+    cbm_store_close(store);
+    for (int i = 1; i < DECOY_DATABASES; i++) {
+        char copy[640];
+        snprintf(copy, sizeof(copy), "%s/decoy-%03d.db", cache, i);
+        ASSERT_EQ(cbm_copy_file(decoy_db, copy), 0);
+    }
+
+    store = cbm_store_open_path(target_db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "zzz-custom-project", target_root), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             target_root);
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    bool matched = output && strstr(output, "zzz-custom-project") && strstr(output, "is indexed");
+
+    free(output);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+    if (!matched)
+        FAIL("SessionStart must exhaust list_projects pages before resolving root_path");
+    PASS();
+}
+
 TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-untrusted-project-XXXXXX");
@@ -9237,6 +9486,56 @@ TEST(cli_hook_augment_context_tracks_search_json_shape) {
     free(ctx);
     free(envelope);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(cli_hook_augment_coverage_requests_machine_json) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-coverage-json-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char repo[512];
+    char source[640];
+    char db_path[640];
+    snprintf(repo, sizeof(repo), "%s/repo", tmpdir);
+    snprintf(source, sizeof(source), "%s/src/partial.c", repo);
+    snprintf(db_path, sizeof(db_path), "%s/hook.db", tmpdir);
+    test_mkdirp(repo);
+    char source_dir[640];
+    snprintf(source_dir, sizeof(source_dir), "%s/src", repo);
+    test_mkdirp(source_dir);
+    write_test_file(source, "int partial(void) { return 1; }\n");
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "repo", repo), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "repo", "src/partial.c", "fixture", 1, 32),
+              CBM_STORE_OK);
+    const cbm_coverage_row_t row = {
+        .rel_path = "src/partial.c", .kind = "parse_partial", .detail = "12-14"};
+    ASSERT_EQ(cbm_store_coverage_replace(store, "repo", &row, 1), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, "repo");
+
+    char input[2048];
+    snprintf(input, sizeof(input),
+             "{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"Read\","
+             "\"tool_input\":{\"file_path\":\"%s\"},\"cwd\":\"%s\"}",
+             source, repo);
+    char *output = cbm_hook_augment_process(srv, input);
+    bool matched = output && strstr(output, "PARTIALLY indexed") && strstr(output, "12-14");
+
+    free(output);
+    cbm_mcp_server_free(srv);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+    if (!matched)
+        FAIL("Post-read hook must parse check_index_coverage's explicit JSON response");
     PASS();
 }
 
@@ -12103,10 +12402,49 @@ TEST(cli_build_args_json_bad_positional_errors_issue680) {
     PASS();
 }
 
-/* Per-tool --help returns 0 for a known tool, -1 for an unknown one. */
+/* Capture per-tool help using the same tmpfile+dup2 idiom as config-command
+ * output above. This stays portable to the MinGW test leg. */
+static int cli_tool_help_capture(const char *tool_name, char *out, size_t cap) {
+    out[0] = '\0';
+    FILE *capture = tmpfile();
+    int saved = capture ? dup(fileno(stdout)) : -1;
+    if (!capture || saved < 0) {
+        if (capture)
+            fclose(capture);
+        if (saved >= 0)
+            close(saved);
+        return -1000;
+    }
+    fflush(stdout);
+    if (dup2(fileno(capture), fileno(stdout)) < 0) {
+        fclose(capture);
+        close(saved);
+        return -1000;
+    }
+    int rc = cbm_cli_print_tool_help(tool_name);
+    fflush(stdout);
+    (void)dup2(saved, fileno(stdout));
+    close(saved);
+    rewind(capture);
+    size_t got = fread(out, 1, cap - 1, capture);
+    out[got] = '\0';
+    fclose(capture);
+    return rc;
+}
+
+/* Per-tool --help returns 0 for a known tool, -1 for an unknown one, and
+ * surfaces schema choices/defaults rather than flattening every flag to its
+ * primitive JSON type. */
 TEST(cli_print_tool_help_issue680) {
-    ASSERT_EQ(cbm_cli_print_tool_help("index_repository"), 0);
-    ASSERT_EQ(cbm_cli_print_tool_help("nope_not_a_tool"), -1);
+    char out[16 * 1024];
+    ASSERT_EQ(cli_tool_help_capture("search_graph", out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "--format <tree|json> [default: tree]"));
+    ASSERT_NOT_NULL(strstr(out, "--detail <ids|default> [default: default]"));
+    ASSERT_EQ(cli_tool_help_capture("index_repository", out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "--mode <full|moderate|fast|cross-repo-intelligence> [default: "
+                                "full]"));
+    ASSERT_EQ(cli_tool_help_capture("nope_not_a_tool", out, sizeof(out)), -1);
+    ASSERT_STR_EQ(out, "");
     PASS();
 }
 
@@ -12465,10 +12803,27 @@ TEST(cli_windows_update_hands_off_to_install_script) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 SUITE(cli) {
+    if (!th_secure_runtime_parent_new(g_cli_suite_runtime_parent,
+                                      sizeof(g_cli_suite_runtime_parent), "cli-suite")) {
+        printf("  %sFAIL%s: could not create private CLI activation runtime\n", tf_red(),
+               tf_reset());
+        tf_fail_count++;
+        return;
+    }
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
+
+    RUN_TEST(cli_suite_uses_private_activation_runtime);
     RUN_TEST(cli_progress_visibility_policy);
+    RUN_TEST(cli_quiet_is_stripped_before_tool_argument_forwarding);
+    RUN_TEST(cli_quiet_rejects_other_outer_output_modes_with_guidance);
+    RUN_TEST(cli_quiet_preserves_tool_level_verbose_argument);
+    RUN_TEST(cli_quiet_suppresses_ordinary_diagnostics_but_preserves_errors);
     RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);
     RUN_TEST(cli_maintenance_cancellation_forces_failure_status);
     RUN_TEST(cli_progress_sink_accepts_worker_json_logs);
+    RUN_TEST(cli_progress_sink_enables_lifecycle_info_then_restores_quiet_default);
+    RUN_TEST(cli_progress_sink_suppresses_noise_and_preserves_failures);
+    RUN_TEST(cli_progress_sink_preserves_explicit_verbose_diagnostics);
     RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
     RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
@@ -12679,6 +13034,7 @@ SUITE(cli) {
     RUN_TEST(cli_augment_installs_session_context_and_subagent);
     RUN_TEST(cli_augment_session_uses_workspace_roots);
     RUN_TEST(cli_hook_session_resolves_custom_named_index_by_root_path);
+    RUN_TEST(cli_hook_session_exhausts_project_registry_pages);
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);
     RUN_TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands);
@@ -12705,6 +13061,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
+    RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);
@@ -12827,4 +13184,8 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+
+    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+    test_rmdir_r(g_cli_suite_runtime_parent);
+    g_cli_suite_runtime_parent[0] = '\0';
 }
