@@ -27,9 +27,40 @@
 #include <errno.h>  /* errno for spawn-failure logging */
 #include <fcntl.h>  /* _O_RDONLY */
 #include <io.h>     /* _wunlink, _open_osfhandle, _close */
+#include <stdatomic.h>
 #include <stdint.h> /* intptr_t */
 #include "foundation/log.h"
+#include "foundation/platform.h" /* cbm_safe_getenv */
 #include "foundation/win_utf8.h"
+
+/* DACL-hardening process flag: -1 undecided, 0 disabled, 1 enabled. The
+ * accessor lazily resolves the CBM_SKIP_DACL_HARDENING kill switch ONLY — it
+ * must stay dependency-free because it is reached from the stamp path, which
+ * runs before the config store exists. The persisted windows-dacl-hardening
+ * key is applied later through the explicit setter (env > config). */
+static atomic_int g_dacl_hardening = -1;
+
+bool cbm_windows_dacl_hardening_enabled(void) {
+    int state = atomic_load_explicit(&g_dacl_hardening, memory_order_acquire);
+    if (state >= 0) {
+        return state == 1;
+    }
+    char buf[CBM_SZ_32];
+    bool skip =
+        cbm_safe_getenv("CBM_SKIP_DACL_HARDENING", buf, sizeof(buf), NULL) != NULL && buf[0] == '1';
+    atomic_store_explicit(&g_dacl_hardening, skip ? 0 : 1, memory_order_release);
+    return !skip;
+}
+
+void cbm_windows_dacl_hardening_set(bool enabled) {
+    atomic_store_explicit(&g_dacl_hardening, enabled ? 1 : 0, memory_order_release);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_windows_dacl_hardening_reset_for_testing(void) {
+    atomic_store_explicit(&g_dacl_hardening, -1, memory_order_release);
+}
+#endif
 
 struct cbm_dir {
     HANDLE find_handle;
@@ -461,10 +492,17 @@ static void cbm_windows_stamp_dir_owner(const wchar_t *path) {
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (directory != INVALID_HANDLE_VALUE) {
             if (SetEntriesInAclW(1U, &access, NULL, &acl) == ERROR_SUCCESS) {
-                (void)SetSecurityInfo(directory, SE_FILE_OBJECT,
-                                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
-                                          PROTECTED_DACL_SECURITY_INFORMATION,
-                                      user->User.Sid, NULL, acl, NULL);
+                /* D3: when hardening is disabled the exact-owner stamp stays
+                 * (the owner validators remain active) but the owner-only
+                 * protected DACL is dropped, leaving the OS-default DACL. */
+                DWORD stamp = OWNER_SECURITY_INFORMATION;
+                PACL stamp_acl = NULL;
+                if (cbm_windows_dacl_hardening_enabled()) {
+                    stamp |= DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+                    stamp_acl = acl;
+                }
+                (void)SetSecurityInfo(directory, SE_FILE_OBJECT, stamp, user->User.Sid, NULL,
+                                      stamp_acl, NULL);
             }
             (void)CloseHandle(directory);
         }
@@ -950,6 +988,20 @@ int cbm_exec_no_shell(const char *const *argv) {
     }
     return CBM_NOT_FOUND; /* killed by signal */
 }
+
+/* DACL hardening is Windows-only; the accessor keeps the safe default and the
+ * setter is a no-op so shared callers (main_build_identity) compile unchanged. */
+bool cbm_windows_dacl_hardening_enabled(void) {
+    return true;
+}
+
+void cbm_windows_dacl_hardening_set(bool enabled) {
+    (void)enabled;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_windows_dacl_hardening_reset_for_testing(void) {}
+#endif
 
 #endif /* _WIN32 */
 
