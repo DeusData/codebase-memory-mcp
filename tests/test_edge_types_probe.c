@@ -222,6 +222,62 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
     return et_index_files(lp, files, n);
 }
 
+/* #1085: count CALLS edges whose target node has `name`, indexing via the
+ * PARALLEL path (et_index_parallel pads to >50 files). The per-file TS resolver
+ * used to treat a raw tsconfig alias as a confident target. That false row made
+ * the parallel driver skip cross-file resolution, then failed graph target
+ * materialization; the guarded JSX carrier correctly refused name-only
+ * fallback, so the relationship vanished. Needs >50 files to reproduce. */
+static int et_calls_to_name_parallel(const EtFile *meaningful, int n_mean, const char *name) {
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, meaningful, n_mean);
+    int hits = 0;
+    if (store) {
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &n) == CBM_STORE_OK) {
+            for (int i = 0; i < n; i++) {
+                cbm_node_t tgt;
+                if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) != CBM_STORE_OK)
+                    continue;
+                if (tgt.name && strcmp(tgt.name, name) == 0)
+                    hits++;
+                cbm_node_free_fields(&tgt);
+            }
+            cbm_store_free_edges(edges, n);
+        }
+    }
+    et_cleanup(&lp, store);
+    return hits;
+}
+
+TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
+    static const EtFile f[] = {
+        {"tsconfig.json",
+         "{ \"compilerOptions\": { \"baseUrl\": \".\", "
+         "\"paths\": { \"@/*\": [\"./src/*\"] } } }\n"},
+        {"src/components/ui/kpi-card.tsx",
+         "export function KpiCard({ label }: { label: string }) {\n"
+         "  return <div>{label}</div>;\n}\n"},
+        {"src/app/dashboard-a.tsx",
+         "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
+         "export function DashboardA() {\n  return <KpiCard label=\"a\" />;\n}\n"},
+        {"src/app/dashboard-b.tsx",
+         "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
+         "export function DashboardB() {\n  return <KpiCard label=\"b\" />;\n}\n"}};
+    /* RED before the fix: 0 (parallel drops alias-JSX). GREEN: exactly one
+     * deduplicated edge from each dashboard render. */
+    int hits = et_calls_to_name_parallel(f, 4, "KpiCard");
+    if (hits != 2) {
+        fprintf(stderr,
+                "  [1085] FAIL CALLS->KpiCard on parallel path = %d (expected 2); "
+                "alias-imported JSX component edges dropped\n",
+                hits);
+    }
+    ASSERT_EQ(hits, 2);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  HANDLES — route→handler across web frameworks
  *
@@ -1514,6 +1570,7 @@ TEST(override_go_interface) {
 
 SUITE(edge_types_probe) {
     /* HANDLES — route→handler across web frameworks */
+    RUN_TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085);
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);
     RUN_TEST(handles_drf_action_python);

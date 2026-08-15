@@ -207,6 +207,53 @@ describe("StatsTab index modal", () => {
     await new Promise((r) => setTimeout(r, 400));
     expect(browseCalls()).toBe(before);
   });
+
+  it("posts empty ADR content when deleting an existing ADR", async () => {
+    let saved: unknown = null;
+    mockProjectsFetch((url, init) => {
+      if (url === "/rpc") {
+        const body = JSON.parse(String(init?.body));
+        const tool = body.params?.name;
+        const result = tool === "list_projects"
+          ? {
+              projects: [{
+                name: "demo",
+                root_path: "/repo",
+                indexed_at: "2026-01-01T00:00:00Z",
+              }],
+            }
+          : { node_labels: [], edge_types: [], total_nodes: 0, total_edges: 0 };
+        return new Response(JSON.stringify({
+          result: { content: [{ text: JSON.stringify(result) }] },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url.startsWith("/api/adr")) {
+        if (init?.method === "POST") {
+          saved = JSON.parse(String(init.body));
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({
+          has_adr: true,
+          content: "old decision text",
+          updated_at: "2026-01-01",
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return undefined;
+    });
+
+    render(<StatsTab onSelectProject={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "ADR" }));
+    expect(await screen.findByDisplayValue("old decision text")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(saved).toEqual({ project: "demo", content: "" });
+    });
+  });
 });
 
 describe("IndexProgress", () => {

@@ -221,17 +221,7 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
  * % ! ^. Callers then use DOUBLE quotes (honored by both POSIX sh and cmd.exe, unlike
  * single quotes on cmd.exe), so a repo path may legitimately contain spaces. */
 bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path) {
-    if (!cbm_validate_shell_arg(repo_path)) {
-        return false;
-    }
-#ifdef _WIN32
-    for (const char *p = repo_path; *p; p++) {
-        if (*p == '%' || *p == '!' || *p == '^') {
-            return false;
-        }
-    }
-#endif
-    return true;
+    return cbm_validate_shell_path_arg(repo_path);
 }
 
 /* Get current git HEAD hash. buf must be >= CBM_SZ_64. Returns false on error. */
@@ -434,6 +424,60 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
 
 /* ── Export helpers ───────────────────────────────────────────────── */
 
+/* Owner-private scratch directory holding the snapshot copy.
+ *
+ * VACUUM INTO refuses to write a destination that already exists, so the
+ * destination file cannot be pre-created with exclusive semantics the way
+ * cbm_mkstemp would — sqlite has to be the one that creates it. Containing it in
+ * a directory only this user can enter buys the same protection: cbm_mkdtemp
+ * creates with 0700 on POSIX and an explicit owner-only DACL on Windows, and the
+ * XXXXXX suffix makes the path unguessable. The old fixed
+ * "<tmp>/cbm_artifact_tmp.db" was vulnerable on both counts — another local user
+ * could pre-plant a symlink there to redirect the copy, and two concurrent
+ * exports collided on the one name. */
+typedef struct {
+    char dir[CBM_SZ_512]; /* cbm_mkdtemp copies its result back into this buffer */
+    char db[CBM_SZ_4K];
+} artifact_snapshot_tmp_t;
+
+static bool artifact_snapshot_tmp_open(artifact_snapshot_tmp_t *tmp) {
+    tmp->dir[0] = '\0';
+    tmp->db[0] = '\0';
+    int written = snprintf(tmp->dir, sizeof(tmp->dir), "%s/cbm-artifact-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || (size_t)written >= sizeof(tmp->dir) || !cbm_mkdtemp(tmp->dir)) {
+        tmp->dir[0] = '\0';
+        return false;
+    }
+    written = snprintf(tmp->db, sizeof(tmp->db), "%s/snapshot.db", tmp->dir);
+    if (written <= 0 || (size_t)written >= sizeof(tmp->db)) {
+        (void)cbm_rmdir(tmp->dir);
+        tmp->dir[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+/* Anchored cleanup — every exit from prepare_snapshot_db runs this, so neither
+ * the copy nor its WAL/SHM sidecars outlive the export. Removing the directory
+ * last doubles as the check that nothing was left inside it: rmdir only
+ * succeeds once it is empty. */
+static void artifact_snapshot_tmp_close(artifact_snapshot_tmp_t *tmp) {
+    if (tmp->dir[0] == '\0') {
+        return;
+    }
+    static const char *const suffixes[] = {"-wal", "-shm"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char sidecar[CBM_SZ_4K];
+        int written = snprintf(sidecar, sizeof(sidecar), "%s%s", tmp->db, suffixes[i]);
+        if (written > 0 && (size_t)written < sizeof(sidecar)) {
+            (void)cbm_unlink(sidecar);
+        }
+    }
+    (void)cbm_unlink(tmp->db);
+    (void)cbm_rmdir(tmp->dir);
+    tmp->dir[0] = '\0';
+}
+
 /* Prepare a stripped DB copy for best-quality export.
  * VACUUM INTO → (optionally) drop indexes → VACUUM. Returns malloc'd buffer
  * or NULL. VACUUM INTO runs on BOTH quality levels: it is the consistent
@@ -441,9 +485,15 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
  * committed transactions still in the -wal and can be mid-checkpoint torn
  * (#895). Only the index-stripping is BEST-only. */
 static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes) {
-    char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_tmp.db", cbm_tmpdir());
-    cbm_unlink(tmp_path);
+    artifact_snapshot_tmp_t tmp;
+    if (!artifact_snapshot_tmp_open(&tmp)) {
+        artifact_export_fail("prepare_snapshot_dir", cbm_tmpdir(), "private_tmpdir_failed", errno);
+        return NULL;
+    }
+    /* Fresh private directory ⇒ the destination is absent by construction, which
+     * is exactly what VACUUM INTO requires. The old unlink-the-stale-file step
+     * is gone with the fixed name it existed to clear. */
+    const char *tmp_path = tmp.db;
 
     /* VACUUM INTO: clean compacted copy. Use raw sqlite3 to bypass store authorizer
      * (which blocks ATTACH, used internally by VACUUM INTO). */
@@ -452,6 +502,7 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
         const char *err = raw_db ? sqlite3_errmsg(raw_db) : "sqlite_open";
         artifact_export_fail("open_source_db", db_path, err, 0);
         sqlite3_close(raw_db);
+        artifact_snapshot_tmp_close(&tmp);
         return NULL;
     }
 
@@ -464,7 +515,7 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
     if (vrc != SQLITE_OK) {
         artifact_export_fail("vacuum_into", tmp_path, errmsg ? errmsg : sqlite3_errstr(vrc), 0);
         sqlite3_free(errmsg);
-        cbm_unlink(tmp_path);
+        artifact_snapshot_tmp_close(&tmp);
         return NULL;
     }
 
@@ -478,19 +529,15 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
         }
     }
 
+    /* Reopened by path rather than held on a descriptor across VACUUM INTO,
+     * because sqlite owns the create. The private directory is what makes that
+     * safe: an attacker who cannot enter it cannot swap the file underneath. */
     char *data = read_file_alloc(tmp_path, out_size);
     if (!data || *out_size == 0) {
         artifact_export_fail("read_stripped_db", tmp_path, "empty_or_unreadable", errno);
     }
-    cbm_unlink(tmp_path);
-
-    /* Clean up WAL/SHM from temp */
-    char wal[CBM_SZ_4K];
-    char shm[CBM_SZ_4K];
-    snprintf(wal, sizeof(wal), "%s-wal", tmp_path);
-    snprintf(shm, sizeof(shm), "%s-shm", tmp_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    /* Removes the copy, its WAL/SHM sidecars, and the private directory. */
+    artifact_snapshot_tmp_close(&tmp);
     return data;
 }
 
@@ -542,14 +589,14 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     /* Compress with zstd */
-    size_t bound = cbm_zstd_compress_bound((int)db_size);
+    size_t bound = cbm_zstd_compress_bound(db_size);
     char *compressed = malloc(bound);
     if (!compressed) {
         free(db_data);
         return artifact_export_fail("compress", NULL, "alloc_compressed_buffer", 0);
     }
 
-    int clen = cbm_zstd_compress(db_data, (int)db_size, compressed, (int)bound, compression_level);
+    int64_t clen = cbm_zstd_compress(db_data, db_size, compressed, bound, compression_level);
     free(db_data);
 
     if (clen <= 0) {
@@ -574,7 +621,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     /* Get node/edge counts for metadata */
     int nodes = 0;
     int edges = 0;
-    cbm_store_t *count_store = cbm_store_open_path(db_path);
+    cbm_store_t *count_store = cbm_store_open_path_query(db_path);
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);

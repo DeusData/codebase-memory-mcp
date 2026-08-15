@@ -6,15 +6,50 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static CBMLogLevel g_log_level = CBM_LOG_INFO;
-static CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
-static cbm_log_sink_fn g_log_sink = NULL;
-static CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
+/* These four are written by whatever thread configures logging and read by
+ * every thread that logs — daemon connection workers, pipeline workers, the
+ * watcher. They were plain globals, which is a data race on the SINK in the
+ * strict sense that matters: emit_line reads the pointer and CALLS it, so a
+ * torn or stale read is a jump through a partially-written pointer, not just
+ * a stale value. Found by running the daemon_runtime suite under TSan (that
+ * suite had been excluded from the TSan set, which is why it went unseen).
+ *
+ * Relaxed ordering is the right level: each is an independent scalar with no
+ * happens-before relationship to publish alongside it, and the log path must
+ * stay cheap enough that nobody is tempted to route around it. */
+static _Atomic CBMLogLevel g_log_level = CBM_LOG_INFO;
+static _Atomic CBMLogFormat g_log_format = CBM_LOG_FORMAT_TEXT;
+/* Cast, not bare NULL: NULL is ((void*)0) and the implicit void*-to-
+ * function-pointer conversion is not a compile-time constant, which
+ * older Apple clang (Xcode 15.4, the macOS CI image) rejects outright
+ * in a static initializer. The cast makes it an address constant. */
+static _Atomic cbm_log_sink_fn g_log_sink = (cbm_log_sink_fn)NULL;
+static _Atomic CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
+
+/* See cbm_log_set_crash_durable in log.h. Read on every emitted line, so it
+ * follows the same relaxed-atomic discipline as the four above. */
+static _Atomic bool g_log_crash_durable = false;
+
+void cbm_log_set_crash_durable(bool enabled) {
+    if (enabled) {
+        /* Best effort by contract: setvbuf is only guaranteed before a stream's
+         * first operation, so a process that has already written to stderr
+         * keeps its buffering. The per-line flush in emit_line is what makes
+         * the durability guarantee hold either way. */
+        (void)setvbuf(stderr, NULL, _IONBF, 0);
+    }
+    atomic_store_explicit(&g_log_crash_durable, enabled, memory_order_relaxed);
+}
+
+bool cbm_log_crash_durable(void) {
+    return atomic_load_explicit(&g_log_crash_durable, memory_order_relaxed);
+}
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
@@ -76,24 +111,26 @@ void cbm_log_set_sink(cbm_log_sink_fn fn) {
 }
 
 void cbm_log_set_sink_ex(cbm_log_sink_fn fn, CBMLogSinkMode mode) {
-    g_log_sink = fn;
-    g_log_sink_mode = mode;
+    /* Mode first: a reader that observes the new sink then reads the mode can
+     * never see the mode belonging to the PREVIOUS sink. */
+    atomic_store_explicit(&g_log_sink_mode, mode, memory_order_relaxed);
+    atomic_store_explicit(&g_log_sink, fn, memory_order_relaxed);
 }
 
 void cbm_log_set_level(CBMLogLevel level) {
-    g_log_level = level;
+    atomic_store_explicit(&g_log_level, level, memory_order_relaxed);
 }
 
 CBMLogLevel cbm_log_get_level(void) {
-    return g_log_level;
+    return atomic_load_explicit(&g_log_level, memory_order_relaxed);
 }
 
 void cbm_log_set_format(CBMLogFormat format) {
-    g_log_format = format;
+    atomic_store_explicit(&g_log_format, format, memory_order_relaxed);
 }
 
 CBMLogFormat cbm_log_get_format(void) {
-    return g_log_format;
+    return atomic_load_explicit(&g_log_format, memory_order_relaxed);
 }
 
 static const char *level_str(CBMLogLevel level) {
@@ -196,17 +233,28 @@ static void finish_line(char *buf, size_t bufsz, size_t pos) {
 }
 
 static void emit_line(const char *line) {
-    if (g_log_sink) {
-        g_log_sink(line);
-        if (g_log_sink_mode == CBM_LOG_SINK_REPLACE) {
+    /* Load ONCE: re-reading the global between the test and the call would
+     * let a concurrent cbm_log_set_sink turn a checked pointer into a NULL
+     * call. */
+    cbm_log_sink_fn sink = atomic_load_explicit(&g_log_sink, memory_order_relaxed);
+    if (sink) {
+        sink(line);
+        if (atomic_load_explicit(&g_log_sink_mode, memory_order_relaxed) == CBM_LOG_SINK_REPLACE) {
             return;
         }
     }
     (void)fprintf(stderr, "%s\n", line);
+    if (atomic_load_explicit(&g_log_crash_durable, memory_order_relaxed)) {
+        /* The line is complete here and the stream lock is released, so a
+         * process that dies on the very next instruction still leaves this
+         * line on disk. Free when stderr is unbuffered; one write() per line
+         * when setvbuf was refused. */
+        (void)fflush(stderr);
+    }
 }
 
 void cbm_log(CBMLogLevel level, const char *msg, ...) {
-    if (level < g_log_level) {
+    if (level < atomic_load_explicit(&g_log_level, memory_order_relaxed)) {
         return;
     }
 
@@ -215,7 +263,7 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     va_list args;
     va_start(args, msg);
 
-    if (g_log_format == CBM_LOG_FORMAT_JSON) {
+    if (atomic_load_explicit(&g_log_format, memory_order_relaxed) == CBM_LOG_FORMAT_JSON) {
         append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
         append_json_string(line_buf, sizeof(line_buf), &pos, level_str(level));
         append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
@@ -251,6 +299,35 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     }
     va_end(args);
 
+    finish_line(line_buf, sizeof(line_buf), pos);
+    emit_line(line_buf);
+}
+
+void cbm_log_control_record(const char *msg, ...) {
+    /* No threshold check: a control record's whole purpose is surviving
+     * CBM_LOG_LEVEL suppression. Always JSON, independent of CBM_LOG_FORMAT,
+     * so consumers get one stable, fully escaped representation. */
+    char line_buf[CBM_SZ_4K];
+    size_t pos = 0;
+    va_list args;
+    va_start(args, msg);
+    append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
+    append_json_string(line_buf, sizeof(line_buf), &pos, "control");
+    append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
+    append_json_string(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
+    for (;;) {
+        const char *key = va_arg(args, const char *);
+        if (!key) {
+            break;
+        }
+        const char *val = va_arg(args, const char *);
+        append_char(line_buf, sizeof(line_buf), &pos, ',');
+        append_json_string(line_buf, sizeof(line_buf), &pos, key);
+        append_char(line_buf, sizeof(line_buf), &pos, ':');
+        append_json_string(line_buf, sizeof(line_buf), &pos, val ? val : "");
+    }
+    append_char(line_buf, sizeof(line_buf), &pos, '}');
+    va_end(args);
     finish_line(line_buf, sizeof(line_buf), pos);
     emit_line(line_buf);
 }

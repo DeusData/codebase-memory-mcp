@@ -3,10 +3,10 @@
     Run the native-Windows product-surface test suite for codebase-memory-mcp.
 
 .DESCRIPTION
-    Builds the product binary (build/c/codebase-memory-mcp.exe) if it is not
-    already present, then runs the deterministic Windows integration tests under
-    tests/windows/ against a real codebase-memory-mcp.exe (real stdio / CLI /
-    HTTP UI, real SQLite DB).
+    Builds the product binary if it is not already present, stages it under its
+    release name, then runs the deterministic Windows integration tests under
+    tests/windows/ against it (real stdio / CLI / HTTP UI, real SQLite DB).
+    Windows ships ONE binary, exactly like Linux and macOS.
 
     Two categories of test:
 
@@ -18,6 +18,11 @@
                       * test_hook_augment.py      guards #618      (fixed by #619)
                       * test_ui_drive_listing.py  guards #548      (roots field)
                       * test_cli_non_ascii_arg.py guards #423/#20  (wide-argv main())
+                      * test_daemon_stability.py guards the daemon parameter
+                        surface, crash recovery, busy-stop refusal, and churn
+                      * test_windows_update_handoff.py guards that `update`
+                        hands off to install.ps1 instead of replacing its own
+                        running image (the removed launcher stub's only job)
 
       KNOWN REDS  - genuine, still-open Windows bugs reproduced at the product
                     surface. They are EXPECTED to be RED (exit 1) and are opt-in
@@ -26,18 +31,17 @@
                       * (none currently - test_cli_non_ascii_arg.py was promoted to a
                         guard when the wide-argv fix for #423/#20 landed)
 
-    Determinism: the runner sets CBM_INDEX_SUPERVISOR=0 so the path / hook / drive
-    guards index in-process (the pass-level readers under test, e.g. #700's cbm_fopen
-    routing, run in-process either way). The non-ASCII CLI guard is the exception - it
-    drops that override to cross the real supervisor -> worker spawn, where the second
-    half of #423/#20 lives (CreateProcessW delivering the wide command line).
+    Indexing runs through the real supervisor -> worker spawn on every guard:
+    under the mandatory coordination daemon CBM_INDEX_SUPERVISOR=0 is a
+    fail-closed refusal seam, never an in-process fallback, so the old
+    determinism override would turn every indexing guard into a refusal.
 
     On native Windows the MinGW/LLVM toolchain ships no libasan/libubsan, so the
     build disables sanitizers (SANITIZE=). Where the toolchain provides
     AddressSanitizer/UBSan (Linux containers, WSL), prefer scripts/test.sh.
 
 .PARAMETER Binary
-    Path to an existing codebase-memory-mcp.exe. If omitted, the script builds it
+    Path to an existing product executable. If omitted, the script builds it
     (target selected by -Target) into build/c/.
 
 .PARAMETER Target
@@ -87,8 +91,9 @@ function Resolve-Binary {
     $built = Join-Path $repoRoot "build\c\codebase-memory-mcp.exe"
     if (Test-Path $built) { return $built }
     Write-Host "Building $Target via Makefile.cbm ..." -ForegroundColor Cyan
-    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
-    if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
+    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp" | Out-Host
+    $buildExit = $LASTEXITCODE
+    if ($buildExit -ne 0) { throw "build failed (exit $buildExit)" }
     if (-not (Test-Path $built)) { throw "binary not produced at $built" }
     return $built
 }
@@ -96,8 +101,58 @@ function Resolve-Binary {
 $bin = Resolve-Binary -Explicit $Binary
 Write-Host "Binary: $bin" -ForegroundColor Green
 
-$env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
-$env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
+$previousTemp = $env:TEMP
+$previousTmp = $env:TMP
+$previousTmpDir = $env:TMPDIR
+$guardRoot = $null
+try {
+    $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    if (-not $userProfile) { throw "could not resolve the current user's profile directory" }
+    $guardRoot = Join-Path $userProfile ("cbm-windows-guards-root-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $guardRoot | Out-Null
+
+    # GitHub-hosted runner profile children can inherit mutation-capable ACEs
+    # even though the profile ancestry itself passes the bounded trust policy. Replace that inheritance before creating any executable or
+    # Python temporary descendant. Use SIDs rather than localized account names.
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if (-not $currentSid) { throw "could not resolve the current user's SID" }
+    $guardAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $guardAcl.SetOwner($currentSid)
+    $guardAcl.SetAccessRuleProtection($true, $false)
+    $guardRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $currentSid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $guardAcl.AddAccessRule($guardRule) | Out-Null
+    Set-Acl -LiteralPath $guardRoot -AclObject $guardAcl
+
+    $guardBundle = Join-Path $guardRoot ("cbm-windows-guards-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $guardBundle | Out-Null
+    $guardBin = Join-Path $guardBundle "codebase-memory-mcp.exe"
+    Copy-Item -LiteralPath $bin -Destination $guardBin
+
+    # Ownership is never inherited on Windows: descendants created under the
+    # hardened root by an admin-group token can default to the Administrators
+    # SID, while the exe policy demands the exact current user as owner. Stamp
+    # the current SID explicitly on everything staged here.
+    foreach ($staged in @($guardBundle, $guardBin)) {
+        $stagedAcl = Get-Acl -LiteralPath $staged
+        $stagedAcl.SetOwner($currentSid)
+        Set-Acl -LiteralPath $staged -AclObject $stagedAcl
+    }
+    Write-Host "Guard bundle: $guardBin" -ForegroundColor Green
+
+    # The guards deliberately reject GitHub's shared D:\a ancestry and the
+    # hosted runner's inherited LocalAppData\Temp ACL. Keep staged fixtures and
+    # Python-created descendants below the accepted profile ancestry.
+    $env:TEMP = $guardRoot
+    $env:TMP = $guardRoot
+    $env:TMPDIR = $guardRoot
+    $env:PYTHONUTF8 = "1"           # encode argv/stdio as UTF-8
 
 # Green regression guards - must stay GREEN (exit 0). RED (exit 1) = the fix for
 # the referenced issue regressed. The drive-picker guard needs the embedded HTTP
@@ -106,9 +161,12 @@ $env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 $guards = @(
     "tests\windows\test_non_ascii_path.py",
     "tests\windows\test_non_ascii_cache_dump.py",
+    "tests\windows\test_daemon_lifecycle.py",
+    "tests\windows\test_daemon_stability.py",
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
-    "tests\windows\test_cli_non_ascii_arg.py"
+    "tests\windows\test_cli_non_ascii_arg.py",
+    "tests\windows\test_windows_update_handoff.py"
 )
 
 # Opt-in known-red repros - EXPECTED red (exit 1); never gate CI. Currently empty:
@@ -122,16 +180,23 @@ $fixedKeepers = @()
 Write-Host "`n--- Green guards ---" -ForegroundColor Cyan
 foreach ($t in $guards) {
     Write-Host "`n=== $t ===" -ForegroundColor Cyan
-    & $py $t $bin
+    & $py $t $guardBin
     $code = $LASTEXITCODE
     if ($code -eq 0) {
         Write-Host "GREEN ($t)" -ForegroundColor Green
-    } elseif ($code -eq 1) {
+    } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_update_handoff.py") {
         Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
         $guardFailures += $t
-    } else {
-        Write-Host "PRECONDITION ($t) exit=$code - skipped (see message above)" -ForegroundColor Yellow
+    } elseif ($code -eq 2) {
+        # Exit 2 is the guards' DOCUMENTED precondition-skip contract; every
+        # other unexpected code (a crashed python, an access-violation status,
+        # a mistyped guard) is a FAILURE - an uncontracted exit once let a
+        # crashing guard read as an invisible skip under a green banner.
+        Write-Host "PRECONDITION ($t) exit=2 - skipped (see message above)" -ForegroundColor Yellow
         $guardSkips += $t
+    } else {
+        Write-Host "FAILED ($t) exit=$code - crashed or exited outside the guard contract 0/1/2" -ForegroundColor Red
+        $guardFailures += $t
     }
 }
 
@@ -139,7 +204,7 @@ if (-not $GuardsOnly) {
     Write-Host "`n--- Known reds (opt-in, expected red) ---" -ForegroundColor Cyan
     foreach ($t in $knownReds) {
         Write-Host "`n=== $t ===" -ForegroundColor Cyan
-        & $py $t $bin
+        & $py $t $guardBin
         $code = $LASTEXITCODE
         if ($code -eq 1) {
             Write-Host "RED ($t) - expected; the underlying Windows bug is still open" -ForegroundColor DarkYellow
@@ -151,6 +216,14 @@ if (-not $GuardsOnly) {
         }
     }
 }
+} finally {
+    $env:TEMP = $previousTemp
+    $env:TMP = $previousTmp
+    $env:TMPDIR = $previousTmpDir
+    if ($guardRoot) {
+        Remove-Item -LiteralPath $guardRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host ""
 if ($guardSkips.Count -gt 0) {
@@ -159,6 +232,10 @@ if ($guardSkips.Count -gt 0) {
 }
 if ($fixedKeepers.Count -gt 0) {
     Write-Host ("Known-red repros that are now GREEN (promote to guards): {0}" -f ($fixedKeepers -join ", ")) -ForegroundColor Green
+}
+if ($guardSkips.Count -eq $guards.Count -and $guards.Count -gt 0) {
+    Write-Host "FAIL: every guard skipped - nothing was actually verified" -ForegroundColor Red
+    exit 1
 }
 if ($guardFailures.Count -gt 0) {
     Write-Host ("REGRESSION: {0} green guard(s) went red: {1}" -f $guardFailures.Count, ($guardFailures -join ", ")) -ForegroundColor Red

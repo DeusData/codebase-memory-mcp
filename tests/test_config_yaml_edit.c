@@ -1501,6 +1501,44 @@ TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically) {
 }
 
 #ifndef _WIN32
+/* #1631: an interior `*` in a written value is ordinary text, not an alias.
+ * A real 16 KB Hermes config was permanently un-editable because prose
+ * asterisks in a personality string were read as aliases (root-caused by
+ * @rg6304 with an isolated repro).
+ *
+ * The asterisk is in the ENTRY BLOCK deliberately: that is the range the
+ * editor validates. An earlier version of this test put it in an untouched
+ * foreign section, which is never scanned - so it passed with the fix
+ * reverted and proved nothing. */
+TEST(config_yaml_edit_accepts_interior_asterisk_in_plain_scalar_issue1631) {
+    const char *original = "existing:\n  keep: 1\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    ASSERT_EQ(cbm_yaml_upsert_mapping_entry(fixture.path, "hooks", "cbm",
+                                            "    value: use *emphasis* and 2 * 3\n"),
+              0);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "value: use *emphasis* and 2 * 3"));
+    free(after);
+    ASSERT_EQ(cbm_unlink(fixture.path), 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+TEST(config_yaml_edit_still_refuses_leading_alias_issue1631) {
+    const char *original = "existing:\n  keep: 1\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    ASSERT(cbm_yaml_upsert_mapping_entry(fixture.path, "hooks", "cbm", "    value: *alias\n") != 0);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, original);
+    free(after);
+    ASSERT_EQ(cbm_unlink(fixture.path), 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_rejects_symlink_byte_identically) {
     const char *original = "hooks:\n  pre_llm_call:\n    - id: \"other\"\n";
     yaml_fixture_t fixture;
@@ -1573,6 +1611,8 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);
     RUN_TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically);
 #ifndef _WIN32
+    RUN_TEST(config_yaml_edit_accepts_interior_asterisk_in_plain_scalar_issue1631);
+    RUN_TEST(config_yaml_edit_still_refuses_leading_alias_issue1631);
     RUN_TEST(config_yaml_edit_nested_sequence_rejects_symlink_byte_identically);
 #endif
 }

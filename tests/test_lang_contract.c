@@ -67,17 +67,26 @@ static void lc_to_fwd_slashes(char *p) {
 }
 
 static cbm_store_t *lang_open_indexed(LangProj *lp) {
+    /* Freed before reassigning: a fixture that indexes more than once would
+     * otherwise drop the previous heap name on the floor. Teardown frees the
+     * last one. */
+    free(lp->project);
     lp->project = cbm_project_name_from_path(lp->tmpdir);
     if (!lp->project) {
         return NULL;
     }
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
-    }
     char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *configured_cache = getenv("CBM_CACHE_DIR");
+    if (configured_cache && configured_cache[0]) {
+        snprintf(cache_dir, sizeof(cache_dir), "%s", configured_cache);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home) {
+            home = "/tmp";
+        }
+        snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    }
+    cbm_mkdir_p(cache_dir, 0755);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
@@ -847,13 +856,34 @@ TEST(contract_calls_breadth) {
 /* Every graph edge type the pipeline can emit — used to print a histogram
  * when an edge contract fails, so a regression shows exactly what WAS
  * produced instead of the missing type. */
-static const char *ALL_EDGE_TYPES[] = {
-    "CALLS",         "CONFIGURES", "CONTAINS_FILE",  "CONTAINS_FOLDER", "DATA_FLOWS",
-    "DECORATES",     "DEFINES",    "DEFINES_METHOD", "DEPENDS_ON",      "FILE_CHANGES_WITH",
-    "GRAPHQL_CALLS", "GRPC_CALLS", "HANDLES",        "HTTP_CALLS",      "IMPLEMENTS",
-    "IMPORTS",       "INHERITS",   "INFRA_MAPS",     "OVERRIDE",        "SEMANTICALLY_RELATED",
-    "SIMILAR_TO",    "TESTS_FILE", "TESTS",          "TRPC_CALLS",      "USAGE",
-    "ASYNC_CALLS",   NULL};
+static const char *ALL_EDGE_TYPES[] = {"CALLS",
+                                       "CALL_REFERENCE",
+                                       "CONFIGURES",
+                                       "CONTAINS_FILE",
+                                       "CONTAINS_FOLDER",
+                                       "DATA_FLOWS",
+                                       "DECORATES",
+                                       "DEFINES",
+                                       "DEFINES_METHOD",
+                                       "DEPENDS_ON",
+                                       "FILE_CHANGES_WITH",
+                                       "GRAPHQL_CALLS",
+                                       "GRPC_CALLS",
+                                       "HANDLES",
+                                       "HTTP_CALLS",
+                                       "IMPLEMENTS",
+                                       "IMPORTS",
+                                       "INHERITS",
+                                       "INFRA_MAPS",
+                                       "OVERRIDE",
+                                       "SEMANTICALLY_RELATED",
+                                       "SIMILAR_TO",
+                                       "TESTS_FILE",
+                                       "TESTS",
+                                       "TRPC_CALLS",
+                                       "USAGE",
+                                       "ASYNC_CALLS",
+                                       NULL};
 
 static void dump_edge_histogram(cbm_store_t *store, const char *project) {
     if (!store) {
@@ -1172,9 +1202,8 @@ TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767) {
                           "      \"@lib\": [\"./src/lib\"],\n"
                           "      \"@lib/*\": [\"./src/lib/*\"]\n    }\n  }\n}\n"},
         {"src/lib/thing.ts", "export const Thing = {};\n"},
-        {"src/consumer.ts",
-         "import { ClientC } from '@lib/external-pkg';\n\n"
-         "export function useClient() {\n  return new ClientC();\n}\n"}};
+        {"src/consumer.ts", "import { ClientC } from '@lib/external-pkg';\n\n"
+                            "export function useClient() {\n  return new ClientC();\n}\n"}};
     cbm_store_t *store = lang_index_files(&lp, f, 3);
     int got = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : -1;
     if (got != 0) {
@@ -1195,10 +1224,138 @@ TEST(contract_edge_imports_alias_resolves_real_file_issue767) {
                           "      \"@lib\": [\"./src/lib\"],\n"
                           "      \"@lib/*\": [\"./src/lib/*\"]\n    }\n  }\n}\n"},
         {"src/lib/thing.ts", "export const Thing = {};\n"},
-        {"src/consumer.ts",
-         "import { Thing } from '@lib/thing';\n\n"
-         "export function useThing() {\n  return Thing;\n}\n"}};
+        {"src/consumer.ts", "import { Thing } from '@lib/thing';\n\n"
+                            "export function useThing() {\n  return Thing;\n}\n"}};
     ASSERT_TRUE(edge_present(f, 3, "IMPORTS", 1));
+    PASS();
+}
+
+/* True if a CALLS edge exists whose source QN ends with `src_suffix` and
+ * target QN ends with `tgt_suffix`. */
+static int calls_edge_between(cbm_store_t *store, const char *project, const char *src_suffix,
+                              const char *tgt_suffix) {
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK)
+        return 0;
+    int found = 0;
+    size_t ssl = strlen(src_suffix);
+    size_t tsl = strlen(tgt_suffix);
+    for (int i = 0; i < n && !found; i++) {
+        cbm_node_t s, t;
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &s) != CBM_STORE_OK)
+            continue;
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &t) != CBM_STORE_OK) {
+            cbm_node_free_fields(&s);
+            continue;
+        }
+        const char *sq = s.qualified_name;
+        const char *tq = t.qualified_name;
+        if (sq && tq) {
+            size_t sql = strlen(sq);
+            size_t tql = strlen(tq);
+            if (sql >= ssl && strcmp(sq + sql - ssl, src_suffix) == 0 && tql >= tsl &&
+                strcmp(tq + tql - tsl, tgt_suffix) == 0)
+                found = 1;
+        }
+        cbm_node_free_fields(&s);
+        cbm_node_free_fields(&t);
+    }
+    cbm_store_free_edges(edges, n);
+    return found;
+}
+
+/* #999: URLs in CI/tooling configs (.pre-commit-config.yaml, .github/
+ * workflows) are repository references for TOOLING, not endpoints this
+ * service exposes. They must not mint __route__infra__ Route nodes — the
+ * route matcher's root-service heuristic otherwise attaches every handler
+ * of an ambiguous "/" route to each junk URL (HANDLES churn on plain
+ * pallets/flask). */
+static int count_infra_routes_matching(cbm_store_t *store, const char *project,
+                                       const char *substr) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Route", &nodes, &count) != CBM_STORE_OK)
+        return -1;
+    int hits = 0;
+    for (int i = 0; i < count; i++) {
+        const char *qn = nodes[i].qualified_name;
+        if (qn && strncmp(qn, "__route__infra__", (sizeof("__route__infra__") - 1)) == 0 &&
+            strstr(qn, substr))
+            hits++;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return hits;
+}
+
+TEST(contract_edge_no_infra_routes_from_ci_configs_issue999) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"app.py", "from flask import Flask\n"
+                   "app = Flask(__name__)\n"
+                   "\n"
+                   "@app.route(\"/\")\n"
+                   "def index():\n"
+                   "    return \"hi\"\n"
+                   "\n"
+                   "@app.route(\"/auth/login\")\n"
+                   "def login():\n"
+                   "    return \"login\"\n"},
+        {".pre-commit-config.yaml", "repos:\n"
+                                    "  - repo: https://github.com/astral-sh/ruff-pre-commit\n"
+                                    "    rev: v0.1.0\n"
+                                    "    hooks:\n"
+                                    "      - id: ruff\n"
+                                    "  - repo: https://github.com/pre-commit/pre-commit-hooks\n"
+                                    "    rev: v4.5.0\n"
+                                    "    hooks:\n"
+                                    "      - id: trailing-whitespace\n"},
+        {".github/workflows/ci.yml", "name: CI\n"
+                                     "on: [push]\n"
+                                     "jobs:\n"
+                                     "  build:\n"
+                                     "    runs-on: ubuntu-latest\n"
+                                     "    steps:\n"
+                                     "      - uses: actions/checkout@v4\n"
+                                     "      - run: curl https://coverage.example.io/upload\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 3);
+    ASSERT_NOT_NULL(store);
+    /* No tooling URL may materialize as an infra Route node. */
+    int gh_routes = count_infra_routes_matching(store, lp.project, "github.com");
+    int wf_routes = count_infra_routes_matching(store, lp.project, "coverage.example.io");
+    if (gh_routes != 0 || wf_routes != 0) {
+        fprintf(stderr,
+                "  [999] FAIL infra routes from CI configs: github.com=%d workflows=%d "
+                "(expected 0/0)\n",
+                gh_routes, wf_routes);
+    }
+    ASSERT_EQ(gh_routes, 0);
+    ASSERT_EQ(wf_routes, 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* #999 inverse guard: genuine infra endpoint URLs (Cloud Scheduler push
+ * targets and similar deployment configs) must STILL mint infra Route
+ * nodes — the CI/tooling deny must be file-scoped, not a blanket URL kill. */
+TEST(contract_edge_infra_routes_from_deploy_configs_still_minted) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"scheduler.yaml", "jobs:\n"
+                           "  - name: nightly-sync\n"
+                           "    schedule: \"0 3 * * *\"\n"
+                           "    push_endpoint: https://sync.internal.example/api/v1/sync\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_NOT_NULL(store);
+    int routes = count_infra_routes_matching(store, lp.project, "sync.internal.example");
+    if (routes < 1) {
+        fprintf(stderr,
+                "  [999] FAIL deploy-config endpoint minted %d infra routes "
+                "(expected >=1)\n",
+                routes);
+    }
+    ASSERT_TRUE(routes >= 1);
+    lang_cleanup(&lp, store);
     PASS();
 }
 
@@ -1228,6 +1385,54 @@ static int calls_edge_targets(cbm_store_t *store, const char *project, const cha
     return found;
 }
 
+/* #988: `from m import f as g; g()` produced NO CALLS edge — the Python LSP
+ * bound the alias as MODULE("m.f") (the from-style heuristic keys on the
+ * local name matching the module-path tail, which an alias never does), so
+ * the call missed, and the registry fallback did not cover the minimal
+ * two-file shape either. The alias must resolve exactly like the plain
+ * import. The other import forms are pinned alongside as invariance guards
+ * (all resolve on main today and must keep resolving). */
+TEST(contract_edge_python_aliased_import_call_resolves_issue988) {
+    LangProj lp;
+    static const LangFile f[] = {{"m.py", "def f(x):\n    return x + 1\n"},
+                                 {"pkg/__init__.py", ""},
+                                 {"pkg/dm.py", "def h(x):\n    return x\n"},
+                                 {"caller_alias.py", "from m import f as g\n"
+                                                     "\n"
+                                                     "def use_alias(x):\n"
+                                                     "    return g(x)\n"},
+                                 {"caller_plain.py", "from m import f\n"
+                                                     "\n"
+                                                     "def use_plain(x):\n"
+                                                     "    return f(x)\n"},
+                                 {"caller_modalias.py", "import m as mm\n"
+                                                        "\n"
+                                                        "def use_modalias(x):\n"
+                                                        "    return mm.f(x)\n"},
+                                 {"caller_dotalias.py", "import pkg.dm as dz\n"
+                                                        "\n"
+                                                        "def use_dotalias(x):\n"
+                                                        "    return dz.h(x)\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 7);
+    ASSERT_TRUE(store != NULL);
+    int alias = calls_edge_between(store, lp.project, ".use_alias", ".m.f");
+    int plain = calls_edge_between(store, lp.project, ".use_plain", ".m.f");
+    int modalias = calls_edge_between(store, lp.project, ".use_modalias", ".m.f");
+    int dotalias = calls_edge_between(store, lp.project, ".use_dotalias", ".pkg.dm.h");
+    if (!alias || !plain || !modalias || !dotalias) {
+        fprintf(stderr,
+                "  [988] FAIL alias=%d plain=%d modalias=%d dotalias=%d (all import forms "
+                "must produce the CALLS edge)\n",
+                alias, plain, modalias, dotalias);
+    }
+    ASSERT_TRUE(alias); /* the #988 bug: aliased from-import call lost */
+    ASSERT_TRUE(plain);
+    ASSERT_TRUE(modalias);
+    ASSERT_TRUE(dotalias);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* #871: a CommonJS require() binding shadowed call resolution. `const doThing
  * = require("../bs/doThing")` emitted a Variable def for `doThing` in the
  * importing module, so the call `doThing(...)` resolved to that same-module
@@ -1254,8 +1459,9 @@ TEST(contract_edge_commonjs_require_call_resolves_issue871) {
      * not a definition). */
     int shadowed = calls_edge_targets(store, lp.project, "Variable", ".mutations.doThing.doThing");
     if (!resolved || shadowed) {
-        fprintf(stderr, "  [871] FAIL resolved=%d shadowed=%d (require binding must resolve to "
-                        "the exported Function, not the local alias Variable)\n",
+        fprintf(stderr,
+                "  [871] FAIL resolved=%d shadowed=%d (require binding must resolve to "
+                "the exported Function, not the local alias Variable)\n",
                 resolved, shadowed);
     }
     ASSERT_TRUE(resolved);
@@ -1473,6 +1679,9 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_workspaces_imports_issue408);
     RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
     RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
+    RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
+    RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
+    RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);

@@ -17,8 +17,10 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
-#include "discover/discover.h" /* cbm_ignored_file_t (#963) */
+#include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
+#include "foundation/constants.h" /* CBM_SZ_512 */
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -54,12 +56,26 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
-/* Run the full indexing pipeline. Returns 0 on success, -1 on error.
- * Discovers files, extracts, resolves, and dumps to SQLite. */
+/* Run the full indexing pipeline. Discovers files, extracts, resolves, and
+ * dumps to SQLite. Returns 0 on success and non-zero on failure.
+ *
+ * Treating any non-zero as "the run failed" is always correct. Callers that
+ * need to know whether the PREVIOUS generation survived can distinguish the
+ * failures by value: the run publishes by renaming a fully validated staging
+ * database over the destination, so every abort before that rename leaves the
+ * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
+ * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
+ * stages that raise them. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
+
+/* Bind cancellation to a caller-owned atomic flag. The flag must outlive the
+ * pipeline and should be initialized before binding. This lets a long-lived
+ * daemon request cancellation without retaining/dereferencing a pipeline
+ * pointer that its request thread may concurrently retire. */
+void cbm_pipeline_bind_cancel_flag(cbm_pipeline_t *p, atomic_int *cancelled);
 
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
@@ -282,5 +298,21 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
                                               const char **import_map_vals, int import_map_count);
 
 const char *cbm_confidence_band(double score);
+
+/* ── Git diff hunks (pass_gitdiff.c) ──────────────────────────────
+ * Public (unlike the rest of pipeline_internal.h) because detect_changes
+ * (src/mcp/mcp.c) scopes seed detection to changed line ranges, not just
+ * changed files. */
+
+typedef struct {
+    char path[CBM_SZ_512];
+    int start_line;
+    int end_line;
+} cbm_changed_hunk_t;
+
+/* Parse `git diff --unified=0` output into per-hunk (path, start_line,
+ * end_line) entries — end_line is the last new-side line the hunk touches.
+ * Returns count written to out (capped at max_out). */
+int cbm_parse_hunks(const char *output, cbm_changed_hunk_t *out, int max_out);
 
 #endif /* CBM_PIPELINE_H */

@@ -65,6 +65,12 @@ enum {
     CBM_JSON_LIKE_OBJECT_MATCH = 0,
     CBM_JSON_LIKE_OBJECT_MISSING = 1,
     CBM_JSON_LIKE_OBJECT_MISMATCH = 2,
+    /* Every field we own is present and matches, but the entry carries
+     * ADDITIONAL keys we do not write. The entry is recognisably ours; it has
+     * simply been annotated by the client or the user. Callers must NOT rewrite
+     * such an entry — the editor replaces an entry wholesale, so rewriting
+     * would silently drop those keys. Treat it as already-satisfied instead. */
+    CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS = 3,
 };
 
 /* captured_string_out receives malloc-owned decoded content only on MATCH.

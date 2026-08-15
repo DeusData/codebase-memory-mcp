@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents</title>
-    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. One command configures 43 automatic/conditional client surfaces.">
+    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Native executable with verified assets and no language runtime. One command configures 43 automatic/conditional client surfaces.">
     <meta name="keywords" content="MCP server, code intelligence, knowledge graph, tree-sitter, Hybrid LSP, semantic code search, code embeddings, code clone detection, cross-repo analysis, data-flow analysis, Claude Code, Codex CLI, Gemini CLI, Cursor, Zed, code exploration, token reduction, call graph, dead code detection">
     <meta name="author" content="DeusData">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
@@ -12,7 +12,7 @@
 
     <!-- Open Graph -->
     <meta property="og:title" content="codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents">
-    <meta property="og:description" content="Index any codebase into a persistent knowledge graph. AI agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP, sub-1ms queries, single static C binary.">
+    <meta property="og:description" content="Index any codebase into a persistent knowledge graph. AI agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP, sub-1ms queries, native executable with verified assets.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp/">
     <meta property="og:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
@@ -24,7 +24,7 @@
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="codebase-memory-mcp — Code Intelligence for AI Coding Agents">
-    <meta name="twitter:description" content="Index any codebase into a knowledge graph. ~120x fewer tokens for AI code exploration. 158 languages, Hybrid LSP, sub-1ms queries, single static C binary.">
+    <meta name="twitter:description" content="Index any codebase into a knowledge graph. ~120x fewer tokens for AI code exploration. 158 languages, Hybrid LSP, sub-1ms queries, native executable with verified assets.">
     <meta name="twitter:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
 
     <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp/">
@@ -41,7 +41,7 @@
       "applicationSubCategory": "Model Context Protocol (MCP) server",
       "operatingSystem": "macOS, Linux, Windows",
       "softwareVersion": "0.8.1",
-      "description": "An open-source MCP server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links, so AI coding agents answer structural questions with roughly 120x fewer tokens than file-by-file search. Parses 158 languages via tree-sitter with Hybrid LSP semantic type resolution for 9 language families. Ships as a single static C binary with zero runtime dependencies.",
+      "description": "An open-source MCP server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links, so AI coding agents answer structural questions with roughly 120x fewer tokens than file-by-file search. Parses 158 languages via tree-sitter with Hybrid LSP semantic type resolution for 9 language families. Ships as a native executable with authenticated release-owned assets; the native install needs no language runtime.",
       "url": "https://deusdata.github.io/codebase-memory-mcp/",
       "downloadUrl": "https://github.com/DeusData/codebase-memory-mcp/releases/latest",
       "codeRepository": "https://github.com/DeusData/codebase-memory-mcp",
@@ -125,7 +125,7 @@
           "name": "What is codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as a single static C binary with no runtime dependencies."
+            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as a native executable with authenticated release-owned assets; the native install needs no language runtime."
           }
         },
         {
@@ -165,7 +165,7 @@
           "name": "Does codebase-memory-mcp send my code anywhere?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "No. All indexing and querying happen 100% locally on your machine. There is no embedded LLM and no API key — your MCP client acts as the intelligence layer. Release binaries are signed, checksummed, and scanned by 70+ antivirus engines."
+            "text": "No. All indexing and querying happen 100% locally on your machine. There is no embedded LLM and no API key — your MCP client acts as the intelligence layer. Before release testing, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) for every platform and link mode are submitted to VirusTotal. The selected candidate is packaged with its SHA-256 unchanged, and release notes link every measured result. Publication permits only the documented single-Microsoft !ml tolerance."
           }
         },
         {
@@ -444,7 +444,7 @@
             The fastest, most efficient code intelligence engine for AI coding agents. It indexes any
             repository into a persistent knowledge graph — full-indexing an average repo in seconds and the
             Linux kernel in 3 minutes — so your agent answers structural questions with ~120x fewer tokens.
-            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, single static C binary.
+            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, native executable with verified assets.
         </p>
         <div>
             <div class="stat"><div class="number">~120x</div><div class="label">fewer tokens</div></div>
@@ -483,7 +483,8 @@
             Protocol (MCP)</a> server that indexes a codebase into a persistent knowledge graph of functions,
             classes, call chains, HTTP routes, and cross-service links. Instead of reading files one at a time,
             an AI coding agent queries the graph — answering structural questions with roughly 120x fewer
-            tokens. It parses 158 languages and ships as a single static C binary with zero runtime dependencies.
+            tokens. It parses 158 languages and ships as a native executable with authenticated release-owned assets;
+            the native install needs no language runtime.
         </p>
         <p class="muted">
             It is a structural-analysis backend, not a chatbot: there is no embedded LLM and no API key. Your
@@ -515,8 +516,8 @@
     <section id="install">
         <h2>How do I install codebase-memory-mcp?</h2>
         <p class="lead">
-            Install with a single command, then tell your agent to index the project. It is a single static C binary for
-            macOS, Linux, and Windows — no Docker, no runtime dependencies, no API key.
+            Install with a single command, then tell your agent to index the project. The native runtime set contains
+            an executable with verified assets for macOS, Linux, and Windows — no Docker, language runtime, or API key.
         </p>
         <div class="install-block">
             <span class="comment"># 1. One-line install (macOS / Linux). Add --ui for the 3D graph UI.</span><br>
@@ -584,7 +585,7 @@
             codebase-memory-mcp ships a <strong>lightweight C implementation of language type-resolution
             algorithms, structurally inspired by and compatible with major language servers</strong> —
             tsserver/typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer —
-            embedded directly into the single static C binary. There is no language-server process, no
+            embedded directly into the native executable. There is no language-server process, no
             per-project setup, and no API key. This layer runs alongside tree-sitter on every parse and refines
             <code>CALLS</code>, <code>USAGE</code>, and <code>RESOLVED_CALLS</code> edges with type information,
             so the graph mirrors what an IDE "Go to Definition" would resolve.
@@ -706,8 +707,8 @@
                 <p>Language-server-grade type inference for Python, TS/JS, PHP, C#, Go, C/C++, Java, Kotlin, and Rust — embedded in the binary, no server process or per-project setup.</p>
             </div>
             <div class="feature">
-                <h3>Pure C, zero dependencies</h3>
-                <p>A single static C binary for macOS, Linux, and Windows. No Docker, no runtime, no API keys. Download, run <code>install</code>, done.</p>
+                <h3>Pure C, no language runtime</h3>
+                <p>A native executable with authenticated release-owned assets for macOS, Linux, and Windows. The native install needs no Docker, language runtime, or API keys; fully static Linux builds are available in the <code>-portable</code> archives.</p>
             </div>
             <div class="feature">
                 <h3>Call-graph tracing</h3>
@@ -735,7 +736,7 @@
             </div>
             <div class="feature">
                 <h3>3D graph visualization</h3>
-                <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
+                <p>The optional UI variant adds one verified, content-addressed frontend pack and serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
                 <h3>15 MCP tools</h3>
@@ -790,7 +791,10 @@
 
         <h3>Does codebase-memory-mcp send my code anywhere?</h3>
         <p>No. All indexing and querying happen 100% locally. There is no embedded LLM and no API key. Release
-           binaries are signed, checksummed, and scanned by 70+ antivirus engines.</p>
+           archives are signed and checksummed. Before testing, three behaviourally identical executable candidates
+           (unstripped, debug-stripped, stripped) for every platform and link mode are submitted to VirusTotal; the selected candidate is packaged with its
+           SHA-256 unchanged. Release notes link every measured result. Publication permits only the
+           documented single-Microsoft <code>!ml</code> tolerance.</p>
 
         <h3>Does it support semantic or natural-language code search?</h3>
         <p>Yes. Alongside structural and full-text search, <code>search_graph</code>'s <code>semantic_query</code>
@@ -800,8 +804,9 @@
            edges between similar functions and <code>SIMILAR_TO</code> edges for near-clone detection.</p>
 
         <h3>Do I need Docker or a runtime?</h3>
-        <p>No. It is a single static C binary with zero runtime dependencies for macOS (arm64/amd64), Linux
-           (arm64/amd64), and Windows (amd64).</p>
+        <p>The native install needs no language runtime. It is a native executable with authenticated release-owned
+           assets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64); npm, PyPI, and Go wrapper
+           installations naturally use their package runtime.</p>
 
         <h3>How does it stay up to date as I edit code?</h3>
         <p>A background watcher detects file changes and re-indexes incrementally — typically a sub-millisecond

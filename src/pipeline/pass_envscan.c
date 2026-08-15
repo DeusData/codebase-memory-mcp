@@ -27,10 +27,23 @@ enum {
 #include <ctype.h>
 #include "foundation/compat_fs.h"
 #include "foundation/compat_regex.h"
+#include "foundation/platform.h" /* cbm_normalize_path_sep */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include "foundation/win_utf8.h" /* cbm_path_to_wide */
+#include <windows.h>
+/* Canonical paths on both sides come from the same resolver, so casing already
+ * agrees; comparing case-insensitively removes the doubt at no cost. */
+#define envscan_path_ncmp _strnicmp
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#define envscan_path_ncmp strncmp
+#endif
 
 /* ── Regex patterns (compiled lazily) ──────────────────────────── */
 
@@ -311,12 +324,145 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
     }
 }
 
+/* ── Containment ───────────────────────────────────────────────── */
+
+/* Join dir + name, rejecting rather than truncating.
+ *
+ * Silent truncation here was not merely a lost path. The root-relative suffix
+ * used to be derived as `full_path + strlen(root_path)`, so once the real root
+ * was longer than this fixed buffer that pointer landed past the end of the
+ * array — out-of-bounds arithmetic on every entry below it. Refusing the path is
+ * what keeps envscan_relative_suffix in bounds by construction. */
+static bool envscan_join_path(char *out, size_t out_sz, const char *dir, const char *name) {
+    if (out_sz == 0) {
+        return false;
+    }
+    int written = snprintf(out, out_sz, "%s/%s", dir, name);
+    if (written <= 0 || (size_t)written >= out_sz) {
+        out[0] = '\0';
+        cbm_log_warn("envscan.path_too_long", "dir", dir, "name", name);
+        return false;
+    }
+    return true;
+}
+
+/* Root-relative suffix of a path built beneath root_path.
+ *
+ * The prefix comparison is not a formality: it succeeding is precisely what
+ * proves `path` holds at least root_len bytes, which is what makes
+ * `path + root_len` a valid pointer. Never compute this suffix from an
+ * unverified strlen. Returns NULL when `path` is not under the root. */
+static const char *envscan_relative_suffix(const char *path, const char *root_path,
+                                           size_t root_len) {
+    if (strncmp(path, root_path, root_len) != 0) {
+        return NULL;
+    }
+    const char *rel = path + root_len;
+    while (*rel == '/') {
+        rel++;
+    }
+    return rel;
+}
+
+/* Stat WITHOUT following links, so a repository-controlled symlink cannot lead
+ * the walk outside the project. The previous stat() resolved the link, reported
+ * the target's S_ISDIR, and the walk happily descended wherever it pointed.
+ * Returns 0 on success, CBM_NOT_FOUND to skip the entry.
+ * Mirrors pass_pkgmap.c's pkgmap_safe_stat and discover.c's safe_stat. */
+static int envscan_safe_stat(const char *abs_path, struct stat *st) {
+#ifdef _WIN32
+    /* Windows has no lstat; a junction or directory symlink surfaces as a
+     * reparse point, which is the same escape hatch, so screen the attribute.
+     * The wide stat also keeps non-ASCII paths off the ANSI CRT. */
+    wchar_t *wide = cbm_path_to_wide(abs_path);
+    if (!wide) {
+        return CBM_NOT_FOUND;
+    }
+    DWORD attributes = GetFileAttributesW(wide);
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        free(wide);
+        return CBM_NOT_FOUND;
+    }
+    struct _stat64 wst;
+    int ret = _wstat64(wide, &wst);
+    free(wide);
+    if (ret != 0) {
+        return CBM_NOT_FOUND;
+    }
+    st->st_mode = wst.st_mode;
+    st->st_size = wst.st_size;
+    st->st_mtime = wst.st_mtime;
+    return 0;
+#else
+    if (lstat(abs_path, st) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (S_ISLNK(st->st_mode)) {
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+#endif
+}
+
+/* True when `candidate` still resolves to somewhere under `canonical_root`.
+ *
+ * Belt to envscan_safe_stat's braces. The link screen refuses the symlink
+ * itself; this catches escapes a mode check cannot see — a resolved path that
+ * leaves the root for any other reason. `canonical_root` is resolved once per
+ * scan because cbm_canonical_path costs a syscall per component. */
+static bool envscan_within_root(const char *candidate, const char *canonical_root) {
+    char resolved[CBM_SZ_4K];
+    if (!cbm_canonical_path(candidate, resolved, sizeof(resolved))) {
+        return false;
+    }
+#ifdef _WIN32
+    cbm_normalize_path_sep(resolved);
+#endif
+    size_t root_len = strlen(canonical_root);
+    if (root_len == 0 || envscan_path_ncmp(resolved, canonical_root, root_len) != 0) {
+        return false;
+    }
+    /* Demand a real component boundary, so root "/repo" does not admit
+     * "/repo-elsewhere". */
+    return canonical_root[root_len - 1] == '/' || resolved[root_len] == '\0' ||
+           resolved[root_len] == '/';
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
+
+/* Open a candidate config file without following a symlink where the platform
+ * allows it. Mode "r" is preserved from the previous cbm_fopen call so the
+ * per-platform newline handling the line loop already copes with is unchanged. */
+static FILE *envscan_open_file(const char *full_path) {
+#ifdef _WIN32
+    /* No O_NOFOLLOW equivalent here; reparse points were screened by
+     * envscan_safe_stat. cbm_fopen is required for UTF-8 → _wfopen mapping. */
+    return cbm_fopen(full_path, "r");
+#else
+    /* O_NOFOLLOW closes the window between the lstat above and this open: if the
+     * entry turned into a symlink in between, the open fails rather than reading
+     * through it. A raw open is correct on POSIX — paths are bytes there, and the
+     * cbm_fopen rule exists for Windows' wide-API mapping. */
+    int flags = O_RDONLY | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int descriptor = open(full_path, flags);
+    if (descriptor < 0) {
+        return NULL;
+    }
+    FILE *stream = fdopen(descriptor, "r");
+    if (!stream) {
+        (void)close(descriptor);
+    }
+    return stream;
+#endif
+}
 
 /* Scan a single file for env URL bindings. Returns number of bindings added. */
 static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
                          cbm_env_binding_t *out, int max_out) {
-    FILE *f = cbm_fopen(full_path, "r");
+    FILE *f = envscan_open_file(full_path);
     if (!f) {
         return 0;
     }
@@ -360,29 +506,52 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
     return count;
 }
 
-/* Process a single directory entry for env scanning. Returns bindings added. */
+/* Process a single directory entry for env scanning. Returns bindings added.
+ * `root_len` is strlen of the root the walk started from, verified against
+ * path_stack[0] by the caller; `canonical_root` is that root resolved once. */
 static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char *root_path,
-                             cbm_env_binding_t *out, int max_out, char path_stack[][CBM_SZ_512],
-                             int *stack_top, char **excluded_dirs, int excluded_count) {
+                             size_t root_len, const char *canonical_root, cbm_env_binding_t *out,
+                             int max_out, char path_stack[][CBM_SZ_512], int *stack_top,
+                             char **excluded_dirs, int excluded_count) {
     char full_path[CBM_SZ_512];
-    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->name);
-    const char *rel = full_path + strlen(root_path);
-    while (*rel == '/') {
-        rel++;
+    if (!envscan_join_path(full_path, sizeof(full_path), dir_path, ent->name)) {
+        return 0;
+    }
+    const char *rel = envscan_relative_suffix(full_path, root_path, root_len);
+    if (!rel) {
+        return 0;
     }
 
     struct stat st;
-    if (stat(full_path, &st) != 0) {
+    if (envscan_safe_stat(full_path, &st) != 0) {
         return 0;
     }
     if (S_ISDIR(st.st_mode)) {
-        if (!is_ignored_dir(ent->name) &&
-            !cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count) &&
-            *stack_top < CBM_SZ_256) {
-            strncpy(path_stack[*stack_top], full_path, sizeof(path_stack[0]) - 1);
-            path_stack[*stack_top][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
-            (*stack_top)++;
+        if (is_ignored_dir(ent->name) ||
+            cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count) ||
+            *stack_top >= CBM_SZ_256) {
+            return 0;
         }
+        if (!envscan_within_root(full_path, canonical_root)) {
+            cbm_log_warn("envscan.dir_outside_root", "path", full_path, "root", canonical_root);
+            return 0;
+        }
+        /* Checked copy. The stack rows are the same width as full_path, so this
+         * cannot truncate today — but check anyway rather than lean on that
+         * coincidence: a truncated row is exactly what reintroduced the
+         * out-of-bounds suffix arithmetic. */
+        int written = snprintf(path_stack[*stack_top], sizeof(path_stack[0]), "%s", full_path);
+        if (written <= 0 || (size_t)written >= sizeof(path_stack[0])) {
+            cbm_log_warn("envscan.path_too_long", "dir", dir_path, "name", ent->name);
+            return 0;
+        }
+        (*stack_top)++;
+        return 0;
+    }
+    /* Only regular files are config files. Without this, the lstat above still
+     * lets a FIFO through, and opening one blocks the pass until a writer
+     * appears. */
+    if (!S_ISREG(st.st_mode)) {
         return 0;
     }
     if (is_secret_file(ent->name)) {
@@ -405,14 +574,36 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
     int count = 0;
     char path_stack[CBM_SZ_256][CBM_SZ_512];
     int stack_top = SKIP_ONE;
-    strncpy(path_stack[0], root_path, sizeof(path_stack[0]) - 1);
-    path_stack[0][sizeof(path_stack[0]) - SKIP_ONE] = '\0';
+    /* Reject an over-long root instead of truncating it in. The old strncpy left
+     * path_stack[0] SHORTER than root_path, and every suffix pointer derived from
+     * strlen(root_path) was then past the end of its buffer. Establishing
+     * root_len from the copy that actually fit is what removes that class. */
+    int written = snprintf(path_stack[0], sizeof(path_stack[0]), "%s", root_path);
+    if (written <= 0 || (size_t)written >= sizeof(path_stack[0])) {
+        cbm_log_warn("envscan.root_too_long", "root", root_path);
+        return 0;
+    }
+    size_t root_len = (size_t)written;
+
+    /* Resolved once per scan: every directory the walk wants to descend is
+     * checked against this, and resolving costs a syscall per component. */
+    char canonical_root[CBM_SZ_4K];
+    if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root))) {
+        /* Unresolvable root — nothing to walk. Previously opendir simply failed
+         * on the first iteration, so the result is the same: zero bindings. */
+        return 0;
+    }
+#ifdef _WIN32
+    cbm_normalize_path_sep(canonical_root);
+#endif
 
     while (stack_top > 0 && count < max_out) {
         stack_top--;
         char dir_path[CBM_SZ_512];
-        strncpy(dir_path, path_stack[stack_top], sizeof(dir_path) - SKIP_ONE);
-        dir_path[sizeof(dir_path) - SKIP_ONE] = '\0';
+        int copied = snprintf(dir_path, sizeof(dir_path), "%s", path_stack[stack_top]);
+        if (copied <= 0 || (size_t)copied >= sizeof(dir_path)) {
+            continue;
+        }
 
         cbm_dir_t *d = cbm_opendir(dir_path);
         if (!d) {
@@ -420,8 +611,9 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
         }
         cbm_dirent_t *ent;
         while ((ent = cbm_readdir(d)) && count < max_out) {
-            count += process_env_entry(ent, dir_path, root_path, out + count, max_out - count,
-                                       path_stack, &stack_top, excluded_dirs, excluded_count);
+            count += process_env_entry(ent, dir_path, root_path, root_len, canonical_root,
+                                       out + count, max_out - count, path_stack, &stack_top,
+                                       excluded_dirs, excluded_count);
         }
         cbm_closedir(d);
     }

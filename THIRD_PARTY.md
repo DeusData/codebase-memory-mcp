@@ -13,6 +13,17 @@ The tree-sitter C runtime is vendored in `internal/cbm/vendored/ts_runtime/`.
 - **License:** MIT
 - **Copyright:** (c) 2018–2024 Max Brunsfeld
 
+**Local modification** (`internal/cbm/vendored/ts_runtime/src/stack.c`, #913): a
+single CBM patch bounds the recursive ambiguity-merge in `stack_node_add_link`
+at `CBM_TS_STACK_MERGE_MAX_DEPTH` (512). Deeply nested grammar-ambiguous input
+(e.g. Perl `f(f(f(...)))`) otherwise recurses once per level on the native C
+stack and overflows it during parsing (SIGSEGV on the ~1 MB Windows thread
+stack, and even the 8 MB POSIX stack at extreme depth) before any extractor
+runs. Past the cap the ambiguity is left on the GLR stack instead of merged —
+still a valid parse, never a wrong one — mirroring the existing
+`MAX_LINK_COUNT` bail-out. The change is clearly marked `// CBM patch:` inline.
+**On re-vendor (e.g. ts_runtime → 0.26.x): re-apply this bound.**
+
 The shared scanner helpers in `internal/cbm/vendored/common/` (`scanner.h`,
 `tag.h`) originate from
 [tree-sitter-html](https://github.com/tree-sitter/tree-sitter-html) (MIT,
@@ -55,7 +66,7 @@ License summary:
 - **Copyright:** (c) 2025 InterSystems Corporation
 - **Vendored at:** `internal/cbm/vendored/grammars/objectscript_udl/`, `internal/cbm/vendored/grammars/objectscript_routine/`
 - **Pinned commit:** `a7ffcdf`
-- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (verbatim copy of upstream `common/scanner.h`).
+- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` copied from upstream `common/scanner.h`; two loop counters in that copy are widened from `uint8_t` to `int` as documented in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ## Vendored C/C++ Libraries
 
@@ -71,6 +82,12 @@ License summary:
 | simplecpp | `internal/cbm/vendored/simplecpp/` | 0BSD | [danmar/simplecpp](https://github.com/danmar/simplecpp) |
 | Verstable | `internal/cbm/vendored/verstable/` | MIT | [JacksonAllan/Verstable](https://github.com/JacksonAllan/Verstable) |
 | wyhash | `internal/cbm/vendored/wyhash/` | Unlicense (public domain) | [wangyi-fudan/wyhash](https://github.com/wangyi-fudan/wyhash) |
+
+Local modifications to these libraries are documented next to the
+vendored sources (currently only SQLite: `vendored/sqlite3/PATCHES.md`,
+raising the Unix VFS `MAX_PATHNAME` ceiling from 512 to 4096 to match
+CBM's 4 KiB path support). Patches must be reapplied on every upstream
+refresh and are covered by `scripts/vendored-checksums.txt`.
 
 The graph-UI HTTP server is a first-party implementation
 (`src/ui/httpd.c` + `src/ui/http_server.c`) — no third-party HTTP library

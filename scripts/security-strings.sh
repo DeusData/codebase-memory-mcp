@@ -31,10 +31,20 @@ FAIL=0
 # audits which are designed for compiled artifacts. Script content is
 # reviewed in PRs and scanned end-to-end by VirusTotal in the same pipeline.
 IS_SCRIPT=false
-if command -v file &>/dev/null; then
+# Structured-text artifacts by EXTENSION first: `file` reports JSON as
+# "JSON data" / "JSON text data", which matched none of the text patterns
+# below, so an .mcpb bundle manifest was audited as if it were a compiled
+# binary and its own homepage/documentation URLs were BLOCKED as unauthorized.
+# The extension check also covers hosts where file(1) is absent, where the
+# `command -v` guard below silently leaves every artifact classified as binary.
+case "$BINARY" in
+    *.json|*.jsonc|*.yaml|*.yml|*.toml|*.md|*.txt) IS_SCRIPT=true ;;
+esac
+if [ "$IS_SCRIPT" = false ] && command -v file &>/dev/null; then
     FILE_TYPE=$(file -b "$BINARY" 2>/dev/null || echo "")
     case "$FILE_TYPE" in
-        *"shell script"*|*"ASCII text"*|*"UTF-8 Unicode text"*|*"Unicode text"*|*"a /usr/bin/env"*)
+        *"shell script"*|*"ASCII text"*|*"UTF-8 Unicode text"*|*"Unicode text"*|*"a /usr/bin/env"*|\
+        *"JSON"*|*"XML"*)
             IS_SCRIPT=true
             ;;
     esac
@@ -72,6 +82,10 @@ echo "--- URL audit ---"
 ALLOWED_URLS=(
     "https://api.github.com/repos/DeusData/codebase-memory-mcp"
     "https://github.com/DeusData/codebase-memory-mcp"
+    # Our own org root and documentation site: the .mcpb bundle manifest carries
+    # them as homepage/documentation fields, and the graph UI links the docs.
+    "https://github.com/DeusData"
+    "https://deusdata.github.io/codebase-memory-mcp"
     "http://127.0.0.1"
     "http://localhost"
     # SQLite internal URLs (part of vendored sqlite3 strings)

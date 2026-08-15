@@ -22,7 +22,9 @@ static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
     resolve_calls_in_node_inner(ctx, node);
     ctx->walk_depth--;
 }
-static void emit_resolved_call(GoLSPContext* ctx, const char* callee_qn, const char* strategy, float confidence);
+static void emit_resolved_call(GoLSPContext *ctx, const char *callee_qn, const char *strategy,
+                               float confidence, TSNode site);
+static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node);
 static const CBMType* go_lookup_field(GoLSPContext* ctx, const char* type_qn, const char* field_name, int depth);
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
     TSNode root, const char* source, const char* module_qn);
@@ -336,7 +338,8 @@ const CBMType* go_eval_expr_type(GoLSPContext* ctx, TSNode node) {
 
         // Check scope first
         const CBMType* t = cbm_scope_lookup(ctx->current_scope, name);
-        if (!cbm_type_is_unknown(t)) return t;
+        if (cbm_scope_contains(ctx->current_scope, name))
+            return t ? t : cbm_type_unknown();
 
         // Check if it's a package-level function
         const CBMRegisteredFunc* f = cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
@@ -929,6 +932,76 @@ const CBMRegisteredFunc* go_lookup_field_or_method(GoLSPContext* ctx,
     return go_lookup_field_or_method_depth(ctx, type_qn, member_name, 0);
 }
 
+/* Resolve only source forms that prove one callable identity.  This is
+ * intentionally narrower than go_eval_expr_type: conditional expressions,
+ * indexed dispatch tables, interfaces with several implementers, and unknown
+ * locals remain ordinary values. */
+static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node) {
+    if (!ctx || ts_node_is_null(node))
+        return NULL;
+    const char *kind = ts_node_type(node);
+
+    if (strcmp(kind, "parenthesized_expression") == 0 && ts_node_named_child_count(node) == 1) {
+        return go_exact_callable_target(ctx, ts_node_named_child(node, 0));
+    }
+
+    if (strcmp(kind, "identifier") == 0) {
+        char *name = lsp_node_text(ctx, node);
+        if (!name)
+            return NULL;
+        /* A local value shadows the package declaration even when its type is
+         * UNKNOWN.  Only an explicitly tracked callable alias may pass. */
+        if (cbm_scope_contains(ctx->current_scope, name)) {
+            return cbm_scope_lookup_callable(ctx->current_scope, name);
+        }
+        const CBMRegisteredFunc *f =
+            cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
+        return f ? f->qualified_name : NULL;
+    }
+
+    if (strcmp(kind, "selector_expression") == 0) {
+        TSNode operand = ts_node_child_by_field_name(node, "operand", 7);
+        TSNode field = ts_node_child_by_field_name(node, "field", 5);
+        if (ts_node_is_null(operand) || ts_node_is_null(field))
+            return NULL;
+        char *member = lsp_node_text(ctx, field);
+        if (!member)
+            return NULL;
+
+        if (strcmp(ts_node_type(operand), "identifier") == 0) {
+            char *local = lsp_node_text(ctx, operand);
+            const char *package_qn = local ? resolve_import(ctx, local) : NULL;
+            if (package_qn) {
+                const CBMRegisteredFunc *f =
+                    cbm_registry_lookup_symbol(ctx->registry, package_qn, member);
+                return f ? f->qualified_name : NULL;
+            }
+        }
+
+        const CBMType *recv = go_eval_expr_type(ctx, operand);
+        if (recv && recv->kind == CBM_TYPE_POINTER)
+            recv = cbm_type_deref(recv);
+        if (recv && recv->kind == CBM_TYPE_NAMED) {
+            /* A direct method name is unique in a valid Go method set.
+             * Promoted lookup through embedded types can be ambiguous; without
+             * full selector-depth resolution, fail closed and retain USAGE. */
+            const CBMRegisteredFunc *method =
+                cbm_registry_lookup_method(ctx->registry, recv->data.named.qualified_name, member);
+            return method ? method->qualified_name : NULL;
+        }
+    }
+    return NULL;
+}
+
+static void go_scope_bind_value(GoLSPContext *ctx, const char *name, const CBMType *type,
+                                const char *callable_qn) {
+    if (callable_qn) {
+        cbm_scope_bind_callable(ctx->current_scope, name, type, callable_qn);
+    } else {
+        cbm_scope_bind(ctx->current_scope, name, type);
+    }
+}
+
 // --- go_process_statement: bind variables from statements ---
 
 void go_process_statement(GoLSPContext* ctx, TSNode node) {
@@ -942,17 +1015,22 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
         if (ts_node_is_null(left) || ts_node_is_null(right)) return;
 
         const CBMType* rhs_type = NULL;
+        TSNode single_rhs = {0};
 
         // Check if RHS is an expression_list (multiple values)
         if (strcmp(ts_node_type(right), "expression_list") == 0) {
             uint32_t rhs_count = ts_node_named_child_count(right);
             if (rhs_count == 1) {
                 // Single expression that might return a tuple (multi-return)
-                rhs_type = go_eval_expr_type(ctx, ts_node_named_child(right, 0));
+                single_rhs = ts_node_named_child(right, 0);
+                rhs_type = go_eval_expr_type(ctx, single_rhs);
             }
         } else {
+            single_rhs = right;
             rhs_type = go_eval_expr_type(ctx, right);
         }
+        const char *rhs_callable =
+            ts_node_is_null(single_rhs) ? NULL : go_exact_callable_target(ctx, single_rhs);
 
         // Bind left-hand side variables
         if (strcmp(ts_node_type(left), "expression_list") == 0) {
@@ -971,13 +1049,50 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
                         var_type = rhs_type;
                     }
                 }
-                cbm_scope_bind(ctx->current_scope, var_name, var_type);
+                go_scope_bind_value(ctx, var_name, var_type, i == 0 ? rhs_callable : NULL);
             }
         } else if (strcmp(ts_node_type(left), "identifier") == 0) {
             char* var_name = lsp_node_text(ctx, left);
             if (var_name && strcmp(var_name, "_") != 0 && rhs_type) {
-                cbm_scope_bind(ctx->current_scope, var_name, rhs_type);
+                go_scope_bind_value(ctx, var_name, rhs_type, rhs_callable);
             }
+        }
+        return;
+    }
+
+    /* Reassignment must update (or clear) callable identity just like :=.
+     * Without this, `alias := target; alias = dynamic; alias()` would retain a
+     * stale exact target and fabricate a call. */
+    if (strcmp(kind, "assignment_statement") == 0) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        TSNode right = ts_node_child_by_field_name(node, "right", 5);
+        if (ts_node_is_null(left) || ts_node_is_null(right))
+            return;
+        uint32_t lhs_count = strcmp(ts_node_type(left), "expression_list") == 0
+                                 ? ts_node_named_child_count(left)
+                                 : 1;
+        uint32_t rhs_count = strcmp(ts_node_type(right), "expression_list") == 0
+                                 ? ts_node_named_child_count(right)
+                                 : 1;
+        for (uint32_t i = 0; i < lhs_count; i++) {
+            TSNode lhs = lhs_count == 1 && strcmp(ts_node_type(left), "expression_list") != 0
+                             ? left
+                             : ts_node_named_child(left, i);
+            if (ts_node_is_null(lhs) || strcmp(ts_node_type(lhs), "identifier") != 0)
+                continue;
+            char *name = lsp_node_text(ctx, lhs);
+            if (!name || strcmp(name, "_") == 0)
+                continue;
+            TSNode rhs = {0};
+            if (rhs_count == lhs_count) {
+                rhs = rhs_count == 1 && strcmp(ts_node_type(right), "expression_list") != 0
+                          ? right
+                          : ts_node_named_child(right, i);
+            }
+            const CBMType *type =
+                ts_node_is_null(rhs) ? cbm_type_unknown() : go_eval_expr_type(ctx, rhs);
+            const char *callable = ts_node_is_null(rhs) ? NULL : go_exact_callable_target(ctx, rhs);
+            go_scope_bind_value(ctx, name, type, callable);
         }
         return;
     }
@@ -988,6 +1103,13 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
         TSNode value_node = ts_node_child_by_field_name(node, "value", 5);
 
         const CBMType* var_type = cbm_type_unknown();
+        TSNode callable_value = value_node;
+        if (!ts_node_is_null(value_node) &&
+            strcmp(ts_node_type(value_node), "expression_list") == 0) {
+            callable_value = ts_node_named_child_count(value_node) == 1
+                                 ? ts_node_named_child(value_node, 0)
+                                 : (TSNode){0};
+        }
         if (!ts_node_is_null(type_node)) {
             var_type = go_parse_type_node(ctx, type_node);
         } else if (!ts_node_is_null(value_node)) {
@@ -998,6 +1120,8 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
                 var_type = go_eval_expr_type(ctx, value_node);
             }
         }
+        const char *callable_qn =
+            ts_node_is_null(callable_value) ? NULL : go_exact_callable_target(ctx, callable_value);
 
         // Bind all name identifiers (handles: var a, b, c int)
         uint32_t vnc = ts_node_child_count(node);
@@ -1007,7 +1131,7 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
             if (strcmp(ts_node_type(ch), "identifier") == 0) {
                 char* var_name = lsp_node_text(ctx, ch);
                 if (var_name && strcmp(var_name, "_") != 0) {
-                    cbm_scope_bind(ctx->current_scope, var_name, var_type);
+                    go_scope_bind_value(ctx, var_name, var_type, callable_qn);
                 }
             }
         }
@@ -1022,6 +1146,13 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
         if (ts_node_is_null(name_node)) return;
 
         const CBMType* const_type = cbm_type_unknown();
+        TSNode callable_value = value_node;
+        if (!ts_node_is_null(value_node) &&
+            strcmp(ts_node_type(value_node), "expression_list") == 0) {
+            callable_value = ts_node_named_child_count(value_node) == 1
+                                 ? ts_node_named_child(value_node, 0)
+                                 : (TSNode){0};
+        }
         if (!ts_node_is_null(type_node)) {
             const_type = go_parse_type_node(ctx, type_node);
         } else if (!ts_node_is_null(value_node)) {
@@ -1033,11 +1164,13 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
                 const_type = go_eval_expr_type(ctx, value_node);
             }
         }
+        const char *callable_qn =
+            ts_node_is_null(callable_value) ? NULL : go_exact_callable_target(ctx, callable_value);
 
         if (strcmp(ts_node_type(name_node), "identifier") == 0) {
             char* name = lsp_node_text(ctx, name_node);
             if (name && strcmp(name, "_") != 0)
-                cbm_scope_bind(ctx->current_scope, name, const_type);
+                go_scope_bind_value(ctx, name, const_type, callable_qn);
         }
         return;
     }
@@ -1094,31 +1227,149 @@ void go_process_statement(GoLSPContext* ctx, TSNode node) {
     // (needs per-case scope narrowing, not just variable binding)
 }
 
-// --- Emit a resolved call ---
+// --- Emit a resolved call/reference ---
 
-static void emit_resolved_call(GoLSPContext* ctx, const char* callee_qn, const char* strategy, float confidence) {
+static void go_emit_resolved_kind(GoLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                  float confidence, const char *source_name, CBMResolvedKind kind,
+                                  TSNode site) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn) return;
 
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
-    rc.reason = NULL;
+    /* When a callable alias has a different textual leaf, retain that source
+     * name for the exact-site join. */
+    rc.reason = source_name;
+    rc.kind = kind;
+    if (!ts_node_is_null(site)) {
+        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_end_byte = ts_node_end_byte(site);
+    }
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void emit_resolved_call(GoLSPContext *ctx, const char *callee_qn, const char *strategy,
+                               float confidence, TSNode site) {
+    go_emit_resolved_kind(ctx, callee_qn, strategy, confidence, NULL, CBM_RESOLVED_INVOCATION,
+                          site);
+}
+
+static void emit_resolved_alias_call(GoLSPContext *ctx, const char *callee_qn,
+                                     const char *source_name, TSNode site) {
+    go_emit_resolved_kind(ctx, callee_qn, "lsp_callable_alias", 0.97f, source_name,
+                          CBM_RESOLVED_INVOCATION, site);
+}
+
+static void emit_resolved_reference(GoLSPContext *ctx, const char *callee_qn,
+                                    const char *source_name, TSNode site) {
+    const char *leaf = strrchr(callee_qn, '.');
+    leaf = leaf ? leaf + 1 : callee_qn;
+    const char *join_name = source_name && strcmp(source_name, leaf) != 0 ? source_name : NULL;
+    go_emit_resolved_kind(ctx, callee_qn, "lsp_callable_value_reference", 0.97f, join_name,
+                          CBM_RESOLVED_CALL_REFERENCE, site);
+}
+
+static void emit_unresolved_reference(GoLSPContext *ctx, const char *source_name, TSNode site) {
+    if (!ctx || !ctx->resolved_calls || !ctx->enclosing_func_qn || !source_name ||
+        ts_node_is_null(site)) {
+        return;
+    }
+    CBMResolvedCall rc = {0};
+    rc.caller_qn = ctx->enclosing_func_qn;
+    rc.callee_qn = source_name;
+    rc.strategy = "lsp_unresolved";
+    rc.confidence = 0.0f;
+    rc.reason = "callable_value_not_in_registry";
+    rc.kind = CBM_RESOLVED_CALL_REFERENCE;
+    rc.site_start_byte = ts_node_start_byte(site);
+    rc.site_end_byte = ts_node_end_byte(site);
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
 // Emit a diagnostic for an unresolved call (confidence 0.0).
-static void emit_unresolved_call(GoLSPContext* ctx, const char* expr_text, const char* reason) {
+static void emit_unresolved_call(GoLSPContext *ctx, const char *expr_text, const char *reason,
+                                 TSNode site) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn) return;
 
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = expr_text ? expr_text : "?";
     rc.strategy = "lsp_unresolved";
     rc.confidence = 0.0f;
     rc.reason = reason;
+    rc.kind = CBM_RESOLVED_INVOCATION;
+    if (!ts_node_is_null(site)) {
+        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_end_byte = ts_node_end_byte(site);
+    }
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+/* Only direct argument expressions are candidates. Descending into a
+ * conditional/map/index expression would promote its constituent names even
+ * though the runtime callable is not statically unique. */
+static void go_resolve_value_references_at(GoLSPContext *ctx, TSNode call) {
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    if (ts_node_is_null(args))
+        return;
+    uint32_t count = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        const char *kind = ts_node_type(arg);
+        if (strcmp(kind, "identifier") != 0 && strcmp(kind, "selector_expression") != 0 &&
+            strcmp(kind, "parenthesized_expression") != 0)
+            continue;
+        const char *target = go_exact_callable_target(ctx, arg);
+        char *source_name = lsp_node_text(ctx, arg);
+        if (target) {
+            emit_resolved_reference(ctx, target, source_name, arg);
+        } else if (strcmp(kind, "identifier") == 0 && source_name &&
+                   !cbm_scope_contains(ctx->current_scope, source_name)) {
+            /* The per-file registry cannot see an unqualified function from
+             * another file in the same Go package. Preserve the exact source
+             * occurrence for the metadata-only project pass. */
+            emit_unresolved_reference(ctx, source_name, arg);
+        }
+    }
+}
+
+/* Any assignment that is guarded by a branch/loop makes the post-construct
+ * callable identity a join of at least two paths. Clear the outer exact
+ * identity before walking the construct; assignments inside its temporary
+ * scope may still be exact locally, but cannot leak past the join. */
+static void go_invalidate_control_flow_aliases(GoLSPContext *ctx, TSNode node, int depth) {
+    if (!ctx || ts_node_is_null(node) || depth > 64)
+        return;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "func_literal") == 0)
+        return;
+    if (strcmp(kind, "assignment_statement") == 0) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        if (!ts_node_is_null(left)) {
+            uint32_t count = strcmp(ts_node_type(left), "expression_list") == 0
+                                 ? ts_node_named_child_count(left)
+                                 : 1;
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode target = count == 1 && strcmp(ts_node_type(left), "expression_list") != 0
+                                    ? left
+                                    : ts_node_named_child(left, i);
+                if (ts_node_is_null(target) || strcmp(ts_node_type(target), "identifier") != 0) {
+                    continue;
+                }
+                char *name = lsp_node_text(ctx, target);
+                if (name && cbm_scope_lookup_callable(ctx->current_scope, name)) {
+                    cbm_scope_update_callable(ctx->current_scope, name, NULL);
+                }
+            }
+        }
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        go_invalidate_control_flow_aliases(ctx, ts_node_named_child(node, i), depth + 1);
+    }
 }
 
 // --- Walk call expressions and resolve them ---
@@ -1130,8 +1381,15 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
     // Process statements to build scope
     go_process_statement(ctx, node);
 
+    if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "for_statement") == 0 ||
+        strcmp(kind, "expression_switch_statement") == 0 ||
+        strcmp(kind, "type_switch_statement") == 0 || strcmp(kind, "select_statement") == 0) {
+        go_invalidate_control_flow_aliases(ctx, node, 0);
+    }
+
     // Resolve call expressions
     if (strcmp(kind, "call_expression") == 0) {
+        go_resolve_value_references_at(ctx, node);
         TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
         if (!ts_node_is_null(func_node)) {
             const char* fk = ts_node_type(func_node);
@@ -1151,13 +1409,15 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                             if (pkg_qn && field_name) {
                                 const CBMRegisteredFunc* f = cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name);
                                 if (f) {
-                                    emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f);
+                                    emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f,
+                                                       node);
                                     goto recurse;
                                 }
                                 // Package found but symbol not in registry
-                                emit_unresolved_call(ctx,
+                                emit_unresolved_call(
+                                    ctx,
                                     cbm_arena_sprintf(ctx->arena, "%s.%s", pkg_name, field_name),
-                                    "symbol_not_in_registry");
+                                    "symbol_not_in_registry", node);
                                 goto recurse;
                             }
                         }
@@ -1170,16 +1430,26 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                         if (base && base->kind == CBM_TYPE_POINTER) base = cbm_type_deref(base);
 
                         if (base && base->kind == CBM_TYPE_NAMED) {
-                            const CBMRegisteredFunc* method = go_lookup_field_or_method(ctx,
-                                base->data.named.qualified_name, field_name);
-                            if (method) {
-                                const char* strategy = "lsp_type_dispatch";
-                                if (method->receiver_type &&
-                                    strcmp(method->receiver_type, base->data.named.qualified_name) != 0) {
-                                    strategy = "lsp_embed_dispatch";
+                            const CBMRegisteredType *receiver_type = cbm_registry_lookup_type(
+                                ctx->registry, base->data.named.qualified_name);
+                            /* Registered interface receivers must reach the
+                             * interface-resolution branch below. Their semantic
+                             * method registrations are signatures, not concrete
+                             * dispatch targets. */
+                            if (!receiver_type || !receiver_type->is_interface) {
+                                const CBMRegisteredFunc *method = go_lookup_field_or_method(
+                                    ctx, base->data.named.qualified_name, field_name);
+                                if (method) {
+                                    const char *strategy = "lsp_type_dispatch";
+                                    if (method->receiver_type &&
+                                        strcmp(method->receiver_type,
+                                               base->data.named.qualified_name) != 0) {
+                                        strategy = "lsp_embed_dispatch";
+                                    }
+                                    emit_resolved_call(ctx, method->qualified_name, strategy, 0.95f,
+                                                       node);
+                                    goto recurse;
                                 }
-                                emit_resolved_call(ctx, method->qualified_name, strategy, 0.95f);
-                                goto recurse;
                             }
                         }
 
@@ -1243,17 +1513,20 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                                             // `Type.method` wins over the interface-method type_dispatch
                                             // for the same call site.
                                             emit_resolved_call(ctx, concrete_method->qualified_name,
-                                                "lsp_interface_resolve", 0.95f);
+                                                               "lsp_interface_resolve", 0.95f,
+                                                               node);
                                             goto recurse;
                                         }
                                     }
                                 }
 
                                 // Fallback: generic interface dispatch
-                                emit_resolved_call(ctx,
+                                emit_resolved_call(
+                                    ctx,
                                     cbm_arena_sprintf(ctx->arena, "%s.%s",
-                                        iface_qn ? iface_qn : "interface", field_name),
-                                    "lsp_interface_dispatch", 0.85f);
+                                                      iface_qn ? iface_qn : "interface",
+                                                      field_name),
+                                    "lsp_interface_dispatch", 0.85f, node);
                                 goto recurse;
                             }
                         }
@@ -1261,15 +1534,17 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                         // Type resolved to NAMED but neither method nor interface matched
                         if (base && base->kind == CBM_TYPE_NAMED) {
                             emit_unresolved_call(ctx,
-                                cbm_arena_sprintf(ctx->arena, "%s.%s",
-                                    base->data.named.qualified_name, field_name),
-                                "method_not_found");
+                                                 cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                                                   base->data.named.qualified_name,
+                                                                   field_name),
+                                                 "method_not_found", node);
                         } else if (cbm_type_is_unknown(recv_type)) {
                             char* operand_text = lsp_node_text(ctx, operand);
-                            emit_unresolved_call(ctx,
+                            emit_unresolved_call(
+                                ctx,
                                 cbm_arena_sprintf(ctx->arena, "%s.%s",
-                                    operand_text ? operand_text : "?", field_name),
-                                "unknown_receiver_type");
+                                                  operand_text ? operand_text : "?", field_name),
+                                "unknown_receiver_type", node);
                         }
                     }
                 }
@@ -1279,12 +1554,23 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
             if (strcmp(fk, "identifier") == 0) {
                 char* name = lsp_node_text(ctx, func_node);
                 if (name && !is_go_builtin_func(name)) {
+                    if (cbm_scope_contains(ctx->current_scope, name)) {
+                        const char *alias_target =
+                            cbm_scope_lookup_callable(ctx->current_scope, name);
+                        if (alias_target) {
+                            emit_resolved_alias_call(ctx, alias_target, name, node);
+                        } else {
+                            emit_unresolved_call(ctx, name, "lexical_value_not_exact_callable",
+                                                 node);
+                        }
+                        goto recurse;
+                    }
                     // Package-local function
                     const CBMRegisteredFunc* f = cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
                     if (f) {
-                        emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f);
+                        emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f, node);
                     } else {
-                        emit_unresolved_call(ctx, name, "function_not_in_registry");
+                        emit_unresolved_call(ctx, name, "function_not_in_registry", node);
                     }
                 }
             }
@@ -1715,6 +2001,17 @@ const CBMType* cbm_parse_return_type_text(CBMArena* a, const char* text, const c
     return cbm_type_named(a, cbm_arena_sprintf(a, "%s.%s", module_qn, text));
 }
 
+typedef struct {
+    const char *module_qn;
+} CBMGoLSPSignatureParserContext;
+
+static const CBMType *cbm_go_lsp_parse_signature_param_text(CBMArena *arena, const char *text,
+                                                            void *parser_ctx) {
+    const CBMGoLSPSignatureParserContext *ctx = (const CBMGoLSPSignatureParserContext *)parser_ctx;
+    const char *module_qn = ctx && ctx->module_qn ? ctx->module_qn : "";
+    return cbm_parse_return_type_text(arena, text, module_qn);
+}
+
 // --- Entry point: build registry from file defs + run LSP ---
 
 void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
@@ -1790,9 +2087,21 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                 ret_types[1] = NULL;
             }
 
-            // Build param types from param_types array
+            /* The occurrence-preserving carrier is authoritative whenever it
+             * is present, including a non-NULL carrier with an explicit zero
+             * count. Its slots deliberately have no names because legacy name
+             * extraction is not guaranteed to have the same multiplicity. */
             const CBMType** param_types_arr = NULL;
-            if (d->param_types) {
+            const char **param_names_arr = NULL;
+            bool has_ordered_params =
+                d->signature_param_types != NULL || d->signature_param_count > 0;
+            CBMGoLSPSignatureParserContext param_parser_ctx = {module_qn};
+            if (has_ordered_params) {
+                param_types_arr = cbm_type_materialize_signature_params(
+                    arena, d->signature_param_types, d->signature_param_count,
+                    cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);
+            } else if (d->param_types) {
+                param_names_arr = d->param_names;
                 int count = 0;
                 while (d->param_types[count]) count++;
                 if (count > 0) {
@@ -1802,36 +2111,43 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                     }
                     param_types_arr[count] = NULL;
                 }
+            } else {
+                param_names_arr = d->param_names;
             }
 
-            rf.signature = cbm_type_func(arena, d->param_names, param_types_arr, ret_types);
+            rf.signature = cbm_type_func(arena, param_names_arr, param_types_arr, ret_types);
 
-            // For methods, extract receiver type from receiver text
-            if (strcmp(d->label, "Method") == 0 && d->receiver && d->receiver[0]) {
-                // Receiver format: "(name *Type)" or "(name Type)"
-                // Extract type name: skip parens, skip first identifier, strip *
-                const char* r = d->receiver;
-                while (*r == '(' || *r == ' ') r++;
-                // Skip receiver name
-                while (*r && *r != ' ' && *r != '*') r++;
-                while (*r == ' ' || *r == '*') r++;
-                // Now r points to the type name
-                const char* end = r;
-                while (*end && *end != ')' && *end != ' ') end++;
-                if (end > r) {
-                    char* type_name = cbm_arena_strndup(arena, r, end - r);
-                    rf.receiver_type = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
-
-                    // Also register this method under the type
-                    const CBMRegisteredType* existing = cbm_registry_lookup_type(&reg, rf.receiver_type);
-                    if (!existing) {
-                        // Auto-create the type entry
-                        CBMRegisteredType auto_type;
-                        memset(&auto_type, 0, sizeof(auto_type));
-                        auto_type.qualified_name = rf.receiver_type;
-                        auto_type.short_name = type_name;
-                        cbm_registry_add_type(&reg, auto_type);
+            // Prefer the extractor's semantic receiver QN. Raw receiver text is
+            // retained only as a compatibility fallback for hand-built defs;
+            // reparsing it alone loses valid unnamed receivers such as `(Right)`.
+            if (strcmp(d->label, "Method") == 0) {
+                if (d->parent_class && d->parent_class[0]) {
+                    rf.receiver_type = d->parent_class;
+                } else if (d->receiver && d->receiver[0]) {
+                    // Legacy named receiver formats: "(name *Type)" / "(name Type)".
+                    const char *r = d->receiver;
+                    while (*r == '(' || *r == ' ')
+                        r++;
+                    while (*r && *r != ' ' && *r != '*')
+                        r++;
+                    while (*r == ' ' || *r == '*')
+                        r++;
+                    const char *end = r;
+                    while (*end && *end != ')' && *end != ' ')
+                        end++;
+                    if (end > r) {
+                        char *type_name = cbm_arena_strndup(arena, r, (size_t)(end - r));
+                        rf.receiver_type = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
                     }
+                }
+
+                if (rf.receiver_type && !cbm_registry_lookup_type(&reg, rf.receiver_type)) {
+                    const char *dot = strrchr(rf.receiver_type, '.');
+                    CBMRegisteredType auto_type;
+                    memset(&auto_type, 0, sizeof(auto_type));
+                    auto_type.qualified_name = rf.receiver_type;
+                    auto_type.short_name = dot ? dot + 1 : rf.receiver_type;
+                    cbm_registry_add_type(&reg, auto_type);
                 }
             }
 
@@ -2343,6 +2659,42 @@ static const CBMType* parse_type_node_with_params(CBMArena* arena, TSNode node,
     return cbm_type_unknown();
 }
 
+/* Go permits one AST parameter declaration to introduce several call
+ * positions: `first, second T`. Count direct names without exposing or
+ * rewriting the legacy public param_names projection. */
+static int cbm_go_lsp_signature_param_multiplicity(TSNode param) {
+    const char *kind = ts_node_type(param);
+    if (strcmp(kind, "parameter_declaration") != 0 &&
+        strcmp(kind, "variadic_parameter_declaration") != 0) {
+        return 1;
+    }
+
+    int field_names = 0;
+    int identifier_names = 0;
+    uint32_t child_count = ts_node_child_count(param);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode child = ts_node_child(param, i);
+        if (ts_node_is_null(child) || !ts_node_is_named(child))
+            continue;
+        const char *field = ts_node_field_name_for_child(param, i);
+        if (field && strcmp(field, "name") == 0)
+            field_names++;
+        if (strcmp(ts_node_type(child), "identifier") == 0)
+            identifier_names++;
+    }
+
+    int names = field_names > 0 ? field_names : identifier_names;
+    return names > 0 ? names : 1;
+}
+
+static const CBMType *cbm_go_lsp_keep_known_refinement(const CBMType *candidate,
+                                                       const CBMType *existing) {
+    if (cbm_type_is_unknown(candidate) && !cbm_type_is_unknown(existing)) {
+        return existing;
+    }
+    return candidate ? candidate : cbm_type_unknown();
+}
+
 // Scan AST for generic function declarations and set type_param_names + re-parse
 // return types on matching registered functions.
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
@@ -2450,20 +2802,32 @@ static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
                                     if (ts_node_is_null(rchild) || !ts_node_is_named(rchild)) continue;
                                     TSNode rtype = ts_node_child_by_field_name(rchild, "type", 4);
                                     if (ts_node_is_null(rtype)) rtype = rchild;
-                                    new_rets[idx++] = parse_type_node_with_params(arena,
-                                        rtype, source, module_qn, tp_names);
+                                    const CBMType *parsed = parse_type_node_with_params(
+                                        arena, rtype, source, module_qn, tp_names);
+                                    new_rets[idx] =
+                                        cbm_go_lsp_keep_known_refinement(parsed, old_rets[idx]);
+                                    idx++;
                                 }
-                                new_rets[idx] = NULL;
+                                while (idx < ret_count) {
+                                    new_rets[idx] = old_rets[idx];
+                                    idx++;
+                                }
+                                new_rets[ret_count] = NULL;
                             } else {
-                                new_rets[0] = parse_type_node_with_params(arena,
-                                    result_node, source, module_qn, tp_names);
-                                new_rets[1] = NULL;
+                                const CBMType *parsed = parse_type_node_with_params(
+                                    arena, result_node, source, module_qn, tp_names);
+                                new_rets[0] = cbm_go_lsp_keep_known_refinement(parsed, old_rets[0]);
+                                for (int idx = 1; idx < ret_count; idx++) {
+                                    new_rets[idx] = old_rets[idx];
+                                }
+                                new_rets[ret_count] = NULL;
                             }
 
-                            CBMType* new_sig = (CBMType*)cbm_arena_alloc(arena, sizeof(CBMType));
-                            *new_sig = *(CBMType*)reg->funcs[fi].signature;
-                            new_sig->data.func.return_types = new_rets;
-                            reg->funcs[fi].signature = new_sig;
+                            const CBMType *new_sig = cbm_type_func_replace_returns(
+                                arena, reg->funcs[fi].signature, new_rets);
+                            if (new_sig && new_sig->kind == CBM_TYPE_FUNC) {
+                                reg->funcs[fi].signature = new_sig;
+                            }
                         }
                     }
                 }
@@ -2480,26 +2844,40 @@ static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
                         const CBMType** new_params = (const CBMType**)cbm_arena_alloc(arena,
                             (pc + 1) * sizeof(const CBMType*));
                         int idx = 0;
+                        bool overflow = false;
                         uint32_t pnc = ts_node_child_count(params_node);
-                        for (uint32_t pi = 0; pi < pnc && idx < pc; pi++) {
+                        for (uint32_t pi = 0; pi < pnc && !overflow; pi++) {
                             TSNode pchild = ts_node_child(params_node, pi);
                             if (ts_node_is_null(pchild) || !ts_node_is_named(pchild)) continue;
-                            if (strcmp(ts_node_type(pchild), "parameter_declaration") != 0) continue;
+                            const char *param_kind = ts_node_type(pchild);
+                            if (strcmp(param_kind, "parameter_declaration") != 0 &&
+                                strcmp(param_kind, "variadic_parameter_declaration") != 0) {
+                                continue;
+                            }
                             TSNode ptype = ts_node_child_by_field_name(pchild, "type", 4);
-                            if (ts_node_is_null(ptype)) continue;
-                            new_params[idx++] = parse_type_node_with_params(arena,
-                                ptype, source, module_qn, tp_names);
+                            const CBMType *parsed =
+                                ts_node_is_null(ptype)
+                                    ? cbm_type_unknown()
+                                    : parse_type_node_with_params(arena, ptype, source, module_qn,
+                                                                  tp_names);
+                            int multiplicity = cbm_go_lsp_signature_param_multiplicity(pchild);
+                            for (int occurrence = 0; occurrence < multiplicity; occurrence++) {
+                                if (idx >= pc) {
+                                    overflow = true;
+                                    break;
+                                }
+                                new_params[idx] =
+                                    cbm_go_lsp_keep_known_refinement(parsed, old_params[idx]);
+                                idx++;
+                            }
                         }
                         new_params[idx] = NULL;
-                        if (idx > 0) {
-                            CBMType* sig = (CBMType*)reg->funcs[fi].signature;
-                            if (sig != reg->funcs[fi].signature) {
-                                // Already rebuilt — update in place
-                                ((CBMType*)reg->funcs[fi].signature)->data.func.param_types = new_params;
-                            } else {
-                                CBMType* new_sig = (CBMType*)cbm_arena_alloc(arena, sizeof(CBMType));
-                                *new_sig = *sig;
-                                new_sig->data.func.param_types = new_params;
+                        if (!overflow && idx == pc) {
+                            const CBMType *old_sig = reg->funcs[fi].signature;
+                            const CBMType *new_sig =
+                                cbm_type_func(arena, old_sig->data.func.param_names, new_params,
+                                              old_sig->data.func.return_types);
+                            if (new_sig && new_sig->kind == CBM_TYPE_FUNC) {
                                 reg->funcs[fi].signature = new_sig;
                             }
                         }
@@ -2587,7 +2965,11 @@ void cbm_run_go_lsp_cross(
 
             // Build FUNC type from return_types text
             const CBMType** ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
+            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod};
+            const CBMType **param_types = cbm_type_materialize_signature_params(
+                arena, d->signature_param_types, d->signature_param_count,
+                cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);
+            rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
 
             // Method receiver
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
@@ -2833,7 +3215,11 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
             rf.qualified_name = d->qualified_name; /* borrowed */
             rf.short_name = d->short_name;
             const CBMType** ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
+            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod};
+            const CBMType **param_types = cbm_type_materialize_signature_params(
+                arena, d->signature_param_types, d->signature_param_count,
+                cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);
+            rf.signature = cbm_type_func(arena, NULL, param_types, ret_types);
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
                 rf.receiver_type = d->receiver_type;
                 if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
@@ -2972,17 +3358,28 @@ int cbm_go_fast_resolve_qualified_calls(
             }
         }
 
+        /* Case 3: an unqualified function value from another source file in
+         * the same Go package. Go module QNs are directory-based, so this is
+         * an exact package-local lookup rather than a project-wide short-name
+         * guess. */
+        if (!f && !strchr(uc->callee_qn, '.') && result->module_qn) {
+            f = cbm_registry_lookup_symbol(reg, result->module_qn, uc->callee_qn);
+        }
+
         if (!f) continue;
 
         /* Emit a resolved entry. cbm_pipeline_find_lsp_resolution
          * picks the highest-confidence match, so the unresolved entry
          * stays (harmless duplicate) but our resolved entry wins. */
-        CBMResolvedCall rc;
+        CBMResolvedCall rc = {0};
         rc.caller_qn = uc->caller_qn;
         rc.callee_qn = f->qualified_name; /* borrowed from pipeline arena */
         rc.strategy = "lsp_strategy_cross_file";
         rc.confidence = 0.92f;
         rc.reason = NULL;
+        rc.kind = uc->kind;
+        rc.site_start_byte = uc->site_start_byte;
+        rc.site_end_byte = uc->site_end_byte;
         cbm_resolvedcall_push(&result->resolved_calls, &result->arena, rc);
         newly_resolved++;
     }
@@ -3034,11 +3431,15 @@ void cbm_batch_go_lsp_cross(
             for (int j = 0; j < file_out.count; j++) {
                 CBMResolvedCall* src = &file_out.items[j];
                 CBMResolvedCall* dst = &out[f].items[j];
+                memset(dst, 0, sizeof(*dst));
                 dst->caller_qn = src->caller_qn ? cbm_arena_strdup(arena, src->caller_qn) : NULL;
                 dst->callee_qn = src->callee_qn ? cbm_arena_strdup(arena, src->callee_qn) : NULL;
                 dst->strategy  = src->strategy  ? cbm_arena_strdup(arena, src->strategy)  : NULL;
                 dst->confidence = src->confidence;
                 dst->reason    = src->reason    ? cbm_arena_strdup(arena, src->reason)    : NULL;
+                dst->kind = src->kind;
+                dst->site_start_byte = src->site_start_byte;
+                dst->site_end_byte = src->site_end_byte;
             }
         }
 

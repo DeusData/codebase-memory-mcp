@@ -66,6 +66,14 @@ int cbm_toml_upsert_owned_named_array_table(const char *file_path, const char *t
 int cbm_toml_remove_owned_named_array_table(const char *file_path, const char *table_name,
                                             const char *identity_key, const char *identity_value,
                                             const char *canonical_body);
+typedef enum {
+    CBM_TOML_CODEX_HOOK_UPSERT = 0,
+    CBM_TOML_CODEX_HOOK_REMOVE = 1
+} cbm_toml_codex_hook_action_t;
+int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_marker,
+                                   const char *end_marker, const char *command,
+                                   const char *command_windows, cbm_toml_codex_hook_action_t action,
+                                   int check_only);
 
 #ifdef CBM_TOML_EDIT_ENABLE_TEST_API
 typedef void (*cbm_toml_precommit_test_hook_t)(const char *file_path, void *context);

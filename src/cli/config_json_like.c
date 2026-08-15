@@ -2834,9 +2834,27 @@ int cbm_json_like_match_object_entry(const char *document, size_t document_lengt
             free(decoded);
         }
     }
-    if (member_count != found_count || !captured) {
+    if (!captured) {
         free(captured);
         return CBM_JSON_LIKE_OBJECT_MISMATCH;
+    }
+    if (member_count != found_count) {
+        /* Extra keys beyond the ones we own. Every field we DO own matched, so
+         * this entry is recognisably ours - it has just been annotated.
+         *
+         * OpenCode is the case that forced this: it writes `"enabled": true`
+         * alongside our `command` and `type`, and toggling a server on or off
+         * in the UI adds that key. Requiring an exact key set therefore made us
+         * classify our OWN entry as foreign and refuse to touch it, so install
+         * failed for anyone who had ever toggled a server (#1630, confirmed on
+         * Linux and Windows with two independent configs where every MCP server
+         * carried the key).
+         *
+         * Reported distinctly from MATCH because the two demand different
+         * handling: a caller may not rewrite this entry, since the editor
+         * replaces an entry wholesale and would drop the extra keys. */
+        *captured_string_out = captured;
+        return CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS;
     }
     *captured_string_out = captured;
     return CBM_JSON_LIKE_OBJECT_MATCH;

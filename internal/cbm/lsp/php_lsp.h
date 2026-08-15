@@ -71,6 +71,10 @@ void php_lsp_add_use(PHPLSPContext *ctx, const char *local_name, const char *tar
 /* Process a file's AST: walk top-level decls, then function/method bodies. */
 void php_lsp_process_file(PHPLSPContext *ctx, TSNode root);
 
+/* Refine an already-populated registry from local class ASTs: declared and
+ * PHPDoc returns, trait flattening, and typed fields. */
+void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root);
+
 /* Evaluate a PHP expression's type. May return NULL / CBM_TYPE_UNKNOWN. */
 const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node);
 
@@ -100,6 +104,9 @@ void cbm_php_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
  * `use` declarations from the AST are layered on top by process_file.
  *
  * Reuses go_lsp.h's CBMLSPDef so cross-language registration is uniform. */
+void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
+                               const CBMLSPDef *defs, int def_count);
+
 void cbm_run_php_lsp_cross(
     CBMArena *arena,
     const char *source, int source_len,

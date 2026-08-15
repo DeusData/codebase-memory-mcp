@@ -75,7 +75,8 @@ TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed) {
         if (sscanf(line, "%64s %3899s", hash, path) != 2)
             continue;
         ASSERT_EQ(strlen(hash), 64U);
-        ASSERT(strncmp(path, "vendored/", strlen("vendored/")) == 0);
+        ASSERT(strncmp(path, "vendored/", strlen("vendored/")) == 0 ||
+               strncmp(path, "internal/cbm/vendored/", strlen("internal/cbm/vendored/")) == 0);
         entries++;
     }
     fclose(checksums);
@@ -217,6 +218,30 @@ TEST(shell_rejects_backslash) {
 
 TEST(shell_rejects_newline) {
     ASSERT_FALSE(cbm_validate_shell_arg("foo\nbar"));
+    PASS();
+}
+
+/* Every path that reaches a shell command must go through the path variant, not
+ * the bare one: the three git shell-out sites each wrap the repo path in cmd.exe
+ * double quotes, where %VAR%, !VAR! and ^ stay active. One site used the bare
+ * validator and so accepted them. */
+TEST(shell_path_arg_rejects_cmd_expansion) {
+    /* Anything the base validator rejects, the path variant rejects too. */
+    ASSERT_FALSE(cbm_validate_shell_path_arg("foo'bar"));
+    ASSERT_FALSE(cbm_validate_shell_path_arg("$(whoami)"));
+    ASSERT_FALSE(cbm_validate_shell_path_arg("foo;rm -rf /"));
+    ASSERT_FALSE(cbm_validate_shell_path_arg(NULL));
+#ifdef _WIN32
+    ASSERT_FALSE(cbm_validate_shell_path_arg("C:/repo/%USERPROFILE%"));
+    ASSERT_FALSE(cbm_validate_shell_path_arg("C:/repo/!PATH!"));
+    ASSERT_FALSE(cbm_validate_shell_path_arg("C:/repo/a^b"));
+    ASSERT_TRUE(cbm_validate_shell_path_arg("C:/Users/dev/my repo"));
+#else
+    /* The cmd.exe metacharacters are inert on POSIX, so a path containing them
+     * stays valid here; only the Windows build rejects them. */
+    ASSERT_TRUE(cbm_validate_shell_path_arg("/tmp/repo/100%"));
+    ASSERT_TRUE(cbm_validate_shell_path_arg("/tmp/my repo"));
+#endif
     PASS();
 }
 
@@ -782,6 +807,7 @@ SUITE(security) {
     RUN_TEST(shell_rejects_ampersand);
     RUN_TEST(shell_rejects_backslash);
     RUN_TEST(shell_rejects_newline);
+    RUN_TEST(shell_path_arg_rejects_cmd_expansion);
     RUN_TEST(shell_rejects_carriage_return);
     RUN_TEST(shell_rejects_null);
     RUN_TEST(shell_rejects_double_quote);

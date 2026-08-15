@@ -21,6 +21,11 @@
 #include <mimalloc.h>
 #ifndef _WIN32
 #include <sys/mman.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 /* ASan detection — mimalloc MI_OVERRIDE=0 under ASan, mi_process_info
@@ -275,11 +280,32 @@ TEST(mem_rss_reflects_external_resident_memory) {
      * reporting a broken small counter instead of true resident memory — which
      * the Linux #else branch exercises directly against the undercount. */
     const size_t threshold = (size_t)32 * 1024 * 1024;
+    const size_t lock_span = (size_t)64 * 1024 * 1024;
     void *big = malloc(region);
     ASSERT_NOT_NULL(big);
     memset(big, 0x5A, region);
-    memset(big, 0x5B, region); /* re-touch right before the measurement */
-    size_t rss = cbm_mem_rss();
+    /* Trimming can evict even a just-touched region: at 18 parallel suites
+     * the VM kept 19 MB resident of a 256 MB double-touch, losing the
+     * re-touch race this test previously relied on. Locked pages are exempt
+     * from working-set trimming, so lock a span comfortably above the
+     * threshold and the measurement becomes pressure-immune. When the lock
+     * is unavailable (working-set quota policy), fall back to bounded
+     * touch-and-sample retries — those races are transient. */
+    HANDLE self_process = GetCurrentProcess();
+    bool locked = SetProcessWorkingSetSize(self_process, lock_span + (size_t)32 * 1024 * 1024,
+                                           (size_t)512 * 1024 * 1024) != 0 &&
+                  VirtualLock(big, lock_span) != 0;
+    size_t rss = 0;
+    for (int attempt = 0; attempt < 6; attempt++) {
+        memset(big, 0x5B + attempt, lock_span);
+        rss = cbm_mem_rss();
+        if (locked || rss >= threshold) {
+            break;
+        }
+    }
+    if (locked) {
+        (void)VirtualUnlock(big, lock_span);
+    }
     ASSERT_GTE(rss, threshold);
     free(big);
 #else
@@ -461,6 +487,21 @@ TEST(resolve_budget_override_when_total_unknown) {
     ASSERT_EQ(r.budget, 512 * CBM_TEST_MB);
     ASSERT_FALSE(r.clamped);
     ASSERT_FALSE(r.invalid);
+    PASS();
+}
+
+TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
+    size_t total = 8192 * CBM_TEST_MB;
+    size_t worker_cap = 16 * CBM_TEST_MB;
+    cbm_mem_budget_t lower = cbm_mem_resolve_budget_capped(total, 0.5, "8", worker_cap);
+    ASSERT_EQ(lower.budget, 8 * CBM_TEST_MB);
+    ASSERT_STR_EQ(lower.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_FALSE(lower.hard_capped);
+
+    cbm_mem_budget_t capped = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
+    ASSERT_EQ(capped.budget, worker_cap);
+    ASSERT_STR_EQ(capped.source, "daemon_worker_cap");
+    ASSERT_TRUE(capped.hard_capped);
     PASS();
 }
 
@@ -1126,8 +1167,93 @@ TEST(parallel_extract_with_slab) {
     PASS();
 }
 
+/* The memory map is a diagnostic, so it must be proven non-vacuous: a map that
+ * silently reported zeros would read as "no leak" and send a future
+ * investigation down the wrong path. Allocate a KNOWN volume in a KNOWN size
+ * class and require the map to attribute it to that class. */
+TEST(mem_map_attributes_a_known_allocation) {
+    enum { PROBE_BLOCKS = 4000, PROBE_SIZE = 3000 };
+    cbm_mem_map_t before;
+    cbm_mem_map_t after;
+    ASSERT_TRUE(cbm_mem_map_collect(&before));
+
+    /* Allocate through mi_* explicitly. The map walks the mimalloc heap, and
+     * only the PRODUCTION build routes plain malloc there (the test build is
+     * CRT+ASan) -- so a malloc-based probe would report 0 here and wrongly look
+     * like a broken instrument. Using mi_malloc exercises the walk and the
+     * bucket attribution in every build configuration. Note the corollary,
+     * which is why the residual exists: in a build where malloc does NOT reach
+     * mimalloc, live_bytes legitimately reads 0 and the residual owns
+     * everything. */
+    void **kept = malloc(PROBE_BLOCKS * sizeof(*kept));
+    ASSERT_NOT_NULL(kept);
+    for (int i = 0; i < PROBE_BLOCKS; i++) {
+        kept[i] = mi_malloc(PROBE_SIZE);
+        ASSERT_NOT_NULL(kept[i]);
+        ((char *)kept[i])[0] = (char)i; /* touch it so it is really committed */
+    }
+    ASSERT_TRUE(cbm_mem_map_collect(&after));
+
+    /* The walk must account for the bulk of the probe. Slack covers allocator
+     * rounding and blocks the aggregate walk may not reach; a map that saw
+     * ~nothing is precisely the failure this test exists to catch. */
+    size_t probe_bytes = (size_t)PROBE_BLOCKS * PROBE_SIZE;
+    ASSERT_GT(after.live_bytes, before.live_bytes);
+
+    /* Assert the contract the map actually offers, which is the triple in
+     * mem.h: what the walk cannot see, the residual must carry. mimalloc v3
+     * exposes only the main heap, abandoned pages, and the CALLING thread's
+     * theap -- there is no API to enumerate every theap -- so on some builds
+     * the probe's blocks are unreachable through all three (Windows sees
+     * ~190 KB of a 12 MB probe, POSIX sees essentially all of it).
+     *
+     * Demanding >50% attribution everywhere would assert a guarantee the
+     * allocator does not give, and the honest property is stronger anyway: the
+     * memory must appear in the map SOMEWHERE. Either the walk attributes the
+     * bulk of the probe, or the committed total grew by at least as much and
+     * the residual owns it. A map that reported neither would be silently
+     * losing memory, which is exactly what this test exists to catch. */
+    size_t attributed = after.live_bytes - before.live_bytes;
+    size_t committed_growth = after.os_committed_bytes > before.os_committed_bytes
+                                  ? after.os_committed_bytes - before.os_committed_bytes
+                                  : 0;
+    bool walk_saw_it = attributed > probe_bytes / 2;
+    bool residual_saw_it = committed_growth + attributed > probe_bytes / 2;
+    ASSERT_TRUE(walk_saw_it || residual_saw_it);
+
+    /* Bucket attribution is only meaningful where the walk reached the probe;
+     * where it did not, there is nothing to attribute and the residual carried
+     * it above. */
+    /* 3000-byte blocks belong to the <=4096 class, not to a smaller one. */
+    int expected_bucket = -1;
+    for (int i = 0; i < CBM_MEM_MAP_BUCKETS; i++) {
+        size_t limit = cbm_mem_map_bucket_limit(i);
+        if (limit >= (size_t)PROBE_SIZE) {
+            expected_bucket = i;
+            break;
+        }
+    }
+    ASSERT_TRUE(expected_bucket >= 0);
+    if (walk_saw_it) {
+        ASSERT_GT(after.bucket_bytes[expected_bucket], before.bucket_bytes[expected_bucket]);
+        ASSERT_GT(after.bucket_blocks[expected_bucket] - before.bucket_blocks[expected_bucket],
+                  (size_t)(PROBE_BLOCKS / 2));
+    }
+
+    /* OS totals must be populated independently of the walk, so the residual is
+     * meaningful rather than derived from an empty measurement. */
+    ASSERT_GT(after.os_committed_bytes, 0);
+
+    for (int i = 0; i < PROBE_BLOCKS; i++) {
+        mi_free(kept[i]);
+    }
+    free(kept);
+    PASS();
+}
+
 SUITE(mem) {
     /* mem API */
+    RUN_TEST(mem_map_attributes_a_known_allocation);
     RUN_TEST(mem_rss_tracking);
     RUN_TEST(mem_collect_reclaims);
     RUN_TEST(mem_budget_check);
@@ -1162,6 +1288,7 @@ SUITE(mem) {
     RUN_TEST(resolve_budget_override_wins);
     RUN_TEST(resolve_budget_override_clamped_to_total);
     RUN_TEST(resolve_budget_override_when_total_unknown);
+    RUN_TEST(resolve_budget_worker_cap_preserves_lower_user_override);
     RUN_TEST(resolve_budget_invalid_override_falls_back);
     RUN_TEST(resolve_budget_override_overflow_clamps_to_total);
     RUN_TEST(resolve_budget_override_overflow_total_unknown_caps);

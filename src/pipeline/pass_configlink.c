@@ -60,6 +60,67 @@ static bool is_dep_section(const char *s) {
 
 /* ── Strategy 1: Config Key → Code Symbol ───────────────────────── */
 
+/* Canonical candidate order (determinism). Both collectors below fill a
+ * fixed-capacity array and stop at max_out; the label indexes they walk are
+ * gbuf insertion order = parallel-extraction merge order, which varies run to
+ * run. On a repo with more candidates than the cap, sorting by a pure content
+ * key first is what keeps the surviving set — and therefore the emitted
+ * CONFIGURES edges — a function of the inputs rather than of worker
+ * scheduling. Tie-breaks stay content-only: node ids are handed out in merge
+ * order, so an id tie-break belongs in no canonical comparator. */
+enum {
+    CANON_CMP_LESS = -1,   /* qsort: left sorts before right */
+    CANON_CMP_GREATER = 1, /* qsort: left sorts after right */
+    CANON_CAP_BUF = 32     /* decimal rendering of a cap value */
+};
+
+static int cmp_node_ptr_canonical(const void *pa, const void *pb) {
+    const cbm_gbuf_node_t *a = *(const cbm_gbuf_node_t *const *)pa;
+    const cbm_gbuf_node_t *b = *(const cbm_gbuf_node_t *const *)pb;
+    const char *qa = a->qualified_name ? a->qualified_name : "";
+    const char *qb = b->qualified_name ? b->qualified_name : "";
+    int r = strcmp(qa, qb);
+    if (r != 0) {
+        return r;
+    }
+    const char *fa = a->file_path ? a->file_path : "";
+    const char *fb = b->file_path ? b->file_path : "";
+    r = strcmp(fa, fb);
+    if (r != 0) {
+        return r;
+    }
+    if (a->start_line != b->start_line) {
+        return a->start_line < b->start_line ? CANON_CMP_LESS : CANON_CMP_GREATER;
+    }
+    const char *na = a->name ? a->name : "";
+    const char *nb = b->name ? b->name : "";
+    return strcmp(na, nb);
+}
+
+/* A filled-to-capacity collector dropped candidates; say so rather than
+ * truncating silently. */
+static void log_candidate_truncation(const char *side, int cap) {
+    char cap_buf[CANON_CAP_BUF];
+    snprintf(cap_buf, sizeof(cap_buf), "%d", cap);
+    cbm_log_info("configlinker.truncated", "side", side, "cap", cap_buf);
+}
+
+/* Heap copy of `nodes` sorted by cmp_node_ptr_canonical. Returns NULL (and
+ * leaves the caller on the unsorted borrowed array) only on allocation
+ * failure, which degrades determinism but never correctness. */
+static const cbm_gbuf_node_t **canonical_node_copy(const cbm_gbuf_node_t *const *nodes, int count) {
+    if (!nodes || count <= 0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **sorted = malloc((size_t)count * sizeof(*sorted));
+    if (!sorted) {
+        return NULL;
+    }
+    memcpy(sorted, nodes, (size_t)count * sizeof(*sorted));
+    qsort(sorted, (size_t)count, sizeof(*sorted), cmp_node_ptr_canonical);
+    return sorted;
+}
+
 typedef struct {
     int64_t node_id;
     char normalized[CBM_SZ_256];
@@ -70,6 +131,10 @@ typedef struct {
 static int collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_count,
                                   config_entry_t *out, int max_out) {
     int n = 0;
+    const cbm_gbuf_node_t **sorted = canonical_node_copy(vars, var_count);
+    if (sorted) {
+        vars = sorted;
+    }
     for (int i = 0; i < var_count && n < max_out; i++) {
         if (!cbm_has_config_extension(vars[i]->file_path)) {
             continue;
@@ -102,6 +167,10 @@ static int collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_co
         snprintf(out[n].name, sizeof(out[n].name), "%s", vars[i]->name);
         n++;
     }
+    if (n == max_out) {
+        log_candidate_truncation("config", max_out);
+    }
+    free((void *)sorted);
     return n;
 }
 
@@ -124,22 +193,32 @@ static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) 
             continue;
         }
 
+        /* Canonical order before the cap — see cmp_node_ptr_canonical. The cap
+         * spans the whole label list, so a later label can be cut mid-group;
+         * sorting per group keeps that cut a pure function of content. */
+        const cbm_gbuf_node_t **sorted = canonical_node_copy(nodes, count);
+        const cbm_gbuf_node_t *const *scan = sorted ? sorted : nodes;
+
         for (int i = 0; i < count && n < max_out; i++) {
-            if (cbm_has_config_extension(nodes[i]->file_path)) {
+            if (cbm_has_config_extension(scan[i]->file_path)) {
                 continue;
             }
 
             char norm[CBM_SZ_256];
-            int tokens = cbm_normalize_config_key(nodes[i]->name, norm, sizeof(norm));
+            int tokens = cbm_normalize_config_key(scan[i]->name, norm, sizeof(norm));
             if (tokens == 0 || norm[0] == '\0') {
                 continue;
             }
 
-            out[n].node_id = nodes[i]->id;
+            out[n].node_id = scan[i]->id;
             snprintf(out[n].normalized, sizeof(out[n].normalized), "%s", norm);
             n++;
         }
-        /* gbuf data is borrowed — no free */
+        /* gbuf data is borrowed — only the sorted copy is owned */
+        free((void *)sorted);
+    }
+    if (n == max_out) {
+        log_candidate_truncation("code", max_out);
     }
     return n;
 }

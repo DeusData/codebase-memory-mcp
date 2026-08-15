@@ -1254,22 +1254,53 @@ static int yaml_find_comment(const char *data, size_t start, size_t end, size_t 
     return 0;
 }
 
+/* `&` and `*` are anchor/alias indicators only where a NODE begins. Once a
+ * plain scalar has started, they are ordinary characters.
+ *
+ * This used to reject them anywhere in the range, so a value containing prose
+ * asterisks — `use *emphasis* here`, a kaomoji, a glob in a description — was
+ * refused as if it were an alias. Reported against a real 16 KB Hermes config
+ * where this was one of four constructs that made the file permanently
+ * un-editable by us (#1631, root-caused by @rg6304 with an isolated repro).
+ *
+ * The test is positional and deliberately conservative: an indicator is only
+ * honoured as one when nothing has appeared before it in the value. `key: *a`
+ * is still an alias and still refused; `key: 2 * 3` and `key: a*b` are text.
+ * `{`/`}` keep their existing treatment — empty flow mappings are a separate
+ * change with its own semantics. */
 static int yaml_range_has_unsupported(const char *data, size_t start, size_t end) {
     char quote = '\0';
+    /* Last significant character seen, so an indicator can be judged by what
+     * PRECEDES it. The scanned range covers a whole line including its key, so
+     * "first character in the range" is not the same as "start of a node" —
+     * in `command: &shared` the `&` is an anchor even though `command:` came
+     * first. A node begins at the range start, after a mapping colon, or after
+     * a block-sequence dash. */
+    char previous = '\0';
     for (size_t i = start; i < end; i++) {
         bool is_plain = false;
         if (yaml_scan_quote(data, end, &i, &quote, &is_plain) != 0) {
             return YAML_MATCH;
         }
         if (!is_plain) {
+            previous = 'q';
             continue;
         }
         char c = data[i];
         if (c == '#' && (i == start || data[i - YAML_UNIT] == ' ')) {
             break;
         }
-        if (c == '{' || c == '}' || c == '&' || c == '*') {
+        if (c == '{' || c == '}') {
             return YAML_MATCH;
+        }
+        if (c == '&' || c == '*') {
+            bool begins_node = previous == '\0' || previous == ':' || previous == '-';
+            if (begins_node) {
+                return YAML_MATCH;
+            }
+        }
+        if (c != ' ' && c != '\t') {
+            previous = c;
         }
         if (c == '<' && i + YAML_ENTRY_INDENT < end && data[i + YAML_UNIT] == '<' &&
             data[i + YAML_ENTRY_INDENT] == ':') {
@@ -2557,8 +2588,11 @@ static int yaml_sequence_parse_block(const yaml_doc_t *doc, size_t begin_line, s
                                      const char *identity_value,
                                      yaml_mapping_sequence_target_t *target) {
     size_t range_len = end_line - begin_line;
-    size_t *starts = range_len ? (size_t *)calloc(range_len, sizeof(*starts)) : NULL;
-    if (range_len && !starts) {
+    /* Minimum one element: a NULL-for-empty-range starts is only safe through
+     * the loop-bound == alloc-bound invariant, which a path-sensitive
+     * analyzer (rightly) refuses to assume across expressions. */
+    size_t *starts = (size_t *)calloc(range_len ? range_len : 1, sizeof(*starts));
+    if (!starts) {
         return YAML_ERROR;
     }
     size_t start_count = 0U;

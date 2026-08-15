@@ -111,7 +111,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     *out = NULL;
     *out_count = 0;
 
-    if (!cbm_validate_shell_arg(repo_path)) {
+    if (!cbm_validate_shell_path_arg(repo_path)) {
         return CBM_NOT_FOUND;
     }
 
@@ -387,7 +387,9 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
      * Single hash-table pass over the same commit set used for coupling so
      * we don't re-scan history. NULL on OOM is fine — the caller still
      * gets the couplings. */
-    cbm_file_temporal_t *ft_arr = malloc(MAX_FILE_TEMPORAL * sizeof(cbm_file_temporal_t));
+    cbm_file_temporal_t *ft_arr =
+        calloc(MAX_FILE_TEMPORAL, sizeof(cbm_file_temporal_t)); /* defined reads
+        even under the analyzer's cross-iteration view of the index map */
     if (ft_arr) {
         int ft_count = 0;
         CBMHashTable *file_idx = cbm_ht_create(CBM_SZ_1K);
@@ -404,14 +406,23 @@ int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result
                         ft_arr[*idx].last_modified = cf[c].timestamp;
                     }
                 } else if (ft_count < MAX_FILE_TEMPORAL) {
+                    /* Allocate the index cell and key BEFORE claiming a slot:
+                     * the previous unchecked malloc dereferenced NULL on
+                     * allocation failure, and a failed strdup would have
+                     * leaked the cell. */
+                    int *nidx = malloc(sizeof(int));
+                    char *key = nidx ? strdup(fp) : NULL;
+                    if (!nidx || !key) {
+                        free(nidx);
+                        continue;
+                    }
                     int new_idx = ft_count++;
                     snprintf(ft_arr[new_idx].file_path, sizeof(ft_arr[new_idx].file_path), "%s",
                              fp);
                     ft_arr[new_idx].change_count = 1;
                     ft_arr[new_idx].last_modified = cf[c].timestamp;
-                    int *nidx = malloc(sizeof(int));
                     *nidx = new_idx;
-                    cbm_ht_set(file_idx, strdup(fp), nidx);
+                    cbm_ht_set(file_idx, key, nidx);
                 }
             }
         }

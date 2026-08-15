@@ -1,11 +1,25 @@
 # Manual trigger: test everything before pushing a release.
 # Each step can be skipped for faster iteration.
 #
-# Pipeline:  lint → test → build → smoke/soak   (sequential chain)
-# Security:  security-static + codeql-gate       (independent island)
+# Pipeline:  lint → test → build + candidate scan/select → smoke/soak
+# Security:  security-static + codeql-gate                    (independent island)
 #
 # Security does NOT block lint/test/build/smoke/soak. All jobs must pass
 # for the overall workflow to be green.
+#
+# Candidate VirusTotal scanning and tuple-local selection are part of the
+# reusable build boundary. Smoke and soak therefore start only after all 16
+# stripped/unstripped candidates have completed and the selected exact bytes
+# have been packaged under the canonical artifact names.
+#
+# The skips are independent because they answer different questions:
+#   skip_builds      no artifacts at all                 "do lint and tests pass?"
+#   skip_smoke       build + scan/select, no smoke       "does this diff scan red?"
+#   skip_virustotal  default-stripped + smoke, no scan   "do the archives pass CI?"
+#
+# skip_virustotal is a conspicuous dry-run-only bypass for API-quota-sensitive
+# iteration. It records unscanned-dry-run and deterministically chooses stripped
+# within each tuple. release.yml has no corresponding bypass.
 name: Dry Run
 
 on:
@@ -20,7 +34,15 @@ on:
         type: boolean
         default: false
       skip_builds:
-        description: 'Skip build + smoke'
+        description: 'Skip build + smoke (also skips VirusTotal — nothing to scan)'
+        type: boolean
+        default: false
+      skip_smoke:
+        description: 'Skip smoke (candidate scan/select still runs inside build)'
+        type: boolean
+        default: false
+      skip_virustotal:
+        description: 'Skip candidate scan; mark unscanned and default to stripped'
         type: boolean
         default: false
       soak_level:
@@ -51,6 +73,7 @@ jobs:
     with:
       skip_perf: true
       broad_platforms: true
+      shard_suites: true
 
   # ── Build all platforms ────────────────────────────────────────
   build:
@@ -63,13 +86,15 @@ jobs:
     uses: ./.github/workflows/_build.yml
     with:
       attest: false
+      scan_candidates: ${{ !inputs.skip_virustotal }}
+    secrets: inherit
 
   # ── Smoke test every binary ────────────────────────────────────
   # Run unless builds were skipped or a build leg FAILED. Every build leg
   # (including the macos-15-intel darwin-amd64 binary) is blocking now, so a
   # failed/missing platform binary correctly stops smoke — see _build.yml.
   smoke:
-    if: ${{ inputs.skip_builds != true && !cancelled() && needs.build.result != 'failure' && needs.build.result != 'skipped' }}
+    if: ${{ inputs.skip_builds != true && inputs.skip_smoke != true && !cancelled() && needs.build.result != 'failure' && needs.build.result != 'skipped' }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
     with:
@@ -83,3 +108,4 @@ jobs:
     with:
       duration_minutes: 10
       run_asan: ${{ inputs.soak_level == 'full' }}
+      use_release_artifacts: true

@@ -6,10 +6,51 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include <foundation/constants.h>
+#include <cbm.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+/* ── Label allowlist / SQL drift guard ──────────────────────────── */
+
+/* CONTRACT PIN. `cbm_label_is_type_like()` is documented in cbm.h as the single
+ * source of truth for type-like labels, "instead of scattering
+ * `|| strcmp(label,\"Struct\")==0` across the tree". A SQL string literal cannot
+ * call it, so four queries in store.c and the BM25 ranking in mcp.c hardcoded
+ * their own label lists — and silently stopped matching once Struct (Rust, Go,
+ * Swift, D) began being emitted. get_architecture and vector search dropped
+ * every struct in the project; search_code under-ranked them.
+ *
+ * This pins the SQL mirrors to the C predicate in BOTH directions, so the next
+ * type-like label fails here instead of quietly shrinking query results. */
+TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
+    /* Every label the C predicate accepts must appear in the SQL fragment. */
+    static const char *const type_like[] = {"Class", "Struct", "Interface",
+                                            "Enum",  "Type",   "Trait"};
+    for (size_t i = 0; i < sizeof(type_like) / sizeof(type_like[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_type_like(type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", type_like[i]);
+        ASSERT_NOT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+        ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, quoted));
+    }
+    /* And nothing the predicate rejects may be smuggled into the type-like
+     * fragment — otherwise the SQL would widen past the C contract. */
+    static const char *const not_type_like[] = {"Function", "Method", "Module",
+                                                "File",     "Folder", "Variable"};
+    for (size_t i = 0; i < sizeof(not_type_like) / sizeof(not_type_like[0]); i++) {
+        ASSERT_FALSE(cbm_label_is_type_like(not_type_like[i]));
+        char quoted[64];
+        snprintf(quoted, sizeof(quoted), "'%s'", not_type_like[i]);
+        ASSERT_NULL(strstr(CBM_SQL_TYPE_LIKE_LABELS, quoted));
+    }
+    /* The callable fragment carries exactly Function and Method on top. */
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Function'"));
+    ASSERT_NOT_NULL(strstr(CBM_SQL_CALLABLE_OR_TYPE_LABELS, "'Method'"));
+    PASS();
+}
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
@@ -456,6 +497,169 @@ TEST(store_file_hash_crud) {
     rc = cbm_store_get_file_hashes(s, "test", &hashes, &count);
     ASSERT_EQ(count, 0);
     cbm_store_free_file_hashes(hashes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_lsp_surface_round_trip) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Empty project: OK + zero rows — the "no surface data, route to full
+     * rebuild" signal, and the upgrade path for pre-table databases. */
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = CBM_NOT_FOUND;
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Batch with the field shapes the codec will produce: a real defs array,
+     * an empty surface, a binary bloom (with embedded NUL), and no bloom. */
+    const unsigned char bloom[] = {0x01, 0x00, 0xfe, 0x7f, 0x00, 0xab};
+    cbm_lsp_surface_row_t in[] = {
+        {.project = "test",
+         .rel_path = "pkg/a.go",
+         .surface_sha = "sha-a",
+         .defs_json = "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]",
+         .ref_bloom = bloom,
+         .ref_bloom_len = (int)sizeof(bloom),
+         .config_ctx = "cfg-1"},
+        {.project = "test",
+         .rel_path = "pkg/b.go",
+         .surface_sha = "sha-b",
+         .defs_json = "[]",
+         .ref_bloom = NULL,
+         .ref_bloom_len = 0,
+         .config_ctx = ""},
+    };
+    ASSERT_EQ(cbm_store_upsert_lsp_surface_batch(s, in, 2), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    /* ORDER BY rel_path: a.go before b.go. */
+    ASSERT_STR_EQ(rows[0].rel_path, "pkg/a.go");
+    ASSERT_STR_EQ(rows[0].surface_sha, "sha-a");
+    ASSERT_STR_EQ(rows[0].defs_json, "[{\"qn\":\"pkg.A\",\"sn\":\"A\",\"label\":\"Function\"}]");
+    ASSERT_STR_EQ(rows[0].config_ctx, "cfg-1");
+    ASSERT_EQ(rows[0].ref_bloom_len, (int)sizeof(bloom));
+    ASSERT_TRUE(rows[0].ref_bloom != NULL && memcmp(rows[0].ref_bloom, bloom, sizeof(bloom)) == 0);
+    ASSERT_STR_EQ(rows[1].rel_path, "pkg/b.go");
+    ASSERT_STR_EQ(rows[1].defs_json, "[]");
+    ASSERT_EQ(rows[1].ref_bloom_len, 0);
+    ASSERT_TRUE(rows[1].ref_bloom == NULL);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Upsert-on-conflict replaces the whole row, including dropping a bloom. */
+    cbm_lsp_surface_row_t update = {.project = "test",
+                                    .rel_path = "pkg/a.go",
+                                    .surface_sha = "sha-a2",
+                                    .defs_json = "[]",
+                                    .ref_bloom = NULL,
+                                    .ref_bloom_len = 0,
+                                    .config_ctx = ""};
+    ASSERT_EQ(cbm_store_upsert_lsp_surface_batch(s, &update, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].surface_sha, "sha-a2");
+    ASSERT_EQ(rows[0].ref_bloom_len, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    /* Project-scoped delete removes everything. */
+    ASSERT_EQ(cbm_store_delete_lsp_surfaces(s, "test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_lsp_surfaces(s, "test", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_lsp_surfaces(rows, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_dependent_files_lookup) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* a.py and c.py each call into b.py; b.py also references itself, and
+     * d.py sits apart. Dependents of {b.py} must be exactly {a.py, c.py}:
+     * the self-reference is not a dependent, d.py is unrelated. */
+    const char *files[] = {"a.py", "b.py", "c.py", "d.py"};
+    int64_t ids[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "test.%s.fn", files[i]);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = "fn",
+                        .qualified_name = qn,
+                        .file_path = files[i],
+                        .start_line = 1,
+                        .end_line = 2,
+                        .properties_json = "{}"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_TRUE(ids[i] > 0);
+    }
+    const int64_t edge_pairs[][2] = {{ids[0], ids[1]}, {ids[2], ids[1]}, {ids[1], ids[1]}};
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t e = {.project = "test",
+                        .source_id = edge_pairs[i][0],
+                        .target_id = edge_pairs[i][1],
+                        .type = "CALLS",
+                        .properties_json = "{}"};
+        ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    }
+
+    /* Structural container noise: a Folder node (placeholder file_path)
+     * with a CONTAINS_FILE edge into b.py must never surface as a
+     * dependent — it is not a source file and cannot be re-resolved. */
+    cbm_node_t folder = {.project = "test",
+                         .label = "Folder",
+                         .name = "pkg",
+                         .qualified_name = "test.pkg",
+                         .file_path = "{}",
+                         .start_line = 0,
+                         .end_line = 0,
+                         .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder);
+    ASSERT_TRUE(folder_id > 0);
+    cbm_edge_t contains = {.project = "test",
+                           .source_id = folder_id,
+                           .target_id = ids[1],
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    ASSERT_TRUE(cbm_store_insert_edge(s, &contains) > 0);
+
+    const char *targets[] = {"b.py"};
+    char **deps = NULL;
+    int dep_count = 0;
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets, 1, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 2);
+    bool saw_a = false;
+    bool saw_c = false;
+    for (int i = 0; i < dep_count; i++) {
+        saw_a = saw_a || strcmp(deps[i], "a.py") == 0;
+        saw_c = saw_c || strcmp(deps[i], "c.py") == 0;
+    }
+    ASSERT_TRUE(saw_a && saw_c);
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    /* No inbound edges: an isolated target has no dependents. */
+    const char *targets_d[] = {"d.py"};
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets_d, 1, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 0);
+    cbm_store_free_dependent_files(deps, dep_count);
+
+    /* A target list already containing the dependent excludes it: asking for
+     * dependents of {a.py, b.py} returns only c.py. */
+    const char *targets_ab[] = {"a.py", "b.py"};
+    ASSERT_EQ(cbm_store_get_dependent_files(s, "test", targets_ab, 2, &deps, &dep_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dep_count, 1);
+    ASSERT_STR_EQ(deps[0], "c.py");
+    cbm_store_free_dependent_files(deps, dep_count);
 
     cbm_store_close(s);
     PASS();
@@ -1057,6 +1261,48 @@ TEST(store_integrity_corrupt_too_many_rows) {
     }
     ASSERT_FALSE(cbm_store_check_integrity(s));
     cbm_store_close(s);
+    PASS();
+}
+
+/* ── Quarantine verdict (#1206, #1037) ──────────────────────────────
+ *
+ * The bool check above cannot answer the only question the quarantine path
+ * actually asks: "is this database damaged, or did I just lose a lock race?"
+ * Answering "damaged" to the second question is what made concurrent instances
+ * rename each other's HEALTHY databases to .corrupt (#1206). These bind the
+ * three-way verdict so that behaviour cannot come back. */
+
+TEST(store_integrity_verdict_healthy_is_ok) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "healthy-proj", "/tmp/healthy");
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_OK);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_real_corruption_is_corrupt) {
+    /* Structural damage the shallow check can see: node IDs landing in
+     * root_path. This one MUST be quarantinable — a verdict that never says
+     * CORRUPT would protect broken databases instead of users. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_exec(db,
+                 "INSERT INTO projects (name, indexed_at, root_path) "
+                 "VALUES ('broken', '2024-01-01', '826');",
+                 NULL, NULL, NULL);
+    ASSERT_EQ(cbm_store_check_integrity_verdict(s), CBM_INTEGRITY_CORRUPT);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt) {
+    /* A handle we could not open tells us NOTHING about the file's contents.
+     * Reporting CORRUPT here is how a database nobody could read got renamed
+     * and rebuilt from scratch (#1206) — the destructive answer to a question
+     * that was never asked. */
+    ASSERT_EQ(cbm_store_check_integrity_verdict(NULL), CBM_INTEGRITY_TRANSIENT);
     PASS();
 }
 
@@ -1930,6 +2176,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
@@ -1938,6 +2185,9 @@ SUITE(store_nodes) {
     RUN_TEST(store_integrity_corrupt_bad_path);
     RUN_TEST(store_integrity_windows_lowercase_drive_issue367);
     RUN_TEST(store_integrity_corrupt_too_many_rows);
+    RUN_TEST(store_integrity_verdict_healthy_is_ok);
+    RUN_TEST(store_integrity_verdict_real_corruption_is_corrupt);
+    RUN_TEST(store_integrity_verdict_unopenable_is_transient_not_corrupt);
     RUN_TEST(store_integrity_null_check);
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
@@ -1954,6 +2204,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_batch_empty);
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
+    RUN_TEST(store_lsp_surface_round_trip);
+    RUN_TEST(store_dependent_files_lookup);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);

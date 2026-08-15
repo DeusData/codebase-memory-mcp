@@ -70,10 +70,8 @@ export const messages = {
       processLogs: "Process Logs",
       noProcesses: "No processes found",
       noLogs: "No logs yet",
-      kill: "Kill",
       thisProcess: "THIS",
       uptime: "Uptime",
-      killConfirm: (pid: number) => `Kill process ${pid}?`,
     },
   },
   zh: {
@@ -143,10 +141,8 @@ export const messages = {
       processLogs: "进程日志",
       noProcesses: "未找到进程",
       noLogs: "暂无日志",
-      kill: "结束",
       thisProcess: "本进程",
       uptime: "运行时间",
-      killConfirm: (pid: number) => `结束进程 ${pid}？`,
     },
   },
 } as const;
@@ -156,8 +152,22 @@ export type UiMessages = (typeof messages)[UiLanguage];
 export function detectLanguage(acceptLanguage?: string | null, override?: string | null): UiLanguage {
   if (override === "zh" || override === "en") return override;
   if (!acceptLanguage) return "en";
-  const normalized = acceptLanguage.toLowerCase();
-  return normalized.includes("zh-cn") || normalized.includes("zh") ? "zh" : "en";
+
+  // Ranked by q, not by whether "zh" appears anywhere. A substring test served
+  // Chinese for "en-US,en;q=0.9,zh;q=0.5", where English is clearly preferred,
+  // and for "zh;q=0, en", where q=0 means Chinese is unacceptable.
+  const best = acceptLanguage
+    .split(",")
+    .map((part) => {
+      const [tag, ...params] = part.trim().split(";");
+      const q = params.map((p) => /^\s*q\s*=\s*([\d.]+)\s*$/i.exec(p)).find(Boolean);
+      return { tag: tag.trim().toLowerCase(), q: q ? Number(q[1]) : 1 };
+    })
+    .filter(({ tag, q }) => tag && Number.isFinite(q) && q > 0)
+    .sort((a, b) => b.q - a.q)
+    .find(({ tag }) => tag.split("-")[0] === "zh" || tag.split("-")[0] === "en");
+
+  return best?.tag.startsWith("zh") ? "zh" : "en";
 }
 
 let cachedLanguage: UiLanguage = "en";

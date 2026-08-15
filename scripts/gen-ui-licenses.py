@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit a markdown license appendix for the embedded graph-UI bundle.
+"""Emit a markdown license appendix for the external graph-UI asset pack.
 
 Usage: gen-ui-licenses.py <graph-ui-dir>
 
@@ -78,10 +78,10 @@ def main():
     excluded = set()
     collect(ui_dir, tree.get("dependencies"), pkgs, excluded)
 
-    print("## Embedded Graph UI — bundled npm packages")
+    print("## External Graph UI asset pack — bundled npm packages")
     print()
-    print("The `-ui` binaries embed a compiled frontend bundle. The packages")
-    print("below are its production dependency tree; their license texts are")
+    print("The `-ui` archives ship a compiled frontend asset pack beside the binary.")
+    print("The packages below are its production dependency tree; license texts are")
     print("reproduced verbatim from the packages as installed at build time.")
     print()
 

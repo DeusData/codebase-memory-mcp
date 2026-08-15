@@ -70,6 +70,15 @@ void cbm_log(CBMLogLevel level, const char *msg, ...);
 /* Convenience macros. */
 #define cbm_log_debug(msg, ...) cbm_log(CBM_LOG_DEBUG, msg, ##__VA_ARGS__, NULL)
 #define cbm_log_info(msg, ...) cbm_log(CBM_LOG_INFO, msg, ##__VA_ARGS__, NULL)
+
+/* Always-delivered internal control/discovery record. It bypasses the level
+ * threshold and always uses the JSON encoding, so exact values (paths with
+ * spaces or control bytes) survive unambiguously; it flows through the
+ * configured sink like every other record. Reserve it for the rare
+ * discovery/control events that ordinary log filtering must never suppress
+ * (e.g. diagnostics.start path announcement). */
+void cbm_log_control_record(const char *msg, ...);
+#define cbm_log_control(msg, ...) cbm_log_control_record(msg, ##__VA_ARGS__, NULL)
 #define cbm_log_warn(msg, ...) cbm_log(CBM_LOG_WARN, msg, ##__VA_ARGS__, NULL)
 #define cbm_log_error(msg, ...) cbm_log(CBM_LOG_ERROR, msg, ##__VA_ARGS__, NULL)
 
@@ -82,6 +91,29 @@ void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_erro
                          int64_t duration_us);
 void cbm_log_http_request(const char *component, const char *method, const char *path, int status,
                           int64_t duration_ms, size_t request_bytes, size_t response_bytes);
+
+/* Crash-durable log stream.
+ *
+ * Enable in a process whose stderr is redirected to a FILE that has to survive
+ * the process dying abnormally — today that is the supervised index worker,
+ * whose `.worker-*.log` is the only post-mortem evidence a contained crash,
+ * SIGKILL or hang leaves behind. Default stdio buffering loses exactly that
+ * evidence: the C standard only promises stderr is "not fully buffered", and
+ * the Windows CRT gives a redirected stderr FULL buffering, so a worker that
+ * aborts or is killed takes its whole diagnostic with it and the user is left
+ * holding a 0-byte log (#1070, #1130, #1132, #1133, #1145, #1450).
+ *
+ * Two mechanisms, deliberately both: setvbuf(_IONBF) covers EVERY writer to
+ * the stream (including the plain fprintf(stderr, …) startup errors that
+ * explain a worker which never got as far as logging), and a per-line flush
+ * covers the case where setvbuf is refused because the stream was already
+ * written to — it is only guaranteed before a stream's first operation.
+ *
+ * Also the process-wide answer to "is this log post-mortem evidence?", which
+ * is what makes the per-file breadcrumb worth its volume in a worker and not
+ * anywhere else. Cost is ~0: flushing an unbuffered stream writes nothing. */
+void cbm_log_set_crash_durable(bool enabled);
+bool cbm_log_crash_durable(void);
 
 /* Optional log sink callback — called with the formatted log line. */
 typedef void (*cbm_log_sink_fn)(const char *line);

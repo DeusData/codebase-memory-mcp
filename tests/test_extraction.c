@@ -8,6 +8,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
+#include "../src/foundation/compat_fs.h"
 #include <time.h>
 #include "macro_table.h"
 #include "iris_export_xml.h"
@@ -52,6 +53,18 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
 }
 
 /* Count definitions with a given label. */
+/* Check for a definition with the given qualified name. Distinct from
+ * find_def_by_name, which returns the first match by NAME and so cannot tell two
+ * same-named definitions in different scopes apart — exactly the case that
+ * attrpath qualification exists to separate. */
+static int has_def_qn(CBMFileResult *r, const char *qn) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int count_defs_with_label(CBMFileResult *r, const char *label) {
     int count = 0;
     for (int i = 0; i < r->defs.count; i++) {
@@ -160,6 +173,55 @@ TEST(extract_cpp_macros_issue375) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Macro", "MAX"));
     ASSERT(has_def(r, "Macro", "PI"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1071: a function-like macro invocation whose argument is a TYPE token
+ * (SYNTH_ALLOC_ARRAY(char, n)) makes tree-sitter's C++ grammar emit an ERROR
+ * node — it parses `char` in expression position — which cbm_collect_error_regions
+ * records as a `parse_partial` coverage gap, even though the file is a valid,
+ * in-file macro use with nothing actually missing from the graph. */
+TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071) {
+    CBMFileResult *r = extract("#include <cstddef>\n"
+                               "#include <cstdlib>\n"
+                               "\n"
+                               "#define SYNTH_ALLOC_ARRAY(Type, Count) \\\n"
+                               "  ((Type*)std::malloc(sizeof(Type) * (Count)))\n"
+                               "\n"
+                               "struct Buffer {\n"
+                               "  char* data;\n"
+                               "  std::size_t size;\n"
+                               "};\n"
+                               "\n"
+                               "Buffer make_buffer(std::size_t n) {\n"
+                               "  Buffer b;\n"
+                               "  b.data = SYNTH_ALLOC_ARRAY(char, n);\n"
+                               "  b.size = n;\n"
+                               "  return b;\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "alloc.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete); /* benign in-body macro call — not a coverage gap */
+    ASSERT(has_def(r, "Function", "make_buffer"));
+    ASSERT(has_def(r, "Macro", "SYNTH_ALLOC_ARRAY"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1071 guard: the suppression must be tight. A REAL parse error inside a
+ * function (not a macro call) must STILL be flagged, and a top-level macro
+ * invocation is covered by extract_cpp_preproc_macro_generated_callable_skipped_issue949. */
+TEST(extract_cpp_real_in_body_error_still_flagged_issue1071) {
+    /* `int x = ;` is a genuine syntax error inside foo()'s body — no macro
+     * involved, so the coverage gap must not be suppressed. */
+    CBMFileResult *r = extract("int foo() {\n"
+                               "  int x = ;\n"
+                               "  return x;\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "broken.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete); /* real gap stays reported */
     cbm_free_result(r);
     PASS();
 }
@@ -365,6 +427,55 @@ TEST(java_interface) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def_any(r, "Repository"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Regression for #1234: Java interface/enum methods were emitted as both a
+ * Method node (correct, via extract_class_methods) and a duplicate Function
+ * node (incorrect, via walk_defs). Prevention in push_class_body_children
+ * (gated to Java) recognizes interface_body and enum_body as class body
+ * containers, stopping the fallback path from re-walking method_declaration
+ * children as top-level functions. */
+TEST(java_interface_no_duplicate_function_issue1234) {
+    CBMFileResult *r =
+        extract("public interface MarketplaceService {\n"
+                "    ReservationDTO createReservation(Authentication auth, RequestDTO req);\n"
+                "    void cancelReservation(long id);\n"
+                "}\n",
+                CBM_LANG_JAVA, "t", "MarketplaceService.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_def(r, "Interface", "MarketplaceService"));
+    ASSERT(has_def(r, "Method", "createReservation"));
+    ASSERT(has_def(r, "Method", "cancelReservation"));
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(java_enum_dedup_preserves_calls_issue1234) {
+    CBMFileResult *r =
+        extract("package app;\n\nenum Day {\n"
+                "    MON, TUE, WED, THU, FRI, SAT, SUN;\n\n"
+                "    public boolean isWeekend() { return this == SAT || this == SUN; }\n"
+                "    public String label() { return name().toLowerCase(); }\n}\n\n"
+                "class DayUtil {\n"
+                "    static String describe(Day d) {\n"
+                "        return d.label() + (d.isWeekend() ? \"(rest)\" : \"(work)\");\n    }\n}\n",
+                CBM_LANG_JAVA, "t", "Day.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT(has_def(r, "Enum", "Day"));
+    ASSERT(has_def(r, "Method", "isWeekend"));
+    ASSERT(has_def(r, "Method", "label"));
+    ASSERT(has_def(r, "Class", "DayUtil"));
+    ASSERT(has_def(r, "Method", "describe"));
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+
     cbm_free_result(r);
     PASS();
 }
@@ -812,6 +923,25 @@ TEST(ts_class) {
     PASS();
 }
 
+TEST(body_tokens_type_identifier) {
+    CBMFileResult *r = extract("function serialize(obj: MyModel): SerializedResult {\n"
+                               "  const result: SerializedResult = new SerializedResult();\n"
+                               "  return result;\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "serial.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "serialize") == 0) {
+            ASSERT_NOT_NULL(r->defs.items[i].body_tokens);
+            ASSERT(strstr(r->defs.items[i].body_tokens, "SerializedResult") != NULL);
+            break;
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Lua --- */
 TEST(lua_function) {
     CBMFileResult *r = extract(
@@ -1137,6 +1267,237 @@ TEST(nix_function) {
     PASS();
 }
 
+/* A Nix file's root expression is normally itself a function (`{ pkgs, lib, ... }:`)
+ * — the near-universal library/module header. Definitions must survive that header.
+ * Each shape below is asserted separately so a regression names the shape it broke.
+ * `nix_function` above deliberately stays as-is: its binding is an application, not
+ * a function, so it pins the "parses, no def" case and cannot cover this. */
+TEST(nix_defs_in_let_rooted_file) {
+    CBMFileResult *r = extract("let\n  alpha = x: x + 1;\n  beta = { a, b }: a + b;\nin\n"
+                               "{ inherit alpha beta; }\n",
+                               CBM_LANG_NIX, "t", "bare.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "alpha"));
+    ASSERT(has_def(r, "Function", "beta"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(nix_defs_in_attrset_rooted_file) {
+    CBMFileResult *r = extract("{\n  epsilon = x: x + 1;\n  zeta = { a, b }: a + b;\n}\n",
+                               CBM_LANG_NIX, "t", "attrset.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "epsilon"));
+    ASSERT(has_def(r, "Function", "zeta"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(nix_defs_in_nested_let) {
+    CBMFileResult *r = extract("let\n  outer =\n    let theta = x: x + 1;\n    in theta;\n"
+                               "in\n{ inherit outer; }\n",
+                               CBM_LANG_NIX, "t", "nested.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "theta"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The regression this suite previously could not see: the root `{ prelude }:` matches
+ * nix_func_types, resolves no name of its own, and — before the fix — terminated the
+ * walk, so nothing below the header was ever visited. */
+TEST(nix_defs_survive_function_header_let) {
+    CBMFileResult *r = extract("{ prelude }:\nlet\n  gamma = x: x + 1;\n"
+                               "  delta = { a, b }: a + b;\nin\n{ inherit gamma delta; }\n",
+                               CBM_LANG_NIX, "t", "wrapped.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "gamma"));
+    ASSERT(has_def(r, "Function", "delta"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(nix_defs_survive_function_header_attrset) {
+    CBMFileResult *r = extract("{ prelude }:\n{\n  eta = x: x + 1;\n}\n", CBM_LANG_NIX, "t",
+                               "wrapped_attrset.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "eta"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A curried header — `final: prev: { … }` is the standard nixpkgs overlay signature, and
+ * the most common multi-arm header in the ecosystem. Two nested function_expressions sit
+ * between the file root and the body. */
+TEST(nix_defs_survive_curried_header) {
+    CBMFileResult *r =
+        extract("final: prev: {\n  kappa = x: x + 1;\n}\n", CBM_LANG_NIX, "t", "overlay.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "kappa"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A Nix binding's name is a PATH, and the extractor previously took only its first
+ * segment. Convention here matches C++ namespaces — `ns::serialize` is name
+ * `serialize`, QN `proj.file.ns.serialize` — so a Nix binding is name = leaf
+ * segment, QN = enclosing scope + leaf. */
+TEST(nix_attrset_scope_disambiguates_leaf_names) {
+    CBMFileResult *r =
+        extract("{\n  setA = { dup = x: x + 1; };\n  setB = { dup = y: y + 2; };\n}\n",
+                CBM_LANG_NIX, "t", "collide.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* Both survive. Unqualified, these shared one QN, so the second definition —
+     * and every CALLS edge sourced from it — was silently discarded at write. */
+    ASSERT(count_defs_with_label(r, "Function") == 2);
+    ASSERT(has_def_qn(r, "t.collide.setA.dup"));
+    ASSERT(has_def_qn(r, "t.collide.setB.dup"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `a.b.fn = …` is sugar for `a = { b = { fn = …; }; }`. Both spellings must yield
+ * the same name and the same QN; the leading segments are scope, not name. */
+TEST(nix_dotted_attrpath_qualifies_like_nested) {
+    CBMFileResult *r = extract("{\n  wrap.deep.fn = z: z + 1;\n}\n", CBM_LANG_NIX, "t", "d.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "fn"));
+    ASSERT(has_def_qn(r, "t.d.wrap.deep.fn"));
+
+    CBMFileResult *n =
+        extract("{\n  wrap = { deep = { fn = z: z + 1; }; };\n}\n", CBM_LANG_NIX, "t", "d.nix");
+    ASSERT_NOT_NULL(n);
+    ASSERT_FALSE(n->has_error);
+    /* The equality that makes this a correctness fix rather than a preference. */
+    ASSERT(has_def_qn(n, "t.d.wrap.deep.fn"));
+    cbm_free_result(n);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A quoted segment is an ordinary name that merely needs quoting in source. The
+ * delimiters are not part of it, and leaving them in means every consumer keying
+ * on the name has to know to re-quote. */
+TEST(nix_quoted_attr_name_strips_quotes) {
+    CBMFileResult *r = extract("{\n  \"kebab-case\" = a: a;\n  svc.\"my.name\" = b: b;\n}\n",
+                               CBM_LANG_NIX, "t", "q.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "kebab-case"));
+    ASSERT_FALSE(has_def_any(r, "\"kebab-case\""));
+    ASSERT(has_def_qn(r, "t.q.kebab-case"));
+    /* A quoted segment may itself contain dots; they are part of the name, not
+     * path separators, but the QN is a dotted string either way. */
+    ASSERT(has_def(r, "Function", "my.name"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `"${x}" = …` has no statically knowable name. Minting it produces a def named
+ * `"${x}"` that nothing can look up or resolve a call against, so mint nothing —
+ * the same call the Makefile dot-prefix guard makes. */
+TEST(nix_interpolated_attr_mints_no_def) {
+    CBMFileResult *r =
+        extract("{\n  \"${dynamic}\" = a: a;\n  fixed = b: b;\n}\n", CBM_LANG_NIX, "t", "i.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "fixed"));
+    ASSERT(count_defs_with_label(r, "Function") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Nix Variables. `nix_var_types` has always declared `binding`, but no Nix name
+ * resolver existed, so the count was unconditionally zero.
+ *
+ * Scope follows the rule every other language uses: extract_variables mints FILE
+ * scope and never locals — a C++ declaration inside a function body is not a
+ * Variable. For Nix, file scope is the `let` bindings and the returned attrset;
+ * anything in a deeper attrset is not. Without that bound a NixOS module's
+ * settings tree would mint a node per `enable = true`. */
+TEST(nix_module_level_bindings_mint_variables) {
+    CBMFileResult *r = extract("{ pkgs, lib, ... }:\n"
+                               "let\n"
+                               "  privateConst = 42;\n"
+                               "in\n"
+                               "{\n"
+                               "  exported = \"value\";\n"
+                               "  services.nginx.enable = true;\n"
+                               "}\n",
+                               CBM_LANG_NIX, "t", "mod.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* A let binding is file scope in the same sense a C++ file-static is. */
+    ASSERT(has_def(r, "Variable", "privateConst"));
+    ASSERT(has_def(r, "Variable", "exported"));
+    /* The QN carries the attrpath, exactly as it does for functions. */
+    ASSERT(has_def(r, "Variable", "enable"));
+    ASSERT(has_def_qn(r, "t.mod.services.nginx.enable"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The flood guard. Each absence assertion is paired with a positive one on the
+ * same predicate in the same result, so none can pass by extracting nothing. */
+TEST(nix_nested_bindings_are_not_module_level) {
+    CBMFileResult *r = extract("{ pkgs }:\n"
+                               "{\n"
+                               "  topLevel = 1;\n"
+                               "  deep = {\n"
+                               "    nested = {\n"
+                               "      shouldNotAppear = 2;\n"
+                               "    };\n"
+                               "  };\n"
+                               "}\n",
+                               CBM_LANG_NIX, "t", "deep.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Variable", "topLevel")); /* positive control */
+    ASSERT_FALSE(has_def_any(r, "shouldNotAppear"));
+    /* `deep` is an attrset — a scope, not a value — so not a Variable either. */
+    ASSERT_FALSE(has_def(r, "Variable", "deep"));
+    ASSERT_FALSE(has_def(r, "Variable", "nested"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A lambda-valued binding is already minted as a Function by the def walk. Minting
+ * it again here would double-count every helper in the ecosystem. */
+TEST(nix_lambda_binding_is_function_not_variable) {
+    CBMFileResult *r =
+        extract("{\n  fn = x: x + 1;\n  val = 7;\n}\n", CBM_LANG_NIX, "t", "mix.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "fn"));
+    ASSERT_FALSE(has_def(r, "Variable", "fn"));
+    ASSERT(has_def(r, "Variable", "val")); /* positive control */
+    ASSERT_FALSE(has_def(r, "Function", "val"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Descending past the header must not mint a second def from a curried lambda's inner
+ * arm: `iota = a: b: ...` is one named function, not two. The inner `b:` has a
+ * function_expression parent, resolves no name, and must stay out. */
+TEST(nix_curried_lambda_mints_one_def) {
+    CBMFileResult *r = extract("{ prelude }:\nlet\n  iota = a: b: a + b;\nin\n{ inherit iota; }\n",
+                               CBM_LANG_NIX, "t", "curried.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "iota"));
+    ASSERT(count_defs_with_label(r, "Function") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Fortran --- */
 TEST(fortran_function) {
     /* Fortran subroutine name extraction is incomplete — just verify no crash */
@@ -1273,6 +1634,41 @@ TEST(cpp_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->defs.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1266: GoogleTest TEST() macros with the same name collapse into a single
+ * node when multiple tests share a file. Each must mint a distinct Function
+ * node whose name encodes the suite and case arguments. */
+TEST(cpp_gtest_same_name_collision_issue1266) {
+    CBMFileResult *r = extract(
+        "namespace demo { int assembleWidget(int s) { return s * 2; } }\n"
+        "TEST(WidgetSuite, DoublesSmallSize) { demo::assembleWidget(1); }\n"
+        "TEST(WidgetSuite, DoublesZero) { demo::assembleWidget(0); }\n"
+        "TEST(WidgetSuite, DoublesLargeSize) {\n"
+        "  demo::assembleWidget(1000);\n"
+        "}\n",
+        CBM_LANG_CPP, "t", "direct_test.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesSmallSize"));
+    ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesZero"));
+    ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesLargeSize"));
+    ASSERT(!has_def(r, "Function", "TEST"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1266: TEST_F fixture macro also produces unique names. */
+TEST(cpp_gtest_f_unique_name_issue1266) {
+    CBMFileResult *r = extract(
+        "TEST_F(MyFixture, FirstTest) { doStuff(); }\n"
+        "TEST_F(MyFixture, SecondTest) { doOtherStuff(); }\n",
+        CBM_LANG_CPP, "t", "fixture_test.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Function", "TEST_F_MyFixture_FirstTest"));
+    ASSERT(has_def(r, "Function", "TEST_F_MyFixture_SecondTest"));
+    ASSERT(!has_def(r, "Function", "TEST_F"));
     cbm_free_result(r);
     PASS();
 }
@@ -2831,6 +3227,30 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* A comment between decorators must not drop the decorators above it.
+ * Comments are NAMED tree-sitter nodes, so the prev-sibling walk used to stop
+ * at one — a documented route (@Post + @HttpCode above an explanatory comment)
+ * silently lost those decorators and disappeared from route/authz queries. */
+TEST(extract_ts_decorators_survive_interleaved_comment) {
+    CBMFileResult *r = extract("class AuthController {\n"
+                               "  @Post('login')\n"
+                               "  @HttpCode(HttpStatus.OK)\n"
+                               "  // throttled per IP and per account\n"
+                               "  @Throttle({ default: { ttl: 900_000, limit: 5 } })\n"
+                               "  async login(dto: LoginDto) { return 1; }\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "auth.controller.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "login");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "Throttle"));  /* below the comment — always worked */
+    ASSERT(decorators_contain(m, "HttpCode"));  /* above the comment — was dropped */
+    ASSERT(decorators_contain(m, "Post"));      /* above the comment — was dropped */
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Find an in-body call by its raw callee text; returns the call or NULL. */
 static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -2840,6 +3260,88 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     }
     return NULL;
 }
+
+/* Issue #1006: JS/TS template-literal URLs must flatten ${...} substitutions
+ * to the canonical "{}" placeholder, both as call arguments (HTTP_CALLS) and
+ * as URL-shaped string_refs collected from const/return positions. */
+TEST(extract_ts_template_string_url_issue1006) {
+    CBMFileResult *r = extract("export function detailPath(id: string): string {\n"
+                               "  return `/api/v1/things/${id}/detail`;\n"
+                               "}\n"
+                               "export function load(id: string) {\n"
+                               "  return fetch(`/api/v1/things/${id}`);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "paths.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "fetch");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/things/{}");
+    int found = 0;
+    for (int i = 0; i < r->string_refs.count; i++) {
+        if (r->string_refs.items[i].value &&
+            strcmp(r->string_refs.items[i].value, "/api/v1/things/{}/detail") == 0) {
+            found = 1;
+            break;
+        }
+    }
+    ASSERT(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #1249: a mux route built as `configVar + "/literal"` (Go's idiomatic
+ * configurable-base-path pattern) must index the literal suffix, both for a
+ * route registration and for an outbound URL built the same way. A real BFF
+ * with 47 such registrations produced only 9 Route nodes before this fix. */
+TEST(extract_go_binary_concat_url_issue1249) {
+    CBMFileResult *r = extract("package main\n"
+                               "import \"net/http\"\n"
+                               "func setup(mux *http.ServeMux, base string) {\n"
+                               "    mux.HandleFunc(base+\"/login\", loginHandler)\n"
+                               "}\n"
+                               "func report(host string, port string) {\n"
+                               "    http.Get(\"http://\" + host + \":\" + port + \"/log\")\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *reg = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NOT_NULL(reg->first_string_arg);
+    ASSERT_STR_EQ(reg->first_string_arg, "/login");
+
+    const CBMCall *out = find_call_by_callee(r, "http.Get");
+    ASSERT_NOT_NULL(out);
+    ASSERT_NOT_NULL(out->first_string_arg);
+    ASSERT_STR_EQ(out->first_string_arg, "/log");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue: when the right side of the concatenation is not itself a
+ * literal (`base + suffixVar`), there is no literal route to recover. The
+ * fix must leave this unresolved rather than fabricate a path. */
+TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
+    CBMFileResult *r = extract("package main\n"
+                               "func setup(mux *http.ServeMux, base string, suffix string) {\n"
+                               "    mux.HandleFunc(base+suffix, dynHandler)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *reg = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NULL(reg->first_string_arg);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 
 /* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
  * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
@@ -3529,6 +4031,138 @@ TEST(extract_c_ifdef_split_brace_fn_recovered_issue961) {
     PASS();
 }
 
+static const char *CPP_PREPROC_SIGNATURE_GAP_SRC =
+    "struct Rect {};\n"
+    "struct IBinder {};\n"
+    "struct IRegionSamplingListener {};\n"
+    "typedef int status_t;\n"
+    "\n"
+    "class SurfaceFlinger {\n"
+    "public:\n"
+    "    status_t addRegionSamplingListener(const Rect&, const IBinder&,\n"
+    "                                       const IRegionSamplingListener&, bool);\n"
+    "    status_t addRegionSamplingListener(const Rect&, const IBinder&,\n"
+    "                                       const IRegionSamplingListener&);\n"
+    "    void commit();\n"
+    "    void composite();\n"
+    "};\n"
+    "\n"
+    "#ifdef FLYME_GRAPHICS_EXTEND_LUMARGB\n"
+    "status_t SurfaceFlinger::addRegionSamplingListener(const Rect& samplingArea,\n"
+    "                                                   const IBinder& stopLayerHandle,\n"
+    "                                                   const IRegionSamplingListener& listener,\n"
+    "                                                   const bool rgbSample) {\n"
+    "#else\n"
+    "status_t SurfaceFlinger::addRegionSamplingListener(const Rect& samplingArea,\n"
+    "                                                   const IBinder& stopLayerHandle,\n"
+    "                                                   const IRegionSamplingListener& listener) "
+    "{\n"
+    "#endif\n"
+    "    return 0;\n"
+    "}\n"
+    "\n"
+    "void SurfaceFlinger::commit() {}\n"
+    "\n"
+    "void SurfaceFlinger::composite() {}\n";
+
+/* #946 fixture from the original report: both preprocessor choices must keep
+ * raw definitions primary while recovering later methods at original lines. */
+TEST(extract_cpp_preproc_signature_gap_issue946) {
+    const char *defines[] = {"FLYME_GRAPHICS_EXTEND_LUMARGB", NULL};
+    for (int enabled = 0; enabled < 2; enabled++) {
+        CBMFileResult *r = cbm_extract_file(
+            CPP_PREPROC_SIGNATURE_GAP_SRC, (int)strlen(CPP_PREPROC_SIGNATURE_GAP_SRC), CBM_LANG_CPP,
+            "t", "SurfaceFlinger.cpp", 0, enabled ? defines : NULL, NULL);
+        ASSERT_NOT_NULL(r);
+        const CBMDefinition *add = find_def(r, "addRegionSamplingListener");
+        const CBMDefinition *commit = find_def(r, "commit");
+        const CBMDefinition *composite = find_def(r, "composite");
+        ASSERT_NOT_NULL(add);
+        ASSERT_NOT_NULL(commit);
+        ASSERT_NOT_NULL(composite);
+        ASSERT_EQ(add->start_line, 22u);
+        ASSERT_EQ(add->end_line, 27u);
+        ASSERT_EQ(commit->start_line, 29u);
+        ASSERT_EQ(commit->end_line, 29u);
+        ASSERT_EQ(composite->start_line, 31u);
+        ASSERT_EQ(composite->end_line, 31u);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Macro expansion can produce callable-looking AST nodes, but no callable
+ * definition exists in the original span; recovery must fail closed. */
+TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949) {
+    const char *src = "#define MAKE_FN(name) int name() { return 1; }\n"
+                      "#ifdef ENABLE_GENERATED\n"
+                      "MAKE_FN(generated)\n"
+                      "#endif\n"
+                      "int visible() { return 0; }\n";
+    const char *defines[] = {"ENABLE_GENERATED", NULL};
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "t", "macro.cpp", 0, defines, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(find_def(r, "generated"));
+    ASSERT_NOT_NULL(find_def(r, "visible"));
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #949 follow-up: an included header shifts physical lines in simplecpp's
+ * expanded output. The #1050 name-on-same-line guard skipped this recoverable
+ * definition; explicit source ownership mapping must restore its original
+ * coordinates while keeping header definitions out of the main file. */
+TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cbm_line_map_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char header_path[512];
+    snprintf(header_path, sizeof(header_path), "%s/padding.h", tmpdir);
+    FILE *header = cbm_fopen(header_path, "wb");
+    ASSERT_NOT_NULL(header);
+    for (int i = 0; i < 40; i++) {
+        ASSERT_GTE(fprintf(header, "static int header_pad_%d(void) { return %d; }\n", i, i), 0);
+    }
+    ASSERT_EQ(fclose(header), 0);
+
+    const char *includes[] = {tmpdir, NULL};
+    const char *src = "#include \"padding.h\"\n"
+                      "static int before(void) { return 1; }\n"
+                      "int shifted_split(int x) {\n"
+                      "#ifdef _WIN32\n"
+                      "    if (before()) {\n"
+                      "#else\n"
+                      "    if (x > 0) {\n"
+                      "#endif\n"
+                      "        x += 1;\n"
+                      "    }\n"
+                      "    return x;\n"
+                      "}\n"
+                      "int after(void) { return 2; }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_C, "t", "shifted.c", 0, NULL, includes);
+    cbm_unlink(header_path);
+    cbm_rmdir(tmpdir);
+
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def(r, "shifted_split");
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(d->start_line, 3u);
+    ASSERT_EQ(d->end_line, 12u);
+    ASSERT_NULL(find_def(r, "header_pad_0"));
+    ASSERT_NOT_NULL(find_def(r, "after"));
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #961 inverse guard: a clean C file must not gain duplicate or phantom
  * defs from the recovery path (it only engages on raw-parse ERROR regions). */
 TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
@@ -3620,6 +4254,81 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     PASS();
 }
 
+/* #1017: docstring truncation at MAX_COMMENT_LEN (500 bytes) can split a
+ * multi-byte UTF-8 character, leaving an incomplete byte sequence.
+ * Craft a Go comment whose 498th-500th bytes are a 3-byte CJK character
+ * (U+6210 = 成 = e6 88 90).  The raw byte truncation at offset 500 lands
+ * one byte past the character start, splitting it.  After the fix the
+ * truncated string must end on a complete codepoint boundary. */
+TEST(docstring_utf8_truncation_boundary_issue1017) {
+    /* Build a comment: "// " (3 bytes) + 495 ASCII 'A' + "成成成" (9 bytes)
+     * Total comment text = 3 + 495 + 9 = 507 bytes.
+     * MAX_COMMENT_LEN = 500.  The first kanji (成 = e6 88 90) occupies
+     * offsets 498-500, so text[500] = '\0' keeps bytes 0-499: the lead
+     * byte 0xe6 plus one continuation 0x88 — an incomplete 2-of-3 sequence.
+     * Before fix: the truncated string ended with that broken pair. */
+    char comment[600];
+    int off = 0;
+    comment[off++] = '/';
+    comment[off++] = '/';
+    comment[off++] = ' ';
+    for (int i = 0; i < 495; i++)
+        comment[off++] = 'A';
+    /* U+6210 (成) = 0xe6 0x88 0x90 — 3-byte UTF-8 */
+    const char *kanji = "\xe6\x88\x90";
+    for (int k = 0; k < 3; k++) {
+        memcpy(comment + off, kanji, 3);
+        off += 3;
+    }
+    comment[off] = '\0';
+
+    /* Wrap in a Go function so the comment becomes the docstring. */
+    char src[800];
+    snprintf(src, sizeof(src), "package main\n\n%s\nfunc Compute() {}\n", comment);
+
+    CBMFileResult *r = extract(src, CBM_LANG_GO, "test", "main.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "Compute"));
+
+    const char *doc = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Compute") == 0) {
+            doc = r->defs.items[i].docstring;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(doc);
+
+    /* Verify every byte in the truncated docstring is valid UTF-8:
+     * no trailing incomplete multi-byte sequence. */
+    size_t len = strlen(doc);
+    ASSERT_TRUE(len <= 500);
+    const unsigned char *u = (const unsigned char *)doc;
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = u[i];
+        int seq_len;
+        if (c < 0x80)
+            seq_len = 1;
+        else if ((c & 0xE0) == 0xC0)
+            seq_len = 2;
+        else if ((c & 0xF0) == 0xE0)
+            seq_len = 3;
+        else if ((c & 0xF8) == 0xF0)
+            seq_len = 4;
+        else
+            FAIL("invalid UTF-8 lead byte");
+        ASSERT_TRUE(i + (size_t)seq_len <= len);
+        for (int j = 1; j < seq_len; j++)
+            ASSERT_TRUE((u[i + (size_t)j] & 0xC0) == 0x80);
+        i += (size_t)seq_len;
+    }
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Reproduce-first (ms-typescript reallyLargeFile.ts, 2026-07-07): a file
  * whose root node has hundreds of thousands of FLAT SIBLINGS (580k ////
  * comment lines in the 3.5 MB fourslash fixture) hung extraction for over
@@ -3674,6 +4383,32 @@ static long extract_wide_flat_ms(int n, int *out_defs) {
     return (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
 }
 
+/* Best-of-N. Timing noise only ever ADDS time, so the minimum of a few runs is
+ * the cheapest good estimate of the noise-free cost. A single sample at each
+ * size made the RATIO carry the noise of BOTH measurements: on a loaded Windows
+ * VM this read 184ms -> 9387ms (51x) for code that measures ~20x unloaded, and
+ * tripped a bound calibrated for exactly that linear case.
+ *
+ * Deliberately NOT solved by raising WF_RATIO_MAX: the bound sits where it does
+ * because linear (~20x) and quadratic (~128x) are each >=2x away from it, so
+ * inflating it moves the test toward the very signal it exists to catch. This
+ * keeps the threshold and removes the variance instead. */
+static long extract_wide_flat_ms_best_of(int n, int reps, int *out_defs) {
+    long best = -1;
+    for (int i = 0; i < reps; i++) {
+        int defs = 0;
+        long ms = extract_wide_flat_ms(n, &defs);
+        if (ms < 0) {
+            return ms;
+        }
+        if (best < 0 || ms < best) {
+            best = ms;
+            *out_defs = defs;
+        }
+    }
+    return best;
+}
+
 TEST(extract_wide_flat_file_is_linear) {
     /* SCALING-RATIO guard: assert the COMPLEXITY CLASS, not a wall-clock
      * bound. Index-based ts_node_child(i) child loops are O(i) per call —
@@ -3697,8 +4432,10 @@ TEST(extract_wide_flat_file_is_linear) {
     enum { WF_SMALL = 20 * 1000, WF_BIG = 400 * 1000, WF_RATIO_MAX = 40, WF_FLOOR_MS = 120 };
     int defs_small = 0;
     int defs_big = 0;
-    long t_small = extract_wide_flat_ms(WF_SMALL, &defs_small);
-    long t_big = extract_wide_flat_ms(WF_BIG, &defs_big);
+    /* Small is cheap, so sample it more; big dominates runtime, so twice is the
+     * affordable compromise that still discards one unlucky sample. */
+    long t_small = extract_wide_flat_ms_best_of(WF_SMALL, 3, &defs_small);
+    long t_big = extract_wide_flat_ms_best_of(WF_BIG, 2, &defs_big);
     ASSERT_GTE(t_small, 0);
     ASSERT_GTE(t_big, 0);
     /* Anti-vacuous guard: the breadth was actually walked at both sizes. */
@@ -3716,6 +4453,87 @@ TEST(extract_wide_flat_file_is_linear) {
     }
     PASS();
 }
+
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+/* A flat block of value-reference statements exercises occurrence-role
+ * classification for every identifier. The old parent/child field lookup
+ * restarts at the block's first child for each statement, so 8x more source
+ * produces about 64x more lookup work. Count work instead of wall time: this
+ * RED is deterministic, sanitizer-independent, and finishes quickly even on
+ * the known-quadratic implementation. */
+static uint64_t extract_wide_reference_field_work(int statement_count, int *out_usages,
+                                                  uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "function target() {}\nfunction wide() {\n";
+    static const char statement[] = "  target;\n";
+    static const char suffix[] = "}\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement) + sizeof(suffix);
+    char *source = malloc(capacity);
+    if (!source) {
+        return UINT64_MAX;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    memcpy(source + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix) - 1U;
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result = cbm_extract_file(source, (int)offset, CBM_LANG_JAVASCRIPT, "proj",
+                                             "wide-references.js", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return UINT64_MAX;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "target") == 0) {
+            usages++;
+        }
+    }
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return work;
+}
+
+TEST(extract_wide_flat_reference_fields_are_linear) {
+    enum { SMALL = 128, BIG = 1024, INPUT_GROWTH = 8, WORK_RATIO_MAX = 12 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_slow_parent_fallbacks = 0;
+    uint64_t big_slow_parent_fallbacks = 0;
+    uint64_t small_work =
+        extract_wide_reference_field_work(SMALL, &small_usages, &small_slow_parent_fallbacks);
+    uint64_t big_work =
+        extract_wide_reference_field_work(BIG, &big_usages, &big_slow_parent_fallbacks);
+    ASSERT_TRUE(small_work != UINT64_MAX);
+    ASSERT_TRUE(big_work != UINT64_MAX);
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    ASSERT_EQ(small_slow_parent_fallbacks, 0);
+    ASSERT_EQ(big_slow_parent_fallbacks, 0);
+    ASSERT_GTE(small_work, (uint64_t)SMALL);
+    fprintf(stderr, "  [wide-reference-fields] work(%d)=%llu work(%d)=%llu input_growth=%dx\n",
+            SMALL, (unsigned long long)small_work, BIG, (unsigned long long)big_work, INPUT_GROWTH);
+    uint64_t maximum = small_work * WORK_RATIO_MAX + 256U;
+    if (big_work > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "wide-reference field lookup grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- quadratic sibling scan",
+                 (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
+                 WORK_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+#endif
 
 /* ===================================================================
  * Group H3: ObjectScript return type extraction
@@ -4458,6 +5276,9 @@ SUITE(extraction) {
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+    RUN_TEST(extract_wide_flat_reference_fields_are_linear);
+#endif
 
     /* Perl call-graph noise (#459 follow-up) */
     RUN_TEST(extract_perl_config_string_not_a_callee);
@@ -4508,6 +5329,8 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_factory_object_methods_issue341);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
+    RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
+    RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
     RUN_TEST(extract_gdscript_issue186);
     RUN_TEST(extract_powershell_issue35);
     RUN_TEST(extract_luau_issue39);
@@ -4521,6 +5344,8 @@ SUITE(extraction) {
     RUN_TEST(java_class);
     RUN_TEST(java_method);
     RUN_TEST(java_interface);
+    RUN_TEST(java_interface_no_duplicate_function_issue1234);
+    RUN_TEST(java_enum_dedup_preserves_calls_issue1234);
     RUN_TEST(java_class_extends_and_implements);
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
@@ -4555,6 +5380,7 @@ SUITE(extraction) {
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
     RUN_TEST(ts_class);
+    RUN_TEST(body_tokens_type_identifier);
     RUN_TEST(lua_function);
     RUN_TEST(bash_function);
     RUN_TEST(perl_function);
@@ -4587,6 +5413,20 @@ SUITE(extraction) {
     RUN_TEST(julia_function);
     RUN_TEST(elm_function);
     RUN_TEST(nix_function);
+    RUN_TEST(nix_defs_in_let_rooted_file);
+    RUN_TEST(nix_defs_in_attrset_rooted_file);
+    RUN_TEST(nix_defs_in_nested_let);
+    RUN_TEST(nix_defs_survive_function_header_let);
+    RUN_TEST(nix_defs_survive_function_header_attrset);
+    RUN_TEST(nix_defs_survive_curried_header);
+    RUN_TEST(nix_attrset_scope_disambiguates_leaf_names);
+    RUN_TEST(nix_dotted_attrpath_qualifies_like_nested);
+    RUN_TEST(nix_quoted_attr_name_strips_quotes);
+    RUN_TEST(nix_interpolated_attr_mints_no_def);
+    RUN_TEST(nix_module_level_bindings_mint_variables);
+    RUN_TEST(nix_nested_bindings_are_not_module_level);
+    RUN_TEST(nix_lambda_binding_is_function_not_variable);
+    RUN_TEST(nix_curried_lambda_mints_one_def);
     RUN_TEST(fortran_function);
 
     /* OOP/Systems variants */
@@ -4601,6 +5441,8 @@ SUITE(extraction) {
     RUN_TEST(rust_enum);
     RUN_TEST(zig_struct);
     RUN_TEST(cpp_function);
+    RUN_TEST(cpp_gtest_same_name_collision_issue1266);
+    RUN_TEST(cpp_gtest_f_unique_name_issue1266);
     RUN_TEST(cpp_out_of_line_method_issue428);
     RUN_TEST(cobol_paragraph);
     RUN_TEST(verilog_module);
@@ -4722,6 +5564,9 @@ SUITE(extraction) {
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_go_binary_concat_url_issue1249);
+    RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);
@@ -4741,9 +5586,14 @@ SUITE(extraction) {
     RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
+    RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
+    RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
+    RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
+    RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
+    RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 
     cbm_shutdown();
 }

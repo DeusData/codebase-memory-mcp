@@ -1,5 +1,6 @@
-# Smoke invariants — "the shipped binary does not fail" — across the WIDEST set of
-# GitHub-hosted runners. Builds the prod binary and runs scripts/smoke-invariants.sh
+# Smoke invariants across the WIDEST set of GitHub-hosted runners. Builds the
+# production source path with explicit fault-injection test seams and runs
+# scripts/smoke-invariants.sh
 # (version/help, MCP initialize handshake [#513], all 14 tools invocable, malformed-
 # input resilience, clean EOF exit, shared-lib resolution, install dry-run).
 #
@@ -50,12 +51,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
-      - name: Build (prod binary)
-        run: scripts/build.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - name: Build (production path with explicit test seams)
+        run: scripts/build.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} TEST_SEAMS=1
       - name: Smoke invariants
         run: |
           chmod +x scripts/smoke-invariants.sh
@@ -70,7 +71,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64
@@ -82,9 +83,9 @@ jobs:
             make
             git
             coreutils
-      - name: Build (prod binary)
+      - name: Build (production path with explicit test seams)
         shell: msys2 {0}
-        run: scripts/build.sh CC=clang CXX=clang++
+        run: scripts/build.sh CC=clang CXX=clang++ TEST_SEAMS=1
       - name: Smoke invariants
         shell: msys2 {0}
         run: |
@@ -100,7 +101,7 @@ jobs:
     timeout-minutes: 240
     continue-on-error: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANGARM64
@@ -112,9 +113,9 @@ jobs:
             make
             git
             coreutils
-      - name: Build (prod binary)
+      - name: Build (production path with explicit test seams)
         shell: msys2 {0}
-        run: scripts/build.sh CC=clang CXX=clang++
+        run: scripts/build.sh CC=clang CXX=clang++ TEST_SEAMS=1
       - name: Smoke invariants
         shell: msys2 {0}
         run: |

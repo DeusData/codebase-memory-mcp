@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 
@@ -20,6 +21,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+#include <aclapi.h>
 #include <direct.h> /* _wmkdir */
 #include <errno.h>  /* errno for spawn-failure logging */
 #include <fcntl.h>  /* _O_RDONLY */
@@ -41,7 +44,7 @@ cbm_dir_t *cbm_opendir(const char *path) {
     if (!path) {
         return NULL;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return NULL;
     }
@@ -116,6 +119,42 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     d->entry.d_type = 0;
     return &d->entry;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
+    free(wpath);
+    if (!ok) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    out->is_symlink = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    out->is_regular = !out->is_directory && !out->is_symlink;
+    /* Compose the 64-bit values arithmetically rather than through
+     * ULARGE_INTEGER. Writing .LowPart/.HighPart and reading .QuadPart is
+     * correct -- it is a union -- but cppcheck does not model that aliasing and
+     * reports all four halves as assigned-but-never-read. This form says the
+     * same thing without the union, so the checker needs no exception. */
+    uint64_t file_size = ((uint64_t)data.nFileSizeHigh << 32) | (uint64_t)data.nFileSizeLow;
+    out->size = (int64_t)file_size;
+    uint64_t written = ((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32) |
+                       (uint64_t)data.ftLastWriteTime.dwLowDateTime;
+    enum { NANOSECONDS_PER_WINDOWS_TICK = 100 };
+    const uint64_t windows_to_unix_ticks = UINT64_C(116444736000000000);
+    out->mtime_ns =
+        written >= windows_to_unix_ticks
+            ? (int64_t)((written - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
+            : 0;
+    return 0;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -271,8 +310,9 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
         *stage = "cmdline";
         *gle = ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, NULL, &si.StartupInfo, &pi);
+        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE,
+                                 EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, NULL,
+                                 &si.StartupInfo, &pi);
         if (!created) {
             *stage = "spawn";
             *gle = GetLastError();
@@ -377,7 +417,7 @@ int cbm_pclose(FILE *f) {
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return NULL;
     }
@@ -392,13 +432,66 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return f;
 }
 
+/* Stamp the exact current user as owner and apply an owner-only protected
+ * DACL on a directory cbm just created. Under the Administrators-default-owner
+ * policy (server/runner images), a plain _wmkdir yields an Administrators-owned
+ * directory that the launcher/activation exact-owner validators reject. Only
+ * freshly created directories are stamped; pre-existing ones keep their owner. */
+static void cbm_windows_stamp_dir_owner(const wchar_t *path) {
+    HANDLE token = NULL;
+    TOKEN_USER *user = NULL;
+    PACL acl = NULL;
+    DWORD needed = 0U;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+        !GetTokenInformation(token, TokenUser, NULL, 0U, &needed) &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER && (user = malloc(needed)) != NULL &&
+        GetTokenInformation(token, TokenUser, user, needed, &needed) && user->User.Sid &&
+        IsValidSid(user->User.Sid)) {
+        EXPLICIT_ACCESSW access;
+        memset(&access, 0, sizeof(access));
+        access.grfAccessPermissions = GENERIC_ALL;
+        access.grfAccessMode = SET_ACCESS;
+        access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+        access.Trustee.ptstrName = (LPWSTR)user->User.Sid;
+        HANDLE directory =
+            CreateFileW(path, WRITE_OWNER | WRITE_DAC | READ_CONTROL,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (directory != INVALID_HANDLE_VALUE) {
+            if (SetEntriesInAclW(1U, &access, NULL, &acl) == ERROR_SUCCESS) {
+                (void)SetSecurityInfo(directory, SE_FILE_OBJECT,
+                                      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION |
+                                          PROTECTED_DACL_SECURITY_INFORMATION,
+                                      user->User.Sid, NULL, acl, NULL);
+            }
+            (void)CloseHandle(directory);
+        }
+    }
+    if (acl) {
+        (void)LocalFree(acl);
+    }
+    free(user);
+    if (token) {
+        (void)CloseHandle(token);
+    }
+}
+
 static bool cbm_windows_mkdir_component(wchar_t *path) {
-    if (_wmkdir(path) != 0 && errno != EEXIST) {
+    bool created = _wmkdir(path) == 0;
+    if (!created && errno != EEXIST) {
         return false;
     }
     DWORD attributes = GetFileAttributesW(path);
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U &&
-           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+        return false;
+    }
+    if (created) {
+        cbm_windows_stamp_dir_owner(path);
+    }
+    return true;
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
@@ -406,7 +499,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
     if (!path || path[0] == '\0') {
         return false;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return false;
     }
@@ -418,15 +511,28 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    size_t start = wlen > 0U && (tmp[0] == L'/' || tmp[0] == L'\\') ? 1U : 0U;
-    if (wlen >= 3U && tmp[1] == L':' && (tmp[2] == L'/' || tmp[2] == L'\\')) {
+    size_t start = wlen > 0U && cbm_win_path_separator(tmp[0]) ? 1U : 0U;
+    if (wlen >= 8U && _wcsnicmp(tmp, L"\\\\?\\UNC\\", 8U) == 0) {
+        /* Extended UNC roots are \\?\UNC\server\share\. Neither the server
+         * nor share component is creatable; begin with the first descendant. */
+        size_t separators = 0U;
+        start = 8U;
+        while (start < wlen && separators < 2U) {
+            if (cbm_win_path_separator(tmp[start])) {
+                separators++;
+            }
+            start++;
+        }
+    } else if (wlen >= 7U && wcsncmp(tmp, L"\\\\?\\", 4U) == 0 && tmp[5] == L':' &&
+               cbm_win_path_separator(tmp[6])) {
+        start = 7U;
+    } else if (wlen >= 3U && tmp[1] == L':' && cbm_win_path_separator(tmp[2])) {
         start = 3U;
-    } else if (wlen >= 2U && (tmp[0] == L'/' || tmp[0] == L'\\') &&
-               (tmp[1] == L'/' || tmp[1] == L'\\')) {
+    } else if (wlen >= 2U && cbm_win_path_separator(tmp[0]) && cbm_win_path_separator(tmp[1])) {
         size_t separators = 0U;
         start = 2U;
         while (start < wlen && separators < 2U) {
-            if (tmp[start] == L'/' || tmp[start] == L'\\') {
+            if (cbm_win_path_separator(tmp[start])) {
                 separators++;
             }
             start++;
@@ -434,8 +540,8 @@ bool cbm_mkdir_p(const char *path, int mode) {
     }
     bool ok = true;
     for (wchar_t *p = tmp + start; ok && *p; p++) {
-        if (*p == L'/' || *p == L'\\') {
-            if (p == tmp || p[-1] == L'/' || p[-1] == L'\\') {
+        if (cbm_win_path_separator(*p)) {
+            if (p == tmp || cbm_win_path_separator(p[-1])) {
                 continue;
             }
             wchar_t separator = *p;
@@ -453,7 +559,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
 }
 
 int cbm_unlink(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -463,7 +569,7 @@ int cbm_unlink(const char *path) {
 }
 
 int cbm_rmdir(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -593,7 +699,14 @@ int cbm_exec_no_shell(const char *const *argv) {
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    /* CREATE_NO_WINDOW: the third and last spawn site that still needed it
+     * (#1427). Without it every helper routed through here — git, codesign,
+     * open — flashes a console window, and under a stdio MCP session with
+     * auto_watch those steal focus while the user is typing. The other three
+     * CreateProcessW sites already set it: subprocess.c and cbm_popen_isolated
+     * via #1448, and the detached daemon spawn in daemon/bootstrap.c, which has
+     * had it since it was written. */
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         free(cmdline);
         return CBM_NOT_FOUND;
     }
@@ -658,11 +771,49 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
-        d->entry.is_dir = (de->d_type == DT_DIR);
-        d->entry.d_type = de->d_type;
+        unsigned char type = de->d_type;
+#if defined(DT_UNKNOWN) && defined(AT_SYMLINK_NOFOLLOW)
+        if (type == DT_UNKNOWN) {
+            struct stat state;
+            if (fstatat(dirfd(d->dir), de->d_name, &state, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (S_ISDIR(state.st_mode)) {
+                    type = DT_DIR;
+                } else if (S_ISREG(state.st_mode)) {
+                    type = DT_REG;
+                } else if (S_ISLNK(state.st_mode)) {
+                    type = DT_LNK;
+                }
+            }
+        }
+#endif
+        d->entry.is_dir = (type == DT_DIR);
+        d->entry.d_type = type;
         return &d->entry;
     }
     return NULL;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    struct stat state;
+    if (lstat(path, &state) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    out->is_regular = S_ISREG(state.st_mode);
+    out->is_directory = S_ISDIR(state.st_mode);
+    out->is_symlink = S_ISLNK(state.st_mode);
+    out->size = (int64_t)state.st_size;
+#ifdef __APPLE__
+    out->mtime_ns = ((int64_t)state.st_mtimespec.tv_sec * INT64_C(1000000000)) +
+                    (int64_t)state.st_mtimespec.tv_nsec;
+#else
+    out->mtime_ns =
+        ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
+#endif
+    return 0;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -802,34 +953,65 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #endif /* _WIN32 */
 
-/* Canonicalize an EXISTING path (collapse `..`, resolve per-OS): realpath on
- * POSIX; on Windows a wide-path GetFileAttributesW existence check +
- * GetFullPathNameW. The previous callers used the ANSI CRT (_access/
- * _fullpath) on UTF-8 input — locale-dependent by construction: on a CJK
- * system codepage (e.g. Big5) the UTF-8 bytes of a CJK path re-decode into
- * different characters and canonicalization corrupts the path (#973).
- * Returns 0 when the path does not exist or cannot be resolved. */
+/* Canonicalize an EXISTING path (collapse `..`, resolve links/junctions):
+ * realpath on POSIX; a final path queried from an opened handle on Windows.
+ * The previous Windows callers used the ANSI CRT (_access/_fullpath) on UTF-8
+ * input — locale-dependent by construction: on a CJK system codepage (e.g.
+ * Big5) the UTF-8 bytes of a CJK path re-decode into different characters and
+ * canonicalization corrupts the path (#973).  GetFullPathNameW alone is also
+ * only lexical and would let an allowed-root check follow a junction outside
+ * the root.  Returns 0 when the path does not exist or cannot be resolved. */
 int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     if (!path || !out || out_sz == 0) {
         return 0;
     }
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
         return 0;
     }
-    if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
-        free(wpath);
+    HANDLE handle = CreateFileW(wpath, FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wpath);
+    if (handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
-    enum { CANON_WIDE_MAX = 4096 };
-    wchar_t wfull[CANON_WIDE_MAX];
-    DWORD n = GetFullPathNameW(wpath, CANON_WIDE_MAX, wfull, NULL);
-    free(wpath);
-    if (n == 0 || n >= CANON_WIDE_MAX) {
+    DWORD needed =
+        GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    /* MAXDWORD keeps the +1 below safe; calloc rejects an unrepresentable
+     * capacity * sizeof(wchar_t) allocation on narrower size_t targets. */
+    if (needed == 0 || needed == MAXDWORD) {
+        (void)CloseHandle(handle);
         return 0;
+    }
+    size_t capacity = (size_t)needed + 1;
+    wchar_t *wfull = calloc(capacity, sizeof(*wfull));
+    if (!wfull) {
+        (void)CloseHandle(handle);
+        return 0;
+    }
+    DWORD n = GetFinalPathNameByHandleW(handle, wfull, (DWORD)capacity,
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    (void)CloseHandle(handle);
+    if (n == 0 || (size_t)n >= capacity) {
+        free(wfull);
+        return 0;
+    }
+
+    /* Preserve the conventional DOS/UNC form returned by the old API while
+     * retaining the handle-based resolution. */
+    if (wcsncmp(wfull, L"\\\\?\\UNC\\", 8) == 0) {
+        size_t tail_length = wcslen(wfull + 8);
+        wmemmove(wfull + 2, wfull + 8, tail_length + 1);
+        wfull[0] = L'\\';
+        wfull[1] = L'\\';
+    } else if (wcsncmp(wfull, L"\\\\?\\", 4) == 0) {
+        size_t tail_length = wcslen(wfull + 4);
+        wmemmove(wfull, wfull + 4, tail_length + 1);
     }
     char *utf8 = cbm_wide_to_utf8(wfull);
+    free(wfull);
     if (!utf8) {
         return 0;
     }
@@ -849,17 +1031,62 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
 
 /* rename() with overwrite semantics on every platform: POSIX rename already
  * replaces atomically; Windows rename fails with EEXIST when the target
- * exists, so use MoveFileExW(MOVEFILE_REPLACE_EXISTING) there (wide paths —
- * raw MoveFileExA would re-mangle non-ASCII cache paths). */
+ * exists, so use write-through MoveFileExW(MOVEFILE_REPLACE_EXISTING) there
+ * (wide paths — raw MoveFileExA would re-mangle non-ASCII cache paths). */
 int cbm_rename_replace(const char *src, const char *dst) {
 #ifdef _WIN32
-    wchar_t *wsrc = cbm_utf8_to_wide(src);
-    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    wchar_t *wsrc = cbm_path_to_wide(src);
+    wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)
-                  ? 0
-                  : CBM_NOT_FOUND;
+        if (MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            ret = 0;
+        } else {
+            /* Translate the Win32 error into errno so callers can report WHY.
+             *
+             * Callers log `errno` after a failed rename (see
+             * finalize.rename_failed in the pipeline). Without this the value
+             * is whatever happened to be left there by an unrelated CRT call,
+             * so on Windows the one field that should explain an atomic-publish
+             * failure was noise. #1620 is exactly that: an ACL problem surfaced
+             * to the user as "Pipeline failed. Check repo_path exists and
+             * contains source files" — blaming their repository — because
+             * ERROR_ACCESS_DENIED never reached the log.
+             *
+             * ERROR_ACCESS_DENIED is the interesting one here: MoveFileEx needs
+             * DELETE on the destination, which a cache file created under an
+             * empty or foreign DACL does not grant. */
+            DWORD error = GetLastError();
+            switch (error) {
+            case ERROR_ACCESS_DENIED:
+            case ERROR_WRITE_PROTECT:
+                errno = EACCES;
+                break;
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
+                errno = ENOENT;
+                break;
+            case ERROR_SHARING_VIOLATION:
+            case ERROR_LOCK_VIOLATION:
+            case ERROR_USER_MAPPED_FILE:
+                errno = EBUSY;
+                break;
+            case ERROR_NOT_SAME_DEVICE:
+                errno = EXDEV;
+                break;
+            case ERROR_DISK_FULL:
+                errno = ENOSPC;
+                break;
+            case ERROR_INVALID_NAME:
+            case ERROR_FILENAME_EXCED_RANGE:
+                errno = ENAMETOOLONG;
+                break;
+            default:
+                errno = EIO;
+                break;
+            }
+            ret = CBM_NOT_FOUND;
+        }
     }
     free(wsrc);
     free(wdst);
@@ -869,24 +1096,161 @@ int cbm_rename_replace(const char *src, const char *dst) {
 #endif
 }
 
-/* Remove a SQLite database's -wal/-shm sidecars (both platforms). Any code
+int cbm_rename_noreplace(const char *src, const char *dst) {
+    if (!src || !dst || !src[0] || !dst[0]) {
+        return CBM_NOT_FOUND;
+    }
+#ifdef _WIN32
+    wchar_t *wsrc = cbm_path_to_wide(src);
+    wchar_t *wdst = cbm_path_to_wide(dst);
+    int ret = CBM_NOT_FOUND;
+    if (wsrc && wdst) {
+        ret = MoveFileExW(wsrc, wdst, MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)
+                  ? 0
+                  : CBM_NOT_FOUND;
+    }
+    free(wsrc);
+    free(wdst);
+    return ret;
+#else
+    /* link()+unlink() provides no-overwrite semantics portably (including
+     * macOS, where renameat2(RENAME_NOREPLACE) is unavailable). Both paths
+     * are adjacent database files and therefore on the same filesystem. */
+    if (link(src, dst) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (unlink(src) != 0) {
+        int saved_errno = errno;
+        (void)unlink(dst);
+        errno = saved_errno;
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+#endif
+}
+
+/* Remove a SQLite database's -wal/-shm/-journal sidecars (both platforms). Any code
  * path that installs a FRESH database file at a path where a previous
  * generation lived must call this first: SQLite decides whether to replay a
  * WAL purely from the sidecar's own header/checksums, so a leftover WAL
  * from a crashed session is recovered ON TOP of the freshly installed file
  * at the next open, splicing old-generation pages into it (#897). */
-void cbm_remove_db_sidecars(const char *db_path) {
+int cbm_remove_db_sidecars(const char *db_path) {
     if (!db_path || !db_path[0]) {
-        return;
+        return CBM_NOT_FOUND;
     }
     enum { SIDECAR_PATH_MAX = 4096 };
     char side[SIDECAR_PATH_MAX];
+    /* Validate the longest suffix before unlinking anything. Otherwise a
+     * near-limit path can remove -wal/-shm, silently skip a truncated
+     * -journal, and report success after partially mutating the generation. */
+    if (strlen(db_path) > sizeof(side) - sizeof("-journal")) {
+        return CBM_NOT_FOUND;
+    }
+    int result = 0;
     int n = snprintf(side, sizeof(side), "%s-wal", db_path);
-    if (n > 0 && (size_t)n < sizeof(side)) {
-        (void)cbm_unlink(side);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    int unlink_rc = cbm_unlink(side);
+    int unlink_error = errno;
+    if (unlink_rc != 0 && unlink_error != ENOENT) {
+        result = CBM_NOT_FOUND;
     }
     n = snprintf(side, sizeof(side), "%s-shm", db_path);
-    if (n > 0 && (size_t)n < sizeof(side)) {
-        (void)cbm_unlink(side);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
     }
+    errno = 0;
+    unlink_rc = cbm_unlink(side);
+    unlink_error = errno;
+    if (unlink_rc != 0 && unlink_error != ENOENT) {
+        result = CBM_NOT_FOUND;
+    }
+    n = snprintf(side, sizeof(side), "%s-journal", db_path);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
+    unlink_rc = cbm_unlink(side);
+    unlink_error = errno;
+    if (unlink_rc != 0 && unlink_error != ENOENT) {
+        result = CBM_NOT_FOUND;
+    }
+    return result;
+}
+
+/* ── Clone-or-copy ───────────────────────────────────────────────── */
+
+#if defined(__APPLE__)
+#include <sys/clonefile.h>
+#elif defined(__linux__)
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
+#include <fcntl.h>
+
+static int stream_copy_file(const char *src, const char *dst) {
+    FILE *in = cbm_fopen(src, "rb");
+    if (!in) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *out = cbm_fopen(dst, "wb");
+    if (!out) {
+        (void)fclose(in);
+        return CBM_NOT_FOUND;
+    }
+    char buf[CBM_SZ_64K];
+    size_t n;
+    int rc = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            rc = CBM_NOT_FOUND;
+            break;
+        }
+    }
+    if (ferror(in)) {
+        rc = CBM_NOT_FOUND;
+    }
+    (void)fclose(in);
+    if (fclose(out) != 0) {
+        rc = CBM_NOT_FOUND;
+    }
+    if (rc != 0) {
+        (void)cbm_unlink(dst);
+    }
+    return rc;
+}
+
+int cbm_clone_or_copy_file(const char *src, const char *dst) {
+    if (!src || !dst) {
+        return CBM_NOT_FOUND;
+    }
+#if defined(__APPLE__)
+    /* clonefile refuses to overwrite; the staging name is freshly minted by
+     * the caller, but clear any leftover defensively so the fast path is
+     * never abandoned for a stale artifact. */
+    (void)cbm_unlink(dst);
+    if (clonefile(src, dst, 0) == 0) {
+        return 0;
+    }
+#elif defined(__linux__)
+    int in_fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (in_fd >= 0) {
+        int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (out_fd >= 0) {
+            int cloned = ioctl(out_fd, FICLONE, in_fd);
+            int close_rc = close(out_fd);
+            (void)close(in_fd);
+            if (cloned == 0 && close_rc == 0) {
+                return 0;
+            }
+            (void)cbm_unlink(dst);
+        } else {
+            (void)close(in_fd);
+        }
+    }
+#endif
+    return stream_copy_file(src, dst);
 }

@@ -39378,7 +39378,7 @@ SQLITE_PRIVATE int sqlite3KvvfsInit(void){
 /*
 ** Maximum supported path-length.
 */
-#define MAX_PATHNAME 512
+#define MAX_PATHNAME 4096
 
 /*
 ** Maximum supported symbolic links

@@ -85,13 +85,13 @@ function AdrButton({ project }: { project: string }) {
 
   useEffect(() => { fetchAdr(); }, [fetchAdr]);
 
-  const save = async () => {
+  const save = async (nextContent = content) => {
     setSaving(true);
     try {
       await fetch("/api/adr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project, content }),
+        body: JSON.stringify({ project, content: nextContent }),
       });
       await fetchAdr();
       setOpen(false);
@@ -138,7 +138,7 @@ function AdrButton({ project }: { project: string }) {
               {hasAdr && (
                 <button
                   onClick={async () => {
-                    setContent(""); await save();
+                    setContent(""); await save("");
                   }}
                   className="px-3 py-2 rounded-lg text-[12px] text-destructive/60 hover:text-destructive hover:bg-destructive/10 font-medium transition-all"
                 >
@@ -146,7 +146,7 @@ function AdrButton({ project }: { project: string }) {
                 </button>
               )}
               <button onClick={() => setOpen(false)} className="px-4 py-2 rounded-lg text-[12px] text-foreground/40 hover:bg-white/[0.04] font-medium transition-all">{t.common.cancel}</button>
-              <button onClick={save} disabled={saving} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
+              <button onClick={() => save()} disabled={saving} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
                 {saving ? t.common.saving : t.common.save}
               </button>
             </div>

@@ -18,6 +18,7 @@
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+#include <foundation/platform.h>
 
 #include <stdarg.h>
 #include <string.h>
@@ -152,7 +153,7 @@ static int count_in_response(const char *resp, const char *key) {
 /* ── Direct store queries (more reliable than MCP for tests) ────── */
 
 static cbm_store_t *open_store(void) {
-    return cbm_store_open_path(g_dbpath);
+    return cbm_store_open_path_existing(g_dbpath);
 }
 
 static int get_node_count(void) {
@@ -208,39 +209,69 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
-    /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
-     * Cuts indexing time roughly in half on slow shared runners. */
-    char cmd[1024];
-    if (getenv("CI")) {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
-                 g_repodir, g_repodir);
+    /* The fixture is cloned from the network at most once per machine, into a
+     * persistent cache; every run local-clones from there (seconds, offline).
+     * The one-time clone is staged and committed with an atomic rename so a
+     * torn download can never masquerade as a valid cache. */
+    const char *cache_home = getenv("CBM_TEST_FIXTURE_CACHE");
+    char cache_root[512];
+    if (cache_home && cache_home[0]) {
+        snprintf(cache_root, sizeof(cache_root), "%s", cache_home);
     } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0])
+            home = ".";
+        snprintf(cache_root, sizeof(cache_root), "%s/.cache/cbm-test-fixtures", home);
+    }
+    char cache_repo[640];
+    snprintf(cache_repo, sizeof(cache_repo), "%s/fastapi-0.99.1", cache_root);
+    char cmd[1600];
+    if (!cbm_is_dir(cache_repo)) {
+        (void)cbm_mkdir_p(cache_root, 0700);
+        char cache_stage[700];
+        snprintf(cache_stage, sizeof(cache_stage), "%s.stage", cache_repo);
+        th_rmtree(cache_stage);
         snprintf(cmd, sizeof(cmd),
                  "git clone --depth=1 --branch 0.99.1 --quiet "
                  "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 g_repodir);
+                 cache_stage);
+        int fetch_rc = system(cmd);
+        if (fetch_rc != 0 || rename(cache_stage, cache_repo) != 0) {
+            th_rmtree(cache_stage);
+            if (!cbm_is_dir(cache_repo)) {
+                printf("  fixture clone failed (rc=%d) — network offline?\n", fetch_rc);
+                return -1;
+            }
+        }
     }
+    snprintf(cmd, sizeof(cmd), "git clone --quiet '%s' '%s' 2>&1", cache_repo, g_repodir);
     int rc = system(cmd);
     if (rc != 0) {
-        printf("  clone failed (rc=%d) — network offline?\n", rc);
+        printf("  fixture local clone failed (rc=%d)\n", rc);
         return -1;
     }
+    /* Index the same corpus everywhere: CI historically indexed a sparse
+     * checkout without docs/ and tests/ (the assertion thresholds are sized
+     * for it) while local runs indexed the full tree — twice the files for
+     * the identical assertions, and a local/CI divergence. Trimming the two
+     * directories is the portable equivalent of that sparse profile. */
+    char trim[600];
+    snprintf(trim, sizeof(trim), "%s/docs", g_repodir);
+    th_rmtree(trim);
+    snprintf(trim, sizeof(trim), "%s/tests", g_repodir);
+    th_rmtree(trim);
 
     g_project = cbm_project_name_from_path(g_repodir);
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int dbpath_length =
+        cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
+    if (dbpath_length <= 0 || (size_t)dbpath_length >= sizeof(g_dbpath) ||
+        !cbm_mkdir_p(cache_dir, 0700)) {
+        return -1;
+    }
 
     unlink(g_dbpath);
 
@@ -332,7 +363,26 @@ TEST(incr_full_index) {
         rss_limit_mb = 2816;
     }
 #endif
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define CBM_TEST_RSS_BUDGET_UNMEASURABLE 1
+#endif
+#endif
+#if defined(CBM_TEST_RSS_BUDGET_UNMEASURABLE)
+    /* MSan maps shadow (and with origins, a second) mapping for every
+     * allocation, inflating RSS by construction: this index measured 3054MB
+     * against the 2304MB budget on the x86-64 lane. The budget exists to catch
+     * a REAL leak (GBs over) in a normal build; under MSan it cannot separate a
+     * leak from shadow, so the number is not evidence either way. Skipped here
+     * rather than inflated, so the guard keeps its teeth on every other
+     * platform -- inflating it would blind the check where it does work. The
+     * rest of this test (node/edge correctness) still runs under MSan, which is
+     * the uninitialized-read coverage the lane exists for. */
+    (void)rss_delta_mb;
+    (void)rss_limit_mb;
+#else
     ASSERT_LT((int)rss_delta_mb, rss_limit_mb);
+#endif
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",
@@ -963,6 +1013,36 @@ static int resp_lacks_key(const char *resp, const char *key) {
 #define NOT_ERROR(resp) ASSERT(strstr((resp), "\"isError\":true") == NULL)
 
 /* ── list_projects ─────────────────────────────────────────────── */
+
+TEST(incr_file_node_name_stays_basename) {
+    /* #994: File nodes must keep their basename NAME through an incremental
+     * re-index (the bug renamed touched files' nodes to rel_path, diverging
+     * from a full build). Modify a file, re-index, assert no File node name
+     * contains a path separator. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    FILE *f = fopen(path, "a");
+    ASSERT(f != NULL);
+    fprintf(f, "\n# incr_file_node_name_stays_basename touch\n");
+    fclose(f);
+
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    double ms;
+    char *r = call_tool_timed("query_graph", &ms,
+                              "{\"project\":\"%s\",\"format\":\"json\","
+                              "\"query\":\"MATCH (n:File) WHERE n.name CONTAINS '/'"
+                              " RETURN n.name LIMIT 5\"}",
+                              g_project);
+    TOOL_OK(r, ms);
+    /* No File node may carry a path separator in its name; the query engine
+     * returns an empty rows array when nothing matches. */
+    ASSERT(strstr(r, "\"rows\":[]") != NULL || strstr(r, "\\\"rows\\\":[]") != NULL);
+    free(r);
+    PASS();
+}
 
 TEST(tool_list_projects_basic) {
     double ms;
@@ -1830,11 +1910,35 @@ TEST(tool_detect_changes_default) {
     double ms;
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
     TOOL_OK(r, ms);
-    /* Must have changed_files array and changed_count */
-    ASSERT(resp_has_key(r, "changed_files"));
-    ASSERT(resp_has_key(r, "changed_count"));
-    ASSERT(resp_has_key(r, "impacted_symbols"));
-    ASSERT(resp_has_key(r, "depth"));
+    /* New tree contract: base + direction scalars, a changed_files section,
+     * and the seed/impact accounting. (The old changed_count/impacted_symbols/
+     * depth keys are gone — impact is now a real traversal, not bare names.) */
+    ASSERT(strstr(r, "changed_files:") != NULL);
+    ASSERT(strstr(r, "direction:") != NULL);
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    free(r);
+    PASS();
+}
+
+/* The blast radius is a REAL traversal now: default inbound gives transitive
+ * callers of the changed symbols with an exact impacted_total and a module
+ * rollup. Fixture diff may be empty (shallow clone at HEAD) — the sections and
+ * their accounting must still be present and internally consistent. */
+TEST(tool_detect_changes_impact_shape) {
+    double ms;
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT(strstr(r, "direction: inbound") != NULL); /* default = blast radius */
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    /* format:"json" returns the same model as structured JSON. */
+    free(r);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"base_branch\":\"HEAD\",\"format\":\"json\"}",
+                        g_project);
+    TOOL_OK(r, ms);
+    ASSERT(resp_has_key(r, "impacted_total"));
+    ASSERT(resp_has_key(r, "direction"));
     free(r);
     PASS();
 }
@@ -2970,6 +3074,7 @@ SUITE(incremental) {
 
     /* Phase 3: Incremental deltas */
     RUN_TEST(incr_modify_file);
+    RUN_TEST(incr_file_node_name_stays_basename);
     RUN_TEST(incr_formatter_run);
     RUN_TEST(incr_add_file);
     RUN_TEST(incr_delete_file);
@@ -3069,6 +3174,7 @@ SUITE(incremental) {
 
     /* Phase 15: detect_changes */
     RUN_TEST(tool_detect_changes_default);
+    RUN_TEST(tool_detect_changes_impact_shape);
     RUN_TEST(tool_detect_changes_custom_branch);
     RUN_TEST(tool_detect_changes_since);
     RUN_TEST(tool_detect_changes_since_precedence);

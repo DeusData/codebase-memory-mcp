@@ -11,7 +11,10 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
+#include "store/store.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
+#include "git/git_context.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
@@ -30,6 +33,8 @@
  * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
  * "no incremental route; continue with a full index" sentinel. */
 #define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
+#define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
+#define CBM_PIPELINE_PERSIST_FAILED (-4)
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
@@ -115,6 +120,14 @@ typedef struct {
      * resolve. */
     CBMArena seq_cross_arena;
     bool seq_cross_arena_live;
+    /* Sequential lsp_cross only: the per-file module-QN strings the collected
+     * defs (and through them the shared cross registries in seq_cross_arena)
+     * borrow. The registries outlive the pass so pass_calls can read borrowed
+     * strings -- these must too. Ownership transfers here at the end of the
+     * pass; released beside the arena. Freeing them at pass end was a
+     * use-after-free first observable on the real-repo corpus tier. */
+    char **seq_cross_def_modules;
+    int seq_cross_def_module_count;
 
     /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
      * no ObjectScript include files were found). Owned by pipeline.c. */
@@ -124,6 +137,18 @@ typedef struct {
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
+
+/* Transcode an ObjectScript Studio Export XML file and compose every generated
+ * UDL class into one cacheable result. The returned result owns all child
+ * extraction arenas and is released with the ordinary cbm_free_result(). */
+CBMFileResult *cbm_pipeline_extract_objectscript_export(
+    const char *source, int source_len, const char *project_name, const char *rel_path,
+    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table);
+
+/* Materialize CONFIGURES edges from one extracted file's env-access carriers.
+ * Shared by sequential definition processing and the parallel cache registry. */
+int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel);
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
@@ -259,6 +284,20 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
  * creates IMPLEMENTS + OVERRIDE edges. Returns edge count created. */
 int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
 
+/* Edge type for an explicit base-class relation, keyed off the resolved
+ * TARGET node's label: Interface → IMPLEMENTS, anything else → INHERITS.
+ * The single decision point for BOTH the sequential semantic pass and the
+ * parallel per-file resolve — the two venues must never diverge. */
+const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
+
+/* Explicit-language override detection on the full graph (serial tail).
+ * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches
+ * the class's DEFINES_METHOD children by name against the base's and creates
+ * Method→Method OVERRIDE edges (Java @Override, TS/C#/Kotlin override, PHP
+ * redefinition). Go is excluded: implicit satisfaction already covers it.
+ * Returns edge count created. */
+int cbm_pipeline_override_explicit(cbm_pipeline_ctx_t *ctx);
+
 /* ── Git diff helpers (pass_gitdiff.c) ───────────────────────────── */
 
 typedef struct {
@@ -267,17 +306,12 @@ typedef struct {
     char old_path[CBM_SZ_512]; /* non-empty only for renames */
 } cbm_changed_file_t;
 
-typedef struct {
-    char path[CBM_SZ_512];
-    int start_line;
-    int end_line;
-} cbm_changed_hunk_t;
+/* cbm_changed_hunk_t + cbm_parse_hunks moved to pipeline.h (public — consumed
+ * by src/mcp/mcp.c's detect_changes for line-scoped seed detection). Visible
+ * here via the `#include "pipeline/pipeline.h"` above. */
 
 /* Parse git diff --name-status output. Returns count written to out. */
 int cbm_parse_name_status(const char *output, cbm_changed_file_t *out, int max_out);
-
-/* Parse git diff --unified=0 output. Returns count written to out. */
-int cbm_parse_hunks(const char *output, cbm_changed_hunk_t *out, int max_out);
 
 /* Parse "start,count" or "start" → (start, count). */
 void cbm_parse_range(const char *s, int *out_start, int *out_count);
@@ -622,7 +656,112 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
  * Classifies files by mtime+size, deletes changed nodes, re-parses changed
  * files, merges into disk DB. Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count);
+                                 int file_count, const cbm_file_hash_t *baseline_manifest,
+                                 int baseline_count);
+
+/* Exact semantic inputs for no-op/forced-full routing. The manifest contains
+ * every discovered source plus repository controls actually consumed by
+ * discovery, package mapping, path aliases, and extension overrides. */
+#define CBM_SEMANTIC_INPUT_PREFIX ".codebase-memory/.semantic-input/"
+#define CBM_SEMANTIC_INPUT_GIT_CONTEXT CBM_SEMANTIC_INPUT_PREFIX "git-context-v1"
+#define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
+#define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
+
+int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
+                                         const cbm_file_info_t *files, int file_count,
+                                         char **excluded_dirs, int excluded_count,
+                                         const cbm_git_context_t *git_ctx,
+                                         const cbm_userconfig_t *userconfig, cbm_file_hash_t **out,
+                                         int *out_count);
+void cbm_pipeline_free_semantic_manifest(cbm_file_hash_t *manifest, int count);
+bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left_count,
+                                           const cbm_file_hash_t *right, int right_count);
+/* Re-run discovery and hash its exact semantic inputs. Used at the publication
+ * boundary so late additions/deletions cannot escape a frozen file list. */
+int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+                                               cbm_file_hash_t **out, int *out_count);
+
+/* Compatibility contract persisted in coverage metadata. Increment when a
+ * graph/manifest semantic change makes prior exact-input indexes unsafe. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+
+typedef struct {
+    cbm_gbuf_t *gbuf;
+    const char *final_db_path;
+    const char *project;
+    atomic_int *cancelled;
+    const cbm_file_hash_t *manifest;
+    int manifest_count;
+    const char *adr_content;
+    const cbm_coverage_row_t *coverage;
+    int coverage_count;
+    cbm_coverage_meta_t coverage_meta;
+    /* Per-file LSP surfaces for the generation being published (may be NULL:
+     * cross-LSP disabled, or a caller that has none). Written into the
+     * staging store alongside the manifest so surface data and graph always
+     * belong to the same generation. */
+    const cbm_lsp_surface_row_t *surface_rows;
+    int surface_row_count;
+    /* True when the caller already wrote this generation's surface rows
+     * into the staging store (delta patch); publish then skips the
+     * wholesale delete+rewrite. */
+    bool surfaces_in_place;
+} cbm_pipeline_generation_t;
+
+/* Serialize and fully populate a sibling staging database, then atomically
+ * replace final_db_path. The old generation is untouched on every failure or
+ * cancellation observed before the rename commit point. */
+int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation);
+/* Final leg shared by the dump-built and delta-patched publication paths:
+ * sidecar removal, previous-generation quarantine, atomic rename. The stage
+ * must be complete and sealed with its store handle closed. Discards the
+ * stage on every failure. Does NOT free stage_path. */
+int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_db_path,
+                                            atomic_int *cancelled, bool destination_known_healthy);
+/* Metadata writes + FTS policy + integrity + seal + finalize for an
+ * already-materialized staging DB. Takes ownership of stage_path. The dump
+ * path passes fts_wholesale=true; the delta path passes false (its patch
+ * wrote row-level FTS inserts). generation->gbuf is not read here. */
+int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_t *generation,
+                                bool fts_wholesale, bool destination_known_healthy);
+
+/* mkstemp-minted staging sibling of final_path (exported for the delta
+ * executor; the dump path uses it internally). malloc'd, caller frees. */
+char *cbm_pipeline_create_staging_path(const char *final_path);
+
+/* ── Delta-repair staging primitives (pipeline_delta.c) ──────────
+ * Closure-route-only subsystem: clone the live generation, patch exactly
+ * the repaired node/edge set, publish through the shared finalize leg. */
+typedef struct {
+    char *source_qn;
+    char *target_qn;
+    char *type;
+    char *props;
+} cbm_delta_saved_edge_t;
+
+int cbm_delta_stage_clone(const char *final_db_path, char **out_stage_path);
+int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const char *const *paths,
+                               int path_count, cbm_delta_saved_edge_t **out, int *out_count);
+void cbm_delta_free_snapshot(cbm_delta_saved_edge_t *items, int count);
+int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *paths,
+                    int path_count);
+/* Pre-seed proxy nodes with their REAL database ids and move the gbuf id
+ * watermark above MAX(id); returns that max id, or -1 on failure. */
+int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf);
+int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, int64_t max_db_id,
+                    const cbm_delta_saved_edge_t *snapshot, int snapshot_count);
+/* discard helper shared with the delta executor (unlink stage + sidecars). */
+void cbm_pipeline_discard_stage(const char *stage_path);
+/* The SQLite generation is authoritative. An explicitly requested artifact is
+ * part of the caller-visible operation and its export error is returned;
+ * automatic refresh of an already-existing artifact remains best-effort. */
+int cbm_pipeline_refresh_artifact(cbm_pipeline_t *p, const char *db_path);
+
+/* Hand the pipeline the per-file LSP-surface rows serialized at the
+ * collect_all_defs seam (the only moment the result cache is alive).
+ * Takes ownership; dump_and_persist_hashes writes them into the staging
+ * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
+void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
@@ -630,6 +769,22 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+
+/* Test seam: invoked after a complete staging DB is sealed and immediately
+ * before the cancellation check + atomic replace. Not part of the public API. */
+void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
+                                            int (*hook)(const char *, const char *, void *),
+                                            void *ctx);
+
+/* Synchronous thread-local seam for deterministic cross-repo cancellation
+ * tests. The callback runs immediately after a CROSS_* edge is committed and
+ * is never retained; it must not re-enter cross-repo matching. */
+typedef void (*cbm_cross_repo_after_insert_test_hook_t)(const char *project, const char *edge_type,
+                                                        void *context);
+void cbm_cross_repo_set_after_insert_hook_for_tests(cbm_cross_repo_after_insert_test_hook_t hook,
+                                                    void *context);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client
@@ -644,5 +799,50 @@ bool extract_grpc_service_method(const char *callee, char *service, size_t srv_s
  * (futile: the resident floor, not transients, holds the memory). */
 long cbm_pp_bp_nap_cycles(void);
 void cbm_pp_bp_nap_cycles_reset(void);
+
+/* Number of resolved-call rows handed to the parallel resolver's linear LSP
+ * fallback since the last reset. Test observability for occurrence-index
+ * coverage; deterministic and independent of wall-clock timing. */
+uint64_t cbm_pp_lsp_linear_fallback_rows(void);
+void cbm_pp_lsp_linear_fallback_rows_reset(void);
+
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+/* Deterministic test-only operation count for the shared semantic-reference
+ * matcher used by both sequential and fused-parallel usage materialization. */
+void cbm_pipeline_lsp_reference_lookup_test_reset(void);
+uint64_t cbm_pipeline_lsp_reference_lookup_test_rows_examined(void);
+#endif
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+typedef enum {
+    CBM_INCREMENTAL_ROUTE_NONE = 0,
+    CBM_INCREMENTAL_ROUTE_NOOP,
+    CBM_INCREMENTAL_ROUTE_FORCED_FULL,
+    CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL,
+    CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR,
+} cbm_incremental_route_t;
+
+/* Deterministic one-shot fault injection for the incremental-parallel result
+ * cache allocation. Reset explicitly so one test cannot affect another. */
+void cbm_pipeline_incremental_test_fail_result_cache_alloc_once(void);
+void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
+void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
+void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
+void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void);
+void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
+typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
+void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
+                                                              void *userdata);
+cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
+void cbm_pipeline_incremental_test_reset_faults(void);
+
+/* Shared persistence-hook plumbing. Tests use the incremental facade above so
+ * one reset covers route, extraction, and publication faults. */
+bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void);
+bool cbm_pipeline_persist_test_take_cancel_after_predump(void);
+bool cbm_pipeline_persist_test_take_cancel_after_destination_prepare(void);
+void cbm_pipeline_persist_test_run_before_final_manifest(void);
+void cbm_pipeline_persist_test_reset_faults(void);
+#endif
 
 #endif /* CBM_PIPELINE_INTERNAL_H */

@@ -5,7 +5,9 @@
 # Build:  docker build -t cbm-lint -f test-infrastructure/Dockerfile.lint test-infrastructure/
 # Run:    docker run --rm -v $(pwd):/src cbm-lint
 
-FROM ubuntu:noble
+# Pinned by digest (supply-chain: no floating tags) — multi-arch manifest-list
+# digest of ubuntu:noble as of 2026-07-23; bump deliberately, never to a tag.
+FROM ubuntu:noble@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make cmake \

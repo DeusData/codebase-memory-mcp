@@ -15,12 +15,12 @@ on:
         type: choice
         options: ['all', 'linux', 'macos', 'windows']
         default: 'all'
-  # Iteration convenience: any push to a qa/** branch runs the board straight
-  # from that branch's own copy of this file (no main merge needed). Non-gating.
-  push:
-    # Exclude the dedicated lane branches so they only run their own workflow
-    # (fast-repro / soak / smoke), not the full board too.
-    branches: ['qa/**', '!qa/fast-**', '!qa/soak-**', '!qa/smoke-**']
+  # DISPATCH-ONLY by decision (2026-08-02): the board's primary venue is the
+  # LOCAL multi-leg CI (scripts/repro.sh on macOS/Linux/Windows), which can hold
+  # the real-repo corpus tier that GitHub runners never can -- the old qa/**
+  # push trigger auto-ran a board that was structurally red from those corpus
+  # skips, repainting red that blocked nobody. Manual dispatch remains for
+  # cross-platform spot checks (gh workflow run bug-repro.yml --ref <branch>).
 
 permissions:
   contents: read
@@ -51,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -66,7 +66,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:

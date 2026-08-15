@@ -115,6 +115,41 @@ const CBMType *cbm_type_func(CBMArena *a, const char **param_names, const CBMTyp
     return t;
 }
 
+const CBMType **cbm_type_materialize_signature_params(CBMArena *a, const char *const *type_texts,
+                                                      int count, CBMTypeTextParser parser,
+                                                      void *parser_ctx) {
+    if (count <= 0)
+        return NULL;
+
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(a, ((size_t)count + 1) * sizeof(const CBMType *));
+    if (!types)
+        return NULL;
+
+    for (int i = 0; i < count; i++) {
+        const char *text = type_texts ? type_texts[i] : NULL;
+        if (!text || text[0] == '\0' || strcmp(text, "?") == 0) {
+            types[i] = cbm_type_unknown();
+            continue;
+        }
+
+        const CBMType *parsed = parser ? parser(a, text, parser_ctx) : NULL;
+        types[i] = parsed ? parsed : cbm_type_unknown();
+    }
+    types[count] = NULL;
+    return types;
+}
+
+const CBMType *cbm_type_func_replace_returns(CBMArena *a, const CBMType *old_signature,
+                                             const CBMType *const *new_return_types) {
+    if (!old_signature || old_signature->kind != CBM_TYPE_FUNC)
+        return cbm_type_unknown();
+
+    /* cbm_type_func only reads and then copies this vector into arena memory. */
+    return cbm_type_func(a, old_signature->data.func.param_names,
+                         old_signature->data.func.param_types, (const CBMType **)new_return_types);
+}
+
 const CBMType *cbm_type_builtin(CBMArena *a, const char *name) {
     CBMType *t = (CBMType *)cbm_arena_alloc(a, sizeof(CBMType));
     if (!t)
