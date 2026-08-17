@@ -249,6 +249,11 @@ Commit a single compressed file to your repo and your teammates skip the reindex
   - **Fast** (`zstd -3`) — written by the watcher for low-latency incremental updates
 - **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing — avoiding the full reindex cost
 - **No merge pain**: a `.gitattributes` line with `merge=ours` is auto-created on first export, so concurrent edits don't produce conflicts on the binary artifact
+- **Use Git LFS for team repos**: the artifact can be >20MB of binary that regenerates on every re-index. Committing it plainly stores a full new blob each time — a repo can reach gigabytes of bloat within a normal week of indexing. For any team-shared repo, register the artifact with Git LFS instead of committing it inline. Replace the auto-created `merge=ours` line in `.gitattributes` with the LFS tracking pattern:
+  ```gitattributes
+  .codebase-memory/graph.db.zst filter=lfs diff=lfs merge=lfs -text
+  ```
+  If you are migrating an existing repo where the artifact was already committed plainly, strip the historical blobs first with `git-filter-repo` — one team's un-LFS'd history accumulated ~7GB before a history rewrite reclaimed it. LFS keeps clones small and avoids the "same file, hundreds of versions" bloat the plain commit path produces.
 - **Optional**: never committed unless you want it. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
 The result is similar in spirit to graphify's `graphify-out/` directory, but as a single compressed file with explicit two-tier export, integrity-checked import, and zero merge friction.
