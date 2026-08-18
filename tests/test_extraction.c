@@ -1005,6 +1005,54 @@ TEST(elixir_function) {
     PASS();
 }
 
+/* True when a channel with this name/transport/direction was extracted. */
+static int has_channel(CBMFileResult *r, const char *name, const char *transport,
+                       CBMChannelDirection dir) {
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *c = &r->channels.items[i];
+        if (c->channel_name && strcmp(c->channel_name, name) == 0 && c->transport &&
+            strcmp(c->transport, transport) == 0 && c->direction == dir)
+            return 1;
+    }
+    return 0;
+}
+
+/* Phoenix pub/sub and channel listeners. Both branches were unreachable: the
+ * emit side looked up an "arguments" FIELD that tree-sitter-elixir does not
+ * define, and the listener side dispatched on a "def" NODE TYPE that does not
+ * exist (Elixir defs are `call` nodes), so a Phoenix app produced no channels
+ * at all. */
+TEST(elixir_channels_pubsub_and_handle_in) {
+    CBMFileResult *r =
+        extract("defmodule Acme.Notifier do\n"
+                "  def announce(p) do\n"
+                "    Phoenix.PubSub.broadcast(Acme.PubSub, \"user:created\", p)\n"
+                "  end\n"
+                "  def watch, do: Phoenix.PubSub.subscribe(Acme.PubSub, \"user:updated\")\n"
+                "end\n"
+                "defmodule AcmeWeb.RoomChannel do\n"
+                "  def handle_in(\"new_msg\", payload, socket) do\n"
+                "    push(socket, \"pong\", %{})\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "  def handle_in(\"ping\", _p, socket) when is_map(socket) do\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "end\n",
+                CBM_LANG_ELIXIR, "t", "chan.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "user:created", "phoenix_pubsub", CBM_CHANNEL_EMIT));
+    ASSERT(has_channel(r, "user:updated", "phoenix_pubsub", CBM_CHANNEL_LISTEN));
+    /* handle_in clauses are listeners — including the guarded one. */
+    ASSERT(has_channel(r, "new_msg", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    ASSERT(has_channel(r, "ping", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    /* A bare push/broadcast inside the channel module is an emit. */
+    ASSERT(has_channel(r, "pong", "phoenix_channel", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -5432,6 +5480,7 @@ SUITE(extraction) {
 
     /* Functional */
     RUN_TEST(elixir_function);
+    RUN_TEST(elixir_channels_pubsub_and_handle_in);
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
