@@ -264,11 +264,13 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
 
-/* #725: drop a suffix_match CALLS edge when the caller language and the
- * target file's language disagree. unique_name (candidates == 1) is #1572
- * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX
- * are one family so a .ts helper calling a .tsx function is not dropped.
- * Pure; unit-tested in test_registry.c. */
+/* #725/#1572: drop a suffix_match or unique_name CALLS edge when the caller
+ * language and the target file's language disagree. suffix_match is the
+ * import-distance winner among many same-named symbols (#725);
+ * unique_name is the candidates==1 case of the same class (#1572).
+ * same_module / import_map / lsp_* are kept. JS/TS/TSX are one family so a
+ * .ts helper calling a .tsx function is not dropped. Pure; unit-tested in
+ * test_registry.c. */
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
 

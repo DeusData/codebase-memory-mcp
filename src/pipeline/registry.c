@@ -476,10 +476,12 @@ static const char *path_basename(const char *path) {
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy) {
     /* Two same-named symbols in different languages: suffix_match picks one
-     * winner by import-distance and attaches every bare-name call to it
-     * (#725, Bash/Python main, JS/Python commit). unique_name is the
-     * candidates==1 case (#1572) and is not this guard. */
-    if (!strategy || strcmp(strategy, "suffix_match") != 0) {
+     * winner by import-distance (#725, Bash/Python main, JS/Python commit).
+     * unique_name is the candidates==1 case of the same class (#1572,
+     * Python `from unittest.mock import patch` binding to a unique TSX
+     * `patch`). */
+    if (!strategy ||
+        (strcmp(strategy, "suffix_match") != 0 && strcmp(strategy, "unique_name") != 0)) {
         return false;
     }
     if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {

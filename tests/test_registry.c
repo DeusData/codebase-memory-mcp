@@ -763,7 +763,7 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
 
 TEST(cross_language_suffix_match_drops_py_vs_js) {
     /* #725: two same-named symbols in different languages. suffix_match is the
-     * strategy that collapses them; unique_name is #1572 and must stay. */
+     * strategy that collapses them. unique_name is covered by the #1572 test. */
     ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
                                                          "suffix_match"));
     ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py",
@@ -772,8 +772,6 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
                                                          "suffix_match"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py",
                                                           "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "unique_name"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
                                                           "same_module"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
@@ -786,6 +784,30 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, NULL, "suffix_match"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py",
                                                           "suffix_match"));
+    PASS();
+}
+
+TEST(cross_language_unique_name_drops_py_vs_tsx) {
+    /* #1572: unique_name is the candidates==1 case of the same class as
+     * suffix_match. Python `from unittest.mock import patch` must not bind
+     * to a unique TSX `function patch`. */
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                         "unique_name"));
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TSX, "backend/test_thing.py",
+                                                         "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "backend/test_thing.py",
+                                                          "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                          "same_module"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                          "import_map"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                          "lsp_direct"));
+    /* JS/TS/TSX are one family — a .ts caller of a .tsx unique_name stays. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TYPESCRIPT, "frontend/Panel.tsx",
+                                                          "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "frontend/Panel.tsx",
+                                                          "unique_name"));
     PASS();
 }
 
@@ -922,6 +944,7 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(cross_language_unique_name_drops_py_vs_tsx);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
 }

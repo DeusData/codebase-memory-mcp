@@ -635,9 +635,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
-    /* #725: suffix_match is language-agnostic and will attach a Python
-     * Store.commit() call to a JS function named commit (or a Bash main
-     * to a Python main). Drop that weak cross-language edge. */
+    /* #725/#1572: suffix_match and unique_name are language-agnostic and
+     * will attach a Python Store.commit() call to a JS function named
+     * commit, or a Python `with patch(...)` to a unique TSX `patch`. Drop
+     * those weak cross-language edges. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }

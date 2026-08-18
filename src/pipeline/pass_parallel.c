@@ -2541,8 +2541,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         if (target_node && source_node->id != target_node->id &&
             cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-            /* #725: same guard as pass_calls.c — do not emit a suffix_match
-             * CALLS edge across a language boundary. */
+            /* #725/#1572: same guard as pass_calls.c — do not emit a
+             * suffix_match or unique_name CALLS edge across a language
+             * boundary. */
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {
