@@ -439,6 +439,34 @@ TEST(index_parse_partial_reported) {
     /* Clean neighbors still extract. */
     int funcs = rh_count_label(store, lp.project, "Function");
     ASSERT_GTE(funcs, 1);
+    cbm_store_close(store);
+    store = NULL;
+
+    /* An incremental run that changes only a clean neighbor has no new parser
+     * errors, but its response must still describe the persisted current
+     * coverage state for the untouched partial file. */
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = INCR_FIX_SLEEP_NS};
+    nanosleep(&delay, NULL);
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 2\n");
+    char iargs[700];
+    snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
+    char *iresp = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
+    ASSERT_NOT_NULL(iresp);
+    yyjson_doc *idoc = yyjson_read(iresp, strlen(iresp), 0);
+    ASSERT_NOT_NULL(idoc);
+    yyjson_val *isc = yyjson_obj_get(yyjson_doc_get_root(idoc), "structuredContent");
+    ASSERT_NOT_NULL(isc);
+    ASSERT_GTE(yyjson_get_int(yyjson_obj_get(isc, "parse_partial_count")), 1);
+    yyjson_val *ipp = yyjson_obj_get(isc, "parse_partial");
+    ASSERT_NOT_NULL(ipp);
+    char *ipp_json = yyjson_val_write(ipp, 0, NULL);
+    ASSERT_NOT_NULL(ipp_json);
+    ASSERT_NOT_NULL(strstr(ipp_json, "split.c"));
+    free(ipp_json);
+    /* The coverage is persisted state, but the logfile remains per-run. */
+    ASSERT_NULL(yyjson_obj_get(isc, "logfile"));
+    yyjson_doc_free(idoc);
+    free(iresp);
 
     yyjson_doc_free(d);
     free(resp);

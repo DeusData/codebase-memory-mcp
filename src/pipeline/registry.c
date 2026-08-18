@@ -662,11 +662,12 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
     /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
-     * import called bare: `from m import f as g; g()` — #875/#979). With a
-     * suffix present (`imported.method()`), returning the bare base here
-     * would swallow the suffix and bind the call to the imported symbol's
-     * own node (a Variable/Class/module) instead of base.method — exactly
-     * the mis-resolution the comment above warns about. That regressed
+     * import called bare: `from m import f as g; g()` — #875/#979; Yui
+     * `import execute as bridge_execute`). With a suffix present
+     * (`imported.method()`), returning the bare base here would swallow
+     * the suffix and bind the call to the imported symbol's own node
+     * (a Variable/Class/module) instead of base.method — exactly the
+     * mis-resolution the comment above warns about. That regressed
      * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
      * degraded to edges onto the signal variables themselves). #1000 */
     if (!suffix || !suffix[0]) {
