@@ -1668,11 +1668,15 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
     // method is `new`.  The constructor body lives in `initialize`, so a callee
     // of "new" never resolves.  Redirect to the receiver type name so the call
     // links to the class/constructor like every other language's `new T()`.
+    // Scope-resolved receivers (`Admin::User.new`) get the same treatment —
+    // the callee carries the full constant path ("Admin::User"), whose bare
+    // leaf ("User") is what resolution joins on.
     if (lang == CBM_LANG_RUBY) {
         TSNode m = ts_node_child_by_field_name(node, TS_FIELD("method"));
         TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
         if (!ts_node_is_null(m) && !ts_node_is_null(recv) &&
-            strcmp(ts_node_type(recv), "constant") == 0) {
+            (strcmp(ts_node_type(recv), "constant") == 0 ||
+             strcmp(ts_node_type(recv), "scope_resolution") == 0)) {
             char *mt = cbm_node_text(a, m, source);
             if (mt && strcmp(mt, "new") == 0) {
                 char *rt = cbm_node_text(a, recv, source);
