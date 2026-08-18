@@ -697,7 +697,8 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
 
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-           lang == CBM_LANG_ARKTS;
+           lang == CBM_LANG_ARKTS || lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE ||
+           lang == CBM_LANG_ASTRO;
 }
 
 /* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
@@ -705,6 +706,10 @@ static bool js_ts_family(CBMLanguage lang) {
  * own header would otherwise read as a language boundary. */
 static bool c_cpp_family(CBMLanguage lang) {
     return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
+}
+
+static bool jvm_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN || lang == CBM_LANG_GROOVY;
 }
 
 static const char *path_basename(const char *path) {
@@ -736,15 +741,12 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     /* Two same-named symbols in different languages: suffix_match picks one
      * winner by import-distance and attaches every bare-name call to it
      * (#725, Bash/Python main, JS/Python commit). unique_name is the
-     * candidates==1 case (#1572) and is not this guard — except for a build
-     * or configuration caller, where even a unique match into another
-     * language is a collision by construction. */
-    if (!strategy) {
-        return false;
-    }
-    bool config_caller = build_config_language(caller_lang);
-    if (strcmp(strategy, "suffix_match") != 0 &&
-        !(config_caller && strcmp(strategy, "unique_name") == 0)) {
+     * candidates==1 case of the same class (#1572, Python
+     * `from unittest.mock import patch` binding to a unique TSX `patch`).
+     * Build/config callers have no cross-language call semantics, so their
+     * unique_name collisions are covered by the same guard. */
+    if (!strategy ||
+        (strcmp(strategy, "suffix_match") != 0 && strcmp(strategy, "unique_name") != 0)) {
         return false;
     }
     if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
@@ -758,6 +760,12 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
         return false;
     }
     if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
+        return false;
+    }
+    if (jvm_family(caller_lang) && jvm_family(target_lang)) {
         return false;
     }
     return true;
