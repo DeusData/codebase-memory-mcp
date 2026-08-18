@@ -145,6 +145,7 @@ source "$ROOT/scripts/path-safety.sh"
 MAKE_ARGS=()
 BUILD_DIR="build/c"
 SANITIZE_GIVEN=0
+SANITIZE_VALUE=""
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
@@ -154,7 +155,11 @@ for arg in "$@"; do
         --tsan) ;; # already handled
         --suites|--suites=*) ;; # already handled (value skipped via prev_arg below)
         BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
-        SANITIZE=*) SANITIZE_GIVEN=1; MAKE_ARGS+=("$arg") ;;
+        SANITIZE=*)
+            SANITIZE_GIVEN=1
+            SANITIZE_VALUE="${arg#SANITIZE=}"
+            MAKE_ARGS+=("$arg")
+            ;;
         *=*)
             if [[ "${prev_arg:-}" != "--suites" ]]; then
                 MAKE_ARGS+=("$arg") # forward any VAR=VAL to make
@@ -174,6 +179,42 @@ if [ "$SANITIZE_GIVEN" -eq 0 ] && [ "${MSYSTEM:-}" = "CLANGARM64" ]; then
     MAKE_ARGS+=("SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer")
 fi
 
+EXPECTED_SANITIZED=1
+if [ "$SANITIZE_GIVEN" -eq 1 ]; then
+    case "$SANITIZE_VALUE" in
+        *[![:space:]]*) EXPECTED_SANITIZED=1 ;;
+        *) EXPECTED_SANITIZED=0 ;;
+    esac
+fi
+
+# Refuse to run suites when the built runner disagrees with the lane that
+# produced it. Exact output keeps missing, duplicate, or future unhandled
+# fields fail-closed instead of silently weakening the gate.
+assert_test_runner_build_config() {
+    local runner="$1"
+    local expected_sanitized="$2"
+    local expected="sanitized=$expected_sanitized test_seams=1"
+    local marker="__cbm_build_config_end__"
+    local captured=""
+    local actual=""
+    local probe_ok=0
+
+    if captured="$("$runner" --build-config && printf '%s' "$marker")"; then
+        probe_ok=1
+        actual="${captured%"$marker"}"
+    else
+        actual="$captured"
+    fi
+    if [ "$probe_ok" -ne 1 ] || [ "$actual" != "$expected"$'\n' ]; then
+        local reported="${actual//$'\n'/\\n}"
+        printf 'ERROR: build config mismatch for %s\n' "$runner" >&2
+        printf '  expected: %s\n' "$expected" >&2
+        printf '  reported: %s\n' "${reported:-<empty>}" >&2
+        printf '%s\n' 'Refusing to run suites; check sanitizer flags and CBM_SANITIZED_BUILD wiring.' >&2
+        return 1
+    fi
+}
+
 print_env "test.sh"
 
 # ── TSan mode (--tsan): the data-race gate ──
@@ -182,6 +223,7 @@ print_env "test.sh"
 if [ "$TSAN" -eq 1 ]; then
     echo "=== test.sh: TSan leg (make test-tsan) ==="
     make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner-tsan" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    assert_test_runner_build_config "$BUILD_DIR/test-runner-tsan" 1
     make -f Makefile.cbm test-tsan ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
     exit "$?"
 fi
@@ -192,6 +234,7 @@ fi
 if [ -n "$SUITES" ]; then
     echo "=== test.sh: ITERATION mode — suites: $SUITES (incremental build) ==="
     make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    assert_test_runner_build_config "$BUILD_DIR/test-runner" "$EXPECTED_SANITIZED"
     # shellcheck disable=SC2086  # suite list is deliberately word-split
     "$BUILD_DIR/test-runner" $SUITES
     exit "$?"
@@ -275,6 +318,7 @@ BUILD_DIR="$BUILD_DIR" scripts/clean.sh
 # pass/fail/skip totals aggregate to the same numbers as the sequential run).
 # CBM_TEST_SEQUENTIAL=1 restores the single-process runner.
 make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+assert_test_runner_build_config "$BUILD_DIR/test-runner" "$EXPECTED_SANITIZED"
 if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
     make -f Makefile.cbm test ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 else

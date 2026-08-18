@@ -17,6 +17,7 @@ int tf_skip_count = 0;
 #include "foundation/log.h"        /* crash-durable worker log probe */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
+#include "foundation/sanitized.h"  /* CBM_SANITIZED — --build-config contract */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
@@ -836,6 +837,15 @@ int main(int argc, char **argv) {
      * Mirror the production binary's minimal verification contract. */
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
         (void)puts("codebase-memory-mcp test-runner");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--build-config") == 0) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        const int test_seams = 1;
+#else
+        const int test_seams = 0;
+#endif
+        (void)printf("sanitized=%d test_seams=%d\n", CBM_SANITIZED, test_seams);
         return 0;
     }
     int mcp_idxfailclosed_rc = tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
