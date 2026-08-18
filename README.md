@@ -485,7 +485,7 @@ overwrite user-modified agents.
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
 | Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
-| Codex CLI | Detected | `$CODEX_HOME/config.toml` | `AGENTS.md`, skill, three read-only agents; `SessionStart` + `SubagentStart` |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Skill, three read-only agents; `SessionStart` + `SubagentStart` |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
 | OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
@@ -529,6 +529,10 @@ overwrite user-modified agents.
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Oh My Pi (omp) | Detected | Effective agent directory (`OMP_PROFILE` / `PI_CODING_AGENT_DIR`; default `~/.omp/agent/mcp.json`) | Skill and three direct-MCP graph-tool subagents (Scout/Verify/Auditor); preserves user `AGENTS.md` |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
+
+For Codex, install no longer creates global `$CODEX_HOME/AGENTS.md` guidance. When that file
+already exists, install removes only the legacy `codebase-memory-mcp` managed block and preserves
+all user-owned bytes; the file itself remains even when the cleanup leaves it empty.
 
 ### Sessions, compaction, and subagents
 
