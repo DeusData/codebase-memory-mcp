@@ -831,9 +831,10 @@ TEST(cross_language_config_caller_drops_unique_name_too) {
         cbm_suppress_cross_language_suffix_match(CBM_LANG_CMAKE, "src/main.c", "unique_name"));
     ASSERT_TRUE(
         cbm_suppress_cross_language_suffix_match(CBM_LANG_YAML, "app/models.py", "unique_name"));
-    /* A code caller's unique_name into another language is still #1572. */
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
-        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "unique_name"));
+    /* A code caller's unique_name into another language is #1572. */
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON,
+                                                         "web/src/pages/Editor.js",
+                                                         "unique_name"));
     /* Same-language config targets are untouched. */
     ASSERT_FALSE(
         cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "lib/Makefile", "unique_name"));
@@ -912,7 +913,7 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
 
 TEST(cross_language_suffix_match_drops_py_vs_js) {
     /* #725: two same-named symbols in different languages. suffix_match is the
-     * strategy that collapses them; unique_name is #1572 and must stay. */
+     * strategy that collapses them. unique_name is covered by the #1572 test. */
     ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
                                                          "suffix_match"));
     ASSERT_TRUE(
@@ -921,8 +922,6 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
         cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py", "suffix_match"));
     ASSERT_FALSE(
         cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py", "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
-        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "unique_name"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
         CBM_LANG_PYTHON, "web/src/pages/Editor.js", "same_module"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON,
@@ -984,6 +983,36 @@ TEST(go_bare_ref_never_binds_field) {
     ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
     /* Degenerate input → nothing to judge. */
     ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
+    PASS();
+}
+
+TEST(cross_language_unique_name_drops_py_vs_tsx) {
+    /* #1572: unique_name is the candidates==1 case of the same class as
+     * suffix_match. Python `from unittest.mock import patch` must not bind
+     * to a unique TSX `function patch`. */
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                         "unique_name"));
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TSX, "backend/test_thing.py",
+                                                         "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "backend/test_thing.py",
+                                                          "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                          "same_module"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                          "import_map"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                          "lsp_direct"));
+    /* JS/TS/TSX are one family — a .ts caller of a .tsx unique_name stays. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TYPESCRIPT, "frontend/Panel.tsx",
+                                                          "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "frontend/Panel.tsx",
+                                                          "unique_name"));
+    /* C/C++, JVM, and Vue→TS families stay exempt for unique_name. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_C, "bpf/probe.h", "unique_name"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_GROOVY, "buildSrc/Foo.java", "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_VUE, "services/Queue.ts",
+                                                          "unique_name"));
     PASS();
 }
 
@@ -1244,6 +1273,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_break_is_independent_of_registration_order);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(cross_language_unique_name_drops_py_vs_tsx);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
