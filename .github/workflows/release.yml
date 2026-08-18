@@ -50,6 +50,21 @@ jobs:
   lint:
     uses: ./.github/workflows/_lint.yml
 
+  # ── Release metadata preflight ─────────────────────────────────
+  # The dispatch version, server.json and generated plugin must agree before
+  # any release artifact is built.
+  plugin-release-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Verify Claude Code plugin release metadata
+        run: scripts/check-plugin-drift.sh "${{ inputs.version }}"
+
   # ── 2. Tests (all platforms, full suite for release) ────────────
   # skip_tests exists for RE-releases of a tree whose tests are already green:
   # when only packaging/gating changed and the previous run proved the suites,
@@ -69,7 +84,7 @@ jobs:
   # never when lint or test actually failed.
   build:
     if: ${{ !cancelled() && !failure() }}
-    needs: [test]
+    needs: [test, plugin-release-metadata]
     permissions:
       contents: read
       id-token: write

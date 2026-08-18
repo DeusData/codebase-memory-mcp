@@ -6952,6 +6952,288 @@ int cbm_cmd_config(int argc, char **argv) {
     return rc;
 }
 
+/* ── emit-plugin: Claude Code plugin generator ──────────────────── */
+
+/* Recursively delete path (file or directory tree). Missing path is not an
+ * error — emit re-runs are idempotent against a from-scratch out_dir.
+ * Built entirely on cross-platform metadata and directory/file primitives in
+ * compat_fs.c, so no platform-specific code is needed here. */
+static int emit_rm_rf(const char *path) {
+    cbm_dir_t *d = cbm_opendir(path);
+    if (!d) {
+        return CLI_OK; /* not a directory (missing, or a plain file) */
+    }
+    int rc = CLI_OK;
+    cbm_dirent_t *e;
+    while (rc == CLI_OK && (e = cbm_readdir(d)) != NULL) {
+        char child[CLI_BUF_1K];
+        snprintf(child, sizeof(child), "%s/%s", path, e->name);
+        cbm_path_info_t child_info;
+        if (cbm_path_info_utf8(child, &child_info) != 0) {
+            rc = CLI_ERR;
+        } else if (child_info.is_symlink) {
+            rc = child_info.is_directory ? (cbm_rmdir(child) == 0 ? CLI_OK : CLI_ERR)
+                                         : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+        } else {
+            rc = child_info.is_directory ? emit_rm_rf(child)
+                                         : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+        }
+    }
+    cbm_closedir(d);
+    if (rc != CLI_OK) {
+        return rc;
+    }
+    return cbm_rmdir(path) == 0 ? CLI_OK : CLI_ERR;
+}
+
+static int emit_write_file(const char *path, const char *content) {
+    if (!path || !content || ensure_parent_dir(path) != CLI_OK) {
+        return CLI_ERR;
+    }
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        return CLI_ERR;
+    }
+    size_t len = strlen(content);
+    size_t wrote = fwrite(content, 1, len, f);
+    int close_rc = fclose(f);
+    return (wrote == len && close_rc == 0) ? CLI_OK : CLI_ERR;
+}
+
+/* Copy src into dst (size cap) as a JSON-safe string body: escape " and \,
+ * drop control chars < 0x20. */
+static void json_escape_into(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 2 < dst_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+        } else if (c < 0x20) {
+            continue;
+        }
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
+static int emit_plugin_json(const char *out_dir, const char *version) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.claude-plugin/plugin.json", out_dir);
+    char ver_esc[CLI_BUF_1K];
+    json_escape_into(ver_esc, sizeof(ver_esc), version);
+    char json[CLI_BUF_1K];
+    snprintf(json, sizeof(json),
+             "{\n"
+             "  \"name\": \"codebase-memory\",\n"
+             "  \"version\": \"%s\",\n"
+             "  \"description\": \"Codebase knowledge graph for AI agents — "
+             "159 languages, sub-ms queries, 99%% fewer tokens.\"\n"
+             "}\n",
+             ver_esc);
+    return emit_write_file(path, json);
+}
+
+static int emit_skills(const char *out_dir) {
+    const cbm_skill_t *skill_list = cbm_get_skills();
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/skills/%s/SKILL.md", out_dir, skill_list[i].name);
+        if (emit_write_file(path, skill_list[i].content) != CLI_OK) {
+            return CLI_ERR;
+        }
+    }
+    return CLI_OK;
+}
+
+static int emit_agents(const char *out_dir) {
+    for (cbm_graph_tier_t tier = CBM_GRAPH_TIER_SCOUT; tier < CBM_GRAPH_TIER_COUNT; tier++) {
+        char *profile =
+            cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, tier, CBM_GRAPH_ACCESS_DIRECT, NULL);
+        const char *slug = cbm_graph_tier_slug(tier);
+        if (!profile || !slug) {
+            free(profile);
+            return CLI_ERR;
+        }
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/agents/%s.md", out_dir, slug);
+        int rc = emit_write_file(path, profile);
+        free(profile);
+        if (rc != CLI_OK) {
+            return CLI_ERR;
+        }
+    }
+    return CLI_OK;
+}
+
+static int emit_package_spec(char *dst, size_t dst_sz, const char *version) {
+    char package[CLI_BUF_1K];
+    int len = snprintf(package, sizeof(package), "codebase-memory-mcp@%s", version);
+    if (len < 0 || (size_t)len >= sizeof(package)) {
+        return CLI_ERR;
+    }
+    json_escape_into(dst, dst_sz, package);
+    return CLI_OK;
+}
+
+static int emit_mcp_json(const char *out_dir, const char *version) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.mcp.json", out_dir);
+    char package[CLI_BUF_2K];
+    if (emit_package_spec(package, sizeof(package), version) != CLI_OK) {
+        return CLI_ERR;
+    }
+    char body[CLI_BUF_2K];
+    int len = snprintf(body, sizeof(body),
+                       "{\n"
+                       "  \"mcpServers\": {\n"
+                       "    \"codebase-memory-mcp\": {\n"
+                       "      \"type\": \"stdio\",\n"
+                       "      \"command\": \"npx\",\n"
+                       "      \"args\": [\"-y\", \"%s\"]\n"
+                       "    }\n"
+                       "  }\n"
+                       "}\n",
+                       package);
+    if (len < 0 || (size_t)len >= sizeof(body)) {
+        return CLI_ERR;
+    }
+    return emit_write_file(path, body);
+}
+
+static int emit_hooks_json(const char *out_dir, const char *version) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/hooks/hooks.json", out_dir);
+    char package[CLI_BUF_2K];
+    if (emit_package_spec(package, sizeof(package), version) != CLI_OK) {
+        return CLI_ERR;
+    }
+    char body[CLI_BUF_4K];
+    int len = snprintf(
+        body, sizeof(body),
+        "{\n"
+        "  \"SessionStart\": [\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": \"npx\", "
+        "\"args\": [\"-y\", \"%s\", \"hook-augment\", \"--event\", \"SessionStart\"] } ] }\n"
+        "  ],\n"
+        "  \"SubagentStart\": [\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": \"npx\", "
+        "\"args\": [\"-y\", \"%s\", \"hook-augment\", \"--event\", \"SubagentStart\"] } ] }\n"
+        "  ],\n"
+        "  \"PreToolUse\": [\n"
+        "    { \"matcher\": \"Grep|Glob\", \"hooks\": [ { \"type\": \"command\", "
+        "\"command\": \"npx\", \"args\": [\"-y\", \"%s\", \"hook-augment\"] } ] }\n"
+        "  ],\n"
+        "  \"PostToolUse\": [\n"
+        "    { \"matcher\": \"Read\", \"hooks\": [ { \"type\": \"command\", "
+        "\"command\": \"npx\", \"args\": [\"-y\", \"%s\", \"hook-augment\"] } ] }\n"
+        "  ]\n"
+        "}\n",
+        package, package, package, package);
+    if (len < 0 || (size_t)len >= sizeof(body)) {
+        return CLI_ERR;
+    }
+    return emit_write_file(path, body);
+}
+
+static bool emit_marker_is_owned(const char *path) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char json[CLI_BUF_8K];
+    size_t len = fread(json, 1, sizeof(json) - 1, f);
+    int extra = len == sizeof(json) - 1 ? fgetc(f) : EOF;
+    int read_failed = ferror(f);
+    int close_failed = fclose(f);
+    if (read_failed || close_failed != 0 || extra != EOF) {
+        return false;
+    }
+    json[len] = '\0';
+
+    yyjson_doc *doc = yyjson_read(json, len, YYJSON_READ_NOFLAG);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *name = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "name") : NULL;
+    const char *owned_name = name ? yyjson_get_str(name) : NULL;
+    bool owned = owned_name && strcmp(owned_name, "codebase-memory") == 0;
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return owned;
+}
+
+int cbm_emit_plugin(const char *out_dir, const char *version) {
+    if (!out_dir || out_dir[0] == '\0') {
+        return CLI_ERR;
+    }
+    const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
+    /* Refuse to wipe anything that is not a real directory carrying our
+     * validated marker. This also rejects top-level links/reparse points. */
+    cbm_path_info_t out_info;
+    cbm_path_info_result_t out_info_result = cbm_path_info_utf8(out_dir, &out_info);
+    if (out_info_result != CBM_PATH_INFO_OK && out_info_result != CBM_PATH_INFO_MISSING) {
+        (void)fprintf(stderr, "error: refusing to clear %s: unable to inspect output path.\n",
+                      out_dir);
+        return CLI_ERR;
+    }
+    if (out_info_result == CBM_PATH_INFO_OK) {
+        char marker[CLI_BUF_1K];
+        snprintf(marker, sizeof(marker), "%s/.claude-plugin/plugin.json", out_dir);
+        cbm_path_info_t marker_info;
+        bool owned = out_info.is_directory && !out_info.is_symlink &&
+                     cbm_path_info_utf8(marker, &marker_info) == 0 && marker_info.is_regular &&
+                     !marker_info.is_symlink && emit_marker_is_owned(marker);
+        if (!owned) {
+            (void)fprintf(stderr,
+                          "error: refusing to clear %s: not an emitted plugin directory "
+                          "owned by codebase-memory. Emit into a fresh or "
+                          "previously-emitted codebase-memory plugin directory.\n",
+                          out_dir);
+            return CLI_ERR;
+        }
+    }
+    if (emit_rm_rf(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_plugin_json(out_dir, ver) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_skills(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_agents(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_mcp_json(out_dir, ver) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_hooks_json(out_dir, ver) != CLI_OK) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+int cbm_cmd_emit_plugin(int argc, char **argv) {
+    const char *out_dir = NULL;
+    const char *version = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 && i + 1 < argc) {
+            version = argv[++i];
+        } else if (argv[i][0] != '-' && !out_dir) {
+            out_dir = argv[i];
+        }
+    }
+    if (!out_dir) {
+        (void)fprintf(stderr, "usage: codebase-memory-mcp emit-plugin <dir> [--version X]\n");
+        return EXIT_FAILURE;
+    }
+    if (cbm_emit_plugin(out_dir, version) != CLI_OK) {
+        (void)fprintf(stderr, "error: emit-plugin failed for %s\n", out_dir);
+        return EXIT_FAILURE;
+    }
+    printf("Emitted Claude Code plugin to %s\n", out_dir);
+    return EXIT_SUCCESS;
+}
+
 /* ── Interactive prompt ───────────────────────────────────────── */
 
 /* Global auto-answer mode: 0=interactive, 1=always yes, -1=always no */

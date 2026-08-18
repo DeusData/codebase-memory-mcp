@@ -1,0 +1,14 @@
+{
+  "SessionStart": [
+    { "hooks": [ { "type": "command", "command": "npx", "args": ["-y", "codebase-memory-mcp@0.8.1", "hook-augment", "--event", "SessionStart"] } ] }
+  ],
+  "SubagentStart": [
+    { "hooks": [ { "type": "command", "command": "npx", "args": ["-y", "codebase-memory-mcp@0.8.1", "hook-augment", "--event", "SubagentStart"] } ] }
+  ],
+  "PreToolUse": [
+    { "matcher": "Grep|Glob", "hooks": [ { "type": "command", "command": "npx", "args": ["-y", "codebase-memory-mcp@0.8.1", "hook-augment"] } ] }
+  ],
+  "PostToolUse": [
+    { "matcher": "Read", "hooks": [ { "type": "command", "command": "npx", "args": ["-y", "codebase-memory-mcp@0.8.1", "hook-augment"] } ] }
+  ]
+}

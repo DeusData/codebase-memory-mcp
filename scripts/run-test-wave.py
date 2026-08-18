@@ -91,6 +91,12 @@ def append_log(path: pathlib.Path, message: str) -> None:
         stream.write("\n")
 
 
+def _atomic_write_text(path: pathlib.Path, text: str) -> None:
+    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def start_suite(
     suite: str,
     runner_command: list[str],
@@ -255,12 +261,12 @@ def wait_for_test_pre_terminate_barrier(
     ready = barrier_dir / f"{active.name}.ready"
     leader_exited = barrier_dir / f"{active.name}.leader-exited"
     release = barrier_dir / f"{active.name}.release"
-    ready.write_text(f"{active.process.pid}\n", encoding="utf-8")
+    _atomic_write_text(ready, f"{active.process.pid}\n")
     deadline = time.monotonic() + 10
     while not release.exists():
         returncode = active.process.poll()
         if returncode is not None and not leader_exited.exists():
-            leader_exited.write_text(f"{returncode}\n", encoding="utf-8")
+            _atomic_write_text(leader_exited, f"{returncode}\n")
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"test pre-terminate barrier for {active.name!r} was not released"
@@ -279,7 +285,7 @@ def wait_for_test_post_exit_barrier(
         return
     ready = barrier_dir / f"{suite}.ready"
     release = barrier_dir / f"{suite}.release"
-    ready.write_text("child exited; result intentionally not recorded\n", encoding="utf-8")
+    _atomic_write_text(ready, "child exited; result intentionally not recorded\n")
     deadline = time.monotonic() + 10
     while not release.exists():
         if time.monotonic() >= deadline:
