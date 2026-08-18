@@ -1790,6 +1790,30 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
     if (target) {
+        /* Python/TS from-import of a member: module_path is often
+         * "pkg.mod.symbol" while resolve_module lands on the Module node
+         * "pkg.mod". Prefer the member Function/Class when it exists —
+         * required for `from M import f as g` so CALLS can import_map to f
+         * (local_name g ≠ f). */
+        if (target->label &&
+            (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
+            char symbuf[256];
+            const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
+            if (sym && sym[0] && strcmp(sym, "*") != 0) {
+                const char *mod_tail =
+                    import_last_segment(target->qualified_name ? target->qualified_name : "");
+                if (!mod_tail || strcmp(mod_tail, sym) != 0) {
+                    char member_qn[CBM_SZ_512];
+                    snprintf(member_qn, sizeof(member_qn), "%s.%s", target->qualified_name, sym);
+                    const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+                    if (member && import_targetable_label(member->label) &&
+                        strcmp(member->label, "Module") != 0 &&
+                        strcmp(member->label, "File") != 0) {
+                        return member;
+                    }
+                }
+            }
+        }
         return target;
     }
 
