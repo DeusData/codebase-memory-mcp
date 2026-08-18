@@ -12561,6 +12561,8 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
     yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
 }
 
+static bool cli_stdin_allowed_for_schema(const char *schema_str);
+
 bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
     /* An interactive run has nothing piped to read: consulting the terminal
      * would just sit waiting for the user to type JSON. Unchanged by #1359 —
@@ -12589,6 +12591,17 @@ bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
         return false;
     }
 
+    return cli_stdin_allowed_for_schema(schema_str);
+}
+
+/* Schema→decision core of the stdin gate, split out so the zero-argument
+ * branch stays TESTED even when no shipped tool is zero-argument anymore:
+ * #1181 gave list_projects pagination parameters, retiring the last
+ * empty-properties schema, and the #1359 regression tests had leaned on it
+ * as their live example. The product contract is unchanged — a schema that
+ * declares no properties means stdin has nothing to carry and the read is
+ * pure deadlock; the tests now exercise this path directly. */
+static bool cli_stdin_allowed_for_schema(const char *schema_str) {
     yyjson_doc *schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
     if (!schema_doc) {
         /* The schemas are compile-time constants, so a parse failure means a
@@ -12603,6 +12616,12 @@ bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty) {
     yyjson_doc_free(schema_doc);
     return accepts_arguments;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str) {
+    return cli_stdin_allowed_for_schema(schema_str);
+}
+#endif
 
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out) {
     if (err_out) {

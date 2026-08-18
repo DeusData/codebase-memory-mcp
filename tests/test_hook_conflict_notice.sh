@@ -44,10 +44,13 @@ if ! LC_ALL=C grep -a -q -F 'CBM_TEST_HOOK_CLIENT_BUILD' "${BINARY}"; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+# shellcheck source=../scripts/test-runtime.sh
+source "${ROOT}/scripts/test-runtime.sh"
+cbm_test_runtime_init
+tmpdir="${CBM_TEST_RUNTIME_ROOT}"
 cleanup() {
   CBM_CACHE_DIR="${tmpdir}/cache" "${BINARY}" daemon stop >/dev/null 2>&1 || true
-  rm -rf "${tmpdir}"
+  cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 

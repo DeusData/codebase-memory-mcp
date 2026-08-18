@@ -14,6 +14,7 @@ void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
                                              cbm_mcp_quarantine_test_hook_fn hook, void *context);
 void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
                                           void *context);
+void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use

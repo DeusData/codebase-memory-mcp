@@ -46,8 +46,29 @@ jobs:
     uses: ./.github/workflows/_security.yml
     secrets: inherit
 
+  # ── 0. Preflight: refuse malformed dispatch inputs ──────────────
+  # The tag is inputs.version VERBATIM. A bare "0.10.7" publishes a release the
+  # installers can never resolve (they fetch releases/download/v<version>/...),
+  # and with immutable releases the mis-named tag cannot be retagged, deleted,
+  # or its name reused — the name is burned permanently (2026-08-18 incident).
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enforce v-prefixed semver version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "version OK: $VERSION"
+          else
+            echo "::error::version must be v-prefixed semver (vX.Y.Z), got '$VERSION'"
+            exit 1
+          fi
+
   # ── 1. Lint (cppcheck + clang-format) ───────────────────────────
   lint:
+    needs: [preflight]
     uses: ./.github/workflows/_lint.yml
 
   # ── 2. Tests (all platforms, full suite for release) ────────────
@@ -65,11 +86,19 @@ jobs:
       shard_suites: true
 
   # ── 3. Build all platforms ──────────────────────────────────────
-  # !cancelled() && !failure(): run when `test` is deliberately skipped, but
-  # never when lint or test actually failed.
+  # `test` may be skipped ONLY by the skip_tests input. A skipped `test` is
+  # also what a cancelled/timed-out lint produces (needs-cascade), and the
+  # bare !cancelled() && !failure() form cannot tell those apart: failure()
+  # does not cover a needed job that was CANCELLED, so a lint timeout let the
+  # whole pipeline publish with the test matrix silently skipped
+  # (v0.10.7 incident, 2026-08-18). Require the explicit results.
   build:
-    if: ${{ !cancelled() && !failure() }}
-    needs: [test]
+    if: >-
+      ${{ !cancelled()
+      && needs.lint.result == 'success'
+      && (needs.test.result == 'success'
+          || (inputs.skip_tests && needs.test.result == 'skipped')) }}
+    needs: [lint, test]
     permissions:
       contents: read
       id-token: write
@@ -92,7 +121,7 @@ jobs:
   # an optional phase needs this override, or the phase being optional silently
   # makes the phases after it optional as well.
   smoke:
-    if: ${{ !cancelled() && !failure() }}
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
     with:
@@ -100,7 +129,7 @@ jobs:
 
   # ── 5. Soak tests ──────────────────────────────────────────────
   soak:
-    if: ${{ !cancelled() && !failure() }}
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     needs: [build]
     uses: ./.github/workflows/_soak.yml
     with:

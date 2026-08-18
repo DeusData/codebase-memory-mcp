@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Layer 4: Install output audit — verifies install --dry-run writes only to expected paths.
+# Layer 4: Install output audit — runs a sandboxed real install and audits its writes.
 #
 # Checks:
 #   1. All output file paths are in the expected set
@@ -19,8 +19,11 @@ fi
 
 echo "=== Layer 4: Install Output Audit ==="
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+TMPDIR="$CBM_TEST_RUNTIME_ROOT"
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 # Set HOME to tmpdir so install writes there instead of real home
 export HOME="$TMPDIR/home"

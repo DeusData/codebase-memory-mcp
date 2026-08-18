@@ -44,7 +44,7 @@ fi
 ENV_PROBE="$WORKDIR/environment-probe-mcp"
 cat > "$ENV_PROBE" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\t%s\n' "${HOME-}" "${CBM_CACHE_DIR-}" >> "$CBM_FUZZ_ENV_PROBE"
+printf '%s\t%s\t%s\n' "${HOME-}" "${CBM_CACHE_DIR-}" "${CBM_RUNTIME_DIR-}" >> "$CBM_FUZZ_ENV_PROBE"
 
 # Echo a JSON-RPC result for every request with a numeric id.  This keeps the
 # fixture compatible with both the current fixed ids and a future per-case
@@ -64,11 +64,13 @@ chmod +x "$ENV_PROBE"
 
 CALLER_HOME="$WORKDIR/caller-home"
 CALLER_CACHE="$WORKDIR/caller-cache"
+CALLER_RUNTIME="$WORKDIR/caller-runtime"
 ENV_LOG="$WORKDIR/environment.log"
-mkdir -p "$CALLER_HOME" "$CALLER_CACHE"
+mkdir -p "$CALLER_HOME" "$CALLER_CACHE" "$CALLER_RUNTIME"
 
 if ! HOME="$CALLER_HOME" \
     CBM_CACHE_DIR="$CALLER_CACHE" \
+    CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
     CBM_FUZZ_ENV_PROBE="$ENV_LOG" \
     "$ROOT/scripts/security-fuzz.sh" "$ENV_PROBE" \
     > "$WORKDIR/environment.out" 2>&1; then
@@ -92,10 +94,12 @@ normalize_path() {
 
 CALLER_HOME_NORMALIZED=$(normalize_path "$CALLER_HOME")
 CALLER_CACHE_NORMALIZED=$(normalize_path "$CALLER_CACHE")
+CALLER_RUNTIME_NORMALIZED=$(normalize_path "$CALLER_RUNTIME")
 
-while IFS=$'\t' read -r child_home_raw child_cache_raw; do
+while IFS=$'\t' read -r child_home_raw child_cache_raw child_runtime_raw; do
     child_home=$(normalize_path "$child_home_raw")
     child_cache=$(normalize_path "$child_cache_raw")
+    child_runtime=$(normalize_path "$child_runtime_raw")
     if [[ -z "$child_home" || "$child_home" == "$CALLER_HOME_NORMALIZED" ]]; then
         echo "FAIL: security-fuzz exposed the caller HOME to a fuzz target"
         exit 1
@@ -104,14 +108,21 @@ while IFS=$'\t' read -r child_home_raw child_cache_raw; do
         echo "FAIL: security-fuzz exposed the caller CBM_CACHE_DIR to a fuzz target"
         exit 1
     fi
+    if [[ -z "$child_runtime" || "$child_runtime" == "$CALLER_RUNTIME_NORMALIZED" ]]; then
+        echo "FAIL: security-fuzz exposed the caller CBM_RUNTIME_DIR to a fuzz target"
+        exit 1
+    fi
     child_home_parent=${child_home%/*}
     child_cache_parent=${child_cache%/*}
+    child_runtime_parent=${child_runtime%/*}
     if [[ "$child_home_parent" != "$child_cache_parent" ||
+          "$child_home_parent" != "$child_runtime_parent" ||
           "${child_home##*/}" != "home" ||
-          "${child_cache##*/}" != "cache" ]]; then
-        echo "FAIL: fuzz HOME/cache were not isolated beneath one harness temp directory"
+          "${child_cache##*/}" != "cache" ||
+          "${child_runtime##*/}" != "runtime" ]]; then
+        echo "FAIL: fuzz HOME/cache/runtime were not isolated beneath one harness temp directory"
         exit 1
     fi
 done < "$ENV_LOG"
 
-echo "PASS: security fuzz harness requires payload progress and isolates HOME/cache"
+echo "PASS: security fuzz harness requires payload progress and isolates HOME/cache/runtime"

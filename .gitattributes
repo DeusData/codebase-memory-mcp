@@ -5,3 +5,9 @@
 # Vendored tree-sitter grammars — machine-generated, hide from stats and diffs
 internal/cbm/vendored/grammars/**/parser.c  linguist-generated=true diff=false
 internal/cbm/vendored/grammars/**/scanner.c linguist-generated=true diff=false
+
+# Shell entrypoints must check out LF everywhere: a CRLF shebang line breaks
+# them under WSL/MSYS (`bash\r: no such file`). The *.sh rule covers scripts;
+# the git hooks are extensionless and need explicit entries. (#1272)
+scripts/git-hooks/commit-msg   text eol=lf
+scripts/hooks/pre-commit       text eol=lf
