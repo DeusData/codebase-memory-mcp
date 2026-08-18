@@ -1259,3 +1259,158 @@ void cbm_run_ruby_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
     cbm_arena_destroy(&idx_arena);
 }
+
+/* ── cross-file entry: cbm_run_ruby_lsp_cross ───────────────────── */
+
+extern const TSLanguage *tree_sitter_ruby(void);
+
+/* Derive the dotted constant path of a cross-file class def: the portion of
+ * its QN after its module QN prefix ("proj.app.models.user.User" with
+ * module "proj.app.models.user" → "User"). NULL when the shape is odd. */
+static const char *ruby_cross_class_path(CBMArena *arena, const CBMLSPDef *d) {
+    (void)arena;
+    if (!d->qualified_name)
+        return NULL;
+    if (d->def_module_qn && d->def_module_qn[0]) {
+        size_t mlen = strlen(d->def_module_qn);
+        if (strncmp(d->qualified_name, d->def_module_qn, mlen) == 0 &&
+            d->qualified_name[mlen] == '.') {
+            return d->qualified_name + mlen + 1;
+        }
+    }
+    return d->short_name;
+}
+
+void cbm_run_ruby_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns, int import_count,
+                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+    if (!arena || !source || !out)
+        return;
+
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, arena);
+    cbm_ruby_stdlib_register(&reg, arena);
+
+    RubyLSPContext ctx;
+    ruby_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
+    ctx.import_names = import_names;
+    ctx.import_qns = import_qns;
+    ctx.import_count = import_count;
+
+    /* Parse if the pipeline didn't hand us a cached tree. */
+    TSTree *tree = cached_tree;
+    bool owns_tree = false;
+    if (!tree) {
+        TSParser *parser = ts_parser_new();
+        if (!parser)
+            return;
+        const TSLanguage *lang = tree_sitter_ruby();
+        if (!ts_parser_set_language(parser, lang)) {
+            ts_parser_delete(parser);
+            return;
+        }
+        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        ts_parser_delete(parser);
+        if (!tree)
+            return;
+        owns_tree = true;
+    }
+    TSNode root = ts_tree_root_node(tree);
+
+    /* PASS 1 over the local AST first (mixins + nesting-packed superclass
+     * refs the defs don't carry). build_reg stays NULL — methods come from
+     * the def registry below, which spans the whole project. */
+    ruby_pass1_scan(&ctx, root);
+
+    /* Register cross-file defs. Classes/modules go into the class table
+     * (constant paths derived from their QNs — Ruby constants live in one
+     * global namespace, so every project class is a resolution candidate);
+     * ruby_add_class dedupes against the AST-scanned file-local entries.
+     * Methods register under their parent-class receiver key. The
+     * instance-vs-singleton split is not carried by CBMLSPDef, so
+     * cross-file methods register on BOTH keys (an approximation the
+     * per-file pass corrects for same-file dispatch). */
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->short_name || !d->label)
+            continue;
+        if (d->lang != CBM_LANG_RUBY)
+            continue;
+        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Module") == 0) {
+            const char *path = ruby_cross_class_path(arena, d);
+            if (!path)
+                continue;
+            RubyClassInfo *ci =
+                ruby_add_class(&ctx, path, d->qualified_name, strcmp(d->label, "Module") == 0);
+            if (ci && !ci->superclass_ref && d->embedded_types && d->embedded_types[0]) {
+                /* First "|"-separated base class (Ruby has single
+                 * inheritance). Normalize A::B to dotted form so the
+                 * finalize step can resolve it; tolerate a legacy
+                 * "< Base" spelling (raw superclass-node text). */
+                const char *start = d->embedded_types;
+                while (*start == '<' || *start == ' ' || *start == '\t')
+                    start++;
+                const char *bar = strchr(start, '|');
+                char *ref = bar ? cbm_arena_strndup(arena, start, (size_t)(bar - start))
+                                : cbm_arena_strdup(arena, start);
+                if (ref) {
+                    char *w = ref;
+                    for (const char *p = ref; *p; p++) {
+                        if (p[0] == ':' && p[1] == ':') {
+                            *w++ = '.';
+                            p++;
+                        } else {
+                            *w++ = *p;
+                        }
+                    }
+                    *w = '\0';
+                    ci->superclass_ref = ref;
+                }
+            }
+        } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
+            CBMRegisteredFunc rf;
+            memset(&rf, 0, sizeof(rf));
+            rf.min_params = -1;
+            rf.qualified_name = d->qualified_name;
+            rf.short_name = d->short_name;
+            rf.receiver_type = d->receiver_type;
+            const CBMType **rets =
+                (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+            if (rets) {
+                rets[0] = cbm_type_unknown();
+                rets[1] = NULL;
+            }
+            rf.signature = cbm_type_func(arena, NULL, NULL, rets);
+            cbm_registry_add_func(&reg, rf);
+            /* Singleton-key twin (see block comment above). */
+            if (d->receiver_type) {
+                CBMRegisteredFunc rs = rf;
+                rs.receiver_type = cbm_arena_sprintf(arena, "%s.self", d->receiver_type);
+                cbm_registry_add_func(&reg, rs);
+            }
+        }
+    }
+
+    /* Resolve superclass + mixin refs against the completed class table. */
+    ruby_finalize_refs(&ctx);
+
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
+    /* PASS 1.5 + PASS 2. */
+    ctx.nesting = "";
+    ctx.enclosing_class_qn = NULL;
+    ruby_ivar_scan(&ctx, root);
+
+    ctx.nesting = "";
+    ctx.enclosing_class_qn = NULL;
+    ctx.enclosing_func_qn = NULL;
+    ctx.in_singleton_method = false;
+    ruby_resolve_calls_in_node(&ctx, root);
+
+    if (owns_tree)
+        ts_tree_delete(tree);
+    cbm_arena_destroy(&idx_arena);
+}

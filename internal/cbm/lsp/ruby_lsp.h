@@ -5,6 +5,7 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
+#include "go_lsp.h" /* CBMLSPDef reused across languages */
 
 /* Ruby mixin kinds. Lookup order for an instance method on class C:
  *   prepended modules (last prepended first) → C's own methods →
@@ -144,5 +145,19 @@ void cbm_run_ruby_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 /* Register Ruby core stdlib types/methods + a curated Rails surface
  * (ActiveRecord/ActiveSupport/ActionController) into a registry. */
 void cbm_ruby_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
+
+/* --- Cross-file LSP resolution ---
+ *
+ * Mirrors cbm_run_java_lsp_cross / cbm_run_kotlin_lsp_cross (fallback
+ * cbm_pxc_run_one path — no prebuilt tier-2 registry yet). Caller supplies
+ * the combined CBMLSPDef[] (file-local + cross-file) and the resolved
+ * require/require_relative import map. Ruby constants live in one global
+ * namespace, so the def registry is consulted by constant path rather than
+ * by import binding; the import map only scopes candidate modules. */
+void cbm_run_ruby_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns, int import_count,
+                            TSTree *cached_tree, /* NULL = parse internally */
+                            CBMResolvedCallArray *out);
 
 #endif /* CBM_LSP_RUBY_LSP_H */

@@ -20,11 +20,14 @@
  *   14. Top-level function calls
  *   15. Unresolvable receiver emits NO spurious edge (negative)
  *   16. send() / the whole dynamic-dispatch family emits NO edge (negative)
+ *   17. Cross-file: defs from another file resolve
+ *   18. Cross-file: ActiveRecord repro mirroring the Rails-shaped e2e fixture
  *
- * Scope: every row here is SINGLE-FILE, driven through cbm_extract_file so it
- * exercises the per-file resolver exactly as the extraction pipeline calls it.
- * Cross-file resolution (cbm_run_ruby_lsp_cross, wired through
- * pass_lsp_cross.c) is a separate tier and is covered by its own rows.
+ * Scope: rows 1-16 are SINGLE-FILE, driven through cbm_extract_file so they
+ * exercise the per-file resolver exactly as the extraction pipeline calls it.
+ * Rows 17-18 drive cbm_run_ruby_lsp_cross directly with a hand-built
+ * CBMLSPDef[], which is the shape pass_lsp_cross.c hands it on the
+ * cbm_pxc_run_one fallback path.
  *
  * The resolver populates result->resolved_calls with CBMResolvedCall rows.
  * Ruby defs weave the class path into the QN (module_qn.Animal.speak), so
@@ -610,6 +613,162 @@ TEST(rubylsp_dynamic_dispatch_family_no_edge) {
     PASS();
 }
 
+/* ── 17. Cross-file: defs from another file resolve ─────────────── */
+
+TEST(rubylsp_cross_file_defs) {
+    /* models/user.rb (other file) provides the class; this file calls it.
+     * Simulates the fallback cbm_pxc_run_one path with a combined def
+     * list. */
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.models.user.User";
+    defs[0].short_name = "User";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.models.user";
+    defs[0].embedded_types = "ApplicationRecord";
+    defs[0].lang = CBM_LANG_RUBY;
+    defs[1].qualified_name = "test.models.user.User.full_name";
+    defs[1].short_name = "full_name";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.models.user.User";
+    defs[1].def_module_qn = "test.models.user";
+    defs[1].lang = CBM_LANG_RUBY;
+    defs[2].qualified_name = "test.models.user.User.admin?";
+    defs[2].short_name = "admin?";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "test.models.user.User";
+    defs[2].def_module_qn = "test.models.user";
+    defs[2].lang = CBM_LANG_RUBY;
+
+    const char *src = "class UsersController\n"
+                      "  def show\n"
+                      "    u = User.new\n"
+                      "    u.full_name\n"
+                      "    f = User.find(3)\n"
+                      "    f.admin?\n"
+                      "  end\n"
+                      "end\n";
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.controller", defs, 3, NULL,
+                           NULL, 0, NULL, &out);
+
+    bool ctor = false;
+    bool full_name = false;
+    bool admin = false;
+    for (int i = 0; i < out.count; i++) {
+        if (!out.items[i].callee_qn || !out.items[i].caller_qn)
+            continue;
+        if (!strstr(out.items[i].caller_qn, "UsersController.show"))
+            continue;
+        if (strcmp(out.items[i].callee_qn, "test.models.user.User") == 0)
+            ctor = true;
+        if (strcmp(out.items[i].callee_qn, "test.models.user.User.full_name") == 0)
+            full_name = true;
+        if (strcmp(out.items[i].callee_qn, "test.models.user.User.admin?") == 0)
+            admin = true;
+    }
+    if (!(ctor && full_name && admin)) {
+        printf("  cross-file rows (%d):\n", out.count);
+        for (int i = 0; i < out.count; i++)
+            printf("    %s -> %s [%s]\n", out.items[i].caller_qn, out.items[i].callee_qn,
+                   out.items[i].strategy);
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT(ctor);
+    ASSERT(full_name);
+    ASSERT(admin);
+    PASS();
+}
+
+/* ── 18. Cross-file: AR repro mirroring the e2e fixture exactly ── */
+
+TEST(rubylsp_cross_file_ar_repro) {
+    CBMLSPDef defs[6];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "e2e.app.models.user.User";
+    defs[0].short_name = "User";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "e2e.app.models.user";
+    defs[0].embedded_types = "ApplicationRecord";
+    defs[0].lang = CBM_LANG_RUBY;
+    defs[1].qualified_name = "e2e.app.models.user.User.full_name";
+    defs[1].short_name = "full_name";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "e2e.app.models.user.User";
+    defs[1].def_module_qn = "e2e.app.models.user";
+    defs[1].lang = CBM_LANG_RUBY;
+    defs[2].qualified_name = "e2e.app.models.user.User.deactivate!";
+    defs[2].short_name = "deactivate!";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "e2e.app.models.user.User";
+    defs[2].def_module_qn = "e2e.app.models.user";
+    defs[2].lang = CBM_LANG_RUBY;
+    defs[3].qualified_name = "e2e.app.models.application_record.ApplicationRecord";
+    defs[3].short_name = "ApplicationRecord";
+    defs[3].label = "Class";
+    defs[3].def_module_qn = "e2e.app.models.application_record";
+    defs[3].embedded_types = "ActiveRecord::Base";
+    defs[3].lang = CBM_LANG_RUBY;
+    defs[4].qualified_name = "e2e.app.services.greeter.Greeter";
+    defs[4].short_name = "Greeter";
+    defs[4].label = "Class";
+    defs[4].def_module_qn = "e2e.app.services.greeter";
+    defs[4].lang = CBM_LANG_RUBY;
+    defs[5].qualified_name = "e2e.app.services.greeter.Greeter.greet";
+    defs[5].short_name = "greet";
+    defs[5].label = "Method";
+    defs[5].receiver_type = "e2e.app.services.greeter.Greeter";
+    defs[5].def_module_qn = "e2e.app.services.greeter";
+    defs[5].lang = CBM_LANG_RUBY;
+
+    const char *src = "class Report\n"
+                      "  def generate(id)\n"
+                      "    user = User.find(id)\n"
+                      "    name = user.full_name\n"
+                      "    greeter = Greeter.new(user)\n"
+                      "    greeter.greet\n"
+                      "    user.deactivate!\n"
+                      "    name\n"
+                      "  end\n"
+                      "end\n";
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "e2e.app.services.report", defs, 6, NULL,
+                           NULL, 0, NULL, &out);
+
+    bool full_name = false;
+    bool deact = false;
+    bool greet = false;
+    for (int i = 0; i < out.count; i++) {
+        if (!out.items[i].callee_qn)
+            continue;
+        if (strcmp(out.items[i].callee_qn, "e2e.app.models.user.User.full_name") == 0)
+            full_name = true;
+        if (strcmp(out.items[i].callee_qn, "e2e.app.models.user.User.deactivate!") == 0)
+            deact = true;
+        if (strcmp(out.items[i].callee_qn, "e2e.app.services.greeter.Greeter.greet") == 0)
+            greet = true;
+    }
+    if (!(full_name && deact && greet)) {
+        printf("  AR-repro rows (%d):\n", out.count);
+        for (int i = 0; i < out.count; i++)
+            printf("    %s -> %s [%s]\n", out.items[i].caller_qn, out.items[i].callee_qn,
+                   out.items[i].strategy);
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT(greet);
+    ASSERT(full_name);
+    ASSERT(deact);
+    PASS();
+}
+
 /* ── suite ──────────────────────────────────────────────────────── */
 
 void suite_ruby_lsp(void) {
@@ -633,4 +792,6 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_unknown_receiver_no_edge);
     RUN_TEST(rubylsp_send_no_edge);
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
+    RUN_TEST(rubylsp_cross_file_defs);
+    RUN_TEST(rubylsp_cross_file_ar_repro);
 }

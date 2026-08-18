@@ -25,6 +25,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/ruby_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
@@ -685,6 +686,7 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
     case CBM_LANG_RUST:   /* fallback cbm_pxc_run_one path (manifest-aware) */
+    case CBM_LANG_RUBY:   /* fallback cbm_pxc_run_one path */
         return true;
     default:
         return false;
@@ -944,6 +946,10 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         cbm_run_kotlin_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count,
                                  imp_names, imp_qns, imp_count, tree, &out);
         break;
+    case CBM_LANG_RUBY:
+        cbm_run_ruby_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
+                               imp_qns, imp_count, tree, &out);
+        break;
     case CBM_LANG_RUST: {
         /* The Rust resolver wants CBMRustLSPDef (rust_lsp.h), not the
          * pipeline's CBMLSPDef — the structs share their first 9 fields
@@ -1135,11 +1141,15 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
      * crate — a module that is in neither own_module nor the import map, so
      * the filter starves cross-crate resolution (#56 repro red). Rust
      * therefore always resolves against the FULL def universe: the lazily
-     * built shared registry when available, else a full per-file build. */
+     * built shared registry when available, else a full per-file build.
+     * RUBY is exempt for the same reason with different mechanics: Ruby
+     * constants live in one global namespace and Rails/Zeitwerk autoloads
+     * them WITHOUT require statements, so an own+imports filter starves
+     * essentially all cross-file resolution in real Ruby apps. */
     CBMLSPDef *filtered = NULL;
     CBMLSPDef *file_defs = all_defs;
     int file_def_count = all_def_count;
-    if (module_def_index && lang != CBM_LANG_RUST) {
+    if (module_def_index && lang != CBM_LANG_RUST && lang != CBM_LANG_RUBY) {
         int filtered_count = 0;
         bool filter_succeeded = false;
         filtered = cbm_pxc_filter_defs_for_file(module_def_index, all_defs, lang,
