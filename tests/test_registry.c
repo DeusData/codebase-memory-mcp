@@ -386,6 +386,28 @@ TEST(resolve_import_map_bare_alias) {
     PASS();
 }
 
+/* Adversarial pin: when import_map already stores the def QN under the alias
+ * key, bare alias call must CALLS→def (not invent …M.bridge_execute). Behavior
+ * already on main via #875/#979; this locks the Yui G1 shape. */
+TEST(resolve_import_map_aliased_from_import) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function");
+    /* Alias ghost must not win if somehow registered. */
+    cbm_registry_add(r, "bridge_execute", "proj.services.satori_bridge.gate.bridge_execute",
+                     "Function");
+
+    const char *keys[] = {"bridge_execute"};
+    const char *vals[] = {"proj.services.satori_bridge.gate.execute"};
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "bridge_execute", "proj.services.yui_core.router", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.services.satori_bridge.gate.execute");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
@@ -888,6 +910,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
+    RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);

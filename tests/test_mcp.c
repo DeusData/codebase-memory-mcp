@@ -162,6 +162,21 @@ typedef struct {
     int merge_base_calls;
 } mcp_command_hook_probe_t;
 
+#ifdef _WIN32
+typedef struct {
+    cbm_mcp_server_t *server;
+    bool cancel_on_call;
+    bool cancel_accepted;
+    int calls;
+    char command[CBM_SZ_4K];
+} mcp_search_command_probe_t;
+
+typedef struct {
+    char path[512];
+    char *saved_cache;
+} mcp_search_cache_t;
+#endif
+
 static bool mcp_quarantine_hook_probe(void *context, const char *step) {
     mcp_quarantine_hook_probe_t *probe = context;
     if (!probe || !step) {
@@ -186,6 +201,45 @@ static bool mcp_command_hook_probe(void *context, const char *command) {
     probe->diff_calls++;
     return true;
 }
+
+#ifdef _WIN32
+static bool mcp_search_command_hook_probe(void *context, const char *command) {
+    mcp_search_command_probe_t *probe = context;
+    if (!probe || !command) {
+        return false;
+    }
+    probe->calls++;
+    snprintf(probe->command, sizeof(probe->command), "%s", command);
+    if (probe->cancel_on_call && probe->server) {
+        probe->cancel_accepted = cbm_mcp_server_cancel_active(probe->server);
+    }
+    return true;
+}
+
+static bool mcp_search_cache_open(mcp_search_cache_t *cache, const char *prefix) {
+    memset(cache, 0, sizeof(*cache));
+    snprintf(cache->path, sizeof(cache->path), "%s/%s-XXXXXX", cbm_tmpdir(), prefix);
+    if (!cbm_mkdtemp(cache->path)) {
+        return false;
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    cache->saved_cache = saved_cache ? strdup(saved_cache) : NULL;
+    if ((saved_cache && !cache->saved_cache) || cbm_setenv("CBM_CACHE_DIR", cache->path, 1) != 0) {
+        free(cache->saved_cache);
+        cache->saved_cache = NULL;
+        (void)th_rmtree(cache->path);
+        return false;
+    }
+    return true;
+}
+
+static bool mcp_search_cache_close(mcp_search_cache_t *cache) {
+    restore_cache_dir(cache->saved_cache);
+    free(cache->saved_cache);
+    cache->saved_cache = NULL;
+    return th_rmtree(cache->path) == 0;
+}
+#endif
 
 typedef struct {
     const char *name;
@@ -2120,7 +2174,7 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest")); /* its value */
     ASSERT_NOT_NULL(strstr(inner, "\"base_classes\""));
     ASSERT_NOT_NULL(strstr(inner, "[\"HandlerBase\",\"Audited\"]"));
-    ASSERT_NULL(strstr(inner, "is_exported"));            /* blob never spills */
+    ASSERT_NULL(strstr(inner, "is_exported")); /* blob never spills */
     free(inner);
     free(resp);
 
@@ -2680,15 +2734,13 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
         ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
         (int64_t)source_stat.st_mtimespec.tv_nsec;
 #elif defined(_WIN32)
-    int64_t source_mtime_ns =
-        (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
 #else
-    int64_t source_mtime_ns =
-        ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-        (int64_t)source_stat.st_mtim.tv_nsec;
+    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+                              (int64_t)source_stat.st_mtim.tv_nsec;
 #endif
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
-                                         source_mtime_ns, source_stat.st_size),
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
+                                         source_stat.st_size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
     ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
@@ -2702,8 +2754,7 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
         .coverage_version = 1,
         .hash_records_complete = true,
     };
-    ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
-              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta), CBM_STORE_OK);
     cbm_project_free_fields(&project);
 
     char *response = cbm_mcp_handle_tool(
@@ -4351,12 +4402,12 @@ TEST(search_code_full_preserves_utf8_source) {
                           .end_line = 2};
     ASSERT_GT(cbm_store_upsert_node(st, &section), 0);
 
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
-             "\"project\":\"utf8-search\",\"pattern\":\"accounting-design\","
-             "\"file_pattern\":\"*.md\",\"path_filter\":\"^design/\","
-             "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                                   "\"project\":\"utf8-search\",\"pattern\":\"accounting-design\","
+                                   "\"file_pattern\":\"*.md\",\"path_filter\":\"^design/\","
+                                   "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -4408,11 +4459,11 @@ TEST(search_code_raw_match_preserves_utf8_content) {
                        .end_line = 1};
     ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
 
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
-             "\"project\":\"test-project\",\"pattern\":\"raw-\","
-             "\"file_pattern\":\"*.md\",\"format\":\"json\",\"limit\":5}}}");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                                   "\"project\":\"test-project\",\"pattern\":\"raw-\","
+                                   "\"file_pattern\":\"*.md\",\"format\":\"json\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -4459,11 +4510,11 @@ TEST(search_code_context_preserves_utf8_context) {
                        .end_line = 3};
     ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
 
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
-             "\"project\":\"test-project\",\"pattern\":\"context-needle\","
-             "\"format\":\"json\",\"context\":1,\"limit\":5}}}");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                                   "\"project\":\"test-project\",\"pattern\":\"context-needle\","
+                                   "\"format\":\"json\",\"context\":1,\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -4507,8 +4558,8 @@ TEST(search_code_invalid_utf8_still_returns_valid_json) {
     char invalid_path[512];
     snprintf(invalid_path, sizeof(invalid_path), "%s/project/invalid.md", tmp);
     static const unsigned char invalid_source[] = {
-        'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 'n', 'e', 'e', 'd', 'l', 'e', '\n',
-        'c', 'o', 'n', 't', 'e', 'x', 't', ' ', 0xFF, '\n',
+        'i', 'n',  'v', 'a', 'l', 'i', 'd', '-', 'n', 'e', 'e',  'd',  'l',
+        'e', '\n', 'c', 'o', 'n', 't', 'e', 'x', 't', ' ', 0xFF, '\n',
     };
     FILE *fp = cbm_fopen(invalid_path, "wb");
     ASSERT_NOT_NULL(fp);
@@ -4526,11 +4577,11 @@ TEST(search_code_invalid_utf8_still_returns_valid_json) {
                        .end_line = 2};
     ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
 
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
-             "\"project\":\"test-project\",\"pattern\":\"invalid-needle\","
-             "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                                   "\"project\":\"test-project\",\"pattern\":\"invalid-needle\","
+                                   "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -4918,6 +4969,113 @@ TEST(search_code_windows_prefilter_precedes_content_scan) {
     PASS();
 #else
     SKIP_PLATFORM("PowerShell prefilter runs on Windows");
+#endif
+}
+
+TEST(search_code_windows_cancel_cleans_supervised_scan) {
+#ifdef _WIN32
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-cancel"));
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    mcp_search_command_probe_t probe = {
+        .server = srv,
+        .cancel_on_call = true,
+    };
+    cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_NOT_NULL(strstr(response, "cancelled"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-"), 0);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+#else
+    SKIP_PLATFORM("supervised Select-String cancellation runs on Windows");
+#endif
+}
+
+TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan) {
+#ifdef _WIN32
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-limit"));
+
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_output_limit_for_test(srv, 512);
+
+    FILE *source = cbm_fopen(src_path, "ab");
+    ASSERT_NOT_NULL(source);
+    for (int i = 0; i < 256; i++) {
+        ASSERT_GT(fprintf(source, "func HandleRequest%d() error { return nil }\n", i), 0);
+    }
+    ASSERT_EQ(fclose(source), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "output exceeded"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+
+    char logs[640];
+    snprintf(logs, sizeof(logs), "%s/logs", cache.path);
+    ASSERT_EQ(mcp_count_directory_entries_with_prefix(logs, ".mcp-command-"), 0);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+#else
+    SKIP_PLATFORM("supervised Select-String output limit runs on Windows");
+#endif
+}
+
+/* Windows raw scans must pin the PowerShell pipe to UTF-8: PS 5.1 otherwise
+ * emits stdout in the console OEM codepage and non-ASCII content degrades to
+ * '?' depending on the inherited console CP (seen as test_mcp raw-Русский
+ * mojibake on CI). Every builder variant must carry the prelude. */
+TEST(search_code_windows_scan_pins_utf8_output) {
+#ifdef _WIN32
+    static const char prelude[] =
+        "powershell -Command \"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ";
+    char command[CBM_SZ_4K];
+    struct {
+        bool scoped;
+        const char *file_pattern;
+    } cases[] = {{true, "*.go"},     /* scoped + prefilterable pattern */
+                 {true, "*x*z*.go"}, /* scoped + non-prefilterable pattern */
+                 {true, NULL},       /* scoped, no pattern */
+                 {false, "*.go"},    /* unscoped + pattern */
+                 {false, NULL}};     /* unscoped, no pattern */
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cbm_search_code_build_grep_cmd(command, sizeof(command), false, cases[i].scoped,
+                                       cases[i].file_pattern, "C:/tmp/pattern", "C:/tmp/filelist",
+                                       "C:/tmp/root");
+        ASSERT_TRUE(strncmp(command, prelude, sizeof(prelude) - 1) == 0);
+    }
+    PASS();
+#else
+    SKIP_PLATFORM("PowerShell scan encoding applies on Windows");
 #endif
 }
 
@@ -8769,10 +8927,10 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     ASSERT_NULL(strstr(list, "ghost704"));     /* 0-byte ghost filtered (RED before) */
     free(list);
 
-    char *page = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"list_projects\","
-             "\"arguments\":{\"offset\":0,\"limit\":1}}}");
+    char *page =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\","
+                                   "\"arguments\":{\"offset\":0,\"limit\":1}}}");
     ASSERT_NOT_NULL(page);
     ASSERT_NOT_NULL(strstr(page, "\\\"total\\\":3"));
     ASSERT_NOT_NULL(strstr(page, "\\\"limit\\\":1"));
@@ -11223,6 +11381,9 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_prefilter_precedes_content_scan);
+    RUN_TEST(search_code_windows_cancel_cleans_supervised_scan);
+    RUN_TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan);
+    RUN_TEST(search_code_windows_scan_pins_utf8_output);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_reports_phase_timings_only_in_debug_mode);
