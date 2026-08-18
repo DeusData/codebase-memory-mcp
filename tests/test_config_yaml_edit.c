@@ -852,6 +852,362 @@ TEST(config_yaml_edit_goose_extensions_preserve_siblings) {
     PASS();
 }
 
+TEST(config_yaml_edit_goose_accepts_empty_flow_mapping_in_sibling_issue1673) {
+    const char *initial = "extensions:\n"
+                          "  demo:\n"
+                          "    enabled: true\n"
+                          "    type: stdio\n"
+                          "    cmd: /bin/true\n"
+                          "    args:\n"
+                          "    - --serve\n"
+                          "    envs: {}\n"
+                          "    env_keys: []\n"
+                          "    timeout: 300\n"
+                          "GOOSE_THINKING_EFFORT: max\n";
+    const char *block = "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    const char *expected = "extensions:\n"
+                           "  demo:\n"
+                           "    enabled: true\n"
+                           "    type: stdio\n"
+                           "    cmd: /bin/true\n"
+                           "    args:\n"
+                           "    - --serve\n"
+                           "    envs: {}\n"
+                           "    env_keys: []\n"
+                           "    timeout: 300\n"
+                           "  codebase-memory-mcp:\n"
+                           "    type: stdio\n"
+                           "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                           "    args: []\n"
+                           "    enabled: true\n"
+                           "GOOSE_THINKING_EFFORT: max\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *installed = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_STR_EQ(installed, expected);
+
+    free(installed);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_goose_still_rejects_nonempty_flow_mapping_issue1673) {
+    const char *initial = "extensions:\n"
+                          "  demo:\n"
+                          "    enabled: true\n"
+                          "    type: stdio\n"
+                          "    cmd: /bin/true\n"
+                          "    args: []\n"
+                          "    envs: {FOO: bar}\n"
+                          "    env_keys: []\n"
+                          "    timeout: 300\n";
+    const char *block = "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_ERROR);
+    char *unchanged = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_STR_EQ(unchanged, initial);
+
+    free(unchanged);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_goose_still_rejects_merge_key_with_empty_mapping_issue1673) {
+    const char *initial = "extensions:\n"
+                          "  demo:\n"
+                          "    type: stdio\n"
+                          "    cmd: /bin/true\n"
+                          "    <<: {}\n";
+    const char *block = "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_ERROR);
+    char *unchanged = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_STR_EQ(unchanged, initial);
+
+    free(unchanged);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+/* ── #1631: legal YAML constructs in real Hermes configs the editor refused ──
+ *
+ * Each construct is distilled from the reporters' actual config.yaml files
+ * (iandol + galaxy gists) and was verified RED end-to-end via `install`
+ * against those files. The document validators must accept them; the owned
+ * edit still only appends/replaces our entry and preserves every original
+ * byte of the user's content. */
+
+static const char *const yaml_hermes_block = "    command: \"/opt/codebase-memory-mcp\"\n";
+
+static int yaml_hermes_upsert(const yaml_fixture_t *fixture) {
+    return cbm_yaml_upsert_owned_mapping_entry(fixture->path, "mcp_servers", "codebase-memory-mcp",
+                                               yaml_hermes_block);
+}
+
+/* Both real Hermes ops: mcp_install (owned mapping entry) AND
+ * pre_llm_hook_install (mapping sequence item) — E2E showed three of the four
+ * constructs break only in the second. */
+static int yaml_hermes_hook_upsert(const yaml_fixture_t *fixture) {
+    static const char *const path[] = {"hooks", "pre_llm_call"};
+    return cbm_yaml_upsert_mapping_sequence_item(
+        fixture->path, path, 2U, "id", "\"cbm-context\"",
+        "- id: \"cbm-context\"\n  type: \"command\"\n  command: \"/opt/codebase-memory-mcp\"\n");
+}
+
+TEST(config_yaml_edit_hermes_accepts_empty_flow_sequence_value_issue1631) {
+    const char *initial = "name: test\n"
+                          "plugins: []\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "plugins: []\n"));
+    ASSERT_NOT_NULL(strstr(after, "command: \"/opt/codebase-memory-mcp\"\n"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_accepts_empty_flow_mapping_value_issue1631) {
+    const char *initial = "name: test\n"
+                          "tool_choice: {}\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "tool_choice: {}\n"));
+    ASSERT_NOT_NULL(strstr(after, "command: \"/opt/codebase-memory-mcp\"\n"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_accepts_column_zero_block_sequence_issue1631) {
+    /* YAML allows a block sequence at the same indent as its mapping key. */
+    const char *initial = "agents:\n"
+                          "- alpha\n"
+                          "- beta\n"
+                          "model: gpt\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "agents:\n- alpha\n- beta\n"));
+    ASSERT_NOT_NULL(strstr(after, "command: \"/opt/codebase-memory-mcp\"\n"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_accepts_escaped_newline_in_double_quote_issue1631) {
+    /* A double-quoted scalar may continue across lines with a trailing `\`. */
+    const char *initial = "name: test\n"
+                          "persona: \"line one \\\n"
+                          "  line two\"\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "persona: \"line one \\\n"));
+    ASSERT_NOT_NULL(strstr(after, "command: \"/opt/codebase-memory-mcp\"\n"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_hook_accepts_column_zero_sequence_issue1631) {
+    /* The pre_llm_call hook op walks the same document: a column-0 sequence
+     * elsewhere in the file must not abort the hook install. */
+    static const char *const path[] = {"hooks", "pre_llm_call"};
+    const char *initial = "agents:\n"
+                          "- alpha\n"
+                          "model: gpt\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(cbm_yaml_upsert_mapping_sequence_item(fixture.path, path, 2U, "id", "\"cbm-context\"",
+                                                    "- id: \"cbm-context\"\n  type: \"command\"\n"
+                                                    "  command: \"/opt/codebase-memory-mcp\"\n"),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "agents:\n- alpha\n"));
+    ASSERT_NOT_NULL(strstr(after, "cbm-context"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_accepts_interior_apostrophe_and_plain_wrap_issue1631) {
+    /* Distilled from the iandol config's `personalities:` block: mid-word
+     * apostrophes in a plain scalar (quotes are indicators only at a node
+     * start), and a plain scalar folded onto a deeper-indented next line. */
+    const char *initial = "agent:\n"
+                          "  personalities:\n"
+                          "    hype: YOOO LET'S GOOOO!!! I am SO PUMPED! Every question\n"
+                          "      is AMAZING and we're gonna CRUSH IT together!\n"
+                          "  verbose: false\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "LET'S GOOOO"));
+    ASSERT_NOT_NULL(strstr(after, "cbm-context"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_accepts_utf8_bom_issue1656) {
+    /* PowerShell 5.1's `Set-Content -Encoding UTF8` writes a BOM, so real
+     * Windows-authored Hermes configs start with EF BB BF — and every edit op
+     * failed content-independently (#1656's 26-byte repro is the reporter's
+     * 23-byte file plus this BOM). The BOM is a prologue: skip it for
+     * structure, preserve it byte-for-byte on write. */
+    const char *initial = "\xEF\xBB\xBFmodel:\n  default: test\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(memcmp(after, "\xEF\xBB\xBFmodel:", 9), 0);
+    ASSERT_NOT_NULL(strstr(after, "  default: test\n"));
+    ASSERT_NOT_NULL(strstr(after, "command: \"/opt/codebase-memory-mcp\"\n"));
+    ASSERT_NOT_NULL(strstr(after, "cbm-context"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_bom_before_our_own_section_stays_single_issue1656) {
+    /* When the BOM immediately precedes OUR section key, the key lookup must
+     * still see `mcp_servers` — otherwise the upsert misses the existing
+     * section and appends a duplicate. */
+    const char *initial = "\xEF\xBB\xBFmcp_servers:\n"
+                          "  codebase-memory-mcp:\n"
+                          "    command: \"/opt/codebase-memory-mcp\"\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    size_t sections = 0U;
+    for (const char *c = after; (c = strstr(c, "mcp_servers:")) != NULL; c++) {
+        sections++;
+    }
+    ASSERT_EQ((int)sections, 1);
+    ASSERT_EQ(memcmp(after, "\xEF\xBB\xBF", 3), 0);
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+/* ── Owned-entry repair (#1631 galaxy + goose upgrades) ──────────────────────
+ *
+ * Byte-identity alone freezes users on any OLD canonical our past writers
+ * produced: v0.10.x wrote `command:` unquoted (the galaxy reporter's file),
+ * and the goose block gained a required `name:` field — without repair, every
+ * such entry is declared FOREIGN forever and install fails. An existing entry
+ * under OUR key is repairable when it parses as a known prior shape and its
+ * command basename is our binary. Truly foreign shapes stay refused. */
+
+TEST(config_yaml_edit_repairs_prior_unquoted_command_entry_issue1631) {
+    const char *initial = "mcp_servers:\n"
+                          "  obsidian:\n"
+                          "    url: \"<VALUE>\"\n"
+                          "  codebase-memory-mcp:\n"
+                          "    command: C:/Users/Administrator/AppData/Local/Programs/"
+                          "codebase-memory-mcp/codebase-memory-mcp.exe\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "  obsidian:\n    url: \"<VALUE>\"\n"));
+    ASSERT_NOT_NULL(strstr(after, "command: \"/opt/codebase-memory-mcp\"\n"));
+    ASSERT_NULL(strstr(after, "Administrator"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_repairs_prior_goose_block_without_name) {
+    const char *initial = "extensions:\n"
+                          "  codebase-memory-mcp:\n"
+                          "    type: stdio\n"
+                          "    cmd: \"/old/place/codebase-memory-mcp\"\n"
+                          "    args: []\n"
+                          "    enabled: true\n";
+    const char *block = "    name: codebase-memory-mcp\n"
+                        "    type: stdio\n"
+                        "    cmd: \"/opt/codebase-memory-mcp\"\n"
+                        "    args: []\n"
+                        "    enabled: true\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(cbm_yaml_upsert_owned_mapping_entry(fixture.path, "extensions", "codebase-memory-mcp",
+                                                  block),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "name: codebase-memory-mcp\n"));
+    ASSERT_NOT_NULL(strstr(after, "cmd: \"/opt/codebase-memory-mcp\"\n"));
+    ASSERT_NULL(strstr(after, "/old/place/"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_still_refuses_truly_foreign_entry_under_our_key) {
+    /* Same key, but the body is not any shape we ever wrote — refuse and
+     * leave the file byte-identical. */
+    const char *initial = "mcp_servers:\n"
+                          "  codebase-memory-mcp:\n"
+                          "    command: /usr/bin/somebody-elses-tool\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_FOREIGN);
+    char *unchanged = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_STR_EQ(unchanged, initial);
+    free(unchanged);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_owned_agent_mapping_installs_idempotently_and_removes_exact_state) {
     struct owned_mapping_case {
         const char *section;
@@ -1567,6 +1923,44 @@ TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically) {
 }
 
 #ifndef _WIN32
+/* #1631: an interior `*` in a written value is ordinary text, not an alias.
+ * A real 16 KB Hermes config was permanently un-editable because prose
+ * asterisks in a personality string were read as aliases (root-caused by
+ * @rg6304 with an isolated repro).
+ *
+ * The asterisk is in the ENTRY BLOCK deliberately: that is the range the
+ * editor validates. An earlier version of this test put it in an untouched
+ * foreign section, which is never scanned - so it passed with the fix
+ * reverted and proved nothing. */
+TEST(config_yaml_edit_accepts_interior_asterisk_in_plain_scalar_issue1631) {
+    const char *original = "existing:\n  keep: 1\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    ASSERT_EQ(cbm_yaml_upsert_mapping_entry(fixture.path, "hooks", "cbm",
+                                            "    value: use *emphasis* and 2 * 3\n"),
+              0);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "value: use *emphasis* and 2 * 3"));
+    free(after);
+    ASSERT_EQ(cbm_unlink(fixture.path), 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+TEST(config_yaml_edit_still_refuses_leading_alias_issue1631) {
+    const char *original = "existing:\n  keep: 1\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    ASSERT(cbm_yaml_upsert_mapping_entry(fixture.path, "hooks", "cbm", "    value: *alias\n") != 0);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, original);
+    free(after);
+    ASSERT_EQ(cbm_unlink(fixture.path), 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_rejects_symlink_byte_identically) {
     const char *original = "hooks:\n  pre_llm_call:\n    - id: \"other\"\n";
     yaml_fixture_t fixture;
@@ -1621,6 +2015,20 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_hermes_mapping_lifecycle);
     RUN_TEST(config_yaml_edit_hermes_creates_missing_section);
     RUN_TEST(config_yaml_edit_goose_extensions_preserve_siblings);
+    RUN_TEST(config_yaml_edit_goose_accepts_empty_flow_mapping_in_sibling_issue1673);
+    RUN_TEST(config_yaml_edit_hermes_accepts_empty_flow_sequence_value_issue1631);
+    RUN_TEST(config_yaml_edit_hermes_accepts_empty_flow_mapping_value_issue1631);
+    RUN_TEST(config_yaml_edit_hermes_accepts_column_zero_block_sequence_issue1631);
+    RUN_TEST(config_yaml_edit_hermes_accepts_escaped_newline_in_double_quote_issue1631);
+    RUN_TEST(config_yaml_edit_hermes_hook_accepts_column_zero_sequence_issue1631);
+    RUN_TEST(config_yaml_edit_hermes_accepts_interior_apostrophe_and_plain_wrap_issue1631);
+    RUN_TEST(config_yaml_edit_accepts_utf8_bom_issue1656);
+    RUN_TEST(config_yaml_edit_bom_before_our_own_section_stays_single_issue1656);
+    RUN_TEST(config_yaml_edit_repairs_prior_unquoted_command_entry_issue1631);
+    RUN_TEST(config_yaml_edit_repairs_prior_goose_block_without_name);
+    RUN_TEST(config_yaml_edit_still_refuses_truly_foreign_entry_under_our_key);
+    RUN_TEST(config_yaml_edit_goose_still_rejects_nonempty_flow_mapping_issue1673);
+    RUN_TEST(config_yaml_edit_goose_still_rejects_merge_key_with_empty_mapping_issue1673);
     RUN_TEST(config_yaml_edit_owned_agent_mapping_installs_idempotently_and_removes_exact_state);
     RUN_TEST(config_yaml_edit_owned_agent_mapping_preserves_foreign_same_name_state);
     RUN_TEST(config_yaml_edit_mapping_remove_first_middle_last);
@@ -1641,6 +2049,8 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);
     RUN_TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically);
 #ifndef _WIN32
+    RUN_TEST(config_yaml_edit_accepts_interior_asterisk_in_plain_scalar_issue1631);
+    RUN_TEST(config_yaml_edit_still_refuses_leading_alias_issue1631);
     RUN_TEST(config_yaml_edit_nested_sequence_rejects_symlink_byte_identically);
 #endif
 }

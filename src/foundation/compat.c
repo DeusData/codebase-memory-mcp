@@ -6,6 +6,7 @@
  */
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/secure_random.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -166,6 +167,10 @@ static int rewrite_tmp_template(char *tmpl, size_t tmpl_sz) {
     return 0;
 }
 
+/* Suffix length is the mkdtemp(3) contract ("XXXXXX"); the attempt ceiling
+ * bounds collision retries so an exhausted namespace fails instead of looping. */
+enum { MKDTEMP_SUFFIX_LEN = 6, MKDTEMP_MAX_ATTEMPTS = 128 };
+
 char *cbm_mkdtemp(char *tmpl) {
     /* Per-call storage: daemon project workers create staging directories
      * concurrently, so a shared scratch buffer would be a data race. The
@@ -178,43 +183,72 @@ char *cbm_mkdtemp(char *tmpl) {
     }
     if (rewrite_tmp_template(buf, sizeof(buf)) != 0)
         return NULL;
-    /* Wide-API template expansion: the ANSI CRT interprets the UTF-8 bytes of
-     * non-ASCII cache/temp components in the local codepage and fails. */
-    wchar_t *wide_template = cbm_utf8_to_wide(buf);
-    if (!wide_template || !_wmktemp(wide_template)) {
-        free(wide_template);
+
+    size_t length = strlen(buf);
+    if (length < MKDTEMP_SUFFIX_LEN ||
+        strcmp(buf + length - MKDTEMP_SUFFIX_LEN, "XXXXXX") != 0) {
+        errno = EINVAL;
         return NULL;
     }
-    char *expanded = cbm_wide_to_utf8(wide_template);
-    free(wide_template);
-    if (!expanded) {
-        return NULL;
-    }
-    size_t expanded_len = strlen(expanded);
-    if (expanded_len >= sizeof(buf)) {
-        free(expanded);
-        return NULL;
-    }
-    memcpy(buf, expanded, expanded_len + SKIP_ONE);
-    free(expanded);
-    if (!win_mkdtemp_private_create(buf)) {
-        /* One-time note: every private-namespace validation downstream
-         * depends on the explicit descriptor, so a silent fallback turns
-         * into unexplained owner/DACL refusals far from this call site. */
-        static bool fallback_reported;
+
+    /* The suffix is minted here rather than by _wmktemp: _wmktemp derives the
+     * name from the process id and returns the SAME name to every caller until
+     * that name exists on disk, so two threads expanding one template raced to
+     * the identical directory. Generating it from cbm_secure_random removes the
+     * shared derivation entirely, and doing it on the UTF-8 buffer keeps the
+     * wide conversion at the creation calls below, where non-ASCII %TEMP%
+     * components are handled correctly anyway. */
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    bool created = false;
+    for (int attempt = 0; attempt < MKDTEMP_MAX_ATTEMPTS; attempt++) {
+        unsigned char random_suffix[MKDTEMP_SUFFIX_LEN];
+        if (!cbm_secure_random(random_suffix, sizeof(random_suffix))) {
+            errno = EIO;
+            return NULL;
+        }
+        for (size_t index = 0; index < sizeof(random_suffix); index++) {
+            buf[length - sizeof(random_suffix) + index] =
+                alphabet[random_suffix[index] % (sizeof(alphabet) - SKIP_ONE)];
+        }
+
+        if (win_mkdtemp_private_create(buf)) {
+            created = true;
+            break;
+        }
+
+        /* Keep the existing compatibility fallback when an explicit private
+         * descriptor is unavailable: every private-namespace validation
+         * downstream depends on the explicit descriptor, so a silent fallback
+         * turns into unexplained owner/DACL refusals far from this call site.
+         * A name collision is retried; any other filesystem refusal is returned
+         * to the caller immediately. */
         DWORD create_error = GetLastError();
         wchar_t *wide_directory = cbm_utf8_to_wide(buf);
+        errno = 0;
         int mkdir_result = wide_directory ? _wmkdir(wide_directory) : -1;
+        int mkdir_error = errno;
         free(wide_directory);
-        if (mkdir_result != 0)
-            return NULL;
-        if (!fallback_reported) {
-            fallback_reported = true;
-            (void)fprintf(stderr,
-                          "warning: private temp-directory descriptor unavailable "
-                          "(os %lu); using default directory security\n",
-                          (unsigned long)create_error);
+        if (mkdir_result == 0) {
+            static volatile LONG fallback_reported;
+            if (InterlockedCompareExchange(&fallback_reported, 1, 0) == 0) {
+                (void)fprintf(stderr,
+                              "warning: private temp-directory descriptor unavailable "
+                              "(os %lu); using default directory security\n",
+                              (unsigned long)create_error);
+            }
+            created = true;
+            break;
         }
+        if (create_error == ERROR_ALREADY_EXISTS || create_error == ERROR_FILE_EXISTS ||
+            mkdir_error == EEXIST) {
+            continue;
+        }
+        errno = mkdir_error != 0 ? mkdir_error : EACCES;
+        return NULL;
+    }
+    if (!created) {
+        errno = EEXIST;
+        return NULL;
     }
     /* Normalize to forward slashes. Callers embed this path in JSON repo_path
      * (where "\t"/"\a" are invalid escapes → index fails) and pass it to git -C.

@@ -49,36 +49,6 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 static bool is_direct_argument_value(TSNode node);
 static TSNode python_direct_callable_attribute_site(TSNode node);
 
-// Check if a node is inside a call expression (to avoid double-counting as usage)
-static bool is_inside_call(TSNode node, const CBMLangSpec *spec) {
-    TSNode cur = ts_node_parent(node);
-    while (!ts_node_is_null(cur)) {
-        if (cbm_kind_in_set(cur, spec->call_node_types)) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
-
-// Check if a node is inside an import statement
-static bool is_inside_import(TSNode node, const CBMLangSpec *spec) {
-    bool has_imports = spec->import_node_types && spec->import_node_types[0];
-    bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
-    if (!has_imports && !has_from_imports) {
-        return false;
-    }
-    TSNode cur = ts_node_parent(node);
-    while (!ts_node_is_null(cur)) {
-        if ((has_imports && cbm_kind_in_set(cur, spec->import_node_types)) ||
-            (has_from_imports && cbm_kind_in_set(cur, spec->import_from_types))) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
-
 // Is this an identifier-like node that represents a reference?
 static bool is_reference_node(TSNode node, CBMLanguage lang) {
     const char *kind = ts_node_type(node);
@@ -2426,7 +2396,8 @@ static bool emit_direct_perl_coderef_usage(CBMExtractCtx *ctx, TSNode node,
 }
 
 // Try to emit a usage for a reference node. Returns early if the node should be skipped.
-static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                           bool inside_call, bool inside_import) {
     if (emit_direct_perl_coderef_usage(ctx, node, cbm_enclosing_func_qn_cached(ctx, node), 0)) {
         return;
     }
@@ -2439,7 +2410,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (is_call_argument_label(node)) {
         return;
     }
-    if (is_inside_call(node, spec) || is_inside_import(node, spec)) {
+    if (inside_call || inside_import) {
         return;
     }
     if (is_binding_occurrence(ctx, node, spec, NULL) ||
@@ -2456,18 +2427,79 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
 }
 
-// Iterative usage walker — explicit stack
+// Iterative usage walker — explicit stack.
+//
+// The call/import ancestry that gates usage emission is maintained as ENTER/
+// EXIT counters on the walk instead of per-node ancestor re-walks: the old
+// is_inside_call/is_inside_import helpers climbed every ancestor via
+// ts_node_parent, and tree-sitter's ts_node_parent RE-DESCENDS from the root
+// scanning siblings — O(depth x sibling-position) per node, which went
+// quadratic on wide nodes (a 1,536-argument call in dotnet/runtime's JIT
+// torture tests put 92% of extract time into these walks; 490 s for one
+// 147 KB file). Counter semantics match the helpers exactly: strict ancestors
+// only — a node is emitted BEFORE its own kind increments the counters, so a
+// call node itself does not count as "inside a call".
 static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    typedef struct {
+        TSNode node;
+        uint32_t next_child;
+        bool counts_call;
+        bool counts_import;
+    } UsageFrame;
+    int cap = 256;
+    UsageFrame *frames = (UsageFrame *)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*frames));
+    if (!frames) {
+        return;
+    }
+    bool has_imports = spec->import_node_types && spec->import_node_types[0];
+    bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
+    int call_depth = 0;
+    int import_depth = 0;
+    int top = 0;
+    frames[top++] = (UsageFrame){root, 0, false, false};
+    bool entering = true;
 
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        try_emit_usage(ctx, node, spec);
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+    while (top > 0) {
+        UsageFrame *f = &frames[top - 1];
+        if (entering) {
+            try_emit_usage(ctx, f->node, spec, call_depth > 0, import_depth > 0);
+            f->counts_call = cbm_kind_in_set(f->node, spec->call_node_types);
+            f->counts_import =
+                (has_imports && cbm_kind_in_set(f->node, spec->import_node_types)) ||
+                (has_from_imports && cbm_kind_in_set(f->node, spec->import_from_types));
+            if (f->counts_call) {
+                call_depth++;
+            }
+            if (f->counts_import) {
+                import_depth++;
+            }
+        }
+        uint32_t count = ts_node_child_count(f->node);
+        if (f->next_child < count) {
+            TSNode child = ts_node_child(f->node, f->next_child);
+            f->next_child++;
+            if (top == cap) {
+                int new_cap = cap * 2;
+                UsageFrame *grown =
+                    (UsageFrame *)cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*grown));
+                if (!grown) {
+                    return;
+                }
+                memcpy(grown, frames, (size_t)cap * sizeof(*frames));
+                frames = grown;
+                cap = new_cap;
+            }
+            frames[top++] = (UsageFrame){child, 0, false, false};
+            entering = true;
+        } else {
+            if (f->counts_call) {
+                call_depth--;
+            }
+            if (f->counts_import) {
+                import_depth--;
+            }
+            top--;
+            entering = false;
         }
     }
 }

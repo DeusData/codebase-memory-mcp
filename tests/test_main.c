@@ -20,6 +20,12 @@ int tf_filter_count = 0;
 #include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
 #include "test_daemon_runtime_contract.h"
+#include "foundation/compat.h"     /* cbm_setenv — #845 supervisor kill switch */
+#include "foundation/compat_fs.h"  /* cbm_fopen — worker response file */
+#include "foundation/constants.h"  /* CBM_SZ_4K — forced stderr buffer */
+#include "foundation/log.h"        /* crash-durable worker log probe */
+#include "foundation/mem.h"        /* cbm_mem_init — worker budget */
+#include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
@@ -57,8 +63,7 @@ static bool tf_invoked_as_windows_git_module(void) {
      * Inspect the actual loaded module so the copied git.exe probe cannot fall
      * through into the ordinary test runner when argv[0] is merely "git". */
     wchar_t image[32768];
-    DWORD image_length =
-        GetModuleFileNameW(NULL, image, (DWORD)(sizeof(image) / sizeof(image[0])));
+    DWORD image_length = GetModuleFileNameW(NULL, image, (DWORD)(sizeof(image) / sizeof(image[0])));
     if (image_length == 0 || image_length >= (DWORD)(sizeof(image) / sizeof(image[0]))) {
         return false;
     }
@@ -89,8 +94,7 @@ static bool tf_invoked_as_blocking_git(const char *argv0) {
             base = cursor + 1;
         }
     }
-    return strcmp(base, "git") == 0 || strcmp(base, "git.exe") == 0 ||
-           strcmp(base, "GIT.EXE") == 0;
+    return strcmp(base, "git") == 0 || strcmp(base, "git.exe") == 0 || strcmp(base, "GIT.EXE") == 0;
 #endif
 }
 
@@ -168,6 +172,38 @@ static void tf_cleanup_cache_sentinel(void) {
     }
 }
 
+/* Client home overrides the CLI honours BEFORE $HOME, so redirecting HOME alone
+ * does not isolate them: cbm_codex_config_dir() and its siblings return the
+ * ambient path and the suite resolves against the developer's real config —
+ * reading its state and writing to it. Same inventory the shell fixtures are
+ * already required to neutralize (tests/test_smoke_fixture_contract.sh), kept
+ * in one place so a new client cannot be isolated in the smoke scripts and
+ * forgotten here. A test that exercises one of these sets it after setup. */
+static const char *const tf_client_home_overrides[] = {
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "KIRO_HOME",
+    "HERMES_HOME",
+    "QWEN_HOME",
+    "CLINE_DATA_DIR",
+    "OPENCLAW_HOME",
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_CONFIG_PATH",
+    "OPENCLAW_WORKSPACE_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "COPILOT_HOME",
+    "CRUSH_GLOBAL_CONFIG",
+    "VIBE_HOME",
+    "GLAB_CONFIG_DIR",
+    "KIMI_CODE_HOME",
+    "CBM_CONTINUE_CONFIG_PATH",
+    "CBM_TRAE_CONFIG_PATH",
+    "CBM_ROO_CONFIG_PATH",
+    "CBM_CODY_CONFIG_PATH",
+};
+
 static bool tf_setup_cache_sentinel(void) {
     snprintf(tf_home_sentinel, sizeof(tf_home_sentinel), "/tmp/cbm-test-home-XXXXXX");
     if (!cbm_mkdtemp(tf_home_sentinel)) {
@@ -178,6 +214,10 @@ static bool tf_setup_cache_sentinel(void) {
      * override keeps both conventions pointed at the same isolated tree. */
     cbm_setenv("HOME", tf_home_sentinel, 1);
     cbm_unsetenv("CBM_CACHE_DIR");
+    for (size_t i = 0U; i < sizeof(tf_client_home_overrides) / sizeof(tf_client_home_overrides[0]);
+         i++) {
+        cbm_unsetenv(tf_client_home_overrides[i]);
+    }
     atexit(tf_cleanup_cache_sentinel);
     return true;
 }
@@ -202,6 +242,27 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         (void)fprintf(stderr, "async worker crash probe\n");
         fflush(NULL);
         abort();
+    }
+    if (strstr(args_json, "\"buffered-kill\"")) {
+        /* The 0-byte-worker-log repro. tf_maybe_run_index_worker has already
+         * put stderr into the FULL buffering a redirected stderr gets from the
+         * Windows CRT (see there), so this line only reaches the log if the
+         * production worker-log entry made the stream crash-durable.
+         *
+         * Then die the way the reports die. NOT abort(): Darwin's abort() runs
+         * the stdio cleanup handler, so it flushes the very buffer this probe
+         * exists to strand — under abort the reverted build still produced a
+         * populated log and the repro was silently toothless. SIGKILL cannot be
+         * caught, blocked or handled, so no cleanup of any kind runs. It is
+         * also literally #1070's death (`signal=9`) and how #1130's hung worker
+         * is terminated. */
+        cbm_log_info("index.worker.buffered_kill_probe", "phase", "before_kill");
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), 9);
+#else
+        (void)raise(SIGKILL);
+#endif
+        _Exit(2); /* unreachable: neither primitive returns */
     }
     if (strstr(args_json, "\"oversize\"")) {
         FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
@@ -268,6 +329,23 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
         return 1;
     }
 
+    /* WHY force full buffering: on POSIX stderr is unbuffered by default, so the
+     * 0-byte worker log of #1070/#1130/#1132/#1133/#1145/#1450 is invisible on
+     * two thirds of the ladder — the Windows CRT is what gives a redirected
+     * stderr FULL buffering. Starting the probe from the Windows default makes
+     * the crash-durability contract testable identically on every OS we own,
+     * instead of a Windows-only claim nobody can run locally. Scoped to the one
+     * probe that asserts it, and set before the production entry below, which is
+     * the code under test. */
+    static char tf_worker_forced_buffer[CBM_SZ_4K];
+    if (invocation.args_json && strstr(invocation.args_json, "\"buffered-kill\"")) {
+        (void)setvbuf(stderr, tf_worker_forced_buffer, _IOFBF, sizeof(tf_worker_forced_buffer));
+    }
+    /* Mirror the production worker entry (run_cli's caller in main.c): the log
+     * header is the first thing a worker records. */
+    char *worker_repo_path = cbm_mcp_get_string_arg(invocation.args_json, "repo_path");
+    cbm_index_worker_log_begin(invocation.args_json, worker_repo_path);
+    free(worker_repo_path);
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
@@ -627,6 +705,7 @@ extern void suite_str_util(void);
 extern void suite_workspace(void);
 extern void suite_platform(void);
 extern void suite_diagnostics(void);
+extern void suite_complexity(void);
 extern void suite_subprocess(void);
 extern void suite_private_file_lock(void);
 extern void suite_lock_registry(void);
@@ -1049,6 +1128,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(workspace);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(diagnostics);
+    RUN_SELECTED_SUITE(complexity);
     RUN_SELECTED_SUITE(subprocess);
     RUN_SELECTED_SUITE(private_file_lock);
     RUN_SELECTED_SUITE(lock_registry);

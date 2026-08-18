@@ -211,6 +211,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_node_by_id;
     sqlite3_stmt *stmt_find_node_by_qn;
     sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
+    sqlite3_stmt *stmt_find_nodes;
     sqlite3_stmt *stmt_find_nodes_by_name;
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
@@ -1765,6 +1766,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_find_node_by_id);
     finalize_stmt(&s->stmt_find_node_by_qn);
     finalize_stmt(&s->stmt_find_node_by_qn_any);
+    finalize_stmt(&s->stmt_find_nodes);
     finalize_stmt(&s->stmt_find_nodes_by_name);
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
@@ -3312,8 +3314,25 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
     }
 
     bind_text(stmt, SKIP_ONE, project);
-    bind_text(stmt, ST_COL_2, val);
+    /* A single-parameter statement has no index 2 to bind; binding it anyway
+     * returns SQLITE_RANGE. Callers that pass no value rely on this. */
+    if (val) {
+        bind_text(stmt, ST_COL_2, val);
+    }
     return collect_nodes_from_stmt(s, stmt, "find_nodes_generic", out, count);
+}
+
+int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, int *count) {
+    if (!s) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+    return find_nodes_generic(s, &s->stmt_find_nodes,
+                              "SELECT id, project, label, name, qualified_name, file_path, "
+                              "start_line, end_line, properties FROM nodes "
+                              "WHERE project = ?1;",
+                              project, NULL, out, count);
 }
 
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
@@ -9285,6 +9304,20 @@ static void cov_failure_fingerprint(const cbm_coverage_row_t *rows, int count,
     out[CBM_SHA256_HEX_LEN] = 0;
 }
 
+static void cov_dir_ids_free_entry(const char *key, void *val, void *ud) {
+    (void)ud;
+    free((char *)key);
+    free(val);
+}
+
+static void cov_dir_ids_free(CBMHashTable *ht) {
+    if (!ht) {
+        return;
+    }
+    cbm_ht_foreach(ht, cov_dir_ids_free_entry, NULL);
+    cbm_ht_free(ht);
+}
+
 static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     char covproj[CBM_SZ_512];
     cbm_store_coverage_shadow_project(covproj, sizeof(covproj), project);
@@ -9382,6 +9415,12 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         return CBM_STORE_ERR;
     }
 
+    /* Directory nodes repeat massively across failure rows (13k baseline files
+     * under one tests/ subtree meant ~80k redundant upsert/edge round-trips —
+     * 9.1 s of a 9.2 s coverage_replace on the TypeScript corpus). Dedup them
+     * in-memory for the rebuild: first sight of a directory creates its node
+     * and containment edge; every later file under it is a hash hit. */
+    CBMHashTable *dir_ids = cbm_ht_create(CBM_SZ_256);
     for (int i = 0; i < count; i++) {
         const char *rel = rows[i].rel_path;
         if (!rel || !rel[0]) {
@@ -9404,6 +9443,12 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
             /* Truncate at this slash → pathbuf is the directory prefix; the
              * upsert binds copies, so restore the slash right after. */
             *p = '\0';
+            int64_t *cached = dir_ids ? (int64_t *)cbm_ht_get(dir_ids, pathbuf) : NULL;
+            if (cached) {
+                parent = *cached;
+                *p = '/';
+                continue;
+            }
             const char *seg = strrchr(pathbuf, '/');
             cbm_node_t folder = {.project = covproj,
                                  .label = "Folder",
@@ -9412,8 +9457,9 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                                  .file_path = pathbuf,
                                  .properties_json = "{}"};
             int64_t fid = cbm_store_upsert_node(s, &folder);
-            *p = '/';
             if (fid <= 0) {
+                *p = '/';
+                cov_dir_ids_free(dir_ids);
                 cbm_store_free_coverage(rows, count);
                 return CBM_STORE_ERR;
             }
@@ -9423,9 +9469,24 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                             .type = "CONTAINS_FOLDER",
                             .properties_json = "{}"};
             if (cbm_store_insert_edge(s, &e) <= 0) {
+                *p = '/';
+                cov_dir_ids_free(dir_ids);
                 cbm_store_free_coverage(rows, count);
                 return CBM_STORE_ERR;
             }
+            if (dir_ids) {
+                int64_t *idv = (int64_t *)malloc(sizeof(*idv));
+                if (idv) {
+                    *idv = fid;
+                    char *kdup = strdup(pathbuf);
+                    if (kdup) {
+                        cbm_ht_set(dir_ids, kdup, idv);
+                    } else {
+                        free(idv);
+                    }
+                }
+            }
+            *p = '/';
             parent = fid;
         }
 
@@ -9443,6 +9504,7 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                            .properties_json = props};
         int64_t file_id = cbm_store_upsert_node(s, &file);
         if (file_id <= 0) {
+            cov_dir_ids_free(dir_ids);
             cbm_store_free_coverage(rows, count);
             return CBM_STORE_ERR;
         }
@@ -9452,10 +9514,12 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                         .type = "CONTAINS_FILE",
                         .properties_json = "{}"};
         if (cbm_store_insert_edge(s, &e) <= 0) {
+            cov_dir_ids_free(dir_ids);
             cbm_store_free_coverage(rows, count);
             return CBM_STORE_ERR;
         }
     }
+    cov_dir_ids_free(dir_ids);
     cbm_store_free_coverage(rows, count);
     {
         sqlite3_stmt *set = NULL;
@@ -9483,6 +9547,15 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
+    /* Sub-block timings (publish.timing style): coverage_replace measured 9 s
+     * on the TypeScript corpus and the caller-level block could not say WHY —
+     * delete, 13k row inserts with large error_ranges payloads, the NOT-IN
+     * prune, meta, and COMMIT are very different suspects. */
+    struct timespec cov_t0;
+    struct timespec cov_t1;
+    long cov_ms[5] = {0, 0, 0, 0, 0};
+    long long cov_detail_bytes = 0;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &cov_t0);
     sqlite3_stmt *del = NULL;
     if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage WHERE project = ?1;", CBM_NOT_FOUND,
                            &del, NULL) != SQLITE_OK) {
@@ -9498,6 +9571,10 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &cov_t1);
+    cov_ms[0] =
+        (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
+    cov_t0 = cov_t1;
     sqlite3_stmt *ins = NULL;
     if (sqlite3_prepare_v2(
             s->db,
@@ -9515,6 +9592,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         bind_text(ins, SKIP_ONE, project);
         bind_text(ins, ST_COL_2, rows[i].rel_path);
         bind_text(ins, ST_COL_3, rows[i].kind);
+        cov_detail_bytes += rows[i].detail ? (long long)strlen(rows[i].detail) : 0;
         bind_text(ins, CBM_SZ_4, rows[i].detail ? rows[i].detail : "");
         if (sqlite3_step(ins) != SQLITE_DONE) {
             store_set_error_sqlite(s, "coverage insert");
@@ -9525,6 +9603,10 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         sqlite3_reset(ins);
     }
     sqlite3_finalize(ins);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &cov_t1);
+    cov_ms[1] =
+        (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
+    cov_t0 = cov_t1;
     /* Prune FAILURE rows for files no longer known to the index (deleted from
      * the repo): file_hashes is the authoritative live-file set after
      * persist. By-design not_indexed_* rows are exempt — deliberately
@@ -9548,6 +9630,10 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &cov_t1);
+    cov_ms[2] =
+        (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
+    cov_t0 = cov_t1;
 
     if (meta) {
         char recorded_at[CBM_SZ_64];
@@ -9624,7 +9710,33 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
-    return cbm_store_commit(s);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &cov_t1);
+    cov_ms[3] =
+        (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
+    cov_t0 = cov_t1;
+    int commit_rc = cbm_store_commit(s);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &cov_t1);
+    cov_ms[4] =
+        (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
+    {
+        char b0[ST_BUF_64];
+        char b1[ST_BUF_64];
+        char b2[ST_BUF_64];
+        char b3[ST_BUF_64];
+        char b4[ST_BUF_64];
+        char bn[ST_BUF_64];
+        char bb[ST_BUF_64];
+        snprintf(b0, sizeof(b0), "%ld", cov_ms[0]);
+        snprintf(b1, sizeof(b1), "%ld", cov_ms[1]);
+        snprintf(b2, sizeof(b2), "%ld", cov_ms[2]);
+        snprintf(b3, sizeof(b3), "%ld", cov_ms[3]);
+        snprintf(b4, sizeof(b4), "%ld", cov_ms[4]);
+        snprintf(bn, sizeof(bn), "%d", count);
+        snprintf(bb, sizeof(bb), "%lld", cov_detail_bytes);
+        cbm_log_info("publish.timing.coverage", "del", b0, "rows", b1, "prune", b2, "meta", b3,
+                     "commit", b4, "row_count", bn, "detail_bytes", bb);
+    }
+    return commit_rc;
 }
 
 int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,

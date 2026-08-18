@@ -2663,6 +2663,37 @@ typedef struct {
     size_t start, end;
 } toml_codex_edit_t;
 static const char toml_codex_aot_prefix[] = "[[hooks.SessionStart]]";
+static void toml_codex_set_failure(cbm_toml_codex_hook_failure_t *failure,
+                                   cbm_toml_codex_hook_failure_t value) {
+    if (failure) {
+        *failure = value;
+    }
+}
+const char *cbm_toml_codex_hook_failure_name(cbm_toml_codex_hook_failure_t failure) {
+    switch (failure) {
+    case CBM_TOML_CODEX_HOOK_FAILURE_NONE:
+        return "none";
+    case CBM_TOML_CODEX_HOOK_FAILURE_INVALID_ARGUMENT:
+        return "invalid_argument";
+    case CBM_TOML_CODEX_HOOK_FAILURE_COMMAND_RENDER:
+        return "command_render";
+    case CBM_TOML_CODEX_HOOK_FAILURE_CONFIG_READ:
+        return "config_read";
+    case CBM_TOML_CODEX_HOOK_FAILURE_UNSAFE_CONTENT:
+        return "unsafe_content";
+    case CBM_TOML_CODEX_HOOK_FAILURE_MALFORMED_CONFIG:
+        return "malformed_config";
+    case CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP:
+        return "ambiguous_hook_ownership";
+    case CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS:
+        return "conflicting_hook_representations";
+    case CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD:
+        return "edit_build";
+    case CBM_TOML_CODEX_HOOK_FAILURE_CONFIG_WRITE:
+        return "config_write";
+    }
+    return "unknown";
+}
 static size_t toml_codex_payload_start(const char *data, size_t len) {
     return len >= 3U && memcmp(data, "\xef\xbb\xbf", 3U) == 0 ? 3U : 0U;
 }
@@ -2909,13 +2940,15 @@ static int toml_codex_add_edit(toml_codex_edit_t *edits, size_t *count, size_t s
     return TOML_EDIT_OK;
 }
 static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_t *edits,
-                                  size_t *edit_count, int found[2]) {
+                                  size_t *edit_count, int found[2],
+                                  cbm_toml_codex_hook_failure_t *failure) {
     toml_key_path_t wanted[2] = {{0}};
     toml_key_path_t scope = {0};
     if (toml_parse_key_path("hooks.SessionStart", 0U, strlen("hooks.SessionStart"), &wanted[0]) !=
             TOML_EDIT_OK ||
         toml_parse_key_path("hooks.SubagentStart", 0U, strlen("hooks.SubagentStart"), &wanted[1]) !=
             TOML_EDIT_OK) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
         goto error;
     }
     size_t cursor = 0U;
@@ -2927,6 +2960,7 @@ static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_
         if (!in_multiline) {
             toml_header_t header;
             if (toml_parse_header(data, &line, "", &header) != TOML_EDIT_OK) {
+                toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_MALFORMED_CONFIG);
                 goto error;
             }
             header_present = header.present;
@@ -2940,12 +2974,14 @@ static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_
         if (!in_multiline && !header_present) {
             toml_assignment_t assignment;
             if (toml_parse_assignment(data, &line, &assignment) != TOML_EDIT_OK) {
+                toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_MALFORMED_CONFIG);
                 goto error;
             }
             if (assignment.present) {
                 toml_key_path_t full_key;
                 if (toml_key_path_join(&scope, &assignment.key, &full_key) != TOML_EDIT_OK) {
                     toml_assignment_dispose(&assignment);
+                    toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
                     goto error;
                 }
                 int event = toml_key_path_equal(&full_key, &wanted[0])
@@ -2957,12 +2993,20 @@ static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_
                     toml_codex_skip_space(data, line.content_end, &tail);
                     size_t payload_start = toml_codex_payload_start(data, len);
                     size_t edit_start = line.start == 0U ? payload_start : line.start;
-                    if (++found[event] > 1 || assignment.multiline_value ||
-                        tail != line.content_end ||
-                        !toml_codex_inline_is_owned(data, assignment.value_start,
-                                                    assignment.value_end, event) ||
-                        toml_codex_add_edit(edits, edit_count, edit_start, line.full_end) !=
-                            TOML_EDIT_OK) {
+                    cbm_toml_codex_hook_failure_t event_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+                    ++found[event];
+                    if (found[event] > 1) {
+                        event_failure = CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS;
+                    } else if (assignment.multiline_value || tail != line.content_end ||
+                               !toml_codex_inline_is_owned(data, assignment.value_start,
+                                                           assignment.value_end, event)) {
+                        event_failure = CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP;
+                    } else if (toml_codex_add_edit(edits, edit_count, edit_start, line.full_end) !=
+                               TOML_EDIT_OK) {
+                        event_failure = CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD;
+                    }
+                    if (event_failure != CBM_TOML_CODEX_HOOK_FAILURE_NONE) {
+                        toml_codex_set_failure(failure, event_failure);
                         toml_assignment_dispose(&assignment);
                         goto error;
                     }
@@ -2971,10 +3015,14 @@ static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_
             }
         }
         if (toml_scan_line_strings(data, &line, &multiline_state) != TOML_EDIT_OK) {
+            toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_MALFORMED_CONFIG);
             goto error;
         }
     }
     int result = multiline_state == TOML_STRING_NONE ? TOML_EDIT_OK : TOML_EDIT_ERR;
+    if (result != TOML_EDIT_OK) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_MALFORMED_CONFIG);
+    }
     goto done;
 error:
     result = TOML_EDIT_ERR;
@@ -2984,28 +3032,38 @@ done:
     toml_key_path_dispose(&wanted[1]);
     return result;
 }
-int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_marker,
-                                   const char *end_marker, const char *command,
-                                   const char *command_windows, cbm_toml_codex_hook_action_t action,
-                                   int check_only) {
+int cbm_toml_reconcile_codex_hooks_detailed(const char *file_path, const char *begin_marker,
+                                            const char *end_marker, const char *command,
+                                            const char *command_windows,
+                                            cbm_toml_codex_hook_action_t action, int check_only,
+                                            cbm_toml_codex_hook_failure_t *failure) {
+    toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_NONE);
     if (!toml_valid_path(file_path) || !toml_valid_marker(begin_marker) ||
         !toml_valid_marker(end_marker) || strcmp(begin_marker, end_marker) == 0 || !command ||
         !command_windows ||
         (action != CBM_TOML_CODEX_HOOK_UPSERT && action != CBM_TOML_CODEX_HOOK_REMOVE)) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_INVALID_ARGUMENT);
         return TOML_EDIT_ERR;
     }
     toml_buffer_t block = {0};
     if (toml_codex_build_block(command, command_windows, &block) != TOML_EDIT_OK) {
         toml_buffer_dispose(&block);
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_COMMAND_RENDER);
         return TOML_EDIT_ERR;
     }
     char *existing = NULL;
     size_t existing_len = 0U;
     toml_file_snapshot_t snapshot;
-    if (toml_read_file(file_path, &existing, &existing_len, &snapshot) != TOML_EDIT_OK ||
-        !toml_text_is_safe(existing, existing_len, 1)) {
+    if (toml_read_file(file_path, &existing, &existing_len, &snapshot) != TOML_EDIT_OK) {
         toml_buffer_dispose(&block);
         free(existing);
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFIG_READ);
+        return TOML_EDIT_ERR;
+    }
+    if (!toml_text_is_safe(existing, existing_len, 1)) {
+        toml_buffer_dispose(&block);
+        free(existing);
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_UNSAFE_CONTENT);
         return TOML_EDIT_ERR;
     }
     const char *newline = toml_newline_style(existing, existing_len);
@@ -3016,6 +3074,7 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
     int has_pair = 0;
     if (toml_find_markers(existing, existing_len, begin_marker, end_marker, &begin_line, &end_line,
                           &has_pair) != TOML_EDIT_OK) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS);
         goto error;
     }
     size_t pair_start = begin_line.start;
@@ -3025,12 +3084,14 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
     if (has_pair &&
         toml_codex_owned_span(existing + pair_start, end_line.full_end - pair_start, begin_marker,
                               end_marker, newline, 1) != end_line.full_end - pair_start) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP);
         goto error;
     }
     toml_codex_edit_t edits[4];
     size_t edit_count = 0U;
     if (has_pair &&
         toml_codex_add_edit(edits, &edit_count, pair_start, end_line.full_end) != TOML_EDIT_OK) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
         goto error;
     }
     size_t payload_start = toml_codex_payload_start(existing, existing_len);
@@ -3046,17 +3107,24 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
                                                        begin_marker, end_marker, newline, 0)
                                : 0U;
         if (owned_len) {
-            if (++markerless_count > 1 ||
-                toml_codex_add_edit(edits, &edit_count, pos, pos + owned_len) != TOML_EDIT_OK) {
+            if (++markerless_count > 1) {
+                toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS);
+                goto error;
+            }
+            if (toml_codex_add_edit(edits, &edit_count, pos, pos + owned_len) != TOML_EDIT_OK) {
+                toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
                 goto error;
             }
             pos += owned_len - 1U;
         }
     }
     int inline_found[2] = {0};
-    if (toml_codex_scan_inline(existing, existing_len, edits, &edit_count, inline_found) !=
-            TOML_EDIT_OK ||
-        (markerless_count && (has_pair || inline_found[0] || inline_found[1]))) {
+    if (toml_codex_scan_inline(existing, existing_len, edits, &edit_count, inline_found, failure) !=
+        TOML_EDIT_OK) {
+        goto error;
+    }
+    if (markerless_count && (has_pair || inline_found[0] || inline_found[1])) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS);
         goto error;
     }
     for (size_t i = 0U; i < edit_count; ++i) {
@@ -3068,6 +3136,7 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
             }
         }
         if (i > 0U && edits[i - 1U].end > edits[i].start) {
+            toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS);
             goto error;
         }
     }
@@ -3075,11 +3144,13 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
     for (size_t i = 0U; i < edit_count; ++i) {
         if (toml_buffer_append(&output, existing + cursor, edits[i].start - cursor) !=
             TOML_EDIT_OK) {
+            toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
             goto error;
         }
         cursor = edits[i].end;
     }
     if (toml_buffer_append(&output, existing + cursor, existing_len - cursor) != TOML_EDIT_OK) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
         goto error;
     }
     if (action == CBM_TOML_CODEX_HOOK_UPSERT) {
@@ -3088,15 +3159,26 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
              toml_buffer_append_cstr(&output, newline) != TOML_EDIT_OK) ||
             toml_append_managed(&output, begin_marker, end_marker, block.data, newline) !=
                 TOML_EDIT_OK) {
+            toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
             goto error;
         }
     }
     result = check_only ? TOML_EDIT_OK
                         : toml_write_atomic(file_path, existing, existing_len, output.data,
                                             output.len, &snapshot);
+    if (result != TOML_EDIT_OK) {
+        toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFIG_WRITE);
+    }
 error:
     toml_buffer_dispose(&output);
     toml_buffer_dispose(&block);
     free(existing);
     return result;
+}
+int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_marker,
+                                   const char *end_marker, const char *command,
+                                   const char *command_windows, cbm_toml_codex_hook_action_t action,
+                                   int check_only) {
+    return cbm_toml_reconcile_codex_hooks_detailed(file_path, begin_marker, end_marker, command,
+                                                   command_windows, action, check_only, NULL);
 }

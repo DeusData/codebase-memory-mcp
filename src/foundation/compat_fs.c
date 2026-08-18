@@ -1546,9 +1546,54 @@ int cbm_rename_replace(const char *src, const char *dst) {
     wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-                  ? 0
-                  : CBM_NOT_FOUND;
+        if (MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            ret = 0;
+        } else {
+            /* Translate the Win32 error into errno so callers can report WHY.
+             *
+             * Callers log `errno` after a failed rename (see
+             * finalize.rename_failed in the pipeline). Without this the value
+             * is whatever happened to be left there by an unrelated CRT call,
+             * so on Windows the one field that should explain an atomic-publish
+             * failure was noise. #1620 is exactly that: an ACL problem surfaced
+             * to the user as "Pipeline failed. Check repo_path exists and
+             * contains source files" — blaming their repository — because
+             * ERROR_ACCESS_DENIED never reached the log.
+             *
+             * ERROR_ACCESS_DENIED is the interesting one here: MoveFileEx needs
+             * DELETE on the destination, which a cache file created under an
+             * empty or foreign DACL does not grant. */
+            DWORD error = GetLastError();
+            switch (error) {
+            case ERROR_ACCESS_DENIED:
+            case ERROR_WRITE_PROTECT:
+                errno = EACCES;
+                break;
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
+                errno = ENOENT;
+                break;
+            case ERROR_SHARING_VIOLATION:
+            case ERROR_LOCK_VIOLATION:
+            case ERROR_USER_MAPPED_FILE:
+                errno = EBUSY;
+                break;
+            case ERROR_NOT_SAME_DEVICE:
+                errno = EXDEV;
+                break;
+            case ERROR_DISK_FULL:
+                errno = ENOSPC;
+                break;
+            case ERROR_INVALID_NAME:
+            case ERROR_FILENAME_EXCED_RANGE:
+                errno = ENAMETOOLONG;
+                break;
+            default:
+                errno = EIO;
+                break;
+            }
+            ret = CBM_NOT_FOUND;
+        }
     }
     free(wsrc);
     free(wdst);

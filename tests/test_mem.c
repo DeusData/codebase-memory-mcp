@@ -41,6 +41,32 @@
 
 /* ── mem basic tests ──────────────────────────────────────────── */
 
+/* Since #1360 routed ordinary malloc/new through mimalloc on Linux, the arena
+ * policy governs EVERY allocation in the process, not just the bound
+ * sqlite/tree_sitter populations. With lazy arena commit (0), mimalloc commits
+ * sub-ranges via mprotect(PROT_READ|PROT_WRITE) over a PROT_NONE reservation,
+ * and each partial commit SPLITS the reserved VMA: an index worker on the Go
+ * corpus held ~22k mappings where v0.9.0 held 10, growing with worker count.
+ * That is how #1654's 96-CPU host reached vm.max_map_count, after which mmap
+ * fails for ANY size — 10 KB allocations failing while `free -g` still showed
+ * 246 GB available. mimalloc's own default is 2, meaning "eager-commit arenas
+ * only on an OS that overcommits (i.e. linux)", where commit is free until the
+ * pages are touched; overriding it to 0 opted Linux out of the default written
+ * for Linux. Measured: 22450 -> 17312 mappings, wall time and peak RSS
+ * unchanged. Pin the platform split so the Linux default cannot be silently
+ * opted out again — and keep the lazy setting where commit is NOT free
+ * (Windows especially, see #581). */
+TEST(mem_arena_eager_commit_follows_platform_commit_cost) {
+    cbm_mem_init(0.5);
+    long eager = mi_option_get(mi_option_arena_eager_commit);
+#if defined(__linux__)
+    ASSERT_EQ(eager, 2);
+#else
+    ASSERT_EQ(eager, 0);
+#endif
+    PASS();
+}
+
 TEST(mem_rss_tracking) {
     cbm_mem_init(0.5);
 
@@ -1253,6 +1279,7 @@ TEST(mem_map_attributes_a_known_allocation) {
 
 SUITE(mem) {
     /* mem API */
+    RUN_TEST(mem_arena_eager_commit_follows_platform_commit_cost);
     RUN_TEST(mem_map_attributes_a_known_allocation);
     RUN_TEST(mem_rss_tracking);
     RUN_TEST(mem_collect_reclaims);

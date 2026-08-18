@@ -102,6 +102,10 @@ enum {
  * memory (the resident floor, not in-flight transients, holds the budget). */
 static _Atomic long g_bp_nap_cycles = 0;
 static _Atomic uint64_t g_lsp_linear_fallback_rows = 0;
+/* Defined here, declared in lsp_resolve.h — the uncapped tail-match scan's
+ * cost, surfaced at end of resolve (#1669). */
+_Atomic uint64_t g_lsp_tail_lookups = 0;
+_Atomic uint64_t g_lsp_tail_candidates = 0;
 
 long cbm_pp_bp_nap_cycles(void) {
     return atomic_load_explicit(&g_bp_nap_cycles, memory_order_relaxed);
@@ -117,6 +121,8 @@ uint64_t cbm_pp_lsp_linear_fallback_rows(void) {
 
 void cbm_pp_lsp_linear_fallback_rows_reset(void) {
     atomic_store_explicit(&g_lsp_linear_fallback_rows, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_lsp_tail_lookups, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_lsp_tail_candidates, 0, memory_order_relaxed);
 }
 
 /* Parse a positive MB-valued retention env knob (CBM_RETAIN_*_MB) into bytes.
@@ -643,6 +649,9 @@ typedef struct {
 
     const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
     const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
+
+    /* Superlinearity probe — see profile.h. Ticked on each file claim below. */
+    cbm_scale_probe_t scale;
 } extract_ctx_t;
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
@@ -713,6 +722,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         if (sort_pos >= ec->file_count) {
             break;
         }
+        cbm_scale_tick(&ec->scale, sort_pos);
         if (atomic_load_explicit(ec->cancelled, memory_order_relaxed) ||
             atomic_load_explicit(&ec->worker_failed, memory_order_relaxed) != 0) {
             break;
@@ -824,8 +834,16 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
 
         /* Per-file start log: shows which file each worker is processing.
-         * Critical for diagnosing stuck workers on large vendored files. */
-        if (sort_pos < PP_LOG_THRESH) { /* first 2 rounds of workers = most interesting */
+         * Critical for diagnosing stuck workers on large vendored files.
+         *
+         * Under a crash-durable log (i.e. a supervised worker) EVERY file gets
+         * its line, not just the first rounds. That log is the only evidence a
+         * contained crash or a kill leaves behind, and #1145/#1130 are
+         * unattributable precisely because it never named the file that was in
+         * flight — the run ends with the culprit still on the last lines. One
+         * line per file, never per node. */
+        if (sort_pos < PP_LOG_THRESH || /* first 2 rounds of workers = most interesting */
+            cbm_log_crash_durable()) {
             cbm_log_info("parallel.extract.file.start", "pos", itoa_log(sort_pos), "size_kb",
                          itoa_log(source_len / CBM_SZ_1K), "path", fi->rel_path);
         }
@@ -1151,7 +1169,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
     cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
+    cbm_scale_begin(&ec.scale, "parallel_extract", (long)file_count);
     cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
+    cbm_scale_end(&ec.scale);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
 
     /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
@@ -1470,6 +1490,11 @@ typedef struct {
     _Atomic uint64_t time_ns_rc_target;     /* gbuf_find_by_qn for target */
     _Atomic uint64_t time_ns_rc_emit;       /* emit_service_edge */
     _Atomic uint64_t time_ns_rc_source;     /* find_source_node */
+
+    /* Superlinearity probe — see profile.h. This is the pass that made it
+     * necessary (#1669: 87% of a Java index), so it is the one that must never
+     * again grow superlinear without saying so. */
+    cbm_scale_probe_t scale;
 } resolve_ctx_t;
 
 /* Build props JSON, append args, close brace, emit edge. */
@@ -2313,6 +2338,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+        if (target_node && source_node->id != target_node->id &&
+            cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+            /* #725: same guard as pass_calls.c — do not emit a suffix_match
+             * CALLS edge across a language boundary. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
@@ -2779,6 +2810,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (file_idx >= rc->file_count) {
             break;
         }
+        cbm_scale_tick(&rc->scale, file_idx);
         if (atomic_load_explicit(rc->cancelled, memory_order_relaxed) ||
             atomic_load_explicit(&rc->worker_failed, memory_order_relaxed) != 0) {
             break;
@@ -3099,7 +3131,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
+    cbm_scale_begin(&rc.scale, "parallel_resolve", (long)file_count);
     cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
+    cbm_scale_end(&rc.scale);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
@@ -3164,6 +3198,56 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         "files_skipped_no_source",
         itoa_log(atomic_load_explicit(&rc.lsp_cross_skipped_no_source, memory_order_relaxed)),
         "defs_total", itoa_log(def_count));
+
+    /* Cross-LSP cost, NORMALISED (#1669). Wall time alone cannot distinguish
+     * "big repo" from "superlinear pass"; us_per_file can. For a pass that is
+     * linear in file count this number is roughly CONSTANT across repo sizes.
+     * When cross-file LSP rebuilds its registry from a corpus-scaled def set,
+     * per-file cost tracks defs_total instead — measured 35ms/file at 5.8k
+     * files and 209ms/file at 46k on the same tree, which is the O(n^2) that
+     * cost a 6x java regression and took an 11-corpus two-binary A/B to find.
+     * Emitted next to defs_total so one grep on two differently sized repos
+     * answers it. */
+    int cross_files = atomic_load_explicit(&rc.lsp_cross_processed, memory_order_relaxed);
+    uint64_t cross_us = atomic_load_explicit(&rc.time_ns_cross_lsp, memory_order_relaxed) / 1000ULL;
+    if (cross_files > 0) {
+        char cf_buf[CBM_SZ_32];
+        char nf_buf[CBM_SZ_32];
+        char cu_buf[CBM_SZ_32];
+        char pk_buf[CBM_SZ_32];
+        snprintf(cf_buf, sizeof(cf_buf), "%llu",
+                 (unsigned long long)(cross_us / (uint64_t)cross_files));
+        snprintf(nf_buf, sizeof(nf_buf), "%d", cross_files);
+        snprintf(cu_buf, sizeof(cu_buf), "%llu", (unsigned long long)(cross_us / 1000ULL));
+        snprintf(pk_buf, sizeof(pk_buf), "%llu",
+                 (unsigned long long)(def_count > 0
+                                          ? (cross_us * 1000ULL) /
+                                                ((uint64_t)cross_files * (uint64_t)def_count)
+                                          : 0ULL));
+        cbm_log_info("parallel.resolve.cross_lsp_cost", "cross_lsp_ms", cu_buf, "files", nf_buf,
+                     "us_per_file", cf_buf, "defs_total", itoa_log(def_count),
+                     "us_per_file_per_kdef", pk_buf);
+
+        /* What the per-file registry build actually cost. defs_per_file is the
+         * lever: if it tracks defs_total rather than the file's own module plus
+         * imports, the module filter is not containing the work and cross-file
+         * LSP is O(files x corpus_defs). */
+        uint64_t reg_defs = 0;
+        uint64_t reg_files = 0;
+        uint64_t flt_files = 0;
+        uint64_t flt_failed = 0;
+        cbm_pxc_filter_stats(&reg_defs, &reg_files, &flt_files, &flt_failed);
+        if (reg_files > 0) {
+            char rd_buf[CBM_SZ_32];
+            char ff_buf[CBM_SZ_32];
+            char fp_buf[CBM_SZ_32];
+            snprintf(rd_buf, sizeof(rd_buf), "%llu", (unsigned long long)(reg_defs / reg_files));
+            snprintf(ff_buf, sizeof(ff_buf), "%llu", (unsigned long long)flt_failed);
+            snprintf(fp_buf, sizeof(fp_buf), "%llu", (unsigned long long)flt_files);
+            cbm_log_info("parallel.resolve.perfile_registry", "defs_per_file", rd_buf, "defs_total",
+                         itoa_log(def_count), "filtered_files", fp_buf, "filter_failed", ff_buf);
+        }
+    }
 
     cbm_log_info("parallel.resolve.done", "calls", itoa_log(total_calls), "usages",
                  itoa_log(total_usages), "semantic", itoa_log(total_semantic + go_impl),
@@ -3242,5 +3326,27 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                  "resolve", rsv_buf);
     cbm_log_info("parallel.resolve.calls_breakdown2", "field_hint", hnt_buf, "find_target", tgt_buf,
                  "emit_edge", emt_buf);
+
+    /* Candidate-scan cost (#1669). `per_lookup` is the diagnostic that matters:
+     * it is a property of the CORPUS, not of the machine, so it is comparable
+     * across runs and versions. If it grows with repo size, the tail-match scan
+     * is turning resolve superlinear — which is precisely what took an
+     * 11-corpus two-binary A/B to establish the first time. `fallback_rows`
+     * was already counted but, until now, readable only from a test. */
+    uint64_t tail_lookups = atomic_load_explicit(&g_lsp_tail_lookups, memory_order_relaxed);
+    uint64_t tail_cands = atomic_load_explicit(&g_lsp_tail_candidates, memory_order_relaxed);
+    char tl_buf[CBM_SZ_32];
+    char tc_buf[CBM_SZ_32];
+    char tp_buf[CBM_SZ_32];
+    char fb_buf[CBM_SZ_32];
+    snprintf(tl_buf, sizeof(tl_buf), "%llu", (unsigned long long)tail_lookups);
+    snprintf(tc_buf, sizeof(tc_buf), "%llu", (unsigned long long)tail_cands);
+    snprintf(tp_buf, sizeof(tp_buf), "%llu",
+             (unsigned long long)(tail_lookups ? tail_cands / tail_lookups : 0ULL));
+    snprintf(fb_buf, sizeof(fb_buf), "%llu",
+             (unsigned long long)atomic_load_explicit(&g_lsp_linear_fallback_rows,
+                                                      memory_order_relaxed));
+    cbm_log_info("parallel.resolve.scan_cost", "tail_lookups", tl_buf, "tail_candidates", tc_buf,
+                 "per_lookup", tp_buf, "fallback_rows", fb_buf);
     return 0;
 }

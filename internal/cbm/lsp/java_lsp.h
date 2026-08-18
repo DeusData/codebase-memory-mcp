@@ -142,6 +142,16 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count);
 
+/* Tier 2 (#1669): build the shared JVM cross registry ONCE per run, then
+ * resolve each file against it with a small own-module overlay. Skips the
+ * per-file registry build that made cross-file LSP O(files x corpus_defs). */
+CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
+void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result,
+                                          const char *source, int source_len, const char *module_qn,
+                                          CBMTypeRegistry *reg, const char **import_names,
+                                          const char **import_qns, int import_count,
+                                          TSTree *cached_tree, CBMResolvedCallArray *out);
+
 void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,

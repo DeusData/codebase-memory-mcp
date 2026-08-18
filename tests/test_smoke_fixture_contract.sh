@@ -71,6 +71,44 @@ require(
     "smoke-local.sh must not reserve/release a port or launch a separate http.server",
 )
 
+# Every environment variable the CLI honours ahead of $HOME. A fixture that
+# redirects only HOME still resolves these to the developer's real config, so
+# both the shell fixtures and the C runner must neutralize the whole set.
+CLIENT_HOME_OVERRIDES = (
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "KIRO_HOME",
+    "HERMES_HOME",
+    "QWEN_HOME",
+    "CLINE_DATA_DIR",
+    "OPENCLAW_HOME",
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_CONFIG_PATH",
+    "OPENCLAW_WORKSPACE_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "COPILOT_HOME",
+    "CRUSH_GLOBAL_CONFIG",
+    "VIBE_HOME",
+    "GLAB_CONFIG_DIR",
+    "KIMI_CODE_HOME",
+    "CBM_CONTINUE_CONFIG_PATH",
+    "CBM_TRAE_CONFIG_PATH",
+    "CBM_ROO_CONFIG_PATH",
+    "CBM_CODY_CONFIG_PATH",
+)
+
+# The C suite exercises the same install/uninstall paths as the shell fixtures,
+# so it needs the same neutralization — otherwise a green run on a developer
+# machine only proves the ambient config happened to be writable.
+test_main = read("tests/test_main.c")
+for variable in CLIENT_HOME_OVERRIDES:
+    require(
+        f'"{variable}"' in test_main,
+        f"tests/test_main.c must neutralize ambient {variable}",
+    )
+
 for relative, source in (
     ("scripts/smoke-local.sh", smoke_local),
     ("test-infrastructure/vm/vm-smoke.sh", vm_smoke),
@@ -91,31 +129,7 @@ for relative, source in (
         'wait "$SERVER_PID"' in source,
         f"{relative} cleanup must reap the fixture-server process",
     )
-    for variable in (
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "KIRO_HOME",
-        "HERMES_HOME",
-        "QWEN_HOME",
-        "CLINE_DATA_DIR",
-        "OPENCLAW_HOME",
-        "OPENCLAW_STATE_DIR",
-        "OPENCLAW_PROFILE",
-        "OPENCLAW_CONFIG_PATH",
-        "OPENCLAW_WORKSPACE_DIR",
-        "OPENCODE_CONFIG",
-        "OPENCODE_CONFIG_DIR",
-        "COPILOT_HOME",
-        "CRUSH_GLOBAL_CONFIG",
-        "VIBE_HOME",
-        "GLAB_CONFIG_DIR",
-        "KIMI_CODE_HOME",
-        "CBM_CONTINUE_CONFIG_PATH",
-        "CBM_TRAE_CONFIG_PATH",
-        "CBM_ROO_CONFIG_PATH",
-        "CBM_CODY_CONFIG_PATH",
-        "CBM_TEST_WINDOWS_USER_PATH_RUN_ID",
-    ):
+    for variable in CLIENT_HOME_OVERRIDES + ("CBM_TEST_WINDOWS_USER_PATH_RUN_ID",):
         require(
             f"-u {variable}" in source,
             f"{relative} must neutralize ambient {variable}",

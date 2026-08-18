@@ -33,7 +33,6 @@
 #include "mcp/index_supervisor.h"
 #include "watcher/watcher.h"
 #include "pipeline/pipeline.h"
-#include "store/store.h"
 #include "depindex/depindex.h"
 #include "pagerank/pagerank.h"
 #include "cli/cli.h"
@@ -804,8 +803,10 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             return SKIP_ONE;
         }
         args_json = heap_args;
-    } else if (!cli_isatty(0)) {
-        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json */
+    } else if (cbm_cli_args_from_stdin_allowed(tool_name, cli_isatty(0) != 0)) {
+        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json.
+         * Gated (#1359): a tool that declares no arguments must not read a pipe
+         * nobody is going to write to or close — see the WHY on the predicate. */
         heap_args = cli_slurp_stream(stdin);
         if (heap_args && heap_args[0]) {
             args_json = heap_args;
@@ -2503,6 +2504,14 @@ int main(int argc, char **argv) {
     }
 #endif
     cbm_daemon_process_role_t role = cbm_daemon_process_role(argc, argv);
+    if (role == CBM_DAEMON_PROCESS_WORKER) {
+        /* Before this process writes ANYTHING. A worker's stderr is a file the
+         * supervisor keeps for post-mortem, and setvbuf only binds before a
+         * stream's first operation — claim it here so even the "could not
+         * start" messages below reach disk. The header follows once the argv
+         * grammar has been validated. */
+        cbm_log_set_crash_durable(true);
+    }
     if (role == CBM_DAEMON_PROCESS_INVALID) {
         (void)fprintf(stderr, "codebase-memory-mcp: invalid internal process arguments\n");
         return EXIT_FAILURE;
@@ -2607,10 +2616,23 @@ int main(int argc, char **argv) {
             coordination_failure = main_build_identity_status_name(local_identity_status);
         }
         if (coordination_failure) {
+            /* Name the rule that refused, not just the stage that failed.
+             *
+             * "(endpoint)" alone is what four separate reporters in #1533 and
+             * #1574 were left with: every mode fails, `config list` included,
+             * so the product cannot even be reconfigured out of it, and
+             * CBM_LOG_LEVEL=debug adds nothing. One of them had to build an
+             * instrumented binary to discover that a single ACE on an ancestor
+             * of %LOCALAPPDATA% was the cause. The validation detail already
+             * holds that — it names the directory, the offending SID and the
+             * right it granted — and the daemon-endpoint path a few hundred
+             * lines below has printed it since #1582. This path did not. */
+            const char *why = cbm_daemon_ipc_validation_detail();
             (void)fprintf(
                 stderr,
-                "codebase-memory-mcp: secure CLI coordination could not be created (%s)%s\n",
-                coordination_failure, main_build_identity_status_guidance(local_identity_status));
+                "codebase-memory-mcp: secure CLI coordination could not be created (%s)%s%s%s\n",
+                coordination_failure, (why && why[0]) ? ": " : "", (why && why[0]) ? why : "",
+                main_build_identity_status_guidance(local_identity_status));
             goto local_cli_cleanup;
         }
         cbm_http_server_set_binary_path(local_executable);
@@ -2738,6 +2760,13 @@ int main(int argc, char **argv) {
                           cbm_index_worker_argv_status_message(worker_status));
             return EXIT_FAILURE;
         }
+        /* First thing a worker records, and the only thing six 0-byte-log
+         * reports were missing: who I am, what I was asked to index, with what
+         * arguments. Everything below here can crash and the log still names
+         * the run. */
+        char *worker_repo_path = cbm_mcp_get_string_arg(invocation.args_json, "repo_path");
+        cbm_index_worker_log_begin(invocation.args_json, worker_repo_path);
+        free(worker_repo_path);
         cbm_daemon_ipc_endpoint_t *worker_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
         cbm_project_lock_manager_t *worker_project_locks =
             worker_endpoint ? cbm_project_lock_manager_new(worker_endpoint) : NULL;

@@ -71,6 +71,107 @@ static void ts_type_budget_reset(size_t source_len) {
     g_ts_type_budget_warned = false;
 }
 
+/* Bumped on every degraded eval return (depth cap or budget exhaustion). An
+ * evaluation whose subtree bumped this counter must NOT be memoized: its value
+ * embeds the degradation, and first-eval-wins would freeze it for call sites
+ * that could have evaluated the node fully. */
+static _Thread_local unsigned long g_ts_eval_degraded;
+
+/* Expression-type memo (per file): node.id -> evaluated CBMType.
+ *
+ * ts_signature_for_call re-evaluates a call's argument expressions while
+ * resolving overloads, and boolean/spread chains re-enter the same
+ * subexpression once per enclosing alternative — the TS suite's
+ * objectSpreadRepeatedComplexity.js builds a union of 2^(n-1) members and
+ * measured 11+ s for a 3.6 KB file while emitting the same 5-node graph
+ * v0.9.0 emits in 0.14 s. Expression types are position-pure within a file
+ * pass (one node = one scope path, and the per-file walk is single-threaded
+ * and deterministic), so one eval per node is the correct semantics, not a
+ * cache trade-off. Degraded results are never stored (see
+ * g_ts_eval_degraded). Arena-backed, linear-probed, power-of-two capacity;
+ * grows by rehash and dies with the file pass. */
+typedef struct TsEvalMemo {
+    const void **keys; /* TSNode.id; NULL = empty slot */
+    const CBMType **vals;
+    uint32_t cap;
+    uint32_t count;
+} TsEvalMemo;
+
+static uint32_t ts_memo_slot(const TsEvalMemo *m, const void *id) {
+    uint64_t x = (uint64_t)(uintptr_t)id;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    uint32_t i = (uint32_t)x & (m->cap - 1);
+    while (m->keys[i] && m->keys[i] != id)
+        i = (i + 1) & (m->cap - 1);
+    return i;
+}
+
+static const CBMType *ts_memo_get(const TsEvalMemo *m, const void *id) {
+    if (!m || !m->cap)
+        return NULL;
+    uint32_t i = ts_memo_slot(m, id);
+    return m->keys[i] ? m->vals[i] : NULL;
+}
+
+static void ts_memo_put(TSLSPContext *ctx, const void *id, const CBMType *t) {
+    TsEvalMemo *m = ctx->eval_memo;
+    if (!m) {
+        m = (TsEvalMemo *)cbm_arena_alloc(ctx->arena, sizeof(*m));
+        if (!m)
+            return;
+        m->cap = 1024;
+        m->count = 0;
+        m->keys = (const void **)cbm_arena_alloc(ctx->arena, m->cap * sizeof(*m->keys));
+        m->vals = (const CBMType **)cbm_arena_alloc(ctx->arena, m->cap * sizeof(*m->vals));
+        if (!m->keys || !m->vals)
+            return;
+        memset(m->keys, 0, m->cap * sizeof(*m->keys));
+        memset(m->vals, 0, m->cap * sizeof(*m->vals));
+        ctx->eval_memo = m;
+    }
+    if (m->count * 10 >= m->cap * 7) { /* grow at 70% load */
+        TsEvalMemo bigger = {0};
+        bigger.cap = m->cap * 2;
+        bigger.keys = (const void **)cbm_arena_alloc(ctx->arena, bigger.cap * sizeof(*bigger.keys));
+        bigger.vals =
+            (const CBMType **)cbm_arena_alloc(ctx->arena, bigger.cap * sizeof(*bigger.vals));
+        if (!bigger.keys || !bigger.vals)
+            return; /* keep serving from the full table; stores stop */
+        memset(bigger.keys, 0, bigger.cap * sizeof(*bigger.keys));
+        memset(bigger.vals, 0, bigger.cap * sizeof(*bigger.vals));
+        for (uint32_t i = 0; i < m->cap; i++) {
+            if (!m->keys[i])
+                continue;
+            uint32_t j = ts_memo_slot(&bigger, m->keys[i]);
+            bigger.keys[j] = m->keys[i];
+            bigger.vals[j] = m->vals[i];
+        }
+        bigger.count = m->count;
+        *m = bigger; /* old arrays stay in the arena */
+    }
+    uint32_t i = ts_memo_slot(m, id);
+    if (!m->keys[i]) {
+        m->keys[i] = id;
+        m->vals[i] = t;
+        m->count++;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Complexity-regression seam: expose the thread's remaining eval budget and
+ * the warned flag after a cbm_run_ts_lsp call. Budget units consumed are a
+ * deterministic work counter — the memo turns the spread-bomb class from
+ * O(2^n) evals into O(nodes), which tests assert without wall-clock. */
+long cbm_ts_lsp_test_budget_remaining(void) {
+    return g_ts_type_budget;
+}
+bool cbm_ts_lsp_test_budget_warned(void) {
+    return g_ts_type_budget_warned;
+}
+#endif
+
 #define TS_LSP_MAX_EVAL_DEPTH 64
 #define TS_LSP_FIELD_LEN(s) ((uint32_t)(sizeof(s) - 1))
 
@@ -1979,9 +2080,43 @@ static const CBMType *return_type_of(CBMArena *arena, const CBMType *sig) {
 const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
-    if (ctx->eval_depth > TS_LSP_MAX_EVAL_DEPTH)
+    /* Memo hit: O(1), charges no budget, ignores depth — the value came from a
+     * completed, non-degraded evaluation of this exact node. */
+    {
+        const CBMType *memo = ts_memo_get(ctx->eval_memo, node.id);
+        if (memo)
+            return memo;
+    }
+    if (ctx->eval_depth > TS_LSP_MAX_EVAL_DEPTH) {
+        g_ts_eval_degraded++;
         return cbm_type_unknown();
+    }
+    /* Depth alone does not bound WORK: crafted expressions (e.g. the TS test
+     * suite's repeated object spreads) stay under the depth cap while fanning
+     * out exponentially — one 3.6 KB baseline file measured 11 s here. Charge
+     * the same per-file budget the type-text parser uses and degrade to
+     * UNKNOWN on exhaustion, exactly like that path. */
+    if (g_ts_type_budget >= 0) {
+        /* An eval entry does ~two orders of magnitude more work than one
+         * text-parse unit (allocations, lookups, recursion bookkeeping), so it
+         * charges accordingly — otherwise the default per-file budget still
+         * permits ~12 s of evaluation on a crafted file. Normal files run
+         * hundreds-to-thousands of entries, far under any budget. */
+        g_ts_type_budget -= 16;
+        if (g_ts_type_budget < 0) {
+            if (!g_ts_type_budget_warned) {
+                g_ts_type_budget_warned = true;
+                fprintf(stderr, "  [tslsp] expression-eval budget exhausted; degrading to "
+                                "unknown\n");
+            }
+            g_ts_eval_degraded++;
+            return cbm_type_unknown();
+        }
+    }
     ctx->eval_depth++;
+    /* Snapshot for the memo-store guard: any degraded return in this subtree
+     * bumps the counter and blocks the store below. */
+    unsigned long degraded_before = g_ts_eval_degraded;
 
     const CBMType *result = cbm_type_unknown();
     const char *kind = ts_node_type(node);
@@ -2241,6 +2376,11 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
     }
 
     ctx->eval_depth--;
+    /* Store only completed, non-degraded evaluations (see g_ts_eval_degraded);
+     * result is never NULL here (initialized to unknown), so NULL stays the
+     * empty-slot sentinel. */
+    if (result && g_ts_eval_degraded == degraded_before)
+        ts_memo_put(ctx, node.id, result);
     return result;
 }
 

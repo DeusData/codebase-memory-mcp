@@ -25,6 +25,7 @@
 #endif
 
 enum { PLATFORM_TIME_THREADS = 8 };
+enum { PLATFORM_MKDTEMP_THREADS = 8, PLATFORM_MKDTEMP_ITERATIONS = 32 };
 
 #include <stdio.h>
 #include <string.h>
@@ -138,6 +139,78 @@ TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
     ASSERT_EQ(missing_error, ENOENT);
     /* The returned path must keep the caller's UTF-8 directory intact. */
     ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
+    PASS();
+}
+
+typedef struct {
+    atomic_int *ready;
+    atomic_bool *go;
+    int worker_index;
+    int created;
+    bool ok;
+    char paths[PLATFORM_MKDTEMP_ITERATIONS][CBM_SZ_512];
+} platform_mkdtemp_worker_t;
+
+static void *platform_mkdtemp_concurrent_worker(void *opaque) {
+    platform_mkdtemp_worker_t *worker = opaque;
+    (void)atomic_fetch_add_explicit(worker->ready, 1, memory_order_acq_rel);
+    while (!atomic_load_explicit(worker->go, memory_order_acquire)) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    worker->ok = true;
+    for (int index = 0; index < PLATFORM_MKDTEMP_ITERATIONS; index++) {
+        int written =
+            snprintf(worker->paths[index], sizeof(worker->paths[index]),
+                     "/tmp/cbm-mkdtemp-concurrent-%d-%d-XXXXXX", worker->worker_index, index);
+        if (written <= 0 || written >= (int)sizeof(worker->paths[index]) ||
+            !cbm_mkdtemp(worker->paths[index])) {
+            worker->ok = false;
+            break;
+        }
+        worker->created++;
+    }
+    return NULL;
+}
+
+/* MCP daemon sessions can enter cbm_mkdtemp simultaneously. Every request must
+ * retain its own expanded path and create a distinct directory. */
+TEST(platform_mkdtemp_is_thread_safe) {
+    cbm_thread_t threads[PLATFORM_MKDTEMP_THREADS];
+    platform_mkdtemp_worker_t workers[PLATFORM_MKDTEMP_THREADS] = {0};
+    atomic_int ready;
+    atomic_bool go;
+    atomic_init(&ready, 0);
+    atomic_init(&go, false);
+
+    int started = 0;
+    for (; started < PLATFORM_MKDTEMP_THREADS; started++) {
+        workers[started].ready = &ready;
+        workers[started].go = &go;
+        workers[started].worker_index = started;
+        if (cbm_thread_create(&threads[started], 0, platform_mkdtemp_concurrent_worker,
+                              &workers[started]) != 0) {
+            break;
+        }
+    }
+    while (started == PLATFORM_MKDTEMP_THREADS &&
+           atomic_load_explicit(&ready, memory_order_acquire) != PLATFORM_MKDTEMP_THREADS) {
+        atomic_signal_fence(memory_order_seq_cst);
+    }
+    atomic_store_explicit(&go, true, memory_order_release);
+    for (int index = 0; index < started; index++) {
+        (void)cbm_thread_join(&threads[index]);
+    }
+
+    bool all_ok = started == PLATFORM_MKDTEMP_THREADS;
+    for (int index = 0; index < started; index++) {
+        all_ok =
+            all_ok && workers[index].ok && workers[index].created == PLATFORM_MKDTEMP_ITERATIONS;
+        for (int path_index = 0; path_index < workers[index].created; path_index++) {
+            all_ok = all_ok && cbm_is_dir(workers[index].paths[path_index]);
+            (void)cbm_rmdir(workers[index].paths[path_index]);
+        }
+    }
+    ASSERT_TRUE(all_ok);
     PASS();
 }
 
@@ -839,6 +912,7 @@ TEST(platform_system_info) {
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
+    RUN_TEST(platform_mkdtemp_is_thread_safe);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
     RUN_TEST(platform_proc_stat_group_parser_handles_parentheses_and_states);

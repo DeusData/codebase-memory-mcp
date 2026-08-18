@@ -67,9 +67,10 @@ UPDATER_NEEDLES=(
 # SQLite loadable extensions = arbitrary code execution through a database
 # file. The amalgamation is built with SQLITE_OMIT_LOAD_EXTENSION; if that ever
 # drops out, dlopen()/LoadLibrary() re-enters the store layer.
-# NOTE: release binaries are stripped, so the two API symbol names only appear
-# when the surface is *exported*. The dlopen error text is the needle that
-# still works on a stripped build — it is compiled in only when the feature is.
+# NOTE: the stripped release candidate can erase non-exported symbol names, so
+# the two API names are not a sufficient proof on their own. The dlopen error
+# text still works after stripping — it is compiled in only with the feature.
+# When the unstripped candidate is inspected, the symbol checks are stronger.
 SQLITE_LOADEXT_NEEDLES=(
     'sqlite3_load_extension'
     'sqlite3_enable_load_extension'
@@ -343,9 +344,9 @@ check_file() {
     for needle in "${SQLITE_LOADEXT_NEEDLES[@]}"; do
         assert_absent "$file" "$token" A4-no-sqlite-loadext "$needle"
     done
-    # Positive control for A4: the three needles above are all *absent* on a
-    # stripped build even when the feature is compiled in, so on its own that
-    # assertion can pass vacuously. SQLite's own compile-option table names
+    # Positive control for A4: the symbol needles can be absent on a stripped
+    # candidate even when the feature is compiled in, so that candidate's
+    # absence assertion can pass vacuously. SQLite's own compile-option table names
     # every OMIT_* it was built with — when that table is present (it ships
     # unless SQLITE_OMIT_COMPILEOPTION_DIAGS is set) it proves the omission
     # positively rather than by absence.

@@ -10,6 +10,7 @@ Verdicts:
   ERROR              upstream fetch failed
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -159,13 +160,24 @@ def main():
         check_upstream(rel, os.path.join(ROOT, rel), repo, exact_path=exact)
 
     # Special: nomic = canonical Apache-2.0 text; sqlite3 = first-party notice
+    #
+    # This used to `curl` https://www.apache.org/licenses/LICENSE-2.0.txt at
+    # gate time and byte-compare. A gating verdict must not depend on a live
+    # HTTP request: any fetch failure yielded an empty string, compared unequal,
+    # and reported DIFFERS -- indistinguishable from a real licence change. That
+    # is what reddened `security / license-gate` on PR #1337 for over two weeks,
+    # on a branch touching three CLI files and no licence at all.
+    #
+    # The canonical Apache-2.0 text is immutable and versioned, so it is pinned
+    # by digest instead. Verified byte-identical to the upstream text at the time
+    # of pinning (11358 bytes). A mismatch now means our vendored copy changed --
+    # which is exactly, and only, what this audit is meant to detect.
+    APACHE_2_0_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     fname, ours = local_license(os.path.join(ROOT, "vendored/nomic"))
-    apache = subprocess.run(
-        ["curl", "-fsSL", "https://www.apache.org/licenses/LICENSE-2.0.txt"],
-        capture_output=True, text=True).stdout
+    ours_digest = hashlib.sha256(ours.encode("utf-8")).hexdigest() if ours is not None else None
     results["vendored/nomic"] = (
-        "IDENTICAL" if ours == apache else "DIFFERS",
-        "apache.org canonical LICENSE-2.0.txt")
+        "IDENTICAL" if ours_digest == APACHE_2_0_SHA256 else "DIFFERS",
+        "canonical Apache-2.0 text, pinned by sha256")
     results["vendored/sqlite3"] = ("FIRST-PARTY-NOTICE",
                                    "own public-domain notice (sqlite has no upstream LICENSE)")
 

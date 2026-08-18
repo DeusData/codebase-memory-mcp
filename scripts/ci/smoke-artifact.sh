@@ -5,7 +5,8 @@
 # packaging/archive-layout bug class could first appear in a release dry run.
 #
 # This driver reproduces the release flow end to end with local bytes:
-#   scripts/build.sh → scripts/package-release.sh → extract →
+#   build → derive stripped/unstripped pair → default-select stripped →
+#   byte-preserving package → extract →
 #   the SAME canonical wrapper the remote venue runs, in artifact mode
 #   (CBM_SMOKE_ARTIFACT_DIR), whose completeness checks make a broken or
 #   incomplete archive a loud failure.
@@ -19,14 +20,15 @@ usage() {
     cat <<'EOF'
 Usage: scripts/ci/smoke-artifact.sh <goos> <goarch> [VAR=VAL ...]
 
-Build → package (scripts/package-release.sh) → extract → smoke the EXTRACTED
-artifact through the canonical wrapper, exactly like the release venue:
+Build → derive both release candidates → select stripped (local, unscanned) →
+package immutable bytes → extract → smoke the EXTRACTED artifact through the
+canonical wrapper, exactly like the release venue:
   unix:    scripts/smoke-local.sh with CBM_SMOKE_ARTIFACT_DIR
   windows: test-infrastructure/vm/vm-smoke.sh with CBM_SMOKE_ARTIFACT_DIR
            (run inside the VM/CI msys2 shell)
 
 Make passthrough (VAR=VAL): CC= CXX= STATIC=1 ... forwarded to build steps.
-Environment: BUILD_DIR (default build/c) — build tree used for the archive.
+Environment: BUILD_DIR (default build/c) — build tree containing linker output.
 On failure the work directory is preserved for post-mortem (path printed).
 EOF
 }
@@ -34,7 +36,6 @@ EOF
 GOOS=""
 GOARCH=""
 BUILD_ARGS=()
-expect_value=""
 for arg in "$@"; do
     case "$arg" in
     -h | --help) usage; exit 0 ;;
@@ -67,9 +68,6 @@ export BUILD_DIR
 
 scripts/build.sh ${UI_FLAG[@]+"${UI_FLAG[@]}"} \
     BUILD_DIR="$BUILD_DIR" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
-if [ "$GOOS" = "darwin" ]; then
-    codesign --sign - --force "$BUILD_DIR/codebase-memory-mcp"
-fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cbm-smoke-artifact.XXXXXX")"
 cleanup() {
@@ -84,8 +82,52 @@ cleanup() {
 }
 trap cleanup EXIT
 
+SOURCE_BINARY="$BUILD_DIR/codebase-memory-mcp"
+if [ "$GOOS" = "windows" ] && [ -f "${SOURCE_BINARY}.exe" ]; then
+    SOURCE_BINARY="${SOURCE_BINARY}.exe"
+fi
+[ -f "$SOURCE_BINARY" ] || {
+    echo "smoke-artifact: build completed without expected binary: $SOURCE_BINARY" >&2
+    exit 2
+}
+
+CANDIDATE_ROOT="$WORK_DIR/candidates"
+scripts/ci/prepare-release-candidates.sh "$GOOS" "$GOARCH" \
+    --binary "$SOURCE_BINARY" --out-dir "$CANDIDATE_ROOT"
+
+SELECTED_NAME="codebase-memory-mcp"
+[ "$GOOS" = "windows" ] && SELECTED_NAME="codebase-memory-mcp.exe"
+SELECTED_BINARY="$CANDIDATE_ROOT/${GOOS}-${GOARCH}/stripped/$SELECTED_NAME"
+[ -f "$SELECTED_BINARY" ] || {
+    echo "smoke-artifact: candidate derivation did not produce $SELECTED_BINARY" >&2
+    exit 2
+}
+PROVENANCE="$CANDIDATE_ROOT/${GOOS}-${GOARCH}/candidate-provenance.tsv"
+SELECTED_SHA256="$(python3 - "$PROVENANCE" <<'PY'
+import csv
+import pathlib
+import sys
+
+with pathlib.Path(sys.argv[1]).open(encoding="utf-8", newline="") as handle:
+    lines = handle.read().splitlines()
+rows = list(csv.DictReader(lines[1:], delimiter="\t"))
+matches = [row for row in rows if row.get("variant") == "stripped"]
+if len(matches) != 1:
+    raise SystemExit("smoke-artifact: provenance does not contain exactly one stripped row")
+print(matches[0]["sha256"])
+PY
+)"
+echo "=== smoke-artifact: unscanned-local-smoke default selected stripped $GOOS-$GOARCH ($SELECTED_SHA256) ==="
+
+# Generate notices while the build's graph-ui/node_modules tree is available;
+# the release build similarly carries this file alongside candidate artifacts.
+NOTICES="$WORK_DIR/THIRD_PARTY_NOTICES.md"
+scripts/gen-third-party-notices.sh "$NOTICES"
 scripts/package-release.sh "$GOOS" "$GOARCH" \
-    --out-dir "$WORK_DIR" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
+    --selected-binary "$SELECTED_BINARY" \
+    --expected-sha256 "$SELECTED_SHA256" \
+    --third-party-notices "$NOTICES" \
+    --out-dir "$WORK_DIR"
 
 NAME="codebase-memory-mcp-${GOOS}-${GOARCH}"
 EXTRACT_DIR="$WORK_DIR/extract"

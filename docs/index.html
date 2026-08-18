@@ -165,7 +165,7 @@
           "name": "Does codebase-memory-mcp send my code anywhere?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "No. All indexing and querying happen 100% locally on your machine. There is no embedded LLM and no API key — your MCP client acts as the intelligence layer. Release archives are signed and checksummed; every distinct extracted release object is submitted to VirusTotal, while downloadable .tar.gz/.zip containers are not. Each object needs at least 50 decisive engines and no suspicious verdicts; malicious verdicts block unless the sole detection is Microsoft's heuristic !ml label, which is published in the release evidence."
+            "text": "No. All indexing and querying happen 100% locally on your machine. There is no embedded LLM and no API key — your MCP client acts as the intelligence layer. Before release testing, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) for every platform and link mode are submitted to VirusTotal. The selected candidate is packaged with its SHA-256 unchanged, and release notes link every measured result. Publication permits only the documented single-Microsoft !ml tolerance."
           }
         },
         {
@@ -753,8 +753,10 @@
 
         <h3>Does codebase-memory-mcp send my code anywhere?</h3>
         <p>No. All indexing and querying happen 100% locally. There is no embedded LLM and no API key. Release
-           archives are signed and checksummed; every distinct extracted release object is submitted
-           to VirusTotal, while downloadable <code>.tar.gz</code>/<code>.zip</code> containers are not. Each object needs at least 50 decisive engines and no suspicious verdicts. Malicious verdicts block unless the sole detection is Microsoft's heuristic <code>!ml</code> label; the release evidence publishes that exception.</p>
+           archives are signed and checksummed. Before testing, three behaviourally identical executable candidates
+           (unstripped, debug-stripped, stripped) for every platform and link mode are submitted to VirusTotal; the selected candidate is packaged with its
+           SHA-256 unchanged. Release notes link every measured result. Publication permits only the
+           documented single-Microsoft <code>!ml</code> tolerance.</p>
 
         <h3>Does it support semantic or natural-language code search?</h3>
         <p>Yes. Alongside structural and full-text search, <code>search_graph</code>'s <code>semantic_query</code>

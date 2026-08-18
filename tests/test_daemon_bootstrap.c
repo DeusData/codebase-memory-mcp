@@ -89,6 +89,15 @@ static bool bootstrap_endpoint_fixture_start(bootstrap_endpoint_fixture_t *fixtu
     return written > 0 && written < (int)sizeof(fixture->runtime_dir);
 }
 
+/* Compare against canonical parents only: the endpoint canonicalizes its parent
+ * before building the runtime path (/var/folders/... becomes /private/var/... on
+ * macOS), so a raw prefix compare would miss a correct relocation. */
+static bool bootstrap_path_has_parent(const char *path, const char *parent) {
+    size_t length = parent ? strlen(parent) : 0;
+    return path && length > 0 && strncmp(path, parent, length) == 0 &&
+           (path[length] == '/' || path[length] == '\\');
+}
+
 static void bootstrap_endpoint_fixture_finish(bootstrap_endpoint_fixture_t *fixture) {
     cbm_daemon_ipc_endpoint_free(fixture->endpoint);
     if (fixture->runtime_dir[0] != '\0') {
@@ -220,8 +229,7 @@ static bool bootstrap_fake_spawn(void *opaque, const cbm_daemon_bootstrap_launch
     bootstrap_fake_ops_t *fake = opaque;
     /* Client bootstrap must only ever spawn the EPHEMERAL two-argument
      * shape; the permanent shape belongs exclusively to `daemon start`. */
-    bool exact = spec && spec->argc == 2U && spec->argv[0] &&
-                 spec->argv[1] && !spec->argv[2] &&
+    bool exact = spec && spec->argc == 2U && spec->argv[0] && spec->argv[1] && !spec->argv[2] &&
                  strcmp(spec->argv[1], CBM_DAEMON_INTERNAL_ARG) == 0 && spec->detached &&
                  !spec->inherit_standard_handles && !spec->use_shell &&
                  atomic_load(&fake->handoff_count) > 0 && atomic_load(&fake->lock_held) == 1;
@@ -362,6 +370,81 @@ TEST(daemon_bootstrap_uses_one_stable_per_account_endpoint) {
                   cbm_daemon_ipc_endpoint_address(second));
     cbm_daemon_ipc_endpoint_free(second);
     bootstrap_endpoint_fixture_finish(&fixture);
+    PASS();
+}
+
+/* #1574/#1621: the shipped build must be able to relocate the rendezvous when
+ * the default ancestry (%LOCALAPPDATA%, /private/tmp) cannot pass the
+ * private-directory walk — otherwise every command fails, `config list`
+ * included, and the operator cannot reconfigure their way out. CBM_RUNTIME_DIR
+ * moves WHERE the rendezvous lives; it never relaxes HOW it is checked, so a
+ * value that cannot be a private runtime parent must be refused rather than
+ * silently replaced by the default. An explicit parent — the compile-time test
+ * seam, the lifecycle guards' isolated namespace — keeps precedence over it. */
+TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
+    char override_parent[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char canonical_override[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char canonical_explicit[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char relocated_runtime[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char explicit_runtime[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char unusable[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    int written = snprintf(override_parent, sizeof(override_parent),
+                           "%s/cbm-bootstrap-runtime-env-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || written >= (int)sizeof(override_parent) || !cbm_mkdtemp(override_parent)) {
+        FAIL("could not create the override runtime parent");
+    }
+    written = snprintf(unusable, sizeof(unusable), "%s/absent/nested", override_parent);
+    bool prepared =
+        written > 0 && written < (int)sizeof(unusable) &&
+        cbm_canonical_path(override_parent, canonical_override, sizeof(canonical_override)) != 0 &&
+        cbm_setenv("CBM_RUNTIME_DIR", override_parent, 1) == 0;
+
+    /* NULL parent == every product call site: daemon, MCP client, local CLI,
+     * index worker, activation. */
+    cbm_daemon_ipc_endpoint_t *relocated =
+        prepared ? cbm_daemon_bootstrap_endpoint_new(NULL) : NULL;
+    const char *relocated_dir = relocated ? cbm_daemon_ipc_endpoint_runtime_dir(relocated) : NULL;
+    if (relocated_dir) {
+        (void)snprintf(relocated_runtime, sizeof(relocated_runtime), "%s", relocated_dir);
+    }
+
+    /* Same environment, explicit parent: the caller still wins. */
+    bootstrap_endpoint_fixture_t fixture = {0};
+    bool explicit_started = prepared && bootstrap_endpoint_fixture_start(&fixture, "runtime-env");
+    bool explicit_canonical =
+        explicit_started &&
+        cbm_canonical_path(fixture.parent, canonical_explicit, sizeof(canonical_explicit)) != 0;
+    if (explicit_started) {
+        (void)snprintf(explicit_runtime, sizeof(explicit_runtime), "%s", fixture.runtime_dir);
+    }
+
+    /* A named parent that cannot pass validation is refused, never ignored. */
+    bool unusable_set = prepared && cbm_setenv("CBM_RUNTIME_DIR", unusable, 1) == 0;
+    cbm_daemon_ipc_endpoint_t *refused =
+        unusable_set ? cbm_daemon_bootstrap_endpoint_new(NULL) : NULL;
+
+    /* Restore before asserting: a failed assertion returns immediately, and a
+     * leaked CBM_RUNTIME_DIR would follow every later suite in this process. */
+    (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+    cbm_daemon_ipc_endpoint_free(refused);
+    cbm_daemon_ipc_endpoint_free(relocated);
+    if (relocated_runtime[0] != '\0') {
+        (void)cbm_rmdir(relocated_runtime);
+    }
+    if (explicit_started) {
+        bootstrap_endpoint_fixture_finish(&fixture);
+    }
+    (void)cbm_rmdir(override_parent);
+
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(explicit_started);
+    ASSERT_TRUE(explicit_canonical);
+    ASSERT_TRUE(unusable_set);
+    ASSERT_NOT_NULL(relocated);
+    ASSERT_TRUE(bootstrap_path_has_parent(relocated_runtime, canonical_override));
+    ASSERT_TRUE(bootstrap_path_has_parent(explicit_runtime, canonical_explicit));
+    ASSERT_FALSE(bootstrap_path_has_parent(explicit_runtime, canonical_override));
+    ASSERT_NULL(refused);
     PASS();
 }
 
@@ -774,6 +857,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_internal_roles_never_take_client_leases);
     RUN_TEST(daemon_bootstrap_rejects_ambiguous_internal_daemon_argv);
     RUN_TEST(daemon_bootstrap_uses_one_stable_per_account_endpoint);
+    RUN_TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous);
     RUN_TEST(daemon_bootstrap_launches_only_exact_detached_hidden_role);
     RUN_TEST(daemon_bootstrap_permanent_daemon_argv_is_byte_exact);
     RUN_TEST(daemon_bootstrap_daemon_ctl_token_routes_after_cli);

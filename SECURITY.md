@@ -128,7 +128,7 @@ Releases are created as **drafts** (invisible to users) and only published after
 2. **Sigstore cosign signing** — keyless digital signatures verifiable by anyone
 3. **SBOM** — Software Bill of Materials (SPDX) listing all vendored dependencies
 4. **SHA-256 checksums** — published with every release
-5. **VirusTotal scanning** — every distinct extracted release object is scanned; downloadable `.tar.gz`/`.zip` containers are not submitted. Each completed analysis must contain at least 50 decisive engine results and no suspicious verdicts. Malicious verdicts block unless the result contains exactly one detection from Microsoft and its label ends in `!ml`; release notes publish that exception and retain archive SHA-256 provenance plus the exact association, scan-set, result, and evidence-checksum assets.
+5. **VirusTotal scanning** — three behaviourally identical executable candidates — unstripped, debug-stripped and stripped — are derived from one linker output for every release product and scanned before smoke/soak. Zero malicious and zero suspicious is preferred; the only tolerated result is exactly one Microsoft malicious label ending in `!ml`, which is disclosed. The selected executable is packaged without changing its SHA-256. After packaging, every distinct object extracted from the 14 shipped containers is scanned under the same policy — `install.sh`, `install.ps1`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, the MCPB `manifest.json` and the unpacked UI assets — so the covered surface is everything we publish, not only the executables. Release notes link the verdict for the exact bytes shipped; the per-candidate results and the selection table are published as release assets for independent audit.
 6. **OpenSSF Scorecard** — repository security health score
 
 Scope of the SLSA claim: this is a build provenance claim for release
@@ -139,8 +139,10 @@ not mean the source code is vulnerability-free or that maintainers cannot change
 source. Consumers should verify the signer workflow, not only repository
 ownership.
 
-Any antivirus finding outside the narrow single-Microsoft-`!ml` policy keeps the
-release as a draft until the issue is investigated and resolved.
+If a scanned executable candidate has any result outside the one narrowly reviewed
+Microsoft `!ml` tolerance, the release stays as a draft and is not published.
+There is no manual bypass around that release gate; its sole machine-enforced
+tolerance and selection table are specified in [Our release policy](#our-release-policy).
 
 ### Code-Level Defenses
 
@@ -168,7 +170,7 @@ cosign verify-blob --bundle <file>.bundle <file>
 # SHA-256 checksum
 sha256sum -c checksums.txt
 
-# VirusTotal (follow the durable per-object results link in the release notes)
+# VirusTotal (follow the durable per-candidate result links in the release notes)
 # https://www.virustotal.com/
 ```
 
@@ -256,7 +258,7 @@ Every release ships the material needed to check our artifacts independently.
 Use the commands in [Verification](#verification) above: SLSA Build Level 3
 provenance ties the archive to the workflow run that produced it, Sigstore cosign
 verifies the signature, and `checksums.txt` pins the bytes. The release notes
-carry a durable per-object VirusTotal link for every scanned file, including any
+carry a durable VirusTotal link for every executable candidate, including any
 tolerated detection — we publish those results whether or not they are clean.
 
 You can also rebuild from source and compare: `scripts/build.sh --with-ui`
@@ -269,6 +271,44 @@ Microsoft and the label ends in `!ml`. Two or more engines, any signature-based
 label, any other vendor, or any "suspicious" verdict blocks the release. That
 rule is enforced in `scripts/ci/check-virustotal.sh` and pinned by
 `tests/test_vt_gate_policy_contract.sh`.
+
+Before smoke and soak testing, each of the eight supported platform/link-mode
+products is built in two conventional forms from the same linked executable:
+stripped and unstripped. Both candidates are scanned, and selection is confined
+to that product tuple; for example, a portable static Linux build can never be
+substituted for the ordinary dynamically linked Linux build.
+
+The selection policy is deterministic:
+
+| Stripped candidate | Unstripped candidate | Selected candidate |
+|---|---|---|
+| Clean | Clean | Stripped |
+| Clean | One tolerated Microsoft `!ml` | Stripped |
+| One tolerated Microsoft `!ml` | Clean | Unstripped |
+| One tolerated Microsoft `!ml` | One tolerated Microsoft `!ml` | Stripped |
+
+Any other verdict, an incomplete scan, a missing sibling, or a provenance/hash
+mismatch blocks the complete release. The selected bytes are then packaged
+without stripping, signing, relinking, or any other content mutation, and the
+resulting archives—not rejected candidates—are what smoke and soak testing execute.
+After packaging, every archive and MCPB executable is extracted and its SHA-256
+must still equal the selected candidate. This identity check makes a second
+VirusTotal submission of the same bytes unnecessary.
+
+This is not obfuscation: stripping is a standard release transformation, both
+forms and their SHA-256 provenance are recorded, and no binary is modified in
+response to an engine result. If the unstripped form is selected, it is larger
+and can expose compiler symbol names and build-time path metadata (but not source
+file contents by itself). Stripping also changes intentionally observable
+developer-facing surfaces such as symbolized backtraces, debugger visibility,
+and executable-symbol lookup; the two forms are therefore not claimed to be
+byte-for-byte or introspection-equivalent. They are conventional copy/strip
+outputs of one linker result, and the actually selected form—not its sibling—is
+subjected to the full smoke/soak gate. That trade-off is visible in the
+published selection evidence.
+
+Policy identifier: `cbm-vt-candidate-selection-v1`. It is reviewed at least
+every 90 days; last review: 2026-08-13, next review due: 2026-11-11.
 
 ### If you find something real
 

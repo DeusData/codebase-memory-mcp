@@ -492,7 +492,58 @@ TEST(cross_repo_pre_cancel_preserves_existing_cross_edges) {
     PASS();
 }
 
+/* Add the internal "<name>::missed" miss-graph row that indexing writes into
+ * the SAME db whenever a file parses partially. */
+static bool cross_repo_add_missed_shadow(const cross_repo_fixture_t *fixture, const char *project) {
+    char path[512];
+    char shadow[256];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    snprintf(shadow, sizeof(shadow), "%s::missed", project);
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(store, shadow, fixture->cache) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ok;
+}
+
+/* #1609: any project that has ever recorded a parse miss carries a
+ * "<name>::missed" shadow row in its own db. cr_store_has_exact_project
+ * demanded count == 1 over ALL rows, so that second row made the project
+ * unresolvable — as source AND as target — and the whole feature failed with
+ * "not indexed" for a project that plainly was. mcp.c already solved exactly
+ * this shape for list_projects in #1044; this site never learned it.
+ *
+ * The control is the pair without shadow rows: the tests above already prove
+ * that path returns edges, so a regression here cannot hide behind a fixture
+ * that never matched in the first place. */
+TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "shadow-source", "shadow-target", "/orders",
+                                           "s") &&
+                 cross_repo_add_missed_shadow(&fixture, "shadow-source") &&
+                 cross_repo_add_missed_shadow(&fixture, "shadow-target");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed shadow-row fixture");
+    }
+
+    const char *target = "shadow-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("shadow-source", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 1);
+    ASSERT_EQ(result.http_edges, 1);
+    PASS();
+}
+
 SUITE(cross_repo) {
+    RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
     RUN_TEST(cross_repo_scans_edges_and_fuzzy_routes_past_former_prefix_cap);

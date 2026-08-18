@@ -31,6 +31,12 @@
 #define worker_getpid getpid
 #endif
 
+/* Same release-injected macro (and same fallback) main.c and cli.c use; the
+ * worker log's header must name the build the user actually ran. */
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
+
 _Static_assert(CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE == CBM_DAEMON_BUILD_FINGERPRINT_SIZE,
                "worker and daemon build fingerprint sizes must match");
 
@@ -82,6 +88,28 @@ const char *cbm_index_worker_response_out(void) {
 
 size_t cbm_index_worker_memory_budget_bytes(void) {
     return g_worker_memory_budget_bytes;
+}
+
+/* Worker log startup header — see index_supervisor.h. */
+static atomic_flag g_worker_log_begun = ATOMIC_FLAG_INIT;
+
+void cbm_index_worker_log_begin(const char *args_json, const char *repo_path) {
+    /* Durability first, header second: if the header itself is the last thing
+     * this process ever manages to write, it must already be on disk. */
+    cbm_log_set_crash_durable(true);
+    if (atomic_flag_test_and_set_explicit(&g_worker_log_begun, memory_order_relaxed)) {
+        return; /* the CLI arg parser re-installs the worker role; header once */
+    }
+    char pid_text[CBM_SZ_32];
+    (void)snprintf(pid_text, sizeof(pid_text), "%ld", (long)worker_getpid());
+    const char *build = cbm_index_supervisor_build_fingerprint();
+    /* A control record, not an info line: a user who set CBM_LOG_LEVEL to warn
+     * or error would otherwise still hand us a 0-byte log, which is the whole
+     * defect. JSON-encoded, so a repo path with spaces or a quote survives. */
+    cbm_log_control(CBM_INDEX_WORKER_LOG_START_EVENT, "version", CBM_VERSION, "build",
+                    build ? build : "", "pid", pid_text, "repo_path", repo_path ? repo_path : "",
+                    "args", args_json ? args_json : "");
+    (void)fflush(stderr);
 }
 
 static bool worker_fingerprint_valid(const char *fingerprint);

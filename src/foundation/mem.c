@@ -291,7 +291,36 @@ void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes) {
     }
 #endif
 
+    /* Lazy arena commit costs address-space FRAGMENTATION, and on Linux we now
+     * pay it for every allocation in the process. mimalloc commits a range with
+     * mprotect(PROT_READ|PROT_WRITE) over a sub-range of a PROT_NONE reservation
+     * (prim/unix/prim.c), and each partial commit SPLITS the reserved VMA. While
+     * mimalloc only served the bound populations (sqlite, tree_sitter) that was a
+     * handful of mappings. Since #1360 routed ordinary malloc/new through
+     * mimalloc on Linux, an index worker peaked at ~22k mappings against
+     * v0.9.0's 10 (Go corpus, 18 workers). The count tracks CONCURRENCY, not
+     * corpus size — sampled mid-run it was 999 at 1 worker, 8460 at 4 and 11965
+     * at 18, while v0.9.0 stayed at 10 regardless — so every worker thread
+     * fragments the address space independently.
+     *
+     * Two consequences, both reported as #1654 on a 96-CPU/376 GB host: the
+     * mmap/mprotect churn serialises on the kernel's per-process mmap_lock (the
+     * reporter saw 1.2% of extraction in 45 minutes, where v0.9.0 finished the
+     * tree in ~13), and the VMA count climbs toward vm.max_map_count, after
+     * which mmap fails for ANY size — hence mimalloc reporting it "cannot
+     * allocate" 10 KB while `free -g` still showed 246 GB available.
+     *
+     * mimalloc's own default is 2, meaning "eager-commit arenas only on an OS
+     * with overcommit (i.e. linux)" — precisely because commit is free there
+     * until the pages are touched. Overriding it to 0 opted Linux out of the
+     * default written for it. Restore the default on Linux; keep the lazy
+     * setting everywhere else, where commit is NOT free and the upfront-memory
+     * reason for it still holds (Windows especially — see #581). */
+#if defined(__linux__)
+    mem_option_set_verified(mi_option_arena_eager_commit, 2, "arena_eager_commit");
+#else
     mem_option_set_verified(mi_option_arena_eager_commit, 0, "arena_eager_commit");
+#endif
     mem_option_set_verified(mi_option_purge_decommits, SKIP_ONE, "purge_decommits");
     mem_option_set_verified(mi_option_purge_delay, 0, "purge_delay"); /* immediate */
     /* v3 (#832): reclaim abandoned pages on ANY thread's free (=1), restoring the

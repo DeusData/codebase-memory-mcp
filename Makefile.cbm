@@ -158,10 +158,21 @@ CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(CXX_
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
+# CBM_SANITIZED_BUILD is unconditional here: this flag set exists only to build
+# an instrumented binary. SANITIZED_DEFINE keys off $(SANITIZE), which TSan does
+# not use (it has its own TSAN_SANITIZE), so the define was silently absent and
+# every sanitized-budget branch compiled to its NATIVE value on this leg —
+# exactly the failure the comment above SANITIZED_DEFINE describes for
+# trap-UBSan, repeated on a leg that was never wired up.
+#
+# The same define now goes on EVERY instrumented flag set of our own code, C and
+# C++ alike (CXXFLAGS_TSAN here, GRAMMAR_CFLAGS_TEST/TSAN below). Vendored flag
+# sets are left alone: mimalloc, sqlite3, tre, zstd, lz4 and tree-sitter read no
+# macro of ours.
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
 	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
-	-g -O1 $(TSAN_SANITIZE)
-CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
+	-DCBM_SANITIZED_BUILD=1 -g -O1 $(TSAN_SANITIZE)
+CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -DCBM_SANITIZED_BUILD=1 -g -O1 \
                 $(TSAN_SANITIZE)
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
@@ -573,6 +584,7 @@ TEST_FOUNDATION_CASE_SRCS = \
     tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
+    tests/test_complexity.c \
     tests/test_dump_verify.c \
     tests/test_subprocess.c \
     tests/test_private_file_lock.c \
@@ -867,9 +879,9 @@ BUILD_DIR = build/c
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(SANITIZE)
+                      -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                      $(TSAN_SANITIZE)
+                      -DCBM_ENABLE_TEST_SEAMS=1 -DCBM_SANITIZED_BUILD=1 $(TSAN_SANITIZE)
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
 GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))
@@ -893,7 +905,7 @@ GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
 .PHONY: test test-par test-focused test-compositional test-repro test-foundation test-tsan \
         test-syntax test-daemon-smoke \
         test-leak test-analyze test-memory test-gmalloc cbm \
-        cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck \
+        cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck \
         lint-format lint-source-safety install test-runner-nosan security \
 		native-extraction-benchmark
 
@@ -1042,7 +1054,15 @@ endif
 #   tre        (only on Windows; TRE_CFLAGS has no -fsanitize)
 #
 NOSAN_DIR            = $(BUILD_DIR)/nosan
-GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+# Keeps -DCBM_ENABLE_TEST_SEAMS=1 for the same reason GRAMMAR_CFLAGS_TEST and
+# GRAMMAR_CFLAGS_TSAN do: the nosan objects are the TEST build minus sanitizers,
+# and test-runner-nosan is linked with the seam define. Dropping it here compiles
+# the seam bodies out of nosan/lsp_all.o while tests still reference them, which
+# fails the leaks/scribble/gmalloc link with undefined
+# _cbm_ts_lsp_test_budget_remaining / _cbm_ts_lsp_test_budget_warned.
+# CBM_SANITIZED_BUILD is deliberately absent — this variant has no sanitizer.
+GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+                       -DCBM_ENABLE_TEST_SEAMS=1
 GRAMMAR_OBJS_NOSAN   = $(patsubst $(CBM_DIR)/%.c,$(NOSAN_DIR)/%.o,$(GRAMMAR_SRCS))
 GRAMMAR_DEPFILES += $(addsuffix .d,$(GRAMMAR_OBJS_NOSAN))
 
@@ -1555,6 +1575,12 @@ LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 lint-tidy:
 	@echo "=== clang-tidy ==="
 	@$(CLANG_TIDY) --quiet $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
+
+# clang-tidy, scoped to this commit's staged changes only (scripts/lint-tidy-diff.sh).
+# The pre-commit hook runs this instead of the full lint-tidy sweep above, so a
+# clean commit is not blocked by pre-existing findings elsewhere in the tree.
+lint-tidy-diff:
+	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
 # cppcheck: complementary analysis (config in .cppcheck). Analyze the
 # failpoint-enabled superset so test-only allocation and cleanup paths remain

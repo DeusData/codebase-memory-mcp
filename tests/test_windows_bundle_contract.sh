@@ -83,7 +83,7 @@ windows_archive_names = (binary, "LICENSE", "install.ps1", "THIRD_PARTY_NOTICES.
 # defined and cannot fork per venue.
 package_release = read("scripts/package-release.sh")
 zip_call = re.search(
-    r"zip -q \"\$OUT_DIR/\$NAME\.zip\" \\\n(?P<members>(?:.|\n)*?)\n", package_release
+    r'zip -q -X "\$ARCHIVE_TMP" \\\n\s+(?P<members>[^\n]+)', package_release
 )
 require(zip_call is not None, "package-release.sh must build the Windows zip in one zip call")
 zip_members = zip_call.group("members").split() if zip_call else []
@@ -91,6 +91,13 @@ require(
     zip_members == list(windows_archive_names),
     "package-release.sh must archive EXACTLY "
     f"{' '.join(windows_archive_names)} (found: {' '.join(zip_members) or 'nothing'})",
+)
+require(
+    "--selected-binary" in package_release
+    and "--expected-sha256" in package_release
+    and 'assert_expected_hash "$VERIFY_DIR/archive/$STAGED_BINARY_NAME"' in package_release,
+    "package-release.sh must bind the selected input and archived executable to the same "
+    "caller-supplied SHA-256",
 )
 
 # ── 2. No shipped surface may name the payload or build a launcher ───────────
@@ -140,17 +147,36 @@ require(
 )
 
 # Every archive is produced through the ONE canonical packaging entry, so the
-# four-file layout above governs all of them. A reappearing --variant flag would
-# mean the retired two-composition split is back.
+# four-file layout above governs all of them. Selection may choose stripped or
+# unstripped only inside the immutable Windows architecture tuple; it must hand
+# final bytes to the packager by hash, never revive a payload composition.
 build_workflow = read(".github/workflows/_build.yml")
-for archive, call in (
-    ("codebase-memory-mcp-windows-amd64.zip", "scripts/package-release.sh windows amd64"),
-    ("codebase-memory-mcp-windows-arm64.zip", "scripts/package-release.sh windows arm64"),
-):
+require(
+    "scripts/package-release.sh" in build_workflow
+    and "--selected-binary" in build_workflow
+    and "--expected-sha256" in build_workflow,
+    "_build.yml must hand hash-bound selected bytes to the canonical packager",
+)
+for target in ("windows-amd64", "windows-arm64"):
     require(
-        re.search(re.escape(call) + r"(?!\s+--variant)", build_workflow) is not None,
-        f"_build.yml must produce {archive} via the canonical packaging entry ('{call}')",
+        target in build_workflow,
+        f"_build.yml must retain the {target} release product",
     )
+
+artifact_smoke = read("scripts/ci/smoke-artifact.sh")
+require(
+    "scripts/ci/prepare-release-candidates.sh" in artifact_smoke
+    and '${GOOS}-${GOARCH}/stripped/$SELECTED_NAME' in artifact_smoke
+    and "--selected-binary" in artifact_smoke
+    and "--expected-sha256" in artifact_smoke,
+    "local artifact smoke must derive both candidates, default-select stripped within its "
+    "target tuple, and package the selected bytes by SHA-256",
+)
+require(
+    'codesign --sign' not in artifact_smoke,
+    "local artifact smoke must not sign after candidate derivation; packaging starts from "
+    "already-final bytes",
+)
 
 # ── 3. install.ps1 retires the running binary before publishing ──────────────
 # This is THE step that replaces the launcher. Windows keeps an image lock on a
@@ -389,7 +415,7 @@ require(
         needle in read("src/daemon/ipc.c")
         for needle in (
             "win_directory_component_secure",
-            "win_file_security_secure(security, directory, false, mutation)",
+            "win_file_security_secure(security, directory, false, mutation, true)",
             "win_private_mutation_rights()",
             "~((DWORD)FILE_ADD_SUBDIRECTORY)",
             "FILE_ADD_FILE",
@@ -401,6 +427,30 @@ require(
         )
     ),
     "src/daemon/ipc.c must enforce the shared cross-account ancestor trust policy",
+)
+
+# ── 6b. AppContainer tolerance is ANCESTOR-ONLY ─────────────────────────────
+# Package (S-1-15-2-*) and capability (S-1-15-3-*) SIDs are admitted on ancestor
+# components so a machine running a sandboxed desktop app (Claude Desktop stamps
+# its package SID on %LOCALAPPDATA%) is not locked out. The private runtime
+# directory must keep demanding the exact current user: it is passed
+# ancestor=false and that is the whole boundary.
+require(
+    all(
+        needle in read("src/daemon/ipc.c")
+        for needle in (
+            "win_sid_is_app_container",
+            "ancestor && win_sid_is_app_container",
+            # both AppContainer forms, not capability alone
+            "first == 2U || first == 3U",
+            # APP_PACKAGE identifier authority
+            "sid[7] != 15U",
+            # the private runtime directory is validated with ancestor=false
+            "win_private_mutation_rights(), false)",
+        )
+    ),
+    "AppContainer SIDs must be tolerated on ancestors ONLY, covering both package "
+    "and capability forms, with the private runtime directory still strict",
 )
 
 # On Windows subprocess supervision receives a non-NULL lpApplicationName, so a

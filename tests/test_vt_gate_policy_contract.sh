@@ -19,6 +19,44 @@ hash_file() {
   sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" | awk '{print $1}'
 }
 
+# Public policy surfaces must not promise a stricter/different gate than the
+# one actually enforced here. Native ClamAV/Defender jobs remain separate and
+# may still use an any-detection-fails rule.
+for surface in "$ROOT/README.md" "$ROOT/SECURITY.md" "$ROOT/docs/index.html"; do
+  if grep -Eqi '(zero malicious( and| or) zero suspicious (required|verdicts required)|zero malicious or suspicious verdicts (are )?required|no exception path in this release gate)' "$surface"; then
+    fail "stale zero-tolerance VirusTotal promise contradicts the Microsoft !ml policy: $surface"
+  fi
+done
+grep -Fq 'Microsoft `!ml` tolerance' "$ROOT/README.md" || \
+  fail "README must link the exact documented Microsoft !ml tolerance"
+grep -Fq 'Policy identifier: `cbm-vt-candidate-selection-v1`' "$ROOT/SECURITY.md" || \
+  fail "SECURITY.md must name the versioned candidate-selection policy"
+
+# Every marker publish-vt-evidence.sh validates must be one the gate actually
+# writes. These drifted silently: the results format went to v2 while the
+# publisher still demanded v1, and nothing caught it because the publisher had
+# no caller for a while. Restoring the caller failed a real release at the very
+# last step, after the full test matrix, both builds, smoke and soak had passed.
+python3 - "$ROOT" <<'MARKERS' || fail "evidence markers disagree between writer and publisher"
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+publisher = (root / "scripts/ci/publish-vt-evidence.sh").read_text(encoding="utf-8")
+writers = "\n".join(
+    (root / name).read_text(encoding="utf-8")
+    for name in ("scripts/ci/check-virustotal.sh", "scripts/ci/append-vt-notes.sh")
+)
+expected = re.findall(r"^publish_copy\s+\S+\s+(\S+)", publisher, re.M)
+if not expected:
+    print("no publish_copy markers found - has the publisher been restructured?", file=sys.stderr)
+    raise SystemExit(1)
+missing = [m for m in expected if m not in writers]
+if missing:
+    for m in missing:
+        print(f"publisher expects marker never written by the gate: {m}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"OK: all {len(expected)} published evidence markers match what the gate writes")
+MARKERS
+
 # Tripwire for the REVERTED endpoint-verification mechanism specifically. The
 # current `!ml` tolerance is a policy branch inside this gate, not a callout to
 # an external verification service, and must never become one.
@@ -105,7 +143,16 @@ write_response wrong-size 0 0 60 "$PROBE_SHA" "$((PROBE_SIZE + 1))"
 
 cat > "$FIX/responses/upload-alias.json" <<EOF
 {"meta":{"file_info":{"sha256":"$PROBE_SHA","size":$PROBE_SIZE}},
- "data":{"id":"canonical-analysis","type":"analysis","attributes":{"status":"completed",
+ "data":{"id":"upload-alias","type":"analysis","attributes":{"status":"completed",
+ "stats":{"malicious":0,"suspicious":0,"undetected":60,"harmless":0,
+          "timeout":0,"confirmed-timeout":0,"failure":0,"type-unsupported":0},
+ "results":{"Microsoft":{"category":"undetected","result":null,
+               "engine_version":"1.26070","engine_update":"20260808"}}}}}
+EOF
+
+cat > "$FIX/responses/mismatched-response-id.json" <<EOF
+{"meta":{"file_info":{"sha256":"$PROBE_SHA","size":$PROBE_SIZE}},
+ "data":{"id":"different-analysis","type":"analysis","attributes":{"status":"completed",
  "stats":{"malicious":0,"suspicious":0,"undetected":60,"harmless":0,
           "timeout":0,"confirmed-timeout":0,"failure":0,"type-unsupported":0},
  "results":{"Microsoft":{"category":"undetected","result":null,
@@ -258,22 +305,36 @@ clean_output="binaries/objects/probe=$(url_for clean-analysis)"
 [ "$(run_gate "$clean_output")" = "0" ] || fail "clean exact scan must pass: $(cat "$FIX/last.log")"
 alias_output="binaries/objects/probe=$(url_for upload-alias)"
 [ "$(run_gate "$alias_output")" = "0" ] || \
-  fail "a content-bound canonical response alias must pass: $(cat "$FIX/last.log")"
+  fail "a content-bound action-output path alias must pass: $(cat "$FIX/last.log")"
 RESULTS="$FIX/work/binaries/vt-results.tsv"
 [ -f "$RESULTS" ] || fail "clean gate did not atomically publish its results manifest"
-grep -q '^# cbm-virustotal-results-v1$' "$RESULTS" || fail "results marker missing"
+grep -q '^# cbm-virustotal-results-v2$' "$RESULTS" || fail "results marker missing"
 grep -q "objects/probe.*$PROBE_SHA.*$PROBE_SIZE.*60" "$RESULTS" || \
   fail "results do not bind path/hash/size/actual engine count"
 grep -Fq 'upload-alias' "$RESULTS" || \
   fail "results must retain the action's submitted analysis ID"
+grep -q $'undetected\t\tclean\t' "$RESULTS" || \
+  fail "clean result must carry an explicit clean policy classification"
+# A differing analysis ID is NOT a failure: VirusTotal is content-addressed and
+# may answer for already-known bytes with its own canonical analysis. The
+# verdict is bound to the object by hash and size (wrong-hash / wrong-size
+# below), which is what actually keeps a tuple's stripped and unstripped
+# candidates apart — they differ in hash by construction.
+[ "$(run_gate "binaries/objects/probe=$(url_for mismatched-response-id)")" = "0" ] || \
+  fail "a content-bound response must pass even when VirusTotal returns its own analysis ID: $(cat "$FIX/last.log")"
 
 for id in one-malicious one-suspicious; do
   [ "$(run_gate "binaries/objects/probe=$(url_for "$id")")" != "0" ] || \
     fail "$id must block"
 done
-[ "$(run_gate "binaries/objects/probe=$(url_for low-engines)")" != "0" ] || \
-  fail "completed analysis below the 50-engine policy must block"
-grep -q 'only 49/49 decisive engines' "$FIX/last.log" || fail "low-engine failure is not explicit"
+# A low decisive-engine count must NOT block. It is VirusTotal fleet
+# availability on the day, not a property of our binary: a ~300 MB release
+# artifact is skipped or timed out by many engines, so the count moves run to
+# run and a floor turns shipping into a lottery. It is reported, not enforced.
+[ "$(run_gate "binaries/objects/probe=$(url_for low-engines)")" = "0" ] || \
+  fail "a clean verdict must stand regardless of how many engines answered: $(cat "$FIX/last.log")"
+grep -q 'NOTE: .*49/49 decisive engines' "$FIX/last.log" || \
+  fail "a below-reference engine count must still be reported explicitly"
 
 # A single Microsoft `!ml` verdict is the tolerated case: it passes, but it is
 # reported and recorded rather than silently downgraded to "clean".
@@ -285,6 +346,9 @@ grep -q 'Microsoft = Trojan:Script/Wacatac.B!ml' "$FIX/last.log" || \
   fail "gate must report the flagging engine and label"
 grep -q $'objects/probe\t.*\t1\t0\t' "$FIX/work/binaries/vt-results.tsv" || \
   fail "tolerated detection was not preserved as workflow evidence"
+grep -Fq $'malicious\tTrojan:Script/Wacatac.B!ml\tmicrosoft-ml\t' \
+  "$FIX/work/binaries/vt-results.tsv" || \
+  fail "tolerated result must retain Microsoft's exact label and policy classification"
 if grep -q 'detected by: Kaspersky' "$FIX/last.log"; then
   fail "gate listed a non-flagging engine as a detection"
 fi
@@ -292,6 +356,9 @@ fi
 # Everything adjacent to the tolerated case still blocks.
 [ "$(run_gate "binaries/objects/probe=$(url_for ms-signature)")" != "0" ] || \
   fail "a Microsoft signature (non-!ml) detection must block"
+grep -Fq $'malicious\tTrojan:Win32/Emotet\thard\t' \
+  "$FIX/work/binaries/vt-results.tsv" || \
+  fail "blocking result must be recorded as hard with its exact label"
 [ "$(run_gate "binaries/objects/probe=$(url_for other-engine)")" != "0" ] || \
   fail "a non-Microsoft detection must block"
 [ "$(run_gate "binaries/objects/probe=$(url_for two-engines)")" != "0" ] || \
@@ -357,4 +424,4 @@ printf 'tampered\n' > "$FIX/work/binaries/objects/probe"
 [ "$(run_gate "$clean_output")" != "0" ] || fail "tampered staged object must block before polling"
 grep -q 'changed after extraction' "$FIX/last.log" || fail "tamper failure is not diagnosable"
 
-echo 'PASS: VT gate is exact-set, content-bound, >=50-engine; tolerates exactly one Microsoft !ml verdict and nothing else'
+echo 'PASS: VT gate is exact-set and content-bound; tolerates exactly one Microsoft !ml verdict and nothing else; engine count is evidence, not a gate'

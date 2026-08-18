@@ -14,7 +14,7 @@ Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
-(Step 0a-0p), a CLEAN sanitizer build, every suite via the parallel harness,
+(Step 0a-0s), a CLEAN sanitizer build, every suite via the parallel harness,
 then the prod-binary regression guards (Steps 4-6).
 
 Modes:
@@ -253,6 +253,15 @@ bash "$ROOT/tests/test_mcpb_bundle_contract.sh"
 
 echo "=== Step 0r: MCPB registry entries contract (#1246) ==="
 bash "$ROOT/tests/test_mcpb_registry_entries_contract.sh"
+
+echo "=== Step 0q: release candidate derivation contract ==="
+bash "$ROOT/tests/test_release_candidate_derivation_contract.sh"
+
+echo "=== Step 0r: VirusTotal candidate-selection contract ==="
+bash "$ROOT/tests/test_vt_candidate_selection_contract.sh"
+
+echo "=== Step 0s: release gate-chain ordering contract ==="
+bash "$ROOT/tests/test_release_gate_chain_contract.sh"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"

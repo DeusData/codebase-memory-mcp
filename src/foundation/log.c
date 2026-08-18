@@ -33,6 +33,25 @@ static _Atomic cbm_log_sink_fn g_log_sink = (cbm_log_sink_fn)NULL;
 static _Atomic CBMLogSinkMode g_log_sink_mode = CBM_LOG_SINK_REPLACE;
 static atomic_bool g_profile_stderr_mirror = false;
 
+/* See cbm_log_set_crash_durable in log.h. Read on every emitted line, so it
+ * follows the same relaxed-atomic discipline as the four above. */
+static _Atomic bool g_log_crash_durable = false;
+
+void cbm_log_set_crash_durable(bool enabled) {
+    if (enabled) {
+        /* Best effort by contract: setvbuf is only guaranteed before a stream's
+         * first operation, so a process that has already written to stderr
+         * keeps its buffering. The per-line flush in emit_line is what makes
+         * the durability guarantee hold either way. */
+        (void)setvbuf(stderr, NULL, _IONBF, 0);
+    }
+    atomic_store_explicit(&g_log_crash_durable, enabled, memory_order_relaxed);
+}
+
+bool cbm_log_crash_durable(void) {
+    return atomic_load_explicit(&g_log_crash_durable, memory_order_relaxed);
+}
+
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
     /* getenv() is safe here: this runs at startup before any thread is created,
@@ -230,6 +249,13 @@ static void emit_line(const char *line) {
         }
     }
     (void)fprintf(stderr, "%s\n", line);
+    if (atomic_load_explicit(&g_log_crash_durable, memory_order_relaxed)) {
+        /* The line is complete here and the stream lock is released, so a
+         * process that dies on the very next instruction still leaves this
+         * line on disk. Free when stderr is unbuffered; one write() per line
+         * when setvbuf was refused. */
+        (void)fflush(stderr);
+    }
 }
 
 void cbm_log(CBMLogLevel level, const char *msg, ...) {

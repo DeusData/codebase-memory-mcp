@@ -252,6 +252,128 @@ TEST(c_trailing_recovered_defs_keep_flag) {
 
 /* ── Suite ────────────────────────────────────────────────────────────────── */
 
+/* ── #1610: a missing FINAL NEWLINE is not a parse failure ────────────────────
+ *
+ * A file that does not end with "\n" leaves the grammar's mandatory line
+ * terminator MISSING. That node is ZERO-WIDTH and sits at EOF: the parser
+ * consumed no source for it, so by construction nothing was dropped — no
+ * construct can live in a zero-byte span. Every instruction still parses.
+ *
+ * Reported on #1610 for Dockerfile, where a reporter proved with a byte-exact
+ * matrix that the trigger is independent of BOM, CRLF/LF, exec-form vs
+ * shell-form and file length — it is purely the absent final newline.
+ *
+ * It was never Dockerfile-specific: tcl, fish, gomod and hyprlang flag the same
+ * way, while ini, fsharp, beancount and others do NOT — only because those
+ * grammars declare the terminator token hidden rather than visible. Whether a
+ * user saw a phantom parse_partial came down to a grammar-authoring accident.
+ *
+ * The cost was not cosmetic: a phantom flag writes a "<project>::missed" shadow
+ * row, and until #1609 that row removed the whole project from cross-repo
+ * linking, as source AND as target. */
+TEST(dockerfile_missing_final_newline_not_flagged_issue1610) {
+    const char *src = "FROM mcr.microsoft.com/dotnet/aspnet:8.0\n"
+                      "ENTRYPOINT [\"dotnet\", \"App.dll\"]"; /* deliberately no \n */
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (flagged) {
+        FAIL("a Dockerfile lacking only its final newline must not be parse_partial");
+    }
+    PASS();
+}
+
+/* The same bytes WITH the newline must stay clean — pins the equivalence the
+ * reporter's matrix proved, so a future change cannot "fix" one by breaking the
+ * other. */
+TEST(dockerfile_with_final_newline_still_clean_issue1610) {
+    const char *src = "FROM mcr.microsoft.com/dotnet/aspnet:8.0\n"
+                      "ENTRYPOINT [\"dotnet\", \"App.dll\"]\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_DOCKERFILE, "Dockerfile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (flagged) {
+        FAIL("a terminated Dockerfile must not be parse_partial");
+    }
+    PASS();
+}
+
+/* Language-general, not a Dockerfile patch: these four were each proven to flag
+ * on a stripped trailing newline. */
+TEST(missing_final_newline_not_flagged_across_grammars_issue1610) {
+    struct {
+        const char *src;
+        CBMLanguage lang;
+        const char *path;
+    } cases[] = {
+        {"proc foo {} {}\nproc bar {} {}", CBM_LANG_TCL, "a.tcl"},
+        {"function foo\n  echo hi\nend", CBM_LANG_FISH, "a.fish"},
+        {"module example.com/m\n\ngo 1.21", CBM_LANG_GOMOD, "go.mod"},
+        {"general {\n  gaps_in = 5\n}", CBM_LANG_HYPRLANG, "hypr.conf"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i].src, cases[i].lang, cases[i].path);
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        if (flagged) {
+            fprintf(stderr, "  %s flagged: ranges=%s\n", cases[i].path,
+                    r->error_ranges ? r->error_ranges : "(none)");
+        }
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final line must not be parse_partial in any grammar");
+        }
+    }
+    PASS();
+}
+
+/* GUARD (the reason this suppression is safe rather than convenient): the rule
+ * is ZERO-WIDTH AT EOF only. A real failure earlier in the file must still be
+ * reported, and its range must name the broken line — not be swallowed along
+ * with the terminator. */
+TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610) {
+    /* Built from C_IFDEF_SPLIT, the fixture this suite already proves is
+     * flagged, with its trailing newline removed. Two conditions now hold at
+     * once: a genuine width-bearing ERROR mid-file, AND an unterminated last
+     * line. Suppressing the EOF terminator must not swallow the real one. */
+    size_t n = strlen(C_IFDEF_SPLIT);
+    char *unterminated = (char *)malloc(n + 1);
+    ASSERT_NOT_NULL(unterminated);
+    memcpy(unterminated, C_IFDEF_SPLIT, n);
+    unterminated[n - 1] = '\0'; /* drop the final newline */
+
+    CBMFileResult *r = do_extract(unterminated, CBM_LANG_C, "split.c");
+    free(unterminated);
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    bool has_ranges = r->error_ranges != NULL;
+    cbm_free_result(r);
+    if (!flagged) {
+        FAIL("a real mid-file parse failure must still be reported when the file also lacks its final newline");
+    }
+    if (!has_ranges) {
+        FAIL("a reported failure must still name its line range");
+    }
+    PASS();
+}
+
+/* GUARD: a MISSING/ERROR node WITH WIDTH at EOF is a genuine loss and must
+ * still be flagged. A Makefile whose final recipe line lacks its newline really
+ * does drop the recipe from the tree — cbm's flag is honest there. */
+TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
+    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
+    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (!flagged) {
+        FAIL("a width-bearing parse failure at EOF must still be reported");
+    }
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -262,4 +384,9 @@ SUITE(parse_coverage) {
     RUN_TEST(py_clean_file_not_flagged);
     RUN_TEST(error_regions_are_not_silently_capped);
     RUN_TEST(c_trailing_recovered_defs_keep_flag);
+    RUN_TEST(dockerfile_missing_final_newline_not_flagged_issue1610);
+    RUN_TEST(dockerfile_with_final_newline_still_clean_issue1610);
+    RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
+    RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
+    RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
 }

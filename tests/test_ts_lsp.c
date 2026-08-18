@@ -4183,6 +4183,49 @@ TEST(tslsp_nested_class_resolution) {
 /* JavaScript relies on local `new` inference here, while TypeScript and TSX use
  * explicit parameter types below.  All three parser modes must preserve the
  * full ordinary call-expression span, independent of JSX-specific behavior. */
+/* ── Expression-eval complexity guard ─────────────────────────────────────────
+ *
+ * The objectSpreadRepeatedComplexity class (TS conformance suite): a chain of
+ * `...(c[i] && c[j] && {...})` spreads makes the union fan out 2^(n-1) ways,
+ * and overload resolution re-evaluates shared subexpressions once per
+ * alternative. The per-node memo turns that into one eval per node. Guarded
+ * via the deterministic budget counter, not wall-clock: without the memo this
+ * source burns the entire eval budget (warned=true); with it, consumption
+ * stays around the node count. */
+TEST(tslsp_eval_memo_bounds_spread_bomb_work) {
+    /* The tsc-compiled form of that file: nested Object.assign(...) member
+     * calls. Resolving the stdlib method evaluates every argument expression
+     * once per lookup path (method dispatch + namespace fallback), and the
+     * first argument is itself the next nested call — without the memo the
+     * shared subtree re-walks once per enclosing level: 2^n evals. */
+    char src[16384];
+    int off = snprintf(src, sizeof(src), "\"use strict\";\nfunction f(cnd) {\n    return ");
+    for (int i = 18; i >= 0; i--) {
+        off += snprintf(src + off, sizeof(src) - (size_t)off, "Object.assign(");
+    }
+    off += snprintf(src + off, sizeof(src) - (size_t)off, "{}");
+    for (int i = 0; i < 19; i++) {
+        off += snprintf(src + off, sizeof(src) - (size_t)off,
+                        ", (cnd[%d] && cnd[%d] && {\n        prop%da: 1,\n        prop%db: 1,\n"
+                        "    }))",
+                        2 * i + 1, 2 * i + 2, i, i);
+    }
+    snprintf(src + off, sizeof(src) - (size_t)off, ";\n}\n");
+
+    CBMFileResult *r = extract_js(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(r->defs.count, 1); /* f extracted; the graph itself is tiny */
+
+    /* Same thread ran the eval: the seam reads its final budget state. */
+    ASSERT_FALSE(cbm_ts_lsp_test_budget_warned());
+    long budget0 = 1000000 + (long)strlen(src) * 64;
+    long consumed = budget0 - cbm_ts_lsp_test_budget_remaining();
+    ASSERT_LT(consumed, 100000);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_js_ordinary_same_leaf_calls_join_by_exact_site) {
     static const char source[] = "class Alpha { render() {} }\n"
                                  "class Beta { render() {} }\n"
@@ -4694,6 +4737,9 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_optional_property_chain);
     RUN_TEST(tslsp_void_returning_method);
     RUN_TEST(tslsp_nested_class_resolution);
+
+    /* Expression-eval complexity guard. */
+    RUN_TEST(tslsp_eval_memo_bounds_spread_bomb_work);
 
     /* Ordinary same-leaf occurrence identity (JS / TS / TSX). */
     RUN_TEST(tslsp_js_ordinary_same_leaf_calls_join_by_exact_site);

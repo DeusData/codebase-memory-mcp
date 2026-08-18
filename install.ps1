@@ -168,6 +168,41 @@ $Url = "$BaseUrl/$Archive"
 $TmpDir = New-CbmExclusiveTempDirectory -ParentDirectory ([System.IO.Path]::GetTempPath())
 try {
 
+# Give the staging directory a protected owner-only DACL.
+#
+# Without this it inherits whatever %TEMP% carries, and the binary we are about
+# to run from here validates its own directory and refuses inherited
+# cross-account mutation grants. That is not a hypothetical: sandboxed clients
+# leave ACEs on %TEMP% (a CodexSandboxUsers group, AppContainer SIDs, and
+# orphaned SIDs from uninstalled software have all been reported), and installs
+# failed with
+#   activation transaction I/O failed: acl-grants-cross-account-mutation to S-1-5-21-...
+# naming an ACE the installer itself inherited. See issues 1529, 1614 and 1571.
+#
+# cbm's own C staging already creates its directory this way; install.ps1 was
+# the one path that did not, which is why redirecting TMP/TEMP worked around it.
+#
+# Applied after creation rather than atomically on purpose: the overload that
+# takes a DirectorySecurity exists on Windows PowerShell 5.1 but not on
+# PowerShell 7, and Set-Acl works on both. The directory name is unpredictable
+# and nothing is written into it until the download below, so the window is not
+# usefully attackable.
+#
+# Best-effort: a filesystem that cannot carry a DACL must not fail the install.
+# If this does not take, the binary's own validation still refuses to proceed,
+# which is the honest outcome rather than a silent downgrade.
+try {
+    $stagingAcl = New-Object System.Security.AccessControl.DirectorySecurity
+    $stagingAcl.SetAccessRuleProtection($true, $false)
+    $stagingOwner = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+    $stagingAcl.SetOwner($stagingOwner)
+    $stagingAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $stagingOwner, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    Set-Acl -Path $TmpDir -AclObject $stagingAcl -ErrorAction Stop
+} catch {
+    Write-Host "note: could not harden the staging directory ACL: $($_.Exception.Message)"
+}
+
 Write-Host "Downloading $Archive..."
 try {
     Invoke-CbmDownload -Url $Url -OutFile "$TmpDir\$Archive"

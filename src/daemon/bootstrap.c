@@ -208,6 +208,27 @@ bool cbm_daemon_process_role_requires_client(cbm_daemon_process_role_t role) {
     return role == CBM_DAEMON_PROCESS_MCP_CLIENT || role == CBM_DAEMON_PROCESS_HOOK_CLIENT;
 }
 
+/* #1574/#1621: the rendezvous directory is created under %LOCALAPPDATA%
+ * (Windows) or /tmp — /private/tmp on macOS — and that ancestry is not always
+ * acceptable to the private-directory walk. A profile that carries a
+ * mutation-granting ACE for an untrusted identity (an AppContainer capability
+ * SID, for instance) fails it, and the binary then cannot start at all: every
+ * command needs this endpoint, `config list` included, so the operator cannot
+ * even reconfigure their way out. The only relocation hook was
+ * CBM_TEST_DAEMON_RUNTIME_PARENT, compiled out unless CBM_ENABLE_TEST_SEAMS is
+ * defined, so a test build started while the shipped build did not. CBM_CACHE_DIR
+ * does not help either — it moves the cache, never the rendezvous.
+ *
+ * CBM_RUNTIME_DIR does NOT relax the check. The directory it names goes through
+ * exactly the same validation as the default; the operator only chooses an
+ * ancestry that passes, and a value that fails is refused rather than ignored.
+ * cbm_safe_getenv never truncates: a value too long for the buffer is reported
+ * as absent, so no half a path can ever become a runtime parent. */
+static const char *bootstrap_runtime_parent_override(char *buffer, size_t capacity) {
+    const char *value = cbm_safe_getenv("CBM_RUNTIME_DIR", buffer, capacity, NULL);
+    return value && value[0] != '\0' ? value : NULL;
+}
+
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     char test_runtime_parent[BOOTSTRAP_PATH_CAP];
@@ -221,7 +242,17 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime
     if (!cbm_daemon_rendezvous_key(key)) {
         return NULL;
     }
-    return cbm_daemon_ipc_endpoint_new(key, runtime_parent);
+    /* An explicit parent keeps precedence: it carries the compile-time test
+     * seam and the lifecycle guards' isolated namespace. The override is
+     * resolved HERE, the one function every product endpoint goes through
+     * (daemon, MCP client, local CLI, index worker, activation), so no call
+     * site can silently keep the default. */
+    char override_parent[BOOTSTRAP_PATH_CAP];
+    const char *parent =
+        runtime_parent
+            ? runtime_parent
+            : bootstrap_runtime_parent_override(override_parent, sizeof(override_parent));
+    return cbm_daemon_ipc_endpoint_new(key, parent);
 }
 
 bool cbm_daemon_bootstrap_launch_spec_init(const char *executable_path,

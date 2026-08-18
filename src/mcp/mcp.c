@@ -77,7 +77,6 @@ enum {
 #include "foundation/workspace.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
-#include <sqlite3.h>
 #include "pipeline/artifact.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache: auto-index thread teardown */
 
@@ -100,7 +99,6 @@ enum {
 #define mcp_close close
 #endif
 #include <yyjson/yyjson.h>
-#include <ctype.h>
 #include <limits.h> // INT_MIN, INT_MAX
 #include <stdarg.h> // va_list, for the bounded help-list appender
 #include <stdint.h> // int64_t
@@ -1363,7 +1361,9 @@ static const tool_def_t TOOLS[] = {
      "files only.\"},"
      "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Max "
      "results (configurable via search_limit config key). Set higher for exhaustive text search."
-     "\"},\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"},\"debug\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Include scope_ms, scan_ms, and enrich_ms phase timing diagnostics.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
      "\"description\":\"Compact TOON matches by default; json returns legacy objects. Omit to "
      "use default_response_format.\"}},\"required\":["
      "\"pattern\"]}"},
@@ -1378,7 +1378,12 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Skip this many valid projects; use next_offset from the prior page.\"},"
      "\"all\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Explicit compatibility path returning the full inventory; ignores "
-     "limit/offset and may be slow or large.\"}}}"},
+     "limit/offset and may be slow or large.\"},"
+     "\"include_details\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Also resolve each listed project's git branch. Node/edge counts "
+     "and size are always included; this adds one git lookup per project.\"},"
+     "\"metadata_only\":{\"type\":\"boolean\",\"description\":\"Deprecated compatibility "
+     "alias for include_details=false.\"}}}"},
 
     {"delete_project", "Delete project", "Delete a project from the index",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
@@ -6225,10 +6230,15 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
 }
 
 /* Open a .db file briefly and return whether it has one resolvable internal
- * project. When emit is true, append its bounded summary to arr. */
+ * project. When emit is true, append its bounded summary to arr. Rows off the
+ * requested page are still validated (that is what makes offsets stable) but
+ * never pay for their detail fields.
+ *
+ * emit and include_details are independent: emit is "this row is on the page",
+ * include_details is "the caller asked for branch and graph counts". */
 static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
                                      const char *name, size_t name_len, int64_t size_bytes,
-                                     bool emit) {
+                                     bool emit, bool include_details) {
     (void)name_len;
 
     char full_path[CBM_SZ_2K];
@@ -6252,6 +6262,10 @@ static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         return true;
     }
 
+    /* Node/edge counts come from the materialized project-stats row, an O(1)
+     * read on a handle this function already holds — so they stay in the lean
+     * listing. include_details gates the git branch lookup below, which is the
+     * part that actually costs (a subprocess per listed project). */
     cbm_project_graph_stats_t graph_stats = {0};
     if (cbm_store_get_project_graph_stats(pstore, project_name, &graph_stats) != CBM_STORE_OK) {
         cbm_store_close(pstore);
@@ -6277,7 +6291,7 @@ static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
      * disambiguates same-repo projects). The 12-field git block — mostly
      * null for non-git roots — cost ~10KB across a full cache and is one
      * index_status call away for the project you actually care about. */
-    if (root_path_buf[0]) {
+    if (include_details && root_path_buf[0]) {
         char *branch = NULL;
         if (cbm_git_current_branch(root_path_buf, &branch) == 0) {
             yyjson_mut_obj_add_strcpy(doc, p, "branch", branch);
@@ -6368,6 +6382,13 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     if (limit > MCP_PROJECTS_PAGE_MAX) {
         limit = MCP_PROJECTS_PAGE_MAX;
     }
+    /* Detail fields cost one database open and a git branch read per listed
+     * project, so they are opt-in. metadata_only is the retired spelling of
+     * include_details=false and still answers for clients that send it. */
+    bool include_details = cbm_mcp_get_bool_arg(args, "include_details");
+    if (include_details && cbm_mcp_get_bool_arg(args, "metadata_only")) {
+        include_details = false;
+    }
 
     char **db_names = NULL;
     int db_name_count = 0;
@@ -6407,7 +6428,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
 
         bool should_emit = all || (valid_seen >= offset && emitted < limit);
         bool valid = build_project_json_entry(doc, arr, dir_path, name, len, (int64_t)st.st_size,
-                                              should_emit);
+                                              should_emit, include_details);
         if (!valid) {
             continue;
         }
@@ -7917,6 +7938,7 @@ static int sg_parse_fields(const char *args, const char *out[], int max_out,
     return count;
 }
 
+/* Single owner of the requested-field cell dispatch for compact output. */
 static void sg_toon_extra_cells(cbm_sb_t *sb, const char *properties_json,
                                 const char *const *fields, int field_count) {
     yyjson_doc *properties_doc = properties_json && properties_json[0]
@@ -7934,6 +7956,14 @@ static void sg_toon_extra_cells(cbm_sb_t *sb, const char *properties_json,
             cbm_toon_cell_int(sb, yyjson_get_int(value), false);
         } else if (value && yyjson_is_real(value)) {
             cbm_toon_cell_real(sb, yyjson_get_real(value), false);
+        } else if (value && !yyjson_is_null(value)) {
+            /* An object or array requested by `fields` used to collapse to an
+             * empty cell, silently dropping the value the caller asked for.
+             * Its compact JSON keeps it in ONE column; the cell emitter quotes
+             * and escapes that text, so following columns stay aligned. */
+            char *json = yyjson_val_write(value, 0, NULL);
+            cbm_toon_cell_str(sb, json ? json : "", false);
+            free(json);
         } else {
             cbm_toon_cell_str(sb, "", false);
         }
@@ -9496,7 +9526,8 @@ static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
 
 static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
                                    const char *requested_path, const char *recording_status,
-                                   bool generation_matches, bool lookup_ok) {
+                                   bool generation_matches, bool lookup_ok,
+                                   bool exact_path_verified) {
     if (!lookup_ok) {
         return "coverage_unavailable";
     }
@@ -9524,7 +9555,10 @@ static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
             }
         }
     }
-    if (!generation_matches || !recording_status || strcmp(recording_status, "complete") != 0) {
+    bool recording_complete = recording_status && strcmp(recording_status, "complete") == 0;
+    bool truncated_exact_path_verified =
+        exact_path_verified && recording_status && strcmp(recording_status, "truncated") == 0;
+    if (!generation_matches || (!recording_complete && !truncated_exact_path_verified)) {
         return "coverage_unavailable";
     }
     return "no_recorded_issue";
@@ -9641,9 +9675,12 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             bool outside = false;
             const char *freshness = coverage_path_freshness(
                 store, project, have_project ? proj.root_path : NULL, rel, &outside);
-            const char *status = outside ? "outside_project"
-                                         : coverage_status(rows, row_count, rel, recording_status,
-                                                           generation_matches, lookup_ok);
+            bool exact_path_verified =
+                have_meta && meta.hash_records_complete && strcmp(freshness, "metadata_match") == 0;
+            const char *status =
+                outside ? "outside_project"
+                        : coverage_status(rows, row_count, rel, recording_status,
+                                          generation_matches, lookup_ok, exact_path_verified);
             yyjson_mut_obj_add_strcpy(doc, item, "status", status);
             yyjson_mut_obj_add_strcpy(doc, item, "freshness", freshness);
             yyjson_mut_obj_add_strcpy(doc, item, "recommended_action",
@@ -11338,14 +11375,23 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
-/* Check if a file path looks like a test file. */
+/* Check if a file path looks like a test file. The /-prefixed substring checks
+ * only catch a tests/ directory nested under another path component
+ * (".../tests/foo"); a project-root-relative path like "tests/repro/foo.c" has
+ * no leading slash before "tests" and fell through undetected, leaking whole
+ * test subtrees into query_graph/trace_path results with the default
+ * include_tests=false (#1294). The strncmp arms below cover that case. */
 static bool is_test_file(const char *path) {
     if (!path) {
         return false;
     }
     return strstr(path, "/test") != NULL || strstr(path, "test_") != NULL ||
            strstr(path, "_test.") != NULL || strstr(path, "/tests/") != NULL ||
-           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
+           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL ||
+           strncmp(path, "tests/", SLEN("tests/")) == 0 ||
+           strncmp(path, "test/", SLEN("test/")) == 0 ||
+           strncmp(path, "spec/", SLEN("spec/")) == 0 ||
+           strncmp(path, "__tests__/", SLEN("__tests__/")) == 0;
 }
 
 /* One direction-aware predecessor edge per visited node. The traversal's edge
@@ -15456,6 +15502,14 @@ typedef struct {
     int match_count;
 } search_result_t;
 
+typedef struct {
+    uint64_t scope_ms;
+    uint64_t scan_ms;
+    uint64_t enrich_ms;
+    uint64_t elapsed_ms;
+    bool include_phase_timings;
+} search_metrics_t;
+
 /* Score a result for ranking: project source first, vendored last, tests lowest */
 enum { SCORE_FUNC = 10, SCORE_ROUTE = 15, SCORE_VENDORED = -50, SCORE_TEST = -5 };
 enum { MAX_LINE_SPAN = 999999 };
@@ -15753,7 +15807,8 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
 static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep_match_t *raw,
                                          int raw_count, int gm_count, int limit,
                                          const char *project, bool warn_literal_pipe,
-                                         const char *mode_warning, uint64_t elapsed_ms) {
+                                         const char *mode_warning,
+                                         const search_metrics_t *metrics) {
     enum { MAX_RAW = 20, SEARCH_SLOW_MS = 5000 };
     cbm_sb_t sb;
     cbm_sb_init(&sb);
@@ -15830,7 +15885,15 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
     /* Compatibility aliases name each count's unit explicitly. */
     cbm_toon_scalar_int(&sb, "correlated_symbol_count", sr_count);
     cbm_toon_scalar_int(&sb, "uncorrelated_source_match_count", raw_count);
-    cbm_toon_scalar_int(&sb, "elapsed_ms", (long long)elapsed_ms);
+    /* debug=true only: a slow search is otherwise one opaque elapsed_ms, and
+     * which phase owns it (scoping, the external scan, graph enrichment) is
+     * exactly what tells a caller whether to narrow file_pattern or reindex. */
+    if (metrics->include_phase_timings) {
+        cbm_toon_scalar_int(&sb, "scope_ms", (long long)metrics->scope_ms);
+        cbm_toon_scalar_int(&sb, "scan_ms", (long long)metrics->scan_ms);
+        cbm_toon_scalar_int(&sb, "enrich_ms", (long long)metrics->enrich_ms);
+    }
+    cbm_toon_scalar_int(&sb, "elapsed_ms", (long long)metrics->elapsed_ms);
     if (warn_literal_pipe) {
         cbm_toon_scalar_str(&sb, "warning",
                             "pattern contains '|' but regex=false, so it is matched literally "
@@ -15840,7 +15903,7 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
     if (mode_warning && mode_warning[0]) {
         cbm_toon_scalar_str(&sb, "mode_warning", mode_warning);
     }
-    if (elapsed_ms >= SEARCH_SLOW_MS) {
+    if (metrics->elapsed_ms >= SEARCH_SLOW_MS) {
         cbm_toon_scalar_str(&sb, "warning_slow",
                             "search was slow; narrow file_pattern/path_filter or use a more "
                             "specific pattern");
@@ -15853,7 +15916,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path, const char *project,
                                     bool warn_literal_pipe, const char *mode_warning,
-                                    uint64_t elapsed_ms, const char *search_scope,
+                                    const search_metrics_t *metrics, const char *search_scope,
                                     int dirty_pending, int dirty_overlay_ready,
                                     const char *dirty_warning,
                                     const cbm_store_overlay_node_view_summary_t *overlay_summary) {
@@ -15928,7 +15991,14 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
      * the existing classification/deduplication work. */
     yyjson_mut_obj_add_int(doc, root_obj, "correlated_symbol_count", sr_count);
     yyjson_mut_obj_add_int(doc, root_obj, "uncorrelated_source_match_count", raw_count);
-    yyjson_mut_obj_add_int(doc, root_obj, "elapsed_ms", (int)elapsed_ms);
+    /* debug=true only: which phase owns a slow search is what tells a caller
+     * whether to narrow file_pattern or reindex. */
+    if (metrics->include_phase_timings) {
+        yyjson_mut_obj_add_uint(doc, root_obj, "scope_ms", metrics->scope_ms);
+        yyjson_mut_obj_add_uint(doc, root_obj, "scan_ms", metrics->scan_ms);
+        yyjson_mut_obj_add_uint(doc, root_obj, "enrich_ms", metrics->enrich_ms);
+    }
+    yyjson_mut_obj_add_uint(doc, root_obj, "elapsed_ms", metrics->elapsed_ms);
     yyjson_mut_obj_add_str(doc, root_obj, "search_scope",
                            search_scope ? search_scope : "project_recursive");
     if (sr_count > 0 && gm_count > 0) {
@@ -15945,15 +16015,15 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             "pattern contains '|' but regex=false, so it is matched literally (not as "
             "alternation). Pass regex=true for 'foo|bar' to mean 'foo OR bar'.");
     }
-    if (elapsed_ms >= SEARCH_SLOW_MS) {
+    if (metrics->elapsed_ms >= SEARCH_SLOW_MS) {
         char slow[CBM_SZ_128];
         snprintf(slow, sizeof(slow),
                  "search took %dms (>%ds); narrow file_pattern/path_filter or use a more "
                  "specific pattern",
-                 (int)elapsed_ms, SEARCH_SLOW_MS / 1000);
+                 (int)metrics->elapsed_ms, SEARCH_SLOW_MS / 1000);
         yyjson_mut_arr_add_strcpy(doc, warnings, slow);
         char ems[CBM_SZ_32];
-        snprintf(ems, sizeof(ems), "%d", (int)elapsed_ms);
+        snprintf(ems, sizeof(ems), "%d", (int)metrics->elapsed_ms);
         cbm_log_warn("search.slow", "elapsed_ms", ems); /* visibility in logs */
     }
     if (yyjson_mut_arr_size(warnings) > 0) {
@@ -16519,6 +16589,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit_sc, CBM_DEFAULT_SEARCH_LIMIT);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
+    search_metrics_t metrics = {0};
+    metrics.include_phase_timings = cbm_mcp_get_bool_arg(args, "debug");
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
      * a common silent 0-match trap; flagged in the result warnings (#282). */
     bool pat_has_pipe = pattern && strchr(pattern, '|') != NULL;
@@ -16714,6 +16786,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     enum { GREP_MAX_MATCHES = 500 };
     int grep_limit = GREP_MAX_MATCHES;
 
+    /* Scan phase: choosing the scan mode (which may probe git and materialize a
+     * scoped file list) through collecting the external scanner's output. */
+    uint64_t scan_t0 = metrics.include_phase_timings ? cbm_now_ms() : 0;
+
     /* Default to the full project root so active edits and newly created files
      * are searchable before the next index. Exact literal path_filter values can
      * safely narrow traversal to one file; general regex path_filter stays a
@@ -16725,6 +16801,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         int gn = snprintf(grep_root, sizeof(grep_root), "%s/%s", root_path, exact_filter_path);
         if (gn < 0 || (size_t)gn >= sizeof(grep_root) || !validate_search_path_arg(grep_root)) {
             search_scratch_close(&scratch);
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
             free(root_path);
             free(pattern);
             free(project);
@@ -16817,6 +16896,13 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int raw_count = 0;
     grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
 
+    /* The external scanner has produced every match it is going to; what
+     * follows is graph enrichment, not scanning. */
+    if (metrics.include_phase_timings) {
+        metrics.scan_ms = cbm_now_ms() - scan_t0;
+    }
+    uint64_t enrich_t0 = metrics.include_phase_timings ? cbm_now_ms() : 0;
+
     /* Sort matches by file path for contiguous per-file processing */
     qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
 
@@ -16858,6 +16944,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (sr_count > SKIP_ONE) {
         qsort(sr, sr_count, sizeof(search_result_t), search_result_cmp);
     }
+    if (metrics.include_phase_timings) {
+        metrics.enrich_ms = cbm_now_ms() - enrich_t0;
+    }
+    metrics.elapsed_ms = cbm_now_ms() - search_t0;
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
@@ -16883,14 +16973,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (mode == MODE_COMPACT && !sc_legacy_json && !needs_freshness_json) {
         char *toon_text = assemble_search_output_toon(
             sr, sr_count, raw, raw_count, gm_count, limit, project, pat_has_pipe && !use_regex,
-            mode_warning ? mode_warning_msg : NULL, cbm_now_ms() - search_t0);
+            mode_warning ? mode_warning_msg : NULL, &metrics);
         result = cbm_mcp_text_result(toon_text ? toon_text : "out of memory", toon_text == NULL);
         free(toon_text);
     } else {
         result = assemble_search_output(
             sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines, root_path, project,
-            pat_has_pipe && !use_regex, mode_warning ? mode_warning_msg : NULL,
-            cbm_now_ms() - search_t0, search_scope, dirty_pending, dirty_overlay_ready,
+            pat_has_pipe && !use_regex, mode_warning ? mode_warning_msg : NULL, &metrics,
+            search_scope, dirty_pending, dirty_overlay_ready,
             overlay_ready_for_code
                 ? "search_code reads live source files and uses active overlay graph annotations "
                   "where ready; pending dirty files may still lack graph metadata until overlay "

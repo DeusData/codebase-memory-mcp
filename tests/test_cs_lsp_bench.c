@@ -28,6 +28,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/sanitized.h"
 #include "lsp/cs_lsp.h"
 #include <stdlib.h>
 #include <time.h>
@@ -240,9 +241,11 @@ TEST(cslsp_bench_resolution_ratio) {
         ASSERT_GTE(resolved * 100, calls * 45);
     }
 
-    /* Instrumentation changes wall-clock cost without changing the native
-     * regression ceiling. Keep both budgets explicit and shared sanitizer
-     * detection portable across GCC and Clang. */
+    /* Instrumentation slows the parse ~5-10x without changing the native
+     * regression ceiling, so scale the budget when a sanitizer is active — and
+     * detect that for every sanitizer, not ASan alone, which left the TSan and
+     * MSan lanes measuring an instrumented parse against the native budget.
+     * Keep both budgets named and the detection portable across GCC and Clang. */
     const double max_elapsed_ms = TF_SANITIZER_ACTIVE ? CSLSP_BENCH_SANITIZER_MAX_ELAPSED_MS
                                                       : CSLSP_BENCH_NATIVE_MAX_ELAPSED_MS;
     ASSERT(ms < max_elapsed_ms);

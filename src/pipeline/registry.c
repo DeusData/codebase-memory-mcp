@@ -541,6 +541,49 @@ bool cbm_suppress_weak_call_match(CBMLanguage language, bool is_member, bool is_
            strcmp(strategy, "fuzzy") == 0;
 }
 
+static bool js_ts_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+}
+
+static const char *path_basename(const char *path) {
+    if (!path || !path[0]) {
+        return path;
+    }
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) {
+        slash = bslash;
+    }
+#endif
+    return slash ? slash + 1 : path;
+}
+
+bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
+                                              const char *strategy) {
+    /* Two same-named symbols in different languages: suffix_match picks one
+     * winner by import-distance and attaches every bare-name call to it
+     * (#725, Bash/Python main, JS/Python commit). unique_name is the
+     * candidates==1 case (#1572) and is not this guard. */
+    if (!strategy || strcmp(strategy, "suffix_match") != 0) {
+        return false;
+    }
+    if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
+        return false;
+    }
+    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    if (target_lang == CBM_LANG_COUNT) {
+        return false;
+    }
+    if (caller_lang == target_lang) {
+        return false;
+    }
+    if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    return true;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {

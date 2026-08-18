@@ -38,6 +38,14 @@ bool cbm_version_is_development(const char *version);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
+ * that no --args-file, raw-JSON positional and no --flag form was supplied.
+ * stdin_is_tty is the caller's isatty(0) result. True only for a non-terminal
+ * stdin AND a tool whose input_schema declares at least one property; a
+ * zero-argument tool such as list_projects must never read stdin, because an
+ * inherited-but-never-closed pipe makes that read block forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty);
+
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
@@ -582,6 +590,12 @@ int cbm_cmd_install(int argc, char **argv);
 
 /* uninstall: remove skills, remove editor MCP configs, remove binary. */
 int cbm_cmd_uninstall(int argc, char **argv);
+
+/* True when the installer script (install.sh / install.ps1 on Windows) is
+ * present beside the binary. `update` prints a command built from this;
+ * naming a path that does not exist ends the interaction on a failing
+ * command (#1632). Exposed for testing. */
+bool cbm_cli_installer_beside_binary(const char *dir);
 
 /* update: validate options and print the platform installer handoff. The product
  * process does not download or replace its running binary. */

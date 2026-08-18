@@ -2213,6 +2213,86 @@ int cbm_json_like_upsert_entry_if_unchanged(const char *file_path, const char *c
                            expected_content, expected_length);
 }
 
+int cbm_json_like_replace_field_raw_if_unchanged(const char *file_path,
+                                                 const char *const *object_path, size_t path_len,
+                                                 const char *entry_key, const char *field_key,
+                                                 const char *raw_value,
+                                                 const char *expected_content,
+                                                 size_t expected_length) {
+    if (jl_validate_arguments(file_path, object_path, path_len, entry_key) != 0 || !field_key ||
+        field_key[0] == '\0' || !raw_value) {
+        return -1;
+    }
+    size_t value_offset = 0U;
+    size_t value_length = 0U;
+    if (jl_validate_entry(raw_value, &value_offset, &value_length) != 0) {
+        return -1;
+    }
+
+    char *source = NULL;
+    size_t source_length = 0;
+    bool missing = false;
+    jl_file_snapshot_t snapshot;
+    if (jl_read_file(file_path, &source, &source_length, &missing, &snapshot) != 0) {
+        return -1;
+    }
+    bool content_matches =
+        expected_content
+            ? !missing && source_length == expected_length &&
+                  (expected_length == 0U || memcmp(source, expected_content, expected_length) == 0)
+            : missing;
+    if (!content_matches || missing || source_length == 0U) {
+        free(source);
+        return -1;
+    }
+
+    size_t object_start = 0;
+    if (jl_validate_document(source, source_length, &object_start) != 0) {
+        free(source);
+        return -1;
+    }
+    for (size_t i = 0; i < path_len; i++) {
+        jl_object_t parent;
+        if (jl_scan_object(source, source_length, object_start, object_path[i], &parent) != 0 ||
+            parent.match_count != 1U || source[parent.match.value_start] != '{') {
+            free(source);
+            return -1;
+        }
+        object_start = parent.match.value_start;
+    }
+    jl_object_t entry;
+    if (jl_scan_object(source, source_length, object_start, entry_key, &entry) != 0 ||
+        entry.match_count != 1U || source[entry.match.value_start] != '{') {
+        free(source);
+        return -1;
+    }
+    jl_object_t field;
+    if (jl_scan_object(source, source_length, entry.match.value_start, field_key, &field) != 0 ||
+        field.match_count != 1U) {
+        free(source);
+        return -1;
+    }
+
+    size_t head = field.match.value_start;
+    size_t tail = field.match.value_end;
+    size_t updated_length = head + value_length + (source_length - tail);
+    char *updated = (char *)malloc(updated_length + 1U);
+    if (!updated) {
+        free(source);
+        return -1;
+    }
+    memcpy(updated, source, head);
+    memcpy(updated + head, raw_value + value_offset, value_length);
+    memcpy(updated + head + value_length, source + tail, source_length - tail);
+    updated[updated_length] = '\0';
+
+    int result =
+        jl_write_document(file_path, updated, updated_length, source, source_length, &snapshot);
+    free(updated);
+    free(source);
+    return result;
+}
+
 static int jl_remove_entry(const char *file_path, const char *const *object_path, size_t path_len,
                            const char *entry_key, bool enforce_expected,
                            const char *expected_content, size_t expected_length) {
@@ -2839,9 +2919,27 @@ int cbm_json_like_match_object_entry(const char *document, size_t document_lengt
             free(decoded);
         }
     }
-    if (member_count != found_count || !captured) {
+    if (!captured) {
         free(captured);
         return CBM_JSON_LIKE_OBJECT_MISMATCH;
+    }
+    if (member_count != found_count) {
+        /* Extra keys beyond the ones we own. Every field we DO own matched, so
+         * this entry is recognisably ours - it has just been annotated.
+         *
+         * OpenCode is the case that forced this: it writes `"enabled": true`
+         * alongside our `command` and `type`, and toggling a server on or off
+         * in the UI adds that key. Requiring an exact key set therefore made us
+         * classify our OWN entry as foreign and refuse to touch it, so install
+         * failed for anyone who had ever toggled a server (#1630, confirmed on
+         * Linux and Windows with two independent configs where every MCP server
+         * carried the key).
+         *
+         * Reported distinctly from MATCH because the two demand different
+         * handling: a caller may not rewrite this entry, since the editor
+         * replaces an entry wholesale and would drop the extra keys. */
+        *captured_string_out = captured;
+        return CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS;
     }
     *captured_string_out = captured;
     return CBM_JSON_LIKE_OBJECT_MATCH;

@@ -762,6 +762,93 @@ TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained) {
     PASS();
 }
 
+/* #1070, #1130, #1132, #1133, #1145, #1450: six reports of an indexing worker
+ * that died leaving "the worker log file is completely empty (0 KB)". Nothing
+ * was ever flushed, so not one of them is reproducible or attributable — the
+ * hint says "crashed on a file" and the file is never named.
+ *
+ * The repro: the worker starts with a FULLY BUFFERED stderr (what the Windows
+ * CRT hands a redirected stderr; tf_maybe_run_index_worker forces the same
+ * state on POSIX so this binds on all three legs), writes diagnostics, then is
+ * SIGKILLed — #1070's own `signal=9`, and the death that runs no cleanup and
+ * flushes nothing. The supervisor keeps the log of a failed worker, so the log
+ * on disk afterwards is exactly what a user would attach to an issue.
+ *
+ * Asserted: it is not empty, it carries the startup header with the version,
+ * pid, repo path and the worker's own arguments, and the line written after the
+ * header survived too. Reverting the fix leaves the file at 0 bytes. */
+TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-logheader-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* A repo path with a space: the header must survive JSON-escaping intact,
+     * because Windows reporters index paths like C:/Users/Some Name/repo. */
+    char repo_path[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(repo_path, sizeof(repo_path), "%s/some repo", cache);
+    char args[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(args, sizeof(args),
+                   "{\"__cbm_test_worker\":\"buffered-kill\",\"repo_path\":\"%s\"}", repo_path);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start(args, 0, false, NULL, NULL, &handle);
+    char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
+    if (handle) {
+        (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
+    }
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    cbm_proc_outcome_t outcome = result ? result->outcome : CBM_PROC_SPAWN_FAILED;
+
+    /* Read the log the way a reporter would: after the worker is gone. */
+    long log_size = log_path[0] ? cbm_file_size(log_path) : -1;
+    char log_text[8192] = {0};
+    FILE *log = log_path[0] ? cbm_fopen(log_path, "rb") : NULL;
+    if (log) {
+        size_t used = fread(log_text, 1, sizeof(log_text) - 1, log);
+        log_text[used] = '\0';
+        (void)fclose(log);
+    }
+    bool has_header =
+        strstr(log_text, "\"event\":\"" CBM_INDEX_WORKER_LOG_START_EVENT "\"") != NULL;
+    bool names_repo =
+        strstr(log_text, "\"repo_path\":\"") != NULL && strstr(log_text, "some repo") != NULL;
+    bool names_args =
+        strstr(log_text, "\"args\":\"") != NULL && strstr(log_text, "buffered-kill") != NULL;
+    bool names_version = strstr(log_text, "\"version\":\"") != NULL;
+    bool names_pid = strstr(log_text, "\"pid\":\"") != NULL;
+    bool kept_post_header_line = strstr(log_text, "index.worker.buffered_kill_probe") != NULL;
+
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_dump("buffered-kill worker log", log_path);
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    if (!has_header) {
+        index_supervisor_test_dump("buffered-kill worker log", log_path);
+    }
+    (void)cbm_unlink(log_path);
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(outcome != CBM_PROC_CLEAN); /* killed: the supervisor keeps the log */
+    ASSERT_TRUE(log_size > 0);              /* the 0-byte log of the six reports */
+    ASSERT_TRUE(has_header);
+    ASSERT_TRUE(names_version);
+    ASSERT_TRUE(names_pid);
+    ASSERT_TRUE(names_repo);
+    ASSERT_TRUE(names_args);
+    ASSERT_TRUE(kept_post_header_line);
+    PASS();
+}
+
 SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
@@ -769,4 +856,5 @@ SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling);
     RUN_TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback);
     RUN_TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained);
+    RUN_TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run);
 }

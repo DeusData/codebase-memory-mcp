@@ -31,6 +31,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /* Confidence floor below which LSP-resolved calls are ignored and the
@@ -1016,6 +1017,18 @@ static inline void cbm_lsp_resolution_index_free(cbm_lsp_resolution_index_t *idx
  *      graph's file-shaped QN, accept one globally unique callable short name.
  *
  * Returns the matching node, or NULL if neither lookup hits. */
+/* Tail-match cost counters (#1669).
+ *
+ * The scan below is the one candidate loop in the resolve path with NO cap —
+ * cbm_registry_resolve bails at REG_MAX_CANDIDATES=256, this does not. Its
+ * candidate set is every node sharing a short name, which grows with the
+ * corpus, so `candidates scanned` is the quantity that turns resolve from O(n)
+ * into O(n^2). Counted always (two relaxed adds), surfaced by pass_parallel at
+ * end of resolve: a candidates/lookup ratio that grows with corpus size IS the
+ * regression, visible in one run. */
+extern _Atomic uint64_t g_lsp_tail_lookups;
+extern _Atomic uint64_t g_lsp_tail_candidates;
+
 static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     const cbm_gbuf_t *gbuf, const char *project_name, const char *callee_qn, bool allow_tail_match,
     bool allow_unique_callable_fallback) {
@@ -1061,6 +1074,8 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     if (cbm_gbuf_find_by_name(gbuf, short_name, &hits, &hit_count) != 0 || hit_count == 0) {
         return NULL;
     }
+    atomic_fetch_add_explicit(&g_lsp_tail_lookups, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_lsp_tail_candidates, (uint64_t)hit_count, memory_order_relaxed);
 
     const cbm_gbuf_node_t *match = NULL;
     const cbm_gbuf_node_t *unique_callable = NULL;

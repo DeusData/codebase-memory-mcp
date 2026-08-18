@@ -11,6 +11,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
+#include "foundation/sanitized.h"
 #include "mcp/mcp.h"
 
 #include <stdint.h>
@@ -936,8 +937,7 @@ static bool frontend_backpressure_run_isolated(bool maintenance) {
      * MSan stayed green. Widening the backstop for sanitized builds costs
      * nothing when the daemon is healthy: a passing run returns as soon as the
      * byte arrives, whatever the ceiling is. */
-#if defined(CBM_SANITIZED_BUILD) || defined(__SANITIZE_ADDRESS__) || \
-    defined(__SANITIZE_MEMORY__) || defined(__SANITIZE_THREAD__)
+#if CBM_SANITIZED
     const uint64_t announce_backstop_ms = 180000U;
 #else
     const uint64_t announce_backstop_ms = 30000U;

@@ -12,6 +12,14 @@ on:
         description: 'Generate build provenance attestations for release artifacts'
         type: boolean
         default: false
+      scan_candidates:
+        description: 'VirusTotal-scan both candidates before tuple-local selection (release must keep true)'
+        type: boolean
+        default: true
+    secrets:
+      VIRUS_TOTAL_SCANNER_API_KEY:
+        description: 'VirusTotal API key used for candidate selection'
+        required: false
 permissions:
   contents: read
   id-token: write
@@ -74,37 +82,34 @@ jobs:
             scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
           fi
 
-      - name: Ad-hoc sign macOS release binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
       - name: Frontend integrity scan
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: scripts/security-ui.sh
 
-      # Archive layout/name live in the ONE canonical script the local
-      # artifact-flow smoke lane also runs (venue-parity contract).
-      - name: Archive release binary (canonical package-release.sh)
-        env:
-          VERSION: ${{ inputs.version }}
-        run: scripts/package-release.sh ${{ matrix.goos }} ${{ matrix.goarch }}
+      - name: Derive immutable stripped and unstripped release candidates
+        run: |
+          scripts/ci/prepare-release-candidates.sh \
+            "${{ matrix.goos }}" "${{ matrix.goarch }}" \
+            --binary build/c/codebase-memory-mcp \
+            --out-dir release-candidates
+          scripts/gen-third-party-notices.sh \
+            "release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/THIRD_PARTY_NOTICES.md"
 
-      - name: Attest release binary provenance
+      - name: Attest release candidate provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          # *.mcpb matches nothing on the glibc-dynamic linux targets — the
-          # canonical packager builds bundles only where static/one-click holds.
           subject-path: |
-            codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
-            *.mcpb
+            release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/candidate-provenance.tsv
+            release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/stripped/*
+            release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/unstripped/*
+            release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/THIRD_PARTY_NOTICES.md
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            *.tar.gz
-            *.mcpb
+          name: release-candidates-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
 
   build-windows:
     runs-on: windows-latest
@@ -120,6 +125,8 @@ jobs:
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
             make
+            python
+            unzip
             zip
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -137,28 +144,30 @@ jobs:
             scripts/build.sh --with-ui CC=clang CXX=clang++
           fi
 
-      # Archive layout/name live in the ONE canonical script the local
-      # artifact-flow smoke lane also runs (venue-parity contract).
-      - name: Archive release binary (canonical package-release.sh)
+      - name: Derive immutable stripped and unstripped release candidates
         shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: scripts/package-release.sh windows amd64 CC=clang CXX=clang++
+        run: |
+          scripts/ci/prepare-release-candidates.sh windows amd64 \
+            --binary build/c/codebase-memory-mcp.exe \
+            --out-dir release-candidates
+          scripts/gen-third-party-notices.sh \
+            release-candidates/windows-amd64/THIRD_PARTY_NOTICES.md
 
-      - name: Attest release binary provenance
+      - name: Attest release candidate provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
-            codebase-memory-mcp-windows-amd64.zip
-            *.mcpb
+            release-candidates/windows-amd64/candidate-provenance.tsv
+            release-candidates/windows-amd64/stripped/*
+            release-candidates/windows-amd64/unstripped/*
+            release-candidates/windows-amd64/THIRD_PARTY_NOTICES.md
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binaries-windows-amd64
-          path: |
-            *.zip
-            *.mcpb
+          name: release-candidates-windows-amd64
+          path: release-candidates/windows-amd64
+          if-no-files-found: error
 
   build-windows-arm64:
     # Native ARM64 Windows binary via the CLANGARM64 toolchain on the
@@ -178,6 +187,8 @@ jobs:
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-zlib
             make
+            python
+            unzip
             zip
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -195,26 +206,30 @@ jobs:
             scripts/build.sh --with-ui CC=clang CXX=clang++
           fi
 
-      - name: Archive release binary (canonical package-release.sh)
+      - name: Derive immutable stripped and unstripped release candidates
         shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: scripts/package-release.sh windows arm64 CC=clang CXX=clang++
+        run: |
+          scripts/ci/prepare-release-candidates.sh windows arm64 \
+            --binary build/c/codebase-memory-mcp.exe \
+            --out-dir release-candidates
+          scripts/gen-third-party-notices.sh \
+            release-candidates/windows-arm64/THIRD_PARTY_NOTICES.md
 
-      - name: Attest release binary provenance
+      - name: Attest release candidate provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
-            codebase-memory-mcp-windows-arm64.zip
-            *.mcpb
+            release-candidates/windows-arm64/candidate-provenance.tsv
+            release-candidates/windows-arm64/stripped/*
+            release-candidates/windows-arm64/unstripped/*
+            release-candidates/windows-arm64/THIRD_PARTY_NOTICES.md
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binaries-windows-arm64
-          path: |
-            *.zip
-            *.mcpb
+          name: release-candidates-windows-arm64
+          path: release-candidates/windows-arm64
+          if-no-files-found: error
 
   build-linux-portable:
     # Fully static Linux binaries (gcc -static on Ubuntu).
@@ -254,22 +269,239 @@ jobs:
           file build/c/codebase-memory-mcp
           ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
 
-      - name: Archive release binary (canonical package-release.sh)
-        env:
-          VERSION: ${{ inputs.version }}
-        run: scripts/package-release.sh linux ${{ matrix.arch }}-portable
+      - name: Derive immutable stripped and unstripped release candidates
+        run: |
+          scripts/ci/prepare-release-candidates.sh \
+            linux "${{ matrix.arch }}-portable" \
+            --binary build/c/codebase-memory-mcp \
+            --out-dir release-candidates
+          scripts/gen-third-party-notices.sh \
+            "release-candidates/linux-${{ matrix.arch }}-portable/THIRD_PARTY_NOTICES.md"
 
-      - name: Attest release binary provenance
+      - name: Attest release candidate provenance
         if: ${{ inputs.attest }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
-            codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
-            *.mcpb
+            release-candidates/linux-${{ matrix.arch }}-portable/candidate-provenance.tsv
+            release-candidates/linux-${{ matrix.arch }}-portable/stripped/*
+            release-candidates/linux-${{ matrix.arch }}-portable/unstripped/*
+            release-candidates/linux-${{ matrix.arch }}-portable/THIRD_PARTY_NOTICES.md
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binaries-linux-${{ matrix.arch }}-portable
-          path: |
-            *.tar.gz
-            *.mcpb
+          name: release-candidates-linux-${{ matrix.arch }}-portable
+          path: release-candidates/linux-${{ matrix.arch }}-portable
+          if-no-files-found: error
+
+  # One blocking join owns the security-sensitive transition from candidates
+  # to public artifacts. Each target tuple contributes exactly three behavior-
+  # equivalent candidates (unstripped/debug-stripped/stripped); the selector may
+  # only choose within that tuple. A hard result on ANY sibling blocks
+  # the all-target release rather than selecting around a real detection.
+  select-package:
+    needs: [build-unix, build-windows, build-windows-arm64, build-linux-portable]
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download all native candidate pairs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-candidates-*
+          path: ${{ runner.temp }}/release-candidate-artifacts
+
+      - name: Stage the exact candidate scan set
+        run: |
+          python3 scripts/ci/stage-release-candidates.py \
+            "$RUNNER_TEMP/release-candidate-artifacts" \
+            release-candidate-scan \
+            --expect-targets 8 \
+            --expect-candidates 24
+          # Staging copied and re-hashed every byte into the immutable object
+          # set. Drop the redundant artifact-download tree before the VT wait.
+          test -n "$RUNNER_TEMP"
+          rm -rf -- "$RUNNER_TEMP/release-candidate-artifacts"
+          test ! -e "$RUNNER_TEMP/release-candidate-artifacts"
+
+      - name: Submit all 24 candidates to VirusTotal
+        if: ${{ inputs.scan_candidates }}
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
+        id: virustotal-candidates
+        with:
+          vt_api_key: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
+          files: release-candidate-scan/objects/*
+          request_rate: 4
+
+      # The established gate tolerates only one Microsoft malicious label
+      # ending !ml and rejects every other malicious/suspicious combination.
+      # Every candidate still must complete with the minimum engine coverage.
+      - name: Wait for complete VirusTotal candidate results
+        if: ${{ inputs.scan_candidates }}
+        env:
+          VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
+          VT_ANALYSIS: ${{ steps.virustotal-candidates.outputs.analysis }}
+          VT_EXPECTED_SCAN_SET: release-candidate-scan/scan-set.tsv
+          VT_ASSOCIATIONS: release-candidate-scan/associations.tsv
+          VT_RESULTS_PATH: release-candidate-scan/vt-results.tsv
+          VT_POLL_TIMEOUT_SECONDS: 14400
+          MIN_ENGINES: 50
+        run: scripts/ci/check-virustotal.sh
+
+      - name: Select one scanned candidate inside every target tuple
+        if: ${{ inputs.scan_candidates }}
+        run: |
+          python3 scripts/ci/select-release-candidates.py \
+            --candidates release-candidate-scan/candidates.tsv \
+            --objects-dir release-candidate-scan/objects \
+            --results release-candidate-scan/vt-results.tsv \
+            --out-dir release-selection
+
+      # This is intentionally reachable only from dry-run.yml's explicit
+      # skip_virustotal input. release.yml pins scan_candidates=true.
+      - name: Mark unscanned dry run and default to stripped candidates
+        if: ${{ !inputs.scan_candidates }}
+        run: |
+          echo '::warning::VirusTotal candidate scan explicitly skipped; selecting stripped candidates as unscanned-dry-run.'
+          python3 scripts/ci/select-release-candidates.py \
+            --candidates release-candidate-scan/candidates.tsv \
+            --objects-dir release-candidate-scan/objects \
+            --default-stripped \
+            --out-dir release-selection
+
+      - name: Reclaim rejected and redundant candidate bytes
+        run: |
+          # release-selection owns fresh, hash-verified copies of the eight
+          # chosen executables. No later release step may consume the 24-object
+          # scan pool, so discard it before packaging to bound runner disk use.
+          rm -rf -- release-candidate-scan/objects
+          test ! -e release-candidate-scan/objects
+
+      - name: Package the selected exact bytes
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          for target in \
+            linux-amd64 linux-arm64 \
+            linux-amd64-portable linux-arm64-portable \
+            darwin-amd64 darwin-arm64 \
+            windows-amd64 windows-arm64; do
+            goos="${target%%-*}"
+            goarch="${target#*-}"
+            selected_name=codebase-memory-mcp
+            test "$goos" != windows || selected_name=codebase-memory-mcp.exe
+            selected="release-selection/selected/$target/$selected_name"
+            notices="release-candidate-scan/notices/$target/THIRD_PARTY_NOTICES.md"
+            test -f "$selected"
+            test -f "$notices"
+            # The expected hash comes from the selector's provenance manifest,
+            # not from the file being checked. package-release.sh independently
+            # re-hashes the file and therefore exercises manifest -> file ->
+            # archive/MCPB binding instead of comparing a file to itself.
+            selected_sha="$(awk -F '\t' -v wanted="$target" '!header { for (i = 1; i <= NF; i++) { if ($i == "target") target_col = i; if ($i == "selected_sha256") sha_col = i } if (target_col && sha_col) header = 1; next } $target_col == wanted { count++; selected = $sha_col } END { if (count != 1 || length(selected) != 64 || selected ~ /[^0-9a-f]/) exit 3; print selected }' release-selection/release-selection.tsv)"
+            scripts/package-release.sh "$goos" "$goarch" \
+              --selected-binary "$selected" \
+              --expected-sha256 "$selected_sha" \
+              --third-party-notices "$notices" \
+              --out-dir "release-containers/$target"
+          done
+
+      - name: Verify every packaged executable matches its selected hash
+        run: |
+          python3 scripts/ci/verify-release-selection.py \
+            --selection release-selection/release-selection.tsv \
+            --archive-dir release-containers
+
+      - name: Prepare durable candidate-selection evidence
+        if: ${{ always() }}
+        run: |
+          mkdir -p selection-evidence
+          test ! -f release-candidate-scan/candidates.tsv || \
+            cp release-candidate-scan/candidates.tsv selection-evidence/release-candidates.tsv
+          test ! -f release-candidate-scan/vt-results.tsv || \
+            cp release-candidate-scan/vt-results.tsv selection-evidence/virustotal-candidate-results.tsv
+          test ! -f release-selection/release-selection.tsv || \
+            cp release-selection/release-selection.tsv selection-evidence/release-selection.tsv
+
+      - name: Attest selected containers and decision evidence
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            release-containers/**/*.tar.gz
+            release-containers/**/*.zip
+            release-containers/**/*.mcpb
+            selection-evidence/*.tsv
+
+      - name: Preserve candidate selection evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-selection-evidence
+          path: selection-evidence
+          if-no-files-found: error
+
+      # Keep the established artifact names so the reusable smoke workflow and
+      # all callers consume only the selected, byte-verified containers.
+      - name: Upload linux-amd64 containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-linux-amd64
+          path: release-containers/linux-amd64/*
+          if-no-files-found: error
+
+      - name: Upload linux-arm64 containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-linux-arm64
+          path: release-containers/linux-arm64/*
+          if-no-files-found: error
+
+      - name: Upload linux-amd64-portable containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-linux-amd64-portable
+          path: release-containers/linux-amd64-portable/*
+          if-no-files-found: error
+
+      - name: Upload linux-arm64-portable containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-linux-arm64-portable
+          path: release-containers/linux-arm64-portable/*
+          if-no-files-found: error
+
+      - name: Upload darwin-amd64 containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-darwin-amd64
+          path: release-containers/darwin-amd64/*
+          if-no-files-found: error
+
+      - name: Upload darwin-arm64 containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-darwin-arm64
+          path: release-containers/darwin-arm64/*
+          if-no-files-found: error
+
+      - name: Upload windows-amd64 containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-windows-amd64
+          path: release-containers/windows-amd64/*
+          if-no-files-found: error
+
+      - name: Upload windows-arm64 containers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-windows-arm64
+          path: release-containers/windows-arm64/*
+          if-no-files-found: error

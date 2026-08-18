@@ -9,10 +9,9 @@
 # Publishing the same bytes under the legacy names makes already-released
 # updaters work again with no action from the user.
 #
-# Runs AFTER the VirusTotal gate: the aliases are copies of archives the gate
-# already cleared, and uploading them earlier would duplicate every object in
-# the scan set and in the provenance manifest. They are likewise absent from
-# checksums.txt, which covers the canonical names current installers request.
+# Runs after verification: each alias is a copy of a container whose executable
+# was hash-bound to the selected, pre-smoke VirusTotal candidate. They are absent
+# from checksums.txt, which covers the canonical names current installers request.
 #
 # Usage: publish-legacy-aliases.sh <version-tag> <repository>
 set -euo pipefail

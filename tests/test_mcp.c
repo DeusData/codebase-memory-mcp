@@ -2812,6 +2812,23 @@ TEST(tool_search_graph_includes_node_properties) {
     free(inner);
     free(resp);
 
+    /* A list-valued requested field is emitted as compact JSON in one cell,
+     * not collapsed to an empty placeholder. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":431,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"fields\":[\"base_classes\"],"
+             "\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "base_classes"));
+    ASSERT_NOT_NULL(strstr(inner, "HandlerBase"));
+    ASSERT_NOT_NULL(strstr(inner, "Audited"));
+    free(inner);
+    free(resp);
+
     /* format:"json", compact:false keeps useful legacy metadata intact. */
     resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
@@ -10718,9 +10735,12 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_hr.file_path = "main.go";
     n_hr.start_line = 3;
     n_hr.end_line = 5;
+    /* base_classes is the compound (array) property the requested-fields cell
+     * emitter has to keep in one column instead of blanking. */
     n_hr.properties_json = "{\"signature\":\"func HandleRequest() error\","
                            "\"return_type\":\"error\","
                            "\"is_exported\":true,"
+                           "\"base_classes\":[\"HandlerBase\",\"Audited\"],"
                            "\"source\":\"infra\"}";
     int64_t id_hr = cbm_store_upsert_node(st, &n_hr);
 
@@ -18816,7 +18836,146 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
 #endif
 }
 
+TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    struct stat source_stat;
+    ASSERT_EQ(stat(source_path, &source_stat), 0);
+#ifdef __APPLE__
+    int64_t source_mtime_ns =
+        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+        (int64_t)source_stat.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    int64_t source_mtime_ns =
+        (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    int64_t source_mtime_ns =
+        ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+        (int64_t)source_stat.st_mtim.tv_nsec;
+#endif
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
+                                         source_mtime_ns, source_stat.st_size),
+              CBM_STORE_OK);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {
+        .generation = project.indexed_at,
+        .index_mode = "fast",
+        .recorded_at = "2026-07-12T00:00:00Z",
+        .recording_status = "truncated",
+        .ignored_files_stored = 2000,
+        .ignored_files_total = 2001,
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta),
+              CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"test-project\",\"paths\":[\"main.go\"],\"scopes\":[\".\"]}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *path = yyjson_arr_get(yyjson_obj_get(root, "paths"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), "no_recorded_issue");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_match");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")),
+                  "use_graph_with_best_effort_caveat");
+    yyjson_val *scope = yyjson_arr_get(yyjson_obj_get(root, "scopes"), 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(scope, "status")), "coverage_unavailable");
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(search_code_full_preserves_utf8_source) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_utf8_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmp) != NULL);
+
+    char project_dir[640];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", tmp);
+    ASSERT_EQ(cbm_mkdir(project_dir), 0);
+    char design_dir[768];
+    snprintf(design_dir, sizeof(design_dir), "%s/design", project_dir);
+    ASSERT_EQ(cbm_mkdir(design_dir), 0);
+
+    char source_path[768];
+    snprintf(source_path, sizeof(source_path), "%s/design.md", design_dir);
+    FILE *fp = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const char source[] = "# accounting-design\nРусский текст: бухгалтерский учет.\n";
+    ASSERT_EQ(fwrite(source, 1, sizeof(source) - SKIP_ONE, fp), sizeof(source) - SKIP_ONE);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "utf8-search";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, project_dir);
+
+    cbm_node_t section = {.project = project,
+                          .label = "Section",
+                          .name = "accounting-design",
+                          .qualified_name = "utf8-search.design.accounting-design",
+                          .file_path = "design/design.md",
+                          .start_line = 1,
+                          .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &section), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"project\":\"utf8-search\",\"pattern\":\"accounting-design\","
+             "\"file_pattern\":\"*.md\",\"path_filter\":\"^design/\","
+             "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* This branch's JSON shape is one object per result carrying its own
+     * "source", rather than column-ordered row arrays. The claim under test is
+     * the same either way: the multi-byte source must come back byte-for-byte,
+     * not mangled into replacement characters by the output sanitizer. */
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_TRUE(yyjson_arr_size(results) > 0);
+    yyjson_val *source_val = yyjson_obj_get(yyjson_arr_get(results, 0), "source");
+    ASSERT_NOT_NULL(source_val);
+    ASSERT_STR_EQ(yyjson_get_str(source_val), source);
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(source_path);
+    cbm_rmdir(design_dir);
+    cbm_rmdir(project_dir);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
+    RUN_TEST(search_code_full_preserves_utf8_source);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch_before_git);
     RUN_TEST(detect_changes_handles_cmd_metacharacters_as_literal_argv);

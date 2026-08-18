@@ -123,9 +123,32 @@ static int cr_project_compare(const void *left, const void *right) {
 static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) {
     cbm_project_t *projects = NULL;
     int count = 0;
-    bool matches = store && cbm_store_check_integrity(store) &&
-                   cbm_store_list_projects(store, &projects, &count) == CBM_STORE_OK &&
-                   count == 1 && projects[0].name && strcmp(projects[0].name, project) == 0;
+    if (!store || !cbm_store_check_integrity(store) ||
+        cbm_store_list_projects(store, &projects, &count) != CBM_STORE_OK) {
+        cbm_store_free_projects(projects, count);
+        return false;
+    }
+    /* Ignore internal shadow projects ("<name>::missed" miss-graph rows): they
+     * live in the SAME db as the primary project, so any project that has ever
+     * recorded a parse miss carries two rows. Requiring count == 1 over ALL rows
+     * therefore made such a project unresolvable as source AND as target, and
+     * cross-repo reported it as not indexed when it plainly was (#1609). This is
+     * the same defect mcp.c fixed for list_projects in #1044; this site never
+     * learned it.
+     *
+     * The single-primary requirement itself is kept: it is what proves this db
+     * belongs to the project we were asked about, rather than being a shared or
+     * mislabelled store. Only the shadow rows stop counting toward it. */
+    int primary_count = 0;
+    bool primary_matches = false;
+    for (int i = 0; i < count; i++) {
+        const char *name = projects[i].name;
+        if (name && name[0] && !strstr(name, "::")) {
+            primary_count++;
+            primary_matches = strcmp(name, project) == 0;
+        }
+    }
+    bool matches = primary_count == 1 && primary_matches;
     cbm_store_free_projects(projects, count);
     return matches;
 }

@@ -15,4 +15,8 @@ CI and the local infrastructure — both of which the venue-parity contract
 | `generate-sbom.py` | The release SPDX SBOM (vendored versions reviewable here, diffable by vendoring PRs — was inline YAML). | `release.yml` |
 | `require-all-green.sh` | The aggregate gate: fail unless every needed job succeeded or legitimately skipped (was inline YAML). | `pr.yml ci-ok` |
 | `verify-shard-union.sh` | Prove sharded test legs lost nothing: shard count agreement, indices 1..n, identical suite lists, union of slices == full list (was inline YAML). | `_test.yml` shard-completeness |
-| `check-virustotal.sh` | Exact extracted-file VirusTotal lookups. | `release.yml` |
+| `prepare-release-candidates.sh` | Copy one linker output into stripped/unstripped candidates, finalize signatures, composition-check them without execution, and record their hashes. | `_build.yml`, local artifact smoke |
+| `stage-release-candidates.py` | Admit exactly eight candidate artifacts / sixteen byte-distinct binaries into the content-addressed VirusTotal scan set. | `_build.yml` |
+| `select-release-candidates.py` | Apply the reviewed tuple-local VT truth table, or the explicit dry-run stripped default, and atomically copy one content-bound binary per target. | `_build.yml` |
+| `verify-release-selection.py` | Recompute the selection policy and prove every executable member in all 14 public containers equals its selected SHA-256. | `_build.yml`, `release.yml` final draft verification |
+| `check-virustotal.sh` | Poll and validate the exact candidate scan set, enforce engine coverage and the narrow documented Microsoft `!ml` policy, and emit content-bound results evidence. | `_build.yml` |

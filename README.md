@@ -20,7 +20,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp). Release archives are signed and checksummed; every distinct extracted release object is submitted to VirusTotal, while the downloadable `.tar.gz`/`.zip` containers themselves are not. Publication requires at least 50 decisive engine results per object and no suspicious verdicts. Malicious verdicts block unless the sole detection is Microsoft's heuristic `!ml` label; that exception and its report are published in the release evidence. All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp). For each release product, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) are submitted to VirusTotal before testing; the selected candidate is then packaged with its SHA-256 unchanged. Release notes link every measured candidate result. Publication permits only the narrowly documented single-Microsoft `!ml` tolerance in [SECURITY.md](SECURITY.md#our-release-policy). All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -394,11 +394,15 @@ scripts/test.sh --suites <name>     # one suite, incremental, seconds
 build/c/test-runner --list-suites   # what is available
 ```
 
-`scripts/test.sh` is the same entry the CI gates run, so a local pass means the same thing a CI pass does. Packaging a release archive locally uses the same canonical script the release pipeline calls:
+`scripts/test.sh` is the same entry the CI gates run, so a local pass means the same thing a CI pass does. The canonical local artifact-flow check builds both stripped/unstripped candidates, defaults to the stripped candidate for this explicitly unscanned local run, packages those exact bytes, extracts the archive, and smokes it:
 
 ```bash
-scripts/package-release.sh <linux|darwin|windows> <amd64|arm64>
+scripts/ci/smoke-artifact.sh <linux|darwin|windows> <amd64|arm64>
 ```
+
+`scripts/package-release.sh` is intentionally a lower-level immutable boundary:
+it accepts only an already-final `--selected-binary` plus its
+`--expected-sha256`; it never builds, strips, signs, or relinks the executable.
 
 The standard and release pathways use the Makefile's optimized production defaults
 (`-O2`). For an inspectable local development binary, append debug flags through the
@@ -533,7 +537,7 @@ codebase-memory-mcp cli --progress index_repository --repo-path /path/to/repo
 codebase-memory-mcp cli search_graph --project my-project --label Function | jq '.results[].name'
 ```
 
-JSON arguments can also be piped on stdin. Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
+JSON arguments can also be piped on stdin, for tools that take arguments. A tool whose input schema declares none — `list_projects` — never reads stdin, so it stays responsive when it inherits a pipe the caller never closes (the default for `child_process.spawn` and similar wrappers). Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
 
 ## MCP Tools
 
@@ -750,7 +754,7 @@ internal/cbm/         Vendored tree-sitter grammars (158 languages) + AST extrac
 
 Every release is verified through a multi-layer pipeline before publication:
 
-- **VirusTotal** — every distinct extracted release object is scanned; downloadable `.tar.gz`/`.zip` containers are not submitted. Each object needs at least 50 decisive engines and no suspicious verdicts. Malicious verdicts block unless the only detection is Microsoft's heuristic `!ml` label; release notes publish every result and exception with archive SHA-256 provenance.
+- **VirusTotal** — all 24 executable candidates (unstripped, debug-stripped and stripped) across the eight release products are scanned before smoke/soak (clean is preferred and only the single-Microsoft `!ml` tolerance documented in [SECURITY.md](SECURITY.md#our-release-policy) may pass; the number of engines that returned a decisive result is recorded as evidence but is VirusTotal fleet availability, not a pass condition). The selected executable is packaged without changing its SHA-256, release notes link the verdict for the exact bytes shipped, and the full per-candidate evidence is published alongside the release as TSVs for anyone auditing the selection. Every distinct object extracted from the shipped containers — `install.sh`, `install.ps1`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, the MCPB `manifest.json` and the unpacked UI assets — is then scanned as well, so the full published surface is covered, not just the executables.
 - **SLSA Level 3** — cryptographic build provenance generated by the trusted GitHub Actions build workflow; verify with `gh attestation verify <file> --repo DeusData/codebase-memory-mcp --signer-workflow DeusData/codebase-memory-mcp/.github/workflows/_build.yml`
 - **Sigstore cosign** — keyless signatures on all artifacts; bundles included in every release
 - **SHA-256 checksums** — `checksums.txt` published with every release; verified by both install scripts before extraction

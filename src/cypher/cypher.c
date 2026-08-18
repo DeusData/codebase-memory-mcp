@@ -5432,8 +5432,26 @@ static void expand_var_length(cbm_store_t *store, cbm_store_trail_graph_t *trail
         cbm_store_traverse_free(&tr);
         return;
     }
+    /* A repeated variable unifies: when to_var is already bound, only the hop
+     * that IS that node can extend the row. Without this a pattern such as
+     * `MATCH (a)-[*1..3]->(b), (b)-[:CALLS]->(c)` re-binds b to every reachable
+     * node and fabricates rows the query never asked for. Same rule, same
+     * QN-then-id precedence as process_active_edge_nodes. */
+    cbm_node_t *bound_to = binding_get(b, to_var);
+    const char *bound_to_qn = bound_to && bound_to->qualified_name && bound_to->qualified_name[0]
+                                  ? bound_to->qualified_name
+                                  : NULL;
+    int64_t bound_to_id = bound_to ? bound_to->id : 0;
     for (int v = 0; v < tr.visited_count; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
+        if (bound_to_qn) {
+            if (!hop->node.qualified_name ||
+                strcmp(bound_to_qn, hop->node.qualified_name) != 0) {
+                continue;
+            }
+        } else if (bound_to && hop->node.id != bound_to_id) {
+            continue;
+        }
         if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {
             continue;
         }

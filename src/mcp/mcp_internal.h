@@ -79,4 +79,9 @@ bool cbm_mcp_auto_index_within_configured_limit(const char *root_path, int confi
 bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *hunks,
                               int hunk_count, const char *file);
 
+/* search_code no longer needs a Windows pre-scan glob filter: when a
+ * file_pattern is given, write_scoped_filelist() narrows the candidate list
+ * from the indexed project's file set BEFORE any shell runs, so PowerShell
+ * never walks non-matching paths and there is nothing left to prefilter. */
+
 #endif

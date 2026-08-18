@@ -169,6 +169,46 @@ static void build_type_embed_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
 
 /* Index: short_name -> chain of FREE-function (receiver_type==NULL) indices.
  * Descending-iterate + prepend for ascending chain order (as above). */
+static void build_type_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
+    int tcount = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        if (reg->types[i].short_name)
+            tcount++;
+    }
+    if (tcount == 0)
+        return;
+    int bucket_count = next_pow2(tcount * 2);
+    if (bucket_count < 16)
+        bucket_count = 16;
+    int *buckets = (int *)cbm_arena_alloc(idx_arena, (size_t)bucket_count * sizeof(int));
+    CBMRegistryHashEntry *entries = (CBMRegistryHashEntry *)cbm_arena_alloc(
+        idx_arena, (size_t)tcount * sizeof(CBMRegistryHashEntry));
+    if (!buckets || !entries)
+        return;
+    for (int i = 0; i < bucket_count; i++)
+        buckets[i] = -1;
+    int idx = 0;
+    /* Reverse insertion so each chain yields ASCENDING types[] order — callers
+     * that used first-match-in-registration-order keep their tie-breaks. */
+    for (int i = reg->type_count - 1; i >= 0; i--) {
+        const CBMRegisteredType *t = &reg->types[i];
+        if (!t->short_name)
+            continue;
+        uint64_t h = fnv1a(t->short_name);
+        int slot = (int)(h & (uint64_t)(bucket_count - 1));
+        entries[idx].hash = h;
+        entries[idx].payload_index = i;
+        entries[idx].next_index = buckets[slot];
+        entries[idx].slot = slot;
+        buckets[slot] = idx;
+        idx++;
+    }
+    reg->type_short_buckets = buckets;
+    reg->type_short_entries = entries;
+    reg->type_short_bucket_count = bucket_count;
+    reg->type_short_entry_count = idx;
+}
+
 static void build_ffunc_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     int fcount = 0;
     for (int i = 0; i < reg->func_count; i++) {
@@ -286,6 +326,42 @@ int cbm_free_func_iter_next(CBMFreeFuncIter *it) {
     return -1;
 }
 
+void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
+                                      CBMTypeShortIter *out) {
+    out->reg = reg;
+    out->hash = fnv1a(short_name);
+    if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
+        if (reg->type_short_buckets && reg->type_short_bucket_count > 0) {
+            int slot = (int)(out->hash & (uint64_t)(reg->type_short_bucket_count - 1));
+            out->chain_idx = reg->type_short_buckets[slot];
+        } else {
+            out->chain_idx = -1;
+        }
+        out->tail_i = reg->type_qn_entry_count;
+        out->tail_end = reg->type_count;
+    } else {
+        out->chain_idx = -1;
+        out->tail_i = 0;
+        out->tail_end = reg->type_count;
+    }
+}
+
+int cbm_type_short_iter_next(CBMTypeShortIter *it) {
+    const CBMTypeRegistry *reg = it->reg;
+    while (it->chain_idx >= 0) {
+        const CBMRegistryHashEntry *e = &reg->type_short_entries[it->chain_idx];
+        int p = e->payload_index;
+        uint64_t h = e->hash;
+        it->chain_idx = e->next_index;
+        if (h != it->hash)
+            continue;
+        return p;
+    }
+    if (it->tail_i < it->tail_end)
+        return it->tail_i++;
+    return -1;
+}
+
 void cbm_registry_methods(const CBMTypeRegistry *reg, const char *receiver_qn,
                           const char *method_name, CBMMethodIter *out) {
     memset(out, 0, sizeof(*out));
@@ -346,6 +422,7 @@ void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     build_method_index(reg, idx_arena);
     build_type_embed_index(reg, idx_arena);
     build_ffunc_short_index(reg, idx_arena);
+    build_type_short_index(reg, idx_arena);
 }
 
 void cbm_registry_finalize(CBMTypeRegistry *reg) {

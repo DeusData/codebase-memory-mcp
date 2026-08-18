@@ -45,7 +45,6 @@ enum {
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
-#include "foundation/str_util.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -2124,17 +2123,44 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * Built ONCE here; shared READ-ONLY across all files of that language
      * during resolve. Per-file work is then: parse + AST walk + O(1) lookups
      * — no registry build, no Phase 1b mutations. Languages added so far:
-     * Go, Python. Others (C/C++, TS/JS, PHP, C#) fall back to per-file. */
+     * Go, Python, C/C++, C#, TS/JS, Java. Others (Kotlin, PHP) fall back to per-file. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
     CBMCrossLspRegistries cross_registries = {0};
     if (all_defs) {
+        /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
+         * ONE language instead of re-diagnosing the whole pass (the cs builder
+         * hid ~140 s behind the pass total, #1669 follow-up). */
+        struct timespec t_b;
+        long b_ms[6];
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.go = cbm_go_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[0] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.python =
             cbm_py_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[1] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[2] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[3] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
         cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[4] = (long)elapsed_ms(t_b);
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t_b);
+        cross_registries.java =
+            cbm_java_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        b_ms[5] = (long)elapsed_ms(t_b);
+        char b_buf[6][CBM_SZ_16];
+        const char *b_name[6] = {"go", "python", "c", "cs", "ts", "java"};
+        for (int bi = 0; bi < 6; bi++) {
+            snprintf(b_buf[bi], sizeof(b_buf[bi]), "%ld", b_ms[bi]);
+        }
+        cbm_log_info("lsp_cross_prepare.builders", b_name[0], b_buf[0], b_name[1], b_buf[1],
+                     b_name[2], b_buf[2], b_name[3], b_buf[3], b_name[4], b_buf[4], b_name[5],
+                     b_buf[5]);
         /* Rust: NOT built here. The shared all_defs registry is built LAZILY on the
          * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
          * — repos whose rust files all filter to subsets never pay the build/RSS. */
@@ -2845,7 +2871,6 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     cbm_path_alias_collection_t *path_aliases = NULL;
     gh_compute_task_t githistory_task = {0};
     char *dump_db_path = NULL;
-
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
     if (!p->userconfig) {
@@ -2914,6 +2939,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
             return rc;
         }
     }
+
     cbm_log_info("pipeline.route", "path", "full");
 
     /* Phase 2: Create graph buffer and registry */
@@ -3444,6 +3470,14 @@ static int seal_staging_db(const char *staging_path) {
             : CBM_NOT_FOUND;
     cbm_store_close(store);
     if (rc == 0 && cbm_remove_db_sidecars(staging_path) != 0) {
+        /* Silent here is how #1620 presented: every pass succeeded, the worker
+         * exited 0, no error-level line was emitted anywhere, and the user was
+         * told to check that their repository exists — pointed at their source
+         * tree for a filesystem permission problem. A publish that fails must
+         * say so. Matches the finalize.prepare_failed reporting below. */
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_error("seal.sidecar_removal_failed", "errno", errno_text, "stage", staging_path);
         rc = CBM_NOT_FOUND;
     }
     return rc;
@@ -3462,7 +3496,11 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
         const char *err = cbm_artifact_export_last_error();
         cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
     }
-    return rc;
+    /* The SQLite generation is authoritative and already committed. An
+     * explicitly requested artifact is part of the caller-visible operation, so
+     * its export error is returned; automatic refresh of an already-existing
+     * artifact stays best-effort and must not fail the indexing run. */
+    return p->persistence ? rc : 0;
 }
 
 int cbm_pipeline_run(cbm_pipeline_t *p) {

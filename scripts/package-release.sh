@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-# package-release.sh — THE canonical release-archive step. Every venue that
-# turns built binaries into a release archive (release/_build.yml, the local
-# artifact-flow smoke lane) runs this file; workflows provide only
-# checkout/toolchain/upload around it. Archive names and contents are defined
-# HERE, nowhere else, so a local artifact smoke provably exercises the same
-# bytes-layout the release publishes.
+# package-release.sh — canonical, byte-preserving release packager.
 #
-# This script ARCHIVES what scripts/build.sh already produced; it never builds
-# or synthesizes another executable.
+# Candidate derivation (including strip and macOS signing) happens before this
+# boundary. This script accepts one already-final executable plus its expected
+# SHA-256 and only copies that byte sequence into the release containers. A
+# hash mismatch at any boundary is fatal.
 
 set -euo pipefail
 
@@ -16,57 +13,70 @@ cd "$ROOT"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/package-release.sh <goos> <goarch> [--out-dir DIR] [VAR=VAL ...]
+Usage: scripts/package-release.sh <goos> <goarch> \
+         --selected-binary FILE --expected-sha256 HEX [OPTIONS]
 
-The canonical release-archive step: identical in the release build and the
-local artifact-flow smoke lane.
+Package an already-final release executable without changing its bytes.
 
-  goos       linux | darwin | windows
-  goarch     arch label used verbatim in the archive name (amd64, arm64,
-             arm64-portable, ...)
-  --out-dir  where to place the archive (default: repository root).
+Required:
+  --selected-binary FILE       selected candidate to package
+  --expected-sha256 HEX        SHA-256 of FILE (64 hexadecimal characters)
 
-Make passthrough (VAR=VAL, forwarded to the build):
-  CC= CXX=   compiler override, e.g. CC=clang CXX=clang++.
+Options:
+  --third-party-notices FILE   pre-generated notices file (otherwise generated)
+  --out-dir DIR                output directory (default: repository root)
 
 Environment:
-  BUILD_DIR  build tree to archive from (default build/c).
-  VERSION    release version stamped into the MCPB manifest (v-prefix
-             accepted; defaults to 0.0.0-dev outside a release build).
+  VERSION                      MCPB manifest version (v-prefix accepted;
+                               default: 0.0.0-dev)
 
-Archive contents (defined here, canonical) — ONE executable, no sidecars:
+Targets are the eight existing release products:
+  linux/{amd64,arm64,amd64-portable,arm64-portable}
+  darwin/{amd64,arm64}
+  windows/{amd64,arm64}
+
+Archive contents — one executable, no sidecars:
   unix:    codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md (.tar.gz)
   windows: codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md (.zip)
 
-MCPB bundle (.mcpb, a zip) — darwin/windows targets plus the STATIC linux
-builds; same staged binary, for MCP-Registry one-click-install hosts:
-  manifest.json  server/codebase-memory-mcp[.exe]  server/LICENSE
-  server/THIRD_PARTY_NOTICES.md
-
-Only one build variant ships: the binary carries the graph UI and the agent
-integration templates inside itself, so an extracted archive is immediately
-complete — no adjacent data file has to resolve for `install` to work.
+MCPB bundle (.mcpb): every darwin/windows target and static linux target.
+The executable member in every produced container is verified against
+--expected-sha256 before anything is published.
 EOF
 }
 
 GOOS=""
 GOARCH=""
+SELECTED_BINARY=""
+EXPECTED_SHA256=""
+THIRD_PARTY_NOTICES=""
 OUT_DIR="$ROOT"
-MAKE_ARGS=()
 expect_value=""
 for arg in "$@"; do
     case "$expect_value" in
+    selected-binary) SELECTED_BINARY="$arg"; expect_value=""; continue ;;
+    expected-sha256) EXPECTED_SHA256="$arg"; expect_value=""; continue ;;
+    third-party-notices) THIRD_PARTY_NOTICES="$arg"; expect_value=""; continue ;;
     out-dir) OUT_DIR="$arg"; expect_value=""; continue ;;
     esac
     case "$arg" in
     -h | --help) usage; exit 0 ;;
+    --selected-binary) expect_value="selected-binary" ;;
+    --selected-binary=*) SELECTED_BINARY="${arg#--selected-binary=}" ;;
+    --expected-sha256) expect_value="expected-sha256" ;;
+    --expected-sha256=*) EXPECTED_SHA256="${arg#--expected-sha256=}" ;;
+    --third-party-notices) expect_value="third-party-notices" ;;
+    --third-party-notices=*) THIRD_PARTY_NOTICES="${arg#--third-party-notices=}" ;;
     --out-dir) expect_value="out-dir" ;;
     --out-dir=*) OUT_DIR="${arg#--out-dir=}" ;;
     -*)
         echo "package-release: unknown option '$arg'. Please consult --help." >&2
         exit 2
         ;;
-    *=*) MAKE_ARGS+=("$arg") ;;
+    *=*)
+        echo "package-release: build variables are not accepted; package already-final bytes." >&2
+        exit 2
+        ;;
     *)
         if [ -z "$GOOS" ]; then GOOS="$arg"
         elif [ -z "$GOARCH" ]; then GOARCH="$arg"
@@ -77,140 +87,189 @@ for arg in "$@"; do
         ;;
     esac
 done
-[ -n "$GOOS" ] && [ -n "$GOARCH" ] || { usage >&2; exit 2; }
-case "$GOOS" in
-linux | darwin | windows) ;;
-*) echo "package-release: goos must be linux, darwin or windows." >&2; exit 2 ;;
-esac
-[ -n "$expect_value" ] && { echo "package-release: --$expect_value needs a value." >&2; exit 2; }
 
-BUILD_DIR="${BUILD_DIR:-build/c}"
-OUT_DIR="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd)"
-NAME="codebase-memory-mcp-${GOOS}-${GOARCH}"
-
-# Ship every release binary stripped. Production already builds without -g, but
-# the linker still keeps a ~536 KB .symtab, so releases carried their full
-# symbol table to users: bigger downloads and a free map of the internals, with
-# nothing gained. Nothing symbolizes at runtime (mem_profile.c is not in the
-# production build and never calls backtrace_symbols), so this costs no
-# diagnostics.
-#
-# A historical unstripped linux-amd64 artifact was the sole Microsoft detection
-# in release run 30398064336, while related stripped artifacts later scanned
-# clean. That is useful release evidence but not controlled feature attribution:
-# engine state and other bytes can differ between observations. Independently
-# of the opaque verdict, stripping removes an unnecessary symbol surface and
-# does not change program behavior.
-#
-# macOS is ad-hoc signed by the build workflow BEFORE this script runs, and
-# stripping invalidates that signature, so Mach-O is re-signed here. Skipping
-# the re-sign ships a binary the kernel refuses to exec.
-strip_release_binary() {
-    local binary="$1"
-    [ -f "$binary" ] || return 0
-    # The right flags differ per format, and the WRONG ones fail silently in
-    # the dangerous direction. Measured on the flagged darwin-arm64 artifact:
-    #
-    #   llvm-strip --strip-all   373 symbols   scanned CLEAN
-    #   strip        (no flags)  378 symbols   equivalent
-    #   strip -x -S             4058 symbols   the state VirusTotal FLAGGED
-    #   strip -X / -u -r        4058 symbols   likewise
-    #
-    # Apple's strip returns success for `-x -S`, so a helper that just tries
-    # candidates until one exits 0 would quietly reship the flagged binary.
-    # GNU/LLVM `--strip-all` is not even accepted by Apple's strip, which is why
-    # generalising it to every platform broke the macOS build -- loudly, which
-    # was the lucky outcome.
-    #
-    # So: --strip-all where it is understood, plain `strip` for Mach-O, and a
-    # hard error when no candidate can do the job. Never a weaker fallback.
-    local stripped=""
-    for tool in "${STRIP:-}" llvm-strip strip; do
-        [ -n "$tool" ] || continue
-        command -v "$tool" >/dev/null 2>&1 || continue
-        if "$tool" --strip-all "$binary" 2>/dev/null; then
-            stripped="$tool --strip-all"
-        elif [ "$GOOS" = "darwin" ] && "$tool" "$binary" 2>/dev/null; then
-            stripped="$tool"
-        fi
-        [ -n "$stripped" ] && break
-    done
-    if [ -z "$stripped" ]; then
-        echo "package-release: no working strip for $binary" >&2
-        return 1
-    fi
-    if [ "$GOOS" = "darwin" ]; then
-        command -v codesign >/dev/null 2>&1 &&
-            codesign --sign - --force "$binary" 2>/dev/null
-    fi
-    echo "=== package-release: stripped $(basename "$binary") ==="
-    return 0
+[ -z "$expect_value" ] || {
+    echo "package-release: --$expect_value needs a value." >&2
+    exit 2
 }
-
-if [ "$GOOS" = "windows" ]; then
-    # Windows ships one executable, exactly like every other runtime set. There is no
-    # launcher stub: a small unsigned PE whose entire job is to verify and
-    # execute another binary adds loader-like behavior and another artifact to
-    # audit. Historical launcher builds received Microsoft Wacatac verdicts,
-    # but that observation does not identify a stable feature or establish
-    # causation. Self-update — the launcher's whole reason to exist — moves OUT
-    # of the running process into install.ps1: Windows' executable lock only
-    # blocks a process from replacing ITSELF.
-    PAYLOAD="$BUILD_DIR/codebase-memory-mcp"
-    [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
-    [ -f "$PAYLOAD" ] || { echo "package-release: build first; missing $PAYLOAD" >&2; exit 2; }
-    STAGED_BINARY_NAME="codebase-memory-mcp.exe"
-    INSTALLER="install.ps1"
-else
-    PAYLOAD="$BUILD_DIR/codebase-memory-mcp"
-    [ -f "$PAYLOAD" ] || { echo "package-release: build first; missing $PAYLOAD" >&2; exit 2; }
-    STAGED_BINARY_NAME="codebase-memory-mcp"
-    INSTALLER="install.sh"
+[ -n "$GOOS" ] && [ -n "$GOARCH" ] || { usage >&2; exit 2; }
+case "$GOOS/$GOARCH" in
+linux/amd64 | linux/arm64 | linux/amd64-portable | linux/arm64-portable | \
+darwin/amd64 | darwin/arm64 | windows/amd64 | windows/arm64) ;;
+*)
+    echo "package-release: unsupported release target '$GOOS/$GOARCH'." >&2
+    exit 2
+    ;;
+esac
+[ -n "$SELECTED_BINARY" ] || {
+    echo "package-release: --selected-binary is required." >&2
+    exit 2
+}
+[ -f "$SELECTED_BINARY" ] || {
+    echo "package-release: selected binary not found: $SELECTED_BINARY" >&2
+    exit 2
+}
+[ -n "$EXPECTED_SHA256" ] || {
+    echo "package-release: --expected-sha256 is required." >&2
+    exit 2
+}
+EXPECTED_SHA256="$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')"
+if ! [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "package-release: --expected-sha256 must be exactly 64 hexadecimal characters." >&2
+    exit 2
 fi
 
-# Work from one owner-private directory for every target. The binary is copied
-# here BEFORE strip/re-sign and the archive is created from this same directory,
-# so the executable that validates the adjacent sidecars is byte-for-byte the
-# executable users receive. Keeping the stage beside the build also avoids a
-# system /tmp mounted noexec: the validation probe must actually execute.
-PACK_DIR="$(mktemp -d "$BUILD_DIR/.cbm-package.XXXXXX")"
-trap 'rm -rf "$PACK_DIR"' EXIT
-STAGED_BINARY="$PACK_DIR/$STAGED_BINARY_NAME"
-cp "$PAYLOAD" "$STAGED_BINARY"
-strip_release_binary "$STAGED_BINARY" || exit 2
+# Resolve all caller-owned inputs before creating the private packaging area.
+SELECTED_BINARY="$(cd "$(dirname "$SELECTED_BINARY")" && pwd -P)/$(basename "$SELECTED_BINARY")"
+if [ -n "$THIRD_PARTY_NOTICES" ]; then
+    [ -f "$THIRD_PARTY_NOTICES" ] || {
+        echo "package-release: notices file not found: $THIRD_PARTY_NOTICES" >&2
+        exit 2
+    }
+    THIRD_PARTY_NOTICES="$(cd "$(dirname "$THIRD_PARTY_NOTICES")" && pwd -P)/$(basename "$THIRD_PARTY_NOTICES")"
+fi
+OUT_DIR="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd -P)"
+NAME="codebase-memory-mcp-${GOOS}-${GOARCH}"
 
-# Gate the artifact AFTER strip/re-sign: this is the final executable image and
-# no later step may mutate it.
+sha256_file() {
+    python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+digest = hashlib.sha256()
+with pathlib.Path(sys.argv[1]).open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+assert_expected_hash() {
+    local path="$1"
+    local label="$2"
+    local actual
+    actual="$(sha256_file "$path")"
+    if [ "$actual" != "$EXPECTED_SHA256" ]; then
+        echo "package-release: $label SHA-256 mismatch: expected $EXPECTED_SHA256, got $actual" >&2
+        return 1
+    fi
+}
+
+extract_zip_member() {
+    local archive="$1"
+    local member="$2"
+    local destination="$3"
+    python3 - "$archive" "$member" "$destination" <<'PY'
+import pathlib
+import shutil
+import stat
+import sys
+import zipfile
+
+archive_path = pathlib.Path(sys.argv[1])
+member_name = sys.argv[2]
+destination = pathlib.Path(sys.argv[3])
+with zipfile.ZipFile(archive_path, "r") as archive:
+    matches = [info for info in archive.infolist() if info.filename == member_name]
+    if len(matches) != 1:
+        raise SystemExit(f"package-release: ZIP must contain exactly one {member_name}")
+    info = matches[0]
+    mode = (info.external_attr >> 16) & 0xFFFF
+    if info.is_dir() or (mode and stat.S_IFMT(mode) not in (0, stat.S_IFREG)):
+        raise SystemExit(f"package-release: ZIP member is not regular: {member_name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with archive.open(info, "r") as source, destination.open("xb") as output:
+        shutil.copyfileobj(source, output, length=1024 * 1024)
+PY
+}
+
+# Hash the caller-owned file before taking the per-target output lock. A bad
+# selection must not create any artifact or packaging residue.
+assert_expected_hash "$SELECTED_BINARY" "selected binary" || exit 2
+
+if [ "$GOOS" = "windows" ]; then
+    STAGED_BINARY_NAME="codebase-memory-mcp.exe"
+    INSTALLER="install.ps1"
+    ARCHIVE_OUT="$OUT_DIR/$NAME.zip"
+else
+    STAGED_BINARY_NAME="codebase-memory-mcp"
+    INSTALLER="install.sh"
+    ARCHIVE_OUT="$OUT_DIR/$NAME.tar.gz"
+fi
+MCPB_OUT="$OUT_DIR/$NAME.mcpb"
+BUILD_MCPB=0
+case "$GOOS/$GOARCH" in
+darwin/* | windows/* | linux/*-portable) BUILD_MCPB=1 ;;
+esac
+
+LOCK_DIR="$OUT_DIR/.${NAME}.package.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "package-release: target is already being packaged (lock exists): $LOCK_DIR" >&2
+    exit 2
+fi
+cleanup() {
+    local status=$?
+    trap - EXIT
+    rm -rf "$LOCK_DIR"
+    exit "$status"
+}
+trap cleanup EXIT
+
+if [ -e "$ARCHIVE_OUT" ] || [ -e "$MCPB_OUT" ]; then
+    echo "package-release: refusing to overwrite an existing $NAME release container." >&2
+    exit 2
+fi
+
+PACK_DIR="$LOCK_DIR/stage"
+OUTPUT_DIR="$LOCK_DIR/output"
+VERIFY_DIR="$LOCK_DIR/verify"
+mkdir -p "$PACK_DIR" "$OUTPUT_DIR" "$VERIFY_DIR"
+STAGED_BINARY="$PACK_DIR/$STAGED_BINARY_NAME"
+cp "$SELECTED_BINARY" "$STAGED_BINARY"
+# upload-artifact transports do not preserve Unix mode. Restoring the container
+# metadata is allowed; chmod does not alter the selected file's byte sequence.
+chmod 0755 "$STAGED_BINARY"
+assert_expected_hash "$STAGED_BINARY" "staged binary" || exit 2
+
+# The composition gate is read-only and runs against the exact executable that
+# will enter both containers. Candidate derivation and scanning precede this
+# packaging boundary.
 bash scripts/ci/check-binary-composition.sh "$STAGED_BINARY" || exit 2
+assert_expected_hash "$STAGED_BINARY" "composition-gated binary" || exit 2
+assert_expected_hash "$SELECTED_BINARY" "selected binary after staging" || exit 2
 
 cp LICENSE "$INSTALLER" "$PACK_DIR/"
-scripts/gen-third-party-notices.sh "$PACK_DIR/THIRD_PARTY_NOTICES.md"
+if [ -n "$THIRD_PARTY_NOTICES" ]; then
+    cp "$THIRD_PARTY_NOTICES" "$PACK_DIR/THIRD_PARTY_NOTICES.md"
+else
+    scripts/gen-third-party-notices.sh "$PACK_DIR/THIRD_PARTY_NOTICES.md"
+fi
 
+ARCHIVE_TMP="$OUTPUT_DIR/$(basename "$ARCHIVE_OUT")"
 if [ "$GOOS" = "windows" ]; then
     (
         cd "$PACK_DIR"
-        rm -f "$OUT_DIR/$NAME.zip"
-        zip -q "$OUT_DIR/$NAME.zip" \
+        zip -q -X "$ARCHIVE_TMP" \
             codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
     )
-    echo "=== package-release: $OUT_DIR/$NAME.zip ==="
+    mkdir "$VERIFY_DIR/archive"
+    extract_zip_member "$ARCHIVE_TMP" "$STAGED_BINARY_NAME" \
+        "$VERIFY_DIR/archive/$STAGED_BINARY_NAME"
 else
     # BSD tar otherwise materializes macOS extended attributes as hidden
     # AppleDouble `._*` members, violating the exact four-file inventory.
-    COPYFILE_DISABLE=1 tar -czf "$OUT_DIR/$NAME.tar.gz" -C "$PACK_DIR" \
+    COPYFILE_DISABLE=1 tar -czf "$ARCHIVE_TMP" -C "$PACK_DIR" \
         codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-    echo "=== package-release: $OUT_DIR/$NAME.tar.gz ==="
+    mkdir "$VERIFY_DIR/archive"
+    tar -xzf "$ARCHIVE_TMP" -C "$VERIFY_DIR/archive" "$STAGED_BINARY_NAME"
 fi
+assert_expected_hash "$VERIFY_DIR/archive/$STAGED_BINARY_NAME" "archive executable" || exit 2
 
-# ── MCPB bundle (registryType "mcpb" in the MCP Registry) ─────────────────
-# Repackages the SAME staged binary the archive above ships — already
-# stripped, re-signed and composition-gated — so the VirusTotal scan set
-# dedupes the executable to the archive's object; only manifest.json is a
-# new scan member. The installer script is deliberately absent: an MCPB
-# host manages install/update itself.
 build_mcpb_bundle() {
-    local out="$OUT_DIR/$NAME.mcpb"
-    local stage="$PACK_DIR/.mcpb-stage"
+    local out
+    out="$OUTPUT_DIR/$(basename "$MCPB_OUT")"
+    local stage="$LOCK_DIR/mcpb-stage"
     local entry="server/$STAGED_BINARY_NAME"
     local platform
     case "$GOOS" in
@@ -224,6 +283,7 @@ build_mcpb_bundle() {
     }
     mkdir -p "$stage/server"
     cp "$STAGED_BINARY" "$stage/$entry"
+    chmod 0755 "$stage/$entry"
     cp "$PACK_DIR/LICENSE" "$PACK_DIR/THIRD_PARTY_NOTICES.md" "$stage/server/"
     local mcpb_version="${VERSION:-0.0.0-dev}"
     mcpb_version="${mcpb_version#v}"
@@ -258,17 +318,48 @@ build_mcpb_bundle() {
   }
 }
 EOF
-    rm -f "$out"
     (
         cd "$stage"
         zip -q -X "$out" \
             manifest.json "$entry" server/LICENSE server/THIRD_PARTY_NOTICES.md
     )
-    echo "=== package-release: $out ==="
+    mkdir "$VERIFY_DIR/mcpb"
+    extract_zip_member "$out" "$entry" "$VERIFY_DIR/mcpb/$entry"
+    assert_expected_hash "$VERIFY_DIR/mcpb/$entry" "MCPB executable" || return 1
 }
 
-# MCPB eligibility: every darwin/windows target, but only the STATIC linux
-# builds — a glibc-dynamic binary defeats the one-click-install promise.
-case "$GOOS/$GOARCH" in
-darwin/* | windows/* | linux/*-portable) build_mcpb_bundle || exit 2 ;;
-esac
+if [ "$BUILD_MCPB" -eq 1 ]; then
+    build_mcpb_bundle || exit 2
+fi
+
+# Recheck both byte owners after every packaging operation. No archive tool,
+# manifest step, or future gate may mutate either one unnoticed.
+assert_expected_hash "$STAGED_BINARY" "final staged binary" || exit 2
+assert_expected_hash "$SELECTED_BINARY" "final selected binary" || exit 2
+
+# Publish only after every container has been built and verified. Because the
+# temporary outputs live below OUT_DIR, a hard link provides an atomic
+# create-if-absent operation on the same filesystem; unlike mv, it cannot
+# replace a path that appeared after the preflight check.
+publish_no_clobber() {
+    local source="$1"
+    local destination="$2"
+    if ! ln "$source" "$destination"; then
+        echo "package-release: refusing to overwrite release container: $destination" >&2
+        return 1
+    fi
+    rm -f "$source"
+}
+
+publish_no_clobber "$ARCHIVE_TMP" "$ARCHIVE_OUT" || exit 2
+if [ "$BUILD_MCPB" -eq 1 ]; then
+    if ! publish_no_clobber "$OUTPUT_DIR/$(basename "$MCPB_OUT")" "$MCPB_OUT"; then
+        rm -f "$ARCHIVE_OUT"
+        exit 2
+    fi
+fi
+
+echo "=== package-release: $ARCHIVE_OUT (selected sha256 $EXPECTED_SHA256) ==="
+if [ "$BUILD_MCPB" -eq 1 ]; then
+    echo "=== package-release: $MCPB_OUT (same selected sha256) ==="
+fi

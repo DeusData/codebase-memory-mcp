@@ -2017,6 +2017,24 @@ static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
     return extract_string_value(ctx, val_node);
 }
 
+// `prefixVar + "/route"` (Go's idiomatic configurable-base-path pattern):
+// recover the literal suffix. A right side that is not itself a literal is
+// left unresolved rather than guessed (issue #1249).
+static const char *extract_binary_concat_suffix(CBMExtractCtx *ctx, TSNode node) {
+    TSNode op_node = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    if (!ts_node_is_null(op_node)) {
+        char *op = cbm_node_text(ctx->arena, op_node, ctx->source);
+        if (!op || strcmp(op, "+") != 0) {
+            return NULL;
+        }
+    }
+    TSNode rhs = ts_node_child_by_field_name(node, TS_FIELD("right"));
+    if (ts_node_is_null(rhs) || !is_string_like(ts_node_type(rhs))) {
+        return NULL;
+    }
+    return strip_and_validate_string_arg(ctx->arena, cbm_node_text(ctx->arena, rhs, ctx->source));
+}
+
 // Try to extract URL/topic from a positional argument (string or constant).
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
     /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
@@ -2025,6 +2043,12 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
         const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
         if (flat) {
             return strip_and_validate_string_arg(ctx->arena, (char *)flat);
+        }
+    }
+    if (strcmp(ak, "binary_expression") == 0) {
+        const char *suffix = extract_binary_concat_suffix(ctx, arg);
+        if (suffix) {
+            return suffix;
         }
     }
     if (is_string_like(ak)) {

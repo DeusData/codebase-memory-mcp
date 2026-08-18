@@ -50,6 +50,20 @@ static int cte_codex_edit(const char *path, cbm_toml_codex_hook_action_t action,
                                           CTE_CODEX_COMMAND, action, check_only);
 }
 
+static int cte_codex_edit_commands_detailed(const char *path, const char *command,
+                                            const char *command_windows,
+                                            cbm_toml_codex_hook_action_t action, int check_only,
+                                            cbm_toml_codex_hook_failure_t *failure) {
+    return cbm_toml_reconcile_codex_hooks_detailed(path, CTE_CODEX_BEGIN, CTE_CODEX_END, command,
+                                                   command_windows, action, check_only, failure);
+}
+
+static int cte_codex_edit_detailed(const char *path, cbm_toml_codex_hook_action_t action,
+                                   int check_only, cbm_toml_codex_hook_failure_t *failure) {
+    return cte_codex_edit_commands_detailed(path, CTE_CODEX_COMMAND, CTE_CODEX_COMMAND, action,
+                                            check_only, failure);
+}
+
 static int cte_fixture(char *dir, size_t dir_size, char *path, size_t path_size) {
     char *created = th_mktempdir("cbm_toml_edit");
     if (!created) {
@@ -101,6 +115,25 @@ static int cte_occurrences(const char *text, const char *needle) {
         cursor += needle_len;
     }
     return count;
+}
+
+static int cte_replace_once(const char *source, const char *needle, const char *replacement,
+                            char *output, size_t output_size) {
+    const char *match = strstr(source, needle);
+    if (!match) {
+        return -1;
+    }
+    size_t prefix_len = (size_t)(match - source);
+    size_t needle_len = strlen(needle);
+    size_t replacement_len = strlen(replacement);
+    size_t suffix_len = strlen(match + needle_len);
+    if (prefix_len + replacement_len + suffix_len >= output_size) {
+        return -1;
+    }
+    memcpy(output, source, prefix_len);
+    memcpy(output + prefix_len, replacement, replacement_len);
+    memcpy(output + prefix_len + replacement_len, match + needle_len, suffix_len + 1U);
+    return 0;
 }
 
 static size_t cte_temp_count(const char *dir) {
@@ -1099,6 +1132,120 @@ TEST(config_toml_codex_reconciles_minimal_owned_forms) {
     PASS();
 }
 
+/* #1633: keep this fixture literal. It is the managed AOT block written by the
+ * v0.10.2 release, with the release's POSIX and PowerShell command builders. */
+TEST(config_toml_codex_accepts_v0102_managed_windows_crlf) {
+    static const char *command =
+        "'C:\\Users\\Example\\AppData\\Local\\Programs\\codebase-memory-mcp\\"
+        "codebase-memory-mcp.exe' hook-augment";
+    static const char *command_windows =
+        "& 'C:\\Users\\Example\\AppData\\Local\\Programs\\codebase-memory-mcp\\"
+        "codebase-memory-mcp.exe' hook-augment";
+    static const char *original =
+        "\xEF\xBB\xBF[mcp_servers.other]\r\n"
+        "command = \"other\"\r\n"
+        "keep = true\r\n"
+        "# >>> codebase-memory-mcp SessionStart >>>\r\n"
+        "[[hooks.SessionStart]]\r\n"
+        "matcher = \"startup|resume|clear|compact\"\r\n"
+        "\r\n"
+        "[[hooks.SessionStart.hooks]]\r\n"
+        "type = \"command\"\r\n"
+        "command = \"'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
+        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "command_windows = \"& 'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
+        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "timeout = 5\r\n"
+        "\r\n"
+        "[[hooks.SubagentStart]]\r\n"
+        "matcher = \"*\"\r\n"
+        "\r\n"
+        "[[hooks.SubagentStart.hooks]]\r\n"
+        "type = \"command\"\r\n"
+        "command = \"'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
+        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "command_windows = \"& 'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
+        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n"
+        "timeout = 5\r\n"
+        "# <<< codebase-memory-mcp SessionStart <<<\r\n";
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char before[CTE_FILE_CAP];
+    char actual[CTE_FILE_CAP];
+    char invalid[2][CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, original), 0);
+    ASSERT_EQ(cte_read(path, before, sizeof(before)), 0);
+
+    cbm_toml_codex_hook_failure_t failure = CBM_TOML_CODEX_HOOK_FAILURE_INVALID_ARGUMENT;
+    int reconcile_rc = cte_codex_edit_commands_detailed(path, command, command_windows,
+                                                        CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure);
+    ASSERT_EQ(failure, CBM_TOML_CODEX_HOOK_FAILURE_NONE);
+    ASSERT_EQ(reconcile_rc, 0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, before);
+
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, before);
+    ASSERT_EQ(cte_occurrences(actual, CTE_CODEX_BEGIN), 1);
+    ASSERT_EQ(cte_occurrences(actual, "[[hooks.SessionStart]]"), 1);
+    ASSERT_EQ(cte_occurrences(actual, "[[hooks.SubagentStart]]"), 1);
+    ASSERT_NOT_NULL(strstr(actual, "[mcp_servers.other]"));
+    ASSERT_NOT_NULL(strstr(actual, "keep = true"));
+    for (const char *cursor = actual; *cursor; ++cursor) {
+        if (*cursor == '\n') {
+            ASSERT(cursor > actual && cursor[-1] == '\r');
+        }
+    }
+
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, before);
+
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_REMOVE, 0, &failure),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_NOT_NULL(strstr(actual, "[mcp_servers.other]"));
+    ASSERT_NOT_NULL(strstr(actual, "keep = true"));
+    ASSERT_NULL(strstr(actual, CTE_CODEX_BEGIN));
+    ASSERT_NULL(strstr(actual, "hook-augment"));
+
+    static const char *owned_line =
+        "command = \"'C:\\\\Users\\\\Example\\\\AppData\\\\Local\\\\Programs\\\\"
+        "codebase-memory-mcp\\\\codebase-memory-mcp.exe' hook-augment\"\r\n";
+    ASSERT_EQ(cte_replace_once(original, owned_line, "command = \"foreign\"\r\n", invalid[0],
+                               sizeof(invalid[0])),
+              0);
+    ASSERT_EQ(cte_replace_once(original, "type = \"command\"\r\n",
+                               "type = \"command\"\r\nenabled = true\r\n", invalid[1],
+                               sizeof(invalid[1])),
+              0);
+    for (size_t i = 0U; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        ASSERT_EQ(th_write_file(path, invalid[i]), 0);
+        failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+        ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                                   CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure),
+                  -1);
+        ASSERT_EQ(failure, CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, invalid[i]);
+        ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                                   CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
+                  -1);
+        ASSERT_EQ(failure, CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, invalid[i]);
+    }
+    th_cleanup(dir);
+    PASS();
+}
+
 TEST(config_toml_codex_rejects_ambiguous_inline_byte_identically) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
@@ -1125,6 +1272,60 @@ TEST(config_toml_codex_rejects_ambiguous_inline_byte_identically) {
         ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
         ASSERT_STR_EQ(actual, invalid[i]);
     }
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_toml_codex_reports_stable_failure_reasons) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    static const struct {
+        const char *content;
+        cbm_toml_codex_hook_failure_t expected;
+        const char *name;
+    } cases[] = {
+        {
+            .content =
+                "[hooks]\nSessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = ["
+                "{ type = 'command', command = 'codebase-memory-mcp hook-augment' }, "
+                "{ type = 'command', command = 'foreign' }] }]\n",
+            .expected = CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP,
+            .name = "ambiguous_hook_ownership",
+        },
+        {
+            .content =
+                "[hooks]\n"
+                "SessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = [{ type = "
+                "'command', command = 'echo \"Code discovery: prefer codebase-memory-mcp\"' }] "
+                "}]\n"
+                "SessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = [{ type = "
+                "'command', command = 'echo \"Code discovery: prefer codebase-memory-mcp\"' }] "
+                "}]\n",
+            .expected = CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS,
+            .name = "conflicting_hook_representations",
+        },
+        {
+            .content = "[hooks\n",
+            .expected = CBM_TOML_CODEX_HOOK_FAILURE_MALFORMED_CONFIG,
+            .name = "malformed_config",
+        },
+    };
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        cbm_toml_codex_hook_failure_t failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
+        ASSERT_EQ(th_write_file(path, cases[i].content), 0);
+        ASSERT_EQ(cte_codex_edit_detailed(path, CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure), -1);
+        ASSERT_EQ(failure, cases[i].expected);
+        ASSERT_STR_EQ(cbm_toml_codex_hook_failure_name(failure), cases[i].name);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, cases[i].content);
+    }
+
+    cbm_toml_codex_hook_failure_t failure = CBM_TOML_CODEX_HOOK_FAILURE_INVALID_ARGUMENT;
+    ASSERT_EQ(th_write_file(path, "keep = true\n"), 0);
+    ASSERT_EQ(cte_codex_edit_detailed(path, CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure), 0);
+    ASSERT_EQ(failure, CBM_TOML_CODEX_HOOK_FAILURE_NONE);
     th_cleanup(dir);
     PASS();
 }
@@ -1269,7 +1470,9 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_vibe_ambiguous_target_fail_closed);
     RUN_TEST(config_toml_target_table_rejects_significant_nonassignments_byte_identically);
     RUN_TEST(config_toml_codex_reconciles_minimal_owned_forms);
+    RUN_TEST(config_toml_codex_accepts_v0102_managed_windows_crlf);
     RUN_TEST(config_toml_codex_rejects_ambiguous_inline_byte_identically);
+    RUN_TEST(config_toml_codex_reports_stable_failure_reasons);
     RUN_TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot);
     RUN_TEST(config_toml_codex_many_foreign_aot_blocks_preserve_owned_reconciliation);
     RUN_TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation);

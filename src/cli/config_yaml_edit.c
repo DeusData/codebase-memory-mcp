@@ -99,6 +99,13 @@ typedef struct {
     size_t indent;
     bool blank;
     bool comment;
+    /* Double-quoted scalars may continue across lines via a trailing `\`
+     * (#1631). dquote_opens: this line ends inside an open double quote whose
+     * last byte is the continuation backslash. dquote_cont: this line is the
+     * textual continuation of such a scalar — VALUE BYTES, not structure;
+     * every structural walker must skip it. */
+    bool dquote_opens;
+    bool dquote_cont;
 } yaml_line_t;
 
 typedef struct {
@@ -291,13 +298,20 @@ static int yaml_validate_key(const char *key, size_t *out_len) {
     return 0;
 }
 
+static int yaml_validate_text_bytes_from(const char *data, size_t len, size_t from);
+
 static int yaml_validate_text_bytes(const char *data, size_t len) {
     if (len >= YAML_UTF8_BOM_LEN && (unsigned char)data[0] == YAML_BOM_BYTE_0 &&
         (unsigned char)data[YAML_UNIT] == YAML_BOM_BYTE_1 &&
         (unsigned char)data[YAML_ENTRY_INDENT] == YAML_BOM_BYTE_2) {
         return YAML_ERROR;
     }
-    for (size_t i = 0; i < len; i++) {
+    return yaml_validate_text_bytes_from(data, len, 0U);
+}
+
+/* Body of the byte validation, entered past any prologue. */
+static int yaml_validate_text_bytes_from(const char *data, size_t len, size_t from) {
+    for (size_t i = from; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
         if (c == '\t' || c == '\0' || c == YAML_DELETE_BYTE) {
             return YAML_ERROR;
@@ -778,9 +792,21 @@ static int yaml_read_file(const char *path, char **out_data, size_t *out_len,
 #endif
 #endif
     data[len] = '\0';
-    if (yaml_validate_text_bytes(data, len) != 0) {
-        free(data);
-        return YAML_ERROR;
+    /* Documents may open with a UTF-8 BOM (#1656) — validated past it here,
+     * treated as a prologue by yaml_doc_init, preserved verbatim on write.
+     * Non-document inputs (keys, blocks, identity scalars) keep the strict
+     * no-BOM rule via yaml_validate_text_bytes. */
+    {
+        size_t prologue = 0U;
+        if (len >= YAML_UTF8_BOM_LEN && (unsigned char)data[0] == YAML_BOM_BYTE_0 &&
+            (unsigned char)data[YAML_UNIT] == YAML_BOM_BYTE_1 &&
+            (unsigned char)data[YAML_ENTRY_INDENT] == YAML_BOM_BYTE_2) {
+            prologue = YAML_UTF8_BOM_LEN;
+        }
+        if (yaml_validate_text_bytes_from(data, len, prologue) != 0) {
+            free(data);
+            return YAML_ERROR;
+        }
     }
     *out_data = data;
     *out_len = len;
@@ -1127,6 +1153,76 @@ static void yaml_doc_free(yaml_doc_t *doc) {
     memset(doc, 0, sizeof(*doc));
 }
 
+/* Precompute the double-quote continuation flags (#1631): a line whose scan
+ * ends inside a double-quoted scalar with a trailing `\` opens a continuation;
+ * the following line is value text and may itself close, or re-open, the
+ * scalar. Any OTHER way of ending a line inside a quote stays an error at the
+ * validators. Returns YAML_ERROR only when the document ENDS inside an open
+ * continuation (the quote can never close). */
+static int yaml_mark_dquote_continuations(yaml_doc_t *doc) {
+    bool cont = false;
+    for (size_t i = 0; i < doc->line_count; i++) {
+        yaml_line_t *line = &doc->lines[i];
+        line->dquote_cont = cont;
+        line->dquote_opens = false;
+        if (!cont && (line->blank || line->comment)) {
+            continue;
+        }
+        size_t start = cont ? line->start : line->start + line->indent;
+        char quote = cont ? '"' : '\0';
+        bool opens = false;
+        char previous = '\0';
+        size_t j = start;
+        while (j < line->text_end) {
+            char c = doc->data[j];
+            if (quote == '"') {
+                if (c == '\\') {
+                    if (j + YAML_UNIT == line->text_end) {
+                        opens = true;
+                        break;
+                    }
+                    j += YAML_ENTRY_INDENT;
+                    continue;
+                }
+                if (c == '"') {
+                    quote = '\0';
+                }
+                j++;
+                continue;
+            }
+            if (quote == '\'') {
+                if (c == '\'') {
+                    if (j + YAML_UNIT < line->text_end && doc->data[j + YAML_UNIT] == '\'') {
+                        j += YAML_ENTRY_INDENT;
+                    } else {
+                        quote = '\0';
+                        j++;
+                    }
+                    continue;
+                }
+                j++;
+                continue;
+            }
+            if ((c == '"' || c == '\'') &&
+                (previous == '\0' || previous == ':' || previous == '-')) {
+                quote = c;
+                j++;
+                continue;
+            }
+            if (c == '#' && (j == start || doc->data[j - YAML_UNIT] == ' ')) {
+                break;
+            }
+            if (c != ' ' && c != '\t') {
+                previous = c;
+            }
+            j++;
+        }
+        line->dquote_opens = opens;
+        cont = opens;
+    }
+    return cont ? YAML_ERROR : 0;
+}
+
 static int yaml_doc_init(yaml_doc_t *doc, const char *data, size_t len) {
     memset(doc, 0, sizeof(*doc));
     doc->data = data;
@@ -1134,9 +1230,29 @@ static int yaml_doc_init(yaml_doc_t *doc, const char *data, size_t len) {
     if (yaml_build_lines(doc) != 0) {
         return YAML_ERROR;
     }
+    /* A UTF-8 BOM is a prologue, not content (#1656): Windows-authored
+     * configs routinely carry one (PowerShell 5.1 Set-Content -Encoding UTF8
+     * writes it), and treating its bytes as the first key made every edit op
+     * fail content-independently. Skip it for structure; edits splice ranges
+     * at line offsets, so the BOM survives every write byte-for-byte. */
+    if (doc->line_count > 0U && doc->len >= YAML_DOC_MARKER_LEN &&
+        (unsigned char)data[0] == 0xEFU && (unsigned char)data[1] == 0xBBU &&
+        (unsigned char)data[2] == 0xBFU) {
+        yaml_line_t *first = &doc->lines[0];
+        if (first->start == 0U && !first->blank) {
+            first->start = YAML_DOC_MARKER_LEN;
+            if (first->start + first->indent >= first->text_end) {
+                first->blank = true;
+            }
+        }
+    }
+    if (yaml_mark_dquote_continuations(doc) != 0) {
+        yaml_doc_free(doc);
+        return YAML_ERROR;
+    }
     for (size_t i = 0; i < doc->line_count; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->indent == 0U && !line->blank && !line->comment) {
+        if (line->indent == 0U && !line->blank && !line->comment && !line->dquote_cont) {
             size_t len_no_eol = line->text_end - line->start;
             if ((len_no_eol == YAML_DOC_MARKER_LEN &&
                  memcmp(doc->data + line->start, "---", YAML_DOC_MARKER_LEN) == 0) ||
@@ -1170,12 +1286,20 @@ static size_t yaml_trim_spaces_end(const char *data, size_t start, size_t end) {
 
 static int yaml_line_matches_key(const yaml_doc_t *doc, const yaml_line_t *line, size_t indent,
                                  const char *key, size_t key_len, size_t *out_colon) {
-    if (line->blank || line->comment || line->indent != indent) {
+    if (line->blank || line->comment || line->dquote_cont || line->indent != indent) {
         return 0;
     }
     size_t start = line->start + indent;
     size_t end = line->text_end;
     if (start >= end) {
+        return 0;
+    }
+    /* A block-sequence item at this indent is a known non-key line (#1631):
+     * YAML puts items at the same indent as their mapping key, so a column-0
+     * `- item` is ordinary structure, not a malformed key. The root-mapping
+     * walker already validated that items only follow a value-less key. */
+    if (doc->data[start] == '-' &&
+        (start + YAML_UNIT == end || doc->data[start + YAML_UNIT] == ' ')) {
         return 0;
     }
     size_t colon = 0U;
@@ -1241,7 +1365,7 @@ static int yaml_find_unique_key(const yaml_doc_t *doc, size_t indent, const char
 static size_t yaml_top_level_section_end(const yaml_doc_t *doc, size_t header_line) {
     for (size_t i = header_line + YAML_UNIT; i < doc->line_count; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (!line->blank && !line->comment && line->indent == 0U) {
+        if (!line->blank && !line->comment && !line->dquote_cont && line->indent == 0U) {
             return i;
         }
     }
@@ -1280,6 +1404,23 @@ static int yaml_scan_quote(const char *data, size_t end, size_t *pos, char *quot
     return 0;
 }
 
+/* Positional variant (#1631): a quote character OPENS a scalar only where a
+ * node begins — at the range start, after a mapping colon, or after a block-
+ * sequence dash. Mid-word apostrophes (`LET'S`) and inch marks are ordinary
+ * text, exactly like the `&`/`*` indicator rule above. Closing behaviour for
+ * an already-open quote is unchanged. */
+static int yaml_scan_quote_positional(const char *data, size_t end, size_t *pos, char *quote,
+                                      bool *is_plain, char previous) {
+    if (*quote == '\0') {
+        char c = data[*pos];
+        if ((c == '\'' || c == '"') && !(previous == '\0' || previous == ':' || previous == '-')) {
+            *is_plain = true;
+            return 0;
+        }
+    }
+    return yaml_scan_quote(data, end, pos, quote, is_plain);
+}
+
 static int yaml_find_comment(const char *data, size_t start, size_t end, size_t *out_comment) {
     char quote = '\0';
     for (size_t i = start; i < end; i++) {
@@ -1302,27 +1443,79 @@ static int yaml_find_comment(const char *data, size_t start, size_t end, size_t 
     return 0;
 }
 
+/* `&` and `*` are anchor/alias indicators only where a NODE begins. Once a
+ * plain scalar has started, they are ordinary characters.
+ *
+ * This used to reject them anywhere in the range, so a value containing prose
+ * asterisks — `use *emphasis* here`, a kaomoji, a glob in a description — was
+ * refused as if it were an alias. Reported against a real 16 KB Hermes config
+ * where this was one of four constructs that made the file permanently
+ * un-editable by us (#1631, root-caused by @rg6304 with an isolated repro).
+ *
+ * The test is positional and deliberately conservative: an indicator is only
+ * honoured as one when nothing has appeared before it in the value. `key: *a`
+ * is still an alias and still refused; `key: 2 * 3` and `key: a*b` are text.
+ * `{`/`}` keep their existing treatment here; mapping-body validation admits
+ * exact empty flow mappings through a context-specific exception.
+ *
+ * allow_open_dquote: the caller established (via the doc-level continuation
+ * flags, #1631) that this range legitimately ends inside a double-quoted
+ * scalar continued on the next line — an open `"` at range end is then not an
+ * error. Every other caller keeps the fail-closed unterminated-quote check. */
+static int yaml_range_has_unsupported_ex(const char *data, size_t start, size_t end,
+                                         bool allow_open_dquote);
+
 static int yaml_range_has_unsupported(const char *data, size_t start, size_t end) {
+    return yaml_range_has_unsupported_ex(data, start, end, false);
+}
+
+static int yaml_range_has_unsupported_ex(const char *data, size_t start, size_t end,
+                                         bool allow_open_dquote) {
     char quote = '\0';
+    /* Last significant character seen, so an indicator can be judged by what
+     * PRECEDES it. The scanned range covers a whole line including its key, so
+     * "first character in the range" is not the same as "start of a node" —
+     * in `command: &shared` the `&` is an anchor even though `command:` came
+     * first. A node begins at the range start, after a mapping colon, or after
+     * a block-sequence dash. */
+    char previous = '\0';
+    /* A continuation range ends with the escaping backslash itself; keep it
+     * out of the scan so yaml_scan_quote never sees a dangling escape. */
+    if (allow_open_dquote && end > start && data[end - YAML_UNIT] == '\\') {
+        end--;
+    }
     for (size_t i = start; i < end; i++) {
         bool is_plain = false;
-        if (yaml_scan_quote(data, end, &i, &quote, &is_plain) != 0) {
+        if (yaml_scan_quote_positional(data, end, &i, &quote, &is_plain, previous) != 0) {
             return YAML_MATCH;
         }
         if (!is_plain) {
+            previous = 'q';
             continue;
         }
         char c = data[i];
         if (c == '#' && (i == start || data[i - YAML_UNIT] == ' ')) {
             break;
         }
-        if (c == '{' || c == '}' || c == '&' || c == '*') {
+        if (c == '{' || c == '}') {
             return YAML_MATCH;
+        }
+        if (c == '&' || c == '*') {
+            bool begins_node = previous == '\0' || previous == ':' || previous == '-';
+            if (begins_node) {
+                return YAML_MATCH;
+            }
+        }
+        if (c != ' ' && c != '\t') {
+            previous = c;
         }
         if (c == '<' && i + YAML_ENTRY_INDENT < end && data[i + YAML_UNIT] == '<' &&
             data[i + YAML_ENTRY_INDENT] == ':') {
             return YAML_MATCH;
         }
+    }
+    if (quote == '"' && allow_open_dquote) {
+        return 0;
     }
     return quote != '\0';
 }
@@ -1351,9 +1544,13 @@ static int yaml_find_mapping_colon(const char *data, size_t start, size_t end, s
 
 static int yaml_validate_root_mapping(const yaml_doc_t *doc) {
     bool have_top_level_entry = false;
+    /* YAML allows a block sequence at the same indent as its mapping key
+     * (#1631): `agents:` followed by `- alpha` at column 0. Item lines are
+     * only legal directly after a value-less top-level key or another item. */
+    bool in_column_zero_sequence = false;
     for (size_t i = 0U; i < doc->line_count; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->blank || line->comment) {
+        if (line->blank || line->comment || line->dquote_cont) {
             continue;
         }
         if (line->indent != 0U) {
@@ -1364,6 +1561,14 @@ static int yaml_validate_root_mapping(const yaml_doc_t *doc) {
         }
 
         size_t start = line->start;
+        bool is_item = doc->data[start] == '-' &&
+                       (start + YAML_UNIT == line->text_end || doc->data[start + YAML_UNIT] == ' ');
+        if (is_item) {
+            if (!in_column_zero_sequence) {
+                return YAML_ERROR;
+            }
+            continue;
+        }
         if (doc->data[start] == '%' || doc->data[start] == '?' || doc->data[start] == ':') {
             return YAML_ERROR;
         }
@@ -1382,6 +1587,8 @@ static int yaml_validate_root_mapping(const yaml_doc_t *doc) {
             return YAML_ERROR;
         }
         have_top_level_entry = true;
+        size_t tail = yaml_skip_spaces(doc->data, colon + YAML_UNIT, line->text_end);
+        in_column_zero_sequence = tail == line->text_end || doc->data[tail] == '#';
     }
     return 0;
 }
@@ -1404,6 +1611,37 @@ static int yaml_tail_is_explicit_empty_mapping(const char *data, size_t colon, s
     return 0;
 }
 
+/* Exact empty flow collection (`{}` or `[]`) as the whole value, optionally
+ * followed by a comment. Used ONLY by the document VALIDATORS (#1631/#1673):
+ * an empty flow collection is preserved opaque user content. Section-header
+ * semantics keep the mapping-only helper above — `section: []` is a sequence,
+ * never an empty mapping section. */
+static int yaml_tail_is_explicit_empty_flow(const char *data, size_t colon, size_t end,
+                                            bool *out_empty) {
+    size_t comment = 0U;
+    if (yaml_find_comment(data, colon + YAML_UNIT, end, &comment) != 0) {
+        return YAML_ERROR;
+    }
+    size_t value_start = yaml_skip_spaces(data, colon + YAML_UNIT, comment);
+    size_t value_end = yaml_trim_spaces_end(data, value_start, comment);
+    *out_empty = value_end - value_start == YAML_QUOTED_MIN_LEN &&
+                 ((data[value_start] == '{' && data[value_start + YAML_UNIT] == '}') ||
+                  (data[value_start] == '[' && data[value_start + YAML_UNIT] == ']'));
+    return 0;
+}
+
+static int yaml_mapping_body_line_has_unsupported(const yaml_doc_t *doc, const yaml_line_t *line) {
+    size_t start = line->start + line->indent;
+    size_t colon = 0U;
+    bool empty_flow = false;
+    if (yaml_find_mapping_colon(doc->data, start, line->text_end, &colon) == 0 &&
+        yaml_tail_is_explicit_empty_flow(doc->data, colon, line->text_end, &empty_flow) == 0 &&
+        empty_flow) {
+        return yaml_range_has_unsupported(doc->data, start, colon + YAML_UNIT);
+    }
+    return yaml_range_has_unsupported_ex(doc->data, start, line->text_end, line->dquote_opens);
+}
+
 static int yaml_value_starts_multiline(const char *data, size_t colon, size_t end) {
     size_t pos = yaml_skip_spaces(data, colon + YAML_UNIT, end);
     return pos < end && (data[pos] == '|' || data[pos] == '>');
@@ -1417,11 +1655,11 @@ static int yaml_validate_mapping_body(const yaml_doc_t *doc, size_t first_line, 
     bool have_entry = false;
     for (size_t i = first_line; i < end_line; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->blank || line->comment) {
+        if (line->blank || line->comment || line->dquote_cont) {
             continue;
         }
         if (line->indent < YAML_ENTRY_INDENT || (line->indent & YAML_UNIT) != 0U ||
-            yaml_range_has_unsupported(doc->data, line->start + line->indent, line->text_end)) {
+            yaml_mapping_body_line_has_unsupported(doc, line)) {
             return YAML_ERROR;
         }
         size_t colon = 0U;
@@ -2394,7 +2632,7 @@ static size_t yaml_sequence_nested_end(const yaml_doc_t *doc, size_t header_line
     size_t indent = doc->lines[header_line].indent;
     for (size_t i = header_line + YAML_UNIT; i < parent_end; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (!line->blank && !line->comment && line->indent <= indent) {
+        if (!line->blank && !line->comment && !line->dquote_cont && line->indent <= indent) {
             return i;
         }
     }
@@ -2403,16 +2641,31 @@ static size_t yaml_sequence_nested_end(const yaml_doc_t *doc, size_t header_line
 
 static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_line_t *line) {
     size_t start = line->start + line->indent;
-    if (yaml_range_has_unsupported(doc->data, start, line->text_end)) {
+    /* Exact empty flow collections as values (`envs: {}`, `plugins: []`) are
+     * preserved opaque user content (#1631/#1673): validate only the key. */
+    size_t flow_colon = 0U;
+    bool empty_flow = false;
+    if (yaml_find_mapping_colon(doc->data, start, line->text_end, &flow_colon) == 0 &&
+        yaml_tail_is_explicit_empty_flow(doc->data, flow_colon, line->text_end, &empty_flow) == 0 &&
+        empty_flow) {
+        return yaml_range_has_unsupported(doc->data, start, flow_colon + YAML_UNIT);
+    }
+    size_t scan_end = line->text_end;
+    if (line->dquote_opens && scan_end > start && doc->data[scan_end - YAML_UNIT] == '\\') {
+        scan_end--;
+    }
+    if (yaml_range_has_unsupported_ex(doc->data, start, line->text_end, line->dquote_opens)) {
         return YAML_MATCH;
     }
     char quote = '\0';
-    for (size_t i = start; i < line->text_end; i++) {
+    char previous = '\0';
+    for (size_t i = start; i < scan_end; i++) {
         bool is_plain = false;
-        if (yaml_scan_quote(doc->data, line->text_end, &i, &quote, &is_plain) != 0) {
+        if (yaml_scan_quote_positional(doc->data, scan_end, &i, &quote, &is_plain, previous) != 0) {
             return YAML_MATCH;
         }
         if (!is_plain) {
+            previous = 'q';
             continue;
         }
         char value = doc->data[i];
@@ -2426,6 +2679,12 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
         if (value == '|' || value == '>') {
             return YAML_MATCH;
         }
+        if (value != ' ' && value != '\t') {
+            previous = value;
+        }
+    }
+    if (quote == '"' && line->dquote_opens) {
+        return 0;
     }
     return quote != '\0' ? YAML_MATCH : 0;
 }
@@ -2433,7 +2692,7 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
 static int yaml_sequence_validate_document(const yaml_doc_t *doc) {
     for (size_t i = 0U; i < doc->line_count; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->blank || line->comment) {
+        if (line->blank || line->comment || line->dquote_cont) {
             continue;
         }
         if ((line->indent & YAML_UNIT) != 0U || yaml_sequence_line_has_unsupported(doc, line)) {
@@ -2464,11 +2723,15 @@ static int yaml_sequence_decode_field_key(const yaml_doc_t *doc, size_t start, s
 static int yaml_sequence_validate_mapping_range(const yaml_doc_t *doc, size_t begin_line,
                                                 size_t end_line, size_t direct_indent) {
     bool have_direct = false;
+    /* YAML allows a block sequence at the same indent as its mapping key
+     * (#1631): a dash line directly after a value-less key at this indent is
+     * that key's opaque foreign value, not malformed structure. */
+    bool prev_key_open = false;
     yaml_sequence_key_vec_t keys = {0};
     int result = 0;
     for (size_t i = begin_line; i < end_line; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->blank || line->comment) {
+        if (line->blank || line->comment || line->dquote_cont) {
             continue;
         }
         if (line->indent < direct_indent || (line->indent > direct_indent && !have_direct)) {
@@ -2479,9 +2742,18 @@ static int yaml_sequence_validate_mapping_range(const yaml_doc_t *doc, size_t be
             continue;
         }
         size_t start = line->start + direct_indent;
-        if (start >= line->text_end || doc->data[start] == '-') {
+        if (start >= line->text_end) {
             result = YAML_ERROR;
             break;
+        }
+        if (doc->data[start] == '-') {
+            bool is_item =
+                start + YAML_UNIT == line->text_end || doc->data[start + YAML_UNIT] == ' ';
+            if (!is_item || !prev_key_open) {
+                result = YAML_ERROR;
+                break;
+            }
+            continue;
         }
         size_t colon = 0U;
         char *key = NULL;
@@ -2491,6 +2763,7 @@ static int yaml_sequence_validate_mapping_range(const yaml_doc_t *doc, size_t be
             break;
         }
         have_direct = true;
+        prev_key_open = yaml_tail_is_empty(doc->data, colon, line->text_end) != 0;
     }
     yaml_sequence_key_vec_free(&keys);
     return result;
@@ -2565,7 +2838,7 @@ static int yaml_sequence_parse_item(const yaml_doc_t *doc, size_t start_line, si
     int result = 0;
     for (size_t i = start_line; i < end_line; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->blank || line->comment) {
+        if (line->blank || line->comment || line->dquote_cont) {
             continue;
         }
         size_t field_start = 0U;
@@ -2619,7 +2892,7 @@ static int yaml_sequence_parse_block(const yaml_doc_t *doc, size_t begin_line, s
     size_t start_count = 0U;
     for (size_t i = begin_line; i < end_line; i++) {
         const yaml_line_t *line = &doc->lines[i];
-        if (line->blank || line->comment) {
+        if (line->blank || line->comment || line->dquote_cont) {
             continue;
         }
         if (line->indent == item_indent) {
@@ -3045,6 +3318,112 @@ static int yaml_remove_mapping_entry_locked(const char *file_path, const char *s
     return rc;
 }
 
+/* #1631 / goose upgrades: an existing entry under OUR key whose bytes differ
+ * from today's canonical is still OURS — and repairable — when it parses as a
+ * shape a previous release wrote AND its command value's basename is our
+ * binary. Recognized prior shapes, nothing else:
+ *   header `  <key>:` then EITHER exactly one `    command: V` line (the YAML
+ *   stdio schema; early releases wrote V unquoted), OR the goose block
+ *   `type/cmd/args/enabled` in order with an optional leading `name:` (the
+ *   pre-#1675 block had no name). V may be plain or double-quoted; its
+ *   basename must be codebase-memory-mcp[.exe]. Anything else stays FOREIGN
+ *   (fail-closed). */
+static bool yaml_owned_value_is_our_binary(const char *v, size_t vlen) {
+    if (vlen >= 2U && v[0] == '"' && v[vlen - 1U] == '"') {
+        v++;
+        vlen -= 2U;
+    }
+    size_t base = 0U;
+    for (size_t i = 0; i < vlen; i++) {
+        if (v[i] == '/' || v[i] == '\\') {
+            base = i + 1U;
+        }
+    }
+    const char *name = v + base;
+    size_t name_len = vlen - base;
+    static const char plain[] = "codebase-memory-mcp";
+    static const char exe[] = "codebase-memory-mcp.exe";
+    return (name_len == sizeof(plain) - 1U && memcmp(name, plain, name_len) == 0) ||
+           (name_len == sizeof(exe) - 1U && memcmp(name, exe, name_len) == 0);
+}
+
+static bool yaml_owned_entry_is_prior_shape(const char *data, size_t len, const char *entry_key,
+                                            size_t entry_key_len) {
+    /* Split into lines, tolerating CRLF. */
+    enum { PRIOR_MAX_LINES = 8 };
+    struct {
+        const char *text;
+        size_t len;
+    } lines[PRIOR_MAX_LINES];
+    size_t count = 0U;
+    size_t pos = 0U;
+    while (pos < len) {
+        const char *nl = memchr(data + pos, '\n', len - pos);
+        size_t line_len = nl ? (size_t)(nl - (data + pos)) : len - pos;
+        size_t trimmed = line_len;
+        while (trimmed > 0U && (data[pos + trimmed - 1U] == '\r')) {
+            trimmed--;
+        }
+        if (trimmed > 0U) {
+            if (count == PRIOR_MAX_LINES) {
+                return false;
+            }
+            lines[count].text = data + pos;
+            lines[count].len = trimmed;
+            count++;
+        }
+        pos += line_len + (nl ? 1U : 0U);
+    }
+    if (count < 2U) {
+        return false;
+    }
+    /* Header: `  <key>:` exactly. */
+    if (lines[0].len != entry_key_len + 3U || memcmp(lines[0].text, "  ", 2U) != 0 ||
+        memcmp(lines[0].text + 2U, entry_key, entry_key_len) != 0 ||
+        lines[0].text[2U + entry_key_len] != ':') {
+        return false;
+    }
+    /* Body lines: 4-space indent, known fields only. */
+    static const char cmd_prefix[] = "    command: ";
+    static const char goose_name[] = "    name: codebase-memory-mcp";
+    static const char goose_type[] = "    type: stdio";
+    static const char goose_cmd[] = "    cmd: ";
+    static const char goose_args[] = "    args: []";
+    static const char goose_enabled[] = "    enabled: true";
+    if (count == 2U && lines[1].len > sizeof(cmd_prefix) - 1U &&
+        memcmp(lines[1].text, cmd_prefix, sizeof(cmd_prefix) - 1U) == 0) {
+        return yaml_owned_value_is_our_binary(lines[1].text + sizeof(cmd_prefix) - 1U,
+                                              lines[1].len - (sizeof(cmd_prefix) - 1U));
+    }
+    size_t i = 1U;
+    if (i < count && lines[i].len == sizeof(goose_name) - 1U &&
+        memcmp(lines[i].text, goose_name, lines[i].len) == 0) {
+        i++;
+    }
+    if (i + 4U != count) {
+        return false;
+    }
+    if (lines[i].len != sizeof(goose_type) - 1U ||
+        memcmp(lines[i].text, goose_type, lines[i].len) != 0) {
+        return false;
+    }
+    i++;
+    if (lines[i].len <= sizeof(goose_cmd) - 1U ||
+        memcmp(lines[i].text, goose_cmd, sizeof(goose_cmd) - 1U) != 0 ||
+        !yaml_owned_value_is_our_binary(lines[i].text + sizeof(goose_cmd) - 1U,
+                                        lines[i].len - (sizeof(goose_cmd) - 1U))) {
+        return false;
+    }
+    i++;
+    if (lines[i].len != sizeof(goose_args) - 1U ||
+        memcmp(lines[i].text, goose_args, lines[i].len) != 0) {
+        return false;
+    }
+    i++;
+    return lines[i].len == sizeof(goose_enabled) - 1U &&
+           memcmp(lines[i].text, goose_enabled, lines[i].len) == 0;
+}
+
 static int yaml_edit_owned_mapping_entry_locked(const char *file_path, const char *section_key,
                                                 const char *entry_key,
                                                 const char *canonical_entry_block, bool remove) {
@@ -3104,14 +3483,17 @@ static int yaml_edit_owned_mapping_entry_locked(const char *file_path, const cha
         }
         entry_start = header->start;
         size_t existing_entry_len = target.entry_end - entry_start;
-        if (existing_entry_len != canonical.len ||
-            memcmp(doc.data + entry_start, canonical.data, canonical.len) != 0) {
+        bool canonical_match = existing_entry_len == canonical.len &&
+                               memcmp(doc.data + entry_start, canonical.data, canonical.len) == 0;
+        if (!canonical_match &&
+            !yaml_owned_entry_is_prior_shape(doc.data + entry_start, existing_entry_len, entry_key,
+                                             entry_len)) {
             yaml_buf_free(&canonical);
             yaml_doc_free(&doc);
             free(data);
             return CBM_YAML_IDENTITY_EDIT_FOREIGN;
         }
-        if (!remove) {
+        if (!remove && canonical_match) {
             yaml_buf_free(&canonical);
             yaml_doc_free(&doc);
             free(data);
@@ -3131,7 +3513,7 @@ static int yaml_edit_owned_mapping_entry_locked(const char *file_path, const cha
                            ? yaml_build_last_mapping_entry_removal(&out, &doc, &target)
                            : yaml_splice(&out, &doc, entry_start, target.entry_end, NULL, 0U);
     } else {
-        build_result = yaml_build_mapping_update(&out, &doc, &target, NULL, section_key,
+        build_result = yaml_build_mapping_update(&out, &doc, &target, header, section_key,
                                                  section_len, &canonical);
     }
     int result = build_result == 0 ? yaml_commit_if_changed(file_path, data, len, &snapshot, &out)

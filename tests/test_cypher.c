@@ -1548,6 +1548,46 @@ TEST(cypher_exec_where_eq) {
     PASS();
 }
 
+/* #1196: max_rows limits projected results, not the source-node candidates
+ * considered before WHERE. The old unlabeled scan searched only
+ * 10 * max_rows nodes, so a valid match later in search order disappeared. */
+TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    for (int i = 0; i < 11; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "early_%02d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t distractor = {.project = "test",
+                                 .label = "Function",
+                                 .name = name,
+                                 .qualified_name = qn,
+                                 .file_path = "early.py"};
+        ASSERT_GT(cbm_store_upsert_node(s, &distractor), 0);
+    }
+
+    cbm_node_t late = {.project = "test",
+                       .label = "Function",
+                       .name = "zz_late_match",
+                       .qualified_name = "test.zz_late_match",
+                       .file_path = "late.py"};
+    ASSERT_GT(cbm_store_upsert_node(s, &late), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n) WHERE n.name = \"zz_late_match\" RETURN n.name", "test", 1, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "zz_late_match");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #874: coalesce(var.prop, literal) in WHERE — null-safe numeric filters
  * for audit queries over OPTIONAL graph properties. The parser rejected the
  * call outright ("unexpected operator"); RETURN-side coalesce already
@@ -2983,11 +3023,39 @@ TEST(cypher_exec_variable_length_any_direction) {
     PASS();
 }
 
+/* A variable-length pattern that reuses a bound variable as its target
+ * (`(f)-[*1..2]->(f)`) unifies: only a hop that IS that node can extend the
+ * row. Without the unification check expand_var_length re-bound f to every
+ * reachable node and fabricated rows the query never asked for. The fixture
+ * graph has no cycle back to a starting Function, so the correct answer is
+ * zero rows. */
+TEST(cypher_exec_variable_length_repeated_node_var_unifies) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS*1..2]->(f:Function) "
+                                "RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* An explicit variable-length upper bound is query semantics, not an output
  * budget. The traversal must honor all 12 requested hops without a warning-only
- * clamp. The store BFS uses a visited frontier, so cyclic graphs terminate at
- * graph exhaustion in O(V + E) traversal work and O(V) visited memory rather
- * than materializing O(V * requested_depth) (node, hop) pairs. */
+ * clamp.
+ *
+ * This deliberately replaces the depth ceiling #887 added. That clamp existed
+ * because the old cbm_store_bfs walk was unbounded on cyclic graphs; the trail
+ * traversal this engine uses now carries an explicit work budget
+ * (g_cypher_trail_work_limit) and a visited frontier, so cost is bounded by
+ * O(V + E) traversal work and O(V) visited memory regardless of the requested
+ * depth. Bounding the WORK instead of the DEPTH removes the DoS without
+ * silently truncating a query the caller spelled out. */
 TEST(cypher_exec_var_length_bounds_preserve_reachability) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -7163,6 +7231,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
+    RUN_TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
     RUN_TEST(cypher_exec_untyped_variable_length_matches_all_relationship_types);
     RUN_TEST(cypher_exec_relationship_uniqueness_spans_entire_pattern);
@@ -7211,6 +7280,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);
     RUN_TEST(cypher_exec_variable_length_any_direction);
+    RUN_TEST(cypher_exec_variable_length_repeated_node_var_unifies);
     RUN_TEST(cypher_exec_var_length_bounds_preserve_reachability);
     RUN_TEST(cypher_exec_var_length_zero_hops_returns_start_only);
     RUN_TEST(cypher_exec_var_length_preserves_all_requested_edge_types);

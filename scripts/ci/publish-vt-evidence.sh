@@ -40,7 +40,7 @@ publish_copy() {
 
 publish_copy "$VT_ASSOCIATIONS" cbm-release-scan-associations-v3 virustotal-associations.tsv
 publish_copy "$VT_EXPECTED_SCAN_SET" cbm-release-scan-set-v2 virustotal-scan-set.tsv
-publish_copy "$VT_RESULTS_PATH" cbm-virustotal-results-v1 virustotal-results.tsv
+publish_copy "$VT_RESULTS_PATH" cbm-virustotal-results-v2 virustotal-results.tsv
 
 for name in virustotal-associations.tsv virustotal-results.tsv virustotal-scan-set.tsv; do
     if command -v sha256sum >/dev/null 2>&1; then

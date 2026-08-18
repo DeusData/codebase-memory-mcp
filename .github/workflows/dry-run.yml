@@ -1,30 +1,25 @@
 # Manual trigger: test everything before pushing a release.
 # Each step can be skipped for faster iteration.
 #
-# Pipeline:  lint → test → build → smoke/soak → virustotal   (sequential chain)
+# Pipeline:  lint → test → build + candidate scan/select → smoke/soak
 # Security:  security-static + codeql-gate                    (independent island)
 #
 # Security does NOT block lint/test/build/smoke/soak. All jobs must pass
 # for the overall workflow to be green.
 #
-# VirusTotal runs LAST and scans the same artifacts the release scans, so a
-# detection surfaces here instead of mid-release. It is the one dry-run job
-# whose verdict does not depend on our code: the same unchanged bytes can come
-# back clean one day and flagged the next, which is precisely why finding out
-# during a dry run is worth the wait.
+# Candidate VirusTotal scanning and tuple-local selection are part of the
+# reusable build boundary. Smoke and soak therefore start only after all 16
+# stripped/unstripped candidates have completed and the selected exact bytes
+# have been packaged under the canonical artifact names.
 #
 # The skips are independent because they answer different questions:
-#   skip_builds      no artifacts at all             "do lint and tests pass?"
-#   skip_smoke       build + scan, no smoke          "does this diff scan red?"
-#   skip_virustotal  build + smoke + soak, no scan   "do the archives pass CI?"
+#   skip_builds      no artifacts at all                 "do lint and tests pass?"
+#   skip_smoke       build + scan/select, no smoke       "does this diff scan red?"
+#   skip_virustotal  default-stripped + smoke, no scan   "do the archives pass CI?"
 #
-# skip_virustotal exists because the scan costs API quota and polls for up to
-# two hours, which is pure noise while iterating on a build or smoke failure.
-#
-# skip_smoke is the opposite trip: go straight from build to VirusTotal when the
-# question is only whether a diff turns the scan red. Smoke is in the VirusTotal
-# job's needs, so without this a smoke failure would withhold exactly the answer
-# such a run was dispatched to get.
+# skip_virustotal is a conspicuous dry-run-only bypass for API-quota-sensitive
+# iteration. It records unscanned-dry-run and deterministically chooses stripped
+# within each tuple. release.yml has no corresponding bypass.
 name: Dry Run
 
 on:
@@ -43,11 +38,11 @@ on:
         type: boolean
         default: false
       skip_smoke:
-        description: 'Skip smoke (build straight to VirusTotal)'
+        description: 'Skip smoke (candidate scan/select still runs inside build)'
         type: boolean
         default: false
       skip_virustotal:
-        description: 'Skip VirusTotal scan (still builds + smokes the archives)'
+        description: 'Skip candidate scan; mark unscanned and default to stripped'
         type: boolean
         default: false
       soak_level:
@@ -91,6 +86,8 @@ jobs:
     uses: ./.github/workflows/_build.yml
     with:
       attest: false
+      scan_candidates: ${{ !inputs.skip_virustotal }}
+    secrets: inherit
 
   # ── Smoke test every binary ────────────────────────────────────
   # Run unless builds were skipped or a build leg FAILED. Every build leg
@@ -111,13 +108,17 @@ jobs:
     with:
       duration_minutes: 10
       run_asan: ${{ inputs.soak_level == 'full' }}
+      use_release_artifacts: true
 
-  # ── VirusTotal (final step) ────────────────────────────────────
-  # Mirrors the release workflow's scan so a dry run answers the question the
-  # release will ask, before we tag anything. The only difference is where the
-  # archives come from: the release pulls them off a published release, a dry
-  # run has none, so they come from the build job's artifacts — the SAME files,
-  # produced by the same canonical package-release.sh.
+  # ── VirusTotal full-surface pass (final step) ─────────────────
+  # _build.yml already scans the 24 executable CANDIDATES and selects one per
+  # target. This job covers everything else we ship — install.sh, install.ps1,
+  # LICENSE, THIRD_PARTY_NOTICES.md, the MCPB manifest.json and the unpacked UI
+  # assets — so a dry run answers the same question the release will ask, before
+  # we tag anything. The only difference is where the containers come from: the
+  # release pulls them off a published release, a dry run has none, so they come
+  # from the build job's artifacts — the SAME bytes, produced by the same
+  # canonical package-release.sh.
   #
   # Runs after smoke and soak deliberately. It is the slowest job (polling can
   # take up to two hours) and the one most likely to be waiting on someone
@@ -146,14 +147,33 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/release-archives
 
-      # Same extraction the release verify job performs. VirusTotal receives
-      # only extracted release objects, never .tar.gz/.zip containers.
+      - name: Download the candidate-selection evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-selection-evidence
+          path: ${{ runner.temp }}/selection-evidence
+
+      # Same extraction the release verify job performs, over the same container
+      # set: 14 = 8 archives + 6 MCPB bundles; runtime 42 = 8x3 archive sidecars
+      # + 6x3 bundle members. VirusTotal receives only extracted release objects,
+      # never .tar.gz/.zip/.mcpb containers.
       - name: Extract archive artifacts
         run: |
           scripts/ci/extract-release-archives.sh "$RUNNER_TEMP/release-archives" binaries \
-            --expect-archives=8 \
-            --expect-binaries=8 \
-            --expect-runtime-files=24
+            --expect-archives=14 \
+            --expect-binaries=14 \
+            --expect-runtime-files=42
+
+      # The selected executables were already scanned as candidates in
+      # _build.yml, and identity is settled by SHA-256, so re-submitting them
+      # adds no assurance and costs a second, independently-timed verdict.
+      # Reached only when skip_virustotal is false, i.e. when the candidate scan
+      # this withholding relies on actually ran.
+      - name: Withhold already-scanned selected executables
+        run: |
+          bash scripts/ci/exclude-rescanned-selected-objects.sh \
+            binaries/objects "$RUNNER_TEMP/selection-evidence/release-selection.tsv" \
+            binaries/virustotal-withheld.tsv
 
       - name: VirusTotal scan
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
@@ -163,8 +183,9 @@ jobs:
           files: binaries/objects/*
           request_rate: 4
 
-      # Same ZERO-tolerance gate as the release. Every extracted object must arrive
-      # naturally clean; any malicious or suspicious verdict fails this run.
+      # Same policy as the release and candidate gates: a single Microsoft `!ml`
+      # is tolerated and disclosed, anything else blocks. Engine count is
+      # evidence, not a gate.
       - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
@@ -172,6 +193,7 @@ jobs:
           VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
           VT_ASSOCIATIONS: binaries/associations.tsv
           VT_RESULTS_PATH: binaries/vt-results.tsv
+          VT_WITHHELD: binaries/virustotal-withheld.tsv
           MIN_ENGINES: 50
         run: scripts/ci/check-virustotal.sh
 
@@ -184,4 +206,5 @@ jobs:
             binaries/associations.tsv
             binaries/scan-set.tsv
             binaries/vt-results.tsv
+            binaries/virustotal-withheld.tsv
           if-no-files-found: warn

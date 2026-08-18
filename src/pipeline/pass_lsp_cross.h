@@ -33,6 +33,7 @@
 #include "lsp/c_lsp.h"    /* cbm_c_build_cross_registry / cbm_run_c_lsp_cross_with_registry */
 #include "lsp/cs_lsp.h"   /* cbm_cs_build_cross_registry / cbm_run_cs_lsp_cross_with_registry */
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
+#include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
@@ -136,12 +137,21 @@ typedef struct {
     CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
+    CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
 
 /* Return the appropriate pre-built registry for a language, or NULL
  * if none was built (or language has no cross-LSP entrypoint). */
+/* Per-file registry-build cost (#1669): how many defs the per-file cross-LSP
+ * path actually registered, and how often the module filter failed. */
+/* Count defs an overlay registered for one file (complexity-gate telemetry). */
+void cbm_pxc_count_perfile_defs(uint64_t defs);
+
+void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint64_t *filter_files,
+                          uint64_t *filter_failed);
+
 static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
                                                          CBMLanguage lang) {
     if (!r)
@@ -163,6 +173,8 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
         return r->php;
     case CBM_LANG_CSHARP:
         return r->cs;
+    case CBM_LANG_JAVA:
+        return r->java;
     default:
         return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }

@@ -25,6 +25,7 @@
 #include "pagerank/pagerank.h"
 #include "test_graph_diff.h"
 #include "foundation/sha256.h"
+#include "foundation/compat_fs.h"
 #include "foundation/win_utf8.h" // cbm_utf8_to_wide (Windows pipeline_test_set_mtime); no-op elsewhere
 #include "discover/userconfig.h"
 
@@ -3765,6 +3766,50 @@ TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation
 }
 
 
+typedef struct {
+    bool published;
+    int rename_calls;
+    int export_count;
+    int exports_before_publish;
+} artifact_publish_observer_t;
+
+static artifact_publish_observer_t *g_artifact_publish_observer;
+
+static void observe_artifact_publish_log(const char *line) {
+    if (g_artifact_publish_observer && line && strstr(line, "msg=artifact.export")) {
+        g_artifact_publish_observer->export_count++;
+        if (!g_artifact_publish_observer->published) {
+            g_artifact_publish_observer->exports_before_publish++;
+        }
+    }
+}
+
+static int observe_successful_publish_rename(const char *staging_path, const char *final_path,
+                                             void *arg) {
+    artifact_publish_observer_t *observer = (artifact_publish_observer_t *)arg;
+    observer->rename_calls++;
+    int rc = cbm_rename_replace(staging_path, final_path);
+    observer->published = rc == 0;
+    return rc;
+}
+
+static int run_observing_artifact_publish(cbm_pipeline_t *pipeline,
+                                          artifact_publish_observer_t *observer) {
+    cbm_pipeline_set_rename_hook_for_tests(pipeline, observe_successful_publish_rename, observer);
+    CBMLogLevel previous_level = cbm_log_get_level();
+    CBMLogFormat previous_format = cbm_log_get_format();
+    g_artifact_publish_observer = observer;
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(observe_artifact_publish_log, CBM_LOG_SINK_REPLACE);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_format(previous_format);
+    cbm_log_set_level(previous_level);
+    g_artifact_publish_observer = NULL;
+    return rc;
+}
+
 /* Once a repository contains a shared artifact, every subsequently published
  * full generation must refresh it, even when persistence was not explicitly
  * requested on that invocation. Otherwise the live DB advances while a clean
@@ -3782,10 +3827,11 @@ TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
     ASSERT_EQ(th_write_file(source_path, "def ArtifactGenerationBefore():\n    return 1\n"), 0);
 
     cbm_pipeline_incremental_test_reset_faults();
+    artifact_publish_observer_t baseline_observer = {0};
     cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(baseline);
     cbm_pipeline_set_persistence(baseline, true);
-    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    int baseline_rc = run_observing_artifact_publish(baseline, &baseline_observer);
     char project[256];
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
     cbm_pipeline_free(baseline);
@@ -3793,18 +3839,29 @@ TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
 
     ASSERT_EQ(th_write_file(source_path, "def ArtifactGenerationAfter():\n    return 2\n"), 0);
     cbm_pipeline_incremental_test_reset_faults();
+    artifact_publish_observer_t reindex_observer = {0};
     cbm_pipeline_t *default_reindex = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(default_reindex);
-    int reindex_rc = cbm_pipeline_run(default_reindex);
+    int reindex_rc = run_observing_artifact_publish(default_reindex, &reindex_observer);
     cbm_incremental_route_t reindex_route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(default_reindex);
 
     /* A derived artifact must not become an input that forces another rebuild,
      * and refreshing it must not switch the authoritative DB back to WAL. */
     cbm_pipeline_incremental_test_reset_faults();
+    artifact_publish_observer_t explicit_observer = {0};
+    cbm_pipeline_t *explicit_noop = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(explicit_noop);
+    cbm_pipeline_set_persistence(explicit_noop, true);
+    int explicit_rc = run_observing_artifact_publish(explicit_noop, &explicit_observer);
+    cbm_incremental_route_t explicit_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(explicit_noop);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    artifact_publish_observer_t observer = {0};
     cbm_pipeline_t *unchanged = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(unchanged);
-    int unchanged_rc = cbm_pipeline_run(unchanged);
+    int unchanged_rc = run_observing_artifact_publish(unchanged, &observer);
     cbm_incremental_route_t unchanged_route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(unchanged);
 
@@ -3848,10 +3905,30 @@ TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
     cbm_pipeline_incremental_test_reset_faults();
     th_rmtree(tmp);
 
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_EQ(baseline_observer.rename_calls, 1);
+    ASSERT_EQ(baseline_observer.exports_before_publish, 0);
+    ASSERT_EQ(baseline_observer.export_count, 1);
     ASSERT_EQ(reindex_rc, 0);
     ASSERT_EQ(reindex_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Ordering, independent of which route the change took: the artifact is
+     * exported exactly once, and only AFTER the generation is published. */
+    ASSERT_EQ(reindex_observer.rename_calls, 1);
+    ASSERT_EQ(reindex_observer.exports_before_publish, 0);
+    ASSERT_EQ(reindex_observer.export_count, 1);
+    /* The artifact this run just refreshed must not read back as a changed
+     * input on the next run: an explicit persistence pass over unchanged
+     * sources still routes to a no-op. */
+    ASSERT_EQ(explicit_rc, 0);
+    ASSERT_EQ(explicit_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(explicit_observer.rename_calls, 1);
+    ASSERT_EQ(explicit_observer.exports_before_publish, 0);
+    ASSERT_EQ(explicit_observer.export_count, 1);
     ASSERT_EQ(unchanged_rc, 0);
     ASSERT_EQ(unchanged_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(observer.rename_calls, 1);
+    ASSERT_EQ(observer.exports_before_publish, 0);
+    ASSERT_EQ(observer.export_count, 1);
     ASSERT_TRUE(journal_ok);
     ASSERT_STR_EQ(journal_mode, "delete");
     ASSERT_EQ(live_before, 0);
@@ -22416,6 +22493,7 @@ TEST(full_reindex_preserves_exact_long_db_path) {
 }
 #endif
 
+
 TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
      * was silently destroying every file under FAST_SKIP_DIRS directories
@@ -24744,6 +24822,91 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
     PASS();
 }
 
+/* #725: two same-named symbols across languages must not share CALLS edges.
+ * Python Store.commit is the real callee of save(); the JS Editor.commit
+ * function is a distinct binding and must have no inbound CALLS from Python.
+ * unique_name (candidates==1) is #1572 and is not this claim. */
+TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
+    const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
+    const char *contents[] = {
+        "class Store:\n"
+        "    def commit(self):\n"
+        "        return True\n",
+
+        "from store import Store\n"
+        "\n"
+        "def save():\n"
+        "    return Store().commit()\n",
+
+        "export function commit() {\n"
+        "  return 1;\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *commits = NULL;
+    int ncommit = 0;
+    cbm_store_find_nodes_by_name(s, proj, "commit", &commits, &ncommit);
+    ASSERT_GTE(ncommit, 2);
+
+    int64_t js_id = 0;
+    int64_t py_id = 0;
+    for (int i = 0; i < ncommit; i++) {
+        if (commits[i].file_path && strstr(commits[i].file_path, "Editor.js"))
+            js_id = commits[i].id;
+        if (commits[i].file_path && strstr(commits[i].file_path, "store.py"))
+            py_id = commits[i].id;
+    }
+    ASSERT_TRUE(js_id != 0);
+    ASSERT_TRUE(py_id != 0);
+
+    cbm_node_t *saves = NULL;
+    int nsave = 0;
+    cbm_store_find_nodes_by_name(s, proj, "save", &saves, &nsave);
+    ASSERT_GT(nsave, 0);
+
+    cbm_edge_t *from_save = NULL;
+    int nfrom = 0;
+    cbm_store_find_edges_by_source_type(s, saves[0].id, "CALLS", &from_save, &nfrom);
+    bool save_calls_py = false;
+    bool save_calls_js = false;
+    for (int i = 0; i < nfrom; i++) {
+        if (from_save[i].target_id == py_id)
+            save_calls_py = true;
+        if (from_save[i].target_id == js_id)
+            save_calls_js = true;
+    }
+    ASSERT_TRUE(save_calls_py);
+    ASSERT_FALSE(save_calls_js);
+
+    cbm_edge_t *into_js = NULL;
+    int njs = 0;
+    cbm_store_find_edges_by_target_type(s, js_id, "CALLS", &into_js, &njs);
+    ASSERT_EQ(njs, 0);
+
+    if (from_save)
+        cbm_store_free_edges(from_save, nfrom);
+    if (into_js)
+        cbm_store_free_edges(into_js, njs);
+    cbm_store_free_nodes(commits, ncommit);
+    cbm_store_free_nodes(saves, nsave);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -24928,6 +25091,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
+    RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
     RUN_TEST(pipeline_incremental_reexport_target_matches_full);
     RUN_TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential);
     RUN_TEST(pipeline_parallel_env_access_matches_sequential);

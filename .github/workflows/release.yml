@@ -22,9 +22,9 @@ on:
         type: boolean
         default: false
       soak_level:
-        description: 'Soak: full (quick+asan), quick (10min), none'
+        description: 'Soak: full (quick+asan) or quick (10min)'
         type: choice
-        options: ['full', 'quick', 'none']
+        options: ['full', 'quick']
         default: 'quick'
       skip_perf:
         description: "Skip performance tests (use when no pipeline logic changed)"
@@ -78,6 +78,10 @@ jobs:
     with:
       version: ${{ inputs.version }}
       attest: true
+      # Release builds have no scan bypass: both candidates in all eight
+      # immutable target tuples must complete before smoke or soak starts.
+      scan_candidates: true
+    secrets: inherit
 
   # ── 4. Smoke test every binary ──────────────────────────────────
   # !cancelled() && !failure(): GitHub propagates "skipped" TRANSITIVELY down the
@@ -96,26 +100,27 @@ jobs:
 
   # ── 5. Soak tests ──────────────────────────────────────────────
   soak:
-    if: ${{ !cancelled() && !failure() && inputs.soak_level != 'none' }}
+    if: ${{ !cancelled() && !failure() }}
     needs: [build]
     uses: ./.github/workflows/_soak.yml
     with:
       duration_minutes: 10
       run_asan: ${{ inputs.soak_level == 'full' }}
       version: ${{ inputs.version }}
+      use_release_artifacts: true
 
   # ── 6. Create DRAFT release ────────────────────────────────────
   # Requires smoke to have actually SUCCEEDED, not merely "not failed". The bare
   # !cancelled() && !failure() form is fail-OPEN: a skipped smoke is neither
   # cancelled nor failed, so a draft was one condition away from being cut from
-  # binaries nobody had run. soak may legitimately be 'skipped' (soak_level=none),
-  # so that one is enumerated explicitly rather than lumped in.
+  # binaries nobody had run. Selected release bytes must also finish soak; a
+  # skipped soak is not an acceptable production-release state.
   release-draft:
     needs: [smoke, soak]
     if: >-
       ${{ !cancelled() && !failure()
       && needs.smoke.result == 'success'
-      && (needs.soak.result == 'success' || needs.soak.result == 'skipped') }}
+      && needs.soak.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -124,15 +129,48 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Download only selected release containers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: binaries-*
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la *.tar.gz *.zip *.mcpb
+      # Candidate artifacts are deliberately excluded from the container
+      # download above. Preserve only the three reviewable manifests that bind
+      # candidate bytes, VT results, and the tuple-local decision.
+      - name: Download candidate selection evidence separately
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-selection-evidence
+          path: selection-evidence
+
+      - name: Verify and stage the exact evidence set
+        run: |
+          test "$(find selection-evidence -maxdepth 1 -type f | wc -l | tr -d ' ')" = 3
+          for f in release-candidates.tsv virustotal-candidate-results.tsv release-selection.tsv; do
+            test -f "selection-evidence/$f"
+            cp "selection-evidence/$f" "$f"
+          done
+
+      - name: List selected artifacts and decision evidence
+        run: ls -la *.tar.gz *.zip *.mcpb *.tsv
 
       - name: Generate checksums
-        run: sha256sum *.tar.gz *.zip *.mcpb > checksums.txt
+        run: |
+          sha256sum \
+            *.tar.gz *.zip *.mcpb \
+            release-candidates.tsv \
+            virustotal-candidate-results.tsv \
+            release-selection.tsv \
+            > checksums.txt
+
+      # The legacy ui-* aliases are byte-identical copies published after verify
+      # (scripts/ci/publish-legacy-aliases.sh), so they were absent from
+      # checksums.txt and 0.9.x updaters refused to install them (#1134). Their
+      # digests are added here, BEFORE attestation, so the attested artifact
+      # covers both names.
+      - name: Cover legacy ui-* aliases in checksums
+        run: scripts/ci/append-legacy-alias-checksums.sh checksums.txt
 
       - name: Attest checksum provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -164,7 +202,12 @@ jobs:
 
       - name: Sign artifacts
         run: |
-          for f in *.tar.gz *.zip *.mcpb checksums.txt; do
+          for f in \
+            *.tar.gz *.zip *.mcpb \
+            release-candidates.tsv \
+            virustotal-candidate-results.tsv \
+            release-selection.tsv \
+            checksums.txt; do
             cosign sign-blob --yes --bundle "${f}.bundle" "$f"
           done
 
@@ -197,6 +240,9 @@ jobs:
             *.tar.gz
             *.zip
             *.mcpb
+            release-candidates.tsv
+            virustotal-candidate-results.tsv
+            release-selection.tsv
             checksums.txt
             sbom.json
             *.bundle
@@ -206,9 +252,9 @@ jobs:
   # ── 7. Verify + Publish (requires security gate) ───────────────
   verify:
     needs: [release-draft, security]
-    # Explicit condition: a skipped ancestor (soak with soak_level=none) must
-    # not skip the publish chain — only real failures/cancellations block it.
-    if: ${{ !cancelled() && !failure() && needs.release-draft.result == 'success' }}
+    # Explicit condition: a deliberately skipped test ancestor must not skip
+    # the publish chain; the draft itself proves smoke and soak both succeeded.
+    if: ${{ !cancelled() && !failure() && needs.security.result == 'success' && needs.release-draft.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -225,6 +271,11 @@ jobs:
           ARCHIVE_DIR="$RUNNER_TEMP/release-archives"
           mkdir -p "$ARCHIVE_DIR" binaries
           gh release download "$VERSION" --dir "$ARCHIVE_DIR" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --pattern '*.mcpb'
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --pattern 'release-selection.tsv' --output "$RUNNER_TEMP/release-selection.tsv"
+          python3 scripts/ci/verify-release-selection.py \
+            --selection "$RUNNER_TEMP/release-selection.tsv" \
+            --require-policy virustotal-v2 \
+            --archive-dir "$ARCHIVE_DIR"
           # 14 = 8 archives + 6 MCPB bundles; runtime 42 = 8×3 archive
           # sidecars + 6×3 bundle members (manifest.json, LICENSE, notices).
           # The bundle binaries dedupe to the archive objects byte-for-byte.
@@ -232,6 +283,14 @@ jobs:
             --expect-archives=14 \
             --expect-binaries=14 \
             --expect-runtime-files=42
+
+      - name: Download the existing candidate VirusTotal evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --pattern 'release-candidates.tsv' --output "$RUNNER_TEMP/release-candidates.tsv"
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --pattern 'virustotal-candidate-results.tsv' --output "$RUNNER_TEMP/virustotal-candidate-results.tsv"
 
       - name: Security audits on all unique extracted release objects
         run: |
@@ -247,7 +306,34 @@ jobs:
             scripts/security-strings.sh "$f"
           done
 
-      - name: VirusTotal scan
+      # Full-surface VirusTotal pass over the SHIPPED containers.
+      #
+      # The candidate scan upstream covers executables only. Everything else we
+      # actually ship — install.sh, install.ps1, LICENSE, THIRD_PARTY_NOTICES.md,
+      # the MCPB manifest.json and the unpacked UI assets, 42 runtime files
+      # across 14 containers — is extracted here and gets scanned here. Dropping
+      # it would have narrowed the promise made in README/SECURITY.md, and
+      # install.sh and install.ps1 are the highest-consequence non-executable
+      # bytes we publish: users pipe them straight into a shell.
+      #
+      # The selected executables are NOT re-submitted. They were scanned as
+      # candidates, and verify-release-selection.py has just proven every
+      # published container carries exactly those bytes — identity is settled by
+      # hash, so a second scan adds no assurance.
+      #
+      # It also is not free, contrary to what this comment used to claim.
+      # Measured on v0.10.5: all eight re-submissions produced a NEW analysis
+      # (same file-id, timestamp 47 minutes later), and Microsoft's ML engine
+      # answered differently for two of them within that hour — in opposite
+      # directions. The release notes then cited one scan while the links showed
+      # the other. See scripts/ci/exclude-rescanned-selected-objects.sh.
+      - name: Withhold already-scanned selected executables
+        run: |
+          bash scripts/ci/exclude-rescanned-selected-objects.sh \
+            binaries/objects "$RUNNER_TEMP/release-selection.tsv" \
+            binaries/virustotal-withheld.tsv
+
+      - name: VirusTotal scan of every extracted release object
         uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
         id: virustotal
         with:
@@ -255,8 +341,8 @@ jobs:
           files: binaries/objects/*
           request_rate: 4
 
-      # ZERO tolerance: every extracted object must arrive naturally clean. Any
-      # malicious or suspicious verdict blocks the release with no exception.
+      # Same policy as the candidate gate: a single Microsoft `!ml` is tolerated
+      # and disclosed, anything else blocks. Engine count is evidence, not a gate.
       - name: Wait for VirusTotal results
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_SCANNER_API_KEY }}
@@ -264,10 +350,11 @@ jobs:
           VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
           VT_ASSOCIATIONS: binaries/associations.tsv
           VT_RESULTS_PATH: binaries/vt-results.tsv
+          VT_WITHHELD: binaries/virustotal-withheld.tsv
           MIN_ENGINES: 50
         run: scripts/ci/check-virustotal.sh
 
-      - name: Preserve VirusTotal scope and result evidence
+      - name: Preserve extracted-object VirusTotal evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -276,6 +363,7 @@ jobs:
             binaries/associations.tsv
             binaries/scan-set.tsv
             binaries/vt-results.tsv
+            binaries/virustotal-withheld.tsv
           if-no-files-found: warn
 
       - name: Publish durable public VirusTotal evidence
@@ -287,15 +375,17 @@ jobs:
           VT_RESULTS_PATH: binaries/vt-results.tsv
         run: bash scripts/ci/publish-vt-evidence.sh
 
-      # Renders extracted-file scan results plus archive SHA-256 provenance. It
-      # runs only after the exact-set zero-tolerance gate passed.
-      - name: Append VirusTotal scan links to release notes
+      # Candidate bytes were scanned before smoke/soak and the verifier above
+      # proved every packaged executable has the selected candidate SHA-256.
+      # Re-submitting the same executable bytes here would add wait time but no
+      # new coverage, so publish the existing per-candidate verdicts instead.
+      - name: Append candidate VirusTotal results to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
-          VT_EXPECTED_SCAN_SET: binaries/scan-set.tsv
-          VT_ASSOCIATIONS: binaries/associations.tsv
-          VT_RESULTS_PATH: binaries/vt-results.tsv
+          VT_CANDIDATES: ${{ runner.temp }}/release-candidates.tsv
+          VT_RESULTS_PATH: ${{ runner.temp }}/virustotal-candidate-results.tsv
+          RELEASE_SELECTION: ${{ runner.temp }}/release-selection.tsv
         run: bash scripts/ci/append-vt-notes.sh
 
   # ── 8. Publish package wrappers (npm + PyPI) ──────────────────
@@ -510,8 +600,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Legacy ui-* aliases so 0.9.x updaters stop 404ing (#1538). Runs after
-      # verify: same bytes as archives the VirusTotal gate already cleared, and
-      # publishing earlier would duplicate the scan set and provenance manifest.
+      # verify: aliases contain the same selected executable bytes already
+      # hash-bound to the pre-smoke VirusTotal verdicts.
       - name: Publish legacy ui-* archive aliases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

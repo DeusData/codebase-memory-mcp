@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
+#include "foundation/sanitized.h" /* CBM_SANITIZED — diagnostic stack floor */
 
 #include <errno.h>
 #include <stdlib.h>
@@ -33,7 +34,7 @@
  * exactly the threads that overflow. Diagnostic builds only: the shipping
  * binary keeps its fixed, predictable stack sizes. */
 static size_t cbm_thread_stack_floor(size_t requested) {
-#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+#if CBM_SANITIZED
     char env_buf[CBM_SZ_64];
     const char *env = cbm_safe_getenv("CBM_THREAD_STACK_MB", env_buf, sizeof(env_buf), NULL);
     if (env && env[0]) {

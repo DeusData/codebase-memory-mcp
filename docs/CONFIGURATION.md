@@ -181,7 +181,45 @@ These environment variables affect runtime behavior:
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the install-script download base URL; also used by local release-fixture tests. |
 | `CBM_LOG_LEVEL` | `info` | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin-frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
+| `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
+
+### Relocating the daemon rendezvous directory
+
+Before it is used, the rendezvous directory and every ancestor of it are checked:
+each ancestor must be owned by you or by root, must not be world-writable (unless
+it is the standard root-owned sticky directory such as `/tmp`), and must carry no
+allow-ACL — on Windows, no ACE granting mutation rights to another identity. The
+rendezvous directory itself is then forced to owner-only (`0700`, no extended ACL
+/ an owner-only DACL).
+
+That ancestry is not always acceptable in the default location. A Windows profile
+that has acquired a capability-SID ACE with `WRITE_DAC` / `WRITE_OWNER` / `DELETE`
+on `%LOCALAPPDATA%` — something an installed packaged app can add — fails the walk,
+and so can an unusual `/tmp` or home directory on POSIX. When that happens *every*
+command fails, `config list` included, so the settings surface cannot be reached
+either:
+
+```text
+codebase-memory-mcp: secure daemon endpoint could not be created
+```
+
+`CBM_RUNTIME_DIR` points the rendezvous at an ancestry you choose:
+
+```bash
+export CBM_RUNTIME_DIR="$HOME/cbm-runtime"   # any directory you own
+```
+
+```powershell
+$env:CBM_RUNTIME_DIR = "D:\cbm-runtime"
+```
+
+The check is not relaxed for the directory you name: it goes through exactly the
+same validation as the default, and a value that fails it is refused rather than
+silently ignored. Because the rendezvous is how sessions find each other, every
+process that should share one daemon must see the same value — set it in the
+environment of your MCP client and your shell alike, or a CLI invocation without
+it will coordinate through the default location instead.
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
 
