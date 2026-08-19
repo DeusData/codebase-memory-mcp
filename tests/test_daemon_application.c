@@ -1309,6 +1309,7 @@ TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
 }
 
 enum { APP_FAKE_MAX_ATTEMPTS = 16 };
+enum { APP_FAKE_ARGS_CAP = 2048 };
 
 typedef struct {
     atomic_int starts;
@@ -1329,6 +1330,11 @@ typedef struct {
     char marker_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     char quarantine_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     char quarantine_seen[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
+    char args_json[APP_FAKE_MAX_ATTEMPTS][APP_FAKE_ARGS_CAP];
+    /* `starts` is incremented before the slot is filled, so waiting on it says
+     * a worker began, not that its arguments are readable. Each slot publishes
+     * itself instead, which is the edge a reader on another thread needs. */
+    atomic_bool args_captured[APP_FAKE_MAX_ATTEMPTS];
     size_t memory_budgets[APP_FAKE_MAX_ATTEMPTS];
 } app_fake_worker_context_t;
 
@@ -1393,6 +1399,9 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
     atomic_init(&worker->cancelled, false);
     worker->result.exit_code = -1;
     if (worker->attempt < APP_FAKE_MAX_ATTEMPTS) {
+        (void)snprintf(context->args_json[worker->attempt], APP_FAKE_ARGS_CAP, "%s",
+                       args_json ? args_json : "");
+        atomic_store(&context->args_captured[worker->attempt], true);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
@@ -1415,6 +1424,33 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
     }
     *worker_out = worker;
     return 0;
+}
+
+static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected);
+
+static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, int attempt,
+                                          const char *max_files, const char *max_source_mb) {
+    if (!context || attempt < 0 || attempt >= APP_FAKE_MAX_ATTEMPTS) {
+        return false;
+    }
+    if (!app_wait_for_atomic_bool(&context->args_captured[attempt], true)) {
+        return false;
+    }
+    const char *args = context->args_json[attempt];
+    yyjson_doc *document = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *policy =
+        root && yyjson_is_obj(root) ? yyjson_obj_get(root, "_cbm_index_policy") : NULL;
+    yyjson_val *files =
+        policy && yyjson_is_obj(policy) ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_FILES) : NULL;
+    yyjson_val *bytes = policy && yyjson_is_obj(policy)
+                            ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_SOURCE_MB)
+                            : NULL;
+    bool equal = files && bytes && yyjson_is_str(files) && yyjson_is_str(bytes) &&
+                 strcmp(yyjson_get_str(files), max_files) == 0 &&
+                 strcmp(yyjson_get_str(bytes), max_source_mb) == 0;
+    yyjson_doc_free(document);
+    return equal;
 }
 
 static cbm_index_worker_poll_t app_fake_worker_poll(void *opaque,
@@ -1970,7 +2006,9 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
     bool config_ready = stored_config &&
                         cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
+                        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "3") == 0 &&
+                        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "4") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -2015,6 +2053,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     bool first_owned = first_initialized && project &&
                        app_wait_for_subscribers(application, project, 1) &&
                        app_wait_for_atomic_int(&fake.starts, 1);
+    bool auto_policy_propagated = first_owned && app_fake_worker_policy_equals(&fake, 0, "3", "4");
     bool second_initialized = app_test_initialize_profile(&callbacks, sessions[1], root,
                                                           CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
     bool coalesced = first_owned && second_initialized && project &&
@@ -2076,6 +2115,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(restricted_started_nothing);
     ASSERT_TRUE(first_initialized);
     ASSERT_TRUE(first_owned);
+    ASSERT_TRUE(auto_policy_propagated);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);
@@ -2350,6 +2390,46 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
     PASS();
 }
 
+TEST(daemon_application_programmatic_index_injects_resource_policy) {
+    char *root = th_mktempdir("cbm_app_policy_root");
+    char *cache = th_mktempdir("cbm_app_policy_cache");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(cache);
+    cbm_config_t *stored_config = cbm_config_open(cache);
+    bool configured = stored_config &&
+                      cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "5") == 0 &&
+                      cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "6") == 0;
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application = configured ? cbm_daemon_application_new(&config) : NULL;
+    int index_rc =
+        application ? cbm_daemon_application_index(application, "policy-programmatic", root) : -1;
+    bool policy_propagated = index_rc == 0 && app_fake_worker_policy_equals(&fake, 0, "5", "6");
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    th_cleanup(root);
+    th_cleanup(cache);
+    ASSERT_TRUE(configured);
+    ASSERT_TRUE(policy_propagated);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
 TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     app_env_backup_t cache_environment;
     bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
@@ -2424,6 +2504,9 @@ TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     ASSERT_TRUE(cache_restored);
     PASS();
 }
+
+/* Native discovery never interprets a repository path as command text. Valid
+ * non-Git paths containing shell metacharacters remain countable literally. */
 
 /* Native discovery never interprets a repository path as command text. Valid
  * non-Git paths containing shell metacharacters remain countable literally. */
@@ -5360,6 +5443,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);
