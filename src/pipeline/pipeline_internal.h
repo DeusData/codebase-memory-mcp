@@ -708,6 +708,9 @@ typedef struct {
     bool surfaces_in_place;
 } cbm_pipeline_generation_t;
 
+int cbm_pipeline_storage_admit(cbm_pipeline_t *p, cbm_pipeline_storage_checkpoint_t checkpoint,
+                               const char *final_path, const char *staging_path);
+
 /* Serialize and fully populate a sibling staging database, then atomically
  * replace final_db_path. The old generation is untouched on every failure or
  * cancellation observed before the rename commit point. */

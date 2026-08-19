@@ -62,6 +62,21 @@ void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resourc
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
 
+typedef enum {
+    CBM_PIPELINE_STORAGE_PREFLIGHT = 0,
+    CBM_PIPELINE_STORAGE_GROWTH,
+    CBM_PIPELINE_STORAGE_PREPUBLISH,
+} cbm_pipeline_storage_checkpoint_t;
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef bool (*cbm_pipeline_storage_probe_fn)(cbm_pipeline_storage_checkpoint_t checkpoint,
+                                              const char *final_db_path,
+                                              const char *staging_db_path,
+                                              cbm_index_storage_sample_t *sample,
+                                              cbm_index_resource_t *failed_resource, void *context);
+void cbm_pipeline_set_storage_probe_for_testing(cbm_pipeline_t *p,
+                                                cbm_pipeline_storage_probe_fn probe, void *context);
+#endif
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 

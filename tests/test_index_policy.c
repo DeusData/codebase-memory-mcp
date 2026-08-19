@@ -3,6 +3,7 @@
 
 #include "cli/cli.h"
 #include "foundation/compat.h"
+#include "foundation/constants.h"
 #include "foundation/index_policy.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
@@ -23,13 +24,21 @@ TEST(index_policy_defaults_are_disabled) {
     ASSERT_FALSE(policy.max_source_bytes.enabled);
     ASSERT_FALSE(policy.max_rss_bytes.enabled);
     ASSERT_FALSE(policy.max_duration_ms.enabled);
+    ASSERT_FALSE(policy.max_cache_bytes.enabled);
+    ASSERT_FALSE(policy.min_free_disk_bytes.enabled);
+    ASSERT_FALSE(policy.max_final_db_bytes.enabled);
+    ASSERT_FALSE(policy.max_staging_bytes.enabled);
+    ASSERT_FALSE(policy.max_task_temp_bytes.enabled);
     ASSERT_FALSE(cbm_index_policy_enabled(&policy));
     ASSERT_FALSE(cbm_index_policy_discovery_enabled(&policy));
     ASSERT_FALSE(cbm_index_policy_worker_enabled(&policy));
+    ASSERT_FALSE(cbm_index_policy_storage_enabled(&policy));
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_FILES), "off");
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_SOURCE_MB), "off");
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_RSS_MB), "off");
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_DURATION_SECONDS), "off");
+    ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_CACHE_MAX_MB), "off");
+    ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MIN_FREE_DISK_MB), "off");
     PASS();
 }
 
@@ -98,6 +107,70 @@ TEST(index_policy_worker_limits_validate_and_convert_units) {
     PASS();
 }
 
+TEST(index_policy_storage_limits_validate_and_convert_units) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+    char value[64];
+
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_CACHE_MAX_MB, "131072", error,
+                                     sizeof(error)));
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB, "4096", error,
+                                     sizeof(error)));
+    ASSERT_EQ(policy.max_cache_bytes.value, UINT64_C(131072) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.min_free_disk_bytes.value, UINT64_C(4096) * CBM_INDEX_MIB_BYTES);
+    ASSERT_TRUE(cbm_index_policy_storage_enabled(&policy));
+    ASSERT_TRUE(
+        cbm_index_policy_format(&policy, CBM_INDEX_CONFIG_CACHE_MAX_MB, value, sizeof(value)));
+    ASSERT_STR_EQ(value, "131072");
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_CACHE_MAX_MB, "off", error, sizeof(error)));
+    ASSERT_FALSE(policy.max_cache_bytes.enabled);
+    PASS();
+}
+
+TEST(index_policy_storage_projection_boundaries_are_overflow_safe) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_cache_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 100};
+    policy.min_free_disk_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 40};
+    policy.max_final_db_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 60};
+    policy.max_staging_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 70};
+    policy.max_task_temp_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 80};
+    cbm_index_storage_sample_t sample = {
+        .current_cache_bytes = 130,
+        .replaceable_old_bytes = 50,
+        .operation_bytes = 20,
+        .free_disk_bytes = 40,
+        .final_db_bytes = 60,
+        .staging_bytes = 70,
+        .task_temp_bytes = 80,
+    };
+    cbm_index_resource_violation_t violation = {0};
+
+    ASSERT_TRUE(cbm_index_policy_check_storage(&policy, &sample, &violation));
+    sample.current_cache_bytes++;
+    ASSERT_FALSE(cbm_index_policy_check_storage(&policy, &sample, &violation));
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_CACHE_BYTES);
+    ASSERT_EQ(violation.observed, 101);
+    ASSERT_EQ(violation.limit, 100);
+    sample.current_cache_bytes--;
+    sample.free_disk_bytes--;
+    ASSERT_FALSE(cbm_index_policy_check_storage(&policy, &sample, &violation));
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FREE_DISK_BYTES);
+    ASSERT_EQ(violation.observed, 39);
+    sample = (cbm_index_storage_sample_t){
+        .current_cache_bytes = UINT64_MAX,
+        .replaceable_old_bytes = 0,
+        .operation_bytes = UINT64_MAX,
+        .free_disk_bytes = UINT64_MAX,
+    };
+    ASSERT_FALSE(cbm_index_policy_check_storage(&policy, &sample, &violation));
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_CACHE_BYTES);
+    ASSERT_EQ(violation.observed, UINT64_MAX);
+    PASS();
+}
+
 TEST(index_policy_invalid_value_is_rejected_atomically) {
     static const char *const invalid[] = {"",   "0",  "-1",       "1MB",
                                           "1 ", "+1", "10000001", "18446744073709551616"};
@@ -149,6 +222,9 @@ TEST(index_policy_format_round_trips_public_values) {
 TEST(index_policy_violation_metadata_is_stable) {
     ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_FILES), "files");
     ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_SOURCE_BYTES), "source_bytes");
+    ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_CACHE_BYTES), "cache_bytes");
+    ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_FREE_DISK_BYTES), "free_disk_bytes");
+    ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_STAGING_BYTES), "staging_bytes");
     ASSERT_STR_EQ(cbm_index_resource_unit(CBM_INDEX_RESOURCE_FILES), "files");
     ASSERT_STR_EQ(cbm_index_resource_unit(CBM_INDEX_RESOURCE_SOURCE_BYTES), "bytes");
     ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_RSS_BYTES), "rss_bytes");
@@ -163,6 +239,10 @@ TEST(index_policy_violation_metadata_is_stable) {
                   CBM_INDEX_CONFIG_MAX_RSS_MB);
     ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_DURATION_MS),
                   CBM_INDEX_CONFIG_MAX_DURATION_SECONDS);
+    ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_CACHE_BYTES),
+                  CBM_INDEX_CONFIG_CACHE_MAX_MB);
+    ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_FREE_DISK_BYTES),
+                  CBM_INDEX_CONFIG_MIN_FREE_DISK_MB);
     PASS();
 }
 
@@ -180,11 +260,15 @@ TEST(index_policy_config_loads_defaults_values_and_rejects_corruption) {
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "3"), 0);
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64"), 0);
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7"), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_CACHE_MAX_MB, "17"), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB, "5"), 0);
     ASSERT_TRUE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
     ASSERT_EQ(policy.max_files.value, 9);
     ASSERT_EQ(policy.max_source_bytes.value, UINT64_C(3) * CBM_INDEX_MIB_BYTES);
     ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(64) * CBM_INDEX_MIB_BYTES);
     ASSERT_EQ(policy.max_duration_ms.value, UINT64_C(7000));
+    ASSERT_EQ(policy.max_cache_bytes.value, UINT64_C(17) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.min_free_disk_bytes.value, UINT64_C(5) * CBM_INDEX_MIB_BYTES);
 
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_FILES, "corrupt"), 0);
     ASSERT_FALSE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
@@ -200,6 +284,8 @@ TEST(index_policy_cli_lists_all_operator_keys) {
     bool bytes_found = false;
     bool rss_found = false;
     bool duration_found = false;
+    bool cache_found = false;
+    bool free_found = false;
     for (size_t index = 0; index < cbm_cli_config_key_count_for_testing(); index++) {
         const char *key = cbm_cli_config_key_at_for_testing(index);
         files_found = files_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_FILES) == 0);
@@ -207,11 +293,15 @@ TEST(index_policy_cli_lists_all_operator_keys) {
         rss_found = rss_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_RSS_MB) == 0);
         duration_found =
             duration_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS) == 0);
+        cache_found = cache_found || (key && strcmp(key, CBM_INDEX_CONFIG_CACHE_MAX_MB) == 0);
+        free_found = free_found || (key && strcmp(key, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB) == 0);
     }
     ASSERT_TRUE(files_found);
     ASSERT_TRUE(bytes_found);
     ASSERT_TRUE(rss_found);
     ASSERT_TRUE(duration_found);
+    ASSERT_TRUE(cache_found);
+    ASSERT_TRUE(free_found);
     PASS();
 }
 
@@ -454,11 +544,92 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
     PASS();
 }
 
+TEST(index_policy_storage_limit_preserves_old_index_and_unrelated_cache_files) {
+    char *repo = th_mktempdir("cbm_index_storage_repo");
+    char *cache = th_mktempdir("cbm_index_storage_cache");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int original(void) { return 1; }\n"), 0);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (server && config) {
+        cbm_mcp_server_set_config(server, config);
+    }
+    char args[CBM_SZ_4K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"name\":\"StoragePolicyFixture\",\"mode\":\"fast\"}",
+                   repo);
+    char *first = server ? cbm_mcp_handle_tool(server, "index_repository", args) : NULL;
+    bool first_ok = first && strstr(first, "\\\"status\\\":\\\"indexed\\\"");
+    free(first);
+
+    char unrelated[CBM_SZ_4K];
+    (void)snprintf(unrelated, sizeof(unrelated), "%s/unrelated.bin", cache);
+    FILE *large = cbm_fopen(unrelated, "wb");
+    char block[4096] = {0};
+    bool wrote_large = large != NULL;
+    for (int index = 0; wrote_large && index < 512; index++) {
+        wrote_large = fwrite(block, 1, sizeof(block), large) == sizeof(block);
+    }
+    if (large) {
+        wrote_large = fclose(large) == 0 && wrote_large;
+    }
+    bool configured =
+        config && cbm_config_set(config, CBM_INDEX_CONFIG_CACHE_MAX_MB, "1") == 0 &&
+        th_write_file(TH_PATH(repo, "main.c"), "int changed(void) { return 2; }\n") == 0;
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"name\":\"StoragePolicyFixture\",\"mode\":\"fast\","
+                   "\"_cbm_index_policy\":{\"index_max_files\":\"off\","
+                   "\"index_max_source_mb\":\"off\",\"index_cache_max_mb\":\"off\","
+                   "\"index_min_free_disk_mb\":\"off\"}}",
+                   repo);
+    char *limited = configured && wrote_large && server
+                        ? cbm_mcp_handle_tool(server, "index_repository", args)
+                        : NULL;
+    bool contract_ok = limited && strstr(limited, "resource_limit_exceeded") &&
+                       strstr(limited, "\\\"stage\\\":\\\"storage\\\"") &&
+                       strstr(limited, "\\\"resource\\\":\\\"cache_bytes\\\"") &&
+                       strstr(limited, "\\\"limit\\\":1048576") &&
+                       strstr(limited, "\\\"unit\\\":\\\"bytes\\\"") &&
+                       strstr(limited, "\\\"serving_index_preserved\\\":true");
+    free(limited);
+    int64_t unrelated_size = cbm_file_size(unrelated);
+    char db_path[CBM_SZ_4K];
+    (void)snprintf(db_path, sizeof(db_path), "%s/StoragePolicyFixture.db", cache);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    bool old_queryable = store && cbm_store_count_nodes(store, "StoragePolicyFixture") > 0;
+    cbm_store_close(store);
+
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    th_cleanup(repo);
+    th_cleanup(cache);
+    if (saved_cache_copy) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache_copy);
+
+    ASSERT_TRUE(first_ok);
+    ASSERT_TRUE(wrote_large);
+    ASSERT_TRUE(configured);
+    ASSERT_TRUE(contract_ok);
+    ASSERT_EQ(unrelated_size, (int64_t)sizeof(block) * 512);
+    ASSERT_TRUE(old_queryable);
+    PASS();
+}
+
 SUITE(index_policy) {
     RUN_TEST(index_policy_defaults_are_disabled);
     RUN_TEST(index_policy_file_limit_accepts_off_and_exact_range);
     RUN_TEST(index_policy_source_limit_converts_mib_without_overflow);
     RUN_TEST(index_policy_worker_limits_validate_and_convert_units);
+    RUN_TEST(index_policy_storage_limits_validate_and_convert_units);
+    RUN_TEST(index_policy_storage_projection_boundaries_are_overflow_safe);
     RUN_TEST(index_policy_invalid_value_is_rejected_atomically);
     RUN_TEST(index_policy_format_round_trips_public_values);
     RUN_TEST(index_policy_violation_metadata_is_stable);
@@ -468,4 +639,5 @@ SUITE(index_policy) {
     RUN_TEST(index_policy_cli_set_reports_a_failed_write);
     RUN_TEST(index_policy_worker_rejects_missing_parent_policy);
     RUN_TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index);
+    RUN_TEST(index_policy_storage_limit_preserves_old_index_and_unrelated_cache_files);
 }

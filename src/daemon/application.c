@@ -306,16 +306,19 @@ static int application_worker_start_default(void *context, const char *args_json
     (void)context;
     cbm_index_resource_policy_t resource_policy;
     char error[CBM_SZ_256] = {0};
+    char task_db_path[CBM_SZ_1K];
     if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
-                                                 sizeof(error))) {
-        cbm_log_error("daemon.index.policy", "error", error);
+                                                 sizeof(error)) ||
+        !cbm_mcp_index_task_db_path(args_json, task_db_path, sizeof(task_db_path))) {
+        cbm_log_error("daemon.index.worker_policy", "error",
+                      error[0] ? error : "could not resolve worker index path");
         *worker_out = NULL;
         return -1;
     }
     cbm_index_worker_handle_t *worker = NULL;
-    int result =
-        cbm_index_worker_start_with_policy(args_json, memory_budget_bytes, &resource_policy, false,
-                                           marker_file, quarantine_file, &worker);
+    int result = cbm_index_worker_start_with_storage_policy(
+        args_json, memory_budget_bytes, &resource_policy, task_db_path, false, marker_file,
+        quarantine_file, NULL, NULL, &worker);
     *worker_out = worker;
     return result;
 }

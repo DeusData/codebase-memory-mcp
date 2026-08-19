@@ -6779,6 +6779,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
     {CBM_INDEX_CONFIG_MAX_RSS_MB, "off", "Max worker process-tree RSS MiB, or off"},
     {CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "off", "Max worker duration in seconds, or off"},
+    {CBM_INDEX_CONFIG_CACHE_MAX_MB, "off", "Max projected cache MiB after publish, or off"},
+    {CBM_INDEX_CONFIG_MIN_FREE_DISK_MB, "off",
+     "Minimum free cache-filesystem MiB during indexing, or off"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing

@@ -67,7 +67,7 @@ static void worker_set_local_env(const char *name, const char *value) {
 
 void cbm_index_set_worker_role_options(bool is_worker, const char *response_out, bool single_thread,
                                        const char *marker_file, const char *quarantine_file,
-                                       size_t memory_budget_bytes) {
+                                       size_t memory_budget_bytes, const char *stage_token) {
     cbm_index_set_worker_role(is_worker, response_out);
     g_worker_memory_budget_bytes = is_worker ? memory_budget_bytes : 0;
     if (!is_worker) {
@@ -76,6 +76,7 @@ void cbm_index_set_worker_role_options(bool is_worker, const char *response_out,
     worker_set_local_env("CBM_INDEX_SINGLE_THREAD", single_thread ? "1" : NULL);
     worker_set_local_env("CBM_INDEX_MARKER_FILE", marker_file);
     worker_set_local_env("CBM_INDEX_QUARANTINE_FILE", quarantine_file);
+    worker_set_local_env("CBM_INDEX_STAGE_TOKEN", stage_token);
 }
 
 bool cbm_index_worker_active(void) {
@@ -161,6 +162,21 @@ static bool worker_fingerprint_valid(const char *fingerprint) {
     return true;
 }
 
+static bool worker_stage_token_valid(const char *token) {
+    size_t length = token ? strlen(token) : 0;
+    if (length < 6U || length >= CBM_SZ_64) {
+        return false;
+    }
+    for (size_t index = 0; index < length; index++) {
+        unsigned char ch = (unsigned char)token[index];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+              ch == '-' || ch == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool worker_parse_positive_size(const char *text, size_t *value_out) {
     if (!text || !text[0] || !value_out) {
         return false;
@@ -236,6 +252,13 @@ cbm_index_worker_argv_status_t cbm_index_worker_parse_process_argv(
             return CBM_INDEX_WORKER_ARGV_INVALID;
         }
         parsed.quarantine_file = argv[next + 1];
+        next += 2;
+    }
+    if (next < argc && argv[next] && strcmp(argv[next], CBM_INDEX_WORKER_STAGE_TOKEN_ARG) == 0) {
+        if (next + 1 >= argc || !worker_stage_token_valid(argv[next + 1])) {
+            return CBM_INDEX_WORKER_ARGV_INVALID;
+        }
+        parsed.stage_token = argv[next + 1];
         next += 2;
     }
     if (next != argc) {
@@ -386,12 +409,13 @@ static char *slurp_worker_response(const char *path, worker_response_read_status
 
 enum {
     INDEX_WORKER_PATH_CAP = CBM_SZ_4K,
-    INDEX_WORKER_ARGV_CAP = 17,
+    INDEX_WORKER_ARGV_CAP = 19,
     INDEX_WORKER_SYNC_POLL_NS = 10000000,
     INDEX_WORKER_RELAY_LINES_PER_POLL = 64,
     INDEX_WORKER_RELAY_BYTES_PER_POLL = 64 * 1024,
     INDEX_WORKER_RSS_PROBE_FAILURE_LIMIT = 3,
     INDEX_WORKER_RSS_PROBE_INTERVAL_MS = 250,
+    INDEX_WORKER_TASK_TEMP_PROBE_INTERVAL_MS = 250,
 };
 
 typedef enum {
@@ -405,6 +429,8 @@ typedef enum {
 static cbm_index_supervisor_clock_fn g_resource_clock;
 static cbm_index_supervisor_rss_fn g_resource_rss;
 static void *g_resource_hook_context;
+static cbm_index_supervisor_task_temp_fn g_task_temp_hook;
+static void *g_task_temp_hook_context;
 
 void cbm_index_supervisor_set_resource_hooks_for_testing(cbm_index_supervisor_clock_fn clock_fn,
                                                          cbm_index_supervisor_rss_fn rss_fn,
@@ -418,6 +444,17 @@ void cbm_index_supervisor_reset_resource_hooks_for_testing(void) {
     g_resource_clock = NULL;
     g_resource_rss = NULL;
     g_resource_hook_context = NULL;
+}
+
+void cbm_index_supervisor_set_task_temp_hook_for_testing(
+    cbm_index_supervisor_task_temp_fn task_temp_fn, void *context) {
+    g_task_temp_hook = task_temp_fn;
+    g_task_temp_hook_context = context;
+}
+
+void cbm_index_supervisor_reset_task_temp_hook_for_testing(void) {
+    g_task_temp_hook = NULL;
+    g_task_temp_hook_context = NULL;
 }
 #endif
 
@@ -450,10 +487,14 @@ struct cbm_index_worker_handle {
     bool process_terminal;
     cbm_proc_result_t process_result;
     cbm_index_resource_policy_t resource_policy;
+    char task_db_path[INDEX_WORKER_PATH_CAP];
+    char stage_token[CBM_SZ_64];
     uint64_t started_ms;
     uint64_t last_rss_probe_ms;
+    uint64_t last_task_temp_probe_ms;
     unsigned int rss_probe_failures;
     bool rss_probe_started;
+    bool task_temp_probe_started;
     atomic_int termination_reason;
     atomic_bool terminal;
     cbm_index_worker_result_t result;
@@ -680,7 +721,7 @@ static void worker_request_resource_termination(cbm_index_worker_handle_t *handl
         return;
     }
     handle->result.resource_violation = (cbm_index_resource_violation_t){
-        .resource = resource, .observed = observed, .limit = limit};
+        .resource = resource, .observed = observed, .limit = limit, .probe_failed = probe_failed};
     handle->result.resource_probe_failed = probe_failed;
     if (!cbm_subprocess_request_cancel(handle->process)) {
         handle->result.resource_violation = (cbm_index_resource_violation_t){0};
@@ -746,11 +787,49 @@ duration_check:
     return rss_probe_failed;
 }
 
+static bool worker_task_temp_bytes(cbm_index_worker_handle_t *handle, uint64_t *bytes_out) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_task_temp_hook) {
+        return g_task_temp_hook(handle->task_db_path, handle->log_path, handle->response_path,
+                                bytes_out, g_task_temp_hook_context);
+    }
+#endif
+    return cbm_index_task_temp_bytes(handle->task_db_path, handle->stage_token, handle->log_path,
+                                     handle->response_path, bytes_out);
+}
+
+static void worker_check_task_temp_limit(cbm_index_worker_handle_t *handle) {
+    const cbm_index_limit_u64_t *limit = &handle->resource_policy.max_task_temp_bytes;
+    if (!limit->enabled ||
+        atomic_load_explicit(&handle->termination_reason, memory_order_acquire) !=
+            INDEX_WORKER_TERMINATION_NONE ||
+        cbm_subprocess_termination_pending(handle->process) ||
+        !cbm_subprocess_supervision_active(handle->process)) {
+        return;
+    }
+    uint64_t now = worker_resource_now_ms();
+    bool probe_due =
+        !handle->task_temp_probe_started || now < handle->last_task_temp_probe_ms ||
+        now - handle->last_task_temp_probe_ms >= INDEX_WORKER_TASK_TEMP_PROBE_INTERVAL_MS;
+    if (!probe_due) {
+        return;
+    }
+    handle->task_temp_probe_started = true;
+    handle->last_task_temp_probe_ms = now;
+    uint64_t observed = 0;
+    bool measured = worker_task_temp_bytes(handle, &observed);
+    if (!measured || observed > limit->value) {
+        worker_request_resource_termination(handle, CBM_INDEX_RESOURCE_TASK_TEMP_BYTES, observed,
+                                            limit->value, !measured);
+    }
+}
+
 static int worker_start_internal(const char *args_json, size_t memory_budget_bytes,
                                  const cbm_index_resource_policy_t *resource_policy,
-                                 bool single_thread, const char *marker_file,
-                                 const char *quarantine_file, cbm_proc_log_cb log_callback,
-                                 void *log_context, cbm_index_worker_handle_t **handle_out) {
+                                 const char *task_db_path, bool single_thread,
+                                 const char *marker_file, const char *quarantine_file,
+                                 cbm_proc_log_cb log_callback, void *log_context,
+                                 cbm_index_worker_handle_t **handle_out) {
     if (handle_out) {
         *handle_out = NULL;
     }
@@ -786,6 +865,15 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
     if (resource_policy) {
         handle->resource_policy = *resource_policy;
     }
+    if (handle->resource_policy.max_task_temp_bytes.enabled) {
+        int written = task_db_path ? snprintf(handle->task_db_path, sizeof(handle->task_db_path),
+                                              "%s", task_db_path)
+                                   : -1;
+        if (written <= 0 || written >= (int)sizeof(handle->task_db_path)) {
+            free(handle);
+            return -1;
+        }
+    }
     atomic_init(&handle->termination_reason, INDEX_WORKER_TERMINATION_NONE);
     atomic_init(&handle->terminal, false);
     handle->log_callback = log_callback;
@@ -793,6 +881,17 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
     worker_result_init(&handle->result);
     if (!worker_unique_file(handle->response_path, sizeof(handle->response_path), "response") ||
         !worker_unique_file(handle->log_path, sizeof(handle->log_path), "log")) {
+        (void)cbm_unlink(handle->response_path);
+        (void)cbm_unlink(handle->log_path);
+        free(handle);
+        return -1;
+    }
+    const char *random_suffix = strrchr(handle->response_path, '-');
+    int token_written = random_suffix ? snprintf(handle->stage_token, sizeof(handle->stage_token),
+                                                 "%ld%s", (long)worker_getpid(), random_suffix)
+                                      : -1;
+    if (token_written <= 0 || token_written >= (int)sizeof(handle->stage_token) ||
+        !worker_stage_token_valid(handle->stage_token)) {
         (void)cbm_unlink(handle->response_path);
         (void)cbm_unlink(handle->log_path);
         free(handle);
@@ -827,6 +926,8 @@ static int worker_start_internal(const char *args_json, size_t memory_budget_byt
         argv[argc++] = CBM_INDEX_WORKER_QUARANTINE_ARG;
         argv[argc++] = quarantine_file;
     }
+    argv[argc++] = CBM_INDEX_WORKER_STAGE_TOKEN_ARG;
+    argv[argc++] = handle->stage_token;
     argv[argc] = NULL;
 
     cbm_proc_opts_t options = {0};
@@ -858,15 +959,16 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
                                     bool single_thread, const char *marker_file,
                                     const char *quarantine_file, cbm_proc_log_cb log_callback,
                                     void *log_context, cbm_index_worker_handle_t **handle_out) {
-    return worker_start_internal(args_json, memory_budget_bytes, NULL, single_thread, marker_file,
-                                 quarantine_file, log_callback, log_context, handle_out);
+    return worker_start_internal(args_json, memory_budget_bytes, NULL, NULL, single_thread,
+                                 marker_file, quarantine_file, log_callback, log_context,
+                                 handle_out);
 }
 
 int cbm_index_worker_start(const char *args_json, size_t memory_budget_bytes, bool single_thread,
                            const char *marker_file, const char *quarantine_file,
                            cbm_index_worker_handle_t **handle_out) {
-    return worker_start_internal(args_json, memory_budget_bytes, NULL, single_thread, marker_file,
-                                 quarantine_file, NULL, NULL, handle_out);
+    return worker_start_internal(args_json, memory_budget_bytes, NULL, NULL, single_thread,
+                                 marker_file, quarantine_file, NULL, NULL, handle_out);
 }
 
 int cbm_index_worker_start_with_policy(const char *args_json, size_t memory_budget_bytes,
@@ -874,8 +976,20 @@ int cbm_index_worker_start_with_policy(const char *args_json, size_t memory_budg
                                        bool single_thread, const char *marker_file,
                                        const char *quarantine_file,
                                        cbm_index_worker_handle_t **handle_out) {
-    return worker_start_internal(args_json, memory_budget_bytes, resource_policy, single_thread,
-                                 marker_file, quarantine_file, NULL, NULL, handle_out);
+    return worker_start_internal(args_json, memory_budget_bytes, resource_policy, NULL,
+                                 single_thread, marker_file, quarantine_file, NULL, NULL,
+                                 handle_out);
+}
+
+int cbm_index_worker_start_with_storage_policy(const char *args_json, size_t memory_budget_bytes,
+                                               const cbm_index_resource_policy_t *resource_policy,
+                                               const char *task_db_path, bool single_thread,
+                                               const char *marker_file, const char *quarantine_file,
+                                               cbm_proc_log_cb log_callback, void *log_context,
+                                               cbm_index_worker_handle_t **handle_out) {
+    return worker_start_internal(args_json, memory_budget_bytes, resource_policy, task_db_path,
+                                 single_thread, marker_file, quarantine_file, log_callback,
+                                 log_context, handle_out);
 }
 
 cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
@@ -893,6 +1007,7 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
     bool relay_caught_up = true;
     if (!handle->process_terminal) {
         bool rss_probe_failed = worker_check_resource_limits(handle);
+        worker_check_task_temp_limit(handle);
         cbm_proc_result_t process_result;
         cbm_proc_poll_t state = cbm_subprocess_poll(handle->process, &process_result);
         relay_caught_up = worker_relay_log(handle);
@@ -940,6 +1055,14 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
             handle->result.response_rejected = true;
             handle->result.outcome = CBM_PROC_EXIT_NONZERO;
             handle->result.exit_code = -1;
+        }
+    }
+    if (termination_reason == INDEX_WORKER_TERMINATION_RESOURCE &&
+        handle->result.resource_violation.resource == CBM_INDEX_RESOURCE_TASK_TEMP_BYTES) {
+        if (!handle->result.tree_quiesced || handle->result.supervision_failed) {
+            cbm_log_warn("index.supervisor.staging_cleanup_deferred", "path", handle->task_db_path);
+        } else if (!cbm_index_staging_cleanup(handle->task_db_path, handle->stage_token)) {
+            cbm_log_warn("index.supervisor.staging_cleanup_failed", "path", handle->task_db_path);
         }
     }
     (void)cbm_unlink(handle->response_path);
@@ -1006,17 +1129,19 @@ void cbm_index_worker_destroy(cbm_index_worker_handle_t *handle) {
 
 static int worker_spawn_internal(const char *args_json,
                                  const cbm_index_resource_policy_t *resource_policy,
-                                 bool single_thread, const char *marker_file,
-                                 const char *quarantine_file, cbm_proc_log_cb log_callback,
-                                 void *log_context, const atomic_int *cancel_requested,
+                                 const char *task_db_path, bool single_thread,
+                                 const char *marker_file, const char *quarantine_file,
+                                 cbm_proc_log_cb log_callback, void *log_context,
+                                 const atomic_int *cancel_requested,
                                  cbm_index_worker_result_t *result) {
     if (!result) {
         return -1;
     }
     worker_result_init(result);
     cbm_index_worker_handle_t *handle = NULL;
-    if (worker_start_internal(args_json, 0, resource_policy, single_thread, marker_file,
-                              quarantine_file, log_callback, log_context, &handle) != 0) {
+    if (worker_start_internal(args_json, 0, resource_policy, task_db_path, single_thread,
+                              marker_file, quarantine_file, log_callback, log_context,
+                              &handle) != 0) {
         return -1;
     }
     const cbm_index_worker_result_t *cached = NULL;
@@ -1047,7 +1172,7 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
                                            cbm_proc_log_cb log_callback, void *log_context,
                                            const atomic_int *cancel_requested,
                                            cbm_index_worker_result_t *result) {
-    return worker_spawn_internal(args_json, NULL, single_thread, marker_file, quarantine_file,
+    return worker_spawn_internal(args_json, NULL, NULL, single_thread, marker_file, quarantine_file,
                                  log_callback, log_context, cancel_requested, result);
 }
 
@@ -1055,9 +1180,19 @@ int cbm_index_spawn_worker_with_policy_log_cancel(
     const char *args_json, const cbm_index_resource_policy_t *resource_policy, bool single_thread,
     const char *marker_file, const char *quarantine_file, cbm_proc_log_cb log_callback,
     void *log_context, const atomic_int *cancel_requested, cbm_index_worker_result_t *result) {
-    return worker_spawn_internal(args_json, resource_policy, single_thread, marker_file,
+    return worker_spawn_internal(args_json, resource_policy, NULL, single_thread, marker_file,
                                  quarantine_file, log_callback, log_context, cancel_requested,
                                  result);
+}
+
+int cbm_index_spawn_worker_with_storage_policy_log_cancel(
+    const char *args_json, const cbm_index_resource_policy_t *resource_policy,
+    const char *task_db_path, bool single_thread, const char *marker_file,
+    const char *quarantine_file, cbm_proc_log_cb log_callback, void *log_context,
+    const atomic_int *cancel_requested, cbm_index_worker_result_t *result) {
+    return worker_spawn_internal(args_json, resource_policy, task_db_path, single_thread,
+                                 marker_file, quarantine_file, log_callback, log_context,
+                                 cancel_requested, result);
 }
 
 int cbm_index_spawn_worker_with_log(const char *args_json, bool single_thread,

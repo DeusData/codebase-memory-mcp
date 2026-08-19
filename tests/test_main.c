@@ -341,7 +341,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     free(worker_repo_path);
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
-                                      invocation.memory_budget_bytes);
+                                      invocation.memory_budget_bytes, invocation.stage_token);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);

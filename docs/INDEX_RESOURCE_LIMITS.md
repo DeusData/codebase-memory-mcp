@@ -94,6 +94,31 @@ Worker limit failures use the same shape with `stage=worker`,
 and omit `observed`, `limit`, and `unit` because no trustworthy observation was
 available.
 
+## Storage settings
+
+| Key | Default | Accepted value | Protects |
+|---|---:|---:|---|
+| `index_cache_max_mb` | `off` | `off` or `1..1048576` | Projected cache bytes after replacement |
+| `index_min_free_disk_mb` | `off` | `off` or `1..1048576` | Free bytes reserved on the cache filesystem |
+
+Set or reset these keys through the same `config set` and `config reset`
+commands. With both keys `off`, indexing does not scan the cache tree or probe
+filesystem capacity.
+
+Projected cache usage is the current cache size, minus the old project
+database and SQLite sidecars only when that generation is confirmed valid and
+replaceable, plus the current operation's staging artifacts. Other projects
+and unrelated files always count toward the limit and are never evicted.
+
+Free space is checked before staging, after the staged build completes, and
+immediately before atomic publication. Equality is allowed. An enabled
+measurement that cannot be completed fails closed with
+`code: "resource_probe_failed"` and
+`stage: "storage"`. A limit breach uses `code: "resource_limit_exceeded"`.
+Both cases preserve the old serving database. Staging files created by a
+terminated supervised worker are tagged with a private task token and removed
+after its process tree is quiescent; cleanup cannot match another attempt.
+
 ## Trust and compatibility
 
 Limits are read from the CLI-managed `_config.db`; they are not MCP request
@@ -104,5 +129,5 @@ parent policy.
 These settings do not replace or increase `auto_index_limit`, change the 512 MiB
 single-file cap, alter workspace-root authorization, or affect
 `cross-repo-intelligence`. With all settings `off`, discovery follows the
-existing path and the supervisor performs no periodic RSS probe or total-duration
-termination.
+existing path, the supervisor performs no periodic RSS probe or total-duration
+termination, and the pipeline performs no cache-tree or free-space probe.

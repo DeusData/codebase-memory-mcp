@@ -7576,6 +7576,8 @@ static bool project_db_is_servable(const char *project, const char *db_path);
  * result. The crash is already contained (this process survived); we report it
  * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
  * rest) is layered on in the probe stage. */
+static bool project_db_is_servable(const char *project, const char *db_path);
+
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -7639,6 +7641,9 @@ static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_ou
 
 char *cbm_mcp_index_worker_resource_response(const char *args,
                                              const cbm_index_worker_result_t *worker_result) {
+    if (!worker_result || worker_result->resource_violation.resource == CBM_INDEX_RESOURCE_NONE) {
+        return NULL;
+    }
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
     char *project_name =
@@ -7649,23 +7654,23 @@ char *cbm_mcp_index_worker_resource_response(const char *args,
     }
 
     const cbm_index_resource_violation_t *violation = &worker_result->resource_violation;
+    bool probe_failed = worker_result->resource_probe_failed || violation->probe_failed;
+    bool worker_stage = violation->resource == CBM_INDEX_RESOURCE_RSS_BYTES ||
+                        violation->resource == CBM_INDEX_RESOURCE_DURATION_MS;
     const char *config_key = cbm_index_resource_config_key(violation->resource);
     char message[CBM_SZ_256];
     (void)snprintf(message, sizeof(message),
-                   worker_result->resource_probe_failed
-                       ? "Worker resource measurement failed for %s"
-                       : "Index worker exceeded %s",
+                   probe_failed ? "Index resource measurement failed for %s" : "Index exceeded %s",
                    config_key);
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "status", "error");
     yyjson_mut_obj_add_str(doc, root, "code",
-                           worker_result->resource_probe_failed ? "resource_probe_failed"
-                                                                : "resource_limit_exceeded");
-    yyjson_mut_obj_add_str(doc, root, "stage", "worker");
+                           probe_failed ? "resource_probe_failed" : "resource_limit_exceeded");
+    yyjson_mut_obj_add_str(doc, root, "stage", worker_stage ? "worker" : "storage");
     yyjson_mut_obj_add_str(doc, root, "resource", cbm_index_resource_name(violation->resource));
-    if (!worker_result->resource_probe_failed) {
+    if (!probe_failed) {
         yyjson_mut_obj_add_uint(doc, root, "observed", violation->observed);
         yyjson_mut_obj_add_uint(doc, root, "limit", violation->limit);
         yyjson_mut_obj_add_str(doc, root, "unit", cbm_index_resource_unit(violation->resource));
@@ -7868,6 +7873,24 @@ bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resourc
     return valid;
 }
 
+bool cbm_mcp_index_task_db_path(const char *args, char *path_out, size_t path_size) {
+    if (!path_out || path_size == 0) {
+        return false;
+    }
+    path_out[0] = '\0';
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *name_override = cbm_mcp_get_string_arg(args, "name");
+    char *project =
+        cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
+    char cache_path[CBM_SZ_1K];
+    cache_dir(cache_path, sizeof(cache_path));
+    int written = project ? snprintf(path_out, path_size, "%s/%s.db", cache_path, project) : -1;
+    free(project);
+    free(name_override);
+    free(repo_path);
+    return written > 0 && (size_t)written < path_size;
+}
+
 static bool load_index_policy(cbm_mcp_server_t *srv, const char *args,
                               cbm_index_resource_policy_t *policy, char *error, size_t error_size) {
     if (cbm_index_worker_active()) {
@@ -7911,12 +7934,17 @@ bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
                                   const cbm_index_resource_policy_t *resource_policy) {
     invalidate_cached_store(srv);
+    char task_db_path[CBM_SZ_1K];
+    if (!resource_policy || !cbm_mcp_index_task_db_path(args, task_db_path, sizeof(task_db_path))) {
+        return cbm_mcp_text_result("could not resolve worker index path", true);
+    }
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
-    int rc = cbm_index_spawn_worker_with_policy_log_cancel(
-        args, resource_policy, false, NULL, NULL, srv ? srv->index_log_callback : NULL,
-        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL, &wr);
+    int rc = cbm_index_spawn_worker_with_storage_policy_log_cancel(
+        args, resource_policy, task_db_path, false, NULL, NULL,
+        srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
+        srv ? &srv->pipeline_cancel_requested : NULL, &wr);
     cbm_mcp_supervised_result_disposition_t disposition =
         cbm_mcp_supervised_result_disposition(rc, &wr);
 
@@ -7947,7 +7975,6 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
         invalidate_cached_store(srv);
         return resp;
     }
-
     /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
      * worker PARALLEL (there are no sequential production runs) with the
      * per-file marker JOURNAL armed; after each failed run the journal's
@@ -7995,10 +8022,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
     bool terminal_cancelled = false;
     for (int i = 0; i < cap; i++) {
         cbm_index_worker_result_t wr2;
-        int rc2 = cbm_index_spawn_worker_with_policy_log_cancel(
-            args, resource_policy, /*single_thread=*/false, marker_path, quarantine_path,
-            srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
-            srv ? &srv->pipeline_cancel_requested : NULL, &wr2);
+        int rc2 = cbm_index_spawn_worker_with_storage_policy_log_cancel(
+            args, resource_policy, task_db_path, /*single_thread=*/false, marker_path,
+            quarantine_path, srv ? srv->index_log_callback : NULL,
+            srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL,
+            &wr2);
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
         if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
@@ -8091,8 +8119,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
      * so it cannot itself hang. Rare given monotonic progress. */
     if (!resp && !unsafe_terminal && quarantined > 0) {
         cbm_index_worker_result_t wrp;
-        int rcp = cbm_index_spawn_worker_with_policy_log_cancel(
-            args, resource_policy, /*single_thread=*/false, NULL, quarantine_path,
+        int rcp = cbm_index_spawn_worker_with_storage_policy_log_cancel(
+            args, resource_policy, task_db_path, /*single_thread=*/false, NULL, quarantine_path,
             srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
             srv ? &srv->pipeline_cancel_requested : NULL, &wrp);
         cbm_mcp_supervised_result_disposition_t partial_disposition =
@@ -8517,11 +8545,18 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     } else if (rc == CBM_PIPELINE_RESOURCE_LIMIT &&
                resource_violation.resource != CBM_INDEX_RESOURCE_NONE) {
         const char *config_key = cbm_index_resource_config_key(resource_violation.resource);
+        bool discovery_resource = resource_violation.resource == CBM_INDEX_RESOURCE_FILES ||
+                                  resource_violation.resource == CBM_INDEX_RESOURCE_SOURCE_BYTES;
         char message[CBM_SZ_256];
-        (void)snprintf(message, sizeof(message), "Index discovery exceeded %s", config_key);
+        (void)snprintf(message, sizeof(message),
+                       resource_violation.probe_failed ? "Index resource probe failed for %s"
+                                                       : "Index exceeded %s",
+                       config_key);
         yyjson_mut_obj_add_str(doc, root, "status", "error");
-        yyjson_mut_obj_add_str(doc, root, "code", "resource_limit_exceeded");
-        yyjson_mut_obj_add_str(doc, root, "stage", "discovery");
+        yyjson_mut_obj_add_str(doc, root, "code",
+                               resource_violation.probe_failed ? "resource_probe_failed"
+                                                               : "resource_limit_exceeded");
+        yyjson_mut_obj_add_str(doc, root, "stage", discovery_resource ? "discovery" : "storage");
         yyjson_mut_obj_add_str(doc, root, "resource",
                                cbm_index_resource_name(resource_violation.resource));
         yyjson_mut_obj_add_uint(doc, root, "observed", resource_violation.observed);
@@ -11760,11 +11795,18 @@ static void *autoindex_thread(void *arg) {
         return NULL;
     }
 
+    cbm_index_resource_policy_t resource_policy;
+    char policy_error[CBM_SZ_256] = {0};
+    if (!load_index_policy(srv, NULL, &resource_policy, policy_error, sizeof(policy_error))) {
+        cbm_log_warn("autoindex.err", "msg", "resource_policy_load_failed", "error", policy_error);
+        return NULL;
+    }
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    cbm_pipeline_set_resource_policy(p, &resource_policy);
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();

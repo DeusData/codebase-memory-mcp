@@ -671,12 +671,16 @@ codebase-memory-mcp config set index_max_files 250000    # optional per-index so
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree current RSS limit
 codebase-memory-mcp config set index_max_duration_seconds 3600 # optional total worker duration
+codebase-memory-mcp config set index_cache_max_mb 32768  # optional projected cache-size limit
+codebase-memory-mcp config set index_min_free_disk_mb 4096 # optional free-space reserve
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-The four `index_max_*` settings default to `off`. Exceeding one fails the complete
-index attempt rather than publishing a partial graph; an existing serving index
-is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
+The six index resource settings default to `off`. Exceeding one fails the
+complete index attempt rather than publishing a partial graph; an existing
+serving index is preserved. Storage probes also fail closed when an enabled
+measurement cannot be completed. See
+[Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables
 
