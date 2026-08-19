@@ -264,6 +264,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_import_refs_by_file;
     sqlite3_stmt *stmt_list_import_ref_paths_by_target;
     sqlite3_stmt *stmt_list_import_edge_source_paths_by_target_qn;
+    sqlite3_stmt *stmt_list_import_edge_source_paths_by_target_file;
     sqlite3_stmt *stmt_list_import_ref_paths_for_export_file;
     sqlite3_stmt *stmt_delete_owned_edges_by_file;
     sqlite3_stmt *stmt_delete_owned_nodes_by_file;
@@ -1819,6 +1820,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_delete_import_refs_by_file);
     finalize_stmt(&s->stmt_list_import_ref_paths_by_target);
     finalize_stmt(&s->stmt_list_import_edge_source_paths_by_target_qn);
+    finalize_stmt(&s->stmt_list_import_edge_source_paths_by_target_file);
     finalize_stmt(&s->stmt_list_import_ref_paths_for_export_file);
     finalize_stmt(&s->stmt_delete_owned_edges_by_file);
     finalize_stmt(&s->stmt_delete_owned_nodes_by_file);
@@ -5231,6 +5233,41 @@ int cbm_store_list_import_edge_source_paths_by_target_qn(cbm_store_t *s, const c
     bind_text(stmt, ST_COL_1, project);
     bind_text(stmt, ST_COL_2, target_qn);
     return store_collect_text_column(s, stmt, "list_import_edge_source_paths_by_target_qn", out,
+                                     count);
+}
+
+int cbm_store_list_import_edge_source_paths_by_target_file(cbm_store_t *s, const char *project,
+                                                           const char *target_rel_path, char ***out,
+                                                           int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !project || !target_rel_path || !out || !count) {
+        if (s) {
+            store_set_error(s, "list_import_edge_source_paths_by_target_file: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_list_import_edge_source_paths_by_target_file,
+        "SELECT DISTINCT src.file_path FROM nodes tgt INDEXED BY idx_nodes_file "
+        "CROSS JOIN edges e INDEXED BY idx_edges_target_type "
+        "JOIN nodes src ON src.project = e.project AND src.id = e.source_id "
+        "WHERE tgt.project = ?1 AND tgt.file_path = ?2 "
+        "  AND e.project = tgt.project AND e.target_id = tgt.id AND e.type = 'IMPORTS' "
+        "  AND src.file_path IS NOT NULL AND src.file_path <> '' "
+        "ORDER BY src.file_path;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, target_rel_path);
+    return store_collect_text_column(s, stmt, "list_import_edge_source_paths_by_target_file", out,
                                      count);
 }
 

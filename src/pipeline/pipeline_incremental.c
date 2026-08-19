@@ -2212,6 +2212,62 @@ static char *incr_frontier_import_target_qn(const char *project, const char *rel
     return cbm_pipeline_fqn_module(project, rel_path);
 }
 
+static int incr_append_import_frontier(cbm_store_t *store, const char *project,
+                                       const char *target_rel_path,
+                                       const cbm_file_info_t *all_files, int all_file_count,
+                                       cbm_file_info_t *exact_files, int *exact_count,
+                                       int max_exact_files, const char **out_reason) {
+    char *module_qn = incr_frontier_import_target_qn(project, target_rel_path);
+    if (!module_qn) {
+        if (out_reason) {
+            *out_reason = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
+        }
+        return CBM_STORE_ERR;
+    }
+
+    char **importers = NULL;
+    int importer_count = 0;
+    int rc = cbm_store_list_import_edge_source_paths_by_target_qn(store, project, module_qn,
+                                                                  &importers, &importer_count);
+    free(module_qn);
+    if (rc != CBM_STORE_OK) {
+        if (out_reason) {
+            *out_reason = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
+        }
+        return rc;
+    }
+    for (int i = 0; i < importer_count; i++) {
+        rc = incr_append_exact_frontier_path(importers[i], all_files, all_file_count, exact_files,
+                                             exact_count, max_exact_files, out_reason);
+        if (rc != CBM_STORE_OK) {
+            incr_free_text_array(importers, importer_count);
+            return rc;
+        }
+    }
+    incr_free_text_array(importers, importer_count);
+
+    importers = NULL;
+    importer_count = 0;
+    rc = cbm_store_list_import_edge_source_paths_by_target_file(store, project, target_rel_path,
+                                                                &importers, &importer_count);
+    if (rc != CBM_STORE_OK) {
+        if (out_reason) {
+            *out_reason = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
+        }
+        return rc;
+    }
+    for (int i = 0; i < importer_count; i++) {
+        rc = incr_append_exact_frontier_path(importers[i], all_files, all_file_count, exact_files,
+                                             exact_count, max_exact_files, out_reason);
+        if (rc != CBM_STORE_OK) {
+            incr_free_text_array(importers, importer_count);
+            return rc;
+        }
+    }
+    incr_free_text_array(importers, importer_count);
+    return CBM_STORE_OK;
+}
+
 static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *project,
                                               const cbm_file_info_t *all_files, int all_file_count,
                                               cbm_file_info_t *exact_files, int *exact_count,
@@ -2287,34 +2343,11 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
         }
         cbm_store_free_inbound_edges(edges, edge_count);
 
-        char *module_qn = incr_frontier_import_target_qn(project, rel_path);
-        if (!module_qn) {
-            if (out_reason) {
-                *out_reason = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
-            }
-            return CBM_STORE_ERR;
-        }
-        char **importers = NULL;
-        int importer_count = 0;
-        rc = cbm_store_list_import_edge_source_paths_by_target_qn(store, project, module_qn,
-                                                                  &importers, &importer_count);
-        free(module_qn);
+        rc = incr_append_import_frontier(store, project, rel_path, all_files, all_file_count,
+                                         exact_files, exact_count, max_exact_files, out_reason);
         if (rc != CBM_STORE_OK) {
-            if (out_reason) {
-                *out_reason = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
-            }
             return rc;
         }
-        for (int i = 0; i < importer_count; i++) {
-            rc = incr_append_exact_frontier_path(importers[i], all_files, all_file_count,
-                                                 exact_files, exact_count, max_exact_files,
-                                                 out_reason);
-            if (rc != CBM_STORE_OK) {
-                incr_free_text_array(importers, importer_count);
-                return rc;
-            }
-        }
-        incr_free_text_array(importers, importer_count);
     }
     return CBM_STORE_OK;
 }
@@ -2340,37 +2373,15 @@ static int incr_expand_regular_changed_frontier(cbm_store_t *store, const char *
 
     for (int cursor = 0; cursor < expanded_count; cursor++) {
         const char *rel_path = expanded[cursor].rel_path;
-        char *module_qn = incr_frontier_import_target_qn(project, rel_path);
-        if (!module_qn) {
-            cbm_log_info("incremental.frontier.fallback", "reason",
-                         CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR);
-            free(expanded);
-            return CBM_STORE_NOT_FOUND;
-        }
-        char **importers = NULL;
-        int importer_count = 0;
-        int rc = cbm_store_list_import_edge_source_paths_by_target_qn(store, project, module_qn,
-                                                                      &importers, &importer_count);
-        free(module_qn);
+        const char *reason = NULL;
+        int rc = incr_append_import_frontier(store, project, rel_path, all_files, all_file_count,
+                                             expanded, &expanded_count, all_file_count, &reason);
         if (rc != CBM_STORE_OK) {
             cbm_log_info("incremental.frontier.fallback", "reason",
-                         CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR);
+                         reason ? reason : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR);
             free(expanded);
             return CBM_STORE_NOT_FOUND;
         }
-        const char *reason = NULL;
-        for (int i = 0; i < importer_count; i++) {
-            rc = incr_append_exact_frontier_path(importers[i], all_files, all_file_count, expanded,
-                                                 &expanded_count, all_file_count, &reason);
-            if (rc != CBM_STORE_OK) {
-                cbm_log_info("incremental.frontier.fallback", "reason",
-                             reason ? reason : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR);
-                incr_free_text_array(importers, importer_count);
-                free(expanded);
-                return CBM_STORE_NOT_FOUND;
-            }
-        }
-        incr_free_text_array(importers, importer_count);
     }
 
     if (expanded_count > cls->changed_file_count) {

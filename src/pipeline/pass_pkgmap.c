@@ -2722,7 +2722,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(cbm_pipeline_ctx_t *ctx,
                         cbm_str_join_dotted_temp(target->qualified_name, sym, member_qn_inline,
                                                  sizeof(member_qn_inline), &member_qn_owned);
                     const cbm_gbuf_node_t *member =
-                        member_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, member_qn) : NULL;
+                        member_qn ? cbm_pipeline_find_node_by_qn(ctx, member_qn) : NULL;
                     if (member_qn_owned) {
                         free(member_qn);
                     }

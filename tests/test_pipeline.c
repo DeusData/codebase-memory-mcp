@@ -7579,18 +7579,19 @@ TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential) {
     ASSERT_GT(n, 0);
     ASSERT_LT((size_t)n, sizeof(target_qn));
 
-    char openapi_module_qn[CBM_SZ_512];
+    char openapi_class_qn[CBM_SZ_512];
     char *base_file_qn = cbm_pipeline_fqn_compute(project, "fastapi/security/base.py", "__file__");
     ASSERT_NOT_NULL(base_file_qn);
-    n = snprintf(openapi_module_qn, sizeof(openapi_module_qn), "%s.fastapi.openapi.models",
+    n = snprintf(openapi_class_qn, sizeof(openapi_class_qn),
+                 "%s.fastapi.openapi.models.SecurityBase",
                  project);
     ASSERT_GT(n, 0);
-    ASSERT_LT((size_t)n, sizeof(openapi_module_qn));
+    ASSERT_LT((size_t)n, sizeof(openapi_class_qn));
 
     ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, base_file_qn, "IMPORTS",
-                                                    openapi_module_qn));
+                                                    openapi_class_qn));
     ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, base_file_qn, "IMPORTS",
-                                                    openapi_module_qn));
+                                                    openapi_class_qn));
     ASSERT_TRUE(
         pipeline_store_has_edge_between_qns(seq_db, project, src_qn, "INHERITS", target_qn));
     ASSERT_TRUE(

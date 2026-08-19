@@ -955,6 +955,12 @@ int cbm_store_list_import_edge_source_paths_by_target_qn(cbm_store_t *s, const c
                                                          const char *target_qn, char ***out,
                                                          int *count);
 
+/* Caller frees each returned string and the array. Uses canonical IMPORTS edges
+ * and indexed target file ownership, including member-level import targets. */
+int cbm_store_list_import_edge_source_paths_by_target_file(cbm_store_t *s, const char *project,
+                                                           const char *target_rel_path, char ***out,
+                                                           int *count);
+
 /* Caller frees each returned string and the array. */
 int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,
                                                     const char *export_rel_path, char ***out,
