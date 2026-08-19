@@ -467,6 +467,25 @@ TEST(daemon_sessions_keep_distinct_roots_and_allowed_root_policy) {
     PASS();
 }
 
+/* A daemon canonicalizes the client's root through the platform API, which on
+ * Windows answers in backslash form, while every tool handler normalizes the
+ * paths it canonicalizes. Keeping the native spelling gave one directory two
+ * names, and an explicit index_repository request was then refused as an
+ * options conflict instead of joining the auto-index job already running for
+ * that root. The separators are folded on every platform, so this holds
+ * wherever the test runs. */
+TEST(daemon_session_context_keeps_one_spelling_of_a_root) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, "C:\\repos\\cbm", "C:\\repos"));
+    ASSERT_STR_EQ(cbm_mcp_server_session_root(srv), "C:/repos/cbm");
+    ASSERT_STR_EQ(cbm_mcp_server_allowed_root(srv), "C:/repos");
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 SUITE(daemon) {
     RUN_TEST(daemon_client_ids_are_connection_bound);
     RUN_TEST(daemon_shared_job_survives_until_final_subscriber_disconnects);
@@ -480,4 +499,5 @@ SUITE(daemon) {
     RUN_TEST(daemon_bridge_rejects_embedded_nul_body);
     RUN_TEST(daemon_bridge_rejects_oversized_headers);
     RUN_TEST(daemon_sessions_keep_distinct_roots_and_allowed_root_policy);
+    RUN_TEST(daemon_session_context_keeps_one_spelling_of_a_root);
 }

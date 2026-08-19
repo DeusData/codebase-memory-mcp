@@ -4,6 +4,51 @@ Index resource limits are optional operator controls for repositories whose
 discovery breadth or worker runtime is not known in advance. They are disabled
 by default so existing large-repository workloads retain their current behavior.
 
+## Resource profiles
+
+`index_resource_profile` accepts `off`, `balanced`, or `strict` and defaults to
+`off`. A profile supplies a baseline; each explicitly stored individual
+resource key then replaces its dimension. An explicit `off` disables only that
+dimension.
+
+| Dimension | `balanced` | `strict` |
+|---|---:|---:|
+| Accepted files | 500,000 | 100,000 |
+| Traversed directories | 250,000 | 20,000 |
+| Directory entries | 2,000,000 | 500,000 |
+| Directory depth | 128 | 64 |
+| Accepted source | 65,536 MiB | 4,096 MiB |
+| Discovery duration | 1,800 seconds | 30 seconds |
+| Worker duration | 7,200 seconds | 3,600 seconds |
+| Final database | 65,536 MiB | 16,384 MiB |
+| Staging artifacts | 81,920 MiB | 20,480 MiB |
+| Task temporary artifacts | 98,304 MiB | 24,576 MiB |
+| Projected cache | 131,072 MiB | 32,768 MiB |
+| Free-disk reserve | 4,096 MiB | 4,096 MiB |
+
+The two profiles answer different questions about worker memory, so their RSS
+ceilings are derived rather than tabled.
+
+Balanced protects the host. Its ceiling is 80% of detected host memory, which
+leaves an index free to use everything this machine can spare and still stops a
+runaway worker before the host is exhausted. A fixed number is deliberately not
+used here: large-repository indexing peaks in the tens of gigabytes, so any
+round ceiling low enough to feel safe would reject repositories that index
+successfully with the profile off. When host memory cannot be read, balanced
+falls back to the higher of twice the worker soft budget or 8,192 MiB.
+
+Strict protects the budget. Its ceiling is the lower of the worker soft budget
+and 8,192 MiB, which is the point of the profile: a repository that needs more
+memory than the daemon budgets for itself fails fast with an attributed
+`rss_bytes` violation instead of completing at the host's expense. On a large
+repository this is expected to fail, and the failure names the limit and the
+observed value so the operator can choose `balanced`, raise
+`index_max_rss_mb`, or leave the profile `off`.
+
+Both derived values are held inside the same 64 to 1,048,576 MiB range that
+`index_max_rss_mb` accepts, and detected host memory can lower but never raise
+an explicitly configured `index_max_rss_mb`.
+
 ## Discovery settings
 
 | Key | Default | Accepted value | Protects |
@@ -62,6 +107,12 @@ tree measurement while the root worker is still running, CBM fails closed with
 rules, filename and suffix filters, language detection, and the existing
 per-file size rule. `index_max_source_mb` sums the filesystem sizes of that same
 accepted set.
+
+Profile directory counting includes the request root and each non-skipped
+directory admitted for traversal. Entry counting happens before ignore,
+language, and file-size filtering. Root depth is zero. The monotonic discovery
+deadline is checked before opening a directory and before processing each
+entry. Equality is allowed for every dimension.
 
 Equality is allowed. The first file or byte that makes an observed value greater
 than its limit stops discovery. CBM discards the partial file list and does not

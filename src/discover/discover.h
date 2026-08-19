@@ -145,6 +145,11 @@ typedef enum {
     CBM_DISCOVER_LIMIT_EXCEEDED = 1,
 } cbm_discover_status_t;
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef uint64_t (*cbm_discover_now_ms_fn)(void *context);
+void cbm_discover_set_now_ms_for_testing(cbm_discover_now_ms_fn now_ms, void *context);
+#endif
+
 /* Walk a repository directory tree and discover all source files.
  * Applies hardcoded filters, gitignore patterns, and language detection.
  * Returns 0 on success, -1 on error.

@@ -2035,10 +2035,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     bool config_ready =
         stored_config && cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
         cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "3") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "4") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7") == 0;
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_RESOURCE_PROFILE, "strict") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -2057,6 +2054,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
         .config = stored_config,
         .worker_ops = &worker_ops,
         .update_ops = &update_ops,
+        .aggregate_memory_budget_bytes = UINT64_C(128) * CBM_INDEX_MIB_BYTES,
     };
     cbm_daemon_application_t *application =
         config_ready ? cbm_daemon_application_new(&config) : NULL;
@@ -2084,7 +2082,41 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
                        app_wait_for_subscribers(application, project, 1) &&
                        app_wait_for_atomic_int(&fake.starts, 1);
     bool auto_policy_propagated =
-        first_owned && app_fake_worker_policy_equals(&fake, 0, "3", "4", "64", "7", "off", "off");
+        first_owned &&
+        app_fake_worker_policy_equals(&fake, 0, "100000", "4096", "64", "3600", "32768", "4096");
+    char explicit_args[APP_TEST_PATH_CAP + 64];
+    (void)snprintf(explicit_args, sizeof(explicit_args), "{\"repo_path\":\"%s\"}", root);
+    uint8_t *explicit_tool = NULL;
+    uint32_t explicit_tool_length = 0;
+    bool explicit_encoded = app_test_tool_request("index_repository", explicit_args, &explicit_tool,
+                                                  &explicit_tool_length);
+    app_request_thread_t explicit_request = {
+        .callbacks = callbacks,
+        .session = sessions[3],
+        .request = explicit_tool,
+        .request_length = explicit_tool_length,
+    };
+    cbm_thread_t explicit_thread;
+    bool explicit_started =
+        explicit_encoded &&
+        cbm_thread_create(&explicit_thread, 0, app_request_thread, &explicit_request) == 0;
+    bool explicit_coalesced = explicit_started && project &&
+                              app_wait_for_subscribers(application, project, 2) &&
+                              atomic_load(&fake.starts) == 1;
+    if (sessions[3]) {
+        callbacks.session_cancel(callbacks.context, sessions[3]);
+    }
+    if (explicit_started) {
+        (void)cbm_thread_join(&explicit_thread);
+    }
+    free(explicit_request.response);
+    free(explicit_tool);
+    if (sessions[3]) {
+        callbacks.session_close(callbacks.context, sessions[3]);
+        sessions[3] = NULL;
+    }
+    bool explicit_detached =
+        explicit_coalesced && project && app_wait_for_subscribers(application, project, 1);
     bool second_initialized = app_test_initialize_profile(&callbacks, sessions[1], root,
                                                           CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
     bool coalesced = first_owned && second_initialized && project &&
@@ -2147,6 +2179,8 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(first_initialized);
     ASSERT_TRUE(first_owned);
     ASSERT_TRUE(auto_policy_propagated);
+    ASSERT_TRUE(explicit_coalesced);
+    ASSERT_TRUE(explicit_detached);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);

@@ -21,6 +21,7 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem.h"
 #include "foundation/sha256.h"
 #include "cli/client_adapter.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
@@ -6743,13 +6744,19 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
         return false;
     }
     cbm_index_policy_init(policy);
+    const char *profile = cbm_config_get(cfg, CBM_INDEX_CONFIG_RESOURCE_PROFILE, "off");
+    if (!cbm_index_policy_set_profile(policy, profile, error, error_size)) {
+        return false;
+    }
     for (size_t index = 0; index < cbm_index_policy_key_count(); index++) {
         const char *key = cbm_index_policy_key_at(index);
-        const char *value = cbm_config_get(cfg, key, cbm_index_policy_default_value(key));
-        if (!cbm_index_policy_set(policy, key, value, error, error_size)) {
+        const char *value = cbm_config_get(cfg, key, NULL);
+        if (value && !cbm_index_policy_set(policy, key, value, error, error_size)) {
             return false;
         }
     }
+    cbm_system_info_t system = cbm_system_info();
+    cbm_index_policy_finalize(policy, (uint64_t)system.total_ram, (uint64_t)cbm_mem_budget());
     return true;
 }
 
@@ -6775,6 +6782,7 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
+    {CBM_INDEX_CONFIG_RESOURCE_PROFILE, "off", "Index resource profile: off, balanced, or strict"},
     {CBM_INDEX_CONFIG_MAX_FILES, "off", "Max accepted source files per index, or off"},
     {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
     {CBM_INDEX_CONFIG_MAX_RSS_MB, "off", "Max worker process-tree RSS MiB, or off"},
@@ -6808,19 +6816,17 @@ static bool config_key_is_ui(const char *key) {
 }
 
 static bool config_key_is_index_policy(const char *key) {
-    for (size_t index = 0; key && index < cbm_index_policy_key_count(); index++) {
-        if (strcmp(key, cbm_index_policy_key_at(index)) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return cbm_index_policy_is_config_key(key);
 }
 
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {
     cbm_index_resource_policy_t candidate;
     cbm_index_policy_init(&candidate);
     char error[CLI_BUF_256];
-    if (!cbm_index_policy_set(&candidate, key, value, error, sizeof(error))) {
+    bool valid = strcmp(key, CBM_INDEX_CONFIG_RESOURCE_PROFILE) == 0
+                     ? cbm_index_policy_set_profile(&candidate, value, error, sizeof(error))
+                     : cbm_index_policy_set(&candidate, key, value, error, sizeof(error));
+    if (!valid) {
         (void)fprintf(stderr, "error: %s\n", error);
         return CLI_ERR;
     }
