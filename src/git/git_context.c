@@ -125,6 +125,35 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
     return *out ? 0 : CBM_NOT_FOUND;
 }
 
+static int git_dirty_status(const char *repo_path, bool *dirty_out) {
+    if (!dirty_out || !repo_path || !git_validate_repo_path(repo_path)) {
+        return CBM_NOT_FOUND;
+    }
+    *dirty_out = false;
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    char cmd[GIT_CMD_MAX];
+    int n = snprintf(
+        cmd, sizeof(cmd),
+        "git --no-optional-locks -C \"%s\" status --porcelain --untracked-files=normal 2>%s",
+        repo_path, null_dev);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+    char buffer[CBM_SZ_4K];
+    while (fread(buffer, 1, sizeof(buffer), fp) > 0) {
+        *dirty_out = true;
+    }
+    return cbm_pclose(fp) == 0 ? 0 : CBM_NOT_FOUND;
+}
+
 /* Regular file, not a directory and not a symlink. Uses the Unicode-safe
  * path probe: stat() follows links and rejects non-ASCII paths on Windows,
  * which upstream removed from this file in the Unicode repository-path fix. */
@@ -458,6 +487,37 @@ void cbm_git_context_free(cbm_git_context_t *ctx) {
     free(ctx->head_sha);
     free(ctx->base_sha);
     memset(ctx, 0, sizeof(*ctx));
+}
+
+int cbm_git_snapshot_read(const char *path, cbm_git_snapshot_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    char head_buf[GIT_OUTPUT_MAX];
+    int status = git_capture_into(path, "rev-parse --verify HEAD", head_buf, sizeof(head_buf));
+    if (status != 0 || !head_buf[0]) {
+        return status == 0 ? CBM_NOT_FOUND : status;
+    }
+    bool dirty = false;
+    if (git_dirty_status(path, &dirty) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    out->head_sha = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, head_buf);
+    if (!out->head_sha) {
+        return CBM_NOT_FOUND;
+    }
+    out->available = true;
+    out->dirty = dirty;
+    return 0;
+}
+
+void cbm_git_snapshot_free(cbm_git_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, snapshot->head_sha);
+    memset(snapshot, 0, sizeof(*snapshot));
 }
 
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
