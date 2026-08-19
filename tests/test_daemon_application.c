@@ -2241,8 +2241,81 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     PASS();
 }
 
+TEST(daemon_application_controlled_tool_error_completes_background_observation) {
+    char *root_created = th_mktempdir("cbm_app_controlled_error_root");
+    char *root = root_created ? strdup(root_created) : NULL;
+    char *cache_created = th_mktempdir("cbm_app_controlled_error_cache");
+    char *cache = cache_created ? strdup(cache_created) : NULL;
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    bool cache_env = cache && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    cbm_config_t *stored_config = cache ? cbm_config_open(cache) : NULL;
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.scripted, true);
+    fake.outcomes[0] = CBM_PROC_CLEAN;
+    fake.responses[0] = "{\"content\":[{\"type\":\"text\",\"text\":\"{"
+                        "\\\"status\\\":\\\"error\\\","
+                        "\\\"code\\\":\\\"resource_limit_exceeded\\\","
+                        "\\\"stage\\\":\\\"discovery\\\","
+                        "\\\"resource\\\":\\\"entries\\\","
+                        "\\\"observed\\\":11,"
+                        "\\\"limit\\\":10,"
+                        "\\\"unit\\\":\\\"entries\\\"}\"}],\"isError\":true}";
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application =
+        cache_env && stored_config ? cbm_daemon_application_new(&config) : NULL;
+    int index_rc = application && root
+                       ? cbm_daemon_application_index(application, "ControlledFailureFixture", root)
+                       : -1;
+    char attempt_path[APP_TEST_PATH_CAP];
+    char attempt_record[APP_TEST_PATH_CAP] = {0};
+    (void)snprintf(attempt_path, sizeof(attempt_path), "%s/status/ControlledFailureFixture.json",
+                   cache ? cache : "");
+    app_fake_worker_read_file(attempt_path, attempt_record, sizeof(attempt_record));
+    bool attempt_failed = strstr(attempt_record, "\"state\":\"failed\"") &&
+                          strstr(attempt_record, "\"failure_code\":\"resource_limit_exceeded\"") &&
+                          strstr(attempt_record, "\"resource\":\"entries\"");
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    int starts = atomic_load(&fake.starts);
+
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    if (saved_cache_copy) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache_copy);
+    th_cleanup(root);
+    th_cleanup(cache);
+    free(root);
+    free(cache);
+
+    ASSERT_EQ(index_rc, 0);
+    ASSERT_TRUE(attempt_failed);
+    ASSERT_EQ(starts, 1);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried) {
-    char *cache = th_mktempdir("cbm_app_worker_resource_cache");
+    char *cache_created = th_mktempdir("cbm_app_worker_resource_cache");
+    char *cache = cache_created ? strdup(cache_created) : NULL;
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    bool cache_env = cache && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
     cbm_config_t *stored_config = cache ? cbm_config_open(cache) : NULL;
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -2276,7 +2349,7 @@ TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried) {
     (void)snprintf(args, sizeof(args),
                    "{\"repo_path\":\"%s\",\"name\":\"DaemonWorkerResourceFixture\"}",
                    root ? root : "");
-    bool setup = cache && stored_config && application && session && root &&
+    bool setup = cache_env && stored_config && application && session && root &&
                  app_test_context_request(root, root, &context, &context_length) &&
                  app_test_tool_request("index_repository", args, &tool, &tool_length);
     uint8_t *response = NULL;
@@ -2298,6 +2371,17 @@ TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried) {
                       strstr((char *)response, "\\\"observed\\\":7001") &&
                       strstr((char *)response, "\\\"limit\\\":7000") &&
                       strstr((char *)response, "\\\"unit\\\":\\\"milliseconds\\\"");
+    char attempt_path[APP_TEST_PATH_CAP];
+    char attempt_record[APP_TEST_PATH_CAP] = {0};
+    (void)snprintf(attempt_path, sizeof(attempt_path), "%s/status/DaemonWorkerResourceFixture.json",
+                   cache ? cache : "");
+    app_fake_worker_read_file(attempt_path, attempt_record, sizeof(attempt_record));
+    bool attempt_visible = strstr(attempt_record, "\"origin\":\"explicit\"") &&
+                           strstr(attempt_record, "\"state\":\"failed\"") &&
+                           strstr(attempt_record, "\"failure_code\":\"resource_limit_exceeded\"") &&
+                           strstr(attempt_record, "\"resource\":\"duration_ms\"") &&
+                           strstr(attempt_record, "\"observed\":7001") &&
+                           strstr(attempt_record, "\"limit\":7000");
     if (session) {
         callbacks.session_close(callbacks.context, session);
     }
@@ -2309,12 +2393,20 @@ TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried) {
     free(response);
     free(context);
     free(tool);
+    if (saved_cache_copy) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache_copy);
     th_cleanup(root);
     th_cleanup(cache);
+    free(cache);
 
     ASSERT_TRUE(setup);
     ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
     ASSERT_TRUE(structured);
+    ASSERT_TRUE(attempt_visible);
     ASSERT_EQ(starts, 1);
     ASSERT_EQ(destroys, 1);
     ASSERT_TRUE(stopped);
@@ -4956,6 +5048,11 @@ TEST(daemon_application_cancellation_between_recovery_attempts_stops_retry) {
 }
 
 TEST(daemon_application_thread_start_failure_rolls_back_job_reservation) {
+    char *cache_created = th_mktempdir("cbm_app_thread_start_cache");
+    char *cache = cache_created ? strdup(cache_created) : NULL;
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    bool cache_ready = cache && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
     atomic_store(&fake.allow_completion, true);
@@ -4968,7 +5065,8 @@ TEST(daemon_application_thread_start_failure_rolls_back_job_reservation) {
         .destroy = app_fake_worker_destroy,
     };
     cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
-    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_application_t *application =
+        cache_ready ? cbm_daemon_application_new(&config) : NULL;
     char root[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-thread-start-XXXXXX", cbm_tmpdir());
     bool root_ok = cbm_mkdtemp(root) != NULL;
@@ -4981,17 +5079,35 @@ TEST(daemon_application_thread_start_failure_rolls_back_job_reservation) {
     size_t active_after_failure = application ? cbm_daemon_application_active_jobs(application) : 1;
     size_t subscribers_after_failure =
         application ? cbm_daemon_application_job_subscribers(application, "thread-start") : 1;
+    char attempt_path[APP_TEST_PATH_CAP];
+    char attempt_record[APP_TEST_PATH_CAP] = {0};
+    (void)snprintf(attempt_path, sizeof(attempt_path), "%s/status/thread-start.json",
+                   cache ? cache : "");
+    app_fake_worker_read_file(attempt_path, attempt_record, sizeof(attempt_record));
+    bool failure_recorded = strstr(attempt_record, "\"state\":\"failed\"") &&
+                            strstr(attempt_record, "\"failure_code\":\"worker_start_failed\"") &&
+                            strstr(attempt_record, "\"origin\":\"explicit\"");
     int retried = application && root_ok
                       ? cbm_daemon_application_index(application, "thread-start", root)
                       : -1;
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     cbm_daemon_application_free(application);
+    if (saved_cache_copy) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache_copy);
     (void)cbm_rmdir(root);
+    th_cleanup(cache);
+    free(cache);
 
+    ASSERT_TRUE(cache_ready);
     ASSERT_TRUE(root_ok);
     ASSERT_LT(failed, 0);
     ASSERT_EQ(active_after_failure, 0);
     ASSERT_EQ(subscribers_after_failure, 0);
+    ASSERT_TRUE(failure_recorded);
     ASSERT_EQ(retried, 0);
     ASSERT_EQ(atomic_load(&fake.starts), 1);
     ASSERT_EQ(atomic_load(&fake.destroys), 1);
@@ -5365,6 +5481,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
+    RUN_TEST(daemon_application_controlled_tool_error_completes_background_observation);
     RUN_TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried);
     RUN_TEST(daemon_application_worker_storage_resource_failure_is_structured_and_not_retried);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);

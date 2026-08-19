@@ -146,6 +146,8 @@ struct cbm_daemon_application_job {
     bool cancelled;
     bool cancel_requested;
     bool supervision_failed;
+    bool attempt_recorded;
+    char attempt_id[33];
     cbm_daemon_application_job_t *next;
 };
 
@@ -1212,6 +1214,63 @@ static void application_record_cancelled(cbm_index_worker_result_t *last_result,
     last_log[0] = '\0';
 }
 
+static cbm_index_resource_t application_resource_from_name(const char *name) {
+    for (int resource = CBM_INDEX_RESOURCE_FILES;
+         resource <= CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS; resource++) {
+        if (name && strcmp(name, cbm_index_resource_name((cbm_index_resource_t)resource)) == 0) {
+            return (cbm_index_resource_t)resource;
+        }
+    }
+    return CBM_INDEX_RESOURCE_NONE;
+}
+
+static bool application_response_error_metadata(const char *response, char *code, size_t code_size,
+                                                cbm_index_resource_violation_t *violation) {
+    if (code && code_size > 0) {
+        code[0] = '\0';
+    }
+    if (violation) {
+        *violation = (cbm_index_resource_violation_t){0};
+    }
+    yyjson_doc *outer = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *outer_root = outer ? yyjson_doc_get_root(outer) : NULL;
+    yyjson_val *is_error =
+        outer_root && yyjson_is_obj(outer_root) ? yyjson_obj_get(outer_root, "isError") : NULL;
+    yyjson_val *content =
+        outer_root && yyjson_is_obj(outer_root) ? yyjson_obj_get(outer_root, "content") : NULL;
+    yyjson_val *first = content && yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    yyjson_val *text = first && yyjson_is_obj(first) ? yyjson_obj_get(first, "text") : NULL;
+    yyjson_doc *inner = text && yyjson_is_str(text)
+                            ? yyjson_read(yyjson_get_str(text), yyjson_get_len(text), 0)
+                            : NULL;
+    yyjson_val *inner_root = inner ? yyjson_doc_get_root(inner) : NULL;
+    yyjson_val *inner_status =
+        inner_root && yyjson_is_obj(inner_root) ? yyjson_obj_get(inner_root, "status") : NULL;
+    bool failed = (is_error && yyjson_is_bool(is_error) && yyjson_get_bool(is_error)) ||
+                  (inner_status && yyjson_is_str(inner_status) &&
+                   strcmp(yyjson_get_str(inner_status), "error") == 0);
+    if (failed && inner_root && yyjson_is_obj(inner_root)) {
+        yyjson_val *failure_code = yyjson_obj_get(inner_root, "code");
+        if (code && code_size > 0 && failure_code && yyjson_is_str(failure_code)) {
+            (void)snprintf(code, code_size, "%s", yyjson_get_str(failure_code));
+        }
+        yyjson_val *resource = yyjson_obj_get(inner_root, "resource");
+        yyjson_val *observed = yyjson_obj_get(inner_root, "observed");
+        yyjson_val *limit = yyjson_obj_get(inner_root, "limit");
+        if (violation && resource && yyjson_is_str(resource)) {
+            violation->resource = application_resource_from_name(yyjson_get_str(resource));
+            violation->probe_failed = code && strcmp(code, "resource_probe_failed") == 0;
+            if (observed && yyjson_is_uint(observed) && limit && yyjson_is_uint(limit)) {
+                violation->observed = yyjson_get_uint(observed);
+                violation->limit = yyjson_get_uint(limit);
+            }
+        }
+    }
+    yyjson_doc_free(inner);
+    yyjson_doc_free(outer);
+    return failed;
+}
+
 static bool application_result_is_attributable_failure(
     const application_attempt_t *attempt, cbm_mcp_supervised_result_disposition_t disposition) {
     return disposition == CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE && attempt->has_result &&
@@ -1227,6 +1286,7 @@ typedef enum {
 typedef struct {
     char *response;
     bool successful;
+    bool response_is_error;
     bool unsafe_terminal;
     bool supervision_failed;
     cbm_index_worker_result_t last_result;
@@ -1256,12 +1316,17 @@ static application_attempt_decision_t application_consume_attempt(
         execution->response = attempt->result.response;
         attempt->result.response = NULL;
         execution->successful = execution->response != NULL;
+        execution->response_is_error =
+            execution->response &&
+            application_response_error_metadata(execution->response, NULL, 0, NULL);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
         execution->response =
             cbm_mcp_index_worker_resource_response(job->args_json, &attempt->result);
+        execution->successful = execution->response != NULL;
+        execution->response_is_error = execution->response != NULL;
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_STOP;
     }
@@ -1461,6 +1526,46 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
             execution->have_last_result ? &execution->last_result : NULL,
             execution->last_log[0] ? execution->last_log : NULL);
     }
+    if (job->attempt_recorded) {
+        bool cancelled =
+            execution->have_last_result && execution->last_result.cancellation_requested;
+        bool attempt_completed = execution->successful && !execution->response_is_error;
+        const char *state = attempt_completed ? "completed" : cancelled ? "cancelled" : "failed";
+        const char *failure_code = NULL;
+        const cbm_index_resource_violation_t *violation = NULL;
+        char response_failure_code[CBM_SZ_128] = {0};
+        cbm_index_resource_violation_t response_violation = {0};
+        if (!attempt_completed && !cancelled) {
+            if (application_response_error_metadata(execution->response, response_failure_code,
+                                                    sizeof(response_failure_code),
+                                                    &response_violation)) {
+                failure_code = response_failure_code[0] ? response_failure_code : "index_failed";
+                if (response_violation.resource != CBM_INDEX_RESOURCE_NONE) {
+                    violation = &response_violation;
+                }
+            } else if (execution->have_last_result &&
+                       execution->last_result.resource_violation.resource !=
+                           CBM_INDEX_RESOURCE_NONE) {
+                violation = &execution->last_result.resource_violation;
+                failure_code =
+                    violation->probe_failed ? "resource_probe_failed" : "resource_limit_exceeded";
+            } else if (execution->supervision_failed || execution->unsafe_terminal) {
+                failure_code = "supervision_failed";
+            } else if (!execution->have_last_result ||
+                       execution->last_result.outcome == CBM_PROC_SPAWN_FAILED) {
+                failure_code = "worker_start_failed";
+            } else {
+                failure_code = "index_failed";
+            }
+        } else if (cancelled) {
+            failure_code = "cancelled";
+        }
+        if (!cbm_mcp_index_attempt_transition(job->project_key, job->root_path, job->attempt_id,
+                                              state, failure_code, violation, attempt_completed)) {
+            cbm_log_warn("daemon.index.attempt_record", "project", job->project_key, "state",
+                         "terminal_write_failed");
+        }
+    }
     cbm_daemon_application_t *application = job->application;
     cbm_mutex_lock(&application->mutex);
     job->response = execution->response;
@@ -1508,6 +1613,12 @@ static void *application_job_thread(void *opaque) {
     if (!application_job_wait_for_mutations(job)) {
         application_job_execution_cancel(&execution);
     } else {
+        if (job->attempt_recorded &&
+            !cbm_mcp_index_attempt_transition(job->project_key, job->root_path, job->attempt_id,
+                                              "running", NULL, NULL, false)) {
+            cbm_log_warn("daemon.index.attempt_record", "project", job->project_key, "state",
+                         "running_write_failed");
+        }
         application_attempt_t attempt;
         application_attempt_status_t status =
             application_job_run_attempt(job, NULL, NULL, &attempt);
@@ -1556,6 +1667,18 @@ static char *application_index_project_key(const char *root_path, const char *ar
     return key;
 }
 
+static const char *application_index_origin(const char *args_json, char **owned_origin) {
+    *owned_origin = cbm_mcp_get_string_arg(args_json, "_cbm_index_origin");
+    if (*owned_origin &&
+        (strcmp(*owned_origin, "auto") == 0 || strcmp(*owned_origin, "watcher") == 0 ||
+         strcmp(*owned_origin, "explicit") == 0)) {
+        return *owned_origin;
+    }
+    free(*owned_origin);
+    *owned_origin = NULL;
+    return "explicit";
+}
+
 static size_t application_active_job_count_locked(cbm_daemon_application_t *application) {
     size_t count = 0;
     for (cbm_daemon_application_job_t *job = application->jobs; job; job = job->next) {
@@ -1587,6 +1710,7 @@ static bool application_index_args_normalize_defaults(yyjson_mut_val *root) {
     if (name && (!yyjson_mut_is_str(name) || yyjson_mut_get_len(name) == 0)) {
         (void)yyjson_mut_obj_remove_key(root, "name");
     }
+    (void)yyjson_mut_obj_remove_key(root, "_cbm_index_origin");
     return true;
 }
 
@@ -1619,6 +1743,9 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
     if (application->stopping) {
         return NULL;
     }
+    char *requested_origin = cbm_mcp_get_string_arg(args_json, "_cbm_index_origin");
+    bool watcher_request = requested_origin && strcmp(requested_origin, "watcher") == 0;
+    free(requested_origin);
     cbm_daemon_application_job_t *job =
         application_find_active_job_locked(application, project_key);
     if (job) {
@@ -1631,6 +1758,9 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
             return NULL;
         }
         job->subscribers++;
+        if (watcher_request && job->attempt_recorded) {
+            (void)cbm_mcp_index_attempt_mark_watcher_change(job->project_key, job->attempt_id);
+        }
         *status_out = APPLICATION_JOB_SUBSCRIBE_OK;
         return job;
     }
@@ -1656,6 +1786,20 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
     }
     job->application = application;
     job->subscribers = 1;
+    cbm_index_resource_policy_t policy;
+    char policy_error[CBM_SZ_256] = {0};
+    char *owned_origin = NULL;
+    const char *origin = application_index_origin(args_json, &owned_origin);
+    if (cbm_mcp_index_policy_from_internal_args(args_json, &policy, policy_error,
+                                                sizeof(policy_error))) {
+        job->attempt_recorded =
+            cbm_mcp_index_attempt_begin(project_key, root_path, origin, &policy,
+                                        strcmp(origin, "watcher") == 0, job->attempt_id);
+    }
+    free(owned_origin);
+    if (!job->attempt_recorded) {
+        cbm_log_warn("daemon.index.attempt_record", "project", project_key, "state", "unavailable");
+    }
     job->next = application->jobs;
     application->jobs = job;
     if (application_job_thread_create(&job->thread, job) == 0) {
@@ -1666,6 +1810,11 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
          * reservation back synchronously and let background callers retry. */
         application->jobs = job->next;
         job->next = NULL;
+        if (job->attempt_recorded) {
+            (void)cbm_mcp_index_attempt_transition(job->project_key, job->root_path,
+                                                   job->attempt_id, "failed", "worker_start_failed",
+                                                   NULL, false);
+        }
         application_job_free(job);
         *status_out = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
         cbm_log_warn("daemon.index.thread_start_failed", "action", "retry");
@@ -1985,6 +2134,7 @@ static char *application_auto_index_args(cbm_daemon_application_t *application,
     }
     yyjson_mut_doc_set_root(document, root);
     char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path) &&
+                         yyjson_mut_obj_add_str(document, root, "_cbm_index_origin", "auto") &&
                          application_index_args_add_policy(application, document, root)
                      ? yyjson_mut_write(document, 0, NULL)
                      : NULL;
@@ -3013,6 +3163,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
             application->watcher, application_watcher_mutation_begin,
             application_watcher_mutation_end, application_watcher_project_pruned, application);
     }
+    cbm_mcp_index_attempt_recover_abandoned();
     return application;
 }
 
@@ -3437,6 +3588,8 @@ static int application_background_index(cbm_daemon_application_t *application,
     }
     yyjson_mut_doc_set_root(document, root);
     bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root) &&
+                   yyjson_mut_obj_add_str(document, root, "_cbm_index_origin",
+                                          require_live_watch ? "watcher" : "explicit") &&
                    application_index_args_add_policy(application, document, root);
     char *default_project = cbm_project_name_from_path(canonical_root);
     bool custom_project =

@@ -682,8 +682,8 @@ codebase-memory-mcp config reset auto_index              # reset to default
 explicit value, including `off`, replaces that dimension of a selected
 profile. Exceeding an effective limit fails the complete index attempt rather
 than publishing a partial graph, and an existing serving index is preserved.
-Storage probes also fail closed when an enabled measurement cannot be
-completed. See
+`index_status` reports the latest physical indexing attempt and Git-based
+freshness after the first recorded attempt. See
 [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables

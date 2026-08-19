@@ -38,6 +38,28 @@ bool cbm_mcp_index_task_db_path(const char *args, char *path_out, size_t path_si
 char *cbm_mcp_index_worker_resource_response(const char *args,
                                              const cbm_index_worker_result_t *worker_result);
 
+typedef enum {
+    CBM_INDEX_ATTEMPT_NONE = 0,
+    CBM_INDEX_ATTEMPT_AVAILABLE,
+    CBM_INDEX_ATTEMPT_CORRUPT,
+} cbm_index_attempt_read_status_t;
+
+bool cbm_mcp_index_attempt_begin(const char *project, const char *repo_path, const char *origin,
+                                 const cbm_index_resource_policy_t *policy,
+                                 bool watcher_observed_change, char attempt_id[33]);
+bool cbm_mcp_index_attempt_transition(const char *project, const char *repo_path,
+                                      const char *attempt_id, const char *state,
+                                      const char *failure_code,
+                                      const cbm_index_resource_violation_t *violation,
+                                      bool generation_completed);
+bool cbm_mcp_index_attempt_mark_watcher_change(const char *project, const char *attempt_id);
+cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc *document,
+                                                                 yyjson_mut_val *root,
+                                                                 const char *project,
+                                                                 const char *current_root_path);
+bool cbm_mcp_index_attempt_remove(const char *project);
+void cbm_mcp_index_attempt_recover_abandoned(void);
+
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
 /* Count indexable files with the pipeline's native full-mode discovery policy,

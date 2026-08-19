@@ -10,6 +10,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
+| Latest indexing attempt | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/status/<project>.json` | JSON | Owner-private, atomically replaced status used by `index_status`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
 | Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
 | Activation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
@@ -108,6 +109,14 @@ budget. Total duration is independent of the existing 15-minute no-log-progress
 timeout. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
+
+After the first physical indexing attempt for a project, `index_status` adds
+`last_index_attempt` and `freshness`. Freshness is `fresh` only when a clean
+Git snapshot observed both before and after indexing still matches the current
+clean `HEAD`. A different clean `HEAD` is `stale`, while non-Git, dirty,
+changed-during-index, missing, or unreadable snapshots are `unknown`.
+`delete_project` also removes a matching attempt record when no database was
+published.
 
 ## 3. UI Settings
 

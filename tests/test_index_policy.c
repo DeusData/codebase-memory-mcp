@@ -683,7 +683,8 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
         th_write_file(TH_PATH(repo, "second.py"), "def second():\n    return 2\n") == 0;
     (void)snprintf(args, sizeof(args),
                    "{\"repo_path\":\"%s\",\"name\":\"ResourcePolicyFixture\","
-                   "\"mode\":\"fast\",\"_cbm_index_policy\":{"
+                   "\"mode\":\"fast\",\"_cbm_index_origin\":\"watcher\","
+                   "\"_cbm_index_policy\":{"
                    "\"index_max_files\":\"off\",\"index_max_source_mb\":\"off\"}}",
                    repo);
     char *limited_response =
@@ -697,6 +698,16 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
                        strstr(limited_response, "\\\"retryable\\\":true") &&
                        strstr(limited_response, "\\\"serving_index_preserved\\\":true");
     free(limited_response);
+    char attempt_path[2048];
+    (void)snprintf(attempt_path, sizeof(attempt_path), "%s/status/ResourcePolicyFixture.json",
+                   cache);
+    yyjson_doc *attempt_record = yyjson_read_file(attempt_path, 0, NULL, NULL);
+    yyjson_val *attempt_root = attempt_record ? yyjson_doc_get_root(attempt_record) : NULL;
+    yyjson_val *attempt_origin =
+        attempt_root && yyjson_is_obj(attempt_root) ? yyjson_obj_get(attempt_root, "origin") : NULL;
+    bool origin_not_forged = attempt_origin && yyjson_is_str(attempt_origin) &&
+                             strcmp(yyjson_get_str(attempt_origin), "explicit") == 0;
+    yyjson_doc_free(attempt_record);
 
     cbm_store_t *after_store = cbm_store_open_path_query(db_path);
     cbm_project_t after_project = {0};
@@ -737,6 +748,7 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
     ASSERT_TRUE(first_indexed);
     ASSERT_TRUE(configured);
     ASSERT_TRUE(contract_ok);
+    ASSERT_TRUE(origin_not_forged);
     ASSERT_TRUE(generation_preserved);
     ASSERT_TRUE(cross_repo_unaffected);
     PASS();

@@ -170,6 +170,25 @@ Both cases preserve the old serving database. Staging files created by a
 terminated supervised worker are tagged with a private task token and removed
 after its process tree is quiescent; cleanup cannot match another attempt.
 
+## Attempt visibility and freshness
+
+The latest physical attempt for each project is atomically stored in an
+owner-private file below `${CBM_CACHE_DIR}/status/`. It records the
+`explicit`, `auto`, or `watcher` origin; `queued`, `running`, `completed`,
+`failed`, or `cancelled` state; effective profile source; timestamps; and
+stable resource failure details when applicable. Daemon startup changes
+abandoned `queued` or `running` records to `failed` with
+`failure_code=worker_lost`.
+
+After a record exists, `index_status` returns `last_index_attempt` and
+`freshness`. A generation is comparable only when matching clean Git snapshots
+were observed before and after indexing, and it is `fresh` only while the
+current worktree remains clean at that `HEAD`. A different clean `HEAD`, or a
+failed watcher rebuild after an observed change, is `stale`. Non-Git roots,
+dirty or changed-during-index snapshots, failed Git probes, and corrupt records
+are `unknown`. Dirty state is never proof of freshness or staleness. Projects
+with no attempt record retain the previous response shape.
+
 ## Trust and compatibility
 
 Limits are read from the CLI-managed `_config.db`; they are not MCP request
