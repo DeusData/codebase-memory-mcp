@@ -2606,7 +2606,31 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
+    cbm_system_info_t system = cbm_system_info();
+    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram,
+                              application ? (uint64_t)application->worker_memory_budget_bytes : 0);
     return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
+}
+
+static char *application_index_args_replace_policy(cbm_daemon_application_t *application,
+                                                   const char *args_json) {
+    yyjson_doc *source = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_mut_doc *document = source ? yyjson_doc_mut_copy(source, NULL) : NULL;
+    yyjson_doc_free(source);
+    yyjson_mut_val *root = document ? yyjson_mut_doc_get_root(document) : NULL;
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(document);
+        return NULL;
+    }
+    while (yyjson_mut_obj_get(root, "_cbm_index_policy")) {
+        (void)yyjson_mut_obj_remove_key(root, "_cbm_index_policy");
+    }
+    char *rewritten =
+        application_index_args_add_policy(application, document, root)
+            ? yyjson_mut_write_opts(document, 0, cbm_json_writer_allocator(), NULL, NULL)
+            : NULL;
+    yyjson_mut_doc_free(document);
+    return rewritten;
 }
 
 static char *application_auto_index_args(cbm_daemon_application_t *application,
@@ -3121,8 +3145,14 @@ static char *application_index_execute(void *context, const char *root_path, con
     if (!session || !root_path || !args_json) {
         return NULL;
     }
-    return async ? application_index_start_async(session, root_path, args_json)
-                 : application_index_run_sync(session, root_path, args_json);
+    char *trusted_args = application_index_args_replace_policy(session->application, args_json);
+    if (!trusted_args) {
+        return cbm_mcp_text_result("failed to resolve daemon index resource policy", true);
+    }
+    char *result = async ? application_index_start_async(session, root_path, trusted_args)
+                         : application_index_run_sync(session, root_path, trusted_args);
+    cbm_free(CBM_MEM_CLASS_OTHER, trusted_args);
+    return result;
 }
 
 static void application_status_add_record(yyjson_mut_doc *doc, yyjson_mut_val *root,
