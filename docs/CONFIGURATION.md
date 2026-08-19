@@ -93,6 +93,8 @@ Current keys:
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `index_max_rss_mb` | `off` | Optional maximum current RSS in MiB for the complete contained index-worker process tree (`64..1048576`). |
+| `index_max_duration_seconds` | `off` | Optional maximum total worker duration in seconds (`1..86400`). |
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
@@ -126,11 +128,13 @@ has not run yet).
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The two `index_max_*` settings are independent and disabled by default. They
+The four `index_max_*` settings are independent and disabled by default. They
 apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
 to `cross-repo-intelligence`, which does not scan repository source files.
-Equality is allowed; exceeding either setting fails the complete index request
-and preserves any previously serving database. See
+Equality is allowed; exceeding any setting fails the complete index request and
+preserves any previously serving database. Worker RSS covers descendants and is
+not the same as the internal `CBM_MEM_BUDGET_MB` allocation budget. Total
+duration is independent of the existing 15-minute no-log-progress timeout. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
 
