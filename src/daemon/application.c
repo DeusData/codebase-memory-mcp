@@ -207,7 +207,8 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
 static bool application_update_reap(cbm_daemon_application_t *application, bool wait,
                                     uint32_t timeout_ms);
 static void *application_job_thread(void *opaque);
-static char *application_auto_index_args(const char *root_path);
+static char *application_auto_index_args(cbm_daemon_application_t *application,
+                                         const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
     const char *args_json, application_job_subscribe_status_t *status_out);
@@ -1399,7 +1400,7 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             application_refresh_watch_locked(session);
             continue;
         }
-        char *args = application_auto_index_args(root_path);
+        char *args = application_auto_index_args(application, root_path);
         if (!args) {
             continue;
         }
@@ -1900,7 +1901,27 @@ static bool application_update_reap(cbm_daemon_application_t *application, bool 
     }
 }
 
-static char *application_auto_index_args(const char *root_path) {
+static bool application_index_args_add_policy(cbm_daemon_application_t *application,
+                                              yyjson_mut_doc *document, yyjson_mut_val *root) {
+    cbm_config_t *owned_config = NULL;
+    cbm_config_t *config = application ? application->config : NULL;
+    if (!config) {
+        owned_config = cbm_config_open(cbm_resolve_cache_dir());
+        config = owned_config;
+    }
+    cbm_index_resource_policy_t policy;
+    char error[CBM_SZ_256] = {0};
+    bool loaded = cbm_config_load_index_policy(config, &policy, error, sizeof(error));
+    cbm_config_close(owned_config);
+    if (!loaded) {
+        cbm_log_error("daemon.index.policy", "error", error);
+        return false;
+    }
+    return cbm_mcp_index_policy_add_to_args(document, root, &policy);
+}
+
+static char *application_auto_index_args(cbm_daemon_application_t *application,
+                                         const char *root_path) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = document ? yyjson_mut_obj(document) : NULL;
     if (!document || !root) {
@@ -1908,7 +1929,8 @@ static char *application_auto_index_args(const char *root_path) {
         return NULL;
     }
     yyjson_mut_doc_set_root(document, root);
-    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path)
+    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path) &&
+                         application_index_args_add_policy(application, document, root)
                      ? yyjson_mut_write(document, 0, NULL)
                      : NULL;
     yyjson_mut_doc_free(document);
@@ -1951,7 +1973,7 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                      files);
     }
     bool args_required = auto_index_candidate && within_auto_index_limit;
-    char *args = args_required ? application_auto_index_args(root_path) : NULL;
+    char *args = args_required ? application_auto_index_args(application, root_path) : NULL;
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     if (application->stopping || application_request_cancelled_locked(session)) {
@@ -3351,7 +3373,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     yyjson_mut_doc_set_root(document, root);
-    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root);
+    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root) &&
+                   application_index_args_add_policy(application, document, root);
     char *default_project = cbm_project_name_from_path(canonical_root);
     bool custom_project =
         project_name[0] && (!default_project || strcmp(default_project, project_name) != 0);

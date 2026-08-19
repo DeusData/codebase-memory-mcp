@@ -48,7 +48,7 @@ trap cleanup EXIT
 
 missing="${tmpdir}/repository-does-not-exist"
 response="${tmpdir}/worker.response"
-args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\"}"
+args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\",$(cbm_test_index_worker_policy_json)}"
 
 if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \

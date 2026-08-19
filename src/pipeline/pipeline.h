@@ -30,6 +30,8 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 typedef struct cbm_pipeline cbm_pipeline_t;
 
+#define CBM_PIPELINE_RESOURCE_LIMIT (-5)
+
 /* ── Index mode ─────────────────────────────────────────────────── */
 
 #ifndef CBM_INDEX_MODE_T_DEFINED
@@ -52,6 +54,13 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
+
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

@@ -667,8 +667,14 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
+codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+index attempt rather than publishing a partial graph; an existing serving index
+is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables
 

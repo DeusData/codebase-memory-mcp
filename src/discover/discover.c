@@ -13,6 +13,7 @@
 
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/workspace.h"
 #include "foundation/platform.h"
 #ifdef _WIN32
@@ -414,6 +415,10 @@ typedef struct {
     int capacity;
     int max_files;
     uint64_t deadline_ms;
+    const cbm_index_resource_policy_t *resource_policy;
+    cbm_index_resource_violation_t *resource_violation;
+    uint64_t source_files;
+    uint64_t source_bytes;
     bool count_only;
     bool collect_excluded;
     bool limit_exceeded;
@@ -434,6 +439,21 @@ typedef struct {
     int ignored_cap;
     int ignored_total;
 } file_list_t;
+
+static void file_list_resource_violation(file_list_t *fl, cbm_index_resource_t resource,
+                                         uint64_t observed, uint64_t limit) {
+    if (!fl || fl->limit_exceeded || fl->failed) {
+        return;
+    }
+    fl->limit_exceeded = true;
+    if (fl->resource_violation) {
+        *fl->resource_violation = (cbm_index_resource_violation_t){
+            .resource = resource,
+            .observed = observed,
+            .limit = limit,
+        };
+    }
+}
 
 static bool file_list_should_stop(file_list_t *fl) {
     if (!fl) {
@@ -503,6 +523,28 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     if (fl->max_files >= 0 && fl->count >= fl->max_files) {
         fl->limit_exceeded = true;
         return;
+    }
+    uint64_t source_size = size > 0 ? (uint64_t)size : 0;
+    bool resource_accepted = fl->resource_policy && source_size <= (uint64_t)cbm_max_file_bytes();
+    if (resource_accepted) {
+        if (fl->resource_policy->max_files.enabled &&
+            fl->source_files >= fl->resource_policy->max_files.value) {
+            file_list_resource_violation(fl, CBM_INDEX_RESOURCE_FILES, fl->source_files + 1U,
+                                         fl->resource_policy->max_files.value);
+            return;
+        }
+        if (fl->resource_policy->max_source_bytes.enabled) {
+            uint64_t limit = fl->resource_policy->max_source_bytes.value;
+            if (source_size > limit || fl->source_bytes > limit - source_size) {
+                uint64_t observed = source_size > UINT64_MAX - fl->source_bytes
+                                        ? UINT64_MAX
+                                        : fl->source_bytes + source_size;
+                file_list_resource_violation(fl, CBM_INDEX_RESOURCE_SOURCE_BYTES, observed, limit);
+                return;
+            }
+            fl->source_bytes += source_size;
+        }
+        fl->source_files++;
     }
     if (fl->count_only) {
         fl->count++;
@@ -1129,6 +1171,9 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     if (ignored_total_out) {
         *ignored_total_out = 0;
     }
+    if (opts && opts->resource_violation) {
+        *opts->resource_violation = (cbm_index_resource_violation_t){0};
+    }
     if (!repo_path || !out || !count || (count_only && max_files < 0)) {
         return CBM_DISCOVER_ERROR;
     }
@@ -1203,6 +1248,8 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     file_list_t fl = {
         .max_files = count_only ? max_files : -1,
         .deadline_ms = count_only ? deadline_ms : 0,
+        .resource_policy = opts ? opts->resource_policy : NULL,
+        .resource_violation = opts ? opts->resource_violation : NULL,
         .count_only = count_only,
         .collect_excluded = !count_only && excluded_out != NULL,
         .collect_ignored = !count_only && ignored_out != NULL,
@@ -1225,11 +1272,11 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         }
         return fl.limit_exceeded ? CBM_DISCOVER_LIMIT_EXCEEDED : CBM_DISCOVER_OK;
     }
-    if (fl.failed) {
+    if (fl.failed || fl.limit_exceeded) {
         cbm_discover_free(fl.files, fl.count);
         cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
         cbm_discover_free_ignored(fl.ignored, fl.ignored_count);
-        return CBM_DISCOVER_ERROR;
+        return fl.limit_exceeded ? CBM_DISCOVER_LIMIT_EXCEEDED : CBM_DISCOVER_ERROR;
     }
 
     *out = fl.files;
