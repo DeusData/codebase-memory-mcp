@@ -91,6 +91,7 @@ Current keys:
 | `doc_candidates` | `auto` | Score documentation sections against code to store doc↔code candidates (the possible targets of a section, and the sections that may describe a function or file, each with a judged probability). Unset (`auto`), the index mode decides: on for `full` indexes (the default mode), off for `moderate` and `fast`. Set `true` or `false` to choose for every mode; `config reset doc_candidates` returns to `auto`. The scoring grows with sections × functions: under a second up to ~100k functions, ~15 s at ~400k, ~3 minutes on the Linux kernel. Off stores no candidates and leaves the rest of the graph unchanged; on in `fast` mode stores candidates without adding `fast`'s skipped `SIMILAR_TO` / `SEMANTICALLY_RELATED` edges. `index_repository` also takes `doc_candidates` for a single index, which wins over this setting. Applies from the next index. |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Only an open MCP session's own project is ever watched; `index_status` reports the current state in its `watch` object. |
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
+| `index_resource_profile` | `off` | Composed index resource baseline: `off`, `balanced`, or `strict`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
@@ -130,8 +131,12 @@ has not run yet).
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The six index resource settings are independent and disabled by default.
-They apply to explicit indexing, automatic indexing, and watcher re-indexing,
+The profile and all six individual resource settings are disabled by default.
+An individual stored value replaces its profile dimension; storing `off`
+disables only that dimension. Profile-only limits also bound traversed
+directories, directory entries, depth, discovery time, final database size,
+staging size, and task temporary size. Effective limits apply to explicit
+indexing, automatic indexing, and watcher re-indexing,
 but not to `cross-repo-intelligence`, which does not scan or publish repository
 source indexes. Equality is allowed; exceeding a setting fails the complete
 index request and preserves any previously serving database. Worker RSS covers

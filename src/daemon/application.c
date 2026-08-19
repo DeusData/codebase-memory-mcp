@@ -2367,7 +2367,30 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
+    cbm_system_info_t system = cbm_system_info();
+    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram,
+                              application ? (uint64_t)application->worker_memory_budget_bytes : 0);
     return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
+}
+
+static char *application_index_args_replace_policy(cbm_daemon_application_t *application,
+                                                   const char *args_json) {
+    yyjson_doc *source = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_mut_doc *document = source ? yyjson_doc_mut_copy(source, NULL) : NULL;
+    yyjson_doc_free(source);
+    yyjson_mut_val *root = document ? yyjson_mut_doc_get_root(document) : NULL;
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(document);
+        return NULL;
+    }
+    while (yyjson_mut_obj_get(root, "_cbm_index_policy")) {
+        (void)yyjson_mut_obj_remove_key(root, "_cbm_index_policy");
+    }
+    char *rewritten = application_index_args_add_policy(application, document, root)
+                          ? yyjson_mut_write(document, 0, NULL)
+                          : NULL;
+    yyjson_mut_doc_free(document);
+    return rewritten;
 }
 
 static char *application_auto_index_args(cbm_daemon_application_t *application,
@@ -2663,14 +2686,19 @@ static const char *application_index_admission_error(application_job_subscribe_s
  * physical job limit); a cancelled request drops only its own reference. */
 static char *application_index_execute_sync(cbm_daemon_application_session_t *session,
                                             const char *root_path, const char *args_json) {
-    char *project_key = application_index_project_key(root_path, args_json);
+    char *trusted_args = application_index_args_replace_policy(session->application, args_json);
+    if (!trusted_args) {
+        return cbm_mcp_text_result("failed to resolve daemon index resource policy", true);
+    }
+    char *project_key = application_index_project_key(root_path, trusted_args);
     if (!project_key) {
+        free(trusted_args);
         return cbm_mcp_text_result("failed to derive index project identity", true);
     }
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
     cbm_daemon_application_job_t *job = NULL;
     for (;;) {
-        job = application_job_subscribe(session->application, project_key, root_path, args_json,
+        job = application_job_subscribe(session->application, project_key, root_path, trusted_args,
                                         &subscribe_status);
         if (job || (subscribe_status != APPLICATION_JOB_SUBSCRIBE_BUSY &&
                     subscribe_status != APPLICATION_JOB_SUBSCRIBE_CANCELLING)) {
@@ -2692,12 +2720,14 @@ static char *application_index_execute_sync(cbm_daemon_application_session_t *se
         cbm_mutex_unlock(&session->application->mutex);
         if (queued_cancelled) {
             free(project_key);
+            free(trusted_args);
             return cbm_mcp_text_result(
                 "index operation cancelled for this session. " CBM_MCP_INDEX_ASYNC_HINT, true);
         }
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
     free(project_key);
+    free(trusted_args);
     if (!job) {
         return cbm_mcp_text_result(application_index_admission_error(subscribe_status), true);
     }
