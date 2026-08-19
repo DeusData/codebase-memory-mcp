@@ -15,7 +15,8 @@ enum {
     INCR_RING_BUF = 4,
     INCR_RING_MASK = 3,
     INCR_TS_BUF = 24,
-    INCR_NOT_INDEXED_PREFIX_LEN = sizeof("not_indexed") - 1
+    INCR_NOT_INDEXED_PREFIX_LEN = sizeof("not_indexed") - 1,
+    INCR_PARALLEL_MIN_FILES = 50
 };
 #include "pipeline/pipeline.h"
 #include <stdio.h>
@@ -673,6 +674,11 @@ static bool incr_changed_has_scoped_overlay_gap(const cbm_file_info_t *changed_f
         }
     }
     return false;
+}
+
+static bool incr_parallel_cross_lsp_requires_full(const cbm_file_info_t *files, int count) {
+    return count > INCR_PARALLEL_MIN_FILES && cbm_default_worker_count(true) > SKIP_ONE &&
+           incr_changed_has_scoped_overlay_gap(files, count);
 }
 
 static bool incr_language_can_attempt_scoped_exact_gap(CBMLanguage lang) {
@@ -1690,15 +1696,11 @@ static int run_extract_resolve_inner(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *c
                                      int ci) {
     struct timespec t;
 
-    /* Per-file LSP always runs. Sequential scoped increments run the reusable
-     * cross-LSP pass over the changed-file cache only; this is not equivalent
-     * to full-repo FAST for languages whose receiver/type resolution needs
-     * project-wide defs. Parallel scoped increments pass NULL cross registries
-     * below, so their fused cross-LSP step is a no-op. */
-
-#define MIN_FILES_FOR_PARALLEL_INCR 50
+    /* Per-file LSP always runs. Parallel scoped increments pass NULL cross
+     * registries below, so route languages that still need cross-LSP parity
+     * to a full rebuild before entering this helper. */
     int worker_count = cbm_default_worker_count(true);
-    bool use_parallel = worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR;
+    bool use_parallel = worker_count > SKIP_ONE && ci > INCR_PARALLEL_MIN_FILES;
 
     if (use_parallel) {
         cbm_log_info("incremental.mode", "mode", "parallel", "workers", itoa_buf_incr(worker_count),
@@ -2861,6 +2863,15 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         cbm_log_info("incremental.exact.frontier", "changed", itoa_buf_incr(changed_count),
                      "expanded", itoa_buf_incr(exact_count));
     }
+    if (incr_parallel_cross_lsp_requires_full(exact_files, exact_count)) {
+        cbm_pipeline_set_exact_delta_stats_with_limit(
+            p, input_path_count, exact_count + deleted_count, -1, max_affected_paths, false);
+        cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP);
+        cbm_log_info("incremental.exact.skip", "reason", CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP,
+                     "scope", "parallel_frontier", "action", "full_reindex");
+        free(exact_files);
+        return CBM_STORE_OK;
+    }
     int delta_count = exact_count + deleted_count;
     cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, -1);
     int rc = CBM_STORE_OK;
@@ -3828,6 +3839,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
     changed_files = cls.changed_files;
     ci = cls.changed_file_count;
+    if (incr_parallel_cross_lsp_requires_full(changed_files, ci)) {
+        cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP);
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.fallback", "reason", CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP,
+                     "scope", "parallel_frontier");
+        return CBM_NOT_FOUND;
+    }
 
     struct timespec t;
 

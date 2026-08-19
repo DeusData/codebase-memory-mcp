@@ -1666,6 +1666,14 @@ class RunBenchmarkTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frontier files must be positive"):
                 BENCHMARK.create_inbound_frontier_repo(Path(tmpdir), "go", 0)
 
+    def test_large_python_frontier_declares_safe_parallel_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata = BENCHMARK.create_inbound_frontier_repo(Path(tmpdir), "python", 50)
+
+        self.assertEqual(metadata["incremental_contract"], "safe_full_rebuild")
+        self.assertEqual(metadata["expected_publish_kind"], "full")
+        self.assertEqual(metadata["expected_reason"], "scoped_lsp_gap")
+
     def test_frontier_gate_rejects_fixture_that_did_not_expand(self) -> None:
         metadata = {"expected_minimum_affected_files": 8}
         incremental = {"response": {"exact_delta": {"affected_paths": 1}}}

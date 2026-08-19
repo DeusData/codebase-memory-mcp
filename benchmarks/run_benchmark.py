@@ -352,6 +352,8 @@ CROSS_FILE_RESOLVER_LANGUAGES = (
     "rust",
 )
 SCOPED_EXACT_FRONTIER_LANGUAGES = frozenset({"go", "c", "cpp", "cuda", "python"})
+INCREMENTAL_PARALLEL_MIN_FILES = 50
+PARALLEL_SCOPED_LSP_FALLBACK_LANGUAGES = frozenset({"python"})
 MATRIX_FRONTIER_SCENARIOS = {
     "go_inbound_frontier": "go",
     "python_inbound_frontier": "python",
@@ -1891,7 +1893,14 @@ def create_inbound_frontier_repo(
         "requested_inbound_dependents": dependent_files,
         "dependent_paths": dependent_paths,
     }
-    if resolver_language in SCOPED_EXACT_FRONTIER_LANGUAGES:
+    parallel_scoped_lsp_fallback = (
+        resolver_language in PARALLEL_SCOPED_LSP_FALLBACK_LANGUAGES
+        and dependent_files + 1 > INCREMENTAL_PARALLEL_MIN_FILES
+    )
+    if (
+        resolver_language in SCOPED_EXACT_FRONTIER_LANGUAGES
+        and not parallel_scoped_lsp_fallback
+    ):
         metadata.update(
             {
                 "incremental_contract": "exact_frontier",

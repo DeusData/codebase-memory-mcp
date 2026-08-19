@@ -18037,6 +18037,81 @@ TEST(incremental_fast_configured_cap_uses_containment_for_oversized_inbound_fron
     PASS();
 }
 
+TEST(incremental_fast_python_parallel_frontier_falls_back_before_incomplete_resolution) {
+    enum { PIPELINE_PY_PARALLEL_FRONTIER_IMPORTERS = 51, PIPELINE_PY_FRONTIER_WORKERS = 4 };
+    pipeline_env_snapshot_t workers_env = pipeline_env_save("CBM_WORKERS");
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char workers[CBM_SZ_32];
+    int n = snprintf(workers, sizeof(workers), "%d", PIPELINE_PY_FRONTIER_WORKERS);
+    ASSERT(n > 0 && (size_t)n < sizeof(workers));
+    ASSERT_EQ(cbm_setenv("CBM_WORKERS", workers, 1), 0);
+
+    char path[CBM_PATH_MAX];
+    n = snprintf(path, sizeof(path), "%s/leaf.py", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path, "def leaf():\n    return 1\n"), 0);
+    for (int i = 0; i < PIPELINE_PY_PARALLEL_FRONTIER_IMPORTERS; i++) {
+        char body[CBM_SZ_256];
+        n = snprintf(path, sizeof(path), "%s/caller_%04d.py", g_incr_tmpdir, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(path));
+        n = snprintf(body, sizeof(body),
+                     "from leaf import leaf\n\n"
+                     "def caller_%04d():\n"
+                     "    return leaf() + %d\n",
+                     i, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(body));
+        ASSERT_EQ(th_write_file(path, body), 0);
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, "64"), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/leaf.py", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path, "def leaf():\n    return 2\n"), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=52") != NULL);
+    ASSERT(strstr(logs,
+                  "msg=incremental.exact.skip reason=scoped_lsp_gap scope=parallel_frontier ") !=
+           NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "large Python frontier fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    pipeline_env_restore(&workers_env);
+    PASS();
+}
+
 TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -25299,6 +25374,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(
         incremental_fast_configured_cap_uses_containment_for_oversized_inbound_frontier);
+    RUN_TEST(incremental_fast_python_parallel_frontier_falls_back_before_incomplete_resolution);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_fast_default_c_header_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild);
