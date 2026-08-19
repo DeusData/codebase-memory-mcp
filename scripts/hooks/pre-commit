@@ -17,4 +17,13 @@ echo "pre-commit: security audit (source-level)..."
 scripts/security-audit.sh
 
 echo "pre-commit: building and running tests..."
-make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) -f Makefile.cbm test
+(
+    # Git exports repository-local variables to hooks. The test suite creates
+    # independent repositories and linked worktrees, so keep the commit's
+    # index and object paths out of those fixtures.
+    while IFS= read -r variable; do
+        unset "$variable"
+    done < <(git rev-parse --local-env-vars)
+
+    make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" -f Makefile.cbm test
+)
