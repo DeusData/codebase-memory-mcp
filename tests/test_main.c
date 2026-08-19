@@ -32,6 +32,8 @@ int tf_skip_count = 0;
 #include <string.h>
 #include <signal.h>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
 #else
 #include <unistd.h>
