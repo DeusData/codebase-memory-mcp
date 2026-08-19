@@ -91,6 +91,8 @@ Current keys:
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `index_max_rss_mb` | `off` | Optional maximum current RSS in MiB for the complete contained index-worker process tree (`64..1048576`). |
+| `index_max_duration_seconds` | `off` | Optional maximum total worker duration in seconds (`1..86400`). |
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
@@ -118,11 +120,13 @@ Current keys:
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The two `index_max_*` settings are independent and disabled by default. They
+The four `index_max_*` settings are independent and disabled by default. They
 apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
 to `cross-repo-intelligence`, which does not scan repository source files.
-Equality is allowed; exceeding either setting fails the complete index request
-and preserves any previously serving database. See
+Equality is allowed; exceeding any setting fails the complete index request and
+preserves any previously serving database. Worker RSS covers descendants and is
+not the same as the internal `CBM_MEM_BUDGET_MB` allocation budget. Total
+duration is independent of the existing 15-minute no-log-progress timeout. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
 
