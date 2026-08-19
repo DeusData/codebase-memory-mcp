@@ -7,7 +7,9 @@
 #include "foundation/index_policy.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
+#include "mcp/mcp_internal.h"
 #include "store/store.h"
+#include <yyjson/yyjson.h>
 
 #include <sqlite3.h>
 #include <stdint.h>
@@ -20,8 +22,14 @@ TEST(index_policy_defaults_are_disabled) {
     cbm_index_resource_policy_t policy;
     cbm_index_policy_init(&policy);
 
+    ASSERT_STR_EQ(cbm_index_policy_profile_name(&policy), "off");
+    ASSERT_STR_EQ(cbm_index_policy_source_name(&policy), "off");
     ASSERT_FALSE(policy.max_files.enabled);
+    ASSERT_FALSE(policy.max_directories.enabled);
+    ASSERT_FALSE(policy.max_entries.enabled);
+    ASSERT_FALSE(policy.max_depth.enabled);
     ASSERT_FALSE(policy.max_source_bytes.enabled);
+    ASSERT_FALSE(policy.discovery_deadline_ms.enabled);
     ASSERT_FALSE(policy.max_rss_bytes.enabled);
     ASSERT_FALSE(policy.max_duration_ms.enabled);
     ASSERT_FALSE(policy.max_cache_bytes.enabled);
@@ -39,6 +47,140 @@ TEST(index_policy_defaults_are_disabled) {
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_DURATION_SECONDS), "off");
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_CACHE_MAX_MB), "off");
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MIN_FREE_DISK_MB), "off");
+    PASS();
+}
+
+TEST(index_policy_balanced_profile_expands_exact_baseline) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "balanced", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, UINT64_C(20) * 1024 * CBM_INDEX_MIB_BYTES,
+                              UINT64_C(4) * 1024 * CBM_INDEX_MIB_BYTES);
+
+    ASSERT_STR_EQ(cbm_index_policy_profile_name(&policy), "balanced");
+    ASSERT_STR_EQ(cbm_index_policy_source_name(&policy), "profile");
+    ASSERT_EQ(policy.max_files.value, UINT64_C(500000));
+    ASSERT_EQ(policy.max_directories.value, UINT64_C(250000));
+    ASSERT_EQ(policy.max_entries.value, UINT64_C(2000000));
+    ASSERT_EQ(policy.max_depth.value, UINT64_C(128));
+    ASSERT_EQ(policy.max_source_bytes.value, UINT64_C(65536) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.discovery_deadline_ms.value, UINT64_C(1800000));
+    /* Four fifths of a 20 GiB host. */
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(16) * 1024 * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_duration_ms.value, UINT64_C(7200000));
+    ASSERT_EQ(policy.max_final_db_bytes.value, UINT64_C(65536) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_staging_bytes.value, UINT64_C(81920) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_task_temp_bytes.value, UINT64_C(98304) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_cache_bytes.value, UINT64_C(131072) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.min_free_disk_bytes.value, UINT64_C(4096) * CBM_INDEX_MIB_BYTES);
+    PASS();
+}
+
+/* A balanced ceiling must never sit below what the host can actually finish.
+ * The large-repository runs this project records as reference workloads peak
+ * in the tens of gigabytes, so a fixed balanced ceiling would reject indexes
+ * that complete today with the profile off. */
+TEST(index_policy_balanced_rss_follows_the_host_share) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "balanced", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, UINT64_C(40) * 1024 * CBM_INDEX_MIB_BYTES,
+                              UINT64_C(4) * 1024 * CBM_INDEX_MIB_BYTES);
+    ASSERT_TRUE(policy.max_rss_bytes.enabled);
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(32) * 1024 * CBM_INDEX_MIB_BYTES);
+
+    /* A small host still receives a real ceiling below its own memory. */
+    cbm_index_policy_init(&policy);
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "balanced", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, UINT64_C(10) * 1024 * CBM_INDEX_MIB_BYTES,
+                              UINT64_C(2) * 1024 * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(8) * 1024 * CBM_INDEX_MIB_BYTES);
+
+    /* Host memory that cannot be read falls back to the fixed floor. */
+    cbm_index_policy_init(&policy);
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "balanced", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, 0, UINT64_C(6) * 1024 * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(12) * 1024 * CBM_INDEX_MIB_BYTES);
+    PASS();
+}
+
+TEST(index_policy_strict_profile_expands_exact_baseline) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "strict", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, 0, UINT64_C(3) * 1024 * CBM_INDEX_MIB_BYTES);
+
+    ASSERT_STR_EQ(cbm_index_policy_profile_name(&policy), "strict");
+    ASSERT_EQ(policy.max_files.value, UINT64_C(100000));
+    ASSERT_EQ(policy.max_directories.value, UINT64_C(20000));
+    ASSERT_EQ(policy.max_entries.value, UINT64_C(500000));
+    ASSERT_EQ(policy.max_depth.value, UINT64_C(64));
+    ASSERT_EQ(policy.max_source_bytes.value, UINT64_C(4096) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.discovery_deadline_ms.value, UINT64_C(30000));
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(3072) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_duration_ms.value, UINT64_C(3600000));
+    ASSERT_EQ(policy.max_final_db_bytes.value, UINT64_C(16384) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_staging_bytes.value, UINT64_C(20480) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_task_temp_bytes.value, UINT64_C(24576) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_cache_bytes.value, UINT64_C(32768) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.min_free_disk_bytes.value, UINT64_C(4096) * CBM_INDEX_MIB_BYTES);
+    PASS();
+}
+
+TEST(index_policy_explicit_override_and_off_replace_profile_dimensions) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "balanced", error, sizeof(error)));
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_FILES, "42", error, sizeof(error)));
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "off", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, UINT64_C(1024) * CBM_INDEX_MIB_BYTES,
+                              UINT64_C(512) * CBM_INDEX_MIB_BYTES);
+
+    ASSERT_EQ(policy.max_files.value, UINT64_C(42));
+    ASSERT_FALSE(policy.max_rss_bytes.enabled);
+    ASSERT_TRUE(policy.max_entries.enabled);
+    ASSERT_STR_EQ(cbm_index_policy_source_name(&policy), "profile+override");
+    PASS();
+}
+
+TEST(index_policy_host_clamp_only_tightens_explicit_rss) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "4096", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, UINT64_C(2048) * CBM_INDEX_MIB_BYTES, 0);
+    ASSERT_EQ(policy.max_rss_bytes.value,
+              (UINT64_C(2048) * CBM_INDEX_MIB_BYTES * UINT64_C(4)) / UINT64_C(5));
+
+    cbm_index_policy_init(&policy);
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "512", error, sizeof(error)));
+    cbm_index_policy_finalize(&policy, UINT64_C(2048) * CBM_INDEX_MIB_BYTES, 0);
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(512) * CBM_INDEX_MIB_BYTES);
+    PASS();
+}
+
+TEST(index_policy_profile_validation_is_atomic) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "strict", error, sizeof(error)));
+    cbm_index_resource_policy_t before = policy;
+    ASSERT_FALSE(cbm_index_policy_set_profile(&policy, "STRICT", error, sizeof(error)));
+    ASSERT_EQ(memcmp(&policy, &before, sizeof(policy)), 0);
+    ASSERT_TRUE(strstr(error, CBM_INDEX_CONFIG_RESOURCE_PROFILE) != NULL);
     PASS();
 }
 
@@ -256,6 +398,8 @@ TEST(index_policy_config_loads_defaults_values_and_rejects_corruption) {
 
     ASSERT_TRUE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
     ASSERT_FALSE(cbm_index_policy_enabled(&policy));
+    ASSERT_STR_EQ(cbm_index_policy_profile_name(&policy), "off");
+    ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_RESOURCE_PROFILE, "strict"), 0);
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_FILES, "9"), 0);
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "3"), 0);
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64"), 0);
@@ -264,6 +408,8 @@ TEST(index_policy_config_loads_defaults_values_and_rejects_corruption) {
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB, "5"), 0);
     ASSERT_TRUE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
     ASSERT_EQ(policy.max_files.value, 9);
+    ASSERT_STR_EQ(cbm_index_policy_profile_name(&policy), "strict");
+    ASSERT_EQ(policy.max_directories.value, UINT64_C(20000));
     ASSERT_EQ(policy.max_source_bytes.value, UINT64_C(3) * CBM_INDEX_MIB_BYTES);
     ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(64) * CBM_INDEX_MIB_BYTES);
     ASSERT_EQ(policy.max_duration_ms.value, UINT64_C(7000));
@@ -280,6 +426,7 @@ TEST(index_policy_config_loads_defaults_values_and_rejects_corruption) {
 }
 
 TEST(index_policy_cli_lists_all_operator_keys) {
+    bool profile_found = false;
     bool files_found = false;
     bool bytes_found = false;
     bool rss_found = false;
@@ -288,6 +435,8 @@ TEST(index_policy_cli_lists_all_operator_keys) {
     bool free_found = false;
     for (size_t index = 0; index < cbm_cli_config_key_count_for_testing(); index++) {
         const char *key = cbm_cli_config_key_at_for_testing(index);
+        profile_found =
+            profile_found || (key && strcmp(key, CBM_INDEX_CONFIG_RESOURCE_PROFILE) == 0);
         files_found = files_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_FILES) == 0);
         bytes_found = bytes_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0);
         rss_found = rss_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_RSS_MB) == 0);
@@ -296,6 +445,7 @@ TEST(index_policy_cli_lists_all_operator_keys) {
         cache_found = cache_found || (key && strcmp(key, CBM_INDEX_CONFIG_CACHE_MAX_MB) == 0);
         free_found = free_found || (key && strcmp(key, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB) == 0);
     }
+    ASSERT_TRUE(profile_found);
     ASSERT_TRUE(files_found);
     ASSERT_TRUE(bytes_found);
     ASSERT_TRUE(rss_found);
@@ -314,6 +464,8 @@ TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite) {
 
     char *set_valid[] = {"set", CBM_INDEX_CONFIG_MAX_FILES, "7"};
     char *set_invalid[] = {"set", CBM_INDEX_CONFIG_MAX_FILES, "0"};
+    char *set_profile[] = {"set", CBM_INDEX_CONFIG_RESOURCE_PROFILE, "balanced"};
+    char *set_invalid_profile[] = {"set", CBM_INDEX_CONFIG_RESOURCE_PROFILE, "BALANCED"};
     char *reset[] = {"reset", CBM_INDEX_CONFIG_MAX_FILES};
     int valid_rc = cbm_cmd_config(3, set_valid);
     cbm_config_t *config = cbm_config_open(cache);
@@ -323,6 +475,14 @@ TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite) {
     int invalid_rc = cbm_cmd_config(3, set_invalid);
     stored = config ? cbm_config_get(config, CBM_INDEX_CONFIG_MAX_FILES, "missing") : "missing";
     bool invalid_preserved = strcmp(stored, "7") == 0;
+    int profile_rc = cbm_cmd_config(3, set_profile);
+    stored =
+        config ? cbm_config_get(config, CBM_INDEX_CONFIG_RESOURCE_PROFILE, "missing") : "missing";
+    bool profile_stored = strcmp(stored, "balanced") == 0;
+    int invalid_profile_rc = cbm_cmd_config(3, set_invalid_profile);
+    stored =
+        config ? cbm_config_get(config, CBM_INDEX_CONFIG_RESOURCE_PROFILE, "missing") : "missing";
+    bool invalid_profile_preserved = strcmp(stored, "balanced") == 0;
     int reset_rc = cbm_cmd_config(2, reset);
     stored = config ? cbm_config_get(config, CBM_INDEX_CONFIG_MAX_FILES, "off") : "missing";
     bool reset_to_default = strcmp(stored, "off") == 0;
@@ -340,6 +500,10 @@ TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite) {
     ASSERT_TRUE(valid_stored);
     ASSERT_TRUE(invalid_rc != 0);
     ASSERT_TRUE(invalid_preserved);
+    ASSERT_EQ(profile_rc, 0);
+    ASSERT_TRUE(profile_stored);
+    ASSERT_TRUE(invalid_profile_rc != 0);
+    ASSERT_TRUE(invalid_profile_preserved);
     ASSERT_EQ(reset_rc, 0);
     ASSERT_TRUE(reset_to_default);
     PASS();
@@ -440,6 +604,40 @@ TEST(index_policy_worker_rejects_missing_parent_policy) {
     cbm_mcp_server_free(server);
     th_cleanup(repo);
     ASSERT_TRUE(rejected);
+    PASS();
+}
+
+TEST(index_policy_worker_contract_preserves_profile_only_dimensions) {
+    cbm_index_resource_policy_t parent;
+    cbm_index_policy_init(&parent);
+    char error[256];
+    ASSERT_TRUE(cbm_index_policy_set_profile(&parent, "strict", error, sizeof(error)));
+    cbm_index_policy_finalize(&parent, UINT64_C(16) * 1024 * CBM_INDEX_MIB_BYTES,
+                              UINT64_C(32) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(parent.max_rss_bytes.value, CBM_INDEX_MIN_RSS_MB_VALUE * CBM_INDEX_MIB_BYTES);
+
+    yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(document);
+    yyjson_mut_doc_set_root(document, root);
+    ASSERT_TRUE(cbm_mcp_index_policy_add_to_args(document, root, &parent));
+    char *args = yyjson_mut_write(document, 0, NULL);
+    ASSERT_NOT_NULL(args);
+
+    cbm_index_resource_policy_t worker;
+    ASSERT_TRUE(cbm_mcp_index_policy_from_internal_args(args, &worker, error, sizeof(error)));
+    ASSERT_STR_EQ(cbm_index_policy_profile_name(&worker), "strict");
+    ASSERT_STR_EQ(cbm_index_policy_source_name(&worker), "profile");
+    ASSERT_EQ(worker.max_directories.value, parent.max_directories.value);
+    ASSERT_EQ(worker.max_entries.value, parent.max_entries.value);
+    ASSERT_EQ(worker.max_depth.value, parent.max_depth.value);
+    ASSERT_EQ(worker.discovery_deadline_ms.value, parent.discovery_deadline_ms.value);
+    ASSERT_EQ(worker.max_final_db_bytes.value, parent.max_final_db_bytes.value);
+    ASSERT_EQ(worker.max_staging_bytes.value, parent.max_staging_bytes.value);
+    ASSERT_EQ(worker.max_task_temp_bytes.value, parent.max_task_temp_bytes.value);
+    ASSERT_EQ(worker.max_rss_bytes.value, parent.max_rss_bytes.value);
+
+    free(args);
+    yyjson_mut_doc_free(document);
     PASS();
 }
 
@@ -625,6 +823,12 @@ TEST(index_policy_storage_limit_preserves_old_index_and_unrelated_cache_files) {
 
 SUITE(index_policy) {
     RUN_TEST(index_policy_defaults_are_disabled);
+    RUN_TEST(index_policy_balanced_profile_expands_exact_baseline);
+    RUN_TEST(index_policy_balanced_rss_follows_the_host_share);
+    RUN_TEST(index_policy_strict_profile_expands_exact_baseline);
+    RUN_TEST(index_policy_explicit_override_and_off_replace_profile_dimensions);
+    RUN_TEST(index_policy_host_clamp_only_tightens_explicit_rss);
+    RUN_TEST(index_policy_profile_validation_is_atomic);
     RUN_TEST(index_policy_file_limit_accepts_off_and_exact_range);
     RUN_TEST(index_policy_source_limit_converts_mib_without_overflow);
     RUN_TEST(index_policy_worker_limits_validate_and_convert_units);
@@ -638,6 +842,7 @@ SUITE(index_policy) {
     RUN_TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite);
     RUN_TEST(index_policy_cli_set_reports_a_failed_write);
     RUN_TEST(index_policy_worker_rejects_missing_parent_policy);
+    RUN_TEST(index_policy_worker_contract_preserves_profile_only_dimensions);
     RUN_TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index);
     RUN_TEST(index_policy_storage_limit_preserves_old_index_and_unrelated_cache_files);
 }

@@ -10673,19 +10673,31 @@ bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resourc
     yyjson_val *encoded =
         root && yyjson_is_obj(root) ? yyjson_obj_get(root, "_cbm_index_policy") : NULL;
     if (!encoded || !yyjson_is_obj(encoded) ||
-        yyjson_obj_size(encoded) != cbm_index_policy_key_count()) {
+        yyjson_obj_size(encoded) != cbm_index_policy_key_count() + 2U) {
         yyjson_doc_free(doc);
         (void)snprintf(error, error_size, "missing or incomplete trusted worker policy");
         return false;
     }
 
     cbm_index_policy_init(policy);
-    bool valid = true;
+    yyjson_val *profile = yyjson_obj_get(encoded, CBM_INDEX_CONFIG_RESOURCE_PROFILE);
+    yyjson_val *override_mask = yyjson_obj_get(encoded, "_cbm_index_override_mask");
+    bool valid = profile && yyjson_is_str(profile) && override_mask &&
+                 yyjson_is_uint(override_mask) &&
+                 cbm_index_policy_set_profile(policy, yyjson_get_str(profile), error, error_size);
     for (size_t index = 0; valid && index < cbm_index_policy_key_count(); index++) {
         const char *key = cbm_index_policy_key_at(index);
         yyjson_val *value = yyjson_obj_get(encoded, key);
         valid = value && yyjson_is_str(value) &&
                 cbm_index_policy_set(policy, key, yyjson_get_str(value), error, error_size);
+    }
+    if (valid) {
+        uint64_t known_mask = cbm_index_policy_key_count() >= 64U
+                                  ? UINT64_MAX
+                                  : (UINT64_C(1) << cbm_index_policy_key_count()) - 1U;
+        uint64_t decoded_mask = yyjson_get_uint(override_mask);
+        valid = (decoded_mask & ~known_mask) == 0;
+        policy->override_mask = decoded_mask;
     }
     yyjson_doc_free(doc);
     if (!valid && error && error_size > 0 && error[0] == '\0') {
@@ -10731,7 +10743,11 @@ static bool load_index_policy(cbm_mcp_server_t *srv, const char *args,
 bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy) {
     yyjson_mut_val *encoded = yyjson_mut_obj(doc);
-    bool valid = encoded != NULL;
+    bool valid = encoded != NULL &&
+                 yyjson_mut_obj_add_strcpy(doc, encoded, CBM_INDEX_CONFIG_RESOURCE_PROFILE,
+                                           cbm_index_policy_profile_name(policy)) &&
+                 yyjson_mut_obj_add_uint(doc, encoded, "_cbm_index_override_mask",
+                                         policy ? policy->override_mask : 0);
     for (size_t index = 0; valid && index < cbm_index_policy_key_count(); index++) {
         const char *key = cbm_index_policy_key_at(index);
         char value[CBM_SZ_64];
@@ -11454,8 +11470,13 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     } else if (rc == CBM_PIPELINE_RESOURCE_LIMIT &&
                resource_violation.resource != CBM_INDEX_RESOURCE_NONE) {
         const char *config_key = cbm_index_resource_config_key(resource_violation.resource);
-        bool discovery_resource = resource_violation.resource == CBM_INDEX_RESOURCE_FILES ||
-                                  resource_violation.resource == CBM_INDEX_RESOURCE_SOURCE_BYTES;
+        bool discovery_resource =
+            resource_violation.resource == CBM_INDEX_RESOURCE_FILES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_SOURCE_BYTES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_DIRECTORIES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_ENTRIES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_DEPTH ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS;
         char message[CBM_SZ_256];
         (void)snprintf(message, sizeof(message),
                        resource_violation.probe_failed ? "Index resource probe failed for %s"

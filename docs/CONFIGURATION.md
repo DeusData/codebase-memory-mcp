@@ -89,6 +89,7 @@ Current keys:
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+| `index_resource_profile` | `off` | Composed index resource baseline: `off`, `balanced`, or `strict`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `index_max_rss_mb` | `off` | Optional maximum current RSS in MiB for the complete contained index-worker process tree (`64..1048576`). |
@@ -122,8 +123,12 @@ Current keys:
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The six index resource settings are independent and disabled by default.
-They apply to explicit indexing, automatic indexing, and watcher re-indexing,
+The profile and all six individual resource settings are disabled by default.
+An individual stored value replaces its profile dimension; storing `off`
+disables only that dimension. Profile-only limits also bound traversed
+directories, directory entries, depth, discovery time, final database size,
+staging size, and task temporary size. Effective limits apply to explicit
+indexing, automatic indexing, and watcher re-indexing,
 but not to `cross-repo-intelligence`, which does not scan or publish repository
 source indexes. Equality is allowed; exceeding a setting fails the complete
 index request and preserves any previously serving database. Worker RSS covers
