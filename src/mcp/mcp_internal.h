@@ -14,6 +14,7 @@ void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
                                              cbm_mcp_quarantine_test_hook_fn hook, void *context);
 void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
                                           void *context);
+void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit);
 
 /* Allocate a server whose store is intentionally absent. Daemon sessions set
  * their project context before dispatch and must not build a temporary SQLite

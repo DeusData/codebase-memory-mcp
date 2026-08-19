@@ -6,7 +6,9 @@
 #include "foundation/constants.h"
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 enum {
     JSON_ESC_LEN = 2, /* escaped char takes 2 bytes (backslash + char) */
@@ -72,6 +74,32 @@ char *cbm_path_join_n(CBMArena *a, const char **parts, int n) {
         result = cbm_path_join(a, result, parts[i]);
     }
     return result;
+}
+
+char *cbm_str_join_dotted_temp(const char *left, const char *right, char *inline_storage,
+                               size_t inline_capacity, bool *owned) {
+    if (!left || !right || !inline_storage || !owned) {
+        return NULL;
+    }
+    *owned = false;
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    if (left_len > SIZE_MAX - right_len || left_len + right_len > SIZE_MAX - PAIR_LEN) {
+        return NULL;
+    }
+    size_t size = left_len + right_len + PAIR_LEN;
+    char *joined = inline_storage;
+    if (size > inline_capacity) {
+        joined = malloc(size);
+        if (!joined) {
+            return NULL;
+        }
+        *owned = true;
+    }
+    memcpy(joined, left, left_len);
+    joined[left_len] = '.';
+    memcpy(joined + left_len + SKIP_ONE, right, right_len + SKIP_ONE);
+    return joined;
 }
 
 const char *cbm_path_ext(const char *path) {

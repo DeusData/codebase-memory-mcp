@@ -15808,6 +15808,16 @@ typedef struct {
     int merge_base_calls;
 } mcp_command_hook_probe_t;
 
+#ifdef _WIN32
+typedef struct {
+    cbm_mcp_server_t *server;
+    bool cancel_on_call;
+    bool cancel_accepted;
+    int calls;
+    char operation[CBM_SZ_64];
+} mcp_search_command_probe_t;
+#endif
+
 static bool mcp_quarantine_hook_probe(void *context, const char *step) {
     mcp_quarantine_hook_probe_t *probe = context;
     if (!probe || !step) {
@@ -15838,6 +15848,21 @@ static bool mcp_command_hook_probe(void *context, const char *command) {
     }
     return true;
 }
+
+#ifdef _WIN32
+static bool mcp_search_command_hook_probe(void *context, const char *operation) {
+    mcp_search_command_probe_t *probe = context;
+    if (!probe || !operation) {
+        return false;
+    }
+    probe->calls++;
+    snprintf(probe->operation, sizeof(probe->operation), "%s", operation);
+    if (probe->cancel_on_call && probe->server) {
+        probe->cancel_accepted = cbm_mcp_server_cancel_active(probe->server);
+    }
+    return true;
+}
+#endif
 
 static bool mcp_mutation_guard_probe_begin(void *context, const char *project) {
     mcp_mutation_guard_probe_t *probe = context;
@@ -16111,6 +16136,72 @@ static int mcp_count_directory_entries_with_prefix(const char *directory, const 
     }
     cbm_closedir(dir);
     return count;
+}
+
+TEST(search_code_windows_cancel_cleans_supervised_scan) {
+#ifdef _WIN32
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    mcp_search_command_probe_t probe = {.server = srv, .cancel_on_call = true};
+    cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
+    int scratch_before = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    int scratch_after = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_STR_EQ(probe.operation, "search_code.scan");
+    ASSERT_NOT_NULL(strstr(response, "cancelled"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_EQ(scratch_after, scratch_before);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+#else
+    SKIP_PLATFORM("supervised Select-String cancellation runs on Windows");
+#endif
+}
+
+TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan) {
+#ifdef _WIN32
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_output_limit_for_test(srv, 512);
+    FILE *source = cbm_fopen(src_path, "ab");
+    ASSERT_NOT_NULL(source);
+    for (int i = 0; i < 256; i++) {
+        ASSERT_GT(fprintf(source, "func HandleRequest%d() error { return nil }\n", i), 0);
+    }
+    ASSERT_EQ(fclose(source), 0);
+    int scratch_before = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+                            "\"file_pattern\":\"*.go\"}");
+    int scratch_after = mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-search-");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "output exceeded"));
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_EQ(scratch_after, scratch_before);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+#else
+    SKIP_PLATFORM("supervised Select-String output limit runs on Windows");
+#endif
 }
 
 static void mcp_cleanup_corrupt_backups(const char *cache, const char *project) {
@@ -18973,9 +19064,62 @@ TEST(search_code_full_preserves_utf8_source) {
     PASS();
 }
 
+/* The scanner's own line content, not a later source-file reread, must remain
+ * UTF-8. This catches Windows PowerShell 5.1 encoding stdout through an
+ * inherited OEM codepage before collect_grep_matches sees it. */
+TEST(search_code_raw_match_preserves_utf8_content) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char raw_path[768];
+    snprintf(raw_path, sizeof(raw_path), "%s/project/raw.md", tmp);
+    const char raw_source[] = "header\nraw-Русский content\n";
+    FILE *fp = cbm_fopen(raw_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fwrite(raw_source, 1, sizeof(raw_source) - SKIP_ONE, fp),
+              sizeof(raw_source) - SKIP_ONE);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t header = {.project = "test-project",
+                         .label = "Section",
+                         .name = "raw",
+                         .qualified_name = "test-project.raw",
+                         .file_path = "raw.md",
+                         .start_line = 1,
+                         .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &header), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code",
+                            "{\"project\":\"test-project\",\"pattern\":\"raw-\","
+                            "\"file_pattern\":\"*.md\",\"format\":\"json\",\"limit\":5}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *matches = yyjson_obj_get(yyjson_doc_get_root(doc), "matches");
+    ASSERT_NOT_NULL(matches);
+    ASSERT_TRUE(yyjson_arr_size(matches) > 0);
+    yyjson_val *match = yyjson_arr_get(matches, 0);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(match, "content")),
+                  "raw-Русский content");
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
     RUN_TEST(search_code_full_preserves_utf8_source);
+    RUN_TEST(search_code_raw_match_preserves_utf8_content);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch_before_git);
     RUN_TEST(detect_changes_handles_cmd_metacharacters_as_literal_argv);
@@ -19229,6 +19373,8 @@ SUITE(mcp) {
 #endif
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
+    RUN_TEST(search_code_windows_cancel_cleans_supervised_scan);
+    RUN_TEST(search_code_windows_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);

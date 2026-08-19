@@ -1,8 +1,7 @@
 /*
  * str_util.h — Safe string operations.
  *
- * All functions that return char* allocate via the provided arena
- * (no malloc, no free needed).
+ * Arena-taking functions return arena-owned strings (no free needed).
  */
 #ifndef CBM_STR_UTIL_H
 #define CBM_STR_UTIL_H
@@ -41,6 +40,11 @@ int cbm_str_common_dot_prefix_len(const char *a, const char *b);
 /* Copy src into fixed buffer dst, always NUL-terminating when dst_sz > 0.
  * NULL src is copied as "". Returns true when the complete string fit. */
 bool cbm_str_copy(char *dst, size_t dst_sz, const char *src);
+
+/* Join qualified-name components with '.'. Uses inline_storage when it fits;
+ * otherwise returns an exact heap allocation and sets *owned for free(). */
+char *cbm_str_join_dotted_temp(const char *left, const char *right, char *inline_storage,
+                               size_t inline_capacity, bool *owned);
 
 /* Convert to lowercase (arena-allocated copy). */
 char *cbm_str_tolower(CBMArena *a, const char *s);

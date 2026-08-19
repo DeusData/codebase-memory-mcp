@@ -584,7 +584,6 @@ TEST_FOUNDATION_CASE_SRCS = \
     tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
-    tests/test_complexity.c \
     tests/test_dump_verify.c \
     tests/test_subprocess.c \
     tests/test_private_file_lock.c \
@@ -641,6 +640,7 @@ TEST_DISCOVER_SRCS = \
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
 TEST_PIPELINE_SRCS = \
+    tests/test_complexity.c \
     tests/test_registry.c \
     tests/test_pipeline.c \
     tests/test_cross_repo.c \

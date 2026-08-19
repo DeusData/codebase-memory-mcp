@@ -747,6 +747,9 @@ enum {
  * growing getline buffers without bound through ignored extension headers. */
 #define MCP_MAX_MESSAGE_SIZE ((size_t)10U * 1024U * 1024U)
 #define MCP_MAX_HEADER_SIZE ((size_t)8U * 1024U)
+/* External scanner output is attacker-amplifiable. Crossing this bound is an
+ * explicit tool error; results are never silently truncated. */
+#define MCP_SEARCH_OUTPUT_MAX ((size_t)64U * 1024U * 1024U)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -2605,6 +2608,7 @@ struct cbm_mcp_server {
     void *quarantine_test_context;
     cbm_mcp_command_test_hook_fn command_test_hook;
     void *command_test_context;
+    size_t search_output_limit_override;
     cbm_thread_t autoindex_tid;
     /* The request thread owns autoindex_active and the join. The worker publishes
      * only atomic outcome state, so checking a running index is O(1) time/O(1)
@@ -4090,6 +4094,12 @@ void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command
     }
     srv->command_test_hook = hook;
     srv->command_test_context = context;
+}
+
+void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit) {
+    if (srv) {
+        srv->search_output_limit_override = limit;
+    }
 }
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
@@ -9362,8 +9372,6 @@ enum {
     COVERAGE_RANGE_MAX = 128,
 };
 
-bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
-
 typedef enum {
     COVERAGE_PATH_OK = 0,
     COVERAGE_PATH_OUTSIDE,
@@ -13347,6 +13355,52 @@ static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 }
 
+/* The pipeline has already persisted the complete current coverage set. Use
+ * it for this response so an incremental run that does not revisit a flagged
+ * file cannot make that gap appear healed. Ignore by-design exclusions: they
+ * have their own not_indexed_files surface. */
+static bool add_persisted_failure_summaries(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            cbm_store_t *store, const char *project,
+                                            const char *logfile) {
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get(store, project, &rows, &row_count) != CBM_STORE_OK) {
+        return false;
+    }
+
+    int failure_count = 0;
+    for (int i = 0; i < row_count; i++) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "not_indexed_dir") != 0 && strcmp(kind, "not_indexed_file") != 0) {
+            failure_count++;
+        }
+    }
+    cbm_file_error_t *failures =
+        failure_count > 0 ? calloc((size_t)failure_count, sizeof(*failures)) : NULL;
+    if (failure_count > 0 && !failures) {
+        cbm_store_free_coverage(rows, row_count);
+        return false;
+    }
+
+    int n = 0;
+    for (int i = 0; i < row_count; i++) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "not_indexed_dir") == 0 || strcmp(kind, "not_indexed_file") == 0) {
+            continue;
+        }
+        failures[n].path = (char *)rows[i].rel_path;
+        failures[n].reason = (char *)rows[i].detail;
+        failures[n].phase = (char *)rows[i].kind;
+        n++;
+    }
+
+    add_skipped_summary(doc, root, failures, failure_count, logfile);
+    add_parse_partial_summary(doc, root, failures, failure_count);
+    free(failures);
+    cbm_store_free_coverage(rows, row_count);
+    return true;
+}
+
 /* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
  * was skipped (no logfile on a clean run). Location:
  *   $CBM_INDEX_LOG (override) else <cache_dir>/logs/<project>-<epoch>.log
@@ -13406,8 +13460,6 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
                                          const cbm_file_error_t *file_errors, int file_error_count,
                                          const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
-    add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
-    add_parse_partial_summary(doc, root, file_errors, file_error_count);
     add_not_indexed_files_summary(doc, root, p);
 
     int exp_nodes = -1;
@@ -13418,6 +13470,12 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
 
     cbm_store_t *store = resolve_store(srv, project_name);
+    if (!store || !add_persisted_failure_summaries(doc, root, store, project_name, logfile)) {
+        /* Failure to read the durable summary must not erase this run's direct
+         * evidence; fall back to the exact per-run report. */
+        add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
+        add_parse_partial_summary(doc, root, file_errors, file_error_count);
+    }
     int64_t nodes = 0;
     int64_t edges = 0;
     bool degraded = false;
@@ -14030,8 +14088,6 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
 char *cbm_mcp_index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
     return index_run_supervised_path(srv, root_path);
 }
-
-bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
 /* Resolve relative index requests against an explicitly supplied MCP session
  * root, never against the long-lived daemon process cwd. */
@@ -14681,81 +14737,6 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
         return NULL;
     }
     return props_doc; /* caller frees after serialization */
-}
-
-/* True only when abs_path, after realpath/_fullpath resolution (which collapses
- * `..` and resolves symlinks/junctions), stays within root_path. This is the
- * single containment guard every MCP file-read sink must pass before reading a
- * file into a tool response: both snippet and search responses route through
- * it, so an indexed path that escapes the project root — via `..`, a symlink,
- * or a Windows junction — is never read back out. */
-/* Canonicalize `path` (resolve symlinks/junctions and `..`) into `out`
- * (>= CBM_SZ_4K bytes); returns true on success. Isolating the per-OS resolver
- * keeps cbm_path_within_root's control flow unconditional: the previous `#ifdef`
- * opened the `if (...) {` brace in one branch and a different one in the other,
- * sharing a single close brace — legal C, but it splits the function's braces
- * across preprocessor branches, which defeats source-level tooling that parses
- * without the preprocessor (and left this function unindexed in the graph). */
-static bool resolve_canonical_path(const char *path, char *out, size_t out_sz) {
-    /* cbm_canonical_path: realpath on POSIX; an opened handle plus
-     * GetFinalPathNameByHandleW on Windows.  The old bare _fullpath was ANSI
-     * (CJK-locale corruption, #973), accepted nonexistent paths, and lexical
-     * expansion alone did not resolve junctions for containment checks. */
-    if (!cbm_canonical_path(path, out, out_sz)) {
-        return false;
-    }
-#ifdef _WIN32
-    cbm_normalize_path_sep(out);
-#endif
-    return true;
-}
-
-static bool canonical_path_has_root(const char *root_path, const char *candidate_path) {
-#ifdef _WIN32
-    wchar_t *wide_root = cbm_utf8_to_wide(root_path);
-    wchar_t *wide_candidate = cbm_utf8_to_wide(candidate_path);
-    bool contained = false;
-    if (wide_root && wide_candidate) {
-        size_t root_len = wcslen(wide_root);
-        size_t candidate_len = wcslen(wide_candidate);
-        bool prefix_equal = root_len <= candidate_len && root_len <= INT_MAX &&
-                            CompareStringOrdinal(wide_candidate, (int)root_len, wide_root,
-                                                 (int)root_len, TRUE) == CSTR_EQUAL;
-        bool root_ends_separator =
-            root_len > 0 && (wide_root[root_len - 1] == L'/' || wide_root[root_len - 1] == L'\\');
-        bool boundary = root_ends_separator || root_len == candidate_len ||
-                        (root_len < candidate_len &&
-                         (wide_candidate[root_len] == L'/' || wide_candidate[root_len] == L'\\'));
-        contained = prefix_equal && boundary;
-    }
-    free(wide_root);
-    free(wide_candidate);
-    return contained;
-#else
-    size_t root_len = strlen(root_path);
-    size_t candidate_len = strlen(candidate_path);
-    bool prefix_equal =
-        root_len <= candidate_len && strncmp(candidate_path, root_path, root_len) == 0;
-    bool root_ends_separator = root_len > 0 && root_path[root_len - 1] == '/';
-    bool boundary = root_ends_separator || root_len == candidate_len ||
-                    (root_len < candidate_len && candidate_path[root_len] == '/');
-    return prefix_equal && boundary;
-#endif
-}
-
-bool cbm_path_within_root(const char *root_path, const char *abs_path) {
-    if (!root_path || !abs_path) {
-        return false;
-    }
-    char real_root[CBM_SZ_4K];
-    char real_file[CBM_SZ_4K];
-    if (resolve_canonical_path(root_path, real_root, sizeof(real_root)) &&
-        resolve_canonical_path(abs_path, real_file, sizeof(real_file))) {
-        if (canonical_path_has_root(real_root, real_file)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 static bool utf8_is_cont(unsigned char c) {
@@ -15577,6 +15558,9 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
                            search_code_scan_mode_t scan_mode, const char *file_pattern,
                            const char *tmpfile, const char *filelist, const char *root_path) {
 #ifdef _WIN32
+    /* PowerShell 5.1 otherwise encodes native-process stdout in the inherited
+     * console codepage, corrupting non-ASCII source before we can parse it. */
+#define MCP_PS_UTF8_PRELUDE "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
     const char *simple_match = use_regex ? "" : " -SimpleMatch";
     const char *case_match = case_sensitive ? " -CaseSensitive" : "";
     int n;
@@ -15588,7 +15572,7 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
     } else if (scan_mode == SEARCH_CODE_SCAN_EXACT_PATH) {
         n = snprintf(
             cmd, cmd_sz,
-            "powershell -Command \"Select-String -LiteralPath '%s' -Pattern "
+            "powershell -Command \"" MCP_PS_UTF8_PRELUDE "Select-String -LiteralPath '%s' -Pattern "
             "(Get-Content -Encoding UTF8 -LiteralPath '%s')%s%s -ErrorAction SilentlyContinue "
             "| ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
             root_path, tmpfile, simple_match, case_match);
@@ -15597,7 +15581,8 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
          * cmd/xargs, spaces remain part of a single filename. */
         n = snprintf(
             cmd, cmd_sz,
-            "powershell -Command \"$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
+            "powershell -Command \"" MCP_PS_UTF8_PRELUDE
+            "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
             "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { "
             "Select-String -LiteralPath $_ -Pattern $pat%s%s -ErrorAction SilentlyContinue } "
             "| ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
@@ -15605,7 +15590,8 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
     } else if (file_pattern) {
         n = snprintf(
             cmd, cmd_sz,
-            "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
+            "powershell -Command \"" MCP_PS_UTF8_PRELUDE
+            "Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File "
             "-ErrorAction SilentlyContinue | Select-String -Pattern "
             "(Get-Content -Encoding UTF8 -LiteralPath '%s')%s%s -ErrorAction SilentlyContinue "
             "| ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
@@ -15613,13 +15599,16 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
     } else {
         n = snprintf(
             cmd, cmd_sz,
-            "powershell -Command \"Get-ChildItem -LiteralPath '%s' -Recurse -File "
+            "powershell -Command \"" MCP_PS_UTF8_PRELUDE
+            "Get-ChildItem -LiteralPath '%s' -Recurse -File "
             "-ErrorAction SilentlyContinue | Select-String -Pattern "
             "(Get-Content -Encoding UTF8 -LiteralPath '%s')%s%s -ErrorAction SilentlyContinue "
             "| ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
             root_path, tmpfile, simple_match, case_match);
     }
-    return n >= 0 && (size_t)n < cmd_sz;
+    bool built = n >= 0 && (size_t)n < cmd_sz;
+#undef MCP_PS_UTF8_PRELUDE
+    return built;
 #else
     const char *flag = use_regex ? "-E" : "-F";
     const char *ci_flag = case_sensitive ? "" : " -i";
@@ -16062,7 +16051,7 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
      * Windows' Unicode case-insensitive root policy as an uncommon fallback;
      * this avoids two UTF-16 allocations per ordinary scanner hit. */
     if (!has_root) {
-        has_root = canonical_path_has_root(root, path);
+        has_root = cbm_canonical_path_has_root(root, path);
     }
 #endif
     /* Never strip a lexical sibling such as /repo-other. */
@@ -16463,11 +16452,13 @@ static bool extract_exact_path_filter(const char *filter, char *out, size_t out_
  *
  * Sizing: cbm_mkdtemp copies its expanded result back into `dir`, and its own
  * internal buffer is CBM_SZ_512, so `dir` must be at least that big to receive
- * it. The two file paths are `dir` plus a short basename. */
+ * it. The child-owned scan output is also kept under this private root so one
+ * cleanup owner removes every search artifact. */
 typedef struct {
     char dir[CBM_SZ_512];
     char pattern_path[CBM_SZ_1K];
     char filelist_path[CBM_SZ_1K];
+    char output_path[CBM_SZ_1K];
     FILE *filelist; /* held open for write_scoped_filelist; closed by the caller */
 } search_scratch_t;
 
@@ -16515,6 +16506,10 @@ static void search_scratch_close(search_scratch_t *scratch) {
         (void)cbm_unlink(scratch->filelist_path);
         scratch->filelist_path[0] = '\0';
     }
+    if (scratch->output_path[0] != '\0') {
+        (void)cbm_unlink(scratch->output_path);
+        scratch->output_path[0] = '\0';
+    }
     if (scratch->dir[0] != '\0') {
         (void)cbm_rmdir(scratch->dir);
         scratch->dir[0] = '\0';
@@ -16528,6 +16523,7 @@ static bool search_scratch_open(search_scratch_t *scratch, const char *pattern) 
     scratch->dir[0] = '\0';
     scratch->pattern_path[0] = '\0';
     scratch->filelist_path[0] = '\0';
+    scratch->output_path[0] = '\0';
     scratch->filelist = NULL;
 
     int written =
@@ -16558,6 +16554,127 @@ static bool search_scratch_open(search_scratch_t *scratch, const char *pattern) 
     }
     return true;
 }
+
+#ifdef _WIN32
+/* Resolve the OS-owned command processor without consulting PATH or mutable
+ * COMSPEC. cbm_subprocess validates the absolute cmd.exe path and contains its
+ * complete descendant tree in one Job Object. */
+static bool mcp_resolve_windows_cmd(char out[CBM_SZ_4K]) {
+    if (!out) {
+        return false;
+    }
+    out[0] = '\0';
+    wchar_t system_directory[MAX_PATH + 1];
+    UINT directory_length = GetSystemDirectoryW(system_directory, MAX_PATH + 1);
+    static const wchar_t suffix[] = L"\\cmd.exe";
+    if (directory_length == 0 || directory_length > MAX_PATH ||
+        (size_t)directory_length + (sizeof(suffix) / sizeof(suffix[0])) >
+            sizeof(system_directory) / sizeof(system_directory[0])) {
+        return false;
+    }
+    memcpy(system_directory + directory_length, suffix, sizeof(suffix));
+    char *candidate = cbm_wide_to_utf8(system_directory);
+    if (!candidate) {
+        return false;
+    }
+    bool resolved = cbm_canonical_path(candidate, out, CBM_SZ_4K) != 0;
+    free(candidate);
+    return resolved;
+}
+
+/* Run one Windows scanner under the shared process-tree supervisor. Output
+ * above `output_limit` cancels the tree and becomes a loud tool error; no
+ * prefix is ever returned as a complete result. */
+static int mcp_run_search_command_cancellable_bounded(cbm_mcp_server_t *srv,
+                                                      search_scratch_t *scratch,
+                                                      const char *command, size_t output_limit,
+                                                      bool *output_limit_exceeded,
+                                                      cbm_proc_result_t *result_out) {
+    if (output_limit_exceeded) {
+        *output_limit_exceeded = false;
+    }
+    if (!srv || !scratch || !command || !output_limit_exceeded || !result_out ||
+        scratch->dir[0] == '\0') {
+        return -1;
+    }
+    int output_length =
+        snprintf(scratch->output_path, sizeof(scratch->output_path), "%s/out", scratch->dir);
+    if (output_length <= 0 || (size_t)output_length >= sizeof(scratch->output_path)) {
+        scratch->output_path[0] = '\0';
+        return -1;
+    }
+    /* The hook observes a stable operation label, never executable shell text. */
+    if (srv->command_test_hook &&
+        !srv->command_test_hook(srv->command_test_context, "search_code.scan")) {
+        return -1;
+    }
+    char shell[CBM_SZ_4K];
+    if (!mcp_resolve_windows_cmd(shell)) {
+        return -1;
+    }
+    cbm_proc_opts_t options = {
+        .bin = shell,
+        .windows_cmd_payload = command,
+        .log_file = scratch->output_path,
+        .discard_stderr = true,
+        .quiet_timeout_ms = 0,
+        .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
+        .delete_log_on_exit = false,
+    };
+    cbm_subprocess_t *process = NULL;
+    if (cbm_subprocess_spawn(&options, &process) != 0) {
+        return -1;
+    }
+
+    bool limit_exceeded = false;
+    cbm_proc_poll_t state;
+    uint64_t poll_started_ms = cbm_now_ms();
+    for (;;) {
+        if (mcp_request_cancelled(srv)) {
+            (void)cbm_subprocess_request_cancel(process);
+        }
+        if (!limit_exceeded) {
+            int64_t output_size = cbm_file_size(scratch->output_path);
+            if (output_size > 0 && (uint64_t)output_size > output_limit) {
+                limit_exceeded = true;
+                (void)cbm_subprocess_request_cancel(process);
+            }
+        }
+        state = cbm_subprocess_poll(process, result_out);
+        if (state == CBM_PROC_POLL_TERMINAL) {
+            break;
+        }
+        if (state == CBM_PROC_POLL_ERROR) {
+            (void)cbm_subprocess_request_cancel(process);
+        }
+        int interval_ms = cbm_subprocess_poll_interval_ms(
+            cbm_now_ms() - poll_started_ms, CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL);
+        cbm_usleep(interval_ms * (unsigned int)CBM_USEC_PER_MSEC);
+    }
+    if (!limit_exceeded) {
+        int64_t final_size = cbm_file_size(scratch->output_path);
+        limit_exceeded = final_size > 0 && (uint64_t)final_size > output_limit;
+    }
+    *output_limit_exceeded = limit_exceeded;
+    bool contained = result_out->tree_quiesced && !result_out->supervision_failed;
+    cbm_subprocess_destroy(process);
+    return contained ? 0 : -1;
+}
+
+static char *search_code_scan_error(search_scratch_t *scratch, bool has_path_filter,
+                                    cbm_regex_t *path_regex, char *root_path, char *pattern,
+                                    char *project, char *file_pattern, const char *message) {
+    search_scratch_close(scratch);
+    if (has_path_filter) {
+        cbm_regfree(path_regex);
+    }
+    free(root_path);
+    free(pattern);
+    free(project);
+    free(file_pattern);
+    return cbm_mcp_text_result(message, true);
+}
+#endif
 
 /* Compile a path filter regex. Returns true if compiled successfully. */
 static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
@@ -16808,9 +16925,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             free(pattern);
             free(project);
             free(file_pattern);
-            if (has_path_filter) {
-                cbm_regfree(&path_regex);
-            }
             return cbm_mcp_text_result(
                 "{\"error\":\"search failed: exact path_filter path too long\","
                 "\"hint\":\"Use a shorter project path or path_filter.\"}",
@@ -16861,6 +16975,46 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                    true);
     }
 
+    int gm_count = 0;
+#ifdef _WIN32
+    cbm_proc_result_t scan_result = {0};
+    bool scan_output_exceeded = false;
+    size_t scan_output_limit = srv->search_output_limit_override ? srv->search_output_limit_override
+                                                                 : MCP_SEARCH_OUTPUT_MAX;
+    int scan_run = mcp_run_search_command_cancellable_bounded(srv, &scratch, cmd, scan_output_limit,
+                                                              &scan_output_exceeded, &scan_result);
+    if (scan_output_exceeded) {
+        char message[CBM_SZ_256];
+        snprintf(message, sizeof(message),
+                 "search failed: output exceeded the %zu-byte safety limit", scan_output_limit);
+        return search_code_scan_error(&scratch, has_path_filter, &path_regex, root_path, pattern,
+                                      project, file_pattern, message);
+    }
+    if (scan_result.cancellation_requested || mcp_request_cancelled(srv)) {
+        return search_code_scan_error(&scratch, has_path_filter, &path_regex, root_path, pattern,
+                                      project, file_pattern,
+                                      "search_code cancelled for this request");
+    }
+    if (scan_run != 0) {
+        return search_code_scan_error(&scratch, has_path_filter, &path_regex, root_path, pattern,
+                                      project, file_pattern,
+                                      "search failed: the contained command could not complete");
+    }
+    if (scan_result.outcome != CBM_PROC_CLEAN) {
+        return search_code_scan_error(&scratch, has_path_filter, &path_regex, root_path, pattern,
+                                      project, file_pattern,
+                                      "search failed: the contained scanner exited unsuccessfully");
+    }
+    FILE *fp = cbm_fopen(scratch.output_path, "rb");
+    if (!fp) {
+        return search_code_scan_error(&scratch, has_path_filter, &path_regex, root_path, pattern,
+                                      project, file_pattern,
+                                      "search failed: contained output could not be read");
+    }
+    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), scan_mode,
+                                            has_path_filter, &path_regex, grep_limit, &gm_count);
+    (void)fclose(fp);
+#else
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         search_scratch_close(&scratch);
@@ -16876,12 +17030,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Check that grep is installed and the project root directory exists.\"}",
             true);
     }
-
-    /* Collect grep matches into array */
-    int gm_count = 0;
     grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), scan_mode,
                                             has_path_filter, &path_regex, grep_limit, &gm_count);
     cbm_pclose(fp);
+#endif
     search_scratch_close(&scratch);
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */

@@ -4,6 +4,8 @@
 #include "test_framework.h"
 #include "../src/foundation/str_util.h"
 
+#include <stdlib.h>
+
 static CBMArena a;
 
 static void setup(void) {
@@ -116,6 +118,27 @@ TEST(str_copy_fixed_buffer) {
 
     ASSERT_FALSE(cbm_str_copy(NULL, sizeof(buf), "x"));
     ASSERT_FALSE(cbm_str_copy(buf, 0, "x"));
+    PASS();
+}
+
+TEST(str_join_dotted_temp_preserves_long_identity) {
+    char inline_buf[16];
+    bool owned = true;
+    char *joined =
+        cbm_str_join_dotted_temp("pkg", "member", inline_buf, sizeof(inline_buf), &owned);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_STR_EQ(joined, "pkg.member");
+    ASSERT_FALSE(owned);
+
+    char left[32];
+    memset(left, 'q', sizeof(left) - 1);
+    left[sizeof(left) - 1] = '\0';
+    joined = cbm_str_join_dotted_temp(left, "member", inline_buf, sizeof(inline_buf), &owned);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_TRUE(owned);
+    ASSERT_EQ(strlen(joined), strlen(left) + strlen(".member"));
+    ASSERT_STR_EQ(joined + strlen(left), ".member");
+    free(joined);
     PASS();
 }
 
@@ -538,6 +561,7 @@ SUITE(str_util) {
     RUN_TEST(str_ends_with);
     RUN_TEST(str_contains);
     RUN_TEST(str_copy_fixed_buffer);
+    RUN_TEST(str_join_dotted_temp_preserves_long_identity);
     RUN_TEST(str_tolower);
     RUN_TEST(str_replace_char);
     RUN_TEST(str_strip_ext);

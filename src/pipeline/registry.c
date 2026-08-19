@@ -169,29 +169,6 @@ static char *registry_temp_buffer(char *inline_storage, size_t inline_capacity, 
     return allocated;
 }
 
-/* Typical qualified names stay allocation-free in caller-owned inline storage;
- * longer logical identities receive one exact checked fallback allocation. */
-static char *registry_join_qualified(const char *left, const char *right, char *inline_storage,
-                                     size_t inline_capacity, bool *owned) {
-    if (!left || !right || !owned) {
-        return NULL;
-    }
-    size_t left_len = strlen(left);
-    size_t right_len = strlen(right);
-    if (left_len > SIZE_MAX - right_len || left_len + right_len > SIZE_MAX - PAIR_LEN) {
-        return NULL;
-    }
-    size_t size = left_len + right_len + PAIR_LEN;
-    char *joined = registry_temp_buffer(inline_storage, inline_capacity, size, owned);
-    if (!joined) {
-        return NULL;
-    }
-    memcpy(joined, left, left_len);
-    joined[left_len] = '.';
-    memcpy(joined + left_len + SKIP_ONE, right, right_len + SKIP_ONE);
-    return joined;
-}
-
 /* Pick candidate with highest composite score. Equal-score ties are resolved
  * lexically so resolver output does not depend on registry insertion order
  * (full index traversal vs incremental store seeding can differ). */
@@ -745,11 +722,12 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
     /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
-     * import called bare: `from m import f as g; g()` — #875/#979). With a
-     * suffix present (`imported.method()`), returning the bare base here
-     * would swallow the suffix and bind the call to the imported symbol's
-     * own node (a Variable/Class/module) instead of base.method — exactly
-     * the mis-resolution the comment above warns about. That regressed
+     * import called bare: `from m import f as g; g()` — #875/#979; Yui
+     * `import execute as bridge_execute`). With a suffix present
+     * (`imported.method()`), returning the bare base here would swallow
+     * the suffix and bind the call to the imported symbol's own node
+     * (a Variable/Class/module) instead of base.method — exactly the
+     * mis-resolution the comment above warns about. That regressed
      * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
      * degraded to edges onto the signal variables themselves). #1000 */
     if (!suffix || !suffix[0]) {
@@ -761,8 +739,8 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     char candidate_inline[CBM_SZ_512];
     bool candidate_owned = false;
     char *candidate =
-        registry_join_qualified(resolved, suffix && suffix[0] ? suffix : prefix, candidate_inline,
-                                sizeof(candidate_inline), &candidate_owned);
+        cbm_str_join_dotted_temp(resolved, suffix && suffix[0] ? suffix : prefix, candidate_inline,
+                                 sizeof(candidate_inline), &candidate_owned);
     if (!candidate) {
         return empty_result();
     }
@@ -807,8 +785,8 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
                                             const char *suffix, const char *module_qn) {
     char candidate_inline[CBM_SZ_512];
     bool candidate_owned = false;
-    char *candidate = registry_join_qualified(module_qn, callee_name, candidate_inline,
-                                              sizeof(candidate_inline), &candidate_owned);
+    char *candidate = cbm_str_join_dotted_temp(module_qn, callee_name, candidate_inline,
+                                               sizeof(candidate_inline), &candidate_owned);
     if (!candidate) {
         return empty_result();
     }
@@ -820,8 +798,8 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     }
     if (suffix && suffix[0]) {
-        candidate = registry_join_qualified(module_qn, suffix, candidate_inline,
-                                            sizeof(candidate_inline), &candidate_owned);
+        candidate = cbm_str_join_dotted_temp(module_qn, suffix, candidate_inline,
+                                             sizeof(candidate_inline), &candidate_owned);
         if (!candidate) {
             return empty_result();
         }

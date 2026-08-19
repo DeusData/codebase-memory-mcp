@@ -1588,6 +1588,69 @@ TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196) {
     PASS();
 }
 
+/* #1196 (second mechanism): max_rows bounds projected rows, not relationship
+ * expansion before aggregation. A prior bind_cap*10 cutoff silently counted a
+ * prefix as the complete graph. Two File nodes with 30 edges each make the
+ * ground truth independent of output ordering; max_rows=2 still permits the
+ * aggregate's single output row. */
+TEST(cypher_exec_aggregate_sees_all_edges_beyond_expansion_cap_issue1196) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t src_ids[2];
+    for (int i = 0; i < 2; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "file_%d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t src = {.project = "test",
+                          .label = "File",
+                          .name = name,
+                          .qualified_name = qn,
+                          .file_path = name};
+        src_ids[i] = cbm_store_upsert_node(s, &src);
+        ASSERT_GT(src_ids[i], 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 30; j++) {
+            char name[32];
+            char qn[64];
+            snprintf(name, sizeof(name), "def_%d_%02d", i, j);
+            snprintf(qn, sizeof(qn), "test.%s", name);
+            cbm_node_t target = {.project = "test",
+                                 .label = "Function",
+                                 .name = name,
+                                 .qualified_name = qn,
+                                 .file_path = "defs.py"};
+            int64_t target_id = cbm_store_upsert_node(s, &target);
+            ASSERT_GT(target_id, 0);
+            cbm_edge_t edge = {.project = "test",
+                               .source_id = src_ids[i],
+                               .target_id = target_id,
+                               .type = "DEFINES"};
+            ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+        }
+    }
+
+    cbm_cypher_result_t aggregate = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:File)-[rel]->(b) RETURN count(rel)", "test", 2, &aggregate);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(aggregate.row_count, 1);
+    ASSERT_STR_EQ(aggregate.rows[0][0], "60");
+    cbm_cypher_result_free(&aggregate);
+
+    cbm_cypher_result_t rows = {0};
+    rc = cbm_cypher_execute(s, "MATCH (a:File)-[rel]->(b) RETURN b.name", "test", 2, &rows);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(rows.row_count, 2);
+    cbm_cypher_result_free(&rows);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #874: coalesce(var.prop, literal) in WHERE — null-safe numeric filters
  * for audit queries over OPTIONAL graph properties. The parser rejected the
  * call outright ("unexpected operator"); RETURN-side coalesce already
@@ -7232,6 +7295,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
     RUN_TEST(cypher_exec_unlabeled_where_beyond_result_limit_issue1196);
+    RUN_TEST(cypher_exec_aggregate_sees_all_edges_beyond_expansion_cap_issue1196);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
     RUN_TEST(cypher_exec_untyped_variable_length_matches_all_relationship_types);
     RUN_TEST(cypher_exec_relationship_uniqueness_spans_entire_pattern);

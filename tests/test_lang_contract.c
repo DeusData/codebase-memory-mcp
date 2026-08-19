@@ -1433,13 +1433,19 @@ static int calls_edge_targets(cbm_store_t *store, const char *project, const cha
  * local name matching the module-path tail, which an alias never does), so
  * the call missed, and the registry fallback did not cover the minimal
  * two-file shape either. The alias must resolve exactly like the plain
- * import. The other import forms are pinned alongside as invariance guards
- * (all resolve on main today and must keep resolving). */
+ * import. Relative/package aliases and a missing-module negative share this
+ * fixture so every import-map variant stays on the same graph-level contract. */
 TEST(contract_edge_python_aliased_import_call_resolves_issue988) {
     LangProj lp;
     static const LangFile f[] = {{"m.py", "def f(x):\n    return x + 1\n"},
                                  {"pkg/__init__.py", ""},
                                  {"pkg/dm.py", "def h(x):\n    return x\n"},
+                                 {"pkg/gate.py", "def execute(x):\n    return x\n"},
+                                 {"services/__init__.py", ""},
+                                 {"services/satori_bridge/__init__.py", ""},
+                                 {"services/satori_bridge/gate.py",
+                                  "def execute(x):\n    return x\n"},
+                                 {"services/yui_core/__init__.py", ""},
                                  {"caller_alias.py", "from m import f as g\n"
                                                      "\n"
                                                      "def use_alias(x):\n"
@@ -1455,23 +1461,41 @@ TEST(contract_edge_python_aliased_import_call_resolves_issue988) {
                                  {"caller_dotalias.py", "import pkg.dm as dz\n"
                                                         "\n"
                                                         "def use_dotalias(x):\n"
-                                                        "    return dz.h(x)\n"}};
-    cbm_store_t *store = lang_index_files(&lp, f, 7);
+                                                        "    return dz.h(x)\n"},
+                                 {"pkg/caller_relative.py",
+                                  "from .gate import execute as bridge_execute\n\n"
+                                  "def use_relative(x):\n    return bridge_execute(x)\n"},
+                                 {"services/yui_core/router.py",
+                                  "from services.satori_bridge.gate import execute as "
+                                  "bridge_execute\n\n"
+                                  "def use_package_alias(x):\n    return bridge_execute(x)\n"},
+                                 {"caller_ghost.py",
+                                  "from ghost_module import nope as alias\n\n"
+                                  "def use_ghost(x):\n    return alias(x)\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
     ASSERT_TRUE(store != NULL);
     int alias = calls_edge_between(store, lp.project, ".use_alias", ".m.f");
     int plain = calls_edge_between(store, lp.project, ".use_plain", ".m.f");
     int modalias = calls_edge_between(store, lp.project, ".use_modalias", ".m.f");
     int dotalias = calls_edge_between(store, lp.project, ".use_dotalias", ".pkg.dm.h");
-    if (!alias || !plain || !modalias || !dotalias) {
+    int relative =
+        calls_edge_between(store, lp.project, ".use_relative", ".pkg.gate.execute");
+    int package_alias = calls_edge_between(store, lp.project, ".use_package_alias",
+                                           ".services.satori_bridge.gate.execute");
+    int ghost_calls = calls_edge_between(store, lp.project, ".use_ghost", "");
+    if (!alias || !plain || !modalias || !dotalias || !relative || !package_alias || ghost_calls) {
         fprintf(stderr,
-                "  [988] FAIL alias=%d plain=%d modalias=%d dotalias=%d (all import forms "
-                "must produce the CALLS edge)\n",
-                alias, plain, modalias, dotalias);
+                "  [988] FAIL alias=%d plain=%d modalias=%d dotalias=%d relative=%d "
+                "package=%d ghost=%d\n",
+                alias, plain, modalias, dotalias, relative, package_alias, ghost_calls);
     }
     ASSERT_TRUE(alias); /* the #988 bug: aliased from-import call lost */
     ASSERT_TRUE(plain);
     ASSERT_TRUE(modalias);
     ASSERT_TRUE(dotalias);
+    ASSERT_TRUE(relative);
+    ASSERT_TRUE(package_alias);
+    ASSERT_FALSE(ghost_calls);
     lang_cleanup(&lp, store);
     PASS();
 }

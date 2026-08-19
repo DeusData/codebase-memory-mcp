@@ -5445,8 +5445,7 @@ static void expand_var_length(cbm_store_t *store, cbm_store_trail_graph_t *trail
     for (int v = 0; v < tr.visited_count; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
         if (bound_to_qn) {
-            if (!hop->node.qualified_name ||
-                strcmp(bound_to_qn, hop->node.qualified_name) != 0) {
+            if (!hop->node.qualified_name || strcmp(bound_to_qn, hop->node.qualified_name) != 0) {
                 continue;
             }
         } else if (bound_to && hop->node.id != bound_to_id) {

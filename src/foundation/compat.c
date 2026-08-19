@@ -185,8 +185,7 @@ char *cbm_mkdtemp(char *tmpl) {
         return NULL;
 
     size_t length = strlen(buf);
-    if (length < MKDTEMP_SUFFIX_LEN ||
-        strcmp(buf + length - MKDTEMP_SUFFIX_LEN, "XXXXXX") != 0) {
+    if (length < MKDTEMP_SUFFIX_LEN || strcmp(buf + length - MKDTEMP_SUFFIX_LEN, "XXXXXX") != 0) {
         errno = EINVAL;
         return NULL;
     }

@@ -434,6 +434,8 @@ TEST(resolve_import_map_bare_function) {
 TEST(resolve_import_map_bare_alias) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function");
+    /* A same-named alias ghost must not override the import-map target. */
+    cbm_registry_add(r, "_scan_bash", "proj.hooks.pre_tool._scan_bash", "Function");
     /* Import map: alias "_scan_bash" → FULL SYMBOL QN (not the module). */
     const char *keys[] = {"_scan_bash"};
     const char *vals[] = {"proj.security_scan.scan_bash"};
