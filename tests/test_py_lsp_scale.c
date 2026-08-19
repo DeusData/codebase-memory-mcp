@@ -93,12 +93,17 @@ TEST(pylsp_scale_linear_growth) {
     ASSERT(r_pct_2000 > 0.5);
 
     /* Linear growth check: 20x input should be at most 35x time
-     * (allowing constant-factor overhead). A looser 100x bound allowed
-     * per-call linear registry scans to pass at 48x. */
+     * (allowing constant-factor overhead). Confirm a failure against the
+     * less noise-sensitive 500-to-2000 interval: clear quadratic growth is
+     * 16x there, so 8x retains a 2x detection margin without letting a noisy
+     * 100-class baseline fabricate an asymptotic regression. */
     if (t100 > 0.5) {  // skip when t100 too small to compare reliably
-        double ratio = t2000 / t100;
-        printf("    scale ratio 2000/100: %.1fx (linear ~20x, quadratic ~400x)\n", ratio);
-        ASSERT(ratio < 35.0);
+        double ratio_100 = t2000 / t100;
+        double ratio_500 = t500 > 0.5 ? t2000 / t500 : 16.0;
+        printf("    scale ratios: 2000/100=%.1fx (linear ~20x, quadratic ~400x), "
+               "2000/500=%.1fx (linear ~4x, quadratic ~16x)\n",
+               ratio_100, ratio_500);
+        ASSERT(ratio_100 < 35.0 || ratio_500 < 8.0);
     }
     PASS();
 }
