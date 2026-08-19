@@ -897,6 +897,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     const char *worker_marker = cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_MARKER_ARG);
     const char *worker_quarantine =
         cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_QUARANTINE_ARG);
+    const char *worker_stage_token =
+        cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_STAGE_TOKEN_ARG);
     if (index_worker) {
         /* The graph lives on this process's heaps: SQLite gets heaps of its
          * own here, and only here (cbm_sqlite_dedicated_heap). */
@@ -905,7 +907,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
-                                      cbm_index_worker_memory_budget_bytes());
+                                      cbm_index_worker_memory_budget_bytes(), worker_stage_token);
 
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -3187,7 +3189,7 @@ int main(int argc, char **argv) {
         }
         cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                           invocation.marker_file, invocation.quarantine_file,
-                                          invocation.memory_budget_bytes);
+                                          invocation.memory_budget_bytes, invocation.stage_token);
 #ifndef _WIN32
         /* Split into three ordered steps rather than one condition, because the
          * ORDER is load-bearing and the middle step only exists in test builds:

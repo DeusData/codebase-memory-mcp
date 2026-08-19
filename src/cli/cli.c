@@ -67,7 +67,7 @@ enum {
     MIN_ARGC_CMD = 3,
     /* minimum argc for subcommand with arg */ /* sqlite3_bind parameter index 2 */ /* 10 MB cap
                                                                                        factor */
-    CLI_MB_FACTOR = CLI_BUF_1K * CLI_BUF_1K,
+        CLI_MB_FACTOR = CLI_BUF_1K * CLI_BUF_1K,
     NUM_RETRIES = 5,
     NUM_DIRS = 4,
     DECOMP_FACTOR = 10,
@@ -7606,6 +7606,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_INDEX_CONFIG_MAX_RSS_MB, "off", "Max worker process-tree charged memory MiB, or off"},
     {CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "off",
      "Max wall-clock seconds for the whole index request, or off"},
+    {CBM_INDEX_CONFIG_CACHE_MAX_MB, "off", "Max projected cache MiB after publish, or off"},
+    {CBM_INDEX_CONFIG_MIN_FREE_DISK_MB, "off",
+     "Minimum free cache-filesystem MiB during indexing, or off"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing

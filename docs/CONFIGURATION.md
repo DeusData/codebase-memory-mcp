@@ -95,6 +95,8 @@ Current keys:
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 | `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
 | `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). |
+| `index_cache_max_mb` | `off` | Optional maximum projected cache size in MiB after publication. |
+| `index_min_free_disk_mb` | `off` | Optional minimum free MiB reserved on the cache filesystem while indexing. |
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
@@ -128,13 +130,14 @@ has not run yet).
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The four `index_max_*` settings are independent and disabled by default. They
-apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
-to `cross-repo-intelligence`, which does not scan repository source files.
-Equality is allowed; exceeding any setting fails the complete index request and
-preserves any previously serving database. Worker RSS covers descendants and is
-not the same as the internal `CBM_MEM_BUDGET_MB` allocation budget. Total
-duration is independent of the existing 15-minute no-log-progress timeout. See
+The six index resource settings are independent and disabled by default.
+They apply to explicit indexing, automatic indexing, and watcher re-indexing,
+but not to `cross-repo-intelligence`, which does not scan or publish repository
+source indexes. Equality is allowed; exceeding a setting fails the complete
+index request and preserves any previously serving database. Worker RSS covers
+descendants and is not the same as the internal `CBM_MEM_BUDGET_MB` allocation
+budget. Total duration is independent of the existing 15-minute no-log-progress
+timeout. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
 
