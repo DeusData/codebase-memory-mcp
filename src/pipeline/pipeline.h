@@ -275,6 +275,17 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
 
+/* #1355: drop a project-wide same-name guess (suffix_match / unique_name /
+ * field_type_hint / fuzzy) for a BARE call whose name the calling file binds to
+ * a NON-RELATIVE (package) import that resolved to nothing in the graph —
+ * `import { eq } from "drizzle-orm"` must not make `eq(...)` a CALLS edge to an
+ * unrelated project `eq`. A name the import map does bind, a relative
+ * specifier, a member/qualified callee, and every import-/receiver-aware
+ * strategy are all kept. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
+                                         const CBMImportArray *file_imports,
+                                         const char **import_map_keys, int import_map_count);
+
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
  * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX

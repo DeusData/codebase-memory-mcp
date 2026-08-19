@@ -853,6 +853,95 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
     PASS();
 }
 
+TEST(external_import_shadow_drops_package_bound_bare_call) {
+    /* #1355: `import { eq, sql } from "drizzle-orm"` binds both names to a
+     * package outside the indexed tree, so no import-map key exists for them and
+     * a project-wide same-name guess is a fabricated edge. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "sql", .module_path = "drizzle-orm"},
+        {.local_name = "users", .module_path = "./schema"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+    /* Only the relative import materialized an IMPORTS edge. */
+    const char *keys[] = {"users"};
+
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, keys, 1));
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("sql", "unique_name", &arr, keys, 1));
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "suffix_match", &arr, keys, 1));
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "field_type_hint", &arr, keys, 1));
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "fuzzy", &arr, keys, 1));
+    /* A file whose imports all failed to materialize is still covered: the
+     * evidence is the import statement, not the map. */
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0));
+    PASS();
+}
+
+TEST(external_import_shadow_keeps_everything_else) {
+    /* Negative space: every input that is NOT "bare call bound to a package
+     * import the graph could not resolve" must keep its edge. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "normalize", .module_path = "./text-utils"},
+        {.local_name = "getRootContainer", .module_path = "@repo/shared"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+    /* The relative import and the workspace package both materialized. */
+    const char *keys[] = {"normalize", "getRootContainer"};
+    const int nkeys = 2;
+
+    /* Import-/receiver-/module-aware strategies are never this guard's business. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "import_map", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "import_map_suffix", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "same_module", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "qualified_suffix", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "lsp_ts_import", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "lsp_ts_method", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "service_pattern", &arr, keys, nkeys));
+    /* A relative specifier names a path inside the tree — a missing IMPORTS edge
+     * there is an in-project gap, not an external binding. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0));
+    /* A package the import map DOES bind resolved in-graph (workspace package). */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("getRootContainer", "unique_name", &arr, keys, nkeys));
+    /* A name the file never imports (called with no import at all). */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("helper", "unique_name", &arr, keys, nkeys));
+    /* Member and package/namespace-qualified callees belong to the
+     * receiver-aware guards, not to this one. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq.apply", "unique_name", &arr, keys, nkeys));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq::apply", "unique_name", &arr, keys, nkeys));
+    /* Empty / absent inputs. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", NULL, &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow(NULL, "unique_name", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("", "unique_name", &arr, keys, nkeys));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", NULL, keys, nkeys));
+    PASS();
+}
+
+TEST(external_import_shadow_relative_binding_wins_the_tie) {
+    /* A name imported from BOTH a package and a relative path keeps its edge,
+     * and does so independently of the order the imports were extracted in —
+     * the relative binding is an explicit tie-break, not an emergent property
+     * of iteration order. */
+    CBMImport pkg_first[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "eq", .module_path = "./text-utils"},
+    };
+    CBMImport rel_first[] = {
+        {.local_name = "eq", .module_path = "./text-utils"},
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+    };
+    CBMImportArray a = {.items = pkg_first, .count = 2, .cap = 2};
+    CBMImportArray b = {.items = rel_first, .count = 2, .cap = 2};
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &a, NULL, 0));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &b, NULL, 0));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* Method call THROUGH an imported symbol that is itself an indexed node
@@ -947,4 +1036,7 @@ SUITE(registry) {
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(external_import_shadow_drops_package_bound_bare_call);
+    RUN_TEST(external_import_shadow_keeps_everything_else);
+    RUN_TEST(external_import_shadow_relative_binding_wins_the_tie);
 }

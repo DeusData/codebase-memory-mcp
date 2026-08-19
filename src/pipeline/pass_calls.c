@@ -476,7 +476,8 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
-                               const CBMResolvedCallArray *lsp_calls, const char *rel,
+                               const CBMResolvedCallArray *lsp_calls,
+                               const CBMImportArray *file_imports, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
@@ -651,6 +652,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
+    /* #1355: `import { eq } from "drizzle-orm"` binds `eq` to a package that is
+     * not in the indexed tree, so a project-wide same-name guess must not turn
+     * `eq(...)` into a CALLS edge to an unrelated project `eq`. Placed with the
+     * #725 guard, after the service-pattern bypasses above, so no HTTP/route
+     * edge can be lost to it. */
+    if (cbm_suppress_external_import_shadow(call->callee_name, res.strategy, file_imports, imp_keys,
+                                            imp_count)) {
+        return 0;
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, tsjs_drop_plain_call);
     return SKIP_ONE;
@@ -810,8 +820,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+            if (resolve_single_call(ctx, call, &result->resolved_calls, &result->imports, rel,
+                                    module_qn, imp_keys, imp_vals, imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;
