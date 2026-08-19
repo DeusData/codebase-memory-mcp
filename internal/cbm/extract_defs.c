@@ -23,6 +23,8 @@
 #define MAX_PARAMS_MINUS_1 31
 #define MAX_RETURN_TYPES 16
 #define MAX_RETURN_TYPES_MINUS_1 15
+#define MAX_ATTR_WRAPPERS 16 // stacked C#/PHP attribute_list siblings per declaration (#1692)
+#define MAX_ATTR_WRAPPERS_MINUS_1 15
 
 // Tree traversal limits.
 enum {
@@ -1287,7 +1289,7 @@ static const char *extract_docstring(CBMArena *a, TSNode node, const char *sourc
     return NULL;
 }
 
-static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang);
+static int find_jvm_modifiers(TSNode node, CBMLanguage lang, TSNode *out, int max);
 
 /* HTTP method names recognized in decorator calls (e.g., @router.post → "POST") */
 static const char *decorator_method_name(const char *attr_text) {
@@ -1673,12 +1675,9 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
     *out_method = NULL;
     *out_jax_path = NULL;
 
-    TSNode wrappers[2];
-    int wn = 0;
-    TSNode modifiers = find_jvm_modifiers(owner, spec->language);
-    if (!ts_node_is_null(modifiers)) {
-        wrappers[wn++] = modifiers;
-    }
+    /* MINUS_1: the owner node itself is appended below, after the wrappers. */
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = find_jvm_modifiers(owner, spec->language, wrappers, MAX_ATTR_WRAPPERS_MINUS_1);
     /* Direct-child annotations (some grammars attach the annotation as a child
      * of the method node rather than under `modifiers`). */
     wrappers[wn++] = owner;
@@ -1832,13 +1831,23 @@ static int count_modifier_annotations(TSNode modifiers, const CBMLangSpec *spec)
     return count;
 }
 
-// Find the wrapper child that holds annotations/attributes for languages where
-// they are nested under an intermediate node rather than being a prev-sibling:
-//   Java/Kotlin/C#/Swift → `modifiers` (contains annotation/attribute)
-//   PHP 8                → `attribute_list` (contains attribute_group)
-// Returns a null node when the language has no such wrapper.
-static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang) {
-    TSNode null_node = {0};
+// Find every wrapper child that holds annotations/attributes for languages
+// where they are nested under an intermediate node rather than being a
+// prev-sibling:
+//   Java/Kotlin/Swift → `modifiers` (one node, contains every annotation)
+//   C#/PHP 8          → `attribute_list` (contains attribute/attribute_group)
+//
+// C#/PHP attribute stacks are NOT a single wrapper: each bracketed group
+// (`[Foo]`, `[Bar]`, ...) compiles to its own `attribute_list` node, so
+// `[A] [B] [C]` above a declaration produces three separate `attribute_list`
+// siblings among that declaration's children — not one `attribute_list`
+// holding three entries. A field-name lookup (`ts_node_child_by_field_name`)
+// only ever returns the first child registered under a given field, so using
+// it here silently dropped every attribute after the first bracket group
+// (#1692). Scanning all children by kind fixes that for C#/PHP and is a
+// no-op change for Java/Kotlin/Swift, where `modifiers` never repeats.
+// Writes up to `max` wrapper nodes into `out`; returns how many were found.
+static int find_jvm_modifiers(TSNode node, CBMLanguage lang, TSNode *out, int max) {
     const char *wrapper = NULL;
     switch (lang) {
     case CBM_LANG_JAVA:
@@ -1848,19 +1857,12 @@ static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang) {
         break;
     case CBM_LANG_CSHARP:
     case CBM_LANG_PHP:
-        /* C# attributes live in an `attribute_list` child (modifiers like
-         * `public` are separate `modifier` nodes); PHP 8 likewise nests
-         * `attribute_group` under `attribute_list`. */
         wrapper = "attribute_list";
         break;
     default:
-        return null_node;
+        return 0;
     }
-    TSNode w = ts_node_child_by_field_name(node, wrapper, (uint32_t)strlen(wrapper));
-    if (ts_node_is_null(w)) {
-        w = cbm_find_child_by_kind(node, wrapper);
-    }
-    return w;
+    return cbm_find_children_by_kind(node, wrapper, out, max);
 }
 
 // Count direct children of `node` that are decorator/annotation nodes (used by
@@ -1938,13 +1940,14 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
         prev = ts_node_prev_sibling(prev);
     }
 
-    TSNode modifiers = {0};
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = 0;
     int mod_count = 0;
     int child_count = 0;
     if (count == 0) {
-        modifiers = find_jvm_modifiers(node, lang);
-        if (!ts_node_is_null(modifiers)) {
-            mod_count = count_modifier_annotations(modifiers, spec);
+        wn = find_jvm_modifiers(node, lang, wrappers, MAX_ATTR_WRAPPERS);
+        for (int w = 0; w < wn; w++) {
+            mod_count += count_modifier_annotations(wrappers[w], spec);
         }
         /* Languages like Scala attach the annotation directly as a child of the
          * definition node (no wrapper, no prev-sibling). */
@@ -1974,8 +1977,8 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
         }
         prev = ts_node_prev_sibling(prev);
     }
-    if (!ts_node_is_null(modifiers)) {
-        idx = collect_modifier_decorators(a, modifiers, source, spec, result, idx, total);
+    for (int w = 0; w < wn && mod_count > 0; w++) {
+        idx = collect_modifier_decorators(a, wrappers[w], source, spec, result, idx, total);
     }
     if (child_count > 0) {
         idx = collect_child_decorators(a, node, source, spec, result, idx, total);

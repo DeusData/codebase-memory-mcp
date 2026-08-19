@@ -364,6 +364,18 @@ TSNode cbm_find_child_by_kind(TSNode parent, const char *kind) {
     return null_node;
 }
 
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max) {
+    int n = 0;
+    uint32_t count = ts_node_child_count(parent);
+    for (uint32_t i = 0; i < count && n < max; i++) {
+        TSNode child = ts_node_child(parent, i);
+        if (strcmp(ts_node_type(child), kind) == 0) {
+            out[n++] = child;
+        }
+    }
+    return n;
+}
+
 /* ── Node-type classification: TSSymbol bitset acceleration ───────────────
  * cbm_kind_in_set is called for nearly every AST node (function/class/call/
  * import/branching sets), so a linear strcmp over the type-name array is a hot
