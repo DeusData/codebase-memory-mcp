@@ -66,7 +66,7 @@ static char *read_file(const char *path, int *out_len) {
 }
 
 static const char *itoa_log(int val) {
-    enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
+    enum { RING_BUF_COUNT = 8, RING_BUF_MASK = 7 };
     static CBM_TLS char bufs[RING_BUF_COUNT][CBM_SZ_32];
     static CBM_TLS int idx = 0;
     int i = idx;

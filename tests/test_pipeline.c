@@ -21,6 +21,7 @@
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
 #include "foundation/log.h"
+#include "foundation/profile.h"
 #include "semantic/semantic.h"
 #include "pagerank/pagerank.h"
 #include "test_graph_diff.h"
@@ -24585,13 +24586,24 @@ TEST(pipeline_committed_counts_match_persisted) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
     }
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "semantic.py"),
+                            "class Base:\n"
+                            "    pass\n\n"
+                            "class Child(Base):\n"
+                            "    pass\n"),
+              0);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/committed_test.db", g_tmpdir);
 
     cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    bool saved_profile = cbm_profile_active;
+    cbm_profile_active = true;
+    pipeline_capture_logs_start();
     int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    cbm_profile_active = saved_profile;
     ASSERT_EQ(rc, 0);
 
     int committed_nodes = -1;
@@ -24608,6 +24620,15 @@ TEST(pipeline_committed_counts_match_persisted) {
     ASSERT_GT(committed_nodes, 0);
     /* A faithful full dump persists exactly what it committed. */
     ASSERT_EQ(committed_nodes, persisted_nodes);
+    char done_marker[CBM_SZ_256];
+    int marker_len = snprintf(done_marker, sizeof(done_marker),
+                              "msg=pipeline.done nodes=%d edges=%d", committed_nodes,
+                              committed_edges);
+    ASSERT(marker_len > 0 && (size_t)marker_len < sizeof(done_marker));
+    ASSERT(strstr(logs, done_marker) != NULL);
+    ASSERT(strstr(logs,
+                  "msg=pass.done pass=semantic inherits=1 decorates=0 implements=0 overrides=0 "
+                  "errors=0") != NULL);
     /* The gate must NOT flag a healthy full index as degraded. */
     ASSERT_FALSE(cbm_dump_verify_is_degraded(committed_nodes, persisted_nodes,
                                              CBM_DUMP_VERIFY_DEFAULT_RATIO,

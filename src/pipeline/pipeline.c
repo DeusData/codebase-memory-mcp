@@ -14,8 +14,8 @@
 
 enum {
     CBM_DIR_PERMS = 0755,
-    PL_RING = 4,
-    PL_RING_MASK = 3,
+    PL_RING = 8,
+    PL_RING_MASK = 7,
     PL_SEQ_PASSES = 6,
     PL_BYTES_PER_MB = 1024 * 1024
 };
