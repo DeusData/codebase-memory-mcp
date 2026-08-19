@@ -1324,6 +1324,8 @@ typedef struct {
     cbm_project_lock_manager_t *project_locks;
     bool project_lock_busy_is_error;
     cbm_proc_outcome_t outcomes[APP_FAKE_MAX_ATTEMPTS];
+    cbm_index_resource_violation_t resource_violations[APP_FAKE_MAX_ATTEMPTS];
+    bool resource_probe_failures[APP_FAKE_MAX_ATTEMPTS];
     const char *responses[APP_FAKE_MAX_ATTEMPTS];
     const char *marker_payloads[APP_FAKE_MAX_ATTEMPTS];
     char marker_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
@@ -1428,7 +1430,9 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
 static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected);
 
 static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, int attempt,
-                                          const char *max_files, const char *max_source_mb) {
+                                          const char *max_files, const char *max_source_mb,
+                                          const char *max_rss_mb,
+                                          const char *max_duration_seconds) {
     if (!context || attempt < 0 || attempt >= APP_FAKE_MAX_ATTEMPTS) {
         return false;
     }
@@ -1445,9 +1449,18 @@ static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, in
     yyjson_val *bytes = policy && yyjson_is_obj(policy)
                             ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_SOURCE_MB)
                             : NULL;
-    bool equal = files && bytes && yyjson_is_str(files) && yyjson_is_str(bytes) &&
+    yyjson_val *rss = policy && yyjson_is_obj(policy)
+                          ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_RSS_MB)
+                          : NULL;
+    yyjson_val *duration = policy && yyjson_is_obj(policy)
+                               ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS)
+                               : NULL;
+    bool equal = files && bytes && rss && duration && yyjson_is_str(files) &&
+                 yyjson_is_str(bytes) && yyjson_is_str(rss) && yyjson_is_str(duration) &&
                  strcmp(yyjson_get_str(files), max_files) == 0 &&
-                 strcmp(yyjson_get_str(bytes), max_source_mb) == 0;
+                 strcmp(yyjson_get_str(bytes), max_source_mb) == 0 &&
+                 strcmp(yyjson_get_str(rss), max_rss_mb) == 0 &&
+                 strcmp(yyjson_get_str(duration), max_duration_seconds) == 0;
     yyjson_doc_free(document);
     return equal;
 }
@@ -1489,6 +1502,12 @@ static cbm_index_worker_poll_t app_fake_worker_poll(void *opaque,
         worker->result.outcome = outcome;
         worker->result.exit_code = outcome == CBM_PROC_CLEAN ? 0 : -1;
         worker->result.tree_quiesced = true;
+        if (worker->attempt < APP_FAKE_MAX_ATTEMPTS) {
+            worker->result.resource_violation =
+                worker->context->resource_violations[worker->attempt];
+            worker->result.resource_probe_failed =
+                worker->context->resource_probe_failures[worker->attempt];
+        }
         const char *response =
             worker->attempt < APP_FAKE_MAX_ATTEMPTS && worker->context->responses[worker->attempt]
                 ? worker->context->responses[worker->attempt]
@@ -2003,11 +2022,13 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
     bool cache_set = dirs_ok && cache_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
-    bool config_ready = stored_config &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
-                        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "3") == 0 &&
-                        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "4") == 0;
+    bool config_ready =
+        stored_config && cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "3") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "4") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -2052,7 +2073,8 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     bool first_owned = first_initialized && project &&
                        app_wait_for_subscribers(application, project, 1) &&
                        app_wait_for_atomic_int(&fake.starts, 1);
-    bool auto_policy_propagated = first_owned && app_fake_worker_policy_equals(&fake, 0, "3", "4");
+    bool auto_policy_propagated =
+        first_owned && app_fake_worker_policy_equals(&fake, 0, "3", "4", "64", "7");
     bool second_initialized = app_test_initialize_profile(&callbacks, sessions[1], root,
                                                           CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
     bool coalesced = first_owned && second_initialized && project &&
@@ -2135,9 +2157,11 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     ASSERT_NOT_NULL(root);
     ASSERT_NOT_NULL(cache);
     cbm_config_t *stored_config = cbm_config_open(cache);
-    bool configured = stored_config &&
-                      cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "5") == 0 &&
-                      cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "6") == 0;
+    bool configured =
+        stored_config && cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "5") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "6") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7") == 0;
 
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -2157,7 +2181,8 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     cbm_daemon_application_t *application = configured ? cbm_daemon_application_new(&config) : NULL;
     int index_rc =
         application ? cbm_daemon_application_index(application, "policy-programmatic", root) : -1;
-    bool policy_propagated = index_rc == 0 && app_fake_worker_policy_equals(&fake, 0, "5", "6");
+    bool policy_propagated =
+        index_rc == 0 && app_fake_worker_policy_equals(&fake, 0, "5", "6", "64", "7");
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
 
     cbm_daemon_application_free(application);
@@ -2166,6 +2191,86 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     th_cleanup(cache);
     ASSERT_TRUE(configured);
     ASSERT_TRUE(policy_propagated);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried) {
+    char *cache = th_mktempdir("cbm_app_worker_resource_cache");
+    cbm_config_t *stored_config = cache ? cbm_config_open(cache) : NULL;
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.scripted, true);
+    fake.outcomes[0] = CBM_PROC_KILLED;
+    fake.resource_violations[0] = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_DURATION_MS, .observed = 7001, .limit = 7000};
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application =
+        stored_config ? cbm_daemon_application_new(&config) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 4188);
+    char *root = th_mktempdir("cbm_app_worker_resource");
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    char args[APP_TEST_PATH_CAP + 96];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"name\":\"DaemonWorkerResourceFixture\"}",
+                   root ? root : "");
+    bool setup = cache && stored_config && application && session && root &&
+                 app_test_context_request(root, root, &context, &context_length) &&
+                 app_test_tool_request("index_repository", args, &tool, &tool_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    if (setup) {
+        uint8_t *context_response = NULL;
+        uint32_t context_response_length = 0;
+        setup = app_test_request(&callbacks, session, context, context_length, &context_response,
+                                 &context_response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+        free(context_response);
+    }
+    cbm_daemon_runtime_application_status_t status =
+        setup
+            ? app_test_request(&callbacks, session, tool, tool_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool structured = response && strstr((char *)response, "resource_limit_exceeded") &&
+                      strstr((char *)response, "\\\"stage\\\":\\\"worker\\\"") &&
+                      strstr((char *)response, "\\\"resource\\\":\\\"duration_ms\\\"") &&
+                      strstr((char *)response, "\\\"observed\\\":7001") &&
+                      strstr((char *)response, "\\\"limit\\\":7000") &&
+                      strstr((char *)response, "\\\"unit\\\":\\\"milliseconds\\\"");
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    int starts = atomic_load(&fake.starts);
+    int destroys = atomic_load(&fake.destroys);
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    free(response);
+    free(context);
+    free(tool);
+    th_cleanup(root);
+    th_cleanup(cache);
+
+    ASSERT_TRUE(setup);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(structured);
+    ASSERT_EQ(starts, 1);
+    ASSERT_EQ(destroys, 1);
     ASSERT_TRUE(stopped);
     PASS();
 }
@@ -5179,6 +5284,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
+    RUN_TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

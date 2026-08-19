@@ -430,7 +430,8 @@ const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
 }
 
 const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p) {
-    return p && cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL;
+    return p && cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy
+                                                                        : NULL;
 }
 
 cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p) {
@@ -2210,7 +2211,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .ignore_file = NULL,
         .max_file_size = 0,
         .resource_policy =
-            cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
+            cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
         .resource_violation = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;

@@ -304,9 +304,18 @@ static int application_worker_start_default(void *context, const char *args_json
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
+    cbm_index_resource_policy_t resource_policy;
+    char error[CBM_SZ_256] = {0};
+    if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
+                                                 sizeof(error))) {
+        cbm_log_error("daemon.index.policy", "error", error);
+        *worker_out = NULL;
+        return -1;
+    }
     cbm_index_worker_handle_t *worker = NULL;
-    int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
-                                        quarantine_file, &worker);
+    int result =
+        cbm_index_worker_start_with_policy(args_json, memory_budget_bytes, &resource_policy, false,
+                                           marker_file, quarantine_file, &worker);
     *worker_out = worker;
     return result;
 }
@@ -1232,6 +1241,12 @@ static application_attempt_decision_t application_consume_attempt(
         execution->successful = execution->response != NULL;
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
+    }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        execution->response =
+            cbm_mcp_index_worker_resource_response(job->args_json, &attempt->result);
+        application_attempt_free(attempt);
+        return APPLICATION_ATTEMPT_DECISION_STOP;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
         execution->unsafe_terminal = true;

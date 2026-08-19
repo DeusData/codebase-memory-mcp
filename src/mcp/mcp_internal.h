@@ -32,6 +32,10 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
  * must remove any untrusted field with the same name before invoking this. */
 bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy);
+bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
+                                             char *error, size_t error_size);
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result);
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
