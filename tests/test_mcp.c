@@ -21210,6 +21210,17 @@ TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery) {
               CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
 
     result.supervision_failed = false;
+    result.tree_quiesced = true;
+    result.outcome = CBM_PROC_KILLED;
+    result.resource_violation.resource = CBM_INDEX_RESOURCE_RSS_BYTES;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE);
+    result.tree_quiesced = false;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
+
+    result.resource_violation = (cbm_index_resource_violation_t){0};
+    result.tree_quiesced = true;
     result.outcome = CBM_PROC_CRASH;
     result.response = NULL;
     ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
@@ -21258,1424 +21269,1235 @@ TEST(index_supervisor_clean_exit_without_response_response_issue1300) {
     PASS();
 }
 
-/* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
- * Distinct exit codes so the parent can report the exact failure mode. */
-enum {
-    IDX845_OK = 0,
-    IDX845_SPAWNED = 41,     /* a worker subprocess was spawned — the #845 bug */
-    IDX845_NO_RESULT = 42,   /* handle_tool returned NULL */
-    IDX845_NOT_INDEXED = 43, /* response lacks status=indexed */
-};
-
-static int idx845_index_inprocess_check(const char *repo_dir) {
-    int spawns_before = cbm_index_supervisor_spawn_count();
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        return IDX845_NO_RESULT;
-    }
-    char args[1024];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_dir);
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
-
-    int code = IDX845_OK;
-    if (cbm_index_supervisor_spawn_count() != spawns_before) {
-        code = IDX845_SPAWNED;
-    } else if (!resp) {
-        code = IDX845_NO_RESULT;
-    } else if (!response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
-        code = IDX845_NOT_INDEXED;
-    }
-    free(resp);
-    cbm_mcp_server_free(srv);
-    return code;
-}
-
-TEST(index_supervisor_gate_requires_marked_host_issue845) {
-    /* #845: index_repository via cbm_mcp_handle_tool from an EMBEDDER (this test
-     * binary) must index IN-PROCESS even with CBM_INDEX_SUPERVISOR unset. The
-     * supervisor gate may only wrap a process that called
-     * cbm_index_supervisor_mark_host() — i.e. the real binary's main(). Before
-     * the fix, should_wrap() was true for ANY embedder: the gate resolved the
-     * CURRENT binary (this test runner!) and spawned
-     * '<test-runner> cli --index-worker --index-worker-build …', which a test binary
-     * interprets as suite-filter args → it re-runs test suites in the child →
-     * recursive spawn chains (observed 11-min hangs; kernel VM-map load during
-     * the 2026-07-04 host panics).
-     *
-     * POSIX: run the call in a forked child under alarm(20) so the pre-fix
-     * recursive behaviour cannot hang the runner; the child reports via exit
-     * code. Windows: no fork — run in-process (safe once the gate is fixed; the
-     * pre-fix redness is demonstrated on POSIX). */
-    char tmp_dir[256];
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx845-repo-XXXXXX");
-    if (!cbm_mkdtemp(tmp_dir)) {
-        PASS();
-    }
-    char cache[256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idx845-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        cbm_rmdir(tmp_dir);
-        PASS();
-    }
-
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    /* The point of the guard: NO kill switch. The gate itself must keep an
-     * unmarked host in-process. Save + restore the ambient value. */
-    const char *saved_sv = getenv("CBM_INDEX_SUPERVISOR");
-    char *saved_sv_copy = saved_sv ? strdup(saved_sv) : NULL;
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-
-    char src_path[512];
-    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
-    FILE *fp = fopen(src_path, "w");
-    ASSERT_NOT_NULL(fp);
-    fputs("def main():\n    return 'ok'\n", fp);
-    fclose(fp);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-#ifdef _WIN32
-    code = idx845_index_inprocess_check(tmp_dir);
-#else
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(20); /* pre-fix spawn chain must die here, not hang the runner */
-        _exit(idx845_index_inprocess_check(tmp_dir));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-#endif
-
-    /* Restore env BEFORE asserting so a red run doesn't leak state. */
-    if (saved_sv_copy) {
-        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sv_copy, 1);
-        free(saved_sv_copy);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    }
-    char *project = cbm_project_name_from_path(tmp_dir);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    remove(src_path);
-    cbm_rmdir(cache);
-    cbm_rmdir(tmp_dir);
-
-    if (signalled) {
-        printf("    child killed by signal %d (alarm => recursive spawn chain hang)\n", sig);
-    } else if (code != IDX845_OK) {
-        printf("    child exit code %d (41=worker spawned, 42=no result, 43=not indexed)\n", code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDX845_OK);
-    PASS();
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  Mandatory supervision must fail closed in real CBM hosts
- * ══════════════════════════════════════════════════════════════════ */
-
-/* A real CBM host must never turn a supervisor refusal into permission to run
- * the native index pipeline in its own long-lived process. The legacy
- * CBM_INDEX_SUPERVISOR=0 switch is a deterministic start-failure seam here: on
- * the buggy path should_wrap() returned false, the parent mutation guard ran,
- * and the project DB was written in-process. The fixed path keeps supervision
- * mandatory, returns an error, and leaves both the guard and filesystem
- * untouched. Host marking is process-lifetime state, so isolate it in a clean
- * re-exec. posix_spawn stays reliable after earlier tests created threads,
- * whereas a late raw fork can fail transiently under sanitizers on macOS. */
-enum {
-    IDXFAILCLOSED_OK = 0,
-    IDXFAILCLOSED_NO_SERVER = 81,
-    IDXFAILCLOSED_PARENT_MUTATED = 82,
-    IDXFAILCLOSED_NO_RESPONSE = 83,
-    IDXFAILCLOSED_INDEXED = 84,
-    IDXFAILCLOSED_NOT_ERROR = 85,
-};
-
 #ifndef _WIN32
-int mcp_test_idxfailclosed_supervisor_start_check(const char *repo_dir, const char *cache_dir) {
-    (void)cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+typedef struct {
+    int calls;
+} index_worker_resource_clock_t;
+
+static uint64_t index_worker_resource_clock(void *context) {
+    index_worker_resource_clock_t *clock = context;
+    clock->calls++;
+    return clock->calls == 1 ? 100 : 1101;
+}
+
+enum {
+    IDXRESOURCE_OK = 0,
+    IDXRESOURCE_SETUP = 71,
+    IDXRESOURCE_NO_RESPONSE = 72,
+    IDXRESOURCE_BAD_CONTRACT = 73,
+    IDXRESOURCE_RETRIED = 74,
+};
+
+static int index_worker_resource_response_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
     cbm_index_supervisor_mark_host();
-    (void)cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        return IDXFAILCLOSED_NO_SERVER;
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server ||
+        cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXRESOURCE_SETUP;
     }
-    mcp_mutation_guard_probe_t parent_guard = {0};
-    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
-                                              mcp_mutation_guard_probe_end, &parent_guard);
-
-    char args[CBM_SZ_4K];
-    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_dir);
-    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
-
-    int result = IDXFAILCLOSED_OK;
-    if (parent_guard.begin_count != 0 || parent_guard.end_count != 0) {
-        result = IDXFAILCLOSED_PARENT_MUTATED;
-    } else if (!response) {
-        result = IDXFAILCLOSED_NO_RESPONSE;
-    } else if (response_contains_json_fragment(response, "\"status\":\"indexed\"")) {
-        result = IDXFAILCLOSED_INDEXED;
-    } else if (!response_contains_json_fragment(response, "\"status\":\"error\"") ||
-               !response_contains_json_fragment(response, "\"outcome\":\"spawn_failed\"")) {
-        result = IDXFAILCLOSED_NOT_ERROR;
+    cbm_mcp_server_set_config(server, config);
+    index_worker_resource_clock_t clock = {0};
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_worker_resource_clock, NULL, &clock);
+    int before = cbm_index_supervisor_spawn_count();
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                   "\"_cbm_index_policy\":{\"index_max_files\":\"off\","
+                   "\"index_max_source_mb\":\"off\",\"index_max_rss_mb\":\"off\","
+                   "\"index_max_duration_seconds\":\"off\"}}",
+                   repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    int after = cbm_index_supervisor_spawn_count();
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    int result = IDXRESOURCE_OK;
+    if (!response) {
+        result = IDXRESOURCE_NO_RESPONSE;
+    } else if (!strstr(response, "resource_limit_exceeded") ||
+               !strstr(response, "\\\"stage\\\":\\\"worker\\\"") ||
+               !strstr(response, "\\\"resource\\\":\\\"duration_ms\\\"") ||
+               !strstr(response, "\\\"observed\\\":1001") ||
+               !strstr(response, "\\\"limit\\\":1000") ||
+               !strstr(response, "\\\"unit\\\":\\\"milliseconds\\\"")) {
+        result = IDXRESOURCE_BAD_CONTRACT;
+    } else if (after - before != 1) {
+        result = IDXRESOURCE_RETRIED;
     }
-
     free(response);
-    cbm_mcp_server_free(srv);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
     return result;
 }
-
-static bool idxfailclosed_self_path(char out[CBM_SZ_4K]) {
-#ifdef __APPLE__
-    int length = proc_pidpath(getpid(), out, CBM_SZ_4K);
-    bool resolved = length > 0 && length < CBM_SZ_4K;
-    if (resolved) {
-        out[length] = '\0';
-    }
-    return resolved;
-#elif defined(__linux__)
-    ssize_t length = readlink("/proc/self/exe", out, CBM_SZ_4K - 1);
-    bool resolved = length > 0 && length < (ssize_t)CBM_SZ_4K - 1;
-    if (resolved) {
-        out[length] = '\0';
-    }
-    return resolved;
-#else
-    (void)out;
-    return false;
-#endif
-}
 #endif
 
-TEST(index_supervisor_start_failure_is_fail_closed_in_real_host) {
+TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried) {
 #ifdef _WIN32
-    SKIP_PLATFORM("immutable host mark needs fork isolation (POSIX-only)");
+    SKIP_PLATFORM("fork-isolated MCP host harness; supervisor state machine is cross-platform");
 #else
-    char repo_dir[CBM_SZ_1K];
-    char cache_dir[CBM_SZ_1K];
-    (void)snprintf(repo_dir, sizeof(repo_dir), "%s/cbm-idx-failclosed-repo-XXXXXX", cbm_tmpdir());
-    (void)snprintf(cache_dir, sizeof(cache_dir), "%s/cbm-idx-failclosed-cache-XXXXXX",
-                   cbm_tmpdir());
-    ASSERT_NOT_NULL(cbm_mkdtemp(repo_dir));
-    ASSERT_NOT_NULL(cbm_mkdtemp(cache_dir));
+    char *repo = th_mktempdir("cbm_worker_resource_repo");
+    char *cache = th_mktempdir("cbm_worker_resource_cache");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(index_worker_resource_response_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    if (exit_code != IDXRESOURCE_OK) {
+        printf("    worker resource child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXRESOURCE_OK);
+    PASS();
+#endif
 
-    char source_path[CBM_SZ_4K];
-    (void)snprintf(source_path, sizeof(source_path), "%s/should_not_index.py", repo_dir);
-    FILE *source = cbm_fopen(source_path, "wb");
-    ASSERT_NOT_NULL(source);
-    ASSERT_TRUE(fputs("def should_not_index():\n    return True\n", source) >= 0);
-    ASSERT_EQ(fclose(source), 0);
-
-    char *project = cbm_project_name_from_path(repo_dir);
-    ASSERT_NOT_NULL(project);
-    char db_path[CBM_SZ_4K];
-    (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, project);
-
-    char self_path[CBM_SZ_4K] = {0};
-    ASSERT_TRUE(idxfailclosed_self_path(self_path));
-    char *const child_argv[] = {
-        self_path, "__cbm_mcp_idxfailclosed_probe", repo_dir, cache_dir, NULL,
+    /* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
+     * Distinct exit codes so the parent can report the exact failure mode. */
+    enum {
+        IDX845_OK = 0,
+        IDX845_SPAWNED = 41,     /* a worker subprocess was spawned — the #845 bug */
+        IDX845_NO_RESULT = 42,   /* handle_tool returned NULL */
+        IDX845_NOT_INDEXED = 43, /* response lacks status=indexed */
     };
-    (void)fflush(NULL);
-    pid_t child = -1;
-    ASSERT_EQ(posix_spawn(&child, self_path, NULL, NULL, child_argv, environ), 0);
-    ASSERT_TRUE(child > 0);
-    int status = 0;
-    ASSERT_EQ(waitpid(child, &status, 0), child);
-    bool exited = WIFEXITED(status);
-    int child_result = exited ? WEXITSTATUS(status) : -1;
-    bool database_absent = !cbm_file_exists(db_path);
 
-    cleanup_project_db(cache_dir, project);
-    free(project);
-    (void)cbm_unlink(source_path);
-    (void)th_rmtree(repo_dir);
-    (void)th_rmtree(cache_dir);
-
-    ASSERT_TRUE(exited);
-    ASSERT_EQ(child_result, IDXFAILCLOSED_OK);
-    ASSERT_TRUE(database_absent);
-    PASS();
-#endif
-}
-
-/* ═══════════════════════════════════════════════════════════
- *  #832 — background auto-index + watcher re-index must run in the
- *         supervised worker SUBPROCESS (RSS isolation)
- * ══════════════════════════════════════════════════════════ */
-
-/* The long-lived server ran the full index pipeline in-process on two background
- * paths (session auto-index in mcp.c, watcher re-index in main.c). Worker-thread
- * mimalloc heaps abandon pages at thread exit and mimalloc v3
- * (page_reclaim_on_free=0) does not reclaim them when the main thread later frees
- * their blocks, so RSS ratchets across re-index cycles (#832). The fix routes both
- * paths through cbm_mcp_index_run_supervised_path() — the SAME supervised worker
- * subprocess the index_repository tool uses — so the child hands 100%% of its RSS
- * back to the OS on exit.
- *
- * This guard proves the ROUTING: on a supervisor-marked host with the kill switch
- * OFF, the shared entry the watcher/auto-index now call must (a) spawn a worker
- * child (cbm_index_supervisor_spawn_count() increases) and (b) actually index the
- * fixture (the worker child writes the Function node). RED on the unfixed
- * in-process routing: it calls cbm_pipeline_run directly, so spawn_count is
- * unchanged → IDX832_NO_SPAWN. */
-enum {
-    IDX832_OK = 0,
-    IDX832_NO_SPAWN = 51,    /* spawn_count unchanged — routed in-process (RED) */
-    IDX832_NULL_RESP = 52,   /* supervised entry degraded to NULL */
-    IDX832_NOT_INDEXED = 53, /* response/store lacks the indexed Function node */
-    IDX832_SERVER_FAIL = 54,
-};
-
-#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
-static int idx832_supervised_route_check(const char *repo_dir) {
-    /* Become a supervisor host with the kill switch OFF — exactly the real MCP
-     * server's state. Done in the FORKED CHILD only (see the harness) so the
-     * parent test-runner's process-wide host mark stays clear and the #845
-     * unmarked-embedder guard is unaffected. Bound the recovery loop + worker
-     * quiet-timeout so a stuck child cannot run long under the fork+alarm net. */
-    cbm_index_supervisor_mark_host();
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
-    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
-
-    int spawns_before = cbm_index_supervisor_spawn_count();
-    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
-    int spawns_after = cbm_index_supervisor_spawn_count();
-
-    if (spawns_after == spawns_before) {
-        free(resp);
-        return IDX832_NO_SPAWN; /* the discriminating assertion: RED in-process */
-    }
-    if (!resp) {
-        return IDX832_NULL_RESP;
-    }
-    bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
-    free(resp);
-    if (!indexed) {
-        return IDX832_NOT_INDEXED;
-    }
-
-    /* Store-level proof the worker child did real work: the Function node it wrote
-     * must be queryable from a fresh server reading the DB the child produced. */
-    char *project = cbm_project_name_from_path(repo_dir);
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        free(project);
-        return IDX832_SERVER_FAIL;
-    }
-    int code = IDX832_OK;
-    if (project) {
-        char q[512];
-        snprintf(q, sizeof(q),
-                 "{\"project\":\"%s\",\"name_pattern\":\"idx832_fn\",\"label\":\"Function\"}",
-                 project);
-        char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
-        if (!sr || !strstr(sr, "idx832_fn")) {
-            code = IDX832_NOT_INDEXED;
-        }
-        free(sr);
-    }
-    cbm_mcp_server_free(srv);
-    free(project);
-    return code;
-}
-#endif /* !_WIN32 */
-
-TEST(index_bg_paths_route_through_supervisor_issue832) {
-#ifdef _WIN32
-    /* The guard marks the process as a supervisor host, which cannot be undone.
-     * POSIX isolates that in a forked child; without fork we would pollute the
-     * shared test-runner (breaking the #845 unmarked-embedder guard). The routing
-     * logic is platform-independent and covered on POSIX CI; Windows containment
-     * is covered by the end-to-end crash-containment test. */
-    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
-#else
-    char tmp_dir[256];
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx832-repo-XXXXXX");
-    if (!cbm_mkdtemp(tmp_dir)) {
-        PASS();
-    }
-    char cache[256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idx832-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        cbm_rmdir(tmp_dir);
-        PASS();
-    }
-
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
-
-    char src_path[512];
-    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
-    FILE *fp = fopen(src_path, "w");
-    ASSERT_NOT_NULL(fp);
-    fputs("def idx832_fn():\n    return 'ok'\n", fp);
-    fclose(fp);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(60); /* a stuck worker dies here instead of hanging the runner */
-        _exit(idx832_supervised_route_check(tmp_dir));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    char *project = cbm_project_name_from_path(tmp_dir);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    remove(src_path);
-    cbm_rmdir(cache);
-    cbm_rmdir(tmp_dir);
-
-    if (signalled) {
-        printf("    child killed by signal %d (alarm => worker hang)\n", sig);
-    } else if (code != IDX832_OK) {
-        printf("    child exit code %d (51=no spawn/in-process=RED, 52=null resp, "
-               "53=not indexed, 54=server fail)\n",
-               code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDX832_OK);
-    PASS();
-#endif
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  Parallel-only crash recovery (ms-typescript cascade fix)
- * ══════════════════════════════════════════════════════════════════ */
-
-/* The old recovery loop re-ran the worker SINGLE-THREADED to keep one exact
- * crash marker. At scale that fell into the sequential crawl, was killed as
- * a hang mid-pass, and the stale marker quarantined FOUR innocent
- * ms-typescript fixtures, one 15-minute retry at a time. The reworked loop
- * re-runs PARALLEL with a marker journal; a file is quarantined only when
- * it is in-flight across two consecutive failed runs.
- *
- * This guard proves the CONTRACT: with an injected crasher among good
- * files, the supervised index must (a) never spawn a single-threaded worker
- * (cbm_index_supervisor_spawn_st_count stays 0 — RED on the old loop),
- * (b) quarantine exactly the crasher, (c) leave the innocents indexed and
- * NOT quarantined. */
-enum {
-    IDXPAR_OK = 0,
-    IDXPAR_ST_SPAWN = 61,      /* single-threaded recovery spawn happened (RED) */
-    IDXPAR_NULL_RESP = 62,     /* supervised entry degraded to NULL */
-    IDXPAR_NOT_INDEXED = 63,   /* response lacks status indexed */
-    IDXPAR_NO_QUARANTINE = 64, /* crasher missing from skipped[] */
-    IDXPAR_INNOCENT_HIT = 65,  /* a good file was quarantined/skipped */
-    IDXPAR_GOOD_MISSING = 66,  /* good file's Function absent from the store */
-    IDXPAR_NOT_ERROR = 67,     /* systemic failure did not report status error */
-    IDXPAR_OUTCOME_WRONG = 68, /* systemic failure outcome is not exit_nonzero */
-};
-
-#ifndef _WIN32
-static int idxpar_recovery_check(const char *repo_dir) {
-    cbm_index_supervisor_mark_host();
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    /* Rounds needed: fail+record, fail+quarantine, clean. Generous cap. */
-    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
-    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
-    cbm_setenv("CBM_TEST_CRASH_ON", "idxpar_crasher", 1);
-
-    int st_before = cbm_index_supervisor_spawn_st_count();
-    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
-    int st_after = cbm_index_supervisor_spawn_st_count();
-    cbm_unsetenv("CBM_TEST_CRASH_ON");
-
-    if (st_after != st_before) {
-        free(resp);
-        return IDXPAR_ST_SPAWN; /* discriminating assertion: RED on the old loop */
-    }
-    if (!resp) {
-        return IDXPAR_NULL_RESP;
-    }
-    bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
-    bool crasher_skipped = strstr(resp, "idxpar_crasher.py") != NULL;
-    bool innocent_hit =
-        strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
-    free(resp);
-    if (!indexed) {
-        return IDXPAR_NOT_INDEXED;
-    }
-    if (!crasher_skipped) {
-        return IDXPAR_NO_QUARANTINE;
-    }
-    if (innocent_hit) {
-        return IDXPAR_INNOCENT_HIT;
-    }
-
-    /* Store proof: an innocent's Function node exists. */
-    char *project = cbm_project_name_from_path(repo_dir);
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    int code = IDXPAR_OK;
-    if (srv && project) {
-        char q[512];
-        snprintf(q, sizeof(q),
-                 "{\"project\":\"%s\",\"name_pattern\":\"idxpar_good_fn\",\"label\":\"Function\"}",
-                 project);
-        char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
-        if (!sr || !strstr(sr, "idxpar_good_fn")) {
-            code = IDXPAR_GOOD_MISSING;
-        }
-        free(sr);
-    }
-    if (srv) {
-        cbm_mcp_server_free(srv);
-    }
-    free(project);
-    return code;
-}
-
-static int idxpar_exit_nonzero_recovery_check(const char *repo_dir) {
-    cbm_index_supervisor_mark_host();
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
-    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
-    cbm_setenv("CBM_TEST_EXIT_ON", "idxpar_exit_nonzero", 1);
-
-    int st_before = cbm_index_supervisor_spawn_st_count();
-    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
-    int st_after = cbm_index_supervisor_spawn_st_count();
-    cbm_unsetenv("CBM_TEST_EXIT_ON");
-
-    if (st_after != st_before) {
-        free(resp);
-        return IDXPAR_ST_SPAWN;
-    }
-    if (!resp) {
-        return IDXPAR_NULL_RESP;
-    }
-    bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
-    bool offender_skipped = strstr(resp, "idxpar_exit_nonzero.py") != NULL;
-    bool innocent_hit =
-        strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
-    bool phase_error = strstr(resp, "\"phase\":\"error\"") != NULL ||
-                       strstr(resp, "quarantined after error") != NULL;
-    free(resp);
-    if (!indexed) {
-        return IDXPAR_NOT_INDEXED;
-    }
-    if (!offender_skipped || !phase_error) {
-        return IDXPAR_NO_QUARANTINE;
-    }
-    if (innocent_hit) {
-        return IDXPAR_INNOCENT_HIT;
-    }
-
-    char *project = cbm_project_name_from_path(repo_dir);
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    int code = IDXPAR_OK;
-    if (srv && project) {
-        char q[512];
-        snprintf(q, sizeof(q),
-                 "{\"project\":\"%s\",\"name_pattern\":\"idxpar_good_fn\",\"label\":\"Function\"}",
-                 project);
-        char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
-        if (!sr || !strstr(sr, "idxpar_good_fn")) {
-            code = IDXPAR_GOOD_MISSING;
-        }
-        free(sr);
-    }
-    if (srv) {
-        cbm_mcp_server_free(srv);
-    }
-    free(project);
-    return code;
-}
-
-static int idxpar_systemic_exit_nonzero_give_up_check(const char *repo_dir) {
-    cbm_index_supervisor_mark_host();
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
-    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
-    cbm_setenv("CBM_TEST_EXIT_ON", "idxpar_", 1);
-
-    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
-    cbm_unsetenv("CBM_TEST_EXIT_ON");
-
-    if (!resp) {
-        return IDXPAR_NULL_RESP;
-    }
-    bool is_error = response_contains_json_fragment(resp, "\"status\":\"error\"");
-    bool is_exit_nonzero = response_contains_json_fragment(resp, "\"outcome\":\"exit_nonzero\"");
-    bool innocent_hit =
-        strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
-    free(resp);
-
-    if (!is_error) {
-        return IDXPAR_NOT_ERROR;
-    }
-    if (!is_exit_nonzero) {
-        return IDXPAR_OUTCOME_WRONG;
-    }
-    if (innocent_hit) {
-        return IDXPAR_INNOCENT_HIT;
-    }
-    return IDXPAR_OK;
-}
-#endif /* !_WIN32 */
-
-/* #773: SIGABRT (invalid free in ts_stack_delete via
- * cbm_destroy_thread_parser) on the SECOND index_repository in one server
- * process, once both repos take the PARALLEL path (~30+ files). The
- * supervisor masks this on the default MCP path (fresh worker process per
- * index); the in-process pipeline — CBM_INDEX_SUPERVISOR=0, and every
- * embedded/test consumer — dies. Forked child so the abort cannot kill the
- * runner; ASan legs print the exact bad free. */
-enum {
-    IDX773_OK = 0,
-    IDX773_FIRST_FAILED = 71,  /* first index didn't return indexed */
-    IDX773_SECOND_FAILED = 72, /* second index didn't return indexed */
-};
-
-#ifndef _WIN32
-static void idx773_write_py_repo(const char *dir, int files, int variant) {
-    for (int i = 0; i < files; i++) {
-        char path[CBM_SZ_512];
-        snprintf(path, sizeof(path), "%s/mod_%d_%03d.py", dir, variant, i);
-        FILE *f = fopen(path, "w");
-        if (!f) {
-            continue;
-        }
-        fprintf(f,
-                "class Handler%d:\n"
-                "    def run(self, x):\n"
-                "        return self.helper(x) + %d\n"
-                "    def helper(self, x):\n"
-                "        for i in range(10):\n"
-                "            x += i\n"
-                "        return x\n"
-                "\n"
-                "def main_%d(x):\n"
-                "    return Handler%d().run(x)\n",
-                i, i, i, i);
-        fclose(f);
-    }
-}
-
-static int idx773_double_index_check(const char *dir_a, const char *dir_b) {
-    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        return IDX773_FIRST_FAILED;
-    }
-    char args[CBM_SZ_512];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", dir_a);
-    char *r1 = cbm_mcp_handle_tool(srv, "index_repository", args);
-    bool ok1 = r1 && strstr(r1, "indexed") != NULL;
-    free(r1);
-    if (!ok1) {
-        cbm_mcp_server_free(srv);
-        return IDX773_FIRST_FAILED;
-    }
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", dir_b);
-    char *r2 = cbm_mcp_handle_tool(srv, "index_repository", args); /* SIGABRT here (RED) */
-    bool ok2 = r2 && strstr(r2, "indexed") != NULL;
-    free(r2);
-    cbm_mcp_server_free(srv);
-    return ok2 ? IDX773_OK : IDX773_SECOND_FAILED;
-}
-#endif /* !_WIN32 */
-
-/* #898: the SEQUENTIAL pipeline emitted malformed JSON for brokered
- * ASYNC_CALLS edges ("broker":"bullmq} — missing closing quote) and stored
- * the RAW broker/method string as the synthesized Route node's properties
- * (literally `bullmq` instead of {"broker":"bullmq"}). json_extract over
- * those rows errors, generated-column indexes fail, and PRAGMA quick_check
- * aborts with "malformed JSON" — which since the artifact deep-integrity
- * check also means such caches are refused at import. The parallel path
- * was correct; both pipelines must emit identical, valid JSON. */
-TEST(sequential_service_edge_props_are_valid_json_issue898) {
-    char tmp[CBM_SZ_256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_seq898_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) {
-        FAIL("mkdtemp failed");
-    }
-    char cache[CBM_SZ_256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm_seq898_cache_XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        cbm_rmdir(tmp);
-        FAIL("cache mkdtemp failed");
-    }
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    char src_path[CBM_SZ_512];
-    snprintf(src_path, sizeof(src_path), "%s/queue.py", tmp);
-    FILE *f = fopen(src_path, "w");
-    ASSERT_NOT_NULL(f);
-    /* celery.Celery("tasks") resolves through the import map to a QN the
-     * service-pattern table classifies as ASYNC with broker "celery". */
-    fputs("import celery\n"
-          "\n"
-          "def enqueue():\n"
-          "    celery.Celery(\"tasks\")\n",
-          f);
-    fclose(f);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    char args[CBM_SZ_512];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "indexed"));
-    free(resp);
-
-    /* File-backed MCP stores are deliberately request-scoped so a sibling
-     * process can atomically replace the DB generation (and so Windows does
-     * not retain a replacement-blocking handle). Inspect the published DB
-     * through an independent query handle instead of relying on srv->store. */
-    char *project = cbm_project_name_from_path(tmp);
-    ASSERT_NOT_NULL(project);
-    char db_path[CBM_SZ_512];
-    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
-    cbm_store_t *store = cbm_store_open_path_query(db_path);
-    ASSERT_NOT_NULL(store);
-    struct sqlite3 *db = cbm_store_get_db(store);
-    ASSERT_NOT_NULL(db);
-
-    /* Non-vacuous: the fixture must actually produce a brokered edge. */
-    sqlite3_stmt *stmt = NULL;
-    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS';", -1,
-                                 &stmt, NULL),
-              SQLITE_OK);
-    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-    int async_edges = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    ASSERT_TRUE(async_edges >= 1);
-
-    /* THE BUG: malformed properties on edges (broker quote) and Route nodes
-     * (raw string). Every properties blob must be valid JSON. */
-    ASSERT_EQ(sqlite3_prepare_v2(db,
-                                 "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
-                                 "AND properties != '' AND json_valid(properties)=0;",
-                                 -1, &stmt, NULL),
-              SQLITE_OK);
-    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-    int bad_edges = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    ASSERT_EQ(bad_edges, 0);
-
-    ASSERT_EQ(sqlite3_prepare_v2(db,
-                                 "SELECT count(*) FROM nodes WHERE properties IS NOT NULL "
-                                 "AND properties != '' AND json_valid(properties)=0;",
-                                 -1, &stmt, NULL),
-              SQLITE_OK);
-    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-    int bad_nodes = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    ASSERT_EQ(bad_nodes, 0);
-
-    /* Pipeline parity: the broker must be extractable exactly like the
-     * parallel path emits it. */
-    ASSERT_EQ(sqlite3_prepare_v2(db,
-                                 "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS' AND "
-                                 "json_extract(properties,'$.broker')='celery';",
-                                 -1, &stmt, NULL),
-              SQLITE_OK);
-    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-    int brokered = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    ASSERT_TRUE(brokered >= 1);
-
-    cbm_store_close(store);
-    cbm_mcp_server_free(srv);
-    cleanup_project_db(cache, project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    free(project);
-    th_rmtree(cache);
-    cbm_unlink(src_path);
-    cbm_rmdir(tmp);
-    PASS();
-}
-
-TEST(index_second_inprocess_run_survives_issue773) {
-#ifdef _WIN32
-    SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
-#else
-    char dir_a[CBM_SZ_256];
-    char dir_b[CBM_SZ_256];
-    char cache[CBM_SZ_256];
-    snprintf(dir_a, sizeof(dir_a), "/tmp/cbm-idx773a-XXXXXX");
-    snprintf(dir_b, sizeof(dir_b), "/tmp/cbm-idx773b-XXXXXX");
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idx773c-XXXXXX");
-    if (!cbm_mkdtemp(dir_a) || !cbm_mkdtemp(dir_b) || !cbm_mkdtemp(cache)) {
-        FAIL("mkdtemp failed");
-    }
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    /* Trigger shape: run 1 small enough for the SEQUENTIAL path (parses on
-     * the calling thread, mimalloc epoch), run 2 large enough for the
-     * PARALLEL path (switches the global ts allocator to the slab). */
-    idx773_write_py_repo(dir_a, 5, 0);
-    idx773_write_py_repo(dir_b, 60, 1);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(180); /* generous: two full parallel indexes */
-        _exit(idx773_double_index_check(dir_a, dir_b));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-
-    if (signalled) {
-        printf("    child killed by signal %d (SIGABRT = the #773 invalid free)\n", sig);
-    } else if (code != IDX773_OK) {
-        printf("    child exit code %d (71=first index failed, 72=second failed)\n", code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDX773_OK);
-    PASS();
-#endif
-}
-
-TEST(index_recovery_parallel_quarantines_crasher) {
-#ifdef _WIN32
-    SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
-#else
-    char tmp_dir[CBM_SZ_256];
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-XXXXXX");
-    if (!cbm_mkdtemp(tmp_dir)) {
-        FAIL("mkdtemp failed");
-    }
-    char cache[CBM_SZ_256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        FAIL("mkdtemp cache failed");
-    }
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    char p1[CBM_SZ_512];
-    char p2[CBM_SZ_512];
-    char pc[CBM_SZ_512];
-    snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
-    snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
-    snprintf(pc, sizeof(pc), "%s/idxpar_crasher.py", tmp_dir);
-    FILE *f = fopen(p1, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
-    fclose(f);
-    f = fopen(p2, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
-    fclose(f);
-    f = fopen(pc, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_crash_fn():\n    return 'boom'\n", f);
-    fclose(f);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(120); /* generous: three supervised rounds + clean run */
-        _exit(idxpar_recovery_check(tmp_dir));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    char *project = cbm_project_name_from_path(tmp_dir);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    remove(p1);
-    remove(p2);
-    remove(pc);
-    cbm_rmdir(cache);
-    cbm_rmdir(tmp_dir);
-
-    if (signalled) {
-        printf("    child killed by signal %d (alarm => recovery loop hang)\n", sig);
-    } else if (code != IDXPAR_OK) {
-        printf("    child exit code %d (61=ST spawn/RED, 62=null resp, 63=not indexed, "
-               "64=no quarantine, 65=innocent hit, 66=good missing)\n",
-               code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDXPAR_OK);
-    PASS();
-#endif
-}
-
-TEST(index_recovery_quarantines_exit_nonzero) {
-#ifdef _WIN32
-    SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
-#else
-    char tmp_dir[CBM_SZ_256];
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-exit-XXXXXX");
-    if (!cbm_mkdtemp(tmp_dir)) {
-        FAIL("mkdtemp failed");
-    }
-    char cache[CBM_SZ_256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-exit-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        FAIL("mkdtemp cache failed");
-    }
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    char p1[CBM_SZ_512];
-    char p2[CBM_SZ_512];
-    char pc[CBM_SZ_512];
-    snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
-    snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
-    snprintf(pc, sizeof(pc), "%s/idxpar_exit_nonzero.py", tmp_dir);
-    FILE *f = fopen(p1, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
-    fclose(f);
-    f = fopen(p2, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
-    fclose(f);
-    f = fopen(pc, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_bad_fn():\n    return 'exit'\n", f);
-    fclose(f);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(120);
-        _exit(idxpar_exit_nonzero_recovery_check(tmp_dir));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    char *project = cbm_project_name_from_path(tmp_dir);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    remove(p1);
-    remove(p2);
-    remove(pc);
-    cbm_rmdir(cache);
-    cbm_rmdir(tmp_dir);
-
-    if (signalled) {
-        printf("    child killed by signal %d\n", sig);
-    } else if (code != IDXPAR_OK) {
-        printf("    child exit code %d\n", code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDXPAR_OK);
-    PASS();
-#endif
-}
-
-TEST(index_recovery_systemic_exit_nonzero_gives_up) {
-#ifdef _WIN32
-    SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
-#else
-    char tmp_dir[CBM_SZ_256];
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-sys-XXXXXX");
-    if (!cbm_mkdtemp(tmp_dir)) {
-        FAIL("mkdtemp failed");
-    }
-    char cache[CBM_SZ_256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-sys-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        FAIL("mkdtemp cache failed");
-    }
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    char p1[CBM_SZ_512];
-    char p2[CBM_SZ_512];
-    snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
-    snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
-    FILE *f = fopen(p1, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
-    fclose(f);
-    f = fopen(p2, "w");
-    ASSERT_NOT_NULL(f);
-    fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
-    fclose(f);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(120);
-        _exit(idxpar_systemic_exit_nonzero_give_up_check(tmp_dir));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    char *project = cbm_project_name_from_path(tmp_dir);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    remove(p1);
-    remove(p2);
-    cbm_rmdir(cache);
-    cbm_rmdir(tmp_dir);
-
-    if (signalled) {
-        printf("    child killed by signal %d\n", sig);
-    } else if (code != IDXPAR_OK) {
-        printf("    child exit code %d\n", code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDXPAR_OK);
-    PASS();
-#endif
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  AUTO_WATCH GATE  (distilled from PR #625)
- *
- *  Background watcher registration on session connect is gated by the
- *  `auto_watch` config key (default TRUE = existing behavior).
- * ══════════════════════════════════════════════════════════════════ */
-
-/* Drive the already-indexed connect path (initialize → maybe_auto_index →
- * watcher registration) and return the resulting watch count.
- * auto_watch_value: NULL leaves the key unset (exercises the default),
- * otherwise the key is set to that value before initialize.
- * Returns a negative code on fixture setup failure. */
-static int auto_watch_connect_watch_count(const char *auto_watch_value) {
-    char cache[256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-autowatch-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
-        return -1;
-    }
-
-    char repodir[512];
-    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
-    if (th_mkdir_p(repodir) != 0) {
-        th_rmtree(cache);
-        return -2;
-    }
-
-    /* Same derivation detect_session uses on the cwd — realpath-based, so
-     * the name matches even where /tmp is a symlink (macOS). */
-    char *project = cbm_project_name_from_path(repodir);
-    if (!project) {
-        th_rmtree(cache);
-        return -3;
-    }
-
-    /* Pre-create <cache>/<project>.db so maybe_auto_index takes the
-     * "already indexed" branch — the watcher-registration site under test. */
-    char db_path[1024];
-    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
-    if (th_write_file(db_path, "") != 0) {
-        free(project);
-        th_rmtree(cache);
-        return -4;
-    }
-    free(project);
-
-    const char *saved = getenv("CBM_CACHE_DIR");
-    char *saved_copy = saved ? strdup(saved) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    char old_cwd[1024];
-    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
-        restore_cache_dir(saved_copy);
-        free(saved_copy);
-        th_rmtree(cache);
-        return -5;
-    }
-
-    int count = -6;
-    cbm_config_t *cfg = cbm_config_open(cache);
-    cbm_store_t *wstore = cbm_store_open_memory();
-    cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
-    if (cfg && watcher) {
-        if (auto_watch_value) {
-            cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, auto_watch_value);
-        }
+    static int idx845_index_inprocess_check(const char *repo_dir) {
+        int spawns_before = cbm_index_supervisor_spawn_count();
 
         cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-        if (srv) {
-            cbm_mcp_server_set_watcher(srv, watcher);
-            cbm_mcp_server_set_config(srv, cfg);
-            char *resp = cbm_mcp_server_handle(
-                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+        if (!srv) {
+            return IDX845_NO_RESULT;
+        }
+        char args[1024];
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_dir);
+        char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+
+        int code = IDX845_OK;
+        if (cbm_index_supervisor_spawn_count() != spawns_before) {
+            code = IDX845_SPAWNED;
+        } else if (!resp) {
+            code = IDX845_NO_RESULT;
+        } else if (!response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
+            code = IDX845_NOT_INDEXED;
+        }
+        free(resp);
+        cbm_mcp_server_free(srv);
+        return code;
+    }
+
+    TEST(index_supervisor_gate_requires_marked_host_issue845) {
+        /* #845: index_repository via cbm_mcp_handle_tool from an EMBEDDER (this test
+         * binary) must index IN-PROCESS even with CBM_INDEX_SUPERVISOR unset. The
+         * supervisor gate may only wrap a process that called
+         * cbm_index_supervisor_mark_host() — i.e. the real binary's main(). Before
+         * the fix, should_wrap() was true for ANY embedder: the gate resolved the
+         * CURRENT binary (this test runner!) and spawned
+         * '<test-runner> cli --index-worker --index-worker-build …', which a test binary
+         * interprets as suite-filter args → it re-runs test suites in the child →
+         * recursive spawn chains (observed 11-min hangs; kernel VM-map load during
+         * the 2026-07-04 host panics).
+         *
+         * POSIX: run the call in a forked child under alarm(20) so the pre-fix
+         * recursive behaviour cannot hang the runner; the child reports via exit
+         * code. Windows: no fork — run in-process (safe once the gate is fixed; the
+         * pre-fix redness is demonstrated on POSIX). */
+        char tmp_dir[256];
+        snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx845-repo-XXXXXX");
+        if (!cbm_mkdtemp(tmp_dir)) {
+            PASS();
+        }
+        char cache[256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idx845-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            cbm_rmdir(tmp_dir);
+            PASS();
+        }
+
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        /* The point of the guard: NO kill switch. The gate itself must keep an
+         * unmarked host in-process. Save + restore the ambient value. */
+        const char *saved_sv = getenv("CBM_INDEX_SUPERVISOR");
+        char *saved_sv_copy = saved_sv ? strdup(saved_sv) : NULL;
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+
+        char src_path[512];
+        snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+        FILE *fp = fopen(src_path, "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("def main():\n    return 'ok'\n", fp);
+        fclose(fp);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+#ifdef _WIN32
+        code = idx845_index_inprocess_check(tmp_dir);
+#else
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(20); /* pre-fix spawn chain must die here, not hang the runner */
+            _exit(idx845_index_inprocess_check(tmp_dir));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+#endif
+
+        /* Restore env BEFORE asserting so a red run doesn't leak state. */
+        if (saved_sv_copy) {
+            cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sv_copy, 1);
+            free(saved_sv_copy);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        }
+        char *project = cbm_project_name_from_path(tmp_dir);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        remove(src_path);
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+
+        if (signalled) {
+            printf("    child killed by signal %d (alarm => recursive spawn chain hang)\n", sig);
+        } else if (code != IDX845_OK) {
+            printf("    child exit code %d (41=worker spawned, 42=no result, 43=not indexed)\n",
+                   code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDX845_OK);
+        PASS();
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     *  Mandatory supervision must fail closed in real CBM hosts
+     * ══════════════════════════════════════════════════════════════════ */
+
+    /* A real CBM host must never turn a supervisor refusal into permission to run
+     * the native index pipeline in its own long-lived process. The legacy
+     * CBM_INDEX_SUPERVISOR=0 switch is a deterministic start-failure seam here: on
+     * the buggy path should_wrap() returned false, the parent mutation guard ran,
+     * and the project DB was written in-process. The fixed path keeps supervision
+     * mandatory, returns an error, and leaves both the guard and filesystem
+     * untouched. Host marking is process-lifetime state, so isolate it in a clean
+     * re-exec. posix_spawn stays reliable after earlier tests created threads,
+     * whereas a late raw fork can fail transiently under sanitizers on macOS. */
+    enum {
+        IDXFAILCLOSED_OK = 0,
+        IDXFAILCLOSED_NO_SERVER = 81,
+        IDXFAILCLOSED_PARENT_MUTATED = 82,
+        IDXFAILCLOSED_NO_RESPONSE = 83,
+        IDXFAILCLOSED_INDEXED = 84,
+        IDXFAILCLOSED_NOT_ERROR = 85,
+    };
+
+#ifndef _WIN32
+    int mcp_test_idxfailclosed_supervisor_start_check(const char *repo_dir, const char *cache_dir) {
+        (void)cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+        cbm_index_supervisor_mark_host();
+        (void)cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (!srv) {
+            return IDXFAILCLOSED_NO_SERVER;
+        }
+        mcp_mutation_guard_probe_t parent_guard = {0};
+        cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                                  mcp_mutation_guard_probe_end, &parent_guard);
+
+        char args[CBM_SZ_4K];
+        (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_dir);
+        char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+
+        int result = IDXFAILCLOSED_OK;
+        if (parent_guard.begin_count != 0 || parent_guard.end_count != 0) {
+            result = IDXFAILCLOSED_PARENT_MUTATED;
+        } else if (!response) {
+            result = IDXFAILCLOSED_NO_RESPONSE;
+        } else if (response_contains_json_fragment(response, "\"status\":\"indexed\"")) {
+            result = IDXFAILCLOSED_INDEXED;
+        } else if (!response_contains_json_fragment(response, "\"status\":\"error\"") ||
+                   !response_contains_json_fragment(response, "\"outcome\":\"spawn_failed\"")) {
+            result = IDXFAILCLOSED_NOT_ERROR;
+        }
+
+        free(response);
+        cbm_mcp_server_free(srv);
+        return result;
+    }
+
+    static bool idxfailclosed_self_path(char out[CBM_SZ_4K]) {
+#ifdef __APPLE__
+        int length = proc_pidpath(getpid(), out, CBM_SZ_4K);
+        bool resolved = length > 0 && length < CBM_SZ_4K;
+        if (resolved) {
+            out[length] = '\0';
+        }
+        return resolved;
+#elif defined(__linux__)
+        ssize_t length = readlink("/proc/self/exe", out, CBM_SZ_4K - 1);
+        bool resolved = length > 0 && length < (ssize_t)CBM_SZ_4K - 1;
+        if (resolved) {
+            out[length] = '\0';
+        }
+        return resolved;
+#else
+        (void)out;
+        return false;
+#endif
+    }
+#endif
+
+    TEST(index_supervisor_start_failure_is_fail_closed_in_real_host) {
+#ifdef _WIN32
+        SKIP_PLATFORM("immutable host mark needs fork isolation (POSIX-only)");
+#else
+        char repo_dir[CBM_SZ_1K];
+        char cache_dir[CBM_SZ_1K];
+        (void)snprintf(repo_dir, sizeof(repo_dir), "%s/cbm-idx-failclosed-repo-XXXXXX",
+                       cbm_tmpdir());
+        (void)snprintf(cache_dir, sizeof(cache_dir), "%s/cbm-idx-failclosed-cache-XXXXXX",
+                       cbm_tmpdir());
+        ASSERT_NOT_NULL(cbm_mkdtemp(repo_dir));
+        ASSERT_NOT_NULL(cbm_mkdtemp(cache_dir));
+
+        char source_path[CBM_SZ_4K];
+        (void)snprintf(source_path, sizeof(source_path), "%s/should_not_index.py", repo_dir);
+        FILE *source = cbm_fopen(source_path, "wb");
+        ASSERT_NOT_NULL(source);
+        ASSERT_TRUE(fputs("def should_not_index():\n    return True\n", source) >= 0);
+        ASSERT_EQ(fclose(source), 0);
+
+        char *project = cbm_project_name_from_path(repo_dir);
+        ASSERT_NOT_NULL(project);
+        char db_path[CBM_SZ_4K];
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, project);
+
+        char self_path[CBM_SZ_4K] = {0};
+        ASSERT_TRUE(idxfailclosed_self_path(self_path));
+        char *const child_argv[] = {
+            self_path, "__cbm_mcp_idxfailclosed_probe", repo_dir, cache_dir, NULL,
+        };
+        (void)fflush(NULL);
+        pid_t child = -1;
+        ASSERT_EQ(posix_spawn(&child, self_path, NULL, NULL, child_argv, environ), 0);
+        ASSERT_TRUE(child > 0);
+        int status = 0;
+        ASSERT_EQ(waitpid(child, &status, 0), child);
+        bool exited = WIFEXITED(status);
+        int child_result = exited ? WEXITSTATUS(status) : -1;
+        bool database_absent = !cbm_file_exists(db_path);
+
+        cleanup_project_db(cache_dir, project);
+        free(project);
+        (void)cbm_unlink(source_path);
+        (void)th_rmtree(repo_dir);
+        (void)th_rmtree(cache_dir);
+
+        ASSERT_TRUE(exited);
+        ASSERT_EQ(child_result, IDXFAILCLOSED_OK);
+        ASSERT_TRUE(database_absent);
+        PASS();
+#endif
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+     *  #832 — background auto-index + watcher re-index must run in the
+     *         supervised worker SUBPROCESS (RSS isolation)
+     * ══════════════════════════════════════════════════════════ */
+
+    /* The long-lived server ran the full index pipeline in-process on two background
+     * paths (session auto-index in mcp.c, watcher re-index in main.c). Worker-thread
+     * mimalloc heaps abandon pages at thread exit and mimalloc v3
+     * (page_reclaim_on_free=0) does not reclaim them when the main thread later frees
+     * their blocks, so RSS ratchets across re-index cycles (#832). The fix routes both
+     * paths through cbm_mcp_index_run_supervised_path() — the SAME supervised worker
+     * subprocess the index_repository tool uses — so the child hands 100%% of its RSS
+     * back to the OS on exit.
+     *
+     * This guard proves the ROUTING: on a supervisor-marked host with the kill switch
+     * OFF, the shared entry the watcher/auto-index now call must (a) spawn a worker
+     * child (cbm_index_supervisor_spawn_count() increases) and (b) actually index the
+     * fixture (the worker child writes the Function node). RED on the unfixed
+     * in-process routing: it calls cbm_pipeline_run directly, so spawn_count is
+     * unchanged → IDX832_NO_SPAWN. */
+    enum {
+        IDX832_OK = 0,
+        IDX832_NO_SPAWN = 51,    /* spawn_count unchanged — routed in-process (RED) */
+        IDX832_NULL_RESP = 52,   /* supervised entry degraded to NULL */
+        IDX832_NOT_INDEXED = 53, /* response/store lacks the indexed Function node */
+        IDX832_SERVER_FAIL = 54,
+    };
+
+#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
+    static int idx832_supervised_route_check(const char *repo_dir) {
+        /* Become a supervisor host with the kill switch OFF — exactly the real MCP
+         * server's state. Done in the FORKED CHILD only (see the harness) so the
+         * parent test-runner's process-wide host mark stays clear and the #845
+         * unmarked-embedder guard is unaffected. Bound the recovery loop + worker
+         * quiet-timeout so a stuck child cannot run long under the fork+alarm net. */
+        cbm_index_supervisor_mark_host();
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+        cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+        int spawns_before = cbm_index_supervisor_spawn_count();
+        char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+        int spawns_after = cbm_index_supervisor_spawn_count();
+
+        if (spawns_after == spawns_before) {
             free(resp);
-            count = cbm_watcher_watch_count(watcher);
+            return IDX832_NO_SPAWN; /* the discriminating assertion: RED in-process */
+        }
+        if (!resp) {
+            return IDX832_NULL_RESP;
+        }
+        bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+        free(resp);
+        if (!indexed) {
+            return IDX832_NOT_INDEXED;
+        }
+
+        /* Store-level proof the worker child did real work: the Function node it wrote
+         * must be queryable from a fresh server reading the DB the child produced. */
+        char *project = cbm_project_name_from_path(repo_dir);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (!srv) {
+            free(project);
+            return IDX832_SERVER_FAIL;
+        }
+        int code = IDX832_OK;
+        if (project) {
+            char q[512];
+            snprintf(q, sizeof(q),
+                     "{\"project\":\"%s\",\"name_pattern\":\"idx832_fn\",\"label\":\"Function\"}",
+                     project);
+            char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
+            if (!sr || !strstr(sr, "idx832_fn")) {
+                code = IDX832_NOT_INDEXED;
+            }
+            free(sr);
+        }
+        cbm_mcp_server_free(srv);
+        free(project);
+        return code;
+    }
+#endif /* !_WIN32 */
+
+    TEST(index_bg_paths_route_through_supervisor_issue832) {
+#ifdef _WIN32
+        /* The guard marks the process as a supervisor host, which cannot be undone.
+         * POSIX isolates that in a forked child; without fork we would pollute the
+         * shared test-runner (breaking the #845 unmarked-embedder guard). The routing
+         * logic is platform-independent and covered on POSIX CI; Windows containment
+         * is covered by the end-to-end crash-containment test. */
+        SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+#else
+        char tmp_dir[256];
+        snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx832-repo-XXXXXX");
+        if (!cbm_mkdtemp(tmp_dir)) {
+            PASS();
+        }
+        char cache[256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idx832-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            cbm_rmdir(tmp_dir);
+            PASS();
+        }
+
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
+
+        char src_path[512];
+        snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+        FILE *fp = fopen(src_path, "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("def idx832_fn():\n    return 'ok'\n", fp);
+        fclose(fp);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(60); /* a stuck worker dies here instead of hanging the runner */
+            _exit(idx832_supervised_route_check(tmp_dir));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        char *project = cbm_project_name_from_path(tmp_dir);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        remove(src_path);
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+
+        if (signalled) {
+            printf("    child killed by signal %d (alarm => worker hang)\n", sig);
+        } else if (code != IDX832_OK) {
+            printf("    child exit code %d (51=no spawn/in-process=RED, 52=null resp, "
+                   "53=not indexed, 54=server fail)\n",
+                   code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDX832_OK);
+        PASS();
+#endif
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     *  Parallel-only crash recovery (ms-typescript cascade fix)
+     * ══════════════════════════════════════════════════════════════════ */
+
+    /* The old recovery loop re-ran the worker SINGLE-THREADED to keep one exact
+     * crash marker. At scale that fell into the sequential crawl, was killed as
+     * a hang mid-pass, and the stale marker quarantined FOUR innocent
+     * ms-typescript fixtures, one 15-minute retry at a time. The reworked loop
+     * re-runs PARALLEL with a marker journal; a file is quarantined only when
+     * it is in-flight across two consecutive failed runs.
+     *
+     * This guard proves the CONTRACT: with an injected crasher among good
+     * files, the supervised index must (a) never spawn a single-threaded worker
+     * (cbm_index_supervisor_spawn_st_count stays 0 — RED on the old loop),
+     * (b) quarantine exactly the crasher, (c) leave the innocents indexed and
+     * NOT quarantined. */
+    enum {
+        IDXPAR_OK = 0,
+        IDXPAR_ST_SPAWN = 61,      /* single-threaded recovery spawn happened (RED) */
+        IDXPAR_NULL_RESP = 62,     /* supervised entry degraded to NULL */
+        IDXPAR_NOT_INDEXED = 63,   /* response lacks status indexed */
+        IDXPAR_NO_QUARANTINE = 64, /* crasher missing from skipped[] */
+        IDXPAR_INNOCENT_HIT = 65,  /* a good file was quarantined/skipped */
+        IDXPAR_GOOD_MISSING = 66,  /* good file's Function absent from the store */
+        IDXPAR_NOT_ERROR = 67,     /* systemic failure did not report status error */
+        IDXPAR_OUTCOME_WRONG = 68, /* systemic failure outcome is not exit_nonzero */
+    };
+
+#ifndef _WIN32
+    static int idxpar_recovery_check(const char *repo_dir) {
+        cbm_index_supervisor_mark_host();
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        /* Rounds needed: fail+record, fail+quarantine, clean. Generous cap. */
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
+        cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+        cbm_setenv("CBM_TEST_CRASH_ON", "idxpar_crasher", 1);
+
+        int st_before = cbm_index_supervisor_spawn_st_count();
+        char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+        int st_after = cbm_index_supervisor_spawn_st_count();
+        cbm_unsetenv("CBM_TEST_CRASH_ON");
+
+        if (st_after != st_before) {
+            free(resp);
+            return IDXPAR_ST_SPAWN; /* discriminating assertion: RED on the old loop */
+        }
+        if (!resp) {
+            return IDXPAR_NULL_RESP;
+        }
+        bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+        bool crasher_skipped = strstr(resp, "idxpar_crasher.py") != NULL;
+        bool innocent_hit =
+            strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
+        free(resp);
+        if (!indexed) {
+            return IDXPAR_NOT_INDEXED;
+        }
+        if (!crasher_skipped) {
+            return IDXPAR_NO_QUARANTINE;
+        }
+        if (innocent_hit) {
+            return IDXPAR_INNOCENT_HIT;
+        }
+
+        /* Store proof: an innocent's Function node exists. */
+        char *project = cbm_project_name_from_path(repo_dir);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        int code = IDXPAR_OK;
+        if (srv && project) {
+            char q[512];
+            snprintf(
+                q, sizeof(q),
+                "{\"project\":\"%s\",\"name_pattern\":\"idxpar_good_fn\",\"label\":\"Function\"}",
+                project);
+            char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
+            if (!sr || !strstr(sr, "idxpar_good_fn")) {
+                code = IDXPAR_GOOD_MISSING;
+            }
+            free(sr);
+        }
+        if (srv) {
             cbm_mcp_server_free(srv);
         }
+        free(project);
+        return code;
     }
 
-    if (watcher) {
-        cbm_watcher_free(watcher);
-    }
-    if (wstore) {
-        cbm_store_close(wstore);
-    }
-    if (cfg) {
-        cbm_config_close(cfg);
+    static int idxpar_exit_nonzero_recovery_check(const char *repo_dir) {
+        cbm_index_supervisor_mark_host();
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
+        cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+        cbm_setenv("CBM_TEST_EXIT_ON", "idxpar_exit_nonzero", 1);
+
+        int st_before = cbm_index_supervisor_spawn_st_count();
+        char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+        int st_after = cbm_index_supervisor_spawn_st_count();
+        cbm_unsetenv("CBM_TEST_EXIT_ON");
+
+        if (st_after != st_before) {
+            free(resp);
+            return IDXPAR_ST_SPAWN;
+        }
+        if (!resp) {
+            return IDXPAR_NULL_RESP;
+        }
+        bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+        bool offender_skipped = strstr(resp, "idxpar_exit_nonzero.py") != NULL;
+        bool innocent_hit =
+            strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
+        bool phase_error = strstr(resp, "\"phase\":\"error\"") != NULL ||
+                           strstr(resp, "quarantined after error") != NULL;
+        free(resp);
+        if (!indexed) {
+            return IDXPAR_NOT_INDEXED;
+        }
+        if (!offender_skipped || !phase_error) {
+            return IDXPAR_NO_QUARANTINE;
+        }
+        if (innocent_hit) {
+            return IDXPAR_INNOCENT_HIT;
+        }
+
+        char *project = cbm_project_name_from_path(repo_dir);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        int code = IDXPAR_OK;
+        if (srv && project) {
+            char q[512];
+            snprintf(
+                q, sizeof(q),
+                "{\"project\":\"%s\",\"name_pattern\":\"idxpar_good_fn\",\"label\":\"Function\"}",
+                project);
+            char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
+            if (!sr || !strstr(sr, "idxpar_good_fn")) {
+                code = IDXPAR_GOOD_MISSING;
+            }
+            free(sr);
+        }
+        if (srv) {
+            cbm_mcp_server_free(srv);
+        }
+        free(project);
+        return code;
     }
 
-    (void)cbm_chdir(old_cwd);
-    restore_cache_dir(saved_copy);
-    free(saved_copy);
-    th_rmtree(cache);
-    return count;
-}
+    static int idxpar_systemic_exit_nonzero_give_up_check(const char *repo_dir) {
+        cbm_index_supervisor_mark_host();
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
+        cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+        cbm_setenv("CBM_TEST_EXIT_ON", "idxpar_", 1);
 
-/* Default (key unset) → watcher registered on connect. Guards the
- * no-behavior-change promise of the auto_watch gate: existing users keep
- * background auto-sync without touching config. */
-TEST(mcp_auto_watch_default_registers_watcher_on_connect) {
-    int count = auto_watch_connect_watch_count(NULL);
-    if (count < 0) {
-        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+        cbm_unsetenv("CBM_TEST_EXIT_ON");
+
+        if (!resp) {
+            return IDXPAR_NULL_RESP;
+        }
+        bool is_error = response_contains_json_fragment(resp, "\"status\":\"error\"");
+        bool is_exit_nonzero =
+            response_contains_json_fragment(resp, "\"outcome\":\"exit_nonzero\"");
+        bool innocent_hit =
+            strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
+        free(resp);
+
+        if (!is_error) {
+            return IDXPAR_NOT_ERROR;
+        }
+        if (!is_exit_nonzero) {
+            return IDXPAR_OUTCOME_WRONG;
+        }
+        if (innocent_hit) {
+            return IDXPAR_INNOCENT_HIT;
+        }
+        return IDXPAR_OK;
     }
-    ASSERT_EQ(count, 1);
-    PASS();
-}
+#endif /* !_WIN32 */
 
-/* auto_watch=false → NO watcher registered on connect. RED on pre-gate code
- * (registration was unconditional and the key did not exist). */
-TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
-    int count = auto_watch_connect_watch_count("false");
-    if (count < 0) {
-        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
-    }
-    ASSERT_EQ(count, 0);
-    PASS();
-}
+    /* #773: SIGABRT (invalid free in ts_stack_delete via
+     * cbm_destroy_thread_parser) on the SECOND index_repository in one server
+     * process, once both repos take the PARALLEL path (~30+ files). The
+     * supervisor masks this on the default MCP path (fresh worker process per
+     * index); the in-process pipeline — CBM_INDEX_SUPERVISOR=0, and every
+     * embedded/test consumer — dies. Forked child so the abort cannot kill the
+     * runner; ASan legs print the exact bad free. */
+    enum {
+        IDX773_OK = 0,
+        IDX773_FIRST_FAILED = 71,  /* first index didn't return indexed */
+        IDX773_SECOND_FAILED = 72, /* second index didn't return indexed */
+    };
 
-/* ══════════════════════════════════════════════════════════════════
- *  #1466 / #713 — the auto_index_limit guard
- *
- *  #1466: autoindex.skip must report the effective numeric limit.
- *  #713:  the guard must bound NON-git roots. The 0.8.x guard counted
- *         `git ls-files | wc -l`, which is 0 outside a checkout, so a plain
- *         directory of 60k files was walked in full (tens of GB RSS). The
- *         bounded discovery count applies to every root, and the skip line
- *         names the limit AND the root so the reporter can act on it.
- * ══════════════════════════════════════════════════════════════════ */
-
-static char autoindex_skip_log[1024];
-static bool autoindex_saw_done;
-
-/* Keeps only the too_many_files skip line, so later lines cannot displace it,
- * and records whether an admitted auto-index actually ran to completion. */
-static void autoindex_limit_capture_log(const char *line) {
-    if (!line) {
-        return;
-    }
-    if (strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
-        snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
-    }
-    if (strstr(line, "msg=autoindex.done")) {
-        autoindex_saw_done = true;
-    }
-}
-
-typedef struct {
-    int files;     /* indexable .py files written into the root */
-    int limit;     /* auto_index_limit */
-    bool git_root; /* emulate a checkout via <root>/.git/HEAD (no git binary) */
-} autoindex_limit_probe_t;
-
-static bool autoindex_limit_write_fixture(const char *repodir,
-                                          const autoindex_limit_probe_t *probe) {
-    if (th_mkdir_p(repodir) != 0) {
-        return false;
-    }
-    for (int i = 0; i < probe->files; i++) {
-        char path[640];
-        char body[96];
-        snprintf(path, sizeof(path), "%s/f%d.py", repodir, i);
-        snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
-        if (th_write_file(path, body) != 0) {
-            return false;
+#ifndef _WIN32
+    static void idx773_write_py_repo(const char *dir, int files, int variant) {
+        for (int i = 0; i < files; i++) {
+            char path[CBM_SZ_512];
+            snprintf(path, sizeof(path), "%s/mod_%d_%03d.py", dir, variant, i);
+            FILE *f = fopen(path, "w");
+            if (!f) {
+                continue;
+            }
+            fprintf(f,
+                    "class Handler%d:\n"
+                    "    def run(self, x):\n"
+                    "        return self.helper(x) + %d\n"
+                    "    def helper(self, x):\n"
+                    "        for i in range(10):\n"
+                    "            x += i\n"
+                    "        return x\n"
+                    "\n"
+                    "def main_%d(x):\n"
+                    "    return Handler%d().run(x)\n",
+                    i, i, i, i);
+            fclose(f);
         }
     }
-    if (probe->git_root) {
-        char gitdir[640];
-        char head[700];
-        snprintf(gitdir, sizeof(gitdir), "%s/.git", repodir);
-        snprintf(head, sizeof(head), "%s/HEAD", gitdir);
-        if (th_mkdir_p(gitdir) != 0 || th_write_file(head, "ref: refs/heads/main\n") != 0) {
-            return false;
+
+    static int idx773_double_index_check(const char *dir_a, const char *dir_b) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (!srv) {
+            return IDX773_FIRST_FAILED;
         }
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", dir_a);
+        char *r1 = cbm_mcp_handle_tool(srv, "index_repository", args);
+        bool ok1 = r1 && strstr(r1, "indexed") != NULL;
+        free(r1);
+        if (!ok1) {
+            cbm_mcp_server_free(srv);
+            return IDX773_FIRST_FAILED;
+        }
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", dir_b);
+        char *r2 = cbm_mcp_handle_tool(srv, "index_repository", args); /* SIGABRT here (RED) */
+        bool ok2 = r2 && strstr(r2, "indexed") != NULL;
+        free(r2);
+        cbm_mcp_server_free(srv);
+        return ok2 ? IDX773_OK : IDX773_SECOND_FAILED;
     }
-    return true;
-}
+#endif /* !_WIN32 */
 
-/* Drive initialize → maybe_auto_index over a fresh root holding probe->files
- * indexable files under auto_index_limit=probe->limit. skip_out receives the
- * too_many_files warning (empty when admitted); *done_out reports whether an
- * admitted auto-index ran to completion (the server free joins the thread).
- * Returns false on fixture setup failure. */
-static bool autoindex_limit_probe(const autoindex_limit_probe_t *probe, char *skip_out,
-                                  size_t skip_size, bool *done_out) {
-    char cache[256];
-    snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(cache)) {
-        return false;
-    }
+    /* #898: the SEQUENTIAL pipeline emitted malformed JSON for brokered
+     * ASYNC_CALLS edges ("broker":"bullmq} — missing closing quote) and stored
+     * the RAW broker/method string as the synthesized Route node's properties
+     * (literally `bullmq` instead of {"broker":"bullmq"}). json_extract over
+     * those rows errors, generated-column indexes fail, and PRAGMA quick_check
+     * aborts with "malformed JSON" — which since the artifact deep-integrity
+     * check also means such caches are refused at import. The parallel path
+     * was correct; both pipelines must emit identical, valid JSON. */
+    TEST(sequential_service_edge_props_are_valid_json_issue898) {
+        char tmp[CBM_SZ_256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_seq898_XXXXXX");
+        if (!cbm_mkdtemp(tmp)) {
+            FAIL("mkdtemp failed");
+        }
+        char cache[CBM_SZ_256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm_seq898_cache_XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            cbm_rmdir(tmp);
+            FAIL("cache mkdtemp failed");
+        }
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
-    char repodir[512];
-    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
-    if (!autoindex_limit_write_fixture(repodir, probe)) {
-        th_rmtree(cache);
-        return false;
-    }
-
-    const char *saved = getenv("CBM_CACHE_DIR");
-    char *saved_copy = saved ? strdup(saved) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    char old_cwd[1024];
-    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
-        restore_cache_dir(saved_copy);
-        free(saved_copy);
-        th_rmtree(cache);
-        return false;
-    }
-
-    bool ok = false;
-    cbm_config_t *cfg = cbm_config_open(cache);
-    if (cfg) {
-        char limit[32];
-        snprintf(limit, sizeof(limit), "%d", probe->limit);
-        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
-        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, limit);
+        char src_path[CBM_SZ_512];
+        snprintf(src_path, sizeof(src_path), "%s/queue.py", tmp);
+        FILE *f = fopen(src_path, "w");
+        ASSERT_NOT_NULL(f);
+        /* celery.Celery("tasks") resolves through the import map to a QN the
+         * service-pattern table classifies as ASYNC with broker "celery". */
+        fputs("import celery\n"
+              "\n"
+              "def enqueue():\n"
+              "    celery.Celery(\"tasks\")\n",
+              f);
+        fclose(f);
 
         cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-        if (srv) {
-            autoindex_skip_log[0] = '\0';
-            autoindex_saw_done = false;
-            CBMLogLevel prev_level = cbm_log_get_level();
-            cbm_log_set_level(CBM_LOG_INFO);
-            cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
-            cbm_log_set_sink_ex(autoindex_limit_capture_log, CBM_LOG_SINK_REPLACE);
+        ASSERT_NOT_NULL(srv);
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
+        char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "indexed"));
+        free(resp);
 
-            cbm_mcp_server_set_config(srv, cfg);
-            char *resp = cbm_mcp_server_handle(
-                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
-            free(resp);
-            cbm_mcp_server_free(srv); /* joins an admitted autoindex thread */
+        /* File-backed MCP stores are deliberately request-scoped so a sibling
+         * process can atomically replace the DB generation (and so Windows does
+         * not retain a replacement-blocking handle). Inspect the published DB
+         * through an independent query handle instead of relying on srv->store. */
+        char *project = cbm_project_name_from_path(tmp);
+        ASSERT_NOT_NULL(project);
+        char db_path[CBM_SZ_512];
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        cbm_store_t *store = cbm_store_open_path_query(db_path);
+        ASSERT_NOT_NULL(store);
+        struct sqlite3 *db = cbm_store_get_db(store);
+        ASSERT_NOT_NULL(db);
 
-            cbm_log_set_sink(NULL);
-            cbm_log_set_level(prev_level);
+        /* Non-vacuous: the fixture must actually produce a brokered edge. */
+        sqlite3_stmt *stmt = NULL;
+        ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS';", -1,
+                                     &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        int async_edges = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        ASSERT_TRUE(async_edges >= 1);
 
-            snprintf(skip_out, skip_size, "%s", autoindex_skip_log);
-            *done_out = autoindex_saw_done;
-            ok = true;
+        /* THE BUG: malformed properties on edges (broker quote) and Route nodes
+         * (raw string). Every properties blob must be valid JSON. */
+        ASSERT_EQ(sqlite3_prepare_v2(db,
+                                     "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                     "AND properties != '' AND json_valid(properties)=0;",
+                                     -1, &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        int bad_edges = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        ASSERT_EQ(bad_edges, 0);
+
+        ASSERT_EQ(sqlite3_prepare_v2(db,
+                                     "SELECT count(*) FROM nodes WHERE properties IS NOT NULL "
+                                     "AND properties != '' AND json_valid(properties)=0;",
+                                     -1, &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        int bad_nodes = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        ASSERT_EQ(bad_nodes, 0);
+
+        /* Pipeline parity: the broker must be extractable exactly like the
+         * parallel path emits it. */
+        ASSERT_EQ(sqlite3_prepare_v2(db,
+                                     "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS' AND "
+                                     "json_extract(properties,'$.broker')='celery';",
+                                     -1, &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        int brokered = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        ASSERT_TRUE(brokered >= 1);
+
+        cbm_store_close(store);
+        cbm_mcp_server_free(srv);
+        cleanup_project_db(cache, project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        free(project);
+        th_rmtree(cache);
+        cbm_unlink(src_path);
+        cbm_rmdir(tmp);
+        PASS();
+    }
+
+    TEST(index_second_inprocess_run_survives_issue773) {
+#ifdef _WIN32
+        SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
+#else
+        char dir_a[CBM_SZ_256];
+        char dir_b[CBM_SZ_256];
+        char cache[CBM_SZ_256];
+        snprintf(dir_a, sizeof(dir_a), "/tmp/cbm-idx773a-XXXXXX");
+        snprintf(dir_b, sizeof(dir_b), "/tmp/cbm-idx773b-XXXXXX");
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idx773c-XXXXXX");
+        if (!cbm_mkdtemp(dir_a) || !cbm_mkdtemp(dir_b) || !cbm_mkdtemp(cache)) {
+            FAIL("mkdtemp failed");
         }
-        cbm_config_close(cfg);
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        /* Trigger shape: run 1 small enough for the SEQUENTIAL path (parses on
+         * the calling thread, mimalloc epoch), run 2 large enough for the
+         * PARALLEL path (switches the global ts allocator to the slab). */
+        idx773_write_py_repo(dir_a, 5, 0);
+        idx773_write_py_repo(dir_b, 60, 1);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(180); /* generous: two full parallel indexes */
+            _exit(idx773_double_index_check(dir_a, dir_b));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+
+        if (signalled) {
+            printf("    child killed by signal %d (SIGABRT = the #773 invalid free)\n", sig);
+        } else if (code != IDX773_OK) {
+            printf("    child exit code %d (71=first index failed, 72=second failed)\n", code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDX773_OK);
+        PASS();
+#endif
     }
 
-    (void)cbm_chdir(old_cwd);
-    restore_cache_dir(saved_copy);
-    free(saved_copy);
-    th_rmtree(cache);
-    return ok;
-}
+    TEST(index_recovery_parallel_quarantines_crasher) {
+#ifdef _WIN32
+        SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
+#else
+        char tmp_dir[CBM_SZ_256];
+        snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-XXXXXX");
+        if (!cbm_mkdtemp(tmp_dir)) {
+            FAIL("mkdtemp failed");
+        }
+        char cache[CBM_SZ_256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            FAIL("mkdtemp cache failed");
+        }
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
-/* RED before the fix: the warning carries `limit=auto_index_limit`, the config
- * key constant, instead of the configured value. */
-TEST(autoindex_skip_reports_numeric_limit_issue1466) {
-    autoindex_limit_probe_t probe = {.files = 2, .limit = 1, .git_root = false};
-    char warning[1024];
-    bool done = false;
-    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
-        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        char p1[CBM_SZ_512];
+        char p2[CBM_SZ_512];
+        char pc[CBM_SZ_512];
+        snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
+        snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
+        snprintf(pc, sizeof(pc), "%s/idxpar_crasher.py", tmp_dir);
+        FILE *f = fopen(p1, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
+        fclose(f);
+        f = fopen(p2, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
+        fclose(f);
+        f = fopen(pc, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_crash_fn():\n    return 'boom'\n", f);
+        fclose(f);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(120); /* generous: three supervised rounds + clean run */
+            _exit(idxpar_recovery_check(tmp_dir));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        char *project = cbm_project_name_from_path(tmp_dir);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        remove(p1);
+        remove(p2);
+        remove(pc);
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+
+        if (signalled) {
+            printf("    child killed by signal %d (alarm => recovery loop hang)\n", sig);
+        } else if (code != IDXPAR_OK) {
+            printf("    child exit code %d (61=ST spawn/RED, 62=null resp, 63=not indexed, "
+                   "64=no quarantine, 65=innocent hit, 66=good missing)\n",
+                   code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDXPAR_OK);
+        PASS();
+#endif
     }
-    /* Not vacuous: the skip path must actually have been taken. */
-    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
-    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
-    ASSERT_NOT_NULL(strstr(warning, "files=2"));
-    ASSERT_NOT_NULL(strstr(warning, "limit=1"));
-    ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
-    ASSERT_FALSE(done);
-    PASS();
-}
 
-/* #713 at the reporter's shape scaled down (60 files vs limit 50, from
- * 60k vs 50k): a PLAIN directory over the limit is refused, and the line
- * names the limit and the root. RED on the `git ls-files` guard (count 0 →
- * admitted → indexed) and RED while the line does not name the root. */
-TEST(autoindex_limit_guards_non_git_root_issue713) {
-    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = false};
-    char warning[1024];
-    bool done = false;
-    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
-        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    TEST(index_recovery_quarantines_exit_nonzero) {
+#ifdef _WIN32
+        SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
+#else
+        char tmp_dir[CBM_SZ_256];
+        snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-exit-XXXXXX");
+        if (!cbm_mkdtemp(tmp_dir)) {
+            FAIL("mkdtemp failed");
+        }
+        char cache[CBM_SZ_256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-exit-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            FAIL("mkdtemp cache failed");
+        }
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        char p1[CBM_SZ_512];
+        char p2[CBM_SZ_512];
+        char pc[CBM_SZ_512];
+        snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
+        snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
+        snprintf(pc, sizeof(pc), "%s/idxpar_exit_nonzero.py", tmp_dir);
+        FILE *f = fopen(p1, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
+        fclose(f);
+        f = fopen(p2, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
+        fclose(f);
+        f = fopen(pc, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_bad_fn():\n    return 'exit'\n", f);
+        fclose(f);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(120);
+            _exit(idxpar_exit_nonzero_recovery_check(tmp_dir));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        char *project = cbm_project_name_from_path(tmp_dir);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        remove(p1);
+        remove(p2);
+        remove(pc);
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+
+        if (signalled) {
+            printf("    child killed by signal %d\n", sig);
+        } else if (code != IDXPAR_OK) {
+            printf("    child exit code %d\n", code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDXPAR_OK);
+        PASS();
+#endif
     }
-    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
-    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
-    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
-    const char *root = strstr(warning, "root=");
-    ASSERT_NOT_NULL(root);
-    ASSERT_NOT_NULL(strstr(root, "/repo"));
-    ASSERT_FALSE(done);
-    PASS();
-}
 
-/* The same plain directory one file UNDER the limit is admitted and indexed:
- * the guard bounds, it does not fail closed on every non-git root. */
-TEST(autoindex_limit_admits_non_git_root_under_limit_issue713) {
-    autoindex_limit_probe_t probe = {.files = 49, .limit = 50, .git_root = false};
-    char warning[1024];
-    bool done = false;
-    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
-        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    TEST(index_recovery_systemic_exit_nonzero_gives_up) {
+#ifdef _WIN32
+        SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
+#else
+        char tmp_dir[CBM_SZ_256];
+        snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-sys-XXXXXX");
+        if (!cbm_mkdtemp(tmp_dir)) {
+            FAIL("mkdtemp failed");
+        }
+        char cache[CBM_SZ_256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-sys-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            FAIL("mkdtemp cache failed");
+        }
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        char p1[CBM_SZ_512];
+        char p2[CBM_SZ_512];
+        snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
+        snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
+        FILE *f = fopen(p1, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
+        fclose(f);
+        f = fopen(p2, "w");
+        ASSERT_NOT_NULL(f);
+        fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
+        fclose(f);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(120);
+            _exit(idxpar_systemic_exit_nonzero_give_up_check(tmp_dir));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        char *project = cbm_project_name_from_path(tmp_dir);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        remove(p1);
+        remove(p2);
+        cbm_rmdir(cache);
+        cbm_rmdir(tmp_dir);
+
+        if (signalled) {
+            printf("    child killed by signal %d\n", sig);
+        } else if (code != IDXPAR_OK) {
+            printf("    child exit code %d\n", code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDXPAR_OK);
+        PASS();
+#endif
     }
-    ASSERT(warning[0] == '\0');
-    ASSERT_TRUE(done);
-    PASS();
-}
 
-/* A checkout keeps its behaviour: one bounded count for both root kinds. */
-TEST(autoindex_limit_guards_git_root_issue713) {
-    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = true};
-    char warning[1024];
-    bool done = false;
-    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
-        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
-    }
-    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
-    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
-    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
-    ASSERT_NOT_NULL(strstr(warning, "root="));
-    ASSERT_FALSE(done);
-    PASS();
-}
+    /* ══════════════════════════════════════════════════════════════════
+     *  AUTO_WATCH GATE  (distilled from PR #625)
+     *
+     *  Background watcher registration on session connect is gated by the
+     *  `auto_watch` config key (default TRUE = existing behavior).
+     * ══════════════════════════════════════════════════════════════════ */
 
-/* ══════════════════════════════════════════════════════════════════
- *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
- *          watcher registration (keystone × #849 merge interaction)
- * ══════════════════════════════════════════════════════════════════ */
+    /* Drive the already-indexed connect path (initialize → maybe_auto_index →
+     * watcher registration) and return the resulting watch count.
+     * auto_watch_value: NULL leaves the key unset (exercises the default),
+     * otherwise the key is set to that value before initialize.
+     * Returns a negative code on fixture setup failure. */
+    static int auto_watch_connect_watch_count(const char *auto_watch_value) {
+        char cache[256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-autowatch-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            return -1;
+        }
 
-/* #849 routed ALL watcher registration through register_watcher_if_enabled()
- * (auto_watch gate). The #832 keystone then added a SECOND registration site in
- * autoindex_thread's supervised-success branch, but wired it as a DIRECT
- * cbm_watcher_watch() guarded only by `if (srv->watcher)` — srv->watcher is set
- * unconditionally, so that guard does NOT honour `config set auto_watch false`.
- * The above tests only cover the already-indexed on-connect path
- * (register_watcher_if_enabled); this guard covers the fresh-index SUPERVISED
- * autoindex_thread branch that #832 introduced.
- *
- * Drive the real public entry initialize → maybe_auto_index → autoindex_thread on
- * a supervisor-marked host (kill switch off) with a FRESH project (no prior .db)
- * and auto_watch=false. cbm_mcp_server_free() joins the autoindex thread, so the
- * (buggy or gated) registration decision has run before we read the watch count.
- *
- * RED on the unfixed ungated block: the supervised success branch calls
- * cbm_watcher_watch() unconditionally → watch_count == 1 → IDX853_WATCHER_REGISTERED.
- * GREEN once it calls register_watcher_if_enabled() → auto_watch_off skip → 0.
- * spawn_count is asserted to have advanced so the assertion cannot pass vacuously
- * (i.e. green only because the supervised branch was never entered). */
-enum {
-    IDX853_OK = 0,                  /* watch_count==0, supervised branch ran → GREEN */
-    IDX853_WATCHER_REGISTERED = 61, /* watch_count==1 → RED: ungated cbm_watcher_watch */
-    IDX853_NO_SPAWN = 62,           /* spawn_count unchanged → supervised path not exercised */
-    IDX853_SETUP_FAIL = 63,         /* config/watcher/server/cwd setup failed */
-    IDX853_BAD_COUNT = 64,          /* unexpected watch_count (<0 or >1) */
-};
+        char repodir[512];
+        snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+        if (th_mkdir_p(repodir) != 0) {
+            th_rmtree(cache);
+            return -2;
+        }
 
-#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
-static int idx853_supervised_autowatch_check(const char *repo_dir, const char *cache_dir) {
-    /* Become a supervisor host with the kill switch OFF — the real prod MCP
-     * server's state. Done in the FORKED CHILD only (see harness) so the parent
-     * test-runner's process-wide host mark stays clear (#845 invariant). Bound the
-     * worker so a stuck spawn cannot run long under the fork+alarm net. */
-    cbm_index_supervisor_mark_host();
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
-    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+        /* Same derivation detect_session uses on the cwd — realpath-based, so
+         * the name matches even where /tmp is a symlink (macOS). */
+        char *project = cbm_project_name_from_path(repodir);
+        if (!project) {
+            th_rmtree(cache);
+            return -3;
+        }
 
-    cbm_config_t *cfg = cbm_config_open(cache_dir);
-    cbm_store_t *wstore = cbm_store_open_memory();
-    cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
-    if (!cfg || !watcher) {
+        /* Pre-create <cache>/<project>.db so maybe_auto_index takes the
+         * "already indexed" branch — the watcher-registration site under test. */
+        char db_path[1024];
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        if (th_write_file(db_path, "") != 0) {
+            free(project);
+            th_rmtree(cache);
+            return -4;
+        }
+        free(project);
+
+        const char *saved = getenv("CBM_CACHE_DIR");
+        char *saved_copy = saved ? strdup(saved) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        char old_cwd[1024];
+        if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
+            restore_cache_dir(saved_copy);
+            free(saved_copy);
+            th_rmtree(cache);
+            return -5;
+        }
+
+        int count = -6;
+        cbm_config_t *cfg = cbm_config_open(cache);
+        cbm_store_t *wstore = cbm_store_open_memory();
+        cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
+        if (cfg && watcher) {
+            if (auto_watch_value) {
+                cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, auto_watch_value);
+            }
+
+            cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+            if (srv) {
+                cbm_mcp_server_set_watcher(srv, watcher);
+                cbm_mcp_server_set_config(srv, cfg);
+                char *resp = cbm_mcp_server_handle(
+                    srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+                free(resp);
+                count = cbm_watcher_watch_count(watcher);
+                cbm_mcp_server_free(srv);
+            }
+        }
+
         if (watcher) {
             cbm_watcher_free(watcher);
         }
@@ -22685,1266 +22507,1560 @@ static int idx853_supervised_autowatch_check(const char *repo_dir, const char *c
         if (cfg) {
             cbm_config_close(cfg);
         }
-        return IDX853_SETUP_FAIL;
-    }
-    /* auto_index=true → maybe_auto_index launches autoindex_thread for the fresh
-     * project; auto_watch=false → the gate this guard exercises. */
-    cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
-    cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false");
 
-    /* detect_session derives session_root/session_project from the cwd. */
-    char old_cwd[1024];
-    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repo_dir) != 0) {
+        (void)cbm_chdir(old_cwd);
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_rmtree(cache);
+        return count;
+    }
+
+    /* Default (key unset) → watcher registered on connect. Guards the
+     * no-behavior-change promise of the auto_watch gate: existing users keep
+     * background auto-sync without touching config. */
+    TEST(mcp_auto_watch_default_registers_watcher_on_connect) {
+        int count = auto_watch_connect_watch_count(NULL);
+        if (count < 0) {
+            PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        }
+        ASSERT_EQ(count, 1);
+        PASS();
+    }
+
+    /* auto_watch=false → NO watcher registered on connect. RED on pre-gate code
+     * (registration was unconditional and the key did not exist). */
+    TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
+        int count = auto_watch_connect_watch_count("false");
+        if (count < 0) {
+            PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        }
+        ASSERT_EQ(count, 0);
+        PASS();
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     *  #1466 / #713 — the auto_index_limit guard
+     *
+     *  #1466: autoindex.skip must report the effective numeric limit.
+     *  #713:  the guard must bound NON-git roots. The 0.8.x guard counted
+     *         `git ls-files | wc -l`, which is 0 outside a checkout, so a plain
+     *         directory of 60k files was walked in full (tens of GB RSS). The
+     *         bounded discovery count applies to every root, and the skip line
+     *         names the limit AND the root so the reporter can act on it.
+     * ══════════════════════════════════════════════════════════════════ */
+
+    static char autoindex_skip_log[1024];
+    static bool autoindex_saw_done;
+
+    /* Keeps only the too_many_files skip line, so later lines cannot displace it,
+     * and records whether an admitted auto-index actually ran to completion. */
+    static void autoindex_limit_capture_log(const char *line) {
+        if (!line) {
+            return;
+        }
+        if (strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
+            snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
+        }
+        if (strstr(line, "msg=autoindex.done")) {
+            autoindex_saw_done = true;
+        }
+    }
+
+    typedef struct {
+        int files;     /* indexable .py files written into the root */
+        int limit;     /* auto_index_limit */
+        bool git_root; /* emulate a checkout via <root>/.git/HEAD (no git binary) */
+    } autoindex_limit_probe_t;
+
+    static bool autoindex_limit_write_fixture(const char *repodir,
+                                              const autoindex_limit_probe_t *probe) {
+        if (th_mkdir_p(repodir) != 0) {
+            return false;
+        }
+        for (int i = 0; i < probe->files; i++) {
+            char path[640];
+            char body[96];
+            snprintf(path, sizeof(path), "%s/f%d.py", repodir, i);
+            snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
+            if (th_write_file(path, body) != 0) {
+                return false;
+            }
+        }
+        if (probe->git_root) {
+            char gitdir[640];
+            char head[700];
+            snprintf(gitdir, sizeof(gitdir), "%s/.git", repodir);
+            snprintf(head, sizeof(head), "%s/HEAD", gitdir);
+            if (th_mkdir_p(gitdir) != 0 || th_write_file(head, "ref: refs/heads/main\n") != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /* Drive initialize → maybe_auto_index over a fresh root holding probe->files
+     * indexable files under auto_index_limit=probe->limit. skip_out receives the
+     * too_many_files warning (empty when admitted); *done_out reports whether an
+     * admitted auto-index ran to completion (the server free joins the thread).
+     * Returns false on fixture setup failure. */
+    static bool autoindex_limit_probe(const autoindex_limit_probe_t *probe, char *skip_out,
+                                      size_t skip_size, bool *done_out) {
+        char cache[256];
+        snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
+        if (!cbm_mkdtemp(cache)) {
+            return false;
+        }
+
+        char repodir[512];
+        snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+        if (!autoindex_limit_write_fixture(repodir, probe)) {
+            th_rmtree(cache);
+            return false;
+        }
+
+        const char *saved = getenv("CBM_CACHE_DIR");
+        char *saved_copy = saved ? strdup(saved) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        char old_cwd[1024];
+        if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
+            restore_cache_dir(saved_copy);
+            free(saved_copy);
+            th_rmtree(cache);
+            return false;
+        }
+
+        bool ok = false;
+        cbm_config_t *cfg = cbm_config_open(cache);
+        if (cfg) {
+            char limit[32];
+            snprintf(limit, sizeof(limit), "%d", probe->limit);
+            cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+            cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, limit);
+
+            cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+            if (srv) {
+                autoindex_skip_log[0] = '\0';
+                autoindex_saw_done = false;
+                CBMLogLevel prev_level = cbm_log_get_level();
+                cbm_log_set_level(CBM_LOG_INFO);
+                cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+                cbm_log_set_sink_ex(autoindex_limit_capture_log, CBM_LOG_SINK_REPLACE);
+
+                cbm_mcp_server_set_config(srv, cfg);
+                char *resp = cbm_mcp_server_handle(
+                    srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+                free(resp);
+                cbm_mcp_server_free(srv); /* joins an admitted autoindex thread */
+
+                cbm_log_set_sink(NULL);
+                cbm_log_set_level(prev_level);
+
+                snprintf(skip_out, skip_size, "%s", autoindex_skip_log);
+                *done_out = autoindex_saw_done;
+                ok = true;
+            }
+            cbm_config_close(cfg);
+        }
+
+        (void)cbm_chdir(old_cwd);
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_rmtree(cache);
+        return ok;
+    }
+
+    /* RED before the fix: the warning carries `limit=auto_index_limit`, the config
+     * key constant, instead of the configured value. */
+    TEST(autoindex_skip_reports_numeric_limit_issue1466) {
+        autoindex_limit_probe_t probe = {.files = 2, .limit = 1, .git_root = false};
+        char warning[1024];
+        bool done = false;
+        if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+            PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        }
+        /* Not vacuous: the skip path must actually have been taken. */
+        ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+        ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+        ASSERT_NOT_NULL(strstr(warning, "files=2"));
+        ASSERT_NOT_NULL(strstr(warning, "limit=1"));
+        ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
+        ASSERT_FALSE(done);
+        PASS();
+    }
+
+    /* #713 at the reporter's shape scaled down (60 files vs limit 50, from
+     * 60k vs 50k): a PLAIN directory over the limit is refused, and the line
+     * names the limit and the root. RED on the `git ls-files` guard (count 0 →
+     * admitted → indexed) and RED while the line does not name the root. */
+    TEST(autoindex_limit_guards_non_git_root_issue713) {
+        autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = false};
+        char warning[1024];
+        bool done = false;
+        if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+            PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        }
+        ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+        ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+        ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+        const char *root = strstr(warning, "root=");
+        ASSERT_NOT_NULL(root);
+        ASSERT_NOT_NULL(strstr(root, "/repo"));
+        ASSERT_FALSE(done);
+        PASS();
+    }
+
+    /* The same plain directory one file UNDER the limit is admitted and indexed:
+     * the guard bounds, it does not fail closed on every non-git root. */
+    TEST(autoindex_limit_admits_non_git_root_under_limit_issue713) {
+        autoindex_limit_probe_t probe = {.files = 49, .limit = 50, .git_root = false};
+        char warning[1024];
+        bool done = false;
+        if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+            PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        }
+        ASSERT(warning[0] == '\0');
+        ASSERT_TRUE(done);
+        PASS();
+    }
+
+    /* A checkout keeps its behaviour: one bounded count for both root kinds. */
+    TEST(autoindex_limit_guards_git_root_issue713) {
+        autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = true};
+        char warning[1024];
+        bool done = false;
+        if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+            PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+        }
+        ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+        ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+        ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+        ASSERT_NOT_NULL(strstr(warning, "root="));
+        ASSERT_FALSE(done);
+        PASS();
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+     *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
+     *          watcher registration (keystone × #849 merge interaction)
+     * ══════════════════════════════════════════════════════════════════ */
+
+    /* #849 routed ALL watcher registration through register_watcher_if_enabled()
+     * (auto_watch gate). The #832 keystone then added a SECOND registration site in
+     * autoindex_thread's supervised-success branch, but wired it as a DIRECT
+     * cbm_watcher_watch() guarded only by `if (srv->watcher)` — srv->watcher is set
+     * unconditionally, so that guard does NOT honour `config set auto_watch false`.
+     * The above tests only cover the already-indexed on-connect path
+     * (register_watcher_if_enabled); this guard covers the fresh-index SUPERVISED
+     * autoindex_thread branch that #832 introduced.
+     *
+     * Drive the real public entry initialize → maybe_auto_index → autoindex_thread on
+     * a supervisor-marked host (kill switch off) with a FRESH project (no prior .db)
+     * and auto_watch=false. cbm_mcp_server_free() joins the autoindex thread, so the
+     * (buggy or gated) registration decision has run before we read the watch count.
+     *
+     * RED on the unfixed ungated block: the supervised success branch calls
+     * cbm_watcher_watch() unconditionally → watch_count == 1 → IDX853_WATCHER_REGISTERED.
+     * GREEN once it calls register_watcher_if_enabled() → auto_watch_off skip → 0.
+     * spawn_count is asserted to have advanced so the assertion cannot pass vacuously
+     * (i.e. green only because the supervised branch was never entered). */
+    enum {
+        IDX853_OK = 0,                  /* watch_count==0, supervised branch ran → GREEN */
+        IDX853_WATCHER_REGISTERED = 61, /* watch_count==1 → RED: ungated cbm_watcher_watch */
+        IDX853_NO_SPAWN = 62,           /* spawn_count unchanged → supervised path not exercised */
+        IDX853_SETUP_FAIL = 63,         /* config/watcher/server/cwd setup failed */
+        IDX853_BAD_COUNT = 64,          /* unexpected watch_count (<0 or >1) */
+    };
+
+#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
+    static int idx853_supervised_autowatch_check(const char *repo_dir, const char *cache_dir) {
+        /* Become a supervisor host with the kill switch OFF — the real prod MCP
+         * server's state. Done in the FORKED CHILD only (see harness) so the parent
+         * test-runner's process-wide host mark stays clear (#845 invariant). Bound the
+         * worker so a stuck spawn cannot run long under the fork+alarm net. */
+        cbm_index_supervisor_mark_host();
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+        cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+        cbm_config_t *cfg = cbm_config_open(cache_dir);
+        cbm_store_t *wstore = cbm_store_open_memory();
+        cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
+        if (!cfg || !watcher) {
+            if (watcher) {
+                cbm_watcher_free(watcher);
+            }
+            if (wstore) {
+                cbm_store_close(wstore);
+            }
+            if (cfg) {
+                cbm_config_close(cfg);
+            }
+            return IDX853_SETUP_FAIL;
+        }
+        /* auto_index=true → maybe_auto_index launches autoindex_thread for the fresh
+         * project; auto_watch=false → the gate this guard exercises. */
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false");
+
+        /* detect_session derives session_root/session_project from the cwd. */
+        char old_cwd[1024];
+        if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repo_dir) != 0) {
+            cbm_watcher_free(watcher);
+            cbm_store_close(wstore);
+            cbm_config_close(cfg);
+            return IDX853_SETUP_FAIL;
+        }
+
+        int spawns_before = cbm_index_supervisor_spawn_count();
+        int code = IDX853_SETUP_FAIL;
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_watcher(srv, watcher);
+            cbm_mcp_server_set_config(srv, cfg);
+            char *resp = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+            free(resp);
+            /* free() joins the autoindex thread → the supervised worker has finished
+             * and the registration decision (buggy or gated) has executed. */
+            cbm_mcp_server_free(srv);
+
+            int spawns_after = cbm_index_supervisor_spawn_count();
+            int watch_count = cbm_watcher_watch_count(watcher);
+
+            if (spawns_after == spawns_before) {
+                code = IDX853_NO_SPAWN; /* supervised branch never ran — not a valid probe */
+            } else if (watch_count == 1) {
+                code = IDX853_WATCHER_REGISTERED; /* the discriminating RED assertion */
+            } else if (watch_count == 0) {
+                code = IDX853_OK;
+            } else {
+                code = IDX853_BAD_COUNT;
+            }
+        }
+
+        (void)cbm_chdir(old_cwd);
         cbm_watcher_free(watcher);
         cbm_store_close(wstore);
         cbm_config_close(cfg);
-        return IDX853_SETUP_FAIL;
+        return code;
     }
-
-    int spawns_before = cbm_index_supervisor_spawn_count();
-    int code = IDX853_SETUP_FAIL;
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (srv) {
-        cbm_mcp_server_set_watcher(srv, watcher);
-        cbm_mcp_server_set_config(srv, cfg);
-        char *resp = cbm_mcp_server_handle(
-            srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
-        free(resp);
-        /* free() joins the autoindex thread → the supervised worker has finished
-         * and the registration decision (buggy or gated) has executed. */
-        cbm_mcp_server_free(srv);
-
-        int spawns_after = cbm_index_supervisor_spawn_count();
-        int watch_count = cbm_watcher_watch_count(watcher);
-
-        if (spawns_after == spawns_before) {
-            code = IDX853_NO_SPAWN; /* supervised branch never ran — not a valid probe */
-        } else if (watch_count == 1) {
-            code = IDX853_WATCHER_REGISTERED; /* the discriminating RED assertion */
-        } else if (watch_count == 0) {
-            code = IDX853_OK;
-        } else {
-            code = IDX853_BAD_COUNT;
-        }
-    }
-
-    (void)cbm_chdir(old_cwd);
-    cbm_watcher_free(watcher);
-    cbm_store_close(wstore);
-    cbm_config_close(cfg);
-    return code;
-}
 #endif /* !_WIN32 */
 
-TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
+    TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
 #ifdef _WIN32
-    /* Marks the process as a supervisor host (irreversible); POSIX isolates that
-     * in a forked child. The gate logic is platform-independent and covered on
-     * POSIX CI. */
-    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+        /* Marks the process as a supervisor host (irreversible); POSIX isolates that
+         * in a forked child. The gate logic is platform-independent and covered on
+         * POSIX CI. */
+        SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
 #else
-    char tmp_dir[256];
-    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx853-repo-XXXXXX");
-    if (!cbm_mkdtemp(tmp_dir)) {
-        PASS();
-    }
-    char cache[256];
-    snprintf(cache, sizeof(cache), "/tmp/cbm-idx853-cache-XXXXXX");
-    if (!cbm_mkdtemp(cache)) {
+        char tmp_dir[256];
+        snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx853-repo-XXXXXX");
+        if (!cbm_mkdtemp(tmp_dir)) {
+            PASS();
+        }
+        char cache[256];
+        snprintf(cache, sizeof(cache), "/tmp/cbm-idx853-cache-XXXXXX");
+        if (!cbm_mkdtemp(cache)) {
+            cbm_rmdir(tmp_dir);
+            PASS();
+        }
+
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
+
+        char src_path[512];
+        snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+        FILE *fp = fopen(src_path, "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("def idx853_fn():\n    return 'ok'\n", fp);
+        fclose(fp);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(60); /* a stuck worker dies here instead of hanging the runner */
+            _exit(idx853_supervised_autowatch_check(tmp_dir, cache));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        char *project = cbm_project_name_from_path(tmp_dir);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        remove(src_path);
+        cbm_rmdir(cache);
         cbm_rmdir(tmp_dir);
+
+        if (signalled) {
+            printf("    child killed by signal %d (alarm => worker hang)\n", sig);
+        } else if (code != IDX853_OK) {
+            printf("    child exit code %d (61=watcher registered under auto_watch=false=RED, "
+                   "62=no spawn, 63=setup fail, 64=bad count)\n",
+                   code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDX853_OK);
+        PASS();
+#endif
+    }
+
+    /* The containment guard both MCP file-read sinks route through
+     * (resolve_snippet_source for get_code_snippet, attach_result_source for
+     * search_code). A result path that resolves outside the indexed project root
+     * — via a `..` segment or a followed symlink/junction — must be rejected so
+     * its contents never reach a tool response. */
+    extern bool cbm_path_within_root(const char *root_path, const char *abs_path);
+
+    TEST(mcp_path_within_root_rejects_escape) {
+#ifdef _WIN32
+        char root[512];
+        char outside[512];
+        snprintf(root, sizeof(root), "%s/cbm_pwr_root_XXXXXX", cbm_tmpdir());
+        snprintf(outside, sizeof(outside), "%s/cbm_pwr_outside_XXXXXX", cbm_tmpdir());
+        ASSERT_NOT_NULL(cbm_mkdtemp(root));
+        ASSERT_NOT_NULL(cbm_mkdtemp(outside));
+
+        char inside[700];
+        char target[700];
+        char junction[700];
+        char linked_target[900];
+        snprintf(inside, sizeof(inside), "%s/inside.c", root);
+        snprintf(target, sizeof(target), "%s/outside.c", outside);
+        snprintf(junction, sizeof(junction), "%s/escape", root);
+        snprintf(linked_target, sizeof(linked_target), "%s/outside.c", junction);
+        FILE *fp = cbm_fopen(inside, "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("int inside;\n", fp);
+        fclose(fp);
+        fp = cbm_fopen(target, "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("int outside;\n", fp);
+        fclose(fp);
+
+        /* cbm_tmpdir() can expose the MSYS spelling C:/msys64/...; cmd's mklink
+         * builtin treats the slash before "msys64" as another option delimiter.
+         * Native backslashes are required only at this cmd.exe fixture boundary. */
+        char junction_native[sizeof(junction)];
+        char outside_native[sizeof(outside)];
+        snprintf(junction_native, sizeof(junction_native), "%s", junction);
+        snprintf(outside_native, sizeof(outside_native), "%s", outside);
+        for (char *cursor = junction_native; *cursor; cursor++) {
+            if (*cursor == '/') {
+                *cursor = '\\';
+            }
+        }
+        for (char *cursor = outside_native; *cursor; cursor++) {
+            if (*cursor == '/') {
+                *cursor = '\\';
+            }
+        }
+        const char *junction_argv[] = {"cmd.exe",       "/d",           "/c", "mklink", "/J",
+                                       junction_native, outside_native, NULL};
+        bool linked = cbm_exec_no_shell(junction_argv) == 0;
+
+        ASSERT_TRUE(linked);
+        ASSERT_TRUE(cbm_path_within_root(root, inside));
+        ASSERT_FALSE(cbm_path_within_root(root, target));
+        ASSERT_FALSE(cbm_path_within_root(root, linked_target));
+
+        char case_alias[sizeof(root)];
+        snprintf(case_alias, sizeof(case_alias), "%s", root);
+        char *leaf = strrchr(case_alias, '/');
+        char *backslash_leaf = strrchr(case_alias, '\\');
+        if (!leaf || (backslash_leaf && backslash_leaf > leaf)) {
+            leaf = backslash_leaf;
+        }
+        leaf = leaf ? leaf + 1 : case_alias;
+        if (*leaf >= 'a' && *leaf <= 'z') {
+            *leaf = (char)(*leaf - 'a' + 'A');
+        } else if (*leaf >= 'A' && *leaf <= 'Z') {
+            *leaf = (char)(*leaf - 'A' + 'a');
+        }
+        ASSERT_TRUE(cbm_path_within_root(case_alias, inside));
+
+        char drive_root[] = {root[0], ':', '\\', '\0'};
+        ASSERT_TRUE(((root[0] >= 'A' && root[0] <= 'Z') || (root[0] >= 'a' && root[0] <= 'z')) &&
+                    root[1] == ':');
+        ASSERT_TRUE(cbm_path_within_root(drive_root, inside));
+
+        cbm_rmdir(junction);
+        cbm_unlink(inside);
+        cbm_unlink(target);
+        cbm_rmdir(root);
+        cbm_rmdir(outside);
+        PASS();
+#else
+        char root[512];
+        snprintf(root, sizeof(root), "%s/cbm_pwr_XXXXXX", cbm_tmpdir());
+        if (!cbm_mkdtemp(root)) {
+            FAIL("cbm_mkdtemp failed");
+        }
+        char inside[700];
+        snprintf(inside, sizeof(inside), "%s/inside.c", root);
+        FILE *fp = fopen(inside, "w");
+        ASSERT_NOT_NULL(fp);
+        fputs("int x;\n", fp);
+        fclose(fp);
+
+        /* The abs_path a sink builds for an in-root result stays contained; a `..`
+         * escape to an existing outside file (/etc/hosts) resolves out and must be
+         * rejected. */
+        char escape[900];
+        snprintf(escape, sizeof(escape), "%s/../../../../etc/hosts", root);
+        ASSERT_TRUE(cbm_path_within_root(root, inside));
+        ASSERT_FALSE(cbm_path_within_root(root, escape));
+        ASSERT_FALSE(cbm_path_within_root(root, "/etc/hosts"));
+        ASSERT_TRUE(cbm_path_within_root("/", "/etc/hosts"));
+
+        remove(inside);
+        cbm_rmdir(root);
+        PASS();
+#endif
+    }
+
+    /* base_branch is spliced into a `git diff --name-only "<base>"...HEAD` command;
+     * a value starting with '-' would be taken by git as an option (e.g.
+     * --output=<path> writes the diff to an arbitrary file) rather than a ref. It
+     * must be rejected up front, alongside the shell-metacharacter check. */
+    TEST(detect_changes_rejects_option_like_base_branch) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        char *resp = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"detect_changes\","
+                 "\"arguments\":{\"project\":\"p\",\"base_branch\":\"--output=/tmp/cbm_pwn\"}}}");
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "invalid characters"));
+        free(resp);
+        cbm_mcp_server_free(srv);
         PASS();
     }
 
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
-
-    char src_path[512];
-    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
-    FILE *fp = fopen(src_path, "w");
-    ASSERT_NOT_NULL(fp);
-    fputs("def idx853_fn():\n    return 'ok'\n", fp);
-    fclose(fp);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(60); /* a stuck worker dies here instead of hanging the runner */
-        _exit(idx853_supervised_autowatch_check(tmp_dir, cache));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    char *project = cbm_project_name_from_path(tmp_dir);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    remove(src_path);
-    cbm_rmdir(cache);
-    cbm_rmdir(tmp_dir);
-
-    if (signalled) {
-        printf("    child killed by signal %d (alarm => worker hang)\n", sig);
-    } else if (code != IDX853_OK) {
-        printf("    child exit code %d (61=watcher registered under auto_watch=false=RED, "
-               "62=no spawn, 63=setup fail, 64=bad count)\n",
-               code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDX853_OK);
-    PASS();
-#endif
-}
-
-/* The containment guard both MCP file-read sinks route through
- * (resolve_snippet_source for get_code_snippet, attach_result_source for
- * search_code). A result path that resolves outside the indexed project root
- * — via a `..` segment or a followed symlink/junction — must be rejected so
- * its contents never reach a tool response. */
-extern bool cbm_path_within_root(const char *root_path, const char *abs_path);
-
-TEST(mcp_path_within_root_rejects_escape) {
+    TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch) {
 #ifdef _WIN32
-    char root[512];
-    char outside[512];
-    snprintf(root, sizeof(root), "%s/cbm_pwr_root_XXXXXX", cbm_tmpdir());
-    snprintf(outside, sizeof(outside), "%s/cbm_pwr_outside_XXXXXX", cbm_tmpdir());
-    ASSERT_NOT_NULL(cbm_mkdtemp(root));
-    ASSERT_NOT_NULL(cbm_mkdtemp(outside));
-
-    char inside[700];
-    char target[700];
-    char junction[700];
-    char linked_target[900];
-    snprintf(inside, sizeof(inside), "%s/inside.c", root);
-    snprintf(target, sizeof(target), "%s/outside.c", outside);
-    snprintf(junction, sizeof(junction), "%s/escape", root);
-    snprintf(linked_target, sizeof(linked_target), "%s/outside.c", junction);
-    FILE *fp = cbm_fopen(inside, "w");
-    ASSERT_NOT_NULL(fp);
-    fputs("int inside;\n", fp);
-    fclose(fp);
-    fp = cbm_fopen(target, "w");
-    ASSERT_NOT_NULL(fp);
-    fputs("int outside;\n", fp);
-    fclose(fp);
-
-    /* cbm_tmpdir() can expose the MSYS spelling C:/msys64/...; cmd's mklink
-     * builtin treats the slash before "msys64" as another option delimiter.
-     * Native backslashes are required only at this cmd.exe fixture boundary. */
-    char junction_native[sizeof(junction)];
-    char outside_native[sizeof(outside)];
-    snprintf(junction_native, sizeof(junction_native), "%s", junction);
-    snprintf(outside_native, sizeof(outside_native), "%s", outside);
-    for (char *cursor = junction_native; *cursor; cursor++) {
-        if (*cursor == '/') {
-            *cursor = '\\';
+        const char *const branches[] = {"topic%PATH%", "topic!name!", "topic^name"};
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        for (size_t i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+            char request[512];
+            snprintf(request, sizeof(request),
+                     "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
+                     "\"params\":{\"name\":\"detect_changes\","
+                     "\"arguments\":{\"project\":\"p\",\"base_branch\":\"%s\"}}}",
+                     branches[i]);
+            char *response = cbm_mcp_server_handle(srv, request);
+            ASSERT_NOT_NULL(response);
+            ASSERT_NOT_NULL(strstr(response, "base_branch contains invalid characters"));
+            free(response);
         }
+        cbm_mcp_server_free(srv);
+        PASS();
+#else
+        SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
+#endif
     }
-    for (char *cursor = outside_native; *cursor; cursor++) {
-        if (*cursor == '/') {
-            *cursor = '\\';
+
+    TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
+#ifdef _WIN32
+        const char *const roots[] = {"C:\\cbm-root-%PATH%", "C:\\cbm-root-!name!",
+                                     "C:\\cbm-root-^name"};
+        const char *project = "windows-cmd-root-validation";
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *store = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(store);
+        cbm_mcp_server_set_project(srv, project);
+        mcp_command_hook_probe_t command_probe = {0};
+        cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
+
+        for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+            ASSERT_EQ(cbm_store_upsert_project(store, project, roots[i]), CBM_STORE_OK);
+            char *response = cbm_mcp_handle_tool(
+                srv, "detect_changes",
+                "{\"project\":\"windows-cmd-root-validation\",\"base_branch\":\"main\"}");
+            ASSERT_NOT_NULL(response);
+            ASSERT_NOT_NULL(strstr(response, "project path contains invalid characters"));
+            free(response);
         }
-    }
-    const char *junction_argv[] = {"cmd.exe",       "/d",           "/c", "mklink", "/J",
-                                   junction_native, outside_native, NULL};
-    bool linked = cbm_exec_no_shell(junction_argv) == 0;
-
-    ASSERT_TRUE(linked);
-    ASSERT_TRUE(cbm_path_within_root(root, inside));
-    ASSERT_FALSE(cbm_path_within_root(root, target));
-    ASSERT_FALSE(cbm_path_within_root(root, linked_target));
-
-    char case_alias[sizeof(root)];
-    snprintf(case_alias, sizeof(case_alias), "%s", root);
-    char *leaf = strrchr(case_alias, '/');
-    char *backslash_leaf = strrchr(case_alias, '\\');
-    if (!leaf || (backslash_leaf && backslash_leaf > leaf)) {
-        leaf = backslash_leaf;
-    }
-    leaf = leaf ? leaf + 1 : case_alias;
-    if (*leaf >= 'a' && *leaf <= 'z') {
-        *leaf = (char)(*leaf - 'a' + 'A');
-    } else if (*leaf >= 'A' && *leaf <= 'Z') {
-        *leaf = (char)(*leaf - 'A' + 'a');
-    }
-    ASSERT_TRUE(cbm_path_within_root(case_alias, inside));
-
-    char drive_root[] = {root[0], ':', '\\', '\0'};
-    ASSERT_TRUE(((root[0] >= 'A' && root[0] <= 'Z') || (root[0] >= 'a' && root[0] <= 'z')) &&
-                root[1] == ':');
-    ASSERT_TRUE(cbm_path_within_root(drive_root, inside));
-
-    cbm_rmdir(junction);
-    cbm_unlink(inside);
-    cbm_unlink(target);
-    cbm_rmdir(root);
-    cbm_rmdir(outside);
-    PASS();
+        ASSERT_EQ(command_probe.diff_calls, 0);
+        ASSERT_EQ(command_probe.merge_base_calls, 0);
+        cbm_mcp_server_free(srv);
+        PASS();
 #else
-    char root[512];
-    snprintf(root, sizeof(root), "%s/cbm_pwr_XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(root)) {
-        FAIL("cbm_mkdtemp failed");
-    }
-    char inside[700];
-    snprintf(inside, sizeof(inside), "%s/inside.c", root);
-    FILE *fp = fopen(inside, "w");
-    ASSERT_NOT_NULL(fp);
-    fputs("int x;\n", fp);
-    fclose(fp);
-
-    /* The abs_path a sink builds for an in-root result stays contained; a `..`
-     * escape to an existing outside file (/etc/hosts) resolves out and must be
-     * rejected. */
-    char escape[900];
-    snprintf(escape, sizeof(escape), "%s/../../../../etc/hosts", root);
-    ASSERT_TRUE(cbm_path_within_root(root, inside));
-    ASSERT_FALSE(cbm_path_within_root(root, escape));
-    ASSERT_FALSE(cbm_path_within_root(root, "/etc/hosts"));
-    ASSERT_TRUE(cbm_path_within_root("/", "/etc/hosts"));
-
-    remove(inside);
-    cbm_rmdir(root);
-    PASS();
+        SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
 #endif
-}
+    }
 
-/* base_branch is spliced into a `git diff --name-only "<base>"...HEAD` command;
- * a value starting with '-' would be taken by git as an option (e.g.
- * --output=<path> writes the diff to an arbitrary file) rather than a ref. It
- * must be rejected up front, alongside the shell-metacharacter check. */
-TEST(detect_changes_rejects_option_like_base_branch) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"detect_changes\","
-             "\"arguments\":{\"project\":\"p\",\"base_branch\":\"--output=/tmp/cbm_pwn\"}}}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "invalid characters"));
-    free(resp);
-    cbm_mcp_server_free(srv);
-    PASS();
-}
+    /* With no boundary configured at all, index_repository must still refuse roots
+     * that are too broad or too sensitive to index as a unit. This is the part that
+     * holds out of the box: the paths the advisories actually demonstrate are refused
+     * without anyone setting an environment variable first. */
+    TEST(index_repository_refuses_overbroad_roots_by_default) {
+        const char *saved = getenv("CBM_ALLOWED_ROOT");
+        char *saved_copy = saved ? strdup(saved) : NULL;
+        cbm_unsetenv("CBM_ALLOWED_ROOT");
 
-TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch) {
-#ifdef _WIN32
-    const char *const branches[] = {"topic%PATH%", "topic!name!", "topic^name"};
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    for (size_t i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
-        char request[512];
-        snprintf(request, sizeof(request),
-                 "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
-                 "\"params\":{\"name\":\"detect_changes\","
-                 "\"arguments\":{\"project\":\"p\",\"base_branch\":\"%s\"}}}",
-                 branches[i]);
-        char *response = cbm_mcp_server_handle(srv, request);
-        ASSERT_NOT_NULL(response);
-        ASSERT_NOT_NULL(strstr(response, "base_branch contains invalid characters"));
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+
+        /* A top-level system tree: refused on breadth, with no configuration. */
+        char *resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/etc\"}");
+        ASSERT_NOT_NULL(resp);
+        ASSERT_TRUE(strstr(resp, "too broad") != NULL);
+        free(resp);
+
+        /* The filesystem root is refused outright and is never overridable. */
+        resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/\"}");
+        ASSERT_NOT_NULL(resp);
+        ASSERT_TRUE(strstr(resp, "cannot be indexed") != NULL);
+        free(resp);
+
+        cbm_mcp_server_free(srv);
+        if (saved_copy) {
+            cbm_setenv("CBM_ALLOWED_ROOT", saved_copy, 1);
+            free(saved_copy);
+        }
+        PASS();
+    }
+
+    /* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
+     * must refuse a repo_path that resolves outside it. Unset (the default) imposes
+     * no restriction. */
+    TEST(index_repository_honors_allowed_root) {
+        char allowed[512];
+        snprintf(allowed, sizeof(allowed), "%s/cbm_allowed_XXXXXX", cbm_tmpdir());
+        if (!cbm_mkdtemp(allowed)) {
+            FAIL("cbm_mkdtemp failed");
+        }
+        cbm_setenv("CBM_ALLOWED_ROOT", allowed, 1);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        char args[1024];
+        snprintf(args, sizeof(args),
+                 "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s/../..\"}}}",
+                 allowed); /* resolves to a parent, outside the allowed root */
+        char *resp = cbm_mcp_server_handle(srv, args);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "outside the allowed root"));
+        free(resp);
+
+        cbm_unsetenv("CBM_ALLOWED_ROOT");
+        cbm_mcp_server_free(srv);
+        cbm_rmdir(allowed);
+        PASS();
+    }
+
+    TEST(index_repository_relative_path_uses_explicit_session_root) {
+        char session_root[512];
+        char cache[512];
+        snprintf(session_root, sizeof(session_root), "%s/cbm_daemon_session_XXXXXX", cbm_tmpdir());
+        snprintf(cache, sizeof(cache), "%s/cbm_daemon_cache_XXXXXX", cbm_tmpdir());
+        if (!cbm_mkdtemp(session_root) || !cbm_mkdtemp(cache)) {
+            th_rmtree(session_root);
+            th_rmtree(cache);
+            FAIL("cbm_mkdtemp failed");
+        }
+
+        char repo[1024];
+        char source[1200];
+        snprintf(repo, sizeof(repo), "%s/repo", session_root);
+        snprintf(source, sizeof(source), "%s/main.py", repo);
+        ASSERT_EQ(th_write_file(source, "def main():\n    return 1\n"), 0);
+
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+        const char *saved_supervisor = getenv("CBM_INDEX_SUPERVISOR");
+        char *saved_supervisor_copy = saved_supervisor ? strdup(saved_supervisor) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+        cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        bool context_set =
+            srv && cbm_mcp_server_set_session_context(srv, session_root, session_root);
+        const char request[] = "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"tools/call\","
+                               "\"params\":{\"name\":\"index_repository\","
+                               "\"arguments\":{\"repo_path\":\"repo\",\"mode\":\"fast\"}}}";
+        char *response = context_set ? cbm_mcp_server_handle(srv, request) : NULL;
+        bool accepted = response && strstr(response, "outside the allowed root") == NULL &&
+                        strstr(response, "\"isError\":true") == NULL;
+
+        char *project = cbm_project_name_from_path(repo);
+        char db_path[CBM_SZ_4K];
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing");
+        bool indexed_session_repo = project && cbm_file_size(db_path) >= 0;
+
         free(response);
-    }
-    cbm_mcp_server_free(srv);
-    PASS();
-#else
-    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
-#endif
-}
-
-TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
-#ifdef _WIN32
-    const char *const roots[] = {"C:\\cbm-root-%PATH%", "C:\\cbm-root-!name!",
-                                 "C:\\cbm-root-^name"};
-    const char *project = "windows-cmd-root-validation";
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *store = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(store);
-    cbm_mcp_server_set_project(srv, project);
-    mcp_command_hook_probe_t command_probe = {0};
-    cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
-
-    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
-        ASSERT_EQ(cbm_store_upsert_project(store, project, roots[i]), CBM_STORE_OK);
-        char *response = cbm_mcp_handle_tool(
-            srv, "detect_changes",
-            "{\"project\":\"windows-cmd-root-validation\",\"base_branch\":\"main\"}");
-        ASSERT_NOT_NULL(response);
-        ASSERT_NOT_NULL(strstr(response, "project path contains invalid characters"));
-        free(response);
-    }
-    ASSERT_EQ(command_probe.diff_calls, 0);
-    ASSERT_EQ(command_probe.merge_base_calls, 0);
-    cbm_mcp_server_free(srv);
-    PASS();
-#else
-    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
-#endif
-}
-
-/* With no boundary configured at all, index_repository must still refuse roots
- * that are too broad or too sensitive to index as a unit. This is the part that
- * holds out of the box: the paths the advisories actually demonstrate are refused
- * without anyone setting an environment variable first. */
-TEST(index_repository_refuses_overbroad_roots_by_default) {
-    const char *saved = getenv("CBM_ALLOWED_ROOT");
-    char *saved_copy = saved ? strdup(saved) : NULL;
-    cbm_unsetenv("CBM_ALLOWED_ROOT");
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-
-    /* A top-level system tree: refused on breadth, with no configuration. */
-    char *resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/etc\"}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_TRUE(strstr(resp, "too broad") != NULL);
-    free(resp);
-
-    /* The filesystem root is refused outright and is never overridable. */
-    resp = cbm_mcp_handle_tool(srv, "index_repository", "{\"repo_path\":\"/\"}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_TRUE(strstr(resp, "cannot be indexed") != NULL);
-    free(resp);
-
-    cbm_mcp_server_free(srv);
-    if (saved_copy) {
-        cbm_setenv("CBM_ALLOWED_ROOT", saved_copy, 1);
-        free(saved_copy);
-    }
-    PASS();
-}
-
-/* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
- * must refuse a repo_path that resolves outside it. Unset (the default) imposes
- * no restriction. */
-TEST(index_repository_honors_allowed_root) {
-    char allowed[512];
-    snprintf(allowed, sizeof(allowed), "%s/cbm_allowed_XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(allowed)) {
-        FAIL("cbm_mkdtemp failed");
-    }
-    cbm_setenv("CBM_ALLOWED_ROOT", allowed, 1);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    char args[1024];
-    snprintf(args, sizeof(args),
-             "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"index_repository\","
-             "\"arguments\":{\"repo_path\":\"%s/../..\"}}}",
-             allowed); /* resolves to a parent, outside the allowed root */
-    char *resp = cbm_mcp_server_handle(srv, args);
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "outside the allowed root"));
-    free(resp);
-
-    cbm_unsetenv("CBM_ALLOWED_ROOT");
-    cbm_mcp_server_free(srv);
-    cbm_rmdir(allowed);
-    PASS();
-}
-
-TEST(index_repository_relative_path_uses_explicit_session_root) {
-    char session_root[512];
-    char cache[512];
-    snprintf(session_root, sizeof(session_root), "%s/cbm_daemon_session_XXXXXX", cbm_tmpdir());
-    snprintf(cache, sizeof(cache), "%s/cbm_daemon_cache_XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(session_root) || !cbm_mkdtemp(cache)) {
+        cbm_mcp_server_free(srv);
+        cleanup_project_db(cache, project);
+        free(project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
+        if (saved_supervisor_copy) {
+            cbm_setenv("CBM_INDEX_SUPERVISOR", saved_supervisor_copy, 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        }
+        free(saved_supervisor_copy);
         th_rmtree(session_root);
         th_rmtree(cache);
-        FAIL("cbm_mkdtemp failed");
+
+        ASSERT_TRUE(context_set);
+        ASSERT_TRUE(accepted);
+        ASSERT_TRUE(indexed_session_repo);
+        PASS();
     }
 
-    char repo[1024];
-    char source[1200];
-    snprintf(repo, sizeof(repo), "%s/repo", session_root);
-    snprintf(source, sizeof(source), "%s/main.py", repo);
-    ASSERT_EQ(th_write_file(source, "def main():\n    return 1\n"), 0);
-
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    const char *saved_supervisor = getenv("CBM_INDEX_SUPERVISOR");
-    char *saved_supervisor_copy = saved_supervisor ? strdup(saved_supervisor) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    bool context_set = srv && cbm_mcp_server_set_session_context(srv, session_root, session_root);
-    const char request[] = "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"tools/call\","
-                           "\"params\":{\"name\":\"index_repository\","
-                           "\"arguments\":{\"repo_path\":\"repo\",\"mode\":\"fast\"}}}";
-    char *response = context_set ? cbm_mcp_server_handle(srv, request) : NULL;
-    bool accepted = response && strstr(response, "outside the allowed root") == NULL &&
-                    strstr(response, "\"isError\":true") == NULL;
-
-    char *project = cbm_project_name_from_path(repo);
-    char db_path[CBM_SZ_4K];
-    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing");
-    bool indexed_session_repo = project && cbm_file_size(db_path) >= 0;
-
-    free(response);
-    cbm_mcp_server_free(srv);
-    cleanup_project_db(cache, project);
-    free(project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    if (saved_supervisor_copy) {
-        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_supervisor_copy, 1);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    }
-    free(saved_supervisor_copy);
-    th_rmtree(session_root);
-    th_rmtree(cache);
-
-    ASSERT_TRUE(context_set);
-    ASSERT_TRUE(accepted);
-    ASSERT_TRUE(indexed_session_repo);
-    PASS();
-}
-
-/* A daemon-backed session validates repo_path against its own session root, but
- * the supervised worker is a fresh process that inherits the daemon's cwd. A
- * relative path must therefore be resolved once by the session and forwarded to
- * the worker as that same canonical absolute path. The decoy repo makes an
- * unsanitized handoff observable: forwarding the original "repo" indexes the
- * cwd-relative decoy instead of the validated session repo. */
-enum {
-    IDXCANON_OK = 0,
-    IDXCANON_GETCWD_FAILED = 71,
-    IDXCANON_CHDIR_FAILED = 72,
-    IDXCANON_NO_SERVER = 73,
-    IDXCANON_CONTEXT_FAILED = 74,
-    IDXCANON_NO_SPAWN = 75,
-    IDXCANON_NO_RESULT = 76,
-    IDXCANON_NOT_INDEXED = 77,
-    IDXCANON_WRONG_PROJECT = 78,
-    IDXCANON_DECOY_INDEXED = 79,
-    IDXCANON_TARGET_MISSING = 80,
-    IDXCANON_CWD_RESTORE_FAILED = 81,
-};
+    /* A daemon-backed session validates repo_path against its own session root, but
+     * the supervised worker is a fresh process that inherits the daemon's cwd. A
+     * relative path must therefore be resolved once by the session and forwarded to
+     * the worker as that same canonical absolute path. The decoy repo makes an
+     * unsanitized handoff observable: forwarding the original "repo" indexes the
+     * cwd-relative decoy instead of the validated session repo. */
+    enum {
+        IDXCANON_OK = 0,
+        IDXCANON_GETCWD_FAILED = 71,
+        IDXCANON_CHDIR_FAILED = 72,
+        IDXCANON_NO_SERVER = 73,
+        IDXCANON_CONTEXT_FAILED = 74,
+        IDXCANON_NO_SPAWN = 75,
+        IDXCANON_NO_RESULT = 76,
+        IDXCANON_NOT_INDEXED = 77,
+        IDXCANON_WRONG_PROJECT = 78,
+        IDXCANON_DECOY_INDEXED = 79,
+        IDXCANON_TARGET_MISSING = 80,
+        IDXCANON_CWD_RESTORE_FAILED = 81,
+    };
 
 #ifndef _WIN32
-static int idxcanon_supervised_session_path_check(const char *session_root, const char *decoy_cwd) {
-    char saved_cwd[CBM_SZ_4K];
-    if (!cbm_getcwd(saved_cwd, sizeof(saved_cwd))) {
-        return IDXCANON_GETCWD_FAILED;
-    }
-    if (cbm_chdir(decoy_cwd) != 0) {
-        return IDXCANON_CHDIR_FAILED;
-    }
-
-    /* Match a real supervisor host. Environment changes are isolated to this
-     * forked child and inherited by its worker; the parent test process keeps
-     * its supervisor kill switch and allowed-root environment untouched. */
-    cbm_index_supervisor_mark_host();
-    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
-    cbm_unsetenv("CBM_ALLOWED_ROOT");
-    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
-    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
-
-    char session_repo[CBM_SZ_4K];
-    char decoy_repo[CBM_SZ_4K];
-    snprintf(session_repo, sizeof(session_repo), "%s/repo", session_root);
-    snprintf(decoy_repo, sizeof(decoy_repo), "%s/repo", decoy_cwd);
-    char *session_project = cbm_project_name_from_path(session_repo);
-    char *decoy_project = cbm_project_name_from_path(decoy_repo);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    int code = IDXCANON_OK;
-    if (!srv) {
-        code = IDXCANON_NO_SERVER;
-    } else if (!cbm_mcp_server_set_session_context(srv, session_root, session_root)) {
-        code = IDXCANON_CONTEXT_FAILED;
-    }
-
-    int spawns_before = cbm_index_supervisor_spawn_count();
-    char *resp = code == IDXCANON_OK
-                     ? cbm_mcp_handle_tool(srv, "index_repository",
-                                           "{\"repo_path\":\"repo\",\"mode\":\"fast\"}")
-                     : NULL;
-    int spawns_after = cbm_index_supervisor_spawn_count();
-    if (code == IDXCANON_OK && spawns_after == spawns_before) {
-        code = IDXCANON_NO_SPAWN;
-    } else if (code == IDXCANON_OK && !resp) {
-        code = IDXCANON_NO_RESULT;
-    } else if (code == IDXCANON_OK &&
-               !response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
-        code = IDXCANON_NOT_INDEXED;
-    }
-
-    if (code == IDXCANON_OK) {
-        char expected[CBM_SZ_4K];
-        snprintf(expected, sizeof(expected), "\"project\":\"%s\"",
-                 session_project ? session_project : "");
-        if (!session_project || !response_contains_json_fragment(resp, expected)) {
-            code = IDXCANON_WRONG_PROJECT;
+    static int idxcanon_supervised_session_path_check(const char *session_root,
+                                                      const char *decoy_cwd) {
+        char saved_cwd[CBM_SZ_4K];
+        if (!cbm_getcwd(saved_cwd, sizeof(saved_cwd))) {
+            return IDXCANON_GETCWD_FAILED;
         }
-    }
-    free(resp);
-
-    /* A raw "repo" handoff is interpreted relative to decoy_cwd by the worker
-     * and creates this project DB. Its absence proves the original JSON did not
-     * substitute a different path after the parent validated session_repo. */
-    if (code == IDXCANON_OK) {
-        const char *cache = getenv("CBM_CACHE_DIR");
-        char decoy_db[CBM_SZ_4K];
-        snprintf(decoy_db, sizeof(decoy_db), "%s/%s.db", cache ? cache : "",
-                 decoy_project ? decoy_project : "");
-        if (!cache || !decoy_project || cbm_file_size(decoy_db) >= 0) {
-            code = IDXCANON_DECOY_INDEXED;
+        if (cbm_chdir(decoy_cwd) != 0) {
+            return IDXCANON_CHDIR_FAILED;
         }
-    }
 
-    if (code == IDXCANON_OK) {
-        char query[CBM_SZ_4K];
-        snprintf(query, sizeof(query),
-                 "{\"project\":\"%s\",\"name_pattern\":\"canonical_target_fn\","
-                 "\"label\":\"Function\"}",
-                 session_project ? session_project : "");
-        char *search = cbm_mcp_handle_tool(srv, "search_graph", query);
-        if (!session_project || !search || !strstr(search, "canonical_target_fn")) {
-            code = IDXCANON_TARGET_MISSING;
+        /* Match a real supervisor host. Environment changes are isolated to this
+         * forked child and inherited by its worker; the parent test process keeps
+         * its supervisor kill switch and allowed-root environment untouched. */
+        cbm_index_supervisor_mark_host();
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+        cbm_unsetenv("CBM_ALLOWED_ROOT");
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+        cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+        char session_repo[CBM_SZ_4K];
+        char decoy_repo[CBM_SZ_4K];
+        snprintf(session_repo, sizeof(session_repo), "%s/repo", session_root);
+        snprintf(decoy_repo, sizeof(decoy_repo), "%s/repo", decoy_cwd);
+        char *session_project = cbm_project_name_from_path(session_repo);
+        char *decoy_project = cbm_project_name_from_path(decoy_repo);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        int code = IDXCANON_OK;
+        if (!srv) {
+            code = IDXCANON_NO_SERVER;
+        } else if (!cbm_mcp_server_set_session_context(srv, session_root, session_root)) {
+            code = IDXCANON_CONTEXT_FAILED;
         }
-        free(search);
-    }
 
-    cbm_mcp_server_free(srv);
-    free(session_project);
-    free(decoy_project);
-    if (cbm_chdir(saved_cwd) != 0 && code == IDXCANON_OK) {
-        code = IDXCANON_CWD_RESTORE_FAILED;
+        int spawns_before = cbm_index_supervisor_spawn_count();
+        char *resp = code == IDXCANON_OK
+                         ? cbm_mcp_handle_tool(srv, "index_repository",
+                                               "{\"repo_path\":\"repo\",\"mode\":\"fast\"}")
+                         : NULL;
+        int spawns_after = cbm_index_supervisor_spawn_count();
+        if (code == IDXCANON_OK && spawns_after == spawns_before) {
+            code = IDXCANON_NO_SPAWN;
+        } else if (code == IDXCANON_OK && !resp) {
+            code = IDXCANON_NO_RESULT;
+        } else if (code == IDXCANON_OK &&
+                   !response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
+            code = IDXCANON_NOT_INDEXED;
+        }
+
+        if (code == IDXCANON_OK) {
+            char expected[CBM_SZ_4K];
+            snprintf(expected, sizeof(expected), "\"project\":\"%s\"",
+                     session_project ? session_project : "");
+            if (!session_project || !response_contains_json_fragment(resp, expected)) {
+                code = IDXCANON_WRONG_PROJECT;
+            }
+        }
+        free(resp);
+
+        /* A raw "repo" handoff is interpreted relative to decoy_cwd by the worker
+         * and creates this project DB. Its absence proves the original JSON did not
+         * substitute a different path after the parent validated session_repo. */
+        if (code == IDXCANON_OK) {
+            const char *cache = getenv("CBM_CACHE_DIR");
+            char decoy_db[CBM_SZ_4K];
+            snprintf(decoy_db, sizeof(decoy_db), "%s/%s.db", cache ? cache : "",
+                     decoy_project ? decoy_project : "");
+            if (!cache || !decoy_project || cbm_file_size(decoy_db) >= 0) {
+                code = IDXCANON_DECOY_INDEXED;
+            }
+        }
+
+        if (code == IDXCANON_OK) {
+            char query[CBM_SZ_4K];
+            snprintf(query, sizeof(query),
+                     "{\"project\":\"%s\",\"name_pattern\":\"canonical_target_fn\","
+                     "\"label\":\"Function\"}",
+                     session_project ? session_project : "");
+            char *search = cbm_mcp_handle_tool(srv, "search_graph", query);
+            if (!session_project || !search || !strstr(search, "canonical_target_fn")) {
+                code = IDXCANON_TARGET_MISSING;
+            }
+            free(search);
+        }
+
+        cbm_mcp_server_free(srv);
+        free(session_project);
+        free(decoy_project);
+        if (cbm_chdir(saved_cwd) != 0 && code == IDXCANON_OK) {
+            code = IDXCANON_CWD_RESTORE_FAILED;
+        }
+        return code;
     }
-    return code;
-}
 #endif
 
-TEST(index_repository_supervisor_uses_canonical_session_path) {
+    TEST(index_repository_supervisor_uses_canonical_session_path) {
 #ifdef _WIN32
-    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+        SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
 #else
-    char session_root[512];
-    char decoy_cwd[512];
-    char cache[512];
-    snprintf(session_root, sizeof(session_root), "%s/cbm_canonical_session_XXXXXX", cbm_tmpdir());
-    snprintf(decoy_cwd, sizeof(decoy_cwd), "%s/cbm_canonical_decoy_XXXXXX", cbm_tmpdir());
-    snprintf(cache, sizeof(cache), "%s/cbm_canonical_cache_XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(session_root) || !cbm_mkdtemp(decoy_cwd) || !cbm_mkdtemp(cache)) {
+        char session_root[512];
+        char decoy_cwd[512];
+        char cache[512];
+        snprintf(session_root, sizeof(session_root), "%s/cbm_canonical_session_XXXXXX",
+                 cbm_tmpdir());
+        snprintf(decoy_cwd, sizeof(decoy_cwd), "%s/cbm_canonical_decoy_XXXXXX", cbm_tmpdir());
+        snprintf(cache, sizeof(cache), "%s/cbm_canonical_cache_XXXXXX", cbm_tmpdir());
+        if (!cbm_mkdtemp(session_root) || !cbm_mkdtemp(decoy_cwd) || !cbm_mkdtemp(cache)) {
+            th_rmtree(session_root);
+            th_rmtree(decoy_cwd);
+            th_rmtree(cache);
+            FAIL("cbm_mkdtemp failed");
+        }
+
+        char session_source[CBM_SZ_4K];
+        char decoy_source[CBM_SZ_4K];
+        snprintf(session_source, sizeof(session_source), "%s/repo/main.py", session_root);
+        snprintf(decoy_source, sizeof(decoy_source), "%s/repo/main.py", decoy_cwd);
+        ASSERT_EQ(th_write_file(session_source, "def canonical_target_fn():\n    return 1\n"), 0);
+        ASSERT_EQ(th_write_file(decoy_source, "def decoy_fn():\n    return 2\n"), 0);
+
+        const char *saved_cache = getenv("CBM_CACHE_DIR");
+        char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+        int code = -1;
+        bool signalled = false;
+        int sig = 0;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+            alarm(60);
+            _exit(idxcanon_supervised_session_path_check(session_root, decoy_cwd));
+        }
+        ASSERT_TRUE(pid > 0);
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            signalled = true;
+            sig = WTERMSIG(status);
+        }
+
+        char session_repo[CBM_SZ_4K];
+        char decoy_repo[CBM_SZ_4K];
+        snprintf(session_repo, sizeof(session_repo), "%s/repo", session_root);
+        snprintf(decoy_repo, sizeof(decoy_repo), "%s/repo", decoy_cwd);
+        char *session_project = cbm_project_name_from_path(session_repo);
+        char *decoy_project = cbm_project_name_from_path(decoy_repo);
+        cleanup_project_db(cache, session_project);
+        cleanup_project_db(cache, decoy_project);
+        free(session_project);
+        free(decoy_project);
+        restore_cache_dir(saved_cache_copy);
+        free(saved_cache_copy);
         th_rmtree(session_root);
         th_rmtree(decoy_cwd);
         th_rmtree(cache);
-        FAIL("cbm_mkdtemp failed");
-    }
 
-    char session_source[CBM_SZ_4K];
-    char decoy_source[CBM_SZ_4K];
-    snprintf(session_source, sizeof(session_source), "%s/repo/main.py", session_root);
-    snprintf(decoy_source, sizeof(decoy_source), "%s/repo/main.py", decoy_cwd);
-    ASSERT_EQ(th_write_file(session_source, "def canonical_target_fn():\n    return 1\n"), 0);
-    ASSERT_EQ(th_write_file(decoy_source, "def decoy_fn():\n    return 2\n"), 0);
-
-    const char *saved_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-
-    int code = -1;
-    bool signalled = false;
-    int sig = 0;
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        alarm(60);
-        _exit(idxcanon_supervised_session_path_check(session_root, decoy_cwd));
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) {
-        code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        signalled = true;
-        sig = WTERMSIG(status);
-    }
-
-    char session_repo[CBM_SZ_4K];
-    char decoy_repo[CBM_SZ_4K];
-    snprintf(session_repo, sizeof(session_repo), "%s/repo", session_root);
-    snprintf(decoy_repo, sizeof(decoy_repo), "%s/repo", decoy_cwd);
-    char *session_project = cbm_project_name_from_path(session_repo);
-    char *decoy_project = cbm_project_name_from_path(decoy_repo);
-    cleanup_project_db(cache, session_project);
-    cleanup_project_db(cache, decoy_project);
-    free(session_project);
-    free(decoy_project);
-    restore_cache_dir(saved_cache_copy);
-    free(saved_cache_copy);
-    th_rmtree(session_root);
-    th_rmtree(decoy_cwd);
-    th_rmtree(cache);
-
-    if (signalled) {
-        printf("    child killed by signal %d (alarm => worker hang)\n", sig);
-    } else if (code != IDXCANON_OK) {
-        printf("    child exit code %d (75=no spawn, 77=not indexed, 78=wrong project, "
-               "79=decoy indexed, 80=target missing)\n",
-               code);
-    }
-    ASSERT_FALSE(signalled);
-    ASSERT_EQ(code, IDXCANON_OK);
-    PASS();
+        if (signalled) {
+            printf("    child killed by signal %d (alarm => worker hang)\n", sig);
+        } else if (code != IDXCANON_OK) {
+            printf("    child exit code %d (75=no spawn, 77=not indexed, 78=wrong project, "
+                   "79=decoy indexed, 80=target missing)\n",
+                   code);
+        }
+        ASSERT_FALSE(signalled);
+        ASSERT_EQ(code, IDXCANON_OK);
+        PASS();
 #endif
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  SUITE
- * ══════════════════════════════════════════════════════════════════ */
-
-/* ── BM25 prose search (#518 / #519) ───────────────────────────────
- *
- * Section and Module used to be filtered out of BM25 results outright, which
- * made the prose they carry unreachable no matter how it was indexed. These
- * cover the query side: prose is findable, the excluded labels come back, and
- * the ranked query and the count query still agree. */
-
-static cbm_mcp_server_t *setup_prose_search_server(const char *proj) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        return NULL;
     }
-    cbm_store_t *st = cbm_mcp_server_store(srv);
-    cbm_mcp_server_set_project(srv, proj);
-    cbm_store_upsert_project(st, proj, "/tmp/prose");
 
-    cbm_node_t section = {.project = proj,
-                          .label = "Section",
-                          .name = "Installation",
-                          .qualified_name = "prose.README.Installation",
-                          .file_path = "README.md",
-                          .start_line = 1,
-                          .end_line = 20,
-                          .properties_json = "{\"docstring\":\"provisions an ephemeral "
-                                             "workstation runner and seeds the cache\"}"};
-    cbm_store_upsert_node(st, &section);
+    /* ══════════════════════════════════════════════════════════════════
+     *  SUITE
+     * ══════════════════════════════════════════════════════════════════ */
 
-    cbm_node_t module = {.project = proj,
-                         .label = "Module",
-                         .name = "action.yml",
-                         .qualified_name = "prose.action_yml",
-                         .file_path = "action.yml",
-                         .start_line = 1,
-                         .end_line = 40,
-                         .properties_json =
-                             "{\"docstring\":\"aggregates telemetry from every shard\"}"};
-    cbm_store_upsert_node(st, &module);
+    /* ── BM25 prose search (#518 / #519) ───────────────────────────────
+     *
+     * Section and Module used to be filtered out of BM25 results outright, which
+     * made the prose they carry unreachable no matter how it was indexed. These
+     * cover the query side: prose is findable, the excluded labels come back, and
+     * the ranked query and the count query still agree. */
 
-    cbm_node_t fn = {.project = proj,
-                     .label = "Function",
-                     .name = "telemetryCollector",
-                     .qualified_name = "prose.src.telemetryCollector",
-                     .file_path = "src/collect.c",
-                     .start_line = 3,
-                     .end_line = 9};
-    cbm_store_upsert_node(st, &fn);
-
-    cbm_store_fts_rebuild(st, NULL, 0);
-    return srv;
-}
-
-static char *prose_search(cbm_mcp_server_t *srv, const char *proj, const char *query) {
-    char req[512];
-    snprintf(req, sizeof(req),
-             "{\"jsonrpc\":\"2.0\",\"id\":518,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"search_graph\","
-             "\"arguments\":{\"project\":\"%s\",\"query\":\"%s\",\"limit\":10}}}",
-             proj, query);
-    char *resp = cbm_mcp_server_handle(srv, req);
-    if (!resp) {
-        return NULL;
-    }
-    char *inner = extract_text_content(resp);
-    free(resp);
-    return inner;
-}
-
-TEST(bm25_finds_section_by_its_prose_issue518) {
-    cbm_mcp_server_t *srv = setup_prose_search_server("prose518");
-    ASSERT_NOT_NULL(srv);
-
-    /* "ephemeral" appears NOWHERE in any identifier — only in the section's
-     * body. Before the body column it was unfindable. */
-    char *inner = prose_search(srv, "prose518", "ephemeral");
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
-    ASSERT_NOT_NULL(strstr(inner, "prose.README.Installation"));
-    ASSERT_NOT_NULL(strstr(inner, "Section"));
-    free(inner);
-
-    cbm_mcp_server_free(srv);
-    PASS();
-}
-
-TEST(bm25_finds_module_by_promoted_description_issue519) {
-    cbm_mcp_server_t *srv = setup_prose_search_server("prose519");
-    ASSERT_NOT_NULL(srv);
-
-    /* A config file's own description, promoted onto its Module node. Module
-     * was one of the labels the BM25 filter used to drop unconditionally. */
-    char *inner = prose_search(srv, "prose519", "shard");
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "prose.action_yml"));
-    ASSERT_NOT_NULL(strstr(inner, "Module"));
-    free(inner);
-
-    cbm_mcp_server_free(srv);
-    PASS();
-}
-
-TEST(bm25_results_and_total_stay_consistent_issue518) {
-    /* The ranked query and the count query share an inner candidate window and
-     * MIRROR each other's filter. Changing the label exclusion (or the weights)
-     * in only one silently reports a total that does not describe the rows. */
-    cbm_mcp_server_t *srv = setup_prose_search_server("prosecount");
-    ASSERT_NOT_NULL(srv);
-
-    char *inner = prose_search(srv, "prosecount", "telemetry");
-    ASSERT_NOT_NULL(inner);
-    /* Both the Module (body: "aggregates telemetry...") and the Function
-     * (name: telemetryCollector) match, and both are now eligible. */
-    const char *total = strstr(inner, "total: ");
-    const char *results = strstr(inner, "results: ");
-    ASSERT_NOT_NULL(total);
-    ASSERT_NOT_NULL(results);
-    int total_n = atoi(total + strlen("total: "));
-    int results_n = atoi(results + strlen("results: "));
-    ASSERT_EQ(total_n, 2);
-    ASSERT_EQ(results_n, total_n);
-    ASSERT_NOT_NULL(strstr(inner, "prose.action_yml"));
-    ASSERT_NOT_NULL(strstr(inner, "prose.src.telemetryCollector"));
-    free(inner);
-
-    cbm_mcp_server_free(srv);
-    PASS();
-}
-
-TEST(bm25_identifier_match_outranks_prose_only_match_issue518) {
-    /* The 0.3 body weight is what keeps prose from drowning identifiers. Both
-     * candidates carry the same label boost, so the ordering here is decided by
-     * the column weights alone. */
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *st = cbm_mcp_server_store(srv);
-    const char *proj = "prose-rank";
-    cbm_mcp_server_set_project(srv, proj);
-    cbm_store_upsert_project(st, proj, "/tmp/prose-rank");
-
-    cbm_node_t by_name = {.project = proj,
-                          .label = "Function",
-                          .name = "reconcile",
-                          .qualified_name = "pr.a.reconcile",
-                          .file_path = "a.c"};
-    ASSERT_TRUE(cbm_store_upsert_node(st, &by_name) > 0);
-
-    cbm_node_t by_body = {.project = proj,
-                          .label = "Function",
-                          .name = "zzz",
-                          .qualified_name = "pr.b.zzz",
-                          .file_path = "b.c",
-                          .properties_json = "{\"docstring\":\"reconcile the ledger\"}"};
-    ASSERT_TRUE(cbm_store_upsert_node(st, &by_body) > 0);
-    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
-
-    char *inner = prose_search(srv, proj, "reconcile");
-    ASSERT_NOT_NULL(inner);
-    const char *name_hit = strstr(inner, "pr.a.reconcile");
-    const char *body_hit = strstr(inner, "pr.b.zzz");
-    ASSERT_NOT_NULL(name_hit);        /* the identifier match */
-    ASSERT_NOT_NULL(body_hit);        /* the prose-only match still SURFACES ... */
-    ASSERT_TRUE(name_hit < body_hit); /* ... but never above the identifier */
-    free(inner);
-
-    cbm_mcp_server_free(srv);
-    PASS();
-}
-
-TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
-    /* No index-format bump means a database whose nodes_fts predates the body
-     * column is opened by the current binary. bm25()'s fifth weight must be
-     * inert there, not an error: FTS5 reads a weight only for a column an
-     * instance actually landed in. */
-    char *td = th_mktempdir("cbm_mcp_legacy_fts");
-    ASSERT_NOT_NULL(td);
-    /* cbm_mcp_server_new(project) opens <cache_dir>/<project>.db, so seeding
-     * the legacy table THERE is what puts the server on a pre-body database —
-     * the same way a real upgrade finds one. */
-    char saved_cache[512] = {0};
-    const char *prev = getenv("CBM_CACHE_DIR");
-    if (prev) {
-        snprintf(saved_cache, sizeof(saved_cache), "%s", prev);
-    }
-    cbm_setenv("CBM_CACHE_DIR", td, 1);
-
-    const char *proj = "legacyfts";
-    char dbpath[600];
-    snprintf(dbpath, sizeof(dbpath), "%s/%s.db", td, proj);
-
-    sqlite3 *raw = NULL;
-    ASSERT_EQ(sqlite3_open(dbpath, &raw), SQLITE_OK);
-    ASSERT_EQ(sqlite3_exec(raw,
-                           "CREATE VIRTUAL TABLE nodes_fts USING fts5("
-                           "  name, qualified_name, label, file_path,"
-                           "  content='', tokenize='unicode61 remove_diacritics 2');",
-                           NULL, NULL, NULL),
-              SQLITE_OK);
-    sqlite3_close(raw);
-
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(proj);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *st = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(st);
-    cbm_mcp_server_set_project(srv, proj);
-    cbm_store_upsert_project(st, proj, td);
-
-    cbm_node_t fn = {.project = proj,
-                     .label = "Function",
-                     .name = "reconcile",
-                     .qualified_name = "legacy.a.reconcile",
-                     .file_path = "a.c",
-                     .properties_json = "{\"docstring\":\"prose that cannot be indexed here\"}"};
-    ASSERT_TRUE(cbm_store_upsert_node(st, &fn) > 0);
-    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
-
-    char *inner = prose_search(srv, proj, "reconcile");
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
-    ASSERT_NOT_NULL(strstr(inner, "legacy.a.reconcile"));
-    free(inner);
-
-    /* Prose is absent rather than broken — a degrade, not a failure. */
-    inner = prose_search(srv, proj, "indexed");
-    ASSERT_NOT_NULL(inner);
-    ASSERT_NULL(strstr(inner, "legacy.a.reconcile"));
-    free(inner);
-
-    cbm_mcp_server_free(srv);
-    if (saved_cache[0]) {
-        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
-    } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
-    }
-    th_rmtree(td);
-    PASS();
-}
-
-/* #2144: async/status need the daemon's job registry. An in-process server
- * (index worker, embedder) has no process that outlives the call, so it must
- * refuse both modes instead of silently running a blocking index. */
-TEST(index_repository_async_and_status_refused_without_daemon_issue2144) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    char *async_reply = cbm_mcp_handle_tool(srv, "index_repository",
-                                            "{\"repo_path\":\"/nonexistent-2144\","
-                                            "\"async\":true}");
-    char *status_reply = cbm_mcp_handle_tool(srv, "index_repository",
-                                             "{\"repo_path\":\"/nonexistent-2144\","
-                                             "\"status\":true}");
-    cbm_mcp_server_free(srv);
-    ASSERT_NOT_NULL(async_reply);
-    ASSERT_NOT_NULL(strstr(async_reply, "\"isError\":true"));
-    ASSERT_NOT_NULL(strstr(async_reply, "daemon"));
-    ASSERT_NOT_NULL(status_reply);
-    ASSERT_NOT_NULL(strstr(status_reply, "\"isError\":true"));
-    ASSERT_NOT_NULL(strstr(status_reply, "daemon"));
-    free(async_reply);
-    free(status_reply);
-    PASS();
-}
-
-/* #2144: the tool schema advertises both flags and the description explains
- * the deadline problem and the polling pattern. */
-TEST(index_repository_schema_documents_async_polling_issue2144) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    char *resp =
-        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2144,\"method\":\"tools/list\"}");
-    cbm_mcp_server_free(srv);
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"async\":{\"type\":\"boolean\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"status\":{\"type\":\"boolean\""));
-    ASSERT_NOT_NULL(strstr(resp, "per-call deadline"));
-    ASSERT_NOT_NULL(strstr(resp, "poll with status:true"));
-    free(resp);
-    PASS();
-}
-
-/* #2144: a notice rides on a JSON payload as a key (content text and
- * structuredContent together) and on a text payload as a paragraph. */
-TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
-    char *object = cbm_mcp_tool_result_add_notice(
-        cbm_mcp_text_result("{\"status\":\"indexed\"}", false), "retry async");
-    char *text =
-        cbm_mcp_tool_result_add_notice(cbm_mcp_text_result("plain failure", true), "retry async");
-    ASSERT_NOT_NULL(object);
-    ASSERT_NOT_NULL(strstr(object, "\"structuredContent\":{\"status\":\"indexed\","
-                                   "\"notice\":\"retry async\"}"));
-    ASSERT_NOT_NULL(strstr(object, "\"isError\":false"));
-    ASSERT_NOT_NULL(text);
-    ASSERT_NOT_NULL(strstr(text, "plain failure\\n\\nretry async"));
-    ASSERT_NOT_NULL(strstr(text, "\"isError\":true"));
-    free(object);
-    free(text);
-    PASS();
-}
-
-/* ── Integer argument bounds ────────────────────────────────────────
- * Sizing arguments are clamped on both sides at the handler. The fixture
- * file is much longer than the `context` bound so the window is observable. */
-
-enum { CTX_FIXTURE_LINES = 1000, CTX_FIXTURE_NEEDLE_LINE = 500, CTX_BOUND = 200 };
-
-static bool write_context_fixture(const char *tmp, char *path, size_t path_sz) {
-    snprintf(path, path_sz, "%s/project/long.md", tmp);
-    FILE *fp = cbm_fopen(path, "wb");
-    if (!fp) {
-        return false;
-    }
-    for (int line = 1; line <= CTX_FIXTURE_LINES; line++) {
-        if (line == CTX_FIXTURE_NEEDLE_LINE) {
-            fprintf(fp, "needle-context-window\n");
-        } else {
-            fprintf(fp, "line %04d\n", line);
+    static cbm_mcp_server_t *setup_prose_search_server(const char *proj) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (!srv) {
+            return NULL;
         }
-    }
-    return fclose(fp) == 0;
-}
+        cbm_store_t *st = cbm_mcp_server_store(srv);
+        cbm_mcp_server_set_project(srv, proj);
+        cbm_store_upsert_project(st, proj, "/tmp/prose");
 
-static bool upsert_context_fixture_node(cbm_mcp_server_t *srv) {
-    cbm_store_t *st = cbm_mcp_server_store(srv);
-    if (!st) {
-        return false;
-    }
-    cbm_node_t node = {.project = "test-project",
-                       .label = "Section",
-                       .name = "long",
-                       .qualified_name = "test-project.long",
-                       .file_path = "long.md",
-                       .start_line = 1,
-                       .end_line = CTX_FIXTURE_LINES};
-    return cbm_store_upsert_node(st, &node) > 0;
-}
+        cbm_node_t section = {.project = proj,
+                              .label = "Section",
+                              .name = "Installation",
+                              .qualified_name = "prose.README.Installation",
+                              .file_path = "README.md",
+                              .start_line = 1,
+                              .end_line = 20,
+                              .properties_json = "{\"docstring\":\"provisions an ephemeral "
+                                                 "workstation runner and seeds the cache\"}"};
+        cbm_store_upsert_node(st, &section);
 
-static char *search_code_with_context(cbm_mcp_server_t *srv, const char *context_value) {
-    char req[256];
-    snprintf(req, sizeof(req),
-             "{\"project\":\"test-project\",\"pattern\":\"needle-context-window\","
-             "\"format\":\"json\",\"context\":%s,\"limit\":5}",
-             context_value);
-    char *resp = cbm_mcp_handle_tool(srv, "search_code", req);
-    if (!resp) {
-        return NULL;
-    }
-    char *inner = extract_text_content(resp);
-    free(resp);
-    return inner;
-}
+        cbm_node_t module = {.project = proj,
+                             .label = "Module",
+                             .name = "action.yml",
+                             .qualified_name = "prose.action_yml",
+                             .file_path = "action.yml",
+                             .start_line = 1,
+                             .end_line = 40,
+                             .properties_json =
+                                 "{\"docstring\":\"aggregates telemetry from every shard\"}"};
+        cbm_store_upsert_node(st, &module);
 
-/* Row-0 context object of a json-format search_code answer, or NULL when the
- * answer carries no context column. *doc_out owns the memory either way. */
-static yyjson_val *search_code_context_object(const char *inner, yyjson_doc **doc_out) {
-    *doc_out = yyjson_read(inner, strlen(inner), 0);
-    if (!*doc_out) {
-        return NULL;
-    }
-    yyjson_val *root = yyjson_doc_get_root(*doc_out);
-    yyjson_val *cols = yyjson_obj_get(root, "cols");
-    yyjson_val *rows = yyjson_obj_get(root, "rows");
-    if (!cols || !rows || yyjson_arr_size(rows) == 0) {
-        return NULL;
-    }
-    size_t col_count = yyjson_arr_size(cols);
-    for (size_t i = 0; i < col_count; i++) {
-        const char *col = yyjson_get_str(yyjson_arr_get(cols, i));
-        if (col && strcmp(col, "context") == 0) {
-            return yyjson_arr_get(yyjson_arr_get(rows, 0), i);
-        }
-    }
-    return NULL;
-}
-
-static int count_newlines(const char *s) {
-    int n = 0;
-    for (; *s; s++) {
-        n += *s == '\n';
-    }
-    return n;
-}
-
-TEST(search_code_context_window_is_bounded) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-    char fixture[512];
-    ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
-    ASSERT_TRUE(upsert_context_fixture_node(srv));
-
-    /* Far above the bound: the window is match ± 200, not the whole file. */
-    char *inner = search_code_with_context(srv, "100000");
-    ASSERT_NOT_NULL(inner);
-    yyjson_doc *doc = NULL;
-    yyjson_val *ctx = search_code_context_object(inner, &doc);
-    ASSERT_NOT_NULL(ctx);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
-              CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
-    const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
-    ASSERT_NOT_NULL(text);
-    ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
-    ASSERT_EQ(strncmp(text, "line 0300\n", 10), 0);
-    ASSERT_NOT_NULL(strstr(text, "\nneedle-context-window\n"));
-    ASSERT_NOT_NULL(strstr(text, "\nline 0700\n"));
-    ASSERT_NULL(strstr(text, "line 0701"));
-    yyjson_doc_free(doc);
-    free(inner);
-
-    /* Inside the bound the window is unchanged. */
-    inner = search_code_with_context(srv, "3");
-    ASSERT_NOT_NULL(inner);
-    ctx = search_code_context_object(inner, &doc);
-    ASSERT_NOT_NULL(ctx);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")), CTX_FIXTURE_NEEDLE_LINE - 3);
-    text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
-    ASSERT_NOT_NULL(text);
-    ASSERT_EQ(count_newlines(text), 7);
-    ASSERT_EQ(strncmp(text, "line 0497\n", 10), 0);
-    yyjson_doc_free(doc);
-    free(inner);
-
-    unlink(fixture);
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-TEST(search_code_context_extreme_values_answer_normally) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
-    char fixture[512];
-    ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
-    ASSERT_TRUE(upsert_context_fixture_node(srv));
-
-    /* The largest value the argument can carry behaves exactly like the bound. */
-    char *inner = search_code_with_context(srv, "2147483647");
-    ASSERT_NOT_NULL(inner);
-    yyjson_doc *doc = NULL;
-    yyjson_val *ctx = search_code_context_object(inner, &doc);
-    ASSERT_NOT_NULL(ctx);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
-              CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
-    const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
-    ASSERT_NOT_NULL(text);
-    ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
-    yyjson_doc_free(doc);
-    free(inner);
-
-    /* A negative value means no context, exactly like 0: a normal answer. */
-    inner = search_code_with_context(srv, "-5");
-    ASSERT_NOT_NULL(inner);
-    ctx = search_code_context_object(inner, &doc);
-    ASSERT_NULL(ctx);
-    ASSERT_NOT_NULL(doc);
-    yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
-    ASSERT_NOT_NULL(rows);
-    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
-    yyjson_doc_free(doc);
-    free(inner);
-
-    unlink(fixture);
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
-
-TEST(tool_query_graph_max_rows_above_ceiling_is_capped) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *store = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(store);
-    const char *project = "row-ceiling";
-    cbm_mcp_server_set_project(srv, project);
-    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/row-ceiling"), CBM_STORE_OK);
-    /* One row more than the visible ceiling (99998), so the cap is observable. */
-    enum { ROW_CEILING = 99998, ROWS = ROW_CEILING + 1 };
-    ASSERT_EQ(cbm_store_begin_bulk(store), CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
-    for (int i = 0; i < ROWS; i++) {
-        char name[32];
-        char qualified_name[64];
-        snprintf(name, sizeof(name), "row_%05d", i);
-        snprintf(qualified_name, sizeof(qualified_name), "row-ceiling.rows.%s", name);
-        cbm_node_t node = {.project = project,
-                           .label = "Function",
-                           .name = name,
-                           .qualified_name = qualified_name,
-                           .file_path = "rows.c",
-                           .start_line = i + 1,
-                           .end_line = i + 1};
-        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
-    }
-    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_end_bulk(store), CBM_STORE_OK);
-
-    char *response = cbm_mcp_handle_tool(
-        srv, "query_graph",
-        "{\"project\":\"row-ceiling\",\"query\":\"MATCH (n) RETURN n.name\","
-        "\"format\":\"json\",\"max_rows\":2147483647,\"max_output_tokens\":1000000}");
-    ASSERT_NOT_NULL(response);
-    char *inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
-    ASSERT_NOT_NULL(doc);
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), ROW_CEILING);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), ROWS);
-    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
-    yyjson_doc_free(doc);
-    free(inner);
-    free(response);
-    cbm_mcp_server_free(srv);
-    PASS();
-}
-
-TEST(tool_search_graph_limit_above_ceiling_is_capped) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *store = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(store);
-    const char *project = "limit-ceiling";
-    cbm_mcp_server_set_project(srv, project);
-    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/limit-ceiling"), CBM_STORE_OK);
-    enum { LIMIT_CEILING = 500, NODES = 600 };
-    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
-    for (int i = 0; i < NODES; i++) {
-        char name[32];
-        char qualified_name[64];
-        snprintf(name, sizeof(name), "fn_%03d", i);
-        snprintf(qualified_name, sizeof(qualified_name), "limit-ceiling.m.%s", name);
-        cbm_node_t node = {.project = project,
-                           .label = "Function",
-                           .name = name,
-                           .qualified_name = qualified_name,
-                           .file_path = "m.c",
-                           .start_line = i + 1,
-                           .end_line = i + 1};
-        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
-    }
-    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
-
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_graph",
-                            "{\"project\":\"limit-ceiling\",\"label\":\"Function\",\"limit\":9999,"
-                            "\"format\":\"json\",\"max_output_tokens\":1000000}");
-    ASSERT_NOT_NULL(response);
-    char *inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
-    ASSERT_NOT_NULL(doc);
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), LIMIT_CEILING);
-    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), NODES);
-    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
-    yyjson_doc_free(doc);
-    free(inner);
-    free(response);
-    cbm_mcp_server_free(srv);
-    PASS();
-}
-
-TEST(tool_trace_cursor_truncated_after_leg_is_rejected) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *st = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(st);
-    const char *proj = "cursor-leg";
-    cbm_mcp_server_set_project(srv, proj);
-    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/cursor-leg"), CBM_STORE_OK);
-    cbm_node_t hub = {.project = proj,
-                      .label = "Function",
-                      .name = "hub",
-                      .qualified_name = "cursor-leg.h.hub",
-                      .file_path = "h.c",
-                      .start_line = 1,
-                      .end_line = 9};
-    int64_t hid = cbm_store_upsert_node(st, &hub);
-    ASSERT_GT(hid, 0);
-    cbm_node_t callee = {.project = proj,
+        cbm_node_t fn = {.project = proj,
                          .label = "Function",
-                         .name = "leaf",
-                         .qualified_name = "cursor-leg.m.leaf",
-                         .file_path = "m.c",
-                         .start_line = 1,
-                         .end_line = 3};
-    int64_t lid = cbm_store_upsert_node(st, &callee);
-    ASSERT_GT(lid, 0);
-    cbm_edge_t e = {.project = proj, .source_id = hid, .target_id = lid, .type = "CALLS"};
-    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+                         .name = "telemetryCollector",
+                         .qualified_name = "prose.src.telemetryCollector",
+                         .file_path = "src/collect.c",
+                         .start_line = 3,
+                         .end_line = 9};
+        cbm_store_upsert_node(st, &fn);
 
-    /* A token that ends right after the leg character has no generation,
-     * hash, hop or node fields to read; it is rejected like any other
-     * malformed token. */
-    static const char *const tokens[] = {"c1.o", "c1.i"};
-    for (size_t t = 0; t < sizeof(tokens) / sizeof(tokens[0]); t++) {
+        cbm_store_fts_rebuild(st, NULL, 0);
+        return srv;
+    }
+
+    static char *prose_search(cbm_mcp_server_t * srv, const char *proj, const char *query) {
+        char req[512];
+        snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":518,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"search_graph\","
+                 "\"arguments\":{\"project\":\"%s\",\"query\":\"%s\",\"limit\":10}}}",
+                 proj, query);
+        char *resp = cbm_mcp_server_handle(srv, req);
+        if (!resp) {
+            return NULL;
+        }
+        char *inner = extract_text_content(resp);
+        free(resp);
+        return inner;
+    }
+
+    TEST(bm25_finds_section_by_its_prose_issue518) {
+        cbm_mcp_server_t *srv = setup_prose_search_server("prose518");
+        ASSERT_NOT_NULL(srv);
+
+        /* "ephemeral" appears NOWHERE in any identifier — only in the section's
+         * body. Before the body column it was unfindable. */
+        char *inner = prose_search(srv, "prose518", "ephemeral");
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+        ASSERT_NOT_NULL(strstr(inner, "prose.README.Installation"));
+        ASSERT_NOT_NULL(strstr(inner, "Section"));
+        free(inner);
+
+        cbm_mcp_server_free(srv);
+        PASS();
+    }
+
+    TEST(bm25_finds_module_by_promoted_description_issue519) {
+        cbm_mcp_server_t *srv = setup_prose_search_server("prose519");
+        ASSERT_NOT_NULL(srv);
+
+        /* A config file's own description, promoted onto its Module node. Module
+         * was one of the labels the BM25 filter used to drop unconditionally. */
+        char *inner = prose_search(srv, "prose519", "shard");
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "prose.action_yml"));
+        ASSERT_NOT_NULL(strstr(inner, "Module"));
+        free(inner);
+
+        cbm_mcp_server_free(srv);
+        PASS();
+    }
+
+    TEST(bm25_results_and_total_stay_consistent_issue518) {
+        /* The ranked query and the count query share an inner candidate window and
+         * MIRROR each other's filter. Changing the label exclusion (or the weights)
+         * in only one silently reports a total that does not describe the rows. */
+        cbm_mcp_server_t *srv = setup_prose_search_server("prosecount");
+        ASSERT_NOT_NULL(srv);
+
+        char *inner = prose_search(srv, "prosecount", "telemetry");
+        ASSERT_NOT_NULL(inner);
+        /* Both the Module (body: "aggregates telemetry...") and the Function
+         * (name: telemetryCollector) match, and both are now eligible. */
+        const char *total = strstr(inner, "total: ");
+        const char *results = strstr(inner, "results: ");
+        ASSERT_NOT_NULL(total);
+        ASSERT_NOT_NULL(results);
+        int total_n = atoi(total + strlen("total: "));
+        int results_n = atoi(results + strlen("results: "));
+        ASSERT_EQ(total_n, 2);
+        ASSERT_EQ(results_n, total_n);
+        ASSERT_NOT_NULL(strstr(inner, "prose.action_yml"));
+        ASSERT_NOT_NULL(strstr(inner, "prose.src.telemetryCollector"));
+        free(inner);
+
+        cbm_mcp_server_free(srv);
+        PASS();
+    }
+
+    TEST(bm25_identifier_match_outranks_prose_only_match_issue518) {
+        /* The 0.3 body weight is what keeps prose from drowning identifiers. Both
+         * candidates carry the same label boost, so the ordering here is decided by
+         * the column weights alone. */
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *st = cbm_mcp_server_store(srv);
+        const char *proj = "prose-rank";
+        cbm_mcp_server_set_project(srv, proj);
+        cbm_store_upsert_project(st, proj, "/tmp/prose-rank");
+
+        cbm_node_t by_name = {.project = proj,
+                              .label = "Function",
+                              .name = "reconcile",
+                              .qualified_name = "pr.a.reconcile",
+                              .file_path = "a.c"};
+        ASSERT_TRUE(cbm_store_upsert_node(st, &by_name) > 0);
+
+        cbm_node_t by_body = {.project = proj,
+                              .label = "Function",
+                              .name = "zzz",
+                              .qualified_name = "pr.b.zzz",
+                              .file_path = "b.c",
+                              .properties_json = "{\"docstring\":\"reconcile the ledger\"}"};
+        ASSERT_TRUE(cbm_store_upsert_node(st, &by_body) > 0);
+        ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+        char *inner = prose_search(srv, proj, "reconcile");
+        ASSERT_NOT_NULL(inner);
+        const char *name_hit = strstr(inner, "pr.a.reconcile");
+        const char *body_hit = strstr(inner, "pr.b.zzz");
+        ASSERT_NOT_NULL(name_hit);        /* the identifier match */
+        ASSERT_NOT_NULL(body_hit);        /* the prose-only match still SURFACES ... */
+        ASSERT_TRUE(name_hit < body_hit); /* ... but never above the identifier */
+        free(inner);
+
+        cbm_mcp_server_free(srv);
+        PASS();
+    }
+
+    TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
+        /* No index-format bump means a database whose nodes_fts predates the body
+         * column is opened by the current binary. bm25()'s fifth weight must be
+         * inert there, not an error: FTS5 reads a weight only for a column an
+         * instance actually landed in. */
+        char *td = th_mktempdir("cbm_mcp_legacy_fts");
+        ASSERT_NOT_NULL(td);
+        /* cbm_mcp_server_new(project) opens <cache_dir>/<project>.db, so seeding
+         * the legacy table THERE is what puts the server on a pre-body database —
+         * the same way a real upgrade finds one. */
+        char saved_cache[512] = {0};
+        const char *prev = getenv("CBM_CACHE_DIR");
+        if (prev) {
+            snprintf(saved_cache, sizeof(saved_cache), "%s", prev);
+        }
+        cbm_setenv("CBM_CACHE_DIR", td, 1);
+
+        const char *proj = "legacyfts";
+        char dbpath[600];
+        snprintf(dbpath, sizeof(dbpath), "%s/%s.db", td, proj);
+
+        sqlite3 *raw = NULL;
+        ASSERT_EQ(sqlite3_open(dbpath, &raw), SQLITE_OK);
+        ASSERT_EQ(sqlite3_exec(raw,
+                               "CREATE VIRTUAL TABLE nodes_fts USING fts5("
+                               "  name, qualified_name, label, file_path,"
+                               "  content='', tokenize='unicode61 remove_diacritics 2');",
+                               NULL, NULL, NULL),
+                  SQLITE_OK);
+        sqlite3_close(raw);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(proj);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *st = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(st);
+        cbm_mcp_server_set_project(srv, proj);
+        cbm_store_upsert_project(st, proj, td);
+
+        cbm_node_t fn = {.project = proj,
+                         .label = "Function",
+                         .name = "reconcile",
+                         .qualified_name = "legacy.a.reconcile",
+                         .file_path = "a.c",
+                         .properties_json =
+                             "{\"docstring\":\"prose that cannot be indexed here\"}"};
+        ASSERT_TRUE(cbm_store_upsert_node(st, &fn) > 0);
+        ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+        char *inner = prose_search(srv, proj, "reconcile");
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+        ASSERT_NOT_NULL(strstr(inner, "legacy.a.reconcile"));
+        free(inner);
+
+        /* Prose is absent rather than broken — a degrade, not a failure. */
+        inner = prose_search(srv, proj, "indexed");
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NULL(strstr(inner, "legacy.a.reconcile"));
+        free(inner);
+
+        cbm_mcp_server_free(srv);
+        if (saved_cache[0]) {
+            cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        } else {
+            cbm_unsetenv("CBM_CACHE_DIR");
+        }
+        th_rmtree(td);
+        PASS();
+    }
+
+    /* #2144: async/status need the daemon's job registry. An in-process server
+     * (index worker, embedder) has no process that outlives the call, so it must
+     * refuse both modes instead of silently running a blocking index. */
+    TEST(index_repository_async_and_status_refused_without_daemon_issue2144) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        char *async_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                                "{\"repo_path\":\"/nonexistent-2144\","
+                                                "\"async\":true}");
+        char *status_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                                 "{\"repo_path\":\"/nonexistent-2144\","
+                                                 "\"status\":true}");
+        cbm_mcp_server_free(srv);
+        ASSERT_NOT_NULL(async_reply);
+        ASSERT_NOT_NULL(strstr(async_reply, "\"isError\":true"));
+        ASSERT_NOT_NULL(strstr(async_reply, "daemon"));
+        ASSERT_NOT_NULL(status_reply);
+        ASSERT_NOT_NULL(strstr(status_reply, "\"isError\":true"));
+        ASSERT_NOT_NULL(strstr(status_reply, "daemon"));
+        free(async_reply);
+        free(status_reply);
+        PASS();
+    }
+
+    /* #2144: the tool schema advertises both flags and the description explains
+     * the deadline problem and the polling pattern. */
+    TEST(index_repository_schema_documents_async_polling_issue2144) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        char *resp = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":2144,\"method\":\"tools/list\"}");
+        cbm_mcp_server_free(srv);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "\"async\":{\"type\":\"boolean\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"status\":{\"type\":\"boolean\""));
+        ASSERT_NOT_NULL(strstr(resp, "per-call deadline"));
+        ASSERT_NOT_NULL(strstr(resp, "poll with status:true"));
+        free(resp);
+        PASS();
+    }
+
+    /* #2144: a notice rides on a JSON payload as a key (content text and
+     * structuredContent together) and on a text payload as a paragraph. */
+    TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
+        char *object = cbm_mcp_tool_result_add_notice(
+            cbm_mcp_text_result("{\"status\":\"indexed\"}", false), "retry async");
+        char *text = cbm_mcp_tool_result_add_notice(cbm_mcp_text_result("plain failure", true),
+                                                    "retry async");
+        ASSERT_NOT_NULL(object);
+        ASSERT_NOT_NULL(strstr(object, "\"structuredContent\":{\"status\":\"indexed\","
+                                       "\"notice\":\"retry async\"}"));
+        ASSERT_NOT_NULL(strstr(object, "\"isError\":false"));
+        ASSERT_NOT_NULL(text);
+        ASSERT_NOT_NULL(strstr(text, "plain failure\\n\\nretry async"));
+        ASSERT_NOT_NULL(strstr(text, "\"isError\":true"));
+        free(object);
+        free(text);
+        PASS();
+    }
+
+    /* ── Integer argument bounds ────────────────────────────────────────
+     * Sizing arguments are clamped on both sides at the handler. The fixture
+     * file is much longer than the `context` bound so the window is observable. */
+
+    enum { CTX_FIXTURE_LINES = 1000, CTX_FIXTURE_NEEDLE_LINE = 500, CTX_BOUND = 200 };
+
+    static bool write_context_fixture(const char *tmp, char *path, size_t path_sz) {
+        snprintf(path, path_sz, "%s/project/long.md", tmp);
+        FILE *fp = cbm_fopen(path, "wb");
+        if (!fp) {
+            return false;
+        }
+        for (int line = 1; line <= CTX_FIXTURE_LINES; line++) {
+            if (line == CTX_FIXTURE_NEEDLE_LINE) {
+                fprintf(fp, "needle-context-window\n");
+            } else {
+                fprintf(fp, "line %04d\n", line);
+            }
+        }
+        return fclose(fp) == 0;
+    }
+
+    static bool upsert_context_fixture_node(cbm_mcp_server_t * srv) {
+        cbm_store_t *st = cbm_mcp_server_store(srv);
+        if (!st) {
+            return false;
+        }
+        cbm_node_t node = {.project = "test-project",
+                           .label = "Section",
+                           .name = "long",
+                           .qualified_name = "test-project.long",
+                           .file_path = "long.md",
+                           .start_line = 1,
+                           .end_line = CTX_FIXTURE_LINES};
+        return cbm_store_upsert_node(st, &node) > 0;
+    }
+
+    static char *search_code_with_context(cbm_mcp_server_t * srv, const char *context_value) {
         char req[256];
         snprintf(req, sizeof(req),
-                 "{\"project\":\"cursor-leg\",\"function_name\":\"hub\","
-                 "\"direction\":\"outbound\",\"limit\":5,\"cursor\":\"%s\"}",
-                 tokens[t]);
-        char *response = cbm_mcp_handle_tool(srv, "trace_call_path", req);
+                 "{\"project\":\"test-project\",\"pattern\":\"needle-context-window\","
+                 "\"format\":\"json\",\"context\":%s,\"limit\":5}",
+                 context_value);
+        char *resp = cbm_mcp_handle_tool(srv, "search_code", req);
+        if (!resp) {
+            return NULL;
+        }
+        char *inner = extract_text_content(resp);
+        free(resp);
+        return inner;
+    }
+
+    /* Row-0 context object of a json-format search_code answer, or NULL when the
+     * answer carries no context column. *doc_out owns the memory either way. */
+    static yyjson_val *search_code_context_object(const char *inner, yyjson_doc **doc_out) {
+        *doc_out = yyjson_read(inner, strlen(inner), 0);
+        if (!*doc_out) {
+            return NULL;
+        }
+        yyjson_val *root = yyjson_doc_get_root(*doc_out);
+        yyjson_val *cols = yyjson_obj_get(root, "cols");
+        yyjson_val *rows = yyjson_obj_get(root, "rows");
+        if (!cols || !rows || yyjson_arr_size(rows) == 0) {
+            return NULL;
+        }
+        size_t col_count = yyjson_arr_size(cols);
+        for (size_t i = 0; i < col_count; i++) {
+            const char *col = yyjson_get_str(yyjson_arr_get(cols, i));
+            if (col && strcmp(col, "context") == 0) {
+                return yyjson_arr_get(yyjson_arr_get(rows, 0), i);
+            }
+        }
+        return NULL;
+    }
+
+    static int count_newlines(const char *s) {
+        int n = 0;
+        for (; *s; s++) {
+            n += *s == '\n';
+        }
+        return n;
+    }
+
+    TEST(search_code_context_window_is_bounded) {
+        char tmp[256];
+        cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+        ASSERT_NOT_NULL(srv);
+        char fixture[512];
+        ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
+        ASSERT_TRUE(upsert_context_fixture_node(srv));
+
+        /* Far above the bound: the window is match ± 200, not the whole file. */
+        char *inner = search_code_with_context(srv, "100000");
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = NULL;
+        yyjson_val *ctx = search_code_context_object(inner, &doc);
+        ASSERT_NOT_NULL(ctx);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+                  CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
+        const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+        ASSERT_NOT_NULL(text);
+        ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
+        ASSERT_EQ(strncmp(text, "line 0300\n", 10), 0);
+        ASSERT_NOT_NULL(strstr(text, "\nneedle-context-window\n"));
+        ASSERT_NOT_NULL(strstr(text, "\nline 0700\n"));
+        ASSERT_NULL(strstr(text, "line 0701"));
+        yyjson_doc_free(doc);
+        free(inner);
+
+        /* Inside the bound the window is unchanged. */
+        inner = search_code_with_context(srv, "3");
+        ASSERT_NOT_NULL(inner);
+        ctx = search_code_context_object(inner, &doc);
+        ASSERT_NOT_NULL(ctx);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+                  CTX_FIXTURE_NEEDLE_LINE - 3);
+        text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+        ASSERT_NOT_NULL(text);
+        ASSERT_EQ(count_newlines(text), 7);
+        ASSERT_EQ(strncmp(text, "line 0497\n", 10), 0);
+        yyjson_doc_free(doc);
+        free(inner);
+
+        unlink(fixture);
+        cbm_mcp_server_free(srv);
+        cleanup_snippet_dir(tmp);
+        PASS();
+    }
+
+    TEST(search_code_context_extreme_values_answer_normally) {
+        char tmp[256];
+        cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+        ASSERT_NOT_NULL(srv);
+        char fixture[512];
+        ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
+        ASSERT_TRUE(upsert_context_fixture_node(srv));
+
+        /* The largest value the argument can carry behaves exactly like the bound. */
+        char *inner = search_code_with_context(srv, "2147483647");
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = NULL;
+        yyjson_val *ctx = search_code_context_object(inner, &doc);
+        ASSERT_NOT_NULL(ctx);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+                  CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
+        const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+        ASSERT_NOT_NULL(text);
+        ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
+        yyjson_doc_free(doc);
+        free(inner);
+
+        /* A negative value means no context, exactly like 0: a normal answer. */
+        inner = search_code_with_context(srv, "-5");
+        ASSERT_NOT_NULL(inner);
+        ctx = search_code_context_object(inner, &doc);
+        ASSERT_NULL(ctx);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+        ASSERT_NOT_NULL(rows);
+        ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+        yyjson_doc_free(doc);
+        free(inner);
+
+        unlink(fixture);
+        cbm_mcp_server_free(srv);
+        cleanup_snippet_dir(tmp);
+        PASS();
+    }
+
+    TEST(tool_query_graph_max_rows_above_ceiling_is_capped) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *store = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(store);
+        const char *project = "row-ceiling";
+        cbm_mcp_server_set_project(srv, project);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/row-ceiling"), CBM_STORE_OK);
+        /* One row more than the visible ceiling (99998), so the cap is observable. */
+        enum { ROW_CEILING = 99998, ROWS = ROW_CEILING + 1 };
+        ASSERT_EQ(cbm_store_begin_bulk(store), CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+        for (int i = 0; i < ROWS; i++) {
+            char name[32];
+            char qualified_name[64];
+            snprintf(name, sizeof(name), "row_%05d", i);
+            snprintf(qualified_name, sizeof(qualified_name), "row-ceiling.rows.%s", name);
+            cbm_node_t node = {.project = project,
+                               .label = "Function",
+                               .name = name,
+                               .qualified_name = qualified_name,
+                               .file_path = "rows.c",
+                               .start_line = i + 1,
+                               .end_line = i + 1};
+            ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+        }
+        ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
+        ASSERT_EQ(cbm_store_end_bulk(store), CBM_STORE_OK);
+
+        char *response = cbm_mcp_handle_tool(
+            srv, "query_graph",
+            "{\"project\":\"row-ceiling\",\"query\":\"MATCH (n) RETURN n.name\","
+            "\"format\":\"json\",\"max_rows\":2147483647,\"max_output_tokens\":1000000}");
         ASSERT_NOT_NULL(response);
         char *inner = extract_text_content(response);
-        free(response);
         ASSERT_NOT_NULL(inner);
-        ASSERT_NOT_NULL(strstr(inner, "invalid_cursor"));
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), ROW_CEILING);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), ROWS);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+        yyjson_doc_free(doc);
         free(inner);
+        free(response);
+        cbm_mcp_server_free(srv);
+        PASS();
     }
-    cbm_mcp_server_free(srv);
-    PASS();
-}
 
-TEST(search_code_rejects_quote_in_file_pattern) {
-    char tmp[256];
-    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
-    ASSERT_NOT_NULL(srv);
+    TEST(tool_search_graph_limit_above_ceiling_is_capped) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *store = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(store);
+        const char *project = "limit-ceiling";
+        cbm_mcp_server_set_project(srv, project);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/limit-ceiling"), CBM_STORE_OK);
+        enum { LIMIT_CEILING = 500, NODES = 600 };
+        ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+        for (int i = 0; i < NODES; i++) {
+            char name[32];
+            char qualified_name[64];
+            snprintf(name, sizeof(name), "fn_%03d", i);
+            snprintf(qualified_name, sizeof(qualified_name), "limit-ceiling.m.%s", name);
+            cbm_node_t node = {.project = project,
+                               .label = "Function",
+                               .name = name,
+                               .qualified_name = qualified_name,
+                               .file_path = "m.c",
+                               .start_line = i + 1,
+                               .end_line = i + 1};
+            ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+        }
+        ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
 
-    /* Both quote characters are rejected before any file is scanned. */
-    static const char *const patterns[] = {"*.go\\\"", "*.go'"};
-    for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
-        char req[256];
-        snprintf(req, sizeof(req),
-                 "{\"project\":\"test-project\",\"pattern\":\"HandleRequest\","
-                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
-                 patterns[p]);
-        char *response = cbm_mcp_handle_tool(srv, "search_code", req);
+        char *response = cbm_mcp_handle_tool(
+            srv, "search_graph",
+            "{\"project\":\"limit-ceiling\",\"label\":\"Function\",\"limit\":9999,"
+            "\"format\":\"json\",\"max_output_tokens\":1000000}");
         ASSERT_NOT_NULL(response);
         char *inner = extract_text_content(response);
-        free(response);
         ASSERT_NOT_NULL(inner);
-        ASSERT_NOT_NULL(strstr(inner, "path or file_pattern contains invalid characters"));
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), LIMIT_CEILING);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), NODES);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+        yyjson_doc_free(doc);
         free(inner);
+        free(response);
+        cbm_mcp_server_free(srv);
+        PASS();
     }
-    cbm_mcp_server_free(srv);
-    cleanup_snippet_dir(tmp);
-    PASS();
-}
+
+    TEST(tool_trace_cursor_truncated_after_leg_is_rejected) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *st = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(st);
+        const char *proj = "cursor-leg";
+        cbm_mcp_server_set_project(srv, proj);
+        ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/cursor-leg"), CBM_STORE_OK);
+        cbm_node_t hub = {.project = proj,
+                          .label = "Function",
+                          .name = "hub",
+                          .qualified_name = "cursor-leg.h.hub",
+                          .file_path = "h.c",
+                          .start_line = 1,
+                          .end_line = 9};
+        int64_t hid = cbm_store_upsert_node(st, &hub);
+        ASSERT_GT(hid, 0);
+        cbm_node_t callee = {.project = proj,
+                             .label = "Function",
+                             .name = "leaf",
+                             .qualified_name = "cursor-leg.m.leaf",
+                             .file_path = "m.c",
+                             .start_line = 1,
+                             .end_line = 3};
+        int64_t lid = cbm_store_upsert_node(st, &callee);
+        ASSERT_GT(lid, 0);
+        cbm_edge_t e = {.project = proj, .source_id = hid, .target_id = lid, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+        /* A token that ends right after the leg character has no generation,
+         * hash, hop or node fields to read; it is rejected like any other
+         * malformed token. */
+        static const char *const tokens[] = {"c1.o", "c1.i"};
+        for (size_t t = 0; t < sizeof(tokens) / sizeof(tokens[0]); t++) {
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"project\":\"cursor-leg\",\"function_name\":\"hub\","
+                     "\"direction\":\"outbound\",\"limit\":5,\"cursor\":\"%s\"}",
+                     tokens[t]);
+            char *response = cbm_mcp_handle_tool(srv, "trace_call_path", req);
+            ASSERT_NOT_NULL(response);
+            char *inner = extract_text_content(response);
+            free(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_NOT_NULL(strstr(inner, "invalid_cursor"));
+            free(inner);
+        }
+        cbm_mcp_server_free(srv);
+        PASS();
+    }
+
+    TEST(search_code_rejects_quote_in_file_pattern) {
+        char tmp[256];
+        cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+        ASSERT_NOT_NULL(srv);
+
+        /* Both quote characters are rejected before any file is scanned. */
+        static const char *const patterns[] = {"*.go\\\"", "*.go'"};
+        for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
+            char req[256];
+            snprintf(req, sizeof(req),
+                     "{\"project\":\"test-project\",\"pattern\":\"HandleRequest\","
+                     "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                     patterns[p]);
+            char *response = cbm_mcp_handle_tool(srv, "search_code", req);
+            ASSERT_NOT_NULL(response);
+            char *inner = extract_text_content(response);
+            free(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_NOT_NULL(strstr(inner, "path or file_pattern contains invalid characters"));
+            free(inner);
+        }
+        cbm_mcp_server_free(srv);
+        cleanup_snippet_dir(tmp);
+        PASS();
+    }
 
 /* ── search_code: every match resolves inside the project root ─────────
  * search_code returns the lines its scan opened. The scoped file list is
@@ -23960,737 +24076,741 @@ TEST(search_code_rejects_quote_in_file_pattern) {
  * and a Windows run of these cases was not attempted in this change, so
  * they skip with that reason rather than sit as an unexplained red. */
 #ifndef _WIN32
-typedef struct {
-    char root[CBM_SZ_512];
-    char outside[CBM_SZ_512];
-} search_root_fixture_t;
+    typedef struct {
+        char root[CBM_SZ_512];
+        char outside[CBM_SZ_512];
+    } search_root_fixture_t;
 
-/* Layout (every line that matters carries ROOTCHECK_NEEDLE):
- *   <root>/main.c                      ordinary file, Variable INSIDE_SYMBOL
- *   <root>/inner/same.c                ordinary file, reached via the links
- *   <root>/alias -> inner              directory link that stays inside
- *   <root>/mirror.c -> inner/same.c    file link that stays inside
- *   <root>/link.c -> <outside>/far.c   file link that leaves the root
- *   <root>/lib -> <outside>/dir        directory link that leaves the root
- *   <outside>/dir/deep.c               raw hit through the directory link
- *   <outside>/dir/sym.c                graph hit (Variable FAR_DIR_SYMBOL) */
-static bool search_root_fixture_create(search_root_fixture_t *fx) {
-    snprintf(fx->root, sizeof(fx->root), "%s/cbm_srch_root_XXXXXX", cbm_tmpdir());
-    snprintf(fx->outside, sizeof(fx->outside), "%s/cbm_srch_outside_XXXXXX", cbm_tmpdir());
-    if (!cbm_mkdtemp(fx->root) || !cbm_mkdtemp(fx->outside)) {
-        return false;
-    }
-    char path[CBM_SZ_1K];
-    char target[CBM_SZ_1K];
-    snprintf(path, sizeof(path), "%s/main.c", fx->root);
-    if (th_write_file(path, "int ROOTCHECK_NEEDLE_INSIDE = 1;\n") != 0) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "%s/inner/same.c", fx->root);
-    if (th_write_file(path, "int ROOTCHECK_NEEDLE_INNER = 4;\n") != 0) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "%s/alias", fx->root);
-    if (symlink("inner", path) != 0) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "%s/mirror.c", fx->root);
-    if (symlink("inner/same.c", path) != 0) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "%s/far.c", fx->outside);
-    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_FILE = 2;\n") != 0) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "%s/dir/deep.c", fx->outside);
-    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_DIR = 3;\n") != 0) {
-        return false;
-    }
-    snprintf(path, sizeof(path), "%s/dir/sym.c", fx->outside);
-    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_SYM = 5;\n") != 0) {
-        return false;
-    }
-    snprintf(target, sizeof(target), "%s/far.c", fx->outside);
-    snprintf(path, sizeof(path), "%s/link.c", fx->root);
-    if (symlink(target, path) != 0) {
-        return false;
-    }
-    snprintf(target, sizeof(target), "%s/dir", fx->outside);
-    snprintf(path, sizeof(path), "%s/lib", fx->root);
-    return symlink(target, path) == 0;
-}
-
-static void search_root_fixture_destroy(search_root_fixture_t *fx) {
-    /* Unlink the links first so the tree removal never descends through one. */
-    static const char *const links[] = {"alias", "mirror.c", "link.c", "lib"};
-    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
-        char path[CBM_SZ_1K];
-        snprintf(path, sizeof(path), "%s/%s", fx->root, links[i]);
-        (void)unlink(path);
-    }
-    (void)th_rmtree(fx->root);
-    (void)th_rmtree(fx->outside);
-}
-
-/* File nodes as a stale index holds them: the link targets were ordinary
- * directories and files when they were indexed (discovery itself never
- * follows a link). inner/same.c is deliberately absent so its line can only
- * be reached through alias/ or mirror.c. */
-static bool search_root_fixture_index(cbm_store_t *store, const char *project) {
-    static const char *const files[] = {"main.c", "alias/same.c", "mirror.c",
-                                        "link.c", "lib/deep.c",   "lib/sym.c"};
-    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-        const char *base = strrchr(files[i], '/');
-        base = base ? base + 1 : files[i];
-        char qualified_name[CBM_SZ_256];
-        snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, files[i]);
-        cbm_node_t file = {.project = project,
-                           .label = "File",
-                           .name = base,
-                           .qualified_name = qualified_name,
-                           .file_path = files[i]};
-        if (cbm_store_upsert_node(store, &file) <= 0) {
+    /* Layout (every line that matters carries ROOTCHECK_NEEDLE):
+     *   <root>/main.c                      ordinary file, Variable INSIDE_SYMBOL
+     *   <root>/inner/same.c                ordinary file, reached via the links
+     *   <root>/alias -> inner              directory link that stays inside
+     *   <root>/mirror.c -> inner/same.c    file link that stays inside
+     *   <root>/link.c -> <outside>/far.c   file link that leaves the root
+     *   <root>/lib -> <outside>/dir        directory link that leaves the root
+     *   <outside>/dir/deep.c               raw hit through the directory link
+     *   <outside>/dir/sym.c                graph hit (Variable FAR_DIR_SYMBOL) */
+    static bool search_root_fixture_create(search_root_fixture_t * fx) {
+        snprintf(fx->root, sizeof(fx->root), "%s/cbm_srch_root_XXXXXX", cbm_tmpdir());
+        snprintf(fx->outside, sizeof(fx->outside), "%s/cbm_srch_outside_XXXXXX", cbm_tmpdir());
+        if (!cbm_mkdtemp(fx->root) || !cbm_mkdtemp(fx->outside)) {
             return false;
         }
+        char path[CBM_SZ_1K];
+        char target[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%s/main.c", fx->root);
+        if (th_write_file(path, "int ROOTCHECK_NEEDLE_INSIDE = 1;\n") != 0) {
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/inner/same.c", fx->root);
+        if (th_write_file(path, "int ROOTCHECK_NEEDLE_INNER = 4;\n") != 0) {
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/alias", fx->root);
+        if (symlink("inner", path) != 0) {
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/mirror.c", fx->root);
+        if (symlink("inner/same.c", path) != 0) {
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/far.c", fx->outside);
+        if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_FILE = 2;\n") != 0) {
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/dir/deep.c", fx->outside);
+        if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_DIR = 3;\n") != 0) {
+            return false;
+        }
+        snprintf(path, sizeof(path), "%s/dir/sym.c", fx->outside);
+        if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_SYM = 5;\n") != 0) {
+            return false;
+        }
+        snprintf(target, sizeof(target), "%s/far.c", fx->outside);
+        snprintf(path, sizeof(path), "%s/link.c", fx->root);
+        if (symlink(target, path) != 0) {
+            return false;
+        }
+        snprintf(target, sizeof(target), "%s/dir", fx->outside);
+        snprintf(path, sizeof(path), "%s/lib", fx->root);
+        return symlink(target, path) == 0;
     }
-    cbm_node_t inside = {.project = project,
-                         .label = "Variable",
-                         .name = "INSIDE_SYMBOL",
-                         .qualified_name = "search-root.INSIDE_SYMBOL",
-                         .file_path = "main.c",
-                         .start_line = 1,
-                         .end_line = 1};
-    cbm_node_t far_symbol = {.project = project,
-                             .label = "Variable",
-                             .name = "FAR_DIR_SYMBOL",
-                             .qualified_name = "search-root.lib.FAR_DIR_SYMBOL",
-                             .file_path = "lib/sym.c",
-                             .start_line = 1,
-                             .end_line = 1};
-    return cbm_store_upsert_node(store, &inside) > 0 &&
-           cbm_store_upsert_node(store, &far_symbol) > 0;
-}
 
-typedef struct {
-    bool ok;               /* a non-error response with text content */
-    bool inside_file;      /* main.c reported */
-    bool inside_dir_link;  /* alias/same.c reported (directory link inside) */
-    bool inside_file_link; /* mirror.c reported (file link inside) */
-    bool outside;          /* any line or path from beyond the root */
-} search_root_probe_t;
+    static void search_root_fixture_destroy(search_root_fixture_t * fx) {
+        /* Unlink the links first so the tree removal never descends through one. */
+        static const char *const links[] = {"alias", "mirror.c", "link.c", "lib"};
+        for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+            char path[CBM_SZ_1K];
+            snprintf(path, sizeof(path), "%s/%s", fx->root, links[i]);
+            (void)unlink(path);
+        }
+        (void)th_rmtree(fx->root);
+        (void)th_rmtree(fx->outside);
+    }
 
-static search_root_probe_t search_root_probe(cbm_mcp_server_t *srv, const char *args) {
-    search_root_probe_t probe = {0};
-    char *response = cbm_mcp_handle_tool(srv, "search_code", args);
-    char *inner = response ? extract_text_content(response) : NULL;
-    probe.ok = response && !strstr(response, "\"isError\":true") && inner;
-    if (probe.ok) {
-        probe.inside_file = strstr(inner, "main.c") != NULL;
-        probe.inside_dir_link = strstr(inner, "alias/same.c") != NULL;
-        probe.inside_file_link = strstr(inner, "mirror.c") != NULL;
-        static const char *const outside_markers[] = {"ROOTCHECK_NEEDLE_FAR", "FAR_DIR_SYMBOL",
-                                                      "deep.c", "sym.c", "link.c"};
-        for (size_t i = 0; i < sizeof(outside_markers) / sizeof(outside_markers[0]); i++) {
-            if (strstr(inner, outside_markers[i])) {
-                probe.outside = true;
+    /* File nodes as a stale index holds them: the link targets were ordinary
+     * directories and files when they were indexed (discovery itself never
+     * follows a link). inner/same.c is deliberately absent so its line can only
+     * be reached through alias/ or mirror.c. */
+    static bool search_root_fixture_index(cbm_store_t * store, const char *project) {
+        static const char *const files[] = {"main.c", "alias/same.c", "mirror.c",
+                                            "link.c", "lib/deep.c",   "lib/sym.c"};
+        for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+            const char *base = strrchr(files[i], '/');
+            base = base ? base + 1 : files[i];
+            char qualified_name[CBM_SZ_256];
+            snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, files[i]);
+            cbm_node_t file = {.project = project,
+                               .label = "File",
+                               .name = base,
+                               .qualified_name = qualified_name,
+                               .file_path = files[i]};
+            if (cbm_store_upsert_node(store, &file) <= 0) {
+                return false;
             }
         }
+        cbm_node_t inside = {.project = project,
+                             .label = "Variable",
+                             .name = "INSIDE_SYMBOL",
+                             .qualified_name = "search-root.INSIDE_SYMBOL",
+                             .file_path = "main.c",
+                             .start_line = 1,
+                             .end_line = 1};
+        cbm_node_t far_symbol = {.project = project,
+                                 .label = "Variable",
+                                 .name = "FAR_DIR_SYMBOL",
+                                 .qualified_name = "search-root.lib.FAR_DIR_SYMBOL",
+                                 .file_path = "lib/sym.c",
+                                 .start_line = 1,
+                                 .end_line = 1};
+        return cbm_store_upsert_node(store, &inside) > 0 &&
+               cbm_store_upsert_node(store, &far_symbol) > 0;
     }
-    free(inner);
-    free(response);
-    return probe;
-}
+
+    typedef struct {
+        bool ok;               /* a non-error response with text content */
+        bool inside_file;      /* main.c reported */
+        bool inside_dir_link;  /* alias/same.c reported (directory link inside) */
+        bool inside_file_link; /* mirror.c reported (file link inside) */
+        bool outside;          /* any line or path from beyond the root */
+    } search_root_probe_t;
+
+    static search_root_probe_t search_root_probe(cbm_mcp_server_t * srv, const char *args) {
+        search_root_probe_t probe = {0};
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        char *inner = response ? extract_text_content(response) : NULL;
+        probe.ok = response && !strstr(response, "\"isError\":true") && inner;
+        if (probe.ok) {
+            probe.inside_file = strstr(inner, "main.c") != NULL;
+            probe.inside_dir_link = strstr(inner, "alias/same.c") != NULL;
+            probe.inside_file_link = strstr(inner, "mirror.c") != NULL;
+            static const char *const outside_markers[] = {"ROOTCHECK_NEEDLE_FAR", "FAR_DIR_SYMBOL",
+                                                          "deep.c", "sym.c", "link.c"};
+            for (size_t i = 0; i < sizeof(outside_markers) / sizeof(outside_markers[0]); i++) {
+                if (strstr(inner, outside_markers[i])) {
+                    probe.outside = true;
+                }
+            }
+        }
+        free(inner);
+        free(response);
+        return probe;
+    }
 
 #define SEARCH_ROOT_ARGS(extra) \
     "{\"pattern\":\"ROOTCHECK_NEEDLE\",\"project\":\"search-root\"" extra "}"
 #endif
 
-/* Scoped route, real scan command: the index lists lib/deep.c and lib/sym.c,
- * lstat follows the lib -> <outside>/dir link and calls both regular, grep
- * reads the targets. Every output mode must leave those lines out while
- * main.c and alias/same.c (a directory link that stays inside) stay in.
- * mirror.c and link.c are links as their last path component; the scoped
- * list writer already leaves those out (lstat reports the link itself) —
- * pinned here as the existing behaviour, not changed. */
-TEST(search_code_matches_stay_inside_project_root) {
+    /* Scoped route, real scan command: the index lists lib/deep.c and lib/sym.c,
+     * lstat follows the lib -> <outside>/dir link and calls both regular, grep
+     * reads the targets. Every output mode must leave those lines out while
+     * main.c and alias/same.c (a directory link that stays inside) stay in.
+     * mirror.c and link.c are links as their last path component; the scoped
+     * list writer already leaves those out (lstat reports the link itself) —
+     * pinned here as the existing behaviour, not changed. */
+    TEST(search_code_matches_stay_inside_project_root) {
 #ifdef _WIN32
-    SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
+        SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
 #else
-    search_root_fixture_t fx;
-    bool fixture_ok = search_root_fixture_create(&fx);
-    if (!fixture_ok) {
+        search_root_fixture_t fx;
+        bool fixture_ok = search_root_fixture_create(&fx);
+        if (!fixture_ok) {
+            search_root_fixture_destroy(&fx);
+        }
+        ASSERT_TRUE(fixture_ok);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *store = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(store);
+        const char *project = "search-root";
+        cbm_mcp_server_set_project(srv, project);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
+        ASSERT_TRUE(search_root_fixture_index(store, project));
+
+        static const char *const args[] = {
+            SEARCH_ROOT_ARGS(""),
+            SEARCH_ROOT_ARGS(",\"format\":\"json\""),
+            SEARCH_ROOT_ARGS(",\"mode\":\"full\""),
+            SEARCH_ROOT_ARGS(",\"mode\":\"full\",\"format\":\"json\""),
+            SEARCH_ROOT_ARGS(",\"mode\":\"files\""),
+            SEARCH_ROOT_ARGS(",\"context\":2"),
+            "{\"pattern\":\"ROOTCHECK_NEEDLE_[A-Z]+\",\"project\":\"search-root\",\"regex\":true}",
+        };
+        enum { PROBES = sizeof(args) / sizeof(args[0]) };
+        search_root_probe_t probes[PROBES];
+        for (size_t i = 0; i < PROBES; i++) {
+            probes[i] = search_root_probe(srv, args[i]);
+        }
+        /* Dropped files are not counted either: the exact total is the two
+         * lines inside the root, as it would be after a fresh index. */
+        char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
+        char *json_inner = json_response ? extract_text_content(json_response) : NULL;
+        bool total_counts_inside_only =
+            json_inner && strstr(json_inner, "\"total_grep_matches\":2");
+        free(json_inner);
+        free(json_response);
+
+        cbm_mcp_server_free(srv);
         search_root_fixture_destroy(&fx);
-    }
-    ASSERT_TRUE(fixture_ok);
 
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *store = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(store);
-    const char *project = "search-root";
-    cbm_mcp_server_set_project(srv, project);
-    ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
-    ASSERT_TRUE(search_root_fixture_index(store, project));
-
-    static const char *const args[] = {
-        SEARCH_ROOT_ARGS(""),
-        SEARCH_ROOT_ARGS(",\"format\":\"json\""),
-        SEARCH_ROOT_ARGS(",\"mode\":\"full\""),
-        SEARCH_ROOT_ARGS(",\"mode\":\"full\",\"format\":\"json\""),
-        SEARCH_ROOT_ARGS(",\"mode\":\"files\""),
-        SEARCH_ROOT_ARGS(",\"context\":2"),
-        "{\"pattern\":\"ROOTCHECK_NEEDLE_[A-Z]+\",\"project\":\"search-root\",\"regex\":true}",
-    };
-    enum { PROBES = sizeof(args) / sizeof(args[0]) };
-    search_root_probe_t probes[PROBES];
-    for (size_t i = 0; i < PROBES; i++) {
-        probes[i] = search_root_probe(srv, args[i]);
-    }
-    /* Dropped files are not counted either: the exact total is the two
-     * lines inside the root, as it would be after a fresh index. */
-    char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
-    char *json_inner = json_response ? extract_text_content(json_response) : NULL;
-    bool total_counts_inside_only = json_inner && strstr(json_inner, "\"total_grep_matches\":2");
-    free(json_inner);
-    free(json_response);
-
-    cbm_mcp_server_free(srv);
-    search_root_fixture_destroy(&fx);
-
-    for (size_t i = 0; i < PROBES; i++) {
-        ASSERT_TRUE(probes[i].ok);
-        ASSERT_FALSE(probes[i].outside);
-        ASSERT_TRUE(probes[i].inside_file);
-        ASSERT_TRUE(probes[i].inside_dir_link);
-        ASSERT_FALSE(probes[i].inside_file_link);
-    }
-    ASSERT_TRUE(total_counts_inside_only);
-    PASS();
+        for (size_t i = 0; i < PROBES; i++) {
+            ASSERT_TRUE(probes[i].ok);
+            ASSERT_FALSE(probes[i].outside);
+            ASSERT_TRUE(probes[i].inside_file);
+            ASSERT_TRUE(probes[i].inside_dir_link);
+            ASSERT_FALSE(probes[i].inside_file_link);
+        }
+        ASSERT_TRUE(total_counts_inside_only);
+        PASS();
 #endif
-}
+    }
 
-/* Recursive route: with no indexed files the scan walks the tree. On POSIX
- * that walker is `find -type f`, which never hands grep a link, so the scan
- * command is replaced by one that does — the hits a walker that follows
- * links (Get-ChildItem on Windows is one) would deliver. Lines from
- * link.c and lib/ resolve outside the root and must be dropped; mirror.c
- * and alias/same.c resolve inside and must be kept. */
-TEST(search_code_drops_walker_hits_that_resolve_outside_root) {
+    /* Recursive route: with no indexed files the scan walks the tree. On POSIX
+     * that walker is `find -type f`, which never hands grep a link, so the scan
+     * command is replaced by one that does — the hits a walker that follows
+     * links (Get-ChildItem on Windows is one) would deliver. Lines from
+     * link.c and lib/ resolve outside the root and must be dropped; mirror.c
+     * and alias/same.c resolve inside and must be kept. */
+    TEST(search_code_drops_walker_hits_that_resolve_outside_root) {
 #ifdef _WIN32
-    SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
+        SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
 #else
-    search_root_fixture_t fx;
-    bool fixture_ok = search_root_fixture_create(&fx);
-    if (!fixture_ok) {
+        search_root_fixture_t fx;
+        bool fixture_ok = search_root_fixture_create(&fx);
+        if (!fixture_ok) {
+            search_root_fixture_destroy(&fx);
+        }
+        ASSERT_TRUE(fixture_ok);
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(srv);
+        cbm_store_t *store = cbm_mcp_server_store(srv);
+        ASSERT_NOT_NULL(store);
+        const char *project = "search-root";
+        cbm_mcp_server_set_project(srv, project);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
+
+        char scan_command[CBM_SZ_4K];
+        int command_length =
+            snprintf(scan_command, sizeof(scan_command),
+                     "grep -Hn -F ROOTCHECK_NEEDLE -- '%s/main.c' '%s/mirror.c' '%s/link.c' "
+                     "'%s/lib/deep.c' '%s/lib/sym.c' '%s/alias/same.c'",
+                     fx.root, fx.root, fx.root, fx.root, fx.root, fx.root);
+        ASSERT_TRUE(command_length > 0 && (size_t)command_length < sizeof(scan_command));
+        cbm_mcp_server_set_search_scan_command_for_test(srv, scan_command);
+
+        static const char *const args[] = {
+            SEARCH_ROOT_ARGS(",\"raw_limit\":10"),
+            SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"format\":\"json\""),
+            SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"full\""),
+            SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"files\""),
+        };
+        enum { PROBES = sizeof(args) / sizeof(args[0]) };
+        search_root_probe_t probes[PROBES];
+        for (size_t i = 0; i < PROBES; i++) {
+            probes[i] = search_root_probe(srv, args[i]);
+        }
+        char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
+        cbm_mcp_server_set_search_scan_command_for_test(srv, NULL);
+        char *json_inner = json_response ? extract_text_content(json_response) : NULL;
+        bool total_counts_inside_only =
+            json_inner && strstr(json_inner, "\"total_grep_matches\":3");
+        free(json_inner);
+        free(json_response);
+
+        cbm_mcp_server_free(srv);
         search_root_fixture_destroy(&fx);
-    }
-    ASSERT_TRUE(fixture_ok);
 
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *store = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(store);
-    const char *project = "search-root";
-    cbm_mcp_server_set_project(srv, project);
-    ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
-
-    char scan_command[CBM_SZ_4K];
-    int command_length =
-        snprintf(scan_command, sizeof(scan_command),
-                 "grep -Hn -F ROOTCHECK_NEEDLE -- '%s/main.c' '%s/mirror.c' '%s/link.c' "
-                 "'%s/lib/deep.c' '%s/lib/sym.c' '%s/alias/same.c'",
-                 fx.root, fx.root, fx.root, fx.root, fx.root, fx.root);
-    ASSERT_TRUE(command_length > 0 && (size_t)command_length < sizeof(scan_command));
-    cbm_mcp_server_set_search_scan_command_for_test(srv, scan_command);
-
-    static const char *const args[] = {
-        SEARCH_ROOT_ARGS(",\"raw_limit\":10"),
-        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"format\":\"json\""),
-        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"full\""),
-        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"files\""),
-    };
-    enum { PROBES = sizeof(args) / sizeof(args[0]) };
-    search_root_probe_t probes[PROBES];
-    for (size_t i = 0; i < PROBES; i++) {
-        probes[i] = search_root_probe(srv, args[i]);
-    }
-    char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
-    cbm_mcp_server_set_search_scan_command_for_test(srv, NULL);
-    char *json_inner = json_response ? extract_text_content(json_response) : NULL;
-    bool total_counts_inside_only = json_inner && strstr(json_inner, "\"total_grep_matches\":3");
-    free(json_inner);
-    free(json_response);
-
-    cbm_mcp_server_free(srv);
-    search_root_fixture_destroy(&fx);
-
-    for (size_t i = 0; i < PROBES; i++) {
-        ASSERT_TRUE(probes[i].ok);
-        ASSERT_FALSE(probes[i].outside);
-        ASSERT_TRUE(probes[i].inside_file);
-        ASSERT_TRUE(probes[i].inside_dir_link);
-        ASSERT_TRUE(probes[i].inside_file_link);
-    }
-    ASSERT_TRUE(total_counts_inside_only);
-    PASS();
+        for (size_t i = 0; i < PROBES; i++) {
+            ASSERT_TRUE(probes[i].ok);
+            ASSERT_FALSE(probes[i].outside);
+            ASSERT_TRUE(probes[i].inside_file);
+            ASSERT_TRUE(probes[i].inside_dir_link);
+            ASSERT_TRUE(probes[i].inside_file_link);
+        }
+        ASSERT_TRUE(total_counts_inside_only);
+        PASS();
 #endif
-}
+    }
 
-SUITE(mcp) {
-    RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
-    RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
-    RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
-    /* #518/#519 — BM25 prose search */
-    RUN_TEST(bm25_finds_section_by_its_prose_issue518);
-    RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
-    RUN_TEST(bm25_results_and_total_stay_consistent_issue518);
-    RUN_TEST(bm25_identifier_match_outranks_prose_only_match_issue518);
-    RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
-    RUN_TEST(mcp_path_within_root_rejects_escape);
-    RUN_TEST(detect_changes_rejects_option_like_base_branch);
-    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
-    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
-    RUN_TEST(index_repository_refuses_overbroad_roots_by_default);
-    RUN_TEST(index_repository_honors_allowed_root);
-    /* JSON-RPC parsing */
-    RUN_TEST(jsonrpc_parse_request);
-    RUN_TEST(jsonrpc_parse_notification);
-    RUN_TEST(jsonrpc_parse_invalid);
-    RUN_TEST(tree_cell_reversibly_encodes_invalid_utf8);
-    RUN_TEST(output_text_accepts_embedded_nul_as_valid_utf8);
-    RUN_TEST(json_to_tree_uses_header_once_rows_without_losing_metadata);
-    RUN_TEST(json_to_tree_keeps_multiline_source_readable);
-    RUN_TEST(json_to_tree_quotes_dynamic_keys_without_line_injection);
-    RUN_TEST(json_to_tree_preserves_embedded_nul_keys_values_and_table_cells);
-    RUN_TEST(tree_table_uses_prefix_dictionary_only_when_it_materially_wins);
-    RUN_TEST(jsonrpc_parse_tools_call);
-    RUN_TEST(jsonrpc_parse_string_id_issue253);
-    RUN_TEST(jsonrpc_format_response_string_id_issue253);
+    SUITE(mcp) {
+        RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
+        RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
+        RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
+        /* #518/#519 — BM25 prose search */
+        RUN_TEST(bm25_finds_section_by_its_prose_issue518);
+        RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
+        RUN_TEST(bm25_results_and_total_stay_consistent_issue518);
+        RUN_TEST(bm25_identifier_match_outranks_prose_only_match_issue518);
+        RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
+        RUN_TEST(mcp_path_within_root_rejects_escape);
+        RUN_TEST(detect_changes_rejects_option_like_base_branch);
+        RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
+        RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
+        RUN_TEST(index_repository_refuses_overbroad_roots_by_default);
+        RUN_TEST(index_repository_honors_allowed_root);
+        /* JSON-RPC parsing */
+        RUN_TEST(jsonrpc_parse_request);
+        RUN_TEST(jsonrpc_parse_notification);
+        RUN_TEST(jsonrpc_parse_invalid);
+        RUN_TEST(tree_cell_reversibly_encodes_invalid_utf8);
+        RUN_TEST(output_text_accepts_embedded_nul_as_valid_utf8);
+        RUN_TEST(json_to_tree_uses_header_once_rows_without_losing_metadata);
+        RUN_TEST(json_to_tree_keeps_multiline_source_readable);
+        RUN_TEST(json_to_tree_quotes_dynamic_keys_without_line_injection);
+        RUN_TEST(json_to_tree_preserves_embedded_nul_keys_values_and_table_cells);
+        RUN_TEST(tree_table_uses_prefix_dictionary_only_when_it_materially_wins);
+        RUN_TEST(jsonrpc_parse_tools_call);
+        RUN_TEST(jsonrpc_parse_string_id_issue253);
+        RUN_TEST(jsonrpc_format_response_string_id_issue253);
 
-    /* JSON-RPC parsing — edge cases */
-    RUN_TEST(jsonrpc_parse_empty_string);
-    RUN_TEST(jsonrpc_parse_missing_jsonrpc_field);
-    RUN_TEST(jsonrpc_parse_missing_method);
-    RUN_TEST(jsonrpc_parse_string_id);
-    RUN_TEST(jsonrpc_parse_no_params);
-    RUN_TEST(jsonrpc_parse_extra_whitespace);
-    RUN_TEST(jsonrpc_parse_array_not_object);
+        /* JSON-RPC parsing — edge cases */
+        RUN_TEST(jsonrpc_parse_empty_string);
+        RUN_TEST(jsonrpc_parse_missing_jsonrpc_field);
+        RUN_TEST(jsonrpc_parse_missing_method);
+        RUN_TEST(jsonrpc_parse_string_id);
+        RUN_TEST(jsonrpc_parse_no_params);
+        RUN_TEST(jsonrpc_parse_extra_whitespace);
+        RUN_TEST(jsonrpc_parse_array_not_object);
 
-    /* JSON-RPC formatting */
-    RUN_TEST(jsonrpc_format_response);
-    RUN_TEST(jsonrpc_format_error);
+        /* JSON-RPC formatting */
+        RUN_TEST(jsonrpc_format_response);
+        RUN_TEST(jsonrpc_format_error);
 
-    /* MCP protocol helpers */
-    RUN_TEST(mcp_initialize_response);
-    RUN_TEST(mcp_tools_list);
-    RUN_TEST(mcp_tools_help_list_matches_registry);
-    RUN_TEST(mcp_tools_list_latest_metadata);
-    RUN_TEST(mcp_discovery_defaults_match_runtime_contract);
-    RUN_TEST(mcp_metadata_byte_budget);
-    RUN_TEST(mcp_tools_have_behavior_annotations);
-    RUN_TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118);
-    RUN_TEST(mcp_index_repository_declares_name_override_issue571);
-    RUN_TEST(mcp_tools_array_schemas_have_items);
-    RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
-    RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
-    RUN_TEST(mcp_get_architecture_behavior_evidence_schema);
-    RUN_TEST(mcp_text_result);
-    RUN_TEST(mcp_text_result_omits_structured_content_for_plain_text);
-    RUN_TEST(mcp_text_result_reversibly_encodes_invalid_utf8_as_standard_json);
-    RUN_TEST(mcp_every_tool_result_is_duplication_free);
-    RUN_TEST(mcp_cancel_matches_request_id);
-    RUN_TEST(mcp_text_result_error);
+        /* MCP protocol helpers */
+        RUN_TEST(mcp_initialize_response);
+        RUN_TEST(mcp_tools_list);
+        RUN_TEST(mcp_tools_help_list_matches_registry);
+        RUN_TEST(mcp_tools_list_latest_metadata);
+        RUN_TEST(mcp_discovery_defaults_match_runtime_contract);
+        RUN_TEST(mcp_metadata_byte_budget);
+        RUN_TEST(mcp_tools_have_behavior_annotations);
+        RUN_TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118);
+        RUN_TEST(mcp_index_repository_declares_name_override_issue571);
+        RUN_TEST(mcp_tools_array_schemas_have_items);
+        RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
+        RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
+        RUN_TEST(mcp_get_architecture_behavior_evidence_schema);
+        RUN_TEST(mcp_text_result);
+        RUN_TEST(mcp_text_result_omits_structured_content_for_plain_text);
+        RUN_TEST(mcp_text_result_reversibly_encodes_invalid_utf8_as_standard_json);
+        RUN_TEST(mcp_every_tool_result_is_duplication_free);
+        RUN_TEST(mcp_cancel_matches_request_id);
+        RUN_TEST(mcp_text_result_error);
 
-    /* Argument extraction */
-    RUN_TEST(mcp_get_tool_name);
-    RUN_TEST(mcp_get_arguments);
-    RUN_TEST(mcp_get_string_arg);
-    RUN_TEST(mcp_get_int_arg);
-    RUN_TEST(mcp_get_bool_arg);
+        /* Argument extraction */
+        RUN_TEST(mcp_get_tool_name);
+        RUN_TEST(mcp_get_arguments);
+        RUN_TEST(mcp_get_string_arg);
+        RUN_TEST(mcp_get_int_arg);
+        RUN_TEST(mcp_get_bool_arg);
 
-    /* Argument extraction — edge cases */
-    RUN_TEST(mcp_get_string_arg_empty_json);
-    RUN_TEST(mcp_get_string_arg_empty_object);
-    RUN_TEST(mcp_get_string_arg_nested_value);
-    RUN_TEST(mcp_get_string_arg_int_value);
-    RUN_TEST(mcp_get_int_arg_empty_json);
-    RUN_TEST(mcp_get_int_arg_string_value);
-    RUN_TEST(mcp_get_int_arg_bool_value);
-    RUN_TEST(mcp_get_bool_arg_empty_json);
-    RUN_TEST(mcp_get_bool_arg_int_value);
-    RUN_TEST(mcp_get_tool_name_empty_json);
-    RUN_TEST(mcp_get_tool_name_missing_name);
-    RUN_TEST(mcp_get_arguments_empty_json);
-    RUN_TEST(mcp_get_arguments_no_arguments_key);
+        /* Argument extraction — edge cases */
+        RUN_TEST(mcp_get_string_arg_empty_json);
+        RUN_TEST(mcp_get_string_arg_empty_object);
+        RUN_TEST(mcp_get_string_arg_nested_value);
+        RUN_TEST(mcp_get_string_arg_int_value);
+        RUN_TEST(mcp_get_int_arg_empty_json);
+        RUN_TEST(mcp_get_int_arg_string_value);
+        RUN_TEST(mcp_get_int_arg_bool_value);
+        RUN_TEST(mcp_get_bool_arg_empty_json);
+        RUN_TEST(mcp_get_bool_arg_int_value);
+        RUN_TEST(mcp_get_tool_name_empty_json);
+        RUN_TEST(mcp_get_tool_name_missing_name);
+        RUN_TEST(mcp_get_arguments_empty_json);
+        RUN_TEST(mcp_get_arguments_no_arguments_key);
 
-    /* Server protocol handling */
-    RUN_TEST(server_handle_initialize);
-    RUN_TEST(server_handle_initialized_notification);
+        /* Server protocol handling */
+        RUN_TEST(server_handle_initialize);
+        RUN_TEST(server_handle_initialized_notification);
 #ifdef CBM_ENABLE_TEST_SEAMS
-    RUN_TEST(mcp_issue403_sensitive_root_stops_before_discovery_count);
-    RUN_TEST(mcp_issue403_explicit_approval_preserves_auto_index);
+        RUN_TEST(mcp_issue403_sensitive_root_stops_before_discovery_count);
+        RUN_TEST(mcp_issue403_explicit_approval_preserves_auto_index);
 #endif
-    RUN_TEST(server_handle_tools_list);
-    RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
-    RUN_TEST(server_handle_analysis_profile_filters_and_rejects_mutators);
-    RUN_TEST(server_handle_scout_profile_exposes_only_the_fast_tier);
-    RUN_TEST(analysis_profile_arguments_fail_closed_and_disable_http);
-    RUN_TEST(hook_windows_path_containment_is_case_insensitive_and_segment_safe);
-    RUN_TEST(server_handle_prompts_list_workflows);
-    RUN_TEST(server_handle_prompts_get_workflows);
-    RUN_TEST(server_handle_prompts_get_validates_arguments);
-    RUN_TEST(server_handle_logs_request_without_params);
-    RUN_TEST(server_handle_unknown_method);
+        RUN_TEST(server_handle_tools_list);
+        RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
+        RUN_TEST(server_handle_analysis_profile_filters_and_rejects_mutators);
+        RUN_TEST(server_handle_scout_profile_exposes_only_the_fast_tier);
+        RUN_TEST(analysis_profile_arguments_fail_closed_and_disable_http);
+        RUN_TEST(hook_windows_path_containment_is_case_insensitive_and_segment_safe);
+        RUN_TEST(server_handle_prompts_list_workflows);
+        RUN_TEST(server_handle_prompts_get_workflows);
+        RUN_TEST(server_handle_prompts_get_validates_arguments);
+        RUN_TEST(server_handle_logs_request_without_params);
+        RUN_TEST(server_handle_unknown_method);
 
-    /* Server handle — edge cases */
-    RUN_TEST(server_handle_invalid_json);
-    RUN_TEST(server_handle_empty_object);
-    RUN_TEST(server_handle_tools_call_missing_name);
+        /* Server handle — edge cases */
+        RUN_TEST(server_handle_invalid_json);
+        RUN_TEST(server_handle_empty_object);
+        RUN_TEST(server_handle_tools_call_missing_name);
 
-    /* Tool handlers */
-    RUN_TEST(tool_list_projects_empty);
-    RUN_TEST(tool_list_projects_empty_cache_returns_wellformed_empty_page);
-    RUN_TEST(tool_get_graph_schema_empty);
-    RUN_TEST(tool_unknown_tool);
-    RUN_TEST(tool_compare_graphs_registered_issue525);
-    RUN_TEST(tool_compare_graphs_streams_stable_deltas_issue525);
-    RUN_TEST(tool_compare_graphs_normalizes_legacy_path_separators_issue525);
-    RUN_TEST(tool_compare_graphs_sanitizes_legacy_invalid_utf8_issue525);
-    RUN_TEST(tool_compare_graphs_bind_failures_are_atomic_issue525);
-    RUN_TEST(tool_compare_graphs_midscan_cancel_restores_store_state_issue525);
-    RUN_TEST(tool_compare_graphs_progress_cancel_clears_handler_issue525);
-    RUN_TEST(tool_compare_graphs_enforces_encoded_budget_issue525);
-    RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
-    RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
-    RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
-    RUN_TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders);
-    RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
-    RUN_TEST(tool_search_graph_basic);
-    RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
-    RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
-    RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
-    RUN_TEST(tool_trace_totals_respect_test_filter);
-    RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
-    RUN_TEST(tool_get_architecture_cycles_detects_scc);
-    RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
-    RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
-    RUN_TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget);
-    RUN_TEST(tool_search_graph_includes_node_properties);
-    RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
-    RUN_TEST(tool_lean_defaults_schema_and_status);
-    RUN_TEST(tool_index_status_keeps_authoritative_ignored_total_when_rows_are_sampled);
-    RUN_TEST(tool_index_status_reports_an_unreadable_count_as_an_error);
-    RUN_TEST(tool_output_regression_gate);
-    RUN_TEST(tool_output_byte_budgets);
-    RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
-    RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
-    RUN_TEST(tool_search_graph_bm25_applies_label_filter);
-    RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
-    RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
-    RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
-    RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
-    RUN_TEST(tool_search_graph_semantic_query_rejects_non_string_elements);
-    RUN_TEST(tool_search_graph_semantic_store_error_fails_closed);
-    RUN_TEST(tool_search_graph_budget_preserves_long_values_and_continuation);
-    RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
-    RUN_TEST(tool_query_graph_basic);
-    RUN_TEST(tool_query_graph_default_budget_is_truthful_and_expandable);
-    RUN_TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound);
-    RUN_TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping);
-    RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
-    RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
-    RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
-    RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
-    RUN_TEST(tool_index_status_no_project);
-    RUN_TEST(tool_ingest_traces_stores_observed_calls);
-    RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
-    RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
-    RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
-    RUN_TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics);
-    RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
-    RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
-    RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
-    RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
-    RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
-    RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
-    RUN_TEST(tool_index_status_includes_git_metadata);
+        /* Tool handlers */
+        RUN_TEST(tool_list_projects_empty);
+        RUN_TEST(tool_list_projects_empty_cache_returns_wellformed_empty_page);
+        RUN_TEST(tool_get_graph_schema_empty);
+        RUN_TEST(tool_unknown_tool);
+        RUN_TEST(tool_compare_graphs_registered_issue525);
+        RUN_TEST(tool_compare_graphs_streams_stable_deltas_issue525);
+        RUN_TEST(tool_compare_graphs_normalizes_legacy_path_separators_issue525);
+        RUN_TEST(tool_compare_graphs_sanitizes_legacy_invalid_utf8_issue525);
+        RUN_TEST(tool_compare_graphs_bind_failures_are_atomic_issue525);
+        RUN_TEST(tool_compare_graphs_midscan_cancel_restores_store_state_issue525);
+        RUN_TEST(tool_compare_graphs_progress_cancel_clears_handler_issue525);
+        RUN_TEST(tool_compare_graphs_enforces_encoded_budget_issue525);
+        RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
+        RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
+        RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
+        RUN_TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders);
+        RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
+        RUN_TEST(tool_search_graph_basic);
+        RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
+        RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
+        RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
+        RUN_TEST(tool_trace_totals_respect_test_filter);
+        RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
+        RUN_TEST(tool_get_architecture_cycles_detects_scc);
+        RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+        RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
+        RUN_TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget);
+        RUN_TEST(tool_search_graph_includes_node_properties);
+        RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
+        RUN_TEST(tool_lean_defaults_schema_and_status);
+        RUN_TEST(tool_index_status_keeps_authoritative_ignored_total_when_rows_are_sampled);
+        RUN_TEST(tool_index_status_reports_an_unreadable_count_as_an_error);
+        RUN_TEST(tool_output_regression_gate);
+        RUN_TEST(tool_output_byte_budgets);
+        RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+        RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
+        RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+        RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
+        RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
+        RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
+        RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
+        RUN_TEST(tool_search_graph_semantic_query_rejects_non_string_elements);
+        RUN_TEST(tool_search_graph_semantic_store_error_fails_closed);
+        RUN_TEST(tool_search_graph_budget_preserves_long_values_and_continuation);
+        RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
+        RUN_TEST(tool_query_graph_basic);
+        RUN_TEST(tool_query_graph_default_budget_is_truthful_and_expandable);
+        RUN_TEST(tool_query_graph_cursor_is_lossless_and_snapshot_bound);
+        RUN_TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping);
+        RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
+        RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
+        RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
+        RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
+        RUN_TEST(tool_index_status_no_project);
+        RUN_TEST(tool_ingest_traces_stores_observed_calls);
+        RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
+        RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
+        RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
+        RUN_TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics);
+        RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
+        RUN_TEST(
+            tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
+        RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
+        RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
+        RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
+        RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
+        RUN_TEST(tool_index_status_includes_git_metadata);
 
-    /* Tool handlers with validation */
-    RUN_TEST(tool_trace_call_path_not_found);
-    RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
-    RUN_TEST(tool_trace_missing_function_name);
-    RUN_TEST(tool_trace_call_path_ambiguous);
-    RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
-    RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
-    RUN_TEST(tool_trace_pagination_exactly_once);
-    RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
-    RUN_TEST(tool_trace_budget_never_slices_identifiers);
-    RUN_TEST(tool_trace_cursor_survives_output_budget_increase);
-    RUN_TEST(tool_trace_budget_drops_huge_optional_args_before_graph_row);
-    RUN_TEST(tool_trace_reports_engine_saturation_as_lower_bound);
-    RUN_TEST(store_bfs_edge_data_is_skippable_and_bounded);
-    RUN_TEST(tool_trace_call_path_prefers_definition);
-    RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
-    RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
-    RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
-    RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
-    RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
-    RUN_TEST(tool_trace_path_edge_details_use_canonical_predecessor);
-    RUN_TEST(tool_trace_path_evidence_columns_align_across_optional_modes);
-    RUN_TEST(tool_trace_call_path_depth_clamped);
-    RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
-    RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
-    RUN_TEST(tool_delete_project_not_found);
-    RUN_TEST(tool_get_architecture_empty);
-    RUN_TEST(tool_get_architecture_behavior_evidence_validation);
-    RUN_TEST(tool_get_architecture_behavior_evidence_cache_isolation);
-    RUN_TEST(tool_get_architecture_emits_populated_sections);
-    RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
-    RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
-    RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
-    RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
-    RUN_TEST(tool_project_path_resolves_owning_project_issue1690);
-    RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
-    RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
-    RUN_TEST(tool_index_repository_reuses_existing_project_for_root_issue2134);
-    RUN_TEST(tool_get_architecture_path_scoping);
-    RUN_TEST(tool_query_graph_missing_query);
+        /* Tool handlers with validation */
+        RUN_TEST(tool_trace_call_path_not_found);
+        RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
+        RUN_TEST(tool_trace_missing_function_name);
+        RUN_TEST(tool_trace_call_path_ambiguous);
+        RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
+        RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
+        RUN_TEST(tool_trace_pagination_exactly_once);
+        RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
+        RUN_TEST(tool_trace_budget_never_slices_identifiers);
+        RUN_TEST(tool_trace_cursor_survives_output_budget_increase);
+        RUN_TEST(tool_trace_budget_drops_huge_optional_args_before_graph_row);
+        RUN_TEST(tool_trace_reports_engine_saturation_as_lower_bound);
+        RUN_TEST(store_bfs_edge_data_is_skippable_and_bounded);
+        RUN_TEST(tool_trace_call_path_prefers_definition);
+        RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
+        RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
+        RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+        RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
+        RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
+        RUN_TEST(tool_trace_path_edge_details_use_canonical_predecessor);
+        RUN_TEST(tool_trace_path_evidence_columns_align_across_optional_modes);
+        RUN_TEST(tool_trace_call_path_depth_clamped);
+        RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
+        RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
+        RUN_TEST(tool_delete_project_not_found);
+        RUN_TEST(tool_get_architecture_empty);
+        RUN_TEST(tool_get_architecture_behavior_evidence_validation);
+        RUN_TEST(tool_get_architecture_behavior_evidence_cache_isolation);
+        RUN_TEST(tool_get_architecture_emits_populated_sections);
+        RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
+        RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
+        RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
+        RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
+        RUN_TEST(tool_project_path_resolves_owning_project_issue1690);
+        RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
+        RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
+        RUN_TEST(tool_index_repository_reuses_existing_project_for_root_issue2134);
+        RUN_TEST(tool_get_architecture_path_scoping);
+        RUN_TEST(tool_query_graph_missing_query);
 
-    /* Pipeline-dependent tool handlers */
-    RUN_TEST(tool_index_repository_missing_path);
-    RUN_TEST(tool_get_code_snippet_missing_qn);
-    RUN_TEST(tool_get_code_snippet_not_found);
-    RUN_TEST(tool_search_code_missing_pattern);
-    RUN_TEST(tool_search_code_negative_limit_is_not_echoed_issue1511);
-    RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
-    RUN_TEST(tool_search_code_declares_independent_result_and_raw_content_paging);
-    RUN_TEST(tool_search_code_no_project);
-    RUN_TEST(search_code_early_errors_release_path_filter_regex);
-    RUN_TEST(search_code_multi_word);
-    RUN_TEST(search_code_full_preserves_utf8_source);
-    RUN_TEST(search_code_raw_match_preserves_utf8_content);
-    RUN_TEST(search_code_context_preserves_utf8_context);
-    RUN_TEST(search_code_invalid_utf8_still_returns_valid_json);
-    RUN_TEST(search_code_preserves_valid_utf8_source);
-    RUN_TEST(search_code_scans_complete_stream_and_ranks_globally);
-    RUN_TEST(search_code_fails_closed_when_complete_scan_is_impossible);
-    RUN_TEST(search_code_scoped_scan_uses_canonical_file_nodes);
-    RUN_TEST(search_code_scoped_file_pattern_is_busybox_portable);
-    RUN_TEST(search_code_recursive_fallback_propagates_discovery_failures);
-    RUN_TEST(search_code_default_budget_limits_raw_rows_before_graph_results);
-    RUN_TEST(search_code_raw_and_directory_remainders_are_independently_pageable);
-    RUN_TEST(search_code_ranked_results_have_lossless_second_page);
-    RUN_TEST(search_code_ranked_budget_omission_has_lossless_continuation);
-    RUN_TEST(search_code_preserves_multi_kib_identities_and_distinct_long_directories);
-    RUN_TEST(search_code_long_raw_line_is_one_truthfully_truncated_match);
-    RUN_TEST(search_code_raw_preview_centers_late_match_and_pages_content_bytes);
-    RUN_TEST(search_code_raw_preview_reversibly_pages_malformed_utf8_bytes);
-    RUN_TEST(search_code_match_locations_are_explicitly_bounded_and_expandable);
-    RUN_TEST(search_code_scoped_path_with_spaces_issue687);
+        /* Pipeline-dependent tool handlers */
+        RUN_TEST(tool_index_repository_missing_path);
+        RUN_TEST(tool_get_code_snippet_missing_qn);
+        RUN_TEST(tool_get_code_snippet_not_found);
+        RUN_TEST(tool_search_code_missing_pattern);
+        RUN_TEST(tool_search_code_negative_limit_is_not_echoed_issue1511);
+        RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
+        RUN_TEST(tool_search_code_declares_independent_result_and_raw_content_paging);
+        RUN_TEST(tool_search_code_no_project);
+        RUN_TEST(search_code_early_errors_release_path_filter_regex);
+        RUN_TEST(search_code_multi_word);
+        RUN_TEST(search_code_full_preserves_utf8_source);
+        RUN_TEST(search_code_raw_match_preserves_utf8_content);
+        RUN_TEST(search_code_context_preserves_utf8_context);
+        RUN_TEST(search_code_invalid_utf8_still_returns_valid_json);
+        RUN_TEST(search_code_preserves_valid_utf8_source);
+        RUN_TEST(search_code_scans_complete_stream_and_ranks_globally);
+        RUN_TEST(search_code_fails_closed_when_complete_scan_is_impossible);
+        RUN_TEST(search_code_scoped_scan_uses_canonical_file_nodes);
+        RUN_TEST(search_code_scoped_file_pattern_is_busybox_portable);
+        RUN_TEST(search_code_recursive_fallback_propagates_discovery_failures);
+        RUN_TEST(search_code_default_budget_limits_raw_rows_before_graph_results);
+        RUN_TEST(search_code_raw_and_directory_remainders_are_independently_pageable);
+        RUN_TEST(search_code_ranked_results_have_lossless_second_page);
+        RUN_TEST(search_code_ranked_budget_omission_has_lossless_continuation);
+        RUN_TEST(search_code_preserves_multi_kib_identities_and_distinct_long_directories);
+        RUN_TEST(search_code_long_raw_line_is_one_truthfully_truncated_match);
+        RUN_TEST(search_code_raw_preview_centers_late_match_and_pages_content_bytes);
+        RUN_TEST(search_code_raw_preview_reversibly_pages_malformed_utf8_bytes);
+        RUN_TEST(search_code_match_locations_are_explicitly_bounded_and_expandable);
+        RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
-    RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
+        RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
 #endif
-    RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
-    RUN_TEST(search_code_long_line_does_not_invent_matches);
-    RUN_TEST(search_code_path_filter_matches_nothing);
-    RUN_TEST(search_code_oversized_path_filter_is_tool_error);
-    RUN_TEST(search_graph_oversized_name_pattern_is_tool_error);
-    RUN_TEST(search_code_file_pattern_prefilter_boundaries);
-    RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
-    RUN_TEST(search_code_cancel_cleans_supervised_scan);
-    RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
-    RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
-    RUN_TEST(search_code_scan_deadline_override_is_per_server);
-    RUN_TEST(search_code_scan_setup_failures_respect_cause_precedence);
-    RUN_TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed);
-    RUN_TEST(search_code_scan_cancellation_precedes_zero_deadline);
-    RUN_TEST(search_code_scan_deadline_precedes_output_limit);
-    RUN_TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up);
-    RUN_TEST(search_code_scratch_creation_error_releases_path_filter);
-    RUN_TEST(search_code_scoped_exit_one_is_not_no_match);
-    RUN_TEST(search_code_no_match_is_empty_for_direct_and_scoped_routes);
-    RUN_TEST(search_code_scoped_scan_skips_non_regular_indexed_paths);
-    RUN_TEST(search_code_windows_scan_pins_utf8_output);
-    RUN_TEST(search_code_invalid_regex_errors_issue283);
-    RUN_TEST(search_code_literal_pipe_warns_issue282);
-    RUN_TEST(search_code_reports_phase_timings_only_in_debug_mode);
-    RUN_TEST(search_code_ampersand_accepted_issue272);
-    RUN_TEST(tool_detect_changes_no_project);
-    RUN_TEST(tool_manage_adr_no_project);
-    RUN_TEST(tool_manage_adr_get_with_existing_adr);
-    RUN_TEST(tool_manage_adr_defaults_to_bounded_outline);
-    RUN_TEST(tool_manage_adr_rejects_unknown_mode_and_empty_update);
-    RUN_TEST(tool_manage_adr_unified_backend_issue256);
-    RUN_TEST(tool_manage_adr_rejects_removed_sections_argument);
-    RUN_TEST(tool_manage_adr_set_sections_replaces_only_named);
-    RUN_TEST(tool_manage_adr_set_sections_is_idempotent);
-    RUN_TEST(tool_manage_adr_set_sections_creates_when_absent);
-    RUN_TEST(tool_manage_adr_set_sections_without_updates_errors);
-    RUN_TEST(tool_manage_adr_set_sections_rejects_unwritable_sections);
-    RUN_TEST(tool_manage_adr_set_sections_adds_custom_heading);
-    RUN_TEST(tool_manage_adr_set_sections_preserves_preamble_and_order);
-    RUN_TEST(tool_manage_adr_set_sections_refuses_unterminated_fence);
-    RUN_TEST(tool_manage_adr_sections_agrees_with_write_path);
-    RUN_TEST(tool_manage_adr_set_sections_rejects_oversize);
-    RUN_TEST(tool_manage_adr_set_sections_is_advertised);
-    RUN_TEST(tool_index_repository_reports_store_backed_adr);
-    RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
-    RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);
-    RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
-    RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
-    RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
-    RUN_TEST(index_repository_cli_name_override_issue823);
-    RUN_TEST(index_repository_over_budget_reports_named_reason);
-    RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
-    RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
-    RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
-    RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
-    RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
-    RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
-    RUN_TEST(index_second_inprocess_run_survives_issue773);
-    RUN_TEST(index_recovery_parallel_quarantines_crasher);
-    RUN_TEST(index_recovery_quarantines_exit_nonzero);
-    RUN_TEST(index_recovery_systemic_exit_nonzero_gives_up);
-    RUN_TEST(tool_manage_adr_not_found_rich_error);
-    RUN_TEST(tool_manage_adr_get_accepts_abs_path);
-    RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
-    RUN_TEST(tool_detect_changes_not_found_rich_error);
-    RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
-    RUN_TEST(detect_changes_default_base_follows_origin_head_issue1357);
-    RUN_TEST(detect_changes_default_base_falls_back_to_master_issue1357);
-    RUN_TEST(detect_changes_explicit_base_is_used_as_given_issue1357);
-    RUN_TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357);
-    RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
-    RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
-    RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
-    RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
-    RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);
-    RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
-    RUN_TEST(tool_detect_changes_pages_changed_files_and_honors_semantic_budget);
-    RUN_TEST(tool_detect_changes_output_budget_sets_truncated_in_tree_and_json);
-    RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
-    RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
-    RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
-    RUN_TEST(detect_changes_seed_list_reports_hunk_without_walk);
-    RUN_TEST(detect_changes_seed_pages_bind_semantics_and_snapshot);
-    RUN_TEST(detect_changes_product_filter_does_not_inflate_fallback);
-    RUN_TEST(detect_changes_seed_params_reject_misuse);
-    RUN_TEST(detect_changes_product_filter_uses_project_config_and_override);
-    RUN_TEST(detect_changes_scope_tests_answers_test_impact);
-    RUN_TEST(detect_changes_fixpoint_walks_past_depth);
-    RUN_TEST(detect_changes_edge_types_reach_references);
-    RUN_TEST(detect_changes_via_names_the_parent);
-    RUN_TEST(detect_changes_walk_params_teach_on_misuse);
-    RUN_TEST(detect_changes_cursor_bound_to_walk_params);
-    RUN_TEST(detect_changes_default_output_is_byte_identical_golden);
-    RUN_TEST(tool_ingest_traces_basic);
-    RUN_TEST(tool_ingest_traces_empty);
+        RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
+        RUN_TEST(search_code_long_line_does_not_invent_matches);
+        RUN_TEST(search_code_path_filter_matches_nothing);
+        RUN_TEST(search_code_oversized_path_filter_is_tool_error);
+        RUN_TEST(search_graph_oversized_name_pattern_is_tool_error);
+        RUN_TEST(search_code_file_pattern_prefilter_boundaries);
+        RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
+        RUN_TEST(search_code_cancel_cleans_supervised_scan);
+        RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
+        RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
+        RUN_TEST(search_code_scan_deadline_override_is_per_server);
+        RUN_TEST(search_code_scan_setup_failures_respect_cause_precedence);
+        RUN_TEST(search_code_scan_live_child_deadline_is_bounded_and_fails_closed);
+        RUN_TEST(search_code_scan_cancellation_precedes_zero_deadline);
+        RUN_TEST(search_code_scan_deadline_precedes_output_limit);
+        RUN_TEST(search_code_scan_hook_rejection_is_contained_and_cleans_up);
+        RUN_TEST(search_code_scratch_creation_error_releases_path_filter);
+        RUN_TEST(search_code_scoped_exit_one_is_not_no_match);
+        RUN_TEST(search_code_no_match_is_empty_for_direct_and_scoped_routes);
+        RUN_TEST(search_code_scoped_scan_skips_non_regular_indexed_paths);
+        RUN_TEST(search_code_windows_scan_pins_utf8_output);
+        RUN_TEST(search_code_invalid_regex_errors_issue283);
+        RUN_TEST(search_code_literal_pipe_warns_issue282);
+        RUN_TEST(search_code_reports_phase_timings_only_in_debug_mode);
+        RUN_TEST(search_code_ampersand_accepted_issue272);
+        RUN_TEST(tool_detect_changes_no_project);
+        RUN_TEST(tool_manage_adr_no_project);
+        RUN_TEST(tool_manage_adr_get_with_existing_adr);
+        RUN_TEST(tool_manage_adr_defaults_to_bounded_outline);
+        RUN_TEST(tool_manage_adr_rejects_unknown_mode_and_empty_update);
+        RUN_TEST(tool_manage_adr_unified_backend_issue256);
+        RUN_TEST(tool_manage_adr_rejects_removed_sections_argument);
+        RUN_TEST(tool_manage_adr_set_sections_replaces_only_named);
+        RUN_TEST(tool_manage_adr_set_sections_is_idempotent);
+        RUN_TEST(tool_manage_adr_set_sections_creates_when_absent);
+        RUN_TEST(tool_manage_adr_set_sections_without_updates_errors);
+        RUN_TEST(tool_manage_adr_set_sections_rejects_unwritable_sections);
+        RUN_TEST(tool_manage_adr_set_sections_adds_custom_heading);
+        RUN_TEST(tool_manage_adr_set_sections_preserves_preamble_and_order);
+        RUN_TEST(tool_manage_adr_set_sections_refuses_unterminated_fence);
+        RUN_TEST(tool_manage_adr_sections_agrees_with_write_path);
+        RUN_TEST(tool_manage_adr_set_sections_rejects_oversize);
+        RUN_TEST(tool_manage_adr_set_sections_is_advertised);
+        RUN_TEST(tool_index_repository_reports_store_backed_adr);
+        RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
+        RUN_TEST(tool_index_repository_unknown_project_name_still_requires_repo_path);
+        RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
+        RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
+        RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
+        RUN_TEST(index_repository_cli_name_override_issue823);
+        RUN_TEST(index_repository_over_budget_reports_named_reason);
+        RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
+        RUN_TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried);
+        RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
+        RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
+        RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
+        RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
+        RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
+        RUN_TEST(index_second_inprocess_run_survives_issue773);
+        RUN_TEST(index_recovery_parallel_quarantines_crasher);
+        RUN_TEST(index_recovery_quarantines_exit_nonzero);
+        RUN_TEST(index_recovery_systemic_exit_nonzero_gives_up);
+        RUN_TEST(tool_manage_adr_not_found_rich_error);
+        RUN_TEST(tool_manage_adr_get_accepts_abs_path);
+        RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
+        RUN_TEST(tool_detect_changes_not_found_rich_error);
+        RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
+        RUN_TEST(detect_changes_default_base_follows_origin_head_issue1357);
+        RUN_TEST(detect_changes_default_base_falls_back_to_master_issue1357);
+        RUN_TEST(detect_changes_explicit_base_is_used_as_given_issue1357);
+        RUN_TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357);
+        RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
+        RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
+        RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
+        RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
+        RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);
+        RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
+        RUN_TEST(tool_detect_changes_pages_changed_files_and_honors_semantic_budget);
+        RUN_TEST(tool_detect_changes_output_budget_sets_truncated_in_tree_and_json);
+        RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
+        RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
+        RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
+        RUN_TEST(detect_changes_seed_list_reports_hunk_without_walk);
+        RUN_TEST(detect_changes_seed_pages_bind_semantics_and_snapshot);
+        RUN_TEST(detect_changes_product_filter_does_not_inflate_fallback);
+        RUN_TEST(detect_changes_seed_params_reject_misuse);
+        RUN_TEST(detect_changes_product_filter_uses_project_config_and_override);
+        RUN_TEST(detect_changes_scope_tests_answers_test_impact);
+        RUN_TEST(detect_changes_fixpoint_walks_past_depth);
+        RUN_TEST(detect_changes_edge_types_reach_references);
+        RUN_TEST(detect_changes_via_names_the_parent);
+        RUN_TEST(detect_changes_walk_params_teach_on_misuse);
+        RUN_TEST(detect_changes_cursor_bound_to_walk_params);
+        RUN_TEST(detect_changes_default_output_is_byte_identical_golden);
+        RUN_TEST(tool_ingest_traces_basic);
+        RUN_TEST(tool_ingest_traces_empty);
 
-    /* Query store generation freshness */
-    RUN_TEST(query_store_reopens_after_database_replacement);
-    /* Query store read-only (data integrity) */
-    RUN_TEST(readonly_query_does_not_mutate_db);
-    RUN_TEST(readonly_query_succeeds_on_readonly_fs);
+        /* Query store generation freshness */
+        RUN_TEST(query_store_reopens_after_database_replacement);
+        /* Query store read-only (data integrity) */
+        RUN_TEST(readonly_query_does_not_mutate_db);
+        RUN_TEST(readonly_query_succeeds_on_readonly_fs);
 
-    /* Idle store eviction */
-    RUN_TEST(store_idle_eviction);
-    RUN_TEST(store_idle_no_eviction_within_timeout);
-    RUN_TEST(store_idle_evict_protects_initial_store);
-    RUN_TEST(store_idle_evict_access_resets_timer);
+        /* Idle store eviction */
+        RUN_TEST(store_idle_eviction);
+        RUN_TEST(store_idle_no_eviction_within_timeout);
+        RUN_TEST(store_idle_evict_protects_initial_store);
+        RUN_TEST(store_idle_evict_access_resets_timer);
 
-    /* URI helpers */
-    RUN_TEST(parse_file_uri_unix);
-    RUN_TEST(parse_file_uri_windows);
-    RUN_TEST(parse_file_uri_invalid);
+        /* URI helpers */
+        RUN_TEST(parse_file_uri_unix);
+        RUN_TEST(parse_file_uri_windows);
+        RUN_TEST(parse_file_uri_invalid);
 
-    /* URI helpers — edge cases */
-    RUN_TEST(parse_file_uri_http_scheme);
-    RUN_TEST(parse_file_uri_ftp_scheme);
-    RUN_TEST(parse_file_uri_buffer_too_small);
-    RUN_TEST(parse_file_uri_spaces_in_path);
-    RUN_TEST(parse_file_uri_null_out_path);
-    RUN_TEST(parse_file_uri_zero_size);
+        /* URI helpers — edge cases */
+        RUN_TEST(parse_file_uri_http_scheme);
+        RUN_TEST(parse_file_uri_ftp_scheme);
+        RUN_TEST(parse_file_uri_buffer_too_small);
+        RUN_TEST(parse_file_uri_spaces_in_path);
+        RUN_TEST(parse_file_uri_null_out_path);
+        RUN_TEST(parse_file_uri_zero_size);
 
-    /* Poll/getline FILE* buffering fix */
+        /* Poll/getline FILE* buffering fix */
 #ifndef _WIN32
-    RUN_TEST(mcp_server_run_rapid_messages);
+        RUN_TEST(mcp_server_run_rapid_messages);
 #endif
 
-    /* Snippet resolution (port of snippet_test.go) */
-    RUN_TEST(snippet_exact_qn);
-    RUN_TEST(snippet_doc_candidates_both_directions);
-    RUN_TEST(snippet_qn_suffix);
-    RUN_TEST(snippet_unique_short_name);
-    RUN_TEST(snippet_c_macro_namespace_c1);
-    RUN_TEST(snippet_name_tier);
-    RUN_TEST(snippet_ambiguous_short_name);
-    RUN_TEST(snippet_not_found);
-    RUN_TEST(snippet_fuzzy_suggestions);
-    RUN_TEST(snippet_enriched_properties);
-    RUN_TEST(snippet_fuzzy_last_segment);
-    RUN_TEST(snippet_auto_resolve_default);
-    RUN_TEST(snippet_auto_resolve_enabled);
-    RUN_TEST(snippet_include_neighbors_default);
-    RUN_TEST(snippet_include_neighbors_enabled);
-    RUN_TEST(snippet_source_invalid_utf8);
-    RUN_TEST(tool_bad_project_name_no_overflow_issue235);
-    RUN_TEST(tool_bad_project_error_valid_json_issue235);
-    RUN_TEST(tool_underscore_projects_visible_in_cache_scans);
-    RUN_TEST(tool_reindex_reuses_underscore_root_owner);
-    RUN_TEST(tool_resolve_store_by_internal_name_issue704);
-    RUN_TEST(tool_list_projects_ignores_missed_shadow_issue1044);
+        /* Snippet resolution (port of snippet_test.go) */
+        RUN_TEST(snippet_exact_qn);
+        RUN_TEST(snippet_doc_candidates_both_directions);
+        RUN_TEST(snippet_qn_suffix);
+        RUN_TEST(snippet_unique_short_name);
+        RUN_TEST(snippet_c_macro_namespace_c1);
+        RUN_TEST(snippet_name_tier);
+        RUN_TEST(snippet_ambiguous_short_name);
+        RUN_TEST(snippet_not_found);
+        RUN_TEST(snippet_fuzzy_suggestions);
+        RUN_TEST(snippet_enriched_properties);
+        RUN_TEST(snippet_fuzzy_last_segment);
+        RUN_TEST(snippet_auto_resolve_default);
+        RUN_TEST(snippet_auto_resolve_enabled);
+        RUN_TEST(snippet_include_neighbors_default);
+        RUN_TEST(snippet_include_neighbors_enabled);
+        RUN_TEST(snippet_source_invalid_utf8);
+        RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+        RUN_TEST(tool_bad_project_error_valid_json_issue235);
+        RUN_TEST(tool_underscore_projects_visible_in_cache_scans);
+        RUN_TEST(tool_reindex_reuses_underscore_root_owner);
+        RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+        RUN_TEST(tool_list_projects_ignores_missed_shadow_issue1044);
 
-    /* auto_watch gate (distilled from PR #625) */
-    RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
-    RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
-    RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
-    RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
-    RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
-    RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
-    RUN_TEST(autoindex_limit_guards_git_root_issue713);
-    RUN_TEST(search_code_context_window_is_bounded);
-    RUN_TEST(search_code_context_extreme_values_answer_normally);
-    RUN_TEST(tool_query_graph_max_rows_above_ceiling_is_capped);
-    RUN_TEST(tool_search_graph_limit_above_ceiling_is_capped);
-    RUN_TEST(tool_trace_cursor_truncated_after_leg_is_rejected);
-    RUN_TEST(search_code_rejects_quote_in_file_pattern);
+        /* auto_watch gate (distilled from PR #625) */
+        RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
+        RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
+        RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
+        RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
+        RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
+        RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
+        RUN_TEST(autoindex_limit_guards_git_root_issue713);
+        RUN_TEST(search_code_context_window_is_bounded);
+        RUN_TEST(search_code_context_extreme_values_answer_normally);
+        RUN_TEST(tool_query_graph_max_rows_above_ceiling_is_capped);
+        RUN_TEST(tool_search_graph_limit_above_ceiling_is_capped);
+        RUN_TEST(tool_trace_cursor_truncated_after_leg_is_rejected);
+        RUN_TEST(search_code_rejects_quote_in_file_pattern);
 
-    /* search_code: every match resolves inside the project root */
-    RUN_TEST(search_code_matches_stay_inside_project_root);
-    RUN_TEST(search_code_drops_walker_hits_that_resolve_outside_root);
-}
+        /* search_code: every match resolves inside the project root */
+        RUN_TEST(search_code_matches_stay_inside_project_root);
+        RUN_TEST(search_code_drops_walker_hits_that_resolve_outside_root);
+    }
 
-/* Kept separate so daemon-coordination regressions can be iterated without
- * running the much larger MCP behavior suite. */
-SUITE(mcp_mutation_guard) {
-    RUN_TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes);
-    RUN_TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes);
-    RUN_TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes);
-    RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
-    RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
-    RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
-    RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
-    RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
-    RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);
-    RUN_TEST(tool_manage_adr_read_missing_store_skips_mutation_guard);
-    RUN_TEST(tool_manage_adr_legacy_migration_tries_without_blocking);
-    RUN_TEST(tool_raw_dispatch_cancel_is_scoped_non_mutating_and_next_request_clean);
-    RUN_TEST(tool_outer_request_scope_preserves_predispatch_cancel);
-    RUN_TEST(tool_index_repository_early_raw_cancel_survives_index_entry);
-    RUN_TEST(tool_cross_repo_mutation_guard_sorts_dedupes_and_unwinds);
-    RUN_TEST(tool_cross_repo_mutation_guard_casefolds_aliases_and_order);
-    RUN_TEST(tool_cross_repo_rejects_wildcard_mixed_with_named_targets);
-    RUN_TEST(tool_cross_repo_checks_cancellation_after_acquiring_leases);
-    RUN_TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases);
-    RUN_TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting);
-    RUN_TEST(tool_cross_repo_status_and_wildcard_skipped_projects);
-    RUN_TEST(tool_cross_repo_honors_source_name_override);
-    RUN_TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested);
-    RUN_TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal);
-    RUN_TEST(tool_manage_adr_corrupt_store_busy_is_retryable);
-    RUN_TEST(tool_manage_adr_corrupt_store_missing_try_guard_reports_configuration);
-    RUN_TEST(tool_corrupt_store_cleanup_rechecks_generation_after_guard_wait);
-    RUN_TEST(tool_corrupt_store_cleanup_preserves_existing_backup_and_uses_unique_name);
-    RUN_TEST(tool_corrupt_store_cleanup_publish_failure_preserves_db_and_wal);
-    RUN_TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete);
-}
+    /* Kept separate so daemon-coordination regressions can be iterated without
+     * running the much larger MCP behavior suite. */
+    SUITE(mcp_mutation_guard) {
+        RUN_TEST(tool_ingest_traces_mutation_guard_denial_prevents_writes);
+        RUN_TEST(tool_ingest_traces_mutation_guard_balances_repeated_writes);
+        RUN_TEST(tool_ingest_traces_mutation_guard_cancel_releases_without_writes);
+        RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
+        RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
+        RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+        RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
+        RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
+        RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);
+        RUN_TEST(tool_manage_adr_read_missing_store_skips_mutation_guard);
+        RUN_TEST(tool_manage_adr_legacy_migration_tries_without_blocking);
+        RUN_TEST(tool_raw_dispatch_cancel_is_scoped_non_mutating_and_next_request_clean);
+        RUN_TEST(tool_outer_request_scope_preserves_predispatch_cancel);
+        RUN_TEST(tool_index_repository_early_raw_cancel_survives_index_entry);
+        RUN_TEST(tool_cross_repo_mutation_guard_sorts_dedupes_and_unwinds);
+        RUN_TEST(tool_cross_repo_mutation_guard_casefolds_aliases_and_order);
+        RUN_TEST(tool_cross_repo_rejects_wildcard_mixed_with_named_targets);
+        RUN_TEST(tool_cross_repo_checks_cancellation_after_acquiring_leases);
+        RUN_TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases);
+        RUN_TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting);
+        RUN_TEST(tool_cross_repo_status_and_wildcard_skipped_projects);
+        RUN_TEST(tool_cross_repo_honors_source_name_override);
+        RUN_TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested);
+        RUN_TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal);
+        RUN_TEST(tool_manage_adr_corrupt_store_busy_is_retryable);
+        RUN_TEST(tool_manage_adr_corrupt_store_missing_try_guard_reports_configuration);
+        RUN_TEST(tool_corrupt_store_cleanup_rechecks_generation_after_guard_wait);
+        RUN_TEST(tool_corrupt_store_cleanup_preserves_existing_backup_and_uses_unique_name);
+        RUN_TEST(tool_corrupt_store_cleanup_publish_failure_preserves_db_and_wal);
+        RUN_TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete);
+    }
