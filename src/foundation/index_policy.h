@@ -9,12 +9,15 @@
 #define CBM_INDEX_CONFIG_MAX_SOURCE_MB "index_max_source_mb"
 #define CBM_INDEX_CONFIG_MAX_RSS_MB "index_max_rss_mb"
 #define CBM_INDEX_CONFIG_MAX_DURATION_SECONDS "index_max_duration_seconds"
+#define CBM_INDEX_CONFIG_CACHE_MAX_MB "index_cache_max_mb"
+#define CBM_INDEX_CONFIG_MIN_FREE_DISK_MB "index_min_free_disk_mb"
 
 #define CBM_INDEX_MAX_FILES_VALUE UINT64_C(10000000)
 #define CBM_INDEX_MAX_SOURCE_MB_VALUE UINT64_C(1048576)
 #define CBM_INDEX_MIN_RSS_MB_VALUE UINT64_C(64)
 #define CBM_INDEX_MAX_RSS_MB_VALUE UINT64_C(1048576)
 #define CBM_INDEX_MAX_DURATION_SECONDS_VALUE UINT64_C(86400)
+#define CBM_INDEX_MAX_STORAGE_MB_VALUE UINT64_C(1048576)
 #define CBM_INDEX_MIB_BYTES UINT64_C(1048576)
 
 typedef struct {
@@ -27,6 +30,15 @@ typedef struct {
     cbm_index_limit_u64_t max_source_bytes;
     cbm_index_limit_u64_t max_rss_bytes;
     cbm_index_limit_u64_t max_duration_ms;
+    cbm_index_limit_u64_t max_cache_bytes;
+    cbm_index_limit_u64_t min_free_disk_bytes;
+    /* Internal storage dimensions with no public config key. Nothing enables
+     * them on its own; they exist so that a single composed decision can bound
+     * the database, the staging artifacts and the task temporary directory
+     * together, which no individual key can express. */
+    cbm_index_limit_u64_t max_final_db_bytes;
+    cbm_index_limit_u64_t max_staging_bytes;
+    cbm_index_limit_u64_t max_task_temp_bytes;
 } cbm_index_resource_policy_t;
 
 typedef enum {
@@ -35,18 +47,38 @@ typedef enum {
     CBM_INDEX_RESOURCE_SOURCE_BYTES,
     CBM_INDEX_RESOURCE_RSS_BYTES,
     CBM_INDEX_RESOURCE_DURATION_MS,
+    CBM_INDEX_RESOURCE_CACHE_BYTES,
+    CBM_INDEX_RESOURCE_FREE_DISK_BYTES,
+    CBM_INDEX_RESOURCE_FINAL_DB_BYTES,
+    CBM_INDEX_RESOURCE_STAGING_BYTES,
+    CBM_INDEX_RESOURCE_TASK_TEMP_BYTES,
 } cbm_index_resource_t;
 
 typedef struct {
     cbm_index_resource_t resource;
     uint64_t observed;
     uint64_t limit;
+    bool probe_failed;
 } cbm_index_resource_violation_t;
+
+typedef struct {
+    uint64_t current_cache_bytes;
+    uint64_t replaceable_old_bytes;
+    uint64_t operation_bytes;
+    uint64_t free_disk_bytes;
+    uint64_t final_db_bytes;
+    uint64_t staging_bytes;
+    uint64_t task_temp_bytes;
+} cbm_index_storage_sample_t;
 
 void cbm_index_policy_init(cbm_index_resource_policy_t *policy);
 bool cbm_index_policy_enabled(const cbm_index_resource_policy_t *policy);
 bool cbm_index_policy_discovery_enabled(const cbm_index_resource_policy_t *policy);
 bool cbm_index_policy_worker_enabled(const cbm_index_resource_policy_t *policy);
+bool cbm_index_policy_storage_enabled(const cbm_index_resource_policy_t *policy);
+bool cbm_index_policy_check_storage(const cbm_index_resource_policy_t *policy,
+                                    const cbm_index_storage_sample_t *sample,
+                                    cbm_index_resource_violation_t *violation);
 
 size_t cbm_index_policy_key_count(void);
 const char *cbm_index_policy_key_at(size_t index);
