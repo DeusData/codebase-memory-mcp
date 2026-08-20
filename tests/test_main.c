@@ -17,7 +17,6 @@ int tf_skip_count = 0;
 #include "foundation/log.h"        /* crash-durable worker log probe */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
-#include "foundation/sanitized.h"  /* CBM_SANITIZED — --build-config contract */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
@@ -837,12 +836,17 @@ int main(int argc, char **argv) {
             return 2;
         }
 #endif
+#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+        const int sanitized = 1;
+#else
+        const int sanitized = 0;
+#endif
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
         const int test_seams = 1;
 #else
         const int test_seams = 0;
 #endif
-        (void)printf("sanitized=%d test_seams=%d\n", CBM_SANITIZED, test_seams);
+        (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
         return 0;
     }
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
