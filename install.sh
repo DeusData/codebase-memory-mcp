@@ -79,26 +79,42 @@ download_file() {
     fi
 }
 
+# Strict argument parser: known flags only. An unrecognized flag is an error,
+# never silently ignored — otherwise a mistyped or unsupported option (a dropped
+# --clients being the motivating case) leaves the caller believing it took effect
+# while the install proceeds with defaults. --clients is passed through to the
+# binary installer, which owns client selection.
+CLIENTS=""
+expect_dir=false
 for arg in "$@"; do
+    if [ "$expect_dir" = true ]; then
+        INSTALL_DIR="$arg"
+        expect_dir=false
+        continue
+    fi
     case "$arg" in
         --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
+        --dir)          expect_dir=true ;;
+        --clients=*)    CLIENTS="${arg#--clients=}" ;;
         --skip-config)  SKIP_CONFIG=true ;;
         --help|-h)
-            echo "Usage: install.sh [--dir=<path>] [--skip-config]"
-            echo "  --dir PATH     Install directory (default: ~/.local/bin)"
-            echo "  --skip-config  Skip automatic agent configuration"
+            echo "Usage: install.sh [--dir=<path>] [--clients=<c1,c2,...>] [--skip-config]"
+            echo "  --dir PATH        Install directory (default: ~/.local/bin)"
+            echo "  --clients LIST    Comma-separated clients to configure (default: all detected)"
+            echo "  --skip-config     Skip automatic agent configuration"
             exit 0
+            ;;
+        *)
+            echo "error: unknown option '$arg'" >&2
+            echo "Run 'install.sh --help' for usage." >&2
+            exit 2
             ;;
     esac
 done
-# Handle --dir <path> (space-separated)
-prev=""
-for arg in "$@"; do
-    if [ "$prev" = "--dir" ]; then
-        INSTALL_DIR="$arg"
-    fi
-    prev="$arg"
-done
+if [ "$expect_dir" = true ]; then
+    echo "error: --dir requires a path argument" >&2
+    exit 2
+fi
 
 detect_os() {
     case "$(uname -s)" in
@@ -316,6 +332,10 @@ DEST="$INSTALL_DIR/codebase-memory-mcp"
 INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
 if [ "$SKIP_CONFIG" = true ]; then
     INSTALL_ARGS+=(--skip-config)
+elif [ -n "$CLIENTS" ]; then
+    # Restrict configuration to the requested clients; the binary installer
+    # validates the list and errors on an unknown client name.
+    INSTALL_ARGS+=(--clients="$CLIENTS")
 fi
 "$DLBIN" install "${INSTALL_ARGS[@]}"
 
