@@ -1,11 +1,34 @@
-/* SHA-256 per FIPS 180-4. Straightforward reference implementation; validated
- * against the NIST test vectors in tests/test_cli.c. */
+/* SHA-256 per FIPS 180-4. On Apple the streaming context is backed by
+ * CommonCrypto's hardware-accelerated SHA-256; every other platform uses the
+ * portable scalar reference below. Both are validated against the NIST test
+ * vectors in tests/test_cli.c, and tests/test_cli.c also asserts the two
+ * implementations are bit-identical. */
 
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
 
 #include <string.h>
 
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+_Static_assert(sizeof(((cbm_sha256_ctx *)0)->apple_cc) >= sizeof(CC_SHA256_CTX),
+               "apple_cc storage must be large enough to hold a CC_SHA256_CTX");
+#endif
+
+/* Raw digest bytes → lowercase hex (no NUL beyond CBM_SHA256_HEX_LEN). */
+static void sha256_bytes_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                                char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+/* Portable scalar SHA-256. On Apple this is retained only under test seams (the
+ * public API there uses CommonCrypto); elsewhere it backs the public API. */
+#if !defined(__APPLE__) || defined(CBM_ENABLE_TEST_SEAMS)
 static const uint32_t K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -60,7 +83,7 @@ static void sha256_transform(cbm_sha256_ctx *c, const uint8_t *data) {
     c->state[7] += h;
 }
 
-void cbm_sha256_init(cbm_sha256_ctx *c) {
+static void sha256_scalar_init(cbm_sha256_ctx *c) {
     c->bitlen = 0;
     c->buflen = 0;
     c->state[0] = 0x6a09e667;
@@ -73,7 +96,7 @@ void cbm_sha256_init(cbm_sha256_ctx *c) {
     c->state[7] = 0x5be0cd19;
 }
 
-void cbm_sha256_update(cbm_sha256_ctx *c, const void *data, size_t len) {
+static void sha256_scalar_update(cbm_sha256_ctx *c, const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     for (size_t i = 0; i < len; i++) {
         c->buf[c->buflen++] = p[i];
@@ -85,7 +108,7 @@ void cbm_sha256_update(cbm_sha256_ctx *c, const void *data, size_t len) {
     }
 }
 
-void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+static void sha256_scalar_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
     c->bitlen += (uint64_t)c->buflen * 8;
 
     size_t i = c->buflen;
@@ -113,6 +136,39 @@ void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
         out[j * 4 + 3] = (uint8_t)(c->state[j]);
     }
 }
+#endif /* portable scalar SHA-256 */
+
+void cbm_sha256_init(cbm_sha256_ctx *c) {
+#ifdef __APPLE__
+    (void)CC_SHA256_Init((CC_SHA256_CTX *)c->apple_cc);
+#else
+    sha256_scalar_init(c);
+#endif
+}
+
+void cbm_sha256_update(cbm_sha256_ctx *c, const void *data, size_t len) {
+#ifdef __APPLE__
+    /* CC_SHA256_Update takes a CC_LONG (uint32_t) length; a single cbm update
+     * may exceed that, so feed it in bounded chunks. */
+    const uint8_t *p = (const uint8_t *)data;
+    while (len > 0) {
+        CC_LONG chunk = len > 0xffffffffu ? 0xffffffffu : (CC_LONG)len;
+        (void)CC_SHA256_Update((CC_SHA256_CTX *)c->apple_cc, p, chunk);
+        p += chunk;
+        len -= chunk;
+    }
+#else
+    sha256_scalar_update(c, data, len);
+#endif
+}
+
+void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+#ifdef __APPLE__
+    (void)CC_SHA256_Final(out, (CC_SHA256_CTX *)c->apple_cc);
+#else
+    sha256_scalar_final(c, out);
+#endif
+}
 
 void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 1]) {
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
@@ -121,12 +177,7 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
     cbm_sha256_update(&c, data, len);
     cbm_sha256_final(&c, digest);
 
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
-        out[i * 2] = hex[digest[i] >> 4];
-        out[i * 2 + 1] = hex[digest[i] & 0x0f];
-    }
-    out[CBM_SHA256_HEX_LEN] = '\0';
+    sha256_bytes_to_hex(digest, out);
     cbm_secure_zero(&c, sizeof(c));
     cbm_secure_zero(digest, sizeof(digest));
 }
@@ -176,3 +227,17 @@ void cbm_hmac_sha256(const void *key, size_t key_len, const void *data, size_t d
     cbm_secure_zero(outer_pad, sizeof(outer_pad));
     cbm_secure_zero(inner_digest, sizeof(inner_digest));
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_sha256_scalar_hex_for_testing(const void *data, size_t len,
+                                       char out[CBM_SHA256_HEX_LEN + 1]) {
+    cbm_sha256_ctx c;
+    sha256_scalar_init(&c);
+    sha256_scalar_update(&c, data, len);
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    sha256_scalar_final(&c, digest);
+    sha256_bytes_to_hex(digest, out);
+    cbm_secure_zero(&c, sizeof(c));
+    cbm_secure_zero(digest, sizeof(digest));
+}
+#endif
