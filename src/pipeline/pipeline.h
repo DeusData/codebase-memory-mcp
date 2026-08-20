@@ -211,10 +211,21 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
- * Returns result with qualified_name="" if unresolved. */
+ * Returns result with qualified_name="" if unresolved.
+ * Never returns a data relation (Table/View): relations are lineage-only
+ * registry members and common table names (users, orders, config) collide with
+ * code identifiers in every language, so the default resolve vetoes them
+ * centrally instead of relying on per-consumer label checks. */
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
+ * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
+ * cache stores the default variant's relation-vetoed answers). */
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count);
 
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start

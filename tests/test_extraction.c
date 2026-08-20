@@ -1867,6 +1867,58 @@ TEST(sql_function) {
     PASS();
 }
 
+TEST(sql_ddl_node_labels) {
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active_users"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_view_lineage_usages) {
+    /* A view's FROM/JOIN relations are emitted as usages (ref_name = table),
+     * which pass_usages later resolves into view -> table USAGE lineage edges. */
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_schema_qualified_name) {
+    /* schema-qualified DDL (schema.table) is named by the table, not the schema,
+     * and FROM schema.table resolves to that table for lineage. */
+    CBMFileResult *r = extract("CREATE TABLE app.users (id INTEGER);\n"
+                               "CREATE VIEW app.active AS SELECT * FROM app.users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active"));
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Meson project --- */
 TEST(meson_project) {
     CBMFileResult *r = extract(
@@ -5552,6 +5604,9 @@ SUITE(extraction) {
     /* Config/Markup */
     RUN_TEST(html_elements);
     RUN_TEST(sql_function);
+    RUN_TEST(sql_ddl_node_labels);
+    RUN_TEST(sql_view_lineage_usages);
+    RUN_TEST(sql_schema_qualified_name);
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(scss_rules);

@@ -166,6 +166,31 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
+// True when `label` names a data relation (SQL CREATE TABLE / CREATE VIEW).
+// Relations live in the registry so FROM/JOIN lineage can resolve, but they are
+// deliberately NOT type-like: they must never satisfy inheritance, impl-receiver,
+// semantic-type, or LSP-registrar lookups, and resolver fallbacks treat them as
+// lineage-only targets (see cbm_label_is_registry_symbol call sites).
+bool cbm_label_is_relation(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Table") == 0 || strcmp(label, "View") == 0;
+}
+
+// True when `label` belongs in the cross-file name registry (see cbm.h). Single
+// source of truth for every registry-seeding site — full, parallel and
+// incremental pipelines MUST admit the same set or an incremental re-resolve
+// diverges from a clean full reindex.
+bool cbm_label_is_registry_symbol(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+           cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+           strcmp(label, "Field") == 0 || cbm_label_is_relation(label);
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

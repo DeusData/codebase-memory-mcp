@@ -1020,20 +1020,15 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
 
-/* Labels the full-index definition pass seeds into the registry
- * (pass_definitions.c — KEEP IN SYNC). Incremental re-resolution must see the
- * SAME symbol set, or it diverges from a clean full reindex: seeding extra
- * container nodes (File / Module / Folder / ...) lets a type usage like `Word`
- * resolve to the same-named Module node instead of the Class node. Only
- * callable / declared symbols belong in the registry. */
+/* Labels the full-index definition pass seeds into the registry. Incremental
+ * re-resolution must see the SAME symbol set, or it diverges from a clean full
+ * reindex: seeding extra container nodes (File / Module / Folder / ...) lets a
+ * type usage like `Word` resolve to the same-named Module node instead of the
+ * Class node. Membership is defined once by cbm_label_is_registry_symbol
+ * (helpers.c) — the same predicate pass_definitions.c / pass_parallel.c seed
+ * through, so divergence is impossible by construction. */
 static bool incr_label_is_registry_symbol(const char *label) {
-    /* Mirror pass_definitions.c / pass_parallel.c registry seeding EXACTLY:
-     * callables + every type-like container (Class/Struct/Interface/Enum/Type/
-     * Trait) + Variable/Field. Struct included so an incremental re-resolve seeds
-     * the same struct type nodes a full reindex would. */
-    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
-                     strcmp(label, "Field") == 0);
+    return cbm_label_is_registry_symbol(label);
 }
 
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing

@@ -192,8 +192,16 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 continue;
             }
-            cbm_resolution_t res = cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn,
-                                                        imp_keys, imp_vals, imp_count);
+            /* SQL usages are FROM/JOIN lineage refs and may bind Table/View
+             * targets (cbm_registry_resolve_lineage); every other language
+             * resolves through the default variant, whose central relation
+             * veto keeps same-named code identifiers out of the lineage layer. */
+            cbm_resolution_t res =
+                (lang == CBM_LANG_SQL)
+                    ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count)
+                    : cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                           imp_vals, imp_count);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }

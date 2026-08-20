@@ -108,5 +108,8 @@ enum { SKIP_ONE = 1, PAIR_LEN = 2 };
 #define CBM_SQL_TYPE_LIKE_LABELS "'Class','Struct','Interface','Enum','Type','Trait'"
 #define CBM_SQL_CALLABLE_LABELS "'Function','Method'"
 #define CBM_SQL_CALLABLE_OR_TYPE_LABELS CBM_SQL_CALLABLE_LABELS "," CBM_SQL_TYPE_LIKE_LABELS
+/* SQL mirror of cbm_label_is_relation() (Table/View — data-lineage nodes),
+ * pinned by tests/test_store_nodes.c the same way as the sets above. */
+#define CBM_SQL_RELATION_LABELS "'Table','View'"
 
 #endif /* CBM_CONSTANTS_H */

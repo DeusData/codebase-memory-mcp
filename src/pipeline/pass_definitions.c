@@ -327,18 +327,12 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
-     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
-     * field resolution can reach them — Struct included so Rust/Go/Swift/D structs
-     * resolve as type targets just as a Class did. Variable/Field defs are also
-     * registered so pass_usages.c can resolve READS/WRITES accesses (rw->var_name)
-     * to a Variable/Field node QN.
-     * KEEP IN SYNC with pass_parallel.c and pipeline_incremental.c's seed sets. */
-    if (node_id > 0 && def->label &&
-        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-         strcmp(def->label, "Field") == 0)) {
+    /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
+     * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
+     * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
+     * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
+     * through the same predicate, so the three registries cannot diverge. */
+    if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
