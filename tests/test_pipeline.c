@@ -4649,6 +4649,17 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * (axios.get, api.patch on a renamed-axios instance, supertest request(app).get).
  * The regex false edge must stay suppressed in parallel too. CBM_WORKERS forces
  * >1 worker so the parallel path is taken regardless of the host core count. */
+/* #1355: padding count for write_external_import_shadow_fixture, deliberately
+ * well past MIN_FILES_FOR_PARALLEL (=50, a private #define in
+ * src/pipeline/pipeline.c — not exposed to tests, so this cannot be a
+ * static_assert against it) rather than sitting right at the threshold. The
+ * margin, not the exact value, is what the test depends on: a modest bump to
+ * the real threshold must not silently drop this fixture back onto the
+ * sequential-only path and leave the parallel resolver unexercised. Same
+ * pattern as ET_PARALLEL_PAD / CP_PARALLEL_PAD in test_edge_types_probe.c /
+ * test_convergence_probe.c. */
+enum { EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD = 64 };
+
 /* #1355: write the shared external-import-shadow fixture into `dir`.
  * `pad_files` filler modules push the run over MIN_FILES_FOR_PARALLEL so the
  * same tree can be indexed by both resolvers. */
@@ -4739,11 +4750,13 @@ TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355) {
     /* Enough files that CBM_WORKERS can take the fused-parallel path; the same
      * tree is then indexed by each resolver in turn, because the guard lives at
      * two independent emit sites (pass_calls.c and pass_parallel.c). */
-    write_external_import_shadow_fixture(tmp, 50);
+    write_external_import_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
 
-    char *old_workers = getenv("CBM_WORKERS");
+    /* getenv() returns a pointer into the process environment that must be
+     * treated as read-only; strdup() below only ever reads through it. */
+    const char *old_workers = getenv("CBM_WORKERS");
     char *saved_workers = old_workers ? strdup(old_workers) : NULL;
-    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
     char *saved_single = old_single ? strdup(old_single) : NULL;
 
     cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);

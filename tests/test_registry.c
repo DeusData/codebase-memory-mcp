@@ -942,6 +942,39 @@ TEST(external_import_shadow_relative_binding_wins_the_tie) {
     PASS();
 }
 
+TEST(external_import_shadow_windows_relative_specifier_kept) {
+    /* #1355 follow-up: a Windows-style specifier —
+     * drive-letter absolute (`C:\...` / `C:/...`) or UNC share (`\\server\...`)
+     * — names a path inside the indexed tree exactly like a POSIX "./x" or
+     * "/x". pr-smoke runs this pipeline on Windows; before this fix these
+     * specifiers fell through to "external package" and the same-name guess
+     * they'd otherwise validate got suppressed on that platform only. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "C:\\repo\\src\\text-utils.ts"},
+        {.local_name = "sql", .module_path = "C:/repo/src/text-utils.ts"},
+        {.local_name = "normalize", .module_path = "\\\\server\\share\\text-utils.ts"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+
+    /* None of these materialized an import-map key (as if resolution missed
+     * them, mirroring the reported scenario) — the specifier alone must still
+     * keep the edge because it is in-tree, not external. RED before the fix
+     * (specifier_is_relative saw '.' / '/' only, so all three were classified
+     * external and suppressed); GREEN after. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("sql", "unique_name", &arr, NULL, 0));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0));
+    /* A bare package specifier without any drive letter or leading separator
+     * (e.g. "drizzle-orm") must still be external — this predicate must not
+     * become "anything with a colon or backslash". */
+    CBMImport pkg_only[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+    };
+    CBMImportArray parr = {.items = pkg_only, .count = 1, .cap = 1};
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &parr, NULL, 0));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* Method call THROUGH an imported symbol that is itself an indexed node
@@ -1039,4 +1072,5 @@ SUITE(registry) {
     RUN_TEST(external_import_shadow_drops_package_bound_bare_call);
     RUN_TEST(external_import_shadow_keeps_everything_else);
     RUN_TEST(external_import_shadow_relative_binding_wins_the_tie);
+    RUN_TEST(external_import_shadow_windows_relative_specifier_kept);
 }

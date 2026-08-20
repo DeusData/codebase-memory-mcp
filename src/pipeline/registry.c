@@ -31,6 +31,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -457,10 +458,29 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
 }
 
 /* A module specifier that names a path inside the indexed tree ("./x", "../x",
- * "/abs/x") rather than an external package. Package specifiers are everything
- * else — "drizzle-orm", "rxjs/operators", "@scope/pkg". */
+ * "/abs/x", and on Windows "C:\x", "C:/x", "\\server\share\x") rather than an
+ * external package. Package specifiers are everything else — "drizzle-orm",
+ * "rxjs/operators", "@scope/pkg". Windows paths must count as in-tree here:
+ * pr-smoke runs this pipeline on Windows, and misclassifying a drive-letter or
+ * UNC specifier as "external" is exactly the false-external edge this guard
+ * exists to prevent (#1355). */
 static bool specifier_is_relative(const char *module_path) {
-    return module_path && (module_path[0] == '.' || module_path[0] == '/');
+    if (!module_path || !module_path[0]) {
+        return false;
+    }
+    if (module_path[0] == '.' || module_path[0] == '/') {
+        return true;
+    }
+    /* UNC share: \\server\share\... */
+    if (module_path[0] == '\\' && module_path[1] == '\\') {
+        return true;
+    }
+    /* Drive-letter absolute path: C:\repo\... or C:/repo/... */
+    if (isalpha((unsigned char)module_path[0]) && module_path[1] == ':' &&
+        (module_path[2] == '\\' || module_path[2] == '/')) {
+        return true;
+    }
+    return false;
 }
 
 static bool import_map_binds(const char **import_map_keys, int import_map_count,
