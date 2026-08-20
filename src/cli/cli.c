@@ -7433,7 +7433,8 @@ static void print_detected_agents(const cbm_detected_agents_t *a, const char *ho
  * behavior (it is the same code path with mutations disabled). */
 typedef struct {
     char agent[CLI_BUF_32];
-    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook */
+    /* mcp_config | instructions | skills | hook | cleanup_instructions */
+    char kind[CLI_BUF_32];
     char path[CLI_BUF_1K];
 } cbm_plan_entry_t;
 
@@ -7769,6 +7770,20 @@ static bool install_generic_agent_config(const char *label, const char *binary_p
         printf("  instructions: %s\n", instr_path);
     }
     return mcp_installed;
+}
+
+static void cleanup_codex_legacy_instructions(const char *path, bool dry_run) {
+    if (!path || !cbm_file_exists(path)) {
+        return;
+    }
+    if (g_install_plan) {
+        plan_record("Codex CLI", "cleanup_instructions", path);
+        return;
+    }
+    printf("  instructions cleanup: %s (managed block if present)\n", path);
+    if (!dry_run && cbm_remove_instructions(path) != CLI_OK) {
+        record_agent_config_error(false, "Codex CLI", "legacy_instructions_cleanup", path);
+    }
 }
 
 static void install_windsurf_config(const char *binary_path, const char *config_path,
@@ -8678,8 +8693,9 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                 reason);
             goto codex_install_done;
         }
-        install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
+        install_generic_agent_config("Codex CLI", binary_path, cp, NULL, dry_run,
                                      cbm_upsert_codex_mcp);
+        cleanup_codex_legacy_instructions(ip, dry_run);
         install_agent_skill("Codex CLI", skills_dir, force, dry_run);
         install_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -9730,9 +9746,10 @@ static bool cli_binary_is_externally_managed(const char *self_path, bool self_pa
 }
 
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
- * the config / instruction / skill / agent / hook files `install` WOULD write, produced by
- * running the real install dispatch in record-only mode (no mutation, no
- * network). Returns a heap JSON string (caller frees) or NULL. */
+ * the config / instruction / skill / agent / hook files `install` WOULD write
+ * plus conditional cleanup actions, produced by running the real install
+ * dispatch in record-only mode (no mutation, no network). Returns a heap JSON
+ * string (caller frees) or NULL. */
 static char *cbm_build_install_plan_json_options(const char *home, const char *binary_path,
                                                  bool skip_config) {
     if (!home || !binary_path) {
@@ -9807,10 +9824,18 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_val *agent_files = yyjson_mut_arr(doc);
     yyjson_mut_val *prompt_files = yyjson_mut_arr(doc);
     yyjson_mut_val *hooks = yyjson_mut_arr(doc);
+    yyjson_mut_val *cleanups = yyjson_mut_arr(doc);
     for (int i = 0; i < plan.count; i++) {
         cbm_plan_entry_t *e = &plan.items[i];
         if (strcmp(e->kind, "mcp_config") == 0) {
             yyjson_mut_arr_add_strcpy(doc, configs, e->path);
+        } else if (strcmp(e->kind, "cleanup_instructions") == 0) {
+            yyjson_mut_val *cleanup = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, cleanup, "agent", e->agent);
+            yyjson_mut_obj_add_str(doc, cleanup, "kind", "instructions");
+            yyjson_mut_obj_add_str(doc, cleanup, "operation", "remove_managed_block_if_present");
+            yyjson_mut_obj_add_strcpy(doc, cleanup, "path", e->path);
+            yyjson_mut_arr_add_val(cleanups, cleanup);
         } else if (strcmp(e->kind, "hook") == 0) {
             yyjson_mut_val *h = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, h, "agent", e->agent);
@@ -9835,6 +9860,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_obj_add_val(doc, root, "agent_files_planned", agent_files);
     yyjson_mut_obj_add_val(doc, root, "prompt_files_planned", prompt_files);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
+    yyjson_mut_obj_add_val(doc, root, "cleanup_actions_planned", cleanups);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
     yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");

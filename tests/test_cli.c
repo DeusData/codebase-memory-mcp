@@ -293,6 +293,32 @@ static bool test_plan_has_hook_for_agent(yyjson_val *root, const char *agent) {
     return false;
 }
 
+static bool test_plan_cleanup_contains(yyjson_val *root, const char *agent, const char *kind,
+                                       const char *operation, const char *path) {
+    yyjson_val *items = root ? yyjson_obj_get(root, "cleanup_actions_planned") : NULL;
+    if (!items || !yyjson_is_arr(items)) {
+        return false;
+    }
+    size_t index;
+    size_t count;
+    yyjson_val *item;
+    yyjson_arr_foreach(items, index, count, item) {
+        yyjson_val *agent_value = yyjson_obj_get(item, "agent");
+        yyjson_val *kind_value = yyjson_obj_get(item, "kind");
+        yyjson_val *operation_value = yyjson_obj_get(item, "operation");
+        yyjson_val *path_value = yyjson_obj_get(item, "path");
+        if (agent_value && yyjson_is_str(agent_value) && kind_value && yyjson_is_str(kind_value) &&
+            operation_value && yyjson_is_str(operation_value) && path_value &&
+            yyjson_is_str(path_value) && strcmp(yyjson_get_str(agent_value), agent) == 0 &&
+            strcmp(yyjson_get_str(kind_value), kind) == 0 &&
+            strcmp(yyjson_get_str(operation_value), operation) == 0 &&
+            strcmp(yyjson_get_str(path_value), path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static size_t test_count_substring(const char *text, const char *needle) {
     size_t count = 0U;
     size_t needle_len = strlen(needle);
@@ -4454,6 +4480,12 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     ASSERT(strstr(json, "cursor") != NULL);
     ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
     ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *cleanups = yyjson_obj_get(yyjson_doc_get_root(doc), "cleanup_actions_planned");
+    ASSERT(cleanups && yyjson_is_arr(cleanups));
+    ASSERT_EQ(yyjson_arr_size(cleanups), 0U);
+    yyjson_doc_free(doc);
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
@@ -7330,23 +7362,149 @@ TEST(cli_codex_respects_codex_home) {
     char *saved = save_test_env("CODEX_HOME");
     cbm_setenv("CODEX_HOME", codex_home, 1);
 
+    char expected_instructions[640];
+    snprintf(expected_instructions, sizeof(expected_instructions), "%s/AGENTS.md", codex_home);
+    const char *user_instructions = "# Personal Codex guidance\n";
+    ASSERT_EQ(write_test_file(expected_instructions, user_instructions), 0);
+
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     char expected_config[640];
-    char expected_instructions[640];
     snprintf(expected_config, sizeof(expected_config), "%s/config.toml", codex_home);
-    snprintf(expected_instructions, sizeof(expected_instructions), "%s/AGENTS.md", codex_home);
-    bool plans_config = json && strstr(json, expected_config) != NULL;
-    bool plans_instructions = json && strstr(json, expected_instructions) != NULL;
+    yyjson_doc *plan_doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    bool plans_config = test_json_string_array_contains(plan_root, "config_files_planned",
+                                                        expected_config);
+    bool plans_instructions = test_json_string_array_contains(
+        plan_root, "instruction_files_planned", expected_instructions);
+    bool plans_cleanup = test_plan_cleanup_contains(
+        plan_root, "Codex CLI", "instructions", "remove_managed_block_if_present",
+        expected_instructions);
+    char *instructions_after = read_test_file_alloc(expected_instructions);
+    bool plan_preserved_user_file =
+        instructions_after && strcmp(instructions_after, user_instructions) == 0;
 
+    free(instructions_after);
+    yyjson_doc_free(plan_doc);
     free(json);
     restore_test_env("CODEX_HOME", saved);
     test_rmdir_r(tmpdir);
 
     if (!agents.codex)
         FAIL("Codex detection must honor CODEX_HOME");
-    if (!plans_config || !plans_instructions)
-        FAIL("Codex install plan must place config and AGENTS.md under CODEX_HOME");
+    if (!plans_config || plans_instructions || !plans_cleanup || !plan_preserved_user_file)
+        FAIL("Codex plan must keep config under CODEX_HOME and report legacy AGENTS cleanup "
+             "without planning a new instruction file or mutating user content");
+    PASS();
+}
+
+TEST(cli_codex_install_removes_only_legacy_global_instructions_issue1689) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-agents-cleanup-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char agents_path[640];
+    char config_path[640];
+    char skill_path[768];
+    char profile_path[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_home);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_home);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_home);
+    snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_home);
+    ASSERT_EQ(test_mkdirp(codex_home), 0);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    struct stat state;
+    int fresh_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool fresh_did_not_create_agents = stat(agents_path, &state) != 0;
+    char *config = read_test_file_alloc(config_path);
+    bool other_surfaces_installed =
+        fresh_rc == 0 && config && strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+        strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
+        stat(profile_path, &state) == 0;
+    free(config);
+
+    const char *user_only = "# Personal Codex guidance\nKeep this byte-for-byte.\n";
+    ASSERT_EQ(write_test_file(agents_path, user_only), 0);
+    int dry_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, true);
+    char *after_dry = read_test_file_alloc(agents_path);
+    int unowned_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after_unowned = read_test_file_alloc(agents_path);
+    bool unowned_preserved = dry_rc == 0 && unowned_rc == 0 && after_dry && after_unowned &&
+                             strcmp(after_dry, user_only) == 0 &&
+                             strcmp(after_unowned, user_only) == 0;
+    free(after_dry);
+    free(after_unowned);
+
+    const char *legacy = "# Before\n<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                         "<!-- codebase-memory-mcp:end -->\n# After\n";
+    const char *legacy_removed = "# Before\n# After\n";
+    ASSERT_EQ(write_test_file(agents_path, legacy), 0);
+    int managed_dry_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, true);
+    char *after_managed_dry = read_test_file_alloc(agents_path);
+    int managed_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after_managed = read_test_file_alloc(agents_path);
+    int repeat_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after_repeat = read_test_file_alloc(agents_path);
+    bool managed_removed_once = managed_dry_rc == 0 && after_managed_dry &&
+                                strcmp(after_managed_dry, legacy) == 0 && managed_rc == 0 &&
+                                repeat_rc == 0 && after_managed && after_repeat &&
+                                strcmp(after_managed, legacy_removed) == 0 &&
+                                strcmp(after_repeat, legacy_removed) == 0;
+    free(after_managed_dry);
+    free(after_managed);
+    free(after_repeat);
+
+    const char *managed_only = "<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                               "<!-- codebase-memory-mcp:end -->\n";
+    ASSERT_EQ(write_test_file(agents_path, managed_only), 0);
+    int managed_only_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after_managed_only = read_test_file_alloc(agents_path);
+    bool empty_file_preserved = managed_only_rc == 0 && after_managed_only &&
+                                after_managed_only[0] == '\0' && stat(agents_path, &state) == 0;
+    free(after_managed_only);
+
+    const char *malformed = "# Keep\n<!-- codebase-memory-mcp:start -->\nunterminated\n";
+    ASSERT_EQ(write_test_file(agents_path, malformed), 0);
+    ASSERT_EQ(remove(config_path), 0);
+    ASSERT_EQ(remove(skill_path), 0);
+    ASSERT_EQ(remove(profile_path), 0);
+    int malformed_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after_malformed = read_test_file_alloc(agents_path);
+    config = read_test_file_alloc(config_path);
+    bool malformed_preserved = malformed_rc != 0 && after_malformed &&
+                               strcmp(after_malformed, malformed) == 0 && config &&
+                               strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+                               strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
+                               stat(profile_path, &state) == 0;
+    free(config);
+    free(after_malformed);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+
+    if (!fresh_did_not_create_agents || !other_surfaces_installed || !unowned_preserved ||
+        !managed_removed_once || !empty_file_preserved || !malformed_preserved)
+        FAIL("Codex install must stop creating global AGENTS guidance, remove only its owned "
+             "legacy block, preserve malformed or user-owned bytes, and keep other surfaces");
     PASS();
 }
 
@@ -13117,6 +13275,7 @@ SUITE(cli) {
     RUN_TEST(cli_openclaw_resolves_active_json5_workspace);
     RUN_TEST(cli_claude_user_scope_avoids_nested_mcp_json);
     RUN_TEST(cli_codex_respects_codex_home);
+    RUN_TEST(cli_codex_install_removes_only_legacy_global_instructions_issue1689);
     RUN_TEST(cli_gemini_session_hook_uses_json_for_all_sources);
     RUN_TEST(cli_gemini_installs_dedicated_graph_subagent);
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
