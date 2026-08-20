@@ -3487,11 +3487,12 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
   INSTALL_TEST_HOME=$(smoke_mktemp_dir)
   INSTALL_TEST_DIR=$(smoke_mktemp_dir)
   mkdir -p "$INSTALL_TEST_HOME/.claude"
+  mkdir -p "$INSTALL_TEST_HOME/.codex"
   mkdir -p "$INSTALL_TEST_HOME/.local/bin"
 
   # 13a: run install.sh with local URL + isolated HOME
   HOME="$INSTALL_TEST_HOME" CBM_DOWNLOAD_URL="$SMOKE_DOWNLOAD_URL" \
-    "$REPO_ROOT/install.sh" --dir="$INSTALL_TEST_DIR" 2>&1 || true
+    "$REPO_ROOT/install.sh" --dir="$INSTALL_TEST_DIR" --clients=claude 2>&1 || true
 
   # 13b: binary placed
   if [ ! -f "$INSTALL_TEST_DIR/codebase-memory-mcp" ]; then
@@ -3531,17 +3532,25 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
     exit 1
   fi
 
-  # 13f: PATH setup — verify shell rc file was modified
+  # 13f: --clients is forwarded by install.sh, so detected but unselected
+  # clients must remain untouched.
+  if [ -f "$INSTALL_TEST_HOME/.codex/config.toml" ]; then
+    echo "FAIL 13f: install.sh ignored --clients=claude and configured Codex"
+    exit 1
+  fi
+  echo "OK 13f: --clients selection forwarded"
+
+  # 13g: PATH setup — verify shell rc file was modified
   RC_FILE=""
   if [ -f "$INSTALL_TEST_HOME/.zshrc" ]; then RC_FILE="$INSTALL_TEST_HOME/.zshrc"; fi
   if [ -f "$INSTALL_TEST_HOME/.bashrc" ]; then RC_FILE="$INSTALL_TEST_HOME/.bashrc"; fi
   if [ -f "$INSTALL_TEST_HOME/.profile" ]; then RC_FILE="$INSTALL_TEST_HOME/.profile"; fi
   if [ -n "$RC_FILE" ] && grep -q '.local/bin' "$RC_FILE" 2>/dev/null; then
-    echo "OK 13f: PATH added to shell rc file"
+    echo "OK 13g: PATH added to shell rc file"
   elif echo "$PATH" | grep -q "$INSTALL_TEST_DIR"; then
-    echo "OK 13f: install dir already on PATH"
+    echo "OK 13g: install dir already on PATH"
   else
-    echo "OK 13f: PATH setup (rc file may not have been modified if already present)"
+    echo "OK 13g: PATH setup (rc file may not have been modified if already present)"
   fi
 
   smoke_rmtree "$INSTALL_TEST_HOME" "$INSTALL_TEST_DIR"

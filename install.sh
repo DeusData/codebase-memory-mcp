@@ -19,6 +19,7 @@ main() {
 REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 SKIP_CONFIG=false
+CLIENTS=""
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
 
 # Security: every remote hop must remain HTTPS. Plain HTTP is accepted only
@@ -79,25 +80,38 @@ download_file() {
     fi
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dir=*)        INSTALL_DIR="${1#--dir=}" ;;
+        --dir)
+            [ "$#" -ge 2 ] || { echo "error: --dir requires a path" >&2; exit 1; }
+            shift
+            INSTALL_DIR="$1"
+            ;;
+        --clients=*)    CLIENTS="${1#--clients=}" ;;
+        --clients)
+            [ "$#" -ge 2 ] || { echo "error: --clients requires a comma-separated list" >&2; exit 1; }
+            shift
+            CLIENTS="$1"
+            ;;
         --skip-config)  SKIP_CONFIG=true ;;
         --help|-h)
-            echo "Usage: install.sh [--dir=<path>] [--skip-config]"
+            echo "Usage: install.sh [--dir=<path>] [--clients=<list>] [--skip-config]"
             echo "  --dir PATH     Install directory (default: ~/.local/bin)"
+            echo "  --clients LIST Configure only comma-separated clients"
             echo "  --skip-config  Skip automatic agent configuration"
             exit 0
             ;;
+        --*)
+            echo "error: unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            echo "error: unexpected argument: $1" >&2
+            exit 1
+            ;;
     esac
-done
-# Handle --dir <path> (space-separated)
-prev=""
-for arg in "$@"; do
-    if [ "$prev" = "--dir" ]; then
-        INSTALL_DIR="$arg"
-    fi
-    prev="$arg"
+    shift
 done
 
 detect_os() {
@@ -316,6 +330,9 @@ DEST="$INSTALL_DIR/codebase-memory-mcp"
 INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
 if [ "$SKIP_CONFIG" = true ]; then
     INSTALL_ARGS+=(--skip-config)
+fi
+if [ -n "$CLIENTS" ]; then
+    INSTALL_ARGS+=("--clients=$CLIENTS")
 fi
 "$DLBIN" install "${INSTALL_ARGS[@]}"
 
