@@ -21,6 +21,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/sanitized.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 
@@ -3550,10 +3551,18 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     SKIP_PLATFORM("requires a queryable copied process image");
 #else
     enum {
+#if CBM_SANITIZED
+        /* This readiness wait is a liveness backstop, not the behavior under
+         * test. The copied instrumented runner can take several seconds to
+         * reach main on macOS, especially while the parallel gate is busy. */
+        CHILD_READY_BOUND_MS = 60000,
+        REQUEST_TIMEOUT_MS = 90000,
+#else
         CHILD_READY_BOUND_MS = 5000,
+        REQUEST_TIMEOUT_MS = 15000,
+#endif
         CHILD_CANCEL_BOUND_MS = 3000,
         CHILD_CLEANUP_BOUND_MS = 5000,
-        REQUEST_TIMEOUT_MS = 15000,
     };
     const char *old_cache = getenv("CBM_CACHE_DIR");
     const char *old_path = getenv("PATH");
