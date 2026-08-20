@@ -31,6 +31,8 @@ int tf_skip_count = 0;
 #include <string.h>
 #include <signal.h>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
 #else
 #include <unistd.h>
@@ -817,6 +819,36 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
+    if (blocking_git_rc >= 0) {
+        return blocking_git_rc;
+    }
+    /* Installation tests use this executable as a structurally real candidate.
+     * Mirror the production binary's minimal verification contract. */
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        (void)puts("codebase-memory-mcp test-runner");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--build-config") == 0) {
+#ifdef _WIN32
+        if (_setmode(cbm_fileno(stdout), _O_BINARY) == -1) {
+            fprintf(stderr, "failed to set build-config stdout to binary mode\n");
+            return 2;
+        }
+#endif
+#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+        const int sanitized = 1;
+#else
+        const int sanitized = 0;
+#endif
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        const int test_seams = 1;
+#else
+        const int test_seams = 0;
+#endif
+        (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
+        return 0;
+    }
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
      * build fingerprint: it is tens of seconds per spawned worker/daemon under
      * ASan on constrained CI runners and the sole cause of the daemon-family
@@ -827,16 +859,6 @@ int main(int argc, char **argv) {
     if (!getenv("CBM_TEST_BUILD_FINGERPRINT")) {
         (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
                          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
-    }
-    int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
-    if (blocking_git_rc >= 0) {
-        return blocking_git_rc;
-    }
-    /* Installation tests use this executable as a structurally real candidate.
-     * Mirror the production binary's minimal verification contract. */
-    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        (void)puts("codebase-memory-mcp test-runner");
-        return 0;
     }
     int mcp_idxfailclosed_rc = tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
     if (mcp_idxfailclosed_rc >= 0) {
