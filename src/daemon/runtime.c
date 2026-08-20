@@ -752,6 +752,313 @@ static bool runtime_posix_stat_same_image(const struct stat *first, const struct
 
 #endif
 
+/* ── Executable-image fingerprint cache ──────────────────────────────────────
+ * The build-identity fingerprint is a SHA-256 over the entire executable
+ * (cbm_daemon_build_fingerprint_native_file): about a second of CPU per hash
+ * for a ~300 MB image. A daemon process otherwise pays it twice at start (the
+ * supervisor's startup capture, then the runtime service's active-image check),
+ * so the digest is cached per process, keyed by the file identity the acquire
+ * path verifies as stable across the hash: device, inode, size, mtime and
+ * change time (on Windows FILE_BASIC_INFO.ChangeTime, which the kernel
+ * maintains and SetFileTime cannot reset, unlike the creation time). A rebuilt
+ * or replaced binary rolls that key and misses, so the cache never returns a
+ * stale digest and build-cohort admission keeps its exact meaning. The cache is
+ * process-local: a fresh process (a hook, a CLI call) still hashes its own image
+ * once. A hit does not weaken the identity proof: the acquire chain still
+ * brackets the held image with its before/after stat and process-maps checks,
+ * so the returned digest is bound to that same verified image; only the re-read
+ * of bytes whose identity is unchanged is skipped. A freshly hashed digest is
+ * committed only after that post-hash check has passed, under the identity
+ * observed after the hash, so an image that changed under the hash is never
+ * cached. */
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || \
+    defined(__NetBSD__)
+
+/* POSIX carries timespec fields; Windows stores FILETIME ticks in the seconds
+ * fields and leaves the nanoseconds fields zero. */
+typedef struct {
+    bool valid;
+    uint64_t device;
+    uint64_t inode;
+    uint64_t size;
+    int64_t mtime_seconds;
+    int64_t mtime_nanoseconds;
+    int64_t ctime_seconds;
+    int64_t ctime_nanoseconds;
+} runtime_fingerprint_key_t;
+
+#define RUNTIME_FINGERPRINT_CACHE_CAP 8
+
+static atomic_flag runtime_fingerprint_cache_lock = ATOMIC_FLAG_INIT;
+static struct {
+    runtime_fingerprint_key_t key;
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+} runtime_fingerprint_cache[RUNTIME_FINGERPRINT_CACHE_CAP];
+static size_t runtime_fingerprint_cache_count;
+static size_t runtime_fingerprint_cache_victim;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_int runtime_fingerprint_hash_call_count;
+static atomic_bool runtime_fingerprint_hash_stub_active;
+static char runtime_fingerprint_hash_stub_digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+#endif
+
+static bool runtime_fingerprint_key_equal(const runtime_fingerprint_key_t *a,
+                                          const runtime_fingerprint_key_t *b) {
+    return a->valid && b->valid && a->device == b->device && a->inode == b->inode &&
+           a->size == b->size && a->mtime_seconds == b->mtime_seconds &&
+           a->mtime_nanoseconds == b->mtime_nanoseconds && a->ctime_seconds == b->ctime_seconds &&
+           a->ctime_nanoseconds == b->ctime_nanoseconds;
+}
+
+static void runtime_fingerprint_cache_enter(void) {
+    while (
+        atomic_flag_test_and_set_explicit(&runtime_fingerprint_cache_lock, memory_order_acquire)) {}
+}
+
+static void runtime_fingerprint_cache_leave(void) {
+    atomic_flag_clear_explicit(&runtime_fingerprint_cache_lock, memory_order_release);
+}
+
+static bool runtime_fingerprint_cache_lookup(const runtime_fingerprint_key_t *key,
+                                             char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!key->valid) {
+        return false;
+    }
+    bool hit = false;
+    runtime_fingerprint_cache_enter();
+    for (size_t index = 0; index < runtime_fingerprint_cache_count; index++) {
+        if (runtime_fingerprint_key_equal(&runtime_fingerprint_cache[index].key, key)) {
+            memcpy(out, runtime_fingerprint_cache[index].fingerprint,
+                   CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+            hit = true;
+            break;
+        }
+    }
+    runtime_fingerprint_cache_leave();
+    return hit;
+}
+
+static void runtime_fingerprint_cache_store(
+    const runtime_fingerprint_key_t *key,
+    const char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!key->valid || fingerprint[0] == '\0') {
+        return;
+    }
+    runtime_fingerprint_cache_enter();
+    size_t slot = RUNTIME_FINGERPRINT_CACHE_CAP;
+    for (size_t index = 0; index < runtime_fingerprint_cache_count; index++) {
+        if (runtime_fingerprint_key_equal(&runtime_fingerprint_cache[index].key, key)) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot == RUNTIME_FINGERPRINT_CACHE_CAP) {
+        if (runtime_fingerprint_cache_count < RUNTIME_FINGERPRINT_CACHE_CAP) {
+            slot = runtime_fingerprint_cache_count++;
+        } else {
+            slot = runtime_fingerprint_cache_victim;
+            runtime_fingerprint_cache_victim =
+                (runtime_fingerprint_cache_victim + 1) % RUNTIME_FINGERPRINT_CACHE_CAP;
+        }
+    }
+    runtime_fingerprint_cache[slot].key = *key;
+    memcpy(runtime_fingerprint_cache[slot].fingerprint, fingerprint,
+           CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+    runtime_fingerprint_cache_leave();
+}
+
+/* The single point where the expensive image hash is paid; a test seam counts
+ * calls and can substitute a stub digest so the cache's hit/miss behaviour is
+ * observable without a real full-image read. */
+static bool runtime_fingerprint_hash_native_file(uintptr_t native_file,
+                                                 char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&runtime_fingerprint_hash_call_count, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&runtime_fingerprint_hash_stub_active, memory_order_acquire)) {
+        memcpy(out, runtime_fingerprint_hash_stub_digest, CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+        return true;
+    }
+#endif
+    return cbm_daemon_build_fingerprint_native_file(native_file, out);
+}
+
+/* Resolve the digest for the image identity `key`: from the cache when it
+ * already holds that identity, otherwise by hashing the held native image.
+ * `cached` reports which. A freshly hashed digest is deliberately not stored
+ * here: the acquire site commits it (runtime_fingerprint_cache_commit) only
+ * once its post-hash identity check has proven the hashed bytes belong to the
+ * identity they were keyed on. */
+static bool runtime_build_fingerprint_resolve(uintptr_t native_file,
+                                              const runtime_fingerprint_key_t *key,
+                                              char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE],
+                                              bool *cached) {
+    *cached = runtime_fingerprint_cache_lookup(key, fingerprint);
+    return *cached || runtime_fingerprint_hash_native_file(native_file, fingerprint);
+}
+
+/* Commit a freshly hashed digest after the acquire chain has passed. The
+ * identity observed after the hash must equal the one the digest was resolved
+ * under; otherwise the bytes read belong to no single identity and are not
+ * cached. A cache hit has nothing to commit. */
+static void runtime_fingerprint_cache_commit(
+    const runtime_fingerprint_key_t *before, const runtime_fingerprint_key_t *after, bool cached,
+    const char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!cached && runtime_fingerprint_key_equal(before, after)) {
+        runtime_fingerprint_cache_store(after, fingerprint);
+    }
+}
+
+#ifdef _WIN32
+static int64_t runtime_fingerprint_filetime(FILETIME value) {
+    return (int64_t)(((uint64_t)value.dwHighDateTime << 32) | value.dwLowDateTime);
+}
+
+/* Key the held image by the snapshot identity the acquire path compares plus
+ * the kernel-maintained change time. An unreadable change time yields an
+ * invalid key, which never hits and is never stored: the image is simply
+ * hashed. */
+static void runtime_fingerprint_key_windows(HANDLE file,
+                                            const BY_HANDLE_FILE_INFORMATION *information,
+                                            const LARGE_INTEGER *size,
+                                            runtime_fingerprint_key_t *key) {
+    memset(key, 0, sizeof(*key));
+    FILE_BASIC_INFO basic;
+    memset(&basic, 0, sizeof(basic));
+    key->valid = information != NULL && size != NULL && size->QuadPart >= 0 &&
+                 file != INVALID_HANDLE_VALUE &&
+                 GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) != 0;
+    if (key->valid) {
+        key->device = information->dwVolumeSerialNumber;
+        key->inode = ((uint64_t)information->nFileIndexHigh << 32) | information->nFileIndexLow;
+        key->size = (uint64_t)size->QuadPart;
+        key->mtime_seconds = runtime_fingerprint_filetime(information->ftLastWriteTime);
+        key->ctime_seconds = basic.ChangeTime.QuadPart;
+    }
+}
+
+static bool runtime_build_fingerprint_resolve_windows(
+    HANDLE file, const BY_HANDLE_FILE_INFORMATION *information, const LARGE_INTEGER *size,
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], runtime_fingerprint_key_t *key,
+    bool *cached) {
+    runtime_fingerprint_key_windows(file, information, size, key);
+    return runtime_build_fingerprint_resolve((uintptr_t)file, key, fingerprint, cached);
+}
+
+static void runtime_fingerprint_cache_commit_windows(
+    HANDLE file, const BY_HANDLE_FILE_INFORMATION *information, const LARGE_INTEGER *size,
+    const runtime_fingerprint_key_t *key, bool cached,
+    const char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    runtime_fingerprint_key_t key_after;
+    runtime_fingerprint_key_windows(file, information, size, &key_after);
+    runtime_fingerprint_cache_commit(key, &key_after, cached, fingerprint);
+}
+#else
+static void runtime_fingerprint_key_posix(const struct stat *status,
+                                          runtime_fingerprint_key_t *key) {
+    memset(key, 0, sizeof(*key));
+    key->valid = status != NULL && S_ISREG(status->st_mode);
+    if (key->valid) {
+        key->device = (uint64_t)status->st_dev;
+        key->inode = (uint64_t)status->st_ino;
+        key->size = (uint64_t)status->st_size;
+#ifdef __APPLE__
+        key->mtime_seconds = status->st_mtimespec.tv_sec;
+        key->mtime_nanoseconds = status->st_mtimespec.tv_nsec;
+        key->ctime_seconds = status->st_ctimespec.tv_sec;
+        key->ctime_nanoseconds = status->st_ctimespec.tv_nsec;
+#else
+        key->mtime_seconds = status->st_mtim.tv_sec;
+        key->mtime_nanoseconds = status->st_mtim.tv_nsec;
+        key->ctime_seconds = status->st_ctim.tv_sec;
+        key->ctime_nanoseconds = status->st_ctim.tv_nsec;
+#endif
+    }
+}
+
+static bool runtime_build_fingerprint_resolve_posix(
+    uintptr_t native_file, const struct stat *status,
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], runtime_fingerprint_key_t *key,
+    bool *cached) {
+    runtime_fingerprint_key_posix(status, key);
+    return runtime_build_fingerprint_resolve(native_file, key, fingerprint, cached);
+}
+
+static void runtime_fingerprint_cache_commit_posix(
+    const struct stat *status, const runtime_fingerprint_key_t *key, bool cached,
+    const char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    runtime_fingerprint_key_t key_after;
+    runtime_fingerprint_key_posix(status, &key_after);
+    runtime_fingerprint_cache_commit(key, &key_after, cached, fingerprint);
+}
+#endif
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_daemon_runtime_fingerprint_cache_reset_for_testing(void) {
+    runtime_fingerprint_cache_enter();
+    memset(runtime_fingerprint_cache, 0, sizeof(runtime_fingerprint_cache));
+    runtime_fingerprint_cache_count = 0;
+    runtime_fingerprint_cache_victim = 0;
+    runtime_fingerprint_cache_leave();
+    atomic_store_explicit(&runtime_fingerprint_hash_call_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&runtime_fingerprint_hash_stub_active, false, memory_order_release);
+    memset(runtime_fingerprint_hash_stub_digest, 0, sizeof(runtime_fingerprint_hash_stub_digest));
+}
+
+void cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(const char *digest) {
+    if (!digest) {
+        atomic_store_explicit(&runtime_fingerprint_hash_stub_active, false, memory_order_release);
+        return;
+    }
+    memset(runtime_fingerprint_hash_stub_digest, 0, sizeof(runtime_fingerprint_hash_stub_digest));
+    size_t length = strlen(digest);
+    if (length >= CBM_DAEMON_BUILD_FINGERPRINT_SIZE) {
+        length = CBM_DAEMON_BUILD_FINGERPRINT_SIZE - 1;
+    }
+    memcpy(runtime_fingerprint_hash_stub_digest, digest, length);
+    atomic_store_explicit(&runtime_fingerprint_hash_stub_active, true, memory_order_release);
+}
+
+int cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(void) {
+    return atomic_load_explicit(&runtime_fingerprint_hash_call_count, memory_order_relaxed);
+}
+
+static runtime_fingerprint_key_t runtime_fingerprint_key_for_testing(
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *identity) {
+    runtime_fingerprint_key_t key = {.valid = true,
+                                     .device = identity->device,
+                                     .inode = identity->inode,
+                                     .size = identity->size,
+                                     .mtime_seconds = identity->mtime_seconds,
+                                     .mtime_nanoseconds = identity->mtime_nanoseconds,
+                                     .ctime_seconds = identity->ctime_seconds,
+                                     .ctime_nanoseconds = identity->ctime_nanoseconds};
+    return key;
+}
+
+bool cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *before,
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *after,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    /* There is no native image behind a synthetic identity: only the stubbed
+     * hash may ever be reached from here. */
+    if (!before || !after || !out ||
+        !atomic_load_explicit(&runtime_fingerprint_hash_stub_active, memory_order_acquire)) {
+        return false;
+    }
+    runtime_fingerprint_key_t key_before = runtime_fingerprint_key_for_testing(before);
+    runtime_fingerprint_key_t key_after = runtime_fingerprint_key_for_testing(after);
+    bool cached = false;
+    if (!runtime_build_fingerprint_resolve((uintptr_t)0, &key_before, out, &cached)) {
+        return false;
+    }
+    runtime_fingerprint_cache_commit(&key_before, &key_after, cached, out);
+    return true;
+}
+#endif
+
+#endif /* supported platform: executable-image fingerprint cache */
+
 /* Acquire one process instance's mapped image as a native object. Supplying a
  * fingerprint hashes that same held object; NULL performs metadata-only
  * acquisition for the HELLO fast path. Every platform brackets the process
@@ -780,6 +1087,8 @@ static bool runtime_process_image_reference_acquire(
     BY_HANDLE_FILE_INFORMATION file_after;
     LARGE_INTEGER size_before;
     LARGE_INTEGER size_after;
+    runtime_fingerprint_key_t fingerprint_key = {0};
+    bool fingerprint_cached = false;
     bool ok = runtime_windows_process_image_snapshot(process, &process_before);
     /* QueryFullProcessImageNameW returns a stable identity spelling for the
      * before/after comparison, but its Win32/DOS form may exceed MAX_PATH.
@@ -793,7 +1102,9 @@ static bool runtime_process_image_reference_acquire(
                       : INVALID_HANDLE_VALUE;
     free(open_path);
     ok = ok && runtime_windows_file_snapshot(file, &file_before, &size_before) &&
-         (!fingerprint || cbm_daemon_build_fingerprint_native_file((uintptr_t)file, fingerprint)) &&
+         (!fingerprint ||
+          runtime_build_fingerprint_resolve_windows(file, &file_before, &size_before, fingerprint,
+                                                    &fingerprint_key, &fingerprint_cached)) &&
          runtime_windows_file_snapshot(file, &file_after, &size_after) &&
          runtime_windows_file_snapshot_same(&file_before, &size_before, &file_after, &size_after) &&
          runtime_windows_process_image_snapshot(process, &process_after) &&
@@ -802,6 +1113,10 @@ static bool runtime_process_image_reference_acquire(
         ok = false;
     }
     if (ok) {
+        if (fingerprint) {
+            runtime_fingerprint_cache_commit_windows(
+                file, &file_after, &size_after, &fingerprint_key, fingerprint_cached, fingerprint);
+        }
         reference->held = true;
         reference->file = file;
         reference->information = file_after;
@@ -827,14 +1142,22 @@ static bool runtime_process_image_reference_acquire(
     int fd = ok ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
     struct stat file_before;
     struct stat file_after;
+    runtime_fingerprint_key_t fingerprint_key = {0};
+    bool fingerprint_cached = false;
     ok = ok && fd >= 0 && fstat(fd, &file_before) == 0 && S_ISREG(file_before.st_mode) &&
          runtime_mac_process_maps_file_executable(pid, &file_before) &&
-         (!fingerprint || cbm_daemon_build_fingerprint_native_file((uintptr_t)fd, fingerprint)) &&
+         (!fingerprint ||
+          runtime_build_fingerprint_resolve_posix((uintptr_t)fd, &file_before, fingerprint,
+                                                  &fingerprint_key, &fingerprint_cached)) &&
          fstat(fd, &file_after) == 0 && runtime_mac_stat_same(&file_before, &file_after) &&
          runtime_mac_process_maps_file_executable(pid, &file_after) &&
          runtime_mac_process_instance(pid, &process_after) &&
          runtime_mac_process_instance_same(&process_before, &process_after);
     if (ok) {
+        if (fingerprint) {
+            runtime_fingerprint_cache_commit_posix(&file_after, &fingerprint_key,
+                                                   fingerprint_cached, fingerprint);
+        }
         reference->held = true;
         reference->fd = fd;
         reference->status = file_after;
@@ -852,12 +1175,15 @@ static bool runtime_process_image_reference_acquire(
     int image_fd = process_fd >= 0 ? openat(process_fd, "exe", O_RDONLY | O_CLOEXEC) : -1;
     struct stat image_before;
     struct stat image_after;
-    bool ok = image_fd >= 0 && fstat(image_fd, &image_before) == 0 &&
-              S_ISREG(image_before.st_mode) &&
-              (!fingerprint ||
-               cbm_daemon_build_fingerprint_native_file((uintptr_t)image_fd, fingerprint)) &&
-              fstat(image_fd, &image_after) == 0 &&
-              runtime_posix_stat_same_image(&image_before, &image_after);
+    runtime_fingerprint_key_t fingerprint_key = {0};
+    bool fingerprint_cached = false;
+    bool ok =
+        image_fd >= 0 && fstat(image_fd, &image_before) == 0 && S_ISREG(image_before.st_mode) &&
+        (!fingerprint ||
+         runtime_build_fingerprint_resolve_posix((uintptr_t)image_fd, &image_before, fingerprint,
+                                                 &fingerprint_key, &fingerprint_cached)) &&
+        fstat(image_fd, &image_after) == 0 &&
+        runtime_posix_stat_same_image(&image_before, &image_after);
     int verify_fd = ok ? openat(process_fd, "exe", O_RDONLY | O_CLOEXEC) : -1;
     struct stat verify_status;
     ok = ok && verify_fd >= 0 && fstat(verify_fd, &verify_status) == 0 &&
@@ -869,6 +1195,10 @@ static bool runtime_process_image_reference_acquire(
         ok = false;
     }
     if (ok) {
+        if (fingerprint) {
+            runtime_fingerprint_cache_commit_posix(&image_after, &fingerprint_key,
+                                                   fingerprint_cached, fingerprint);
+        }
         reference->held = true;
         reference->fd = image_fd;
         reference->status = image_after;
@@ -894,12 +1224,19 @@ static bool runtime_process_image_reference_acquire(
     int image_fd = ok ? open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK) : -1;
     struct stat image_before;
     struct stat image_after;
+    runtime_fingerprint_key_t fingerprint_key = {0};
+    bool fingerprint_cached = false;
     ok = image_fd >= 0 && fstat(image_fd, &image_before) == 0 && S_ISREG(image_before.st_mode) &&
          (!fingerprint ||
-          cbm_daemon_build_fingerprint_native_file((uintptr_t)image_fd, fingerprint)) &&
+          runtime_build_fingerprint_resolve_posix((uintptr_t)image_fd, &image_before, fingerprint,
+                                                  &fingerprint_key, &fingerprint_cached)) &&
          fstat(image_fd, &image_after) == 0 &&
          runtime_posix_stat_same_image(&image_before, &image_after);
     if (ok) {
+        if (fingerprint) {
+            runtime_fingerprint_cache_commit_posix(&image_after, &fingerprint_key,
+                                                   fingerprint_cached, fingerprint);
+        }
         reference->held = true;
         reference->fd = image_fd;
         reference->status = image_after;
