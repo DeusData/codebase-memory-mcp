@@ -1105,8 +1105,9 @@ TEST(swift_struct) {
 }
 
 TEST(swift_enum) {
-    CBMFileResult *r = extract("enum StudyDepth {\n    case brief\n    case study\n    case deep\n}\n",
-                               CBM_LANG_SWIFT, "t", "StudyDepth.swift");
+    CBMFileResult *r =
+        extract("enum StudyDepth {\n    case brief\n    case study\n    case deep\n}\n",
+                CBM_LANG_SWIFT, "t", "StudyDepth.swift");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Enum", "StudyDepth"));
