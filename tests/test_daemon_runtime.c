@@ -904,7 +904,8 @@ static void *runtime_application_client_request_thread(void *opaque) {
     call->status = call->tagged
                        ? cbm_daemon_runtime_client_application_request_tagged(
                              call->client, call->request_token, call->request, call->request_length,
-                             &call->response, &call->response_length, RUNTIME_TEST_TIMEOUT_MS)
+                             &call->response, &call->response_length, NULL,
+                             RUNTIME_TEST_TIMEOUT_MS)
                        : cbm_daemon_runtime_client_application_request(
                              call->client, call->request, call->request_length, &call->response,
                              &call->response_length, RUNTIME_TEST_TIMEOUT_MS);
@@ -3155,7 +3156,7 @@ TEST(daemon_runtime_presend_request_cancel_is_sticky_and_nonterminal) {
         cancel = cbm_daemon_runtime_client_application_cancel(client, request_token);
         cancelled_status = cbm_daemon_runtime_client_application_request_tagged(
             client, request_token, blocking_request, (uint32_t)sizeof(blocking_request),
-            &cancelled_response, &cancelled_response_length, RUNTIME_TEST_TIMEOUT_MS);
+            &cancelled_response, &cancelled_response_length, NULL, RUNTIME_TEST_TIMEOUT_MS);
     }
     if (cancelled_status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
         next_status = cbm_daemon_runtime_client_application_request(
@@ -3212,8 +3213,10 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     bool first_reserved = false;
     bool duplicate_reservation_rejected = false;
     bool first_exact = false;
+    bool first_sent = false;
     bool second_reserved = false;
     bool second_exact = false;
+    bool second_sent = false;
     bool closed = false;
     bool exited = false;
 
@@ -3233,7 +3236,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
         cbm_daemon_runtime_application_status_t status =
             cbm_daemon_runtime_client_application_request_tagged(
                 client, first_token, first_request, (uint32_t)sizeof(first_request), &response,
-                &response_length, RUNTIME_TEST_TIMEOUT_MS);
+                &response_length, &first_sent, RUNTIME_TEST_TIMEOUT_MS);
         first_exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
                       response_length == sizeof(first_request) && response &&
                       memcmp(response, first_request, sizeof(first_request)) == 0;
@@ -3249,7 +3252,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
         cbm_daemon_runtime_application_status_t status =
             cbm_daemon_runtime_client_application_request_tagged(
                 client, second_token, second_request, (uint32_t)sizeof(second_request), &response,
-                &response_length, RUNTIME_TEST_TIMEOUT_MS);
+                &response_length, &second_sent, RUNTIME_TEST_TIMEOUT_MS);
         second_exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
                        response_length == sizeof(second_request) && response &&
                        memcmp(response, second_request, sizeof(second_request)) == 0;
@@ -3268,9 +3271,11 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     ASSERT_TRUE(first_reserved);
     ASSERT_TRUE(duplicate_reservation_rejected);
     ASSERT_TRUE(first_exact);
+    ASSERT_TRUE(first_sent);
     ASSERT_TRUE(second_reserved);
     ASSERT_EQ(second_token, first_token + 1U);
     ASSERT_TRUE(second_exact);
+    ASSERT_TRUE(second_sent);
     ASSERT_TRUE(closed);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.requests), 2);
@@ -3370,6 +3375,10 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
     uint8_t *response = NULL;
     uint32_t response_length = 0;
     cbm_daemon_runtime_application_status_t status = CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    cbm_daemon_runtime_application_token_t request_token =
+        CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    bool token_reserved = false;
+    bool request_sent = true;
     bool close_begun = false;
     bool duplicate_begin_rejected = false;
     bool close_acknowledged = false;
@@ -3380,6 +3389,8 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
                                                    RUNTIME_TEST_TIMEOUT_MS, &result);
     }
     if (client) {
+        token_reserved =
+            cbm_daemon_runtime_client_application_token_reserve(client, &request_token);
         close_begun = cbm_daemon_runtime_client_close_begin(client);
         duplicate_begin_rejected = close_begun && !cbm_daemon_runtime_client_close_begin(client);
     }
@@ -3387,9 +3398,9 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
         /* Deterministically models the frontend boundary where close begins
          * after a worker claims an item but before it enters the runtime API.
          * The retained allocation must reject the call without touching IPC. */
-        status = cbm_daemon_runtime_client_application_request(
-            client, request, (uint32_t)sizeof(request), &response, &response_length,
-            RUNTIME_TEST_TIMEOUT_MS);
+        status = cbm_daemon_runtime_client_application_request_tagged(
+            client, request_token, request, (uint32_t)sizeof(request), &response, &response_length,
+            &request_sent, RUNTIME_TEST_TIMEOUT_MS);
         close_acknowledged =
             cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS);
         client = NULL;
@@ -3407,11 +3418,13 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
     runtime_test_fixture_finish(&fixture);
 
     ASSERT_TRUE(started);
+    ASSERT_TRUE(token_reserved);
     ASSERT_TRUE(close_begun);
     ASSERT_TRUE(duplicate_begin_rejected);
     ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR);
     ASSERT_NULL(response);
     ASSERT_EQ(response_length, 0);
+    ASSERT_FALSE(request_sent);
     ASSERT_TRUE(close_acknowledged);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.opened), 1);

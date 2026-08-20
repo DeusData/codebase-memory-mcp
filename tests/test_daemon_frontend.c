@@ -4,6 +4,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 
+#include "daemon/application.h"
 #include "daemon/frontend.h"
 #include "daemon/ipc.h"
 #include "daemon/service.h"
@@ -80,7 +81,17 @@ enum {
      * regression black-box: it must remain valid if the exact capacity changes
      * while still proving that overload cannot hide an already-pending EOF. */
     FRONTEND_EOF_TEST_OVERFLOW_MESSAGES = 32,
+    /* Hold replacement context past the production frontend's 15 second
+     * no-progress EOF
+       drain so shutdown deterministically overlaps recovery. */
+    FRONTEND_RECOVERY_EOF_RELEASE_MS = 16000,
 };
+
+typedef enum {
+    FRONTEND_RECOVERY_RETRY = 0,
+    FRONTEND_RECOVERY_CANCEL = 1,
+    FRONTEND_RECOVERY_CLEAN_EOF = 2,
+} frontend_recovery_mode_t;
 
 typedef struct {
     atomic_int requests;
@@ -109,6 +120,7 @@ typedef struct {
 typedef struct {
     int fd;
     bool overflow;
+    frontend_recovery_mode_t recovery_mode;
     frontend_eof_application_context_t *application;
     atomic_bool finished;
     atomic_bool succeeded;
@@ -116,7 +128,9 @@ typedef struct {
 
 typedef struct {
     char conflict_log[FRONTEND_TEST_PATH_CAP];
+    char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     cbm_daemon_ipc_endpoint_t *endpoint;
+    cbm_daemon_build_identity_t identity;
     cbm_version_cohort_manager_t *manager;
     cbm_daemon_runtime_service_t *service;
     cbm_daemon_runtime_client_t *client;
@@ -178,16 +192,22 @@ static cbm_daemon_runtime_application_status_t frontend_eof_application_request(
         }
         /* Released: fall through and answer normally like every later item. */
     }
-    if (request_length == 0) {
+    if (request_length == 0 || request[0] == CBM_DAEMON_APPLICATION_REQUEST_SET_CONTEXT) {
         return CBM_DAEMON_RUNTIME_APPLICATION_OK;
     }
-    uint8_t *response = malloc(request_length);
+    const uint8_t *response_source = request;
+    uint32_t response_length = request_length;
+    if (request[0] == CBM_DAEMON_APPLICATION_REQUEST_MCP) {
+        response_source++;
+        response_length--;
+    }
+    uint8_t *response = malloc(response_length);
     if (!response) {
         return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
-    memcpy(response, request, request_length);
+    memcpy(response, response_source, response_length);
     *response_out = response;
-    *response_length_out = request_length;
+    *response_length_out = response_length;
     if (context->request_observed_fd >= 0) {
         const char marker = 'Q';
         (void)write(context->request_observed_fd, &marker, 1);
@@ -295,6 +315,86 @@ static void *frontend_eof_writer(void *opaque) {
     return NULL;
 }
 
+static const char frontend_recovery_request[] =
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+static const char frontend_recovery_cancel[] =
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\","
+    "\"params\":{\"requestId\":1}}\n";
+static const char frontend_recovery_followup[] =
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
+
+static void *frontend_recovery_writer(void *opaque) {
+    frontend_eof_writer_t *writer = opaque;
+    bool ok = frontend_eof_write_all(writer->fd, frontend_recovery_request,
+                                     sizeof(frontend_recovery_request) - 1U);
+    uint64_t deadline = cbm_now_ms() + FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS;
+    if (writer->recovery_mode != FRONTEND_RECOVERY_RETRY) {
+        while (ok &&
+               !atomic_load_explicit(&writer->application->first_request_started,
+                                     memory_order_acquire) &&
+               cbm_now_ms() < deadline) {
+            cbm_usleep(1000);
+        }
+        ok = ok && atomic_load_explicit(&writer->application->first_request_started,
+                                        memory_order_acquire);
+    }
+    if (writer->recovery_mode == FRONTEND_RECOVERY_CANCEL) {
+        ok = ok && frontend_eof_write_all(writer->fd, frontend_recovery_cancel,
+                                          sizeof(frontend_recovery_cancel) - 1U);
+        /* Keep context blocked until the reader routes the cancellation. */
+        cbm_usleep(100000);
+        atomic_store_explicit(&writer->application->release_first_request, true,
+                              memory_order_release);
+        ok = ok && frontend_eof_write_all(writer->fd, frontend_recovery_followup,
+                                          sizeof(frontend_recovery_followup) - 1U);
+    } else if (writer->recovery_mode == FRONTEND_RECOVERY_CLEAN_EOF) {
+        ok = close(writer->fd) == 0 && ok;
+        writer->fd = -1;
+        cbm_usleep(FRONTEND_RECOVERY_EOF_RELEASE_MS * 1000U);
+        atomic_store_explicit(&writer->application->release_first_request, true,
+                              memory_order_release);
+    }
+    int expected_requests = writer->recovery_mode == FRONTEND_RECOVERY_CLEAN_EOF ? 1 : 2;
+    while (ok &&
+           atomic_load_explicit(&writer->application->requests, memory_order_acquire) <
+               expected_requests &&
+           cbm_now_ms() < deadline) {
+        cbm_usleep(1000);
+    }
+    ok = ok && atomic_load_explicit(&writer->application->requests, memory_order_acquire) ==
+                   expected_requests;
+    if (writer->fd >= 0) {
+        ok = close(writer->fd) == 0 && ok;
+        writer->fd = -1;
+    }
+    atomic_store_explicit(&writer->succeeded, ok, memory_order_release);
+    atomic_store_explicit(&writer->finished, true, memory_order_release);
+    return NULL;
+}
+
+static cbm_daemon_runtime_service_t *frontend_eof_service_start(frontend_eof_fixture_t *fixture) {
+    cbm_daemon_runtime_application_callbacks_t callbacks = {
+        .context = &fixture->application,
+        .session_open = frontend_eof_application_session_open,
+        .request = frontend_eof_application_request,
+        .request_cancel = frontend_eof_application_request_cancel,
+        .session_cancel = frontend_eof_application_session_cancel,
+        .session_close = frontend_eof_application_session_close,
+    };
+    cbm_daemon_runtime_service_config_t config = {
+        .endpoint = fixture->endpoint,
+        .identity = fixture->identity,
+        .conflict_log_path = fixture->conflict_log,
+        .conflict_log_cap_bytes = 64U * 1024U,
+        .max_clients = 4,
+        .lease_timeout_ms = 5000,
+        .request_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+        .shutdown_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+        .application = callbacks,
+    };
+    return cbm_daemon_runtime_service_start(&config);
+}
+
 static bool frontend_eof_fixture_start(frontend_eof_fixture_t *fixture, const char *parent) {
     memset(fixture, 0, sizeof(*fixture));
     atomic_init(&fixture->application.requests, 0);
@@ -308,51 +408,40 @@ static bool frontend_eof_fixture_start(frontend_eof_fixture_t *fixture, const ch
     fixture->application.request_observed_fd = -1;
     fixture->application.session_cancel_fd = -1;
     char key[CBM_DAEMON_KEY_SIZE];
-    char build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     int log_written = snprintf(fixture->conflict_log, sizeof(fixture->conflict_log),
                                "%s/conflicts.ndjson", parent);
     if (log_written <= 0 || log_written >= (int)sizeof(fixture->conflict_log) ||
         !cbm_daemon_rendezvous_key(key) ||
-        !cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), build)) {
+        !cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(),
+                                                      fixture->build_fingerprint)) {
         return false;
     }
     fixture->endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
     fixture->manager = fixture->endpoint ? cbm_version_cohort_manager_new(fixture->endpoint) : NULL;
-    cbm_daemon_build_identity_t identity = {
+    fixture->identity = (cbm_daemon_build_identity_t){
         .semantic_version = "2.4.0",
-        .build_fingerprint = build,
+        .build_fingerprint = fixture->build_fingerprint,
         .cache_fingerprint = FRONTEND_TEST_CACHE,
         .protocol_abi = 3,
         .store_abi = 11,
         .feature_abi = 7,
     };
-    cbm_daemon_runtime_application_callbacks_t callbacks = {
-        .context = &fixture->application,
-        .session_open = frontend_eof_application_session_open,
-        .request = frontend_eof_application_request,
-        .request_cancel = frontend_eof_application_request_cancel,
-        .session_cancel = frontend_eof_application_session_cancel,
-        .session_close = frontend_eof_application_session_close,
-    };
-    cbm_daemon_runtime_service_config_t config = {
-        .endpoint = fixture->endpoint,
-        .identity = identity,
-        .conflict_log_path = fixture->conflict_log,
-        .conflict_log_cap_bytes = 64U * 1024U,
-        .max_clients = 4,
-        .lease_timeout_ms = 5000,
-        .request_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
-        .shutdown_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
-        .application = callbacks,
-    };
-    fixture->service = fixture->manager ? cbm_daemon_runtime_service_start(&config) : NULL;
+    fixture->service = fixture->manager ? frontend_eof_service_start(fixture) : NULL;
     cbm_daemon_runtime_connect_result_t connect_result = {0};
     fixture->client = fixture->service
-                          ? cbm_daemon_runtime_client_connect(fixture->endpoint, &identity,
+                          ? cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
                                                               FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
                                                               &connect_result)
                           : NULL;
     return fixture->client && connect_result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
+}
+
+static bool frontend_eof_fixture_restart_service(frontend_eof_fixture_t *fixture) {
+    bool stopped = fixture->service && cbm_daemon_runtime_service_stop(
+                                           fixture->service, FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS);
+    bool freed = stopped && cbm_daemon_runtime_service_free(fixture->service);
+    fixture->service = freed ? frontend_eof_service_start(fixture) : NULL;
+    return stopped && freed && fixture->service;
 }
 
 static bool frontend_eof_fixture_finish(frontend_eof_fixture_t *fixture) {
@@ -420,7 +509,21 @@ static int frontend_eof_child_run(const char *parent, bool overflow) {
 
     cbm_daemon_runtime_client_t *frontend_client = fixture.client;
     fixture.client = NULL; /* cbm_daemon_frontend_mcp_run consumes it. */
-    int result = cbm_daemon_frontend_mcp_run(frontend_client, fixture.manager, input, output);
+    cbm_daemon_frontend_session_config_t session = {
+        .bootstrap =
+            {
+                .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+                .endpoint = fixture.endpoint,
+                .identity = &fixture.identity,
+                .executable_path = "unused",
+                .connect_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+                .startup_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+            },
+        .session_root = parent,
+        .tool_profile = CBM_MCP_TOOL_PROFILE_ALL,
+    };
+    int result =
+        cbm_daemon_frontend_mcp_run(frontend_client, fixture.manager, &session, input, output);
     bool joined = cbm_thread_join(&writer_thread) == 0;
     bool writer_ok = atomic_load_explicit(&writer.finished, memory_order_acquire) &&
                      atomic_load_explicit(&writer.succeeded, memory_order_acquire);
@@ -497,6 +600,111 @@ static bool frontend_eof_run_isolated(const char *tag, bool overflow) {
     }
     if (!cleaned) {
         (void)fprintf(stderr, "frontend EOF fixture %s: cleanup failed\n", tag);
+    }
+    return child_ok && cleaned;
+}
+
+static int frontend_recovery_child_run(const char *parent, frontend_recovery_mode_t recovery_mode) {
+    (void)alarm(FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S);
+    frontend_eof_fixture_t fixture;
+    if (!frontend_eof_fixture_start(&fixture, parent)) {
+        (void)frontend_eof_fixture_finish(&fixture);
+        return 73;
+    }
+    atomic_store_explicit(&fixture.application.block_first_request,
+                          recovery_mode != FRONTEND_RECOVERY_RETRY, memory_order_release);
+    cbm_daemon_runtime_client_t *stale_client = fixture.client;
+    fixture.client = NULL;
+    bool replacement_ready = frontend_eof_fixture_restart_service(&fixture);
+    int input_pipe[2] = {-1, -1};
+    bool pipe_ready = replacement_ready && pipe(input_pipe) == 0;
+    FILE *input = pipe_ready ? fdopen(input_pipe[0], "rb") : NULL;
+    FILE *output = input ? tmpfile() : NULL;
+    frontend_eof_writer_t writer = {
+        .fd = input_pipe[1],
+        .recovery_mode = recovery_mode,
+        .application = &fixture.application,
+    };
+    atomic_init(&writer.finished, false);
+    atomic_init(&writer.succeeded, false);
+    cbm_thread_t writer_thread;
+    bool writer_started =
+        output && cbm_thread_create(&writer_thread, 0, frontend_recovery_writer, &writer) == 0;
+    if (!writer_started && input_pipe[1] >= 0) {
+        (void)close(input_pipe[1]);
+        input_pipe[1] = -1;
+    }
+    bool request_ready = writer_started;
+    cbm_daemon_frontend_session_config_t session = {
+        .bootstrap =
+            {
+                .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+                .endpoint = fixture.endpoint,
+                .identity = &fixture.identity,
+                .executable_path = "unused",
+                .connect_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+                .startup_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+            },
+        .session_root = parent,
+        .tool_profile = CBM_MCP_TOOL_PROFILE_ALL,
+    };
+    int result = request_ready ? cbm_daemon_frontend_mcp_run(stale_client, fixture.manager,
+                                                             &session, input, output)
+                               : -1;
+    stale_client = NULL; /* the frontend consumes the stale or replacement handle */
+    bool writer_joined = writer_started && cbm_thread_join(&writer_thread) == 0;
+    bool writer_ok = writer_joined &&
+                     atomic_load_explicit(&writer.finished, memory_order_acquire) &&
+                     atomic_load_explicit(&writer.succeeded, memory_order_acquire);
+    char response[512];
+    memset(response, 0, sizeof(response));
+    bool response_ready = result == 0 && fflush(output) == 0 && fseek(output, 0, SEEK_SET) == 0;
+    size_t response_length = response_ready ? fread(response, 1, sizeof(response) - 1U, output) : 0;
+    bool response_exact = false;
+    if (recovery_mode == FRONTEND_RECOVERY_CANCEL) {
+        response_exact = strstr(response, "\"id\":1") && strstr(response, "\"code\":-32800") &&
+                         strstr(response, frontend_recovery_followup);
+    } else if (recovery_mode == FRONTEND_RECOVERY_CLEAN_EOF) {
+        response_exact = response_length == 0;
+    } else {
+        response_exact = response_length == sizeof(frontend_recovery_request) - 1U &&
+                         memcmp(response, frontend_recovery_request,
+                                sizeof(frontend_recovery_request) - 1U) == 0;
+    }
+    int requests = atomic_load_explicit(&fixture.application.requests, memory_order_acquire);
+    int expected_requests = recovery_mode == FRONTEND_RECOVERY_CLEAN_EOF ? 1 : 2;
+    bool input_closed = input && fclose(input) == 0;
+    bool output_closed = output && fclose(output) == 0;
+    bool fixture_closed = frontend_eof_fixture_finish(&fixture);
+    return replacement_ready && request_ready && result == 0 && response_exact &&
+                   requests == expected_requests && writer_ok && input_closed && output_closed &&
+                   fixture_closed
+               ? 0
+               : 74;
+}
+
+static bool frontend_recovery_run_isolated(frontend_recovery_mode_t recovery_mode) {
+    char parent[FRONTEND_TEST_PATH_CAP];
+    int written = snprintf(parent, sizeof(parent), "%s/cbm-frontend-recovery-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || written >= (int)sizeof(parent) || !cbm_mkdtemp(parent)) {
+        return false;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        (void)signal(SIGALRM, SIG_DFL);
+        _exit(frontend_recovery_child_run(parent, recovery_mode));
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = child > 0 ? waitpid(child, &status, 0) : -1;
+    } while (waited < 0 && errno == EINTR);
+    bool cleaned = th_rmtree(parent) == 0;
+    bool child_ok = child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!child_ok && child > 0 && waited == child) {
+        (void)fprintf(stderr, "frontend recovery fixture failed: status=0x%x exit=%d signal=%d\n",
+                      status, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
     }
     return child_ok && cleaned;
 }
@@ -761,7 +969,20 @@ static int frontend_backpressure_frontend_run(const char *parent, int input_fd, 
         return 81;
     }
 
-    int result = cbm_daemon_frontend_mcp_run(client, manager, input, output);
+    cbm_daemon_frontend_session_config_t session = {
+        .bootstrap =
+            {
+                .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+                .endpoint = endpoint,
+                .identity = &identity,
+                .executable_path = "unused",
+                .connect_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+                .startup_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+            },
+        .session_root = parent,
+        .tool_profile = CBM_MCP_TOOL_PROFILE_ALL,
+    };
+    int result = cbm_daemon_frontend_mcp_run(client, manager, &session, input, output);
     bool joined = cbm_thread_join(&writer_thread) == 0;
     bool writer_ok = atomic_load_explicit(&writer.finished, memory_order_acquire) &&
                      atomic_load_explicit(&writer.succeeded, memory_order_acquire);
@@ -1178,8 +1399,21 @@ TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked) {
         if (!announced) {
             _exit(70);
         }
+        cbm_daemon_frontend_session_config_t session = {
+            .bootstrap =
+                {
+                    .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+                    .endpoint = endpoint,
+                    .identity = &identity,
+                    .executable_path = "unused",
+                    .connect_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+                    .startup_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+                },
+            .session_root = fixture.parent,
+            .tool_profile = CBM_MCP_TOOL_PROFILE_ALL,
+        };
         int result = cbm_daemon_frontend_mcp_run((cbm_daemon_runtime_client_t *)(uintptr_t)1,
-                                                 manager, input, output);
+                                                 manager, &session, input, output);
         (void)result;
         _exit(71);
     }
@@ -1393,6 +1627,27 @@ TEST(daemon_frontend_over_capacity_input_backpressures_without_loss) {
     PASS();
 }
 
+/* A request rejected before its application frame reaches the daemon is safe
+ * to replay. The frontend must replace its stale authenticated client, restore
+ * the session, reserve a token from the new connection, and return the one
+ * response without closing Codex's stdio transport. */
+TEST(daemon_frontend_recovers_one_unsent_request_after_daemon_replacement) {
+    ASSERT_TRUE(frontend_recovery_run_isolated(FRONTEND_RECOVERY_RETRY));
+    PASS();
+}
+
+/* Context-replay cancellation must not strand a token or break the next request. */
+TEST(daemon_frontend_recovery_cancellation_preserves_next_request) {
+    ASSERT_TRUE(frontend_recovery_run_isolated(FRONTEND_RECOVERY_CANCEL));
+    PASS();
+}
+
+/* Clean EOF during context replay must preserve worker-owned client cleanup. */
+TEST(daemon_frontend_clean_eof_during_recovery_preserves_client_ownership) {
+    ASSERT_TRUE(frontend_recovery_run_isolated(FRONTEND_RECOVERY_CLEAN_EOF));
+    PASS();
+}
+
 /* Clean EOF is the normal MCP-session ownership boundary. Accepted work gets a
  * bounded drain opportunity; work still active at the deadline is cancelled
  * with that exact session, while the frontend itself reports a clean close. */
@@ -1447,6 +1702,9 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation);
     RUN_TEST(daemon_local_participant_monitor_allows_supervisor_containment_window);
     RUN_TEST(daemon_frontend_over_capacity_input_backpressures_without_loss);
+    RUN_TEST(daemon_frontend_recovers_one_unsent_request_after_daemon_replacement);
+    RUN_TEST(daemon_frontend_recovery_cancellation_preserves_next_request);
+    RUN_TEST(daemon_frontend_clean_eof_during_recovery_preserves_client_ownership);
     RUN_TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success);
     RUN_TEST(daemon_frontend_stdout_backpressure_eof_fail_stops_and_cancels_session);
     RUN_TEST(daemon_frontend_stdout_backpressure_maintenance_stops_and_cancels_session);

@@ -149,11 +149,12 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(
     cbm_daemon_runtime_client_t *client, const char *message, uint8_t **response_out,
     uint32_t *response_length_out, uint32_t timeout_ms);
 
-/* Cancellable frontend variant using a token reserved on the runtime client. */
+/* Cancellable frontend variant using a token reserved on the runtime client.
+ * request_sent_out preserves the runtime's application-frame delivery fact. */
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const char *message, uint8_t **response_out, uint32_t *response_length_out,
-    uint32_t timeout_ms);
+    bool *request_sent_out, uint32_t timeout_ms);
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_tool(
     cbm_daemon_runtime_client_t *client, const char *tool_name, const char *args_json,
