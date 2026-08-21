@@ -2677,10 +2677,15 @@ TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal) {
     if (accepted) {
         overflow = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
                                                      RUNTIME_TEST_TIMEOUT_MS, &overflow_result);
+        /* The "capacity" substring in the rejection message proves the reason.
+         * active_connections is NOT sampled here: on a loaded runner the
+         * server's HELLO timeout can fire for slow_hello between the raw
+         * connect and this read, making the count 1 instead of 2 — a
+         * scheduling race, not a product bug (see db91b88c for precedent).
+         * active_clients == 1 is safe because we still hold accepted. */
         capacity_rejected = overflow == NULL &&
                             overflow_result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
                             strstr(overflow_result.message, "capacity") != NULL &&
-                            cbm_daemon_runtime_service_active_connections(fixture.service) == 2 &&
                             cbm_daemon_runtime_service_active_clients(fixture.service) == 1;
 
         cbm_daemon_ipc_connection_close(slow_hello);
