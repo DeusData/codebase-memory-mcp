@@ -1527,6 +1527,52 @@ TEST(ui_server_ui_config_prefers_config_lang) {
     PASS();
 }
 
+TEST(ui_server_ui_config_post_persists_lang) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_httpd_cfg_post_XXXXXX");
+    char *td = cbm_mkdtemp(tmpdir);
+    ASSERT_NOT_NULL(td);
+
+    char *old_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+    cbm_setenv("HOME", td, 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+
+    /* POST zh; expect the preference echoed and the effective lang resolved. */
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "POST /api/ui-config HTTP/1.1\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 14\r\n"
+                    "\r\n"
+                    "{\"lang\":\"zh\"}",
+                    resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"lang_pref\":\"zh\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"lang\":\"zh\""));
+
+    /* A subsequent GET reflects the persisted preference. */
+    char resp2[4096];
+    int n2 = th_http(cbm_http_server_port(ts.srv),
+                     "GET /api/ui-config HTTP/1.1\r\n"
+                     "Accept-Language: en-US,en;q=0.9\r\n"
+                     "\r\n",
+                     resp2, sizeof(resp2));
+    ASSERT_TRUE(n2 > 0);
+    ASSERT_EQ(th_status(resp2), 200);
+    ASSERT_NOT_NULL(strstr(resp2, "\"lang_pref\":\"zh\""));
+    ASSERT_NOT_NULL(strstr(resp2, "\"lang\":\"zh\""));
+
+    th_server_stop(&ts);
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    }
+    PASS();
+}
+
 TEST(ui_server_slow_request_hits_deadline) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);

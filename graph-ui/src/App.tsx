@@ -3,7 +3,16 @@ import { GraphTab } from "./components/GraphTab";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
 import type { TabId } from "./lib/types";
-import { useUiMessages } from "./lib/i18n";
+import {
+  useUiMessages,
+  useUiLanguage,
+  getCachedLangPref,
+  getUiLangPref,
+  langOptionLabels,
+  setUiLanguage,
+  messages,
+  type UiLangPref,
+} from "./lib/i18n";
 
 const TAB_IDS: TabId[] = ["graph", "stats", "control"];
 
@@ -28,6 +37,42 @@ function routeUrl(tab: TabId, project: string | null): string {
   params.set("tab", tab);
   if (project) params.set("project", project);
   return `${window.location.pathname}?${params.toString()}${window.location.hash}`;
+}
+
+function LanguageSwitcher() {
+  const lang = useUiLanguage();
+  const [pref, setPref] = useState<UiLangPref>(getCachedLangPref());
+  const labels = langOptionLabels(lang);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getUiLangPref().then((p) => {
+      if (!cancelled) setPref(p);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const next = e.target.value as UiLangPref;
+    setPref(next);
+    void setUiLanguage(next);
+  };
+
+  return (
+    <select
+      value={pref}
+      onChange={onChange}
+      aria-label={messages[lang].language.label}
+      title={messages[lang].language.label}
+      className="bg-white/[0.04] border border-border/30 rounded-md px-2 py-1 text-[12px] text-foreground/90 cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/40 hover:bg-white/[0.08] transition-colors"
+    >
+      <option value="zh">{labels.zh}</option>
+      <option value="en">{labels.en}</option>
+      <option value="auto">{labels.auto}</option>
+    </select>
+  );
 }
 
 export function App() {
@@ -100,8 +145,11 @@ export function App() {
           </nav>
         </div>
 
-        {selectedProject && (
-          <div className="flex items-center gap-2 px-3 py-1 rounded-lg bg-white/[0.04] border border-border/30">
+        <div className="flex items-center gap-3">
+          <LanguageSwitcher />
+
+          {selectedProject && (
+            <div className="flex items-center gap-2 px-3 py-1 rounded-lg bg-white/[0.04] border border-border/30">
             <span className="text-[10px] text-foreground/30 uppercase tracking-wider">
               {t.graph.selectedLabel}
             </span>
@@ -114,8 +162,9 @@ export function App() {
             >
               ×
             </button>
-          </div>
-        )}
+            </div>
+          )}
+        </div>
       </header>
 
       {/* Content */}

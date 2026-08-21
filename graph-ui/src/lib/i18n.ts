@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 
 export type UiLanguage = "en" | "zh";
 
+/** The persisted language preference. "auto" follows the browser via Accept-Language. */
+export type UiLangPref = "en" | "zh" | "auto";
+
 export const messages = {
   en: {
     tabs: {
@@ -72,6 +75,9 @@ export const messages = {
       noLogs: "No logs yet",
       thisProcess: "THIS",
       uptime: "Uptime",
+    },
+    language: {
+      label: "Language",
     },
   },
   zh: {
@@ -144,6 +150,9 @@ export const messages = {
       thisProcess: "本进程",
       uptime: "运行时间",
     },
+    language: {
+      label: "语言",
+    },
   },
 } as const;
 
@@ -171,6 +180,7 @@ export function detectLanguage(acceptLanguage?: string | null, override?: string
 }
 
 let cachedLanguage: UiLanguage = "en";
+let cachedLangPref: UiLangPref = "auto";
 let languageLoaded = false;
 let languageRequest: Promise<UiLanguage> | null = null;
 const languageListeners = new Set<(lang: UiLanguage) => void>();
@@ -181,7 +191,12 @@ function loadUiLanguage(): Promise<UiLanguage> {
 
   languageRequest = fetch("/api/ui-config")
     .then((r) => r.json())
-    .then((data) => detectLanguage(null, data?.lang))
+    .then((data) => {
+      if (data?.lang_pref === "en" || data?.lang_pref === "zh" || data?.lang_pref === "auto") {
+        cachedLangPref = data.lang_pref;
+      }
+      return detectLanguage(null, data?.lang);
+    })
     .catch(() => detectLanguage(navigator.language))
     .then((lang) => {
       cachedLanguage = lang;
@@ -212,4 +227,73 @@ export function useUiMessages(): UiMessages {
   }, []);
 
   return messages[lang];
+}
+
+/** Read the persisted language preference without forcing a load. */
+export function getCachedLangPref(): UiLangPref {
+  return cachedLangPref;
+}
+
+/** Fetch the persisted language preference from the server. */
+export async function getUiLangPref(): Promise<UiLangPref> {
+  try {
+    const data = await fetch("/api/ui-config").then((r) => r.json());
+    const pref = data?.lang_pref;
+    if (pref === "en" || pref === "zh" || pref === "auto") return pref;
+  } catch {
+    // The server is unreachable; fall back to the in-memory default.
+  }
+  return "auto";
+}
+
+/** Subscribe to the current effective UI language and re-render on change. */
+export function useUiLanguage(): UiLanguage {
+  const [lang, setLang] = useState<UiLanguage>(cachedLanguage);
+
+  useEffect(() => {
+    let cancelled = false;
+    languageListeners.add(setLang);
+    void loadUiLanguage().then((nextLang) => {
+      if (!cancelled) setLang(nextLang);
+    });
+    return () => {
+      cancelled = true;
+      languageListeners.delete(setLang);
+    };
+  }, []);
+
+  return lang;
+}
+
+/**
+ * Labels for the three language options, rendered in the currently active UI
+ * language so the dropdown reads naturally regardless of the chosen preference.
+ */
+export function langOptionLabels(lang: UiLanguage): Record<UiLangPref, string> {
+  if (lang === "zh") {
+    return { zh: "中文", en: "English", auto: "跟随浏览器" };
+  }
+  return { zh: "Chinese", en: "English", auto: "Follow browser" };
+}
+
+/**
+ * Persist a new language preference and immediately reflect it in the UI.
+ * "auto" recomputes the effective language from the browser at switch time and
+ * stores "auto" so future loads re-derive it from Accept-Language.
+ */
+export async function setUiLanguage(pref: UiLangPref): Promise<void> {
+  cachedLangPref = pref;
+  const effective: UiLanguage = pref === "auto" ? detectLanguage(navigator.language) : pref;
+  cachedLanguage = effective;
+  for (const listener of languageListeners) listener(effective);
+
+  try {
+    await fetch("/api/ui-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang: pref }),
+    });
+  } catch {
+    // If persistence fails, the in-memory language still applies for this session.
+  }
 }

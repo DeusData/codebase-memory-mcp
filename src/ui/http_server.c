@@ -123,13 +123,18 @@ static const char *detect_ui_lang(const char *accept_language) {
 
 static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     const char *lang = NULL;
+    char lang_pref[8];
+    snprintf(lang_pref, sizeof(lang_pref), "auto");
     char cache_dir[1024];
     snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
     cbm_config_t *cfg = cbm_config_open(cache_dir);
     if (cfg) {
         const char *pinned = cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto");
-        if (strcmp(pinned, "zh") == 0 || strcmp(pinned, "en") == 0) {
-            lang = pinned;
+        if (pinned) {
+            snprintf(lang_pref, sizeof(lang_pref), "%s", pinned);
+        }
+        if (strcmp(lang_pref, "zh") == 0 || strcmp(lang_pref, "en") == 0) {
+            lang = lang_pref;
         }
     }
 
@@ -142,9 +147,60 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * edge-case reports. Served from the backend on purpose — the UI security
      * audit forbids hardcoded external URLs in graph-ui source (external
      * targets must come from an auditable backend response, same pattern as
-     * the /api/repo-info deep-links). */
-    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+     * the /api/repo-info deep-links). lang_pref echoes the stored preference
+     * (en | zh | auto) so the in-UI language switcher can reflect state. */
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"lang\":\"%s\",\"lang_pref\":\"%s\",\"upstream_issues_url\":\"%s\"}",
+                    lang_buf, lang_pref,
+                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+}
+
+/* POST /api/ui-config → persist the pinned UI language (en | zh | auto) and
+ * return the resolved config. The in-UI language switcher calls this so the
+ * choice survives restarts without forcing a language on other users. */
+static void handle_ui_config_update(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    if (req->body_len == 0 || req->body_len > 64) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
+        return;
+    }
+
+    yyjson_doc *doc = yyjson_read(req->body, req->body_len, 0);
+    if (!doc) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
+        return;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *v_lang = root ? yyjson_obj_get(root, "lang") : NULL;
+    if (!yyjson_is_str(v_lang)) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing lang\"}");
+        return;
+    }
+
+    const char *lang = yyjson_get_str(v_lang);
+    if (strcmp(lang, "en") != 0 && strcmp(lang, "zh") != 0 && strcmp(lang, "auto") != 0) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid lang\"}");
+        return;
+    }
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    if (!cfg) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"config unavailable\"}");
+        return;
+    }
+    cbm_config_set(cfg, CBM_CONFIG_UI_LANG, lang);
+    cbm_config_close(cfg);
+    yyjson_doc_free(doc);
+
+    const char *effective = (strcmp(lang, "auto") == 0) ? detect_ui_lang(req->accept_language) : lang;
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"lang\":\"%s\",\"lang_pref\":\"%s\",\"upstream_issues_url\":\"%s\"}",
+                    effective, lang, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -1936,9 +1992,13 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* GET /api/ui-config → language and local UI preferences */
-    if (is_get && cbm_http_path_match(req->path, "/api/ui-config")) {
-        handle_ui_config(c, req);
+    /* /api/ui-config → language and local UI preferences (GET reads, POST writes) */
+    if (cbm_http_path_match(req->path, "/api/ui-config")) {
+        if (is_post) {
+            handle_ui_config_update(c, req);
+        } else {
+            handle_ui_config(c, req);
+        }
         return;
     }
 

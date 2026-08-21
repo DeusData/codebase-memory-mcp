@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { detectLanguage, messages } from "./i18n";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { detectLanguage, langOptionLabels, messages, setUiLanguage } from "./i18n";
 
 describe("i18n", () => {
   it("detects Chinese from Accept-Language and falls back to English", () => {
@@ -36,5 +36,47 @@ describe("i18n", () => {
     expect(messages.zh.tabs.projects).toBe("项目");
     expect(messages.zh.index.newIndex).toBe("新建索引");
     expect(messages.en.index.repositoryPath).toBe("Repository path");
+  });
+});
+
+describe("langOptionLabels", () => {
+  it("labels the three options in the active UI language", () => {
+    expect(langOptionLabels("en")).toEqual({
+      zh: "Chinese",
+      en: "English",
+      auto: "Follow browser",
+    });
+    expect(langOptionLabels("zh")).toEqual({
+      zh: "中文",
+      en: "English",
+      auto: "跟随浏览器",
+    });
+  });
+});
+
+describe("setUiLanguage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("POSTs the chosen preference to /api/ui-config", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true } as Response);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setUiLanguage("zh");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/ui-config");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ lang: "zh" });
+  });
+
+  it("resolves without throwing when the POST fails", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("network"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(setUiLanguage("en")).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
