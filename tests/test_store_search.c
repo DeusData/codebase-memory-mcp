@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <sqlite3.h>
 #include <store/store.h>
 #include <stdint.h>
 #include <string.h>
@@ -1480,6 +1481,165 @@ TEST(store_find_nodes_rejects_null_store_without_ub) {
     PASS();
 }
 
+/* ── FTS5 body indexing (#518) ───────────────────────────────────── */
+
+/* Count nodes_fts rows matching a single (test-controlled) alpha token. */
+static int fts_match_count(sqlite3 *db, const char *term) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH '%s'", term);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int c = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return c;
+}
+
+/* cbm_store_fts_rebuild indexes the `body` column from each node's docstring, so
+ * BM25 MATCH finds a Section by its content, not just its name. */
+TEST(fts_rebuild_indexes_body_content) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t sec = {.project = "test",
+                      .label = "Section",
+                      .name = "BROWSER AGENT",
+                      .qualified_name = "test.SKILL.browser",
+                      .file_path = "SKILL.md",
+                      .properties_json =
+                          "{\"docstring\":\"explore the live app using Playwright\"}"};
+    cbm_store_upsert_node(s, &sec);
+
+    ASSERT_EQ(cbm_store_fts_rebuild(s), CBM_STORE_OK);
+    sqlite3 *db = cbm_store_get_db(s);
+
+    /* A body token that appears in no node name is searchable. */
+    ASSERT_GTE(fts_match_count(db, "playwright"), 1);
+    /* Name tokens still searchable. */
+    ASSERT_GTE(fts_match_count(db, "browser"), 1);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A database created before the `body` column is upgraded in place: rebuild drops
+ * the legacy 4-column table, recreates it with body, and repopulates. */
+TEST(fts_rebuild_upgrades_legacy_schema) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    sqlite3 *db = cbm_store_get_db(s);
+    /* Replace the current table with the historical 4-column (no body) schema. */
+    ASSERT_EQ(sqlite3_exec(db, "DROP TABLE IF EXISTS nodes_fts;", NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "CREATE VIRTUAL TABLE nodes_fts USING fts5(name, qualified_name, label, "
+                           "file_path, content='', tokenize='unicode61 remove_diacritics 2');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    cbm_node_t fn = {.project = "test",
+                     .label = "Function",
+                     .name = "parseConfig",
+                     .qualified_name = "test.parseConfig",
+                     .file_path = "a.c",
+                     .properties_json = "{\"docstring\":\"loads zookeeper settings\"}"};
+    cbm_store_upsert_node(s, &fn);
+
+    ASSERT_EQ(cbm_store_fts_rebuild(s), CBM_STORE_OK);
+
+    /* The new body column now exists and the docstring is searchable. */
+    sqlite3_stmt *probe = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT body FROM nodes_fts", -1, &probe, NULL), SQLITE_OK);
+    sqlite3_finalize(probe);
+    ASSERT_GTE(fts_match_count(db, "zookeeper"), 1);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The backfill must survive rows whose properties_json is not valid JSON (legacy
+ * databases contain such rows); the json_valid() guard prevents json_extract from
+ * aborting the whole INSERT...SELECT. */
+TEST(fts_rebuild_tolerates_malformed_properties) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t bad = {.project = "test",
+                      .label = "Function",
+                      .name = "weird",
+                      .qualified_name = "test.weird",
+                      .file_path = "a.c",
+                      .properties_json = "{not valid json"};
+    cbm_node_t ok = {.project = "test",
+                     .label = "Function",
+                     .name = "fine",
+                     .qualified_name = "test.fine",
+                     .file_path = "b.c",
+                     .properties_json = "{\"docstring\":\"kafka consumer group\"}"};
+    cbm_store_upsert_node(s, &bad);
+    cbm_store_upsert_node(s, &ok);
+
+    ASSERT_EQ(cbm_store_fts_rebuild(s), CBM_STORE_OK);
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_GTE(fts_match_count(db, "kafka"), 1); /* good row indexed */
+    ASSERT_GTE(fts_match_count(db, "weird"), 1); /* malformed row's name still indexed */
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Regression guard for the incremental path (pipeline_delta.c).  nodes_fts has five
+ * columns, and a row-level INSERT naming only the original four is still valid SQL
+ * that silently leaves `body` NULL — prose arriving via delta merge would be
+ * unsearchable while a full reindex looked perfectly correct.  This runs the delta
+ * site's exact statement shape (id > max_db_id, via CBM_SQL_FTS_BODY_EXPR) and
+ * asserts the newly merged node's body is searchable. */
+TEST(fts_delta_insert_populates_body) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t first = {.project = "test",
+                        .label = "Function",
+                        .name = "existing",
+                        .qualified_name = "test.existing",
+                        .file_path = "a.c",
+                        .properties_json = "{\"docstring\":\"already indexed\"}"};
+    cbm_store_upsert_node(s, &first);
+    ASSERT_EQ(cbm_store_fts_rebuild(s), CBM_STORE_OK);
+
+    sqlite3 *db = cbm_store_get_db(s);
+    /* Everything already in nodes_fts is the previous generation. */
+    sqlite3_stmt *mx = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT coalesce(max(id),0) FROM nodes", -1, &mx, NULL),
+              SQLITE_OK);
+    ASSERT(sqlite3_step(mx) == SQLITE_ROW);
+    sqlite3_int64 max_db_id = sqlite3_column_int64(mx, 0);
+    sqlite3_finalize(mx);
+
+    /* A markdown Section arrives incrementally, carrying prose in its docstring. */
+    cbm_node_t added = {.project = "test",
+                        .label = "Section",
+                        .name = "Deployment",
+                        .qualified_name = "test.README.deployment",
+                        .file_path = "README.md",
+                        .properties_json = "{\"docstring\":\"rollback uses the canary alias\"}"};
+    cbm_store_upsert_node(s, &added);
+
+    sqlite3_stmt *fts = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "INSERT INTO nodes_fts (rowid, name, qualified_name, label,"
+                                 " file_path, body)"
+                                 " SELECT id, name, qualified_name, label,"
+                                 " file_path," CBM_SQL_FTS_BODY_EXPR
+                                 "FROM nodes WHERE project = ?1 AND id > ?2",
+                                 -1, &fts, NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(fts, 1, "test", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(fts, 2, max_db_id);
+    ASSERT_EQ(sqlite3_step(fts), SQLITE_DONE);
+    sqlite3_finalize(fts);
+
+    /* The delta-merged node's prose is searchable — not just its name. */
+    ASSERT_GTE(fts_match_count(db, "canary"), 1);
+    ASSERT_GTE(fts_match_count(db, "rollback"), 1);
+    ASSERT_GTE(fts_match_count(db, "deployment"), 1);
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
     RUN_TEST(store_search_by_name_pattern);
@@ -1548,4 +1708,9 @@ SUITE(store_search) {
     RUN_TEST(store_risk_label_all_levels);
     RUN_TEST(store_impact_summary_empty);
     RUN_TEST(store_find_nodes_rejects_null_store_without_ub);
+    /* FTS5 body indexing (#518) */
+    RUN_TEST(fts_rebuild_indexes_body_content);
+    RUN_TEST(fts_rebuild_upgrades_legacy_schema);
+    RUN_TEST(fts_rebuild_tolerates_malformed_properties);
+    RUN_TEST(fts_delta_insert_populates_body);
 }

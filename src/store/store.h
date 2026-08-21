@@ -342,6 +342,24 @@ int cbm_store_drop_indexes(cbm_store_t *s);
 /* Recreate user indexes after bulk inserts. */
 int cbm_store_create_indexes(cbm_store_t *s);
 
+/* Rebuild the nodes_fts BM25 index from the nodes table.  Drops and recreates the
+ * FTS virtual table — which upgrades legacy 4-column databases to the schema carrying
+ * the `body` column — then re-inserts every node with its camelCase-split name and
+ * prose body (the docstring property) so full-text search matches content and not
+ * only identifiers (#518).  Returns CBM_STORE_OK or CBM_STORE_ERR. */
+int cbm_store_fts_rebuild(cbm_store_t *s);
+
+/* Body expression shared by EVERY nodes_fts write site — the wholesale rebuild in
+ * cbm_store_fts_rebuild and the row-level delta insert in pipeline_delta.c.  Any new
+ * write site must use it too: nodes_fts carries five columns, and an INSERT naming
+ * only the original four is still valid SQL that silently leaves `body` NULL, making
+ * prose added on that path unsearchable while a full reindex looks correct.
+ * Feeds the node's docstring property, or '' when absent.  The json_valid() guard is
+ * essential — json_extract() aborts the whole statement on malformed JSON, and pre-fix
+ * databases contain such rows; a guarded row degrades to name-only indexing instead of
+ * failing the write.  Expects the `nodes` row in scope as the SELECT source. */
+#define CBM_SQL_FTS_BODY_EXPR                                                                          " CASE WHEN json_valid(properties)"                                                                " THEN coalesce(json_extract(properties,'$.docstring'),'') ELSE '' END "
+
 /* ── WAL / Checkpoint ───────────────────────────────────────────── */
 
 /* Force WAL checkpoint + PRAGMA optimize. */

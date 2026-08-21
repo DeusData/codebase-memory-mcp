@@ -3028,7 +3028,11 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         ") fts "
         "JOIN nodes n ON n.id = fts.rowid "
         "WHERE n.project = ?2 "
-        "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        /* Section is searchable (#518): its body text is indexed into nodes_fts.body,
+         * and it falls in the ELSE 0.0 bucket of the boost CASE above, so code symbols
+         * keep their ranking advantage by construction rather than by exclusion.
+         * Module stays excluded pending #519. */
+        "  AND n.label NOT IN ('File','Folder','Module','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
         /* rank ties are common (boosted floats) — the id tie-break makes
          * offset pages contractually stable across calls. */
@@ -3063,7 +3067,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             "    ) fts "
             "    JOIN nodes n ON n.id = fts.rowid "
             "    WHERE n.project = ?2 "
-            "      AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project')"
+            /* Keep in sync with the search query's filter above (#518). */
+            "      AND n.label NOT IN ('File','Folder','Module','Variable','Project')"
             "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
             ")";
         sqlite3_stmt *cs = NULL;

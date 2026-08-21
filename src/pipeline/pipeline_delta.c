@@ -22,7 +22,11 @@
  * a live node again (AUTOINCREMENT), so dead entries simply drop out of the
  * rowid join at query time. The patch inserts rows for exactly the new
  * nodes, via the same cbm_camel_split SQL function the wholesale rebuild
- * uses.
+ * uses, and through the same CBM_SQL_FTS_BODY_EXPR so prose arriving on the
+ * incremental path is searchable too.  That shared expression is not optional:
+ * naming only the original four columns here would still be valid SQL, leaving
+ * `body` NULL for every delta-merged node — unsearchable prose on the path
+ * users hit most, while a full reindex looked correct.
  */
 #include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
@@ -526,9 +530,10 @@ int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, i
         sqlite3_stmt *fts = NULL;
         if (sqlite3_prepare_v2(db,
                                "INSERT INTO nodes_fts (rowid, name, qualified_name, label,"
-                               " file_path)"
+                               " file_path, body)"
                                " SELECT id, cbm_camel_split(name), qualified_name, label,"
-                               " file_path FROM nodes WHERE project = ?1 AND id > ?2",
+                               " file_path," CBM_SQL_FTS_BODY_EXPR
+                               "FROM nodes WHERE project = ?1 AND id > ?2",
                                CBM_NOT_FOUND, &fts, NULL) == SQLITE_OK) {
             sqlite3_bind_text(fts, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
             sqlite3_bind_int64(fts, 2, max_db_id);

@@ -1492,20 +1492,11 @@ static void discard_generation_stage(const char *stage_path) {
     cbm_remove_db_sidecars(stage_path);
 }
 
+/* Wholesale FTS rebuild.  Delegates to the store so the DDL, the camelCase-split
+ * fallback and the prose `body` backfill live in one place; the DROP+recreate it
+ * performs is also what upgrades a legacy 4-column nodes_fts (#518). */
 static int generation_rebuild_fts(cbm_store_t *store) {
-    if (cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
-        CBM_STORE_OK) {
-        return CBM_STORE_ERR;
-    }
-    if (cbm_store_exec(store,
-                       "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                       "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                       "FROM nodes;") == CBM_STORE_OK) {
-        return CBM_STORE_OK;
-    }
-    return cbm_store_exec(store,
-                          "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                          "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+    return cbm_store_fts_rebuild(store);
 }
 
 typedef struct {
