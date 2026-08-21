@@ -41,6 +41,7 @@ typedef enum {
     CBM_GRAPH_DIALECT_CURSOR,
     CBM_GRAPH_DIALECT_ROVO,
     CBM_GRAPH_DIALECT_POCHI,
+    CBM_GRAPH_DIALECT_OMP,
     CBM_GRAPH_DIALECT_COUNT
 } cbm_graph_profile_dialect_t;
 

@@ -195,6 +195,8 @@ static const char *const tf_client_home_overrides[] = {
     "CBM_TRAE_CONFIG_PATH",
     "CBM_ROO_CONFIG_PATH",
     "CBM_CODY_CONFIG_PATH",
+    "OMP_PROFILE",
+    "PI_CODING_AGENT_DIR",
 };
 
 static bool tf_setup_cache_sentinel(void) {
