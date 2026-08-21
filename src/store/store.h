@@ -358,7 +358,9 @@ int cbm_store_fts_rebuild(cbm_store_t *s);
  * essential — json_extract() aborts the whole statement on malformed JSON, and pre-fix
  * databases contain such rows; a guarded row degrades to name-only indexing instead of
  * failing the write.  Expects the `nodes` row in scope as the SELECT source. */
-#define CBM_SQL_FTS_BODY_EXPR                                                                          " CASE WHEN json_valid(properties)"                                                                " THEN coalesce(json_extract(properties,'$.docstring'),'') ELSE '' END "
+#define CBM_SQL_FTS_BODY_EXPR                                                \
+    " CASE WHEN json_valid(properties)"                                      \
+    " THEN coalesce(json_extract(properties,'$.docstring'),'') ELSE '' END "
 
 /* ── WAL / Checkpoint ───────────────────────────────────────────── */
 
