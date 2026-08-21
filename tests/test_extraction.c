@@ -1029,6 +1029,33 @@ TEST(elixir_function) {
     PASS();
 }
 
+/* tree-sitter-elixir gives a call's arguments node no field name, so the
+ * generic `arguments` field lookup returns null and first_string_arg was never
+ * populated for any Elixir call — Phoenix route paths, service URLs and config
+ * keys all key off it. */
+TEST(elixir_call_string_argument) {
+    CBMFileResult *r = extract("defmodule Sample do\n"
+                               "  def run do\n"
+                               "    get(\"/wallets\", WalletController)\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "sample.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int seen = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "get") != 0) {
+            continue;
+        }
+        seen = 1;
+        ASSERT_NOT_NULL(r->calls.items[i].first_string_arg);
+        ASSERT_STR_EQ("/wallets", r->calls.items[i].first_string_arg);
+    }
+    ASSERT_EQ(1, seen);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -5603,6 +5630,7 @@ SUITE(extraction) {
 
     /* Functional */
     RUN_TEST(elixir_function);
+    RUN_TEST(elixir_call_string_argument);
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);

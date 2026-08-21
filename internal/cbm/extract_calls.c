@@ -515,6 +515,17 @@ static char *extract_objc_callee(CBMArena *a, TSNode node, const char *source, c
     return ts_node_is_null(selector) ? NULL : cbm_node_text(a, selector, source);
 }
 
+/* tree-sitter-elixir gives a call's arguments node no field name, so it is
+ * found positionally. Mirrors elixir_call_args() in extract_defs.c, which the
+ * definition side has always used for the same reason. */
+static TSNode elixir_call_arguments_fallback(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) && ts_node_child_count(node) > 1) {
+        args = ts_node_child(node, 1);
+    }
+    return args;
+}
+
 // Erlang: extract callee from call node's first child.
 static char *extract_erlang_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "call") != 0 || ts_node_child_count(node) == 0) {
@@ -3311,6 +3322,21 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            /* tree-sitter-elixir attaches NO field name to a call's arguments
+             * node — its whole field set is key, left, operand, operator,
+             * quoted_start, quoted_end, right, target, value — so the lookup
+             * above is always null for Elixir and first_string_arg was never
+             * populated for ANY Elixir call. That silently disabled every
+             * downstream signal keyed off a call's string argument: Phoenix
+             * route paths, HTTP/async service URLs, and config keys.
+             * cbm_elixir_call_args is the shared second-child fallback the
+             * definition side already uses. Restricted to `call` nodes —
+             * Elixir's other call kinds (`dot`, the `|>` binary_operator) have
+             * no arguments node in that position. */
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_ELIXIR &&
+                strcmp(ts_node_type(node), "call") == 0) {
+                args = elixir_call_arguments_fallback(node);
+            }
             // ObjectScript stores args under oref_method/method_args, not the
             // generic "arguments" field; macro arguments add one wrapper.
             if (ts_node_is_null(args) && is_objectscript_language(ctx->language)) {
