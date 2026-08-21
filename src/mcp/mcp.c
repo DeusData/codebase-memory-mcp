@@ -8345,9 +8345,25 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
-        yyjson_mut_obj_add_str(doc, root, "hint",
-                               "Pipeline failed. Check repo_path exists and contains source files. "
-                               "Try mode='fast' for a quicker diagnostic run.");
+        /* #1665: a post-publish artifact export failure (read-only repo, etc.)
+         * must not be blamed on the repository path. The pipeline snapshots the
+         * export error of THIS run, so its presence names the phase exactly —
+         * the graph database was already published when the export ran. */
+        const char *export_error = cbm_pipeline_export_error(p);
+        if (export_error && export_error[0]) {
+            char hint[CBM_SZ_1K];
+            (void)snprintf(
+                hint, sizeof(hint),
+                "Index database was published, but the persistence artifact export failed for "
+                "repo_path/.codebase-memory (%s). Use a writable checkout, or re-run with "
+                "--persistence false if the shared artifact is not needed.",
+                export_error);
+            yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
+        } else {
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "Pipeline failed. Check repo_path exists and contains source "
+                                   "files. Try mode='fast' for a quicker diagnostic run.");
+        }
     }
 
     char *json = yy_doc_to_str(doc);
