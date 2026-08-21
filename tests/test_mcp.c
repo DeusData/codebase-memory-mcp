@@ -3436,6 +3436,118 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     PASS();
 }
 
+/* #1542 leftover: header order is strategy,confidence then args, but json
+ * used to emit args first; tree flat_trace (risk_labels || data_flow) used
+ * to call bfs_to_toon_table without include_evidence. Pin both: every row
+ * has len(cols)==len(row), and the strategy cell is the class not the args
+ * array. */
+TEST(tool_trace_path_evidence_columns_match_header_issue1542) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ev-order";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/ev-order");
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "ev-order.src.caller",
+                         .file_path = "src/a.c",
+                         .start_line = 1,
+                         .end_line = 5};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "ev-order.src.target",
+                         .file_path = "src/a.c",
+                         .start_line = 10,
+                         .end_line = 20};
+    int64_t id_caller = cbm_store_upsert_node(st, &caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {.project = proj,
+                    .source_id = id_caller,
+                    .target_id = id_callee,
+                    .type = "CALLS",
+                    .properties_json = "{\"callee\":\"target\",\"confidence\":0.95,"
+                                       "\"strategy\":\"lsp_trait_dispatch\",\"candidates\":1,"
+                                       "\"args\":[\"x\"]}"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    /* json × data_flow × include_evidence: cols identity, not just count. */
+    char *js = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-order\",\"direction\":\"outbound\",\"include_evidence\":true,"
+             "\"mode\":\"data_flow\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(js);
+    char *js_txt = extract_text_content(js);
+    ASSERT_NOT_NULL(js_txt);
+    yyjson_doc *doc = yyjson_read(js_txt, strlen(js_txt), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *callees = yyjson_obj_get(yyjson_doc_get_root(doc), "callees");
+    ASSERT_NOT_NULL(callees);
+    yyjson_val *cols = yyjson_obj_get(callees, "cols");
+    ASSERT_NOT_NULL(cols);
+    static const char *want[] = {"name", "hop", "strategy", "confidence", "args"};
+    ASSERT_EQ((int)yyjson_arr_size(cols), 5);
+    for (int i = 0; i < 5; i++) {
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(cols, i)), want[i]);
+    }
+    yyjson_val *hop1 = NULL;
+    yyjson_val *groups = yyjson_obj_get(callees, "groups");
+    ASSERT_NOT_NULL(groups);
+    size_t ng = yyjson_arr_size(groups);
+    for (size_t g = 0; g < ng; g++) {
+        yyjson_val *rows = yyjson_obj_get(yyjson_arr_get(groups, g), "rows");
+        if (!rows) {
+            continue;
+        }
+        size_t nr = yyjson_arr_size(rows);
+        for (size_t r = 0; r < nr; r++) {
+            yyjson_val *row = yyjson_arr_get(rows, r);
+            yyjson_val *hop = row ? yyjson_arr_get(row, 1) : NULL;
+            if (hop && yyjson_get_int(hop) >= 1) {
+                hop1 = row;
+                break;
+            }
+        }
+        if (hop1) {
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(hop1);
+    ASSERT_EQ((int)yyjson_arr_size(hop1), 5);
+    ASSERT_TRUE(yyjson_is_str(yyjson_arr_get(hop1, 2)));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(hop1, 2)), "lsp");
+    ASSERT_TRUE(yyjson_is_num(yyjson_arr_get(hop1, 3)));
+    ASSERT_TRUE(yyjson_is_arr(yyjson_arr_get(hop1, 4)));
+    yyjson_doc_free(doc);
+    free(js_txt);
+    free(js);
+
+    /* tree × risk_labels × include_evidence used to drop evidence entirely
+     * because flat_trace routed through bfs_to_toon_table without the flag. */
+    char *tree = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"ev-order\",\"direction\":\"outbound\",\"include_evidence\":true,"
+             "\"risk_labels\":true}}}");
+    ASSERT_NOT_NULL(tree);
+    char *tree_txt = extract_text_content(tree);
+    ASSERT_NOT_NULL(tree_txt);
+    ASSERT_NOT_NULL(strstr(tree_txt, "strategy"));
+    ASSERT_NOT_NULL(strstr(tree_txt, "confidence"));
+    ASSERT_NOT_NULL(strstr(tree_txt, "lsp"));
+    ASSERT_NOT_NULL(strstr(tree_txt, "0.95"));
+    ASSERT_NULL(strstr(tree_txt, "lsp_trait_dispatch"));
+    free(tree_txt);
+    free(tree);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce-first (#887): the client-supplied `depth` on trace_call_path must be
  * clamped to the MCP ceiling (cbm_mcp_max_depth(), default 15). On origin/main
  * an MCP_MAX_DEPTH=15 constant was defined but never applied — `depth` flowed
@@ -11346,6 +11458,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+    RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);

@@ -5965,10 +5965,13 @@ static bool bfs_edge_evidence_for_hop(cbm_traverse_result_t *tr, int64_t hop_nod
 }
 
 /* TOON table for one trace direction: callees[N]{qn,hop,...} with optional
- * risk / test / args columns. `name` is omitted (it is the qn's last
- * segment); the per-item JSON key envelope was 84% of the legacy payload. */
+ * risk / test / evidence / args columns. `name` is omitted (it is the qn's
+ * last segment); the per-item JSON key envelope was 84% of the legacy
+ * payload. include_evidence must be forwarded here — flat_trace used to
+ * drop it (#1542 leftover). */
 static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
-                              bool risk_labels, bool include_tests, bool data_flow) {
+                              bool risk_labels, bool include_tests, bool data_flow,
+                              bool include_evidence) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
         if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
@@ -5976,13 +5979,18 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         }
         visible++;
     }
-    const char *cols[5] = {"qn", "hop"};
+    /* Max: qn hop risk test strategy confidence args. */
+    const char *cols[7] = {"qn", "hop"};
     int ncols = 2;
     if (risk_labels) {
         cols[ncols++] = "risk";
     }
     if (include_tests) {
         cols[ncols++] = "test";
+    }
+    if (include_evidence) {
+        cols[ncols++] = "strategy";
+        cols[ncols++] = "confidence";
     }
     if (data_flow) {
         cols[ncols++] = "args";
@@ -6002,6 +6010,23 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         }
         if (include_tests) {
             cbm_tree_cell_bool(sb, test, false);
+        }
+        if (include_evidence) {
+            const char *ev_class = NULL;
+            double ev_conf = -1.0;
+            if (bfs_edge_evidence_for_hop(tr, tr->visited[i].node.id, &ev_class, &ev_conf)) {
+                cbm_tree_cell_str(sb, ev_class ? ev_class : "", false);
+                if (ev_conf >= 0.0) {
+                    cbm_tree_cell_real(sb, ev_conf, false);
+                } else {
+                    cbm_tree_cell_str(sb, "-", false);
+                }
+            } else {
+                /* Root hop / non-CALLS: keep column count fixed, same "-"
+                 * placeholders as bfs_to_tree_table. */
+                cbm_tree_cell_str(sb, "-", false);
+                cbm_tree_cell_str(sb, "-", false);
+            }
         }
         if (data_flow) {
             size_t alen = 0;
@@ -6348,20 +6373,9 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
         if (risk_labels) {
             yyjson_mut_arr_add_str(doc, row, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
         }
-        if (data_flow) {
-            size_t alen = 0;
-            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
-            if (ea && alen > 0) {
-                yyjson_mut_val *av = yyjson_mut_rawn(doc, ea, alen);
-                if (av) {
-                    yyjson_mut_arr_add_val(row, av);
-                } else {
-                    yyjson_mut_arr_add_str(doc, row, "");
-                }
-            } else {
-                yyjson_mut_arr_add_str(doc, row, "");
-            }
-        }
+        /* Emit in header order: strategy, confidence, then args. Swapping these
+         * two blocks mislabeled every include_evidence+data_flow json row
+         * (#1542 leftover). */
         if (include_evidence) {
             const char *ev_class = NULL;
             double ev_conf = -1.0;
@@ -6379,6 +6393,20 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
                  * in a form a structured caller can test. */
                 yyjson_mut_arr_add_null(doc, row);
                 yyjson_mut_arr_add_null(doc, row);
+            }
+        }
+        if (data_flow) {
+            size_t alen = 0;
+            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
+            if (ea && alen > 0) {
+                yyjson_mut_val *av = yyjson_mut_rawn(doc, ea, alen);
+                if (av) {
+                    yyjson_mut_arr_add_val(row, av);
+                } else {
+                    yyjson_mut_arr_add_str(doc, row, "");
+                }
+            } else {
+                yyjson_mut_arr_add_str(doc, row, "");
             }
         }
         yyjson_mut_arr_add_val(cur_rows, row);
@@ -6793,7 +6821,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (do_outbound) {
             cbm_tree_scalar_int(&sb, "callees_total", out_total);
             if (flat_trace) {
-                bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow);
+                bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow,
+                                  include_evidence);
             } else {
                 bfs_to_tree_table(&sb, "callees", &view_out, include_tests, include_evidence);
             }
@@ -6801,7 +6830,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
             if (flat_trace) {
-                bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow);
+                bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow,
+                                  include_evidence);
             } else {
                 bfs_to_tree_table(&sb, "callers", &view_in, include_tests, include_evidence);
             }
