@@ -31,7 +31,7 @@ void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes);
  * the caller never re-parses the env string. */
 typedef struct {
     size_t budget;      /* resolved budget in bytes */
-    const char *source; /* log token: "ram_fraction" | "CBM_MEM_BUDGET_MB" */
+    const char *source; /* "ram_fraction" | "CBM_MEM_BUDGET_MB" | "daemon_worker_cap" */
     bool clamped;       /* override was valid but exceeded total_ram → clamped down */
     bool invalid;       /* override was present but unparseable / out-of-range / ≤0 */
     bool hard_capped;   /* internal worker hard cap reduced the resolved budget */
