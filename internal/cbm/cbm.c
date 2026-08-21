@@ -810,17 +810,39 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
  * Deliberately narrow — ZERO-WIDTH AT EOF ONLY. A MISSING or ERROR node with
  * WIDTH still counts even at EOF (a Makefile whose last recipe line is
  * unterminated really does lose the recipe), and anything before EOF is
- * untouched. */
-static bool cbm_is_eof_terminator_miss(TSNode n, int source_len) {
+ * untouched.
+ *
+ * #1746: "at EOF" means EOF modulo trailing blanks. Blanks are extras owned by
+ * no node, so `ENTRYPOINT ["a"] ` + EOF parks the terminator one byte short of
+ * source_len and an exact end == source_len test missed it. Every blank except
+ * newline counts: a file ending in \n has a terminated final line and produces
+ * no MISSING terminator at all. */
+static bool cbm_is_blank_not_newline(char c) {
+    return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r';
+}
+
+static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_len) {
     if (!ts_node_is_missing(n) || source_len < 0) {
         return false;
     }
     uint32_t start = ts_node_start_byte(n);
     uint32_t end = ts_node_end_byte(n);
-    return start == end && end == (uint32_t)source_len;
+    if (start != end || end > (uint32_t)source_len) {
+        return false;
+    }
+    if (!source) {
+        return end == (uint32_t)source_len;
+    }
+    for (uint32_t i = end; i < (uint32_t)source_len; i++) {
+        if (!cbm_is_blank_not_newline(source[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
-static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int source_len) {
+static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
+                                      int source_len) {
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         return;
     }
@@ -828,12 +850,12 @@ static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int so
     for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
         TSNode c = ts_node_child(n, i);
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, source_len)) {
+            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
                 continue; /* absent final newline only — nothing was dropped */
             }
             cbm_error_regions_push(acc, c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc, source_len);
+            cbm_collect_error_regions(c, acc, source, source_len);
         }
     }
 }
@@ -1456,7 +1478,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                      * already extract. */
                     if (ts_node_has_error(root)) {
                         cbm_error_regions_t raw_regs = {{0}, {0}, 0};
-                        cbm_collect_error_regions(root, &raw_regs, source_len);
+                        cbm_collect_error_regions(root, &raw_regs, source, source_len);
                         if (raw_regs.count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
@@ -1614,7 +1636,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (strcmp(ts_node_type(root), "ERROR") == 0) {
             cbm_error_regions_push(&regs, root); /* whole file unparseable */
         } else {
-            cbm_collect_error_regions(root, &regs, source_len);
+            cbm_collect_error_regions(root, &regs, source, source_len);
         }
         cbm_subtract_recovered_regions(&regs, &result->defs);
         /* #1071: don't flag a benign function-like-macro call (defined in-file)
