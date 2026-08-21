@@ -570,6 +570,22 @@ static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lo
     }
     int generation = cbm_daemon_ipc_generation_probe_under_startup_lock(context->endpoint,
                                                                         context->startup_lock);
+#ifndef _WIN32
+    /* #1760: generation==1 together with an absent lifetime reservation cannot
+     * be a live daemon — every listener retains its lifetime reservation for
+     * the whole of its life (ipc.c listen path), and the startup lock we hold
+     * excludes any boot in flight. That combination is residual socket
+     * publication from a hard-killed process (the endpoint probe is
+     * intentionally fail-closed on ECONNREFUSED to protect saturated BSD
+     * listeners). Repair it exactly like cbm_version_cohort_daemon_presence()
+     * does, then re-probe: stale_generation_cleanup refuses (returns 0) when a
+     * reservation is genuinely held, so this can never damage a live daemon. */
+    if (generation == 1 && cbm_daemon_ipc_lifetime_reservation_probe(context->endpoint) == 0 &&
+        cbm_daemon_ipc_stale_generation_cleanup(context->endpoint, context->startup_lock) == 1) {
+        generation = cbm_daemon_ipc_generation_probe_under_startup_lock(context->endpoint,
+                                                                        context->startup_lock);
+    }
+#endif
     if (generation != 0) {
         cli_activation_startup_lock_release_complete(context);
         cli_activation_release_cleanup_lease(context, &lease);
