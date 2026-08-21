@@ -11658,10 +11658,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     int file_count = -1;
     if (!cbm_mcp_auto_index_within_file_limit(srv->session_root, file_limit, &file_count)) {
         char files[32];
+        char limit[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);
+        (void)snprintf(limit, sizeof(limit), "%d", file_limit);
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", CBM_CONFIG_AUTO_INDEX_LIMIT);
+                     files, "limit", limit);
         return;
     }
 

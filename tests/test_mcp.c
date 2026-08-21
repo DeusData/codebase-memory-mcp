@@ -10541,6 +10541,105 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  #1466 — autoindex.skip must report the effective numeric limit
+ * ══════════════════════════════════════════════════════════════════ */
+
+static char autoindex_skip_log[1024];
+
+/* Keeps only the too_many_files skip line, so later lines cannot displace it. */
+static void autoindex_skip_capture_log(const char *line) {
+    if (line && strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
+        snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
+    }
+}
+
+/* Drive initialize → maybe_auto_index over a fresh project holding more tracked
+ * files than auto_index_limit, and capture the resulting skip warning.
+ * Returns false on fixture setup failure. */
+static bool autoindex_skip_warning(char *out, size_t out_size) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(cache)) {
+        return false;
+    }
+
+    char repodir[512];
+    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+    char file_a[640];
+    char file_b[640];
+    snprintf(file_a, sizeof(file_a), "%s/a.py", repodir);
+    snprintf(file_b, sizeof(file_b), "%s/b.py", repodir);
+    if (th_mkdir_p(repodir) != 0 || th_write_file(file_a, "def a():\n    return 1\n") != 0 ||
+        th_write_file(file_b, "def b():\n    return 2\n") != 0) {
+        th_rmtree(cache);
+        return false;
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_rmtree(cache);
+        return false;
+    }
+
+    bool ok = false;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    if (cfg) {
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "1");
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            autoindex_skip_log[0] = '\0';
+            CBMLogLevel prev_level = cbm_log_get_level();
+            cbm_log_set_level(CBM_LOG_WARN);
+            cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+            cbm_log_set_sink_ex(autoindex_skip_capture_log, CBM_LOG_SINK_REPLACE);
+
+            cbm_mcp_server_set_config(srv, cfg);
+            char *resp = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+            free(resp);
+            cbm_mcp_server_free(srv);
+
+            cbm_log_set_sink(NULL);
+            cbm_log_set_level(prev_level);
+
+            snprintf(out, out_size, "%s", autoindex_skip_log);
+            ok = true;
+        }
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    return ok;
+}
+
+/* RED before the fix: the warning carries `limit=auto_index_limit`, the config
+ * key constant, instead of the configured value. */
+TEST(autoindex_skip_reports_numeric_limit_issue1466) {
+    char warning[1024];
+    if (!autoindex_skip_warning(warning, sizeof(warning))) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    /* Not vacuous: the skip path must actually have been taken. */
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "files=2"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=1"));
+    ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
  * ══════════════════════════════════════════════════════════════════ */
@@ -11472,6 +11571,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
+    RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
