@@ -725,6 +725,10 @@ static void cbm_test_fault_inject(const char *rel_path) {
             /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
         }
     }
+    const char *exit_on = getenv("CBM_TEST_EXIT_ON");
+    if (exit_on && exit_on[0] && strstr(rel_path, exit_on)) {
+        exit(1); /* Nonzero exit code → CBM_PROC_EXIT_NONZERO → classified as "error" */
+    }
 }
 #endif
 
