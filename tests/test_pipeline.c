@@ -2250,6 +2250,48 @@ TEST(pipeline_sql_lineage_and_relation_isolation) {
     PASS();
 }
 
+/* dbt lineage end-to-end. A dbt project's dependency structure lives entirely
+ * in Jinja ({{ ref('x') }}), which the SQL grammar cannot read, so this is the
+ * whole value: model -> model edges across files, plus the join onto a Table
+ * declared in ordinary DDL — Model and Table are both relation labels, so one
+ * lineage layer spans both. The Python file is the isolation control: `stg_orders`
+ * exists project-wide only as a dbt model, and the registry's relation veto must
+ * keep a same-named call out of the lineage layer. */
+TEST(pipeline_dbt_jinja_lineage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dbt_lineage_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "raw_schema.sql", "CREATE TABLE customers (id INTEGER, name TEXT);\n");
+    write_temp_file(tmp, "stg_orders.sql",
+                    "SELECT id, customer_id FROM {{ source('raw', 'customers') }}\n");
+    write_temp_file(tmp, "orders_enriched.sql",
+                    "SELECT o.id, c.name\n"
+                    "FROM {{ ref('stg_orders') }} o\n"
+                    "JOIN {{ ref('stg_orders') }} c ON c.id = o.customer_id\n");
+    write_temp_file(tmp, "app.py", "def load():\n    return stg_orders()\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dbt.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    /* model -> model: the ref() lineage the SQL grammar cannot see */
+    ASSERT_TRUE(named_edge_count(s, project, "USAGE", "orders_enriched", "stg_orders") >= 1);
+    /* model -> table: source() joining dbt onto plain DDL in the same repo */
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "stg_orders", "customers"), 1);
+    /* isolation: the Python call must not reach the model */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "load", "stg_orders"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "load", "stg_orders"), 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Renaming a table must drop lineage from DEPENDENT (unchanged) SQL files on
  * the incremental path. Table/View participate in the per-file LSP surface
  * hash as registry-only labels (lsp_surface.c), so tables.sql's def change
@@ -12348,6 +12390,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
+    RUN_TEST(pipeline_dbt_jinja_lineage);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);

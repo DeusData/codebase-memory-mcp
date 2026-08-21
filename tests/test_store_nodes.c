@@ -57,7 +57,7 @@ TEST(sql_label_allowlists_match_cbm_label_is_type_like) {
  * cbm_registry_resolve vetoes them, so a code identifier sharing a table's
  * name never binds into the lineage layer. */
 TEST(sql_relation_labels_match_cbm_label_is_relation) {
-    static const char *const relations[] = {"Table", "View"};
+    static const char *const relations[] = {"Table", "View", "Model"};
     for (size_t i = 0; i < sizeof(relations) / sizeof(relations[0]); i++) {
         ASSERT_TRUE(cbm_label_is_relation(relations[i]));
         ASSERT_TRUE(cbm_label_is_registry_symbol(relations[i]));

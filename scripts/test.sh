@@ -263,6 +263,9 @@ bash "$ROOT/tests/test_runtime_isolation_contract.sh"
 echo "=== Step 0u: shell line-ending contract ==="
 bash "$ROOT/tests/test_shell_line_endings.sh"
 
+echo "=== Step 0v: nomic blob generator contract ==="
+bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 

@@ -745,9 +745,14 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         }
 
         /* Swift and newer tree-sitter-kotlin: function_declaration has no `name`
-         * field; the function name is a `simple_identifier` child. */
+         * field; the function name is a `simple_identifier` child. A Swift
+         * protocol requirement (a bodyless `func` inside a protocol) is a
+         * separate node type with the same shape; it is named here as well as in
+         * resolve_method_name because swift_func_types now admits it, so it can
+         * reach the free-function path too and would otherwise land unnamed. */
         if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-            strcmp(kind, "function_declaration") == 0) {
+            (strcmp(kind, "function_declaration") == 0 ||
+             strcmp(kind, "protocol_function_declaration") == 0)) {
             TSNode si = cbm_find_child_by_kind(node, "simple_identifier");
             if (!ts_node_is_null(si)) {
                 return si;
@@ -4579,6 +4584,7 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     static const char *body_types[] = {"class_body",
                                        "interface_body",
                                        "enum_body",
+                                       "protocol_body",
                                        "template_body",
                                        "interface_type",
                                        "struct_type",
@@ -4699,7 +4705,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     }
 
     if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-        strcmp(ck, "function_declaration") == 0) {
+        (strcmp(ck, "function_declaration") == 0 ||
+         strcmp(ck, "protocol_function_declaration") == 0)) {
         return cbm_find_child_by_kind(child, "simple_identifier");
     }
 

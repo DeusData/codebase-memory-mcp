@@ -245,6 +245,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_env_accesses.c \
     $(CBM_DIR)/extract_channels.c \
     $(CBM_DIR)/extract_k8s.c \
+    $(CBM_DIR)/extract_dbt.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
     $(CBM_DIR)/macro_table.c \

@@ -726,6 +726,10 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+// dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
+// per ref()/source() call. No-op unless the file parses as SQL and actually
+// contains a dbt builtin call. Defined in extract_dbt.c.
+void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);

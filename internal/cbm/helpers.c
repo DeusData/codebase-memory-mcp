@@ -166,16 +166,20 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
-// True when `label` names a data relation (SQL CREATE TABLE / CREATE VIEW).
-// Relations live in the registry so FROM/JOIN lineage can resolve, but they are
-// deliberately NOT type-like: they must never satisfy inheritance, impl-receiver,
-// semantic-type, or LSP-registrar lookups, and resolver fallbacks treat them as
-// lineage-only targets (see cbm_label_is_registry_symbol call sites).
+// True when `label` names a data relation: SQL CREATE TABLE / CREATE VIEW, and
+// a dbt Model (a Jinja-templated .sql file, which materializes as a warehouse
+// table or view). Relations live in the registry so FROM/JOIN and dbt ref()
+// lineage can resolve, and sharing one label class is what lets a dbt model's
+// ref() reach a Table declared in plain DDL elsewhere in the same repository.
+// They are deliberately NOT type-like: they must never satisfy inheritance,
+// impl-receiver, semantic-type, or LSP-registrar lookups, and resolver
+// fallbacks treat them as lineage-only targets (see cbm_label_is_registry_symbol
+// call sites).
 bool cbm_label_is_relation(const char *label) {
     if (!label) {
         return false;
     }
-    return strcmp(label, "Table") == 0 || strcmp(label, "View") == 0;
+    return strcmp(label, "Table") == 0 || strcmp(label, "View") == 0 || strcmp(label, "Model") == 0;
 }
 
 // True when `label` belongs in the cross-file name registry (see cbm.h). Single

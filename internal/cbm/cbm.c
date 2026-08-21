@@ -1303,6 +1303,13 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         cbm_extract_k8s(&ctx);
     }
 
+    // dbt lineage pass: a dbt model's dependencies live in Jinja ({{ ref(...) }}),
+    // which the SQL grammar cannot read. Self-gated — SQL files only, and only
+    // those carrying a real dbt builtin call.
+    if (ctx.language == CBM_LANG_SQL) {
+        cbm_extract_dbt(&ctx);
+    }
+
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
     uint64_t lsp_start = now_ns();

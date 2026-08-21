@@ -44,6 +44,12 @@ enum {
     MAIN_PATH_CAP = 4096,
     MAIN_CONNECT_TIMEOUT_MS = 1000,
     MAIN_STARTUP_TIMEOUT_MS = 10000,
+    /* Backstop for waiting out a held startup transition — see
+     * main_local_transition_acquire. Not a budget for healthy contention: a busy
+     * lock always resolves, either because the live holder finishes or because
+     * the OS finishes reclaiming a dead holder's lock. This only bounds a peer
+     * that never finishes, so a command cannot hang indefinitely. */
+    MAIN_STARTUP_CONTENTION_CEILING_MS = 120000,
     MAIN_MCP_STARTUP_TIMEOUT_MS = 30000,
     MAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
     MAIN_HOOK_CONNECT_TIMEOUT_MS = 250,
@@ -1288,14 +1294,47 @@ static bool main_local_cli_feedback_enabled(int argc, char **argv) {
     return cbm_cli_progress_enabled(requested, cli_isatty(2) != 0);
 }
 
+/* Acquire the exclusive startup transition, waiting out whatever currently holds it.
+ *
+ * try_acquire answers one of three things, and they must not be conflated:
+ *    1  acquired
+ *   -1  coordination is unsafe or unverifiable — fail now, waiting cannot help
+ *    0  BUSY: the lock is held
+ *
+ * A busy lock always resolves, by one of two routes:
+ *   - a live peer holds it, and releases when its command finishes;
+ *   - the holder is already dead and the operating system has not finished
+ *     reclaiming the lock yet.
+ *
+ * The second route is Windows-specific and is why this wait needs room. On POSIX
+ * the kernel drops flock the instant the owner dies. Windows byte-range locks do
+ * not work that way: Microsoft documents that after a process terminates holding
+ * one, "the time it takes for the operating system to unlock these locks depends
+ * upon available system resources", and that until then "access to these files
+ * may be denied". A loaded CI runner is precisely where those resources are
+ * scarce, and `tests/windows/test_daemon_stability.py` manufactures the situation
+ * deliberately — it hard-kills daemons with `taskkill /F`, including a crash
+ * recovery section, so the next client meets a lock whose owner no longer exists.
+ *
+ * Waiting was previously capped at MAIN_STARTUP_TIMEOUT_MS (10s), which let a
+ * clock decide a user-visible outcome: a command was refused with "coordination
+ * remained busy" while the only thing wrong was that the OS had not yet swept up
+ * after a killed process. Since both routes above terminate, the correct response
+ * to busy is to keep waiting; the ceiling below is a backstop against a peer that
+ * never finishes, not a budget for healthy contention. Clean exits already
+ * release through main_local_transition_close, so this path is only reached after
+ * an abrupt termination or under genuine concurrency. */
 static int main_local_transition_acquire(const cbm_daemon_ipc_endpoint_t *endpoint, FILE *feedback,
                                          cbm_daemon_ipc_local_transition_t **transition_out) {
-    uint64_t deadline = main_deadline_after(MAIN_STARTUP_TIMEOUT_MS);
+    uint64_t ceiling = main_deadline_after(MAIN_STARTUP_CONTENTION_CEILING_MS);
     bool waiting_reported = false;
     for (;;) {
         int status = cbm_daemon_ipc_local_transition_try_acquire(endpoint, transition_out);
-        if (status != 0 || cbm_now_ms() >= deadline) {
-            return status;
+        if (status != 0) {
+            return status; /* acquired, or a genuine coordination failure */
+        }
+        if (cbm_now_ms() >= ceiling) {
+            return 0; /* still busy after the backstop */
         }
         if (feedback && !waiting_reported) {
             (void)fputs("Waiting for CBM startup coordination...\n", feedback);
@@ -2542,11 +2581,24 @@ int main(int argc, char **argv) {
         int transition_status =
             main_local_transition_acquire(local_endpoint, feedback, &local_transition);
         if (transition_status != 1 || !local_transition) {
-            (void)fprintf(stderr,
-                          "codebase-memory-mcp: CLI startup coordination %s; retry after the "
-                          "active CBM transition exits\n",
-                          transition_status == 0 ? "remained busy"
-                                                 : "could not be verified safely");
+            if (transition_status == 0) {
+                /* The backstop fired. Name both explanations: after this much
+                 * waiting the likely causes are a peer that is genuinely stuck,
+                 * or (on Windows) a lock left behind by a force-killed process
+                 * that the OS has not reclaimed. "Busy" alone sent reporters
+                 * hunting for a CBM session that had already exited. */
+                (void)fprintf(stderr,
+                              "codebase-memory-mcp: CLI startup coordination stayed busy for "
+                              "%d seconds. Either another CBM command is still running, or a "
+                              "previous one was force-killed and the operating system has not "
+                              "released its lock yet. Check for running CBM processes; if there "
+                              "are none, retry shortly.\n",
+                              MAIN_STARTUP_CONTENTION_CEILING_MS / 1000);
+            } else {
+                (void)fprintf(stderr, "codebase-memory-mcp: CLI startup coordination could not "
+                                      "be verified safely; retry after active CBM sessions "
+                                      "exit\n");
+            }
             goto local_cli_cleanup;
         }
         int seal_status = cbm_daemon_ipc_local_transition_seal_legacy(local_transition);

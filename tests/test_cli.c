@@ -4447,24 +4447,55 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     test_mkdirp(dir);
 
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
-    ASSERT_NOT_NULL(json);
-    ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
-    ASSERT(strstr(json, "writes_started") != NULL);
-    ASSERT(strstr(json, "next_safe_command") != NULL);
-    ASSERT(strstr(json, "cursor") != NULL);
-    ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
-    ASSERT(strstr(json, ".codex/config.toml") != NULL);
+
+    /* WHY the failures are deferred: asserting inline returns before the free
+     * and the rmdir below, so every red run leaked the receipt and left a
+     * stray /tmp/cli-plan-* directory behind. That makes the next debugging
+     * session harder than the failure it is reporting. Record what went wrong,
+     * release everything, then fail -- and name the specific marker, because
+     * "a marker was missing" costs a reader a bisect that "next_safe_command
+     * was missing" does not. */
+    const char *missing = NULL;
+    if (!json) {
+        missing = "receipt was NULL";
+    } else {
+        static const char *const required[] = {
+            "agent.install.plan.v1", "writes_started",     "next_safe_command", "cursor",
+            ".cursor/mcp.json",      ".codex/config.toml",
+        };
+        for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+            if (!strstr(json, required[i])) {
+                missing = required[i];
+                break;
+            }
+        }
+    }
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
     char cfg[512];
     struct stat st;
+    const char *created = NULL;
     snprintf(cfg, sizeof(cfg), "%s/.cursor/mcp.json", tmpdir);
-    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    if (stat(cfg, &st) == 0) {
+        created = ".cursor/mcp.json";
+    }
     snprintf(cfg, sizeof(cfg), "%s/.codex/config.toml", tmpdir);
-    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    if (!created && stat(cfg, &st) == 0) {
+        created = ".codex/config.toml";
+    }
 
     test_rmdir_r(tmpdir);
+
+    char reason[256];
+    if (missing) {
+        snprintf(reason, sizeof(reason), "install plan receipt is missing %s", missing);
+        FAIL(reason);
+    }
+    if (created) {
+        snprintf(reason, sizeof(reason), "building an install plan created %s", created);
+        FAIL(reason);
+    }
     PASS();
 }
 
