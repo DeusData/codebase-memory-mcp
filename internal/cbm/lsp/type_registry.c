@@ -167,6 +167,56 @@ static void build_type_embed_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     reg->type_embed_entry_count = idx;
 }
 
+/* Optional index: final qualified-name segment -> chain of TYPE indices.
+ * Descending iteration plus prepend preserves ascending registry scan order.
+ * Consumers opt in after the QN index captures the finalized tail boundary. */
+void cbm_registry_build_type_short_index(CBMTypeRegistry *reg) {
+    if (!reg)
+        return;
+    reg->type_short_buckets = NULL;
+    reg->type_short_entries = NULL;
+    reg->type_short_bucket_count = 0;
+    if (!reg->arena || !reg->type_qn_buckets || reg->type_qn_bucket_count <= 0)
+        return;
+    CBMArena *idx_arena = reg->arena;
+    int count = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        if (reg->types[i].qualified_name)
+            count++;
+    }
+    if (count == 0)
+        return;
+    int bucket_count = next_pow2(count * 2);
+    if (bucket_count < 16)
+        bucket_count = 16;
+    int *buckets = (int *)cbm_arena_alloc(idx_arena, (size_t)bucket_count * sizeof(int));
+    CBMRegistryHashEntry *entries = (CBMRegistryHashEntry *)cbm_arena_alloc(
+        idx_arena, (size_t)count * sizeof(CBMRegistryHashEntry));
+    if (!buckets || !entries)
+        return;
+    for (int i = 0; i < bucket_count; i++)
+        buckets[i] = -1;
+    int idx = 0;
+    for (int i = reg->type_count - 1; i >= 0; i--) {
+        const char *qn = reg->types[i].qualified_name;
+        if (!qn)
+            continue;
+        const char *dot = strrchr(qn, '.');
+        const char *short_name = dot ? dot + 1 : qn;
+        uint64_t h = fnv1a(short_name);
+        int slot = (int)(h & (uint64_t)(bucket_count - 1));
+        entries[idx].hash = h;
+        entries[idx].payload_index = i;
+        entries[idx].next_index = buckets[slot];
+        entries[idx].slot = slot;
+        buckets[slot] = idx;
+        idx++;
+    }
+    reg->type_short_buckets = buckets;
+    reg->type_short_entries = entries;
+    reg->type_short_bucket_count = bucket_count;
+}
+
 /* Index: short_name -> chain of FREE-function (receiver_type==NULL) indices.
  * Descending-iterate + prepend for ascending chain order (as above). */
 static void build_type_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
@@ -246,6 +296,43 @@ static void build_ffunc_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     reg->ffunc_short_entries = entries;
     reg->ffunc_short_bucket_count = bucket_count;
     reg->ffunc_short_entry_count = idx;
+}
+
+void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
+                                      CBMTypeNameIter *out) {
+    out->reg = reg;
+    out->hash = fnv1a(short_name);
+    if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
+        if (reg->type_short_buckets && reg->type_short_bucket_count > 0) {
+            int slot = (int)(out->hash & (uint64_t)(reg->type_short_bucket_count - 1));
+            out->chain_idx = reg->type_short_buckets[slot];
+            out->tail_i = reg->type_qn_entry_count;
+        } else {
+            out->chain_idx = -1;
+            out->tail_i = 0; /* auxiliary-index allocation failed: preserve full-scan semantics */
+        }
+        out->tail_end = reg->type_count;
+    } else {
+        out->chain_idx = -1;
+        out->tail_i = 0;
+        out->tail_end = reg->type_count;
+    }
+}
+
+int cbm_type_name_iter_next(CBMTypeNameIter *it) {
+    const CBMTypeRegistry *reg = it->reg;
+    while (it->chain_idx >= 0) {
+        const CBMRegistryHashEntry *e = &reg->type_short_entries[it->chain_idx];
+        int p = e->payload_index;
+        uint64_t h = e->hash;
+        it->chain_idx = e->next_index;
+        if (h != it->hash)
+            continue;
+        return p;
+    }
+    if (it->tail_i < it->tail_end)
+        return it->tail_i++;
+    return -1;
 }
 
 void cbm_registry_types_by_embedded_bare(const CBMTypeRegistry *reg, const char *bare,

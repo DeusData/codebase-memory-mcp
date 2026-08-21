@@ -111,9 +111,14 @@ typedef struct CBMTypeRegistry {
     int method_bucket_count;
     int method_entry_count;
 
-    // Auxiliary short-name / embedded-type indexes (built by finalize alongside the
-    // QN buckets). Turn the Rust trait- and free-function fallback scans from
-    // O(type_count)/O(func_count) into O(chain). Read-only after finalize.
+    // Auxiliary short-name / embedded-type indexes. The type short-name index is
+    // opt-in after finalize; the others are built by finalize. Current C/C++ cross
+    // registries opt in, while other languages incur no construction cost.
+    // Type short-name index: fnv1a(last-'.'-segment of qualified_name) -> chain
+    // of TYPE indices. payload_index = type index.
+    int *type_short_buckets;
+    CBMRegistryHashEntry *type_short_entries;
+    int type_short_bucket_count;
     // Embedded-type index: fnv1a(bare last-'.'-segment of each embedded_type) -> chain
     // of TYPE indices declaring it. payload_index = type index (a type may appear once
     // per embedded entry; consumers dedup adjacent same-type via the iterator).
@@ -159,6 +164,11 @@ void cbm_registry_finalize(CBMTypeRegistry *reg);
 // pipeline-lifetime result arena, and per-file index allocations accumulated
 // there add GBs across a large repo (FastAPI incremental test: +1.1 GB RSS).
 void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena);
+
+// Build the optional final-QN-segment type index. Call immediately after
+// finalization. Consumers that do not opt in avoid its type_count-sized allocation
+// and scan. Allocation failure preserves the iterator's linear fallback.
+void cbm_registry_build_type_short_index(CBMTypeRegistry *reg);
 
 // Register a function/method.
 void cbm_registry_add_func(CBMTypeRegistry *reg, CBMRegisteredFunc func);
@@ -219,8 +229,24 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
                                                              const CBMType **arg_types,
                                                              int arg_count);
 
-// --- Auxiliary index iterators (Rust trait / free-function fallback fast paths) ---
+// --- Auxiliary index iterators (language fallback fast paths) ---
 //
+// Iterate registry TYPE indices whose qualified-name final segment may equal
+// `short_name`. When the optional index is present this walks its hash chain plus
+// any post-finalize tail; otherwise it degrades to the original full scan. Results
+// preserve ascending registry order. The index is a hash prefilter; callers must
+// re-check their exact predicate, including tail entries.
+typedef struct {
+    const CBMTypeRegistry *reg;
+    uint64_t hash;
+    int chain_idx;
+    int tail_i;
+    int tail_end;
+} CBMTypeNameIter;
+void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
+                                      CBMTypeNameIter *out);
+int cbm_type_name_iter_next(CBMTypeNameIter *it);
+
 // Iterate registry TYPE indices whose embedded_types contain an entry whose BARE
 // name (last '.'-segment) equals `bare`. On a finalized registry this walks the
 // embedded-type index plus any post-finalize tail; on an unfinalized registry it
