@@ -448,7 +448,7 @@ overwrite user-modified agents.
 
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
-| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`, and post-`Read` coverage |
+| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
 | Codex CLI | Detected | `$CODEX_HOME/config.toml` | `AGENTS.md`, skill, three read-only agents; `SessionStart` + `SubagentStart` |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
@@ -495,7 +495,7 @@ overwrite user-modified agents.
 ### Sessions, compaction, and subagents
 
 Hooks installed by this project are fail-open and context-only. Claude Code's
-`PreToolUse` observes `Grep`/`Glob` and injects matching graph symbols as
+`PreToolUse` observes `Grep`/`Glob`/`Bash` and injects matching graph symbols as
 `additionalContext`; `PostToolUse` on `Read` adds targeted coverage context when
 the graph could not fully parse or index that file. It never denies or replaces
 the requested tool call.

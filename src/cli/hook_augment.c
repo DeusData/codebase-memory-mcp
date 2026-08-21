@@ -13,7 +13,7 @@
  *
  * The underlying query is `search_graph` (pure SQLite, shell-free) — chosen
  * over `search_code` (which shells out to grep|xargs) so the hook stays cheap
- * enough to run before every Grep/Glob.
+ * enough to run before every Grep/Glob/Bash call.
  */
 
 #include "cli/cli.h"
@@ -1015,6 +1015,206 @@ static bool ha_dialect_event_supported(ha_lifecycle_dialect_t dialect, const cha
     return ha_lifecycle_event_supported(event);
 }
 
+/* ── Bash search-command pattern extractor ────────────────────────────────
+ * Tokenises and walks a Bash tool command to extract a search pattern for
+ * graph augmentation.  Returns true and fills out when one clear pattern is
+ * found; false on unrecognised binary, -f pattern-file, multiple -e, or any
+ * other ambiguity.  Never executes or rewrites the command. */
+
+#define HA_BASH_TOK_MAX 32
+#define HA_BASH_TOK_SZ 256
+
+static int ha_tokenize(const char *cmd, char toks[][HA_BASH_TOK_SZ], int max) {
+    int n = 0;
+    const char *p = cmd;
+    while (*p && n < max) {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (!*p)
+            break;
+        char *d = toks[n];
+        int dlen = 0;
+        while (*p && !isspace((unsigned char)*p)) {
+            if (*p == '\'') {
+                for (p++; *p && *p != '\''; p++)
+                    if (dlen < HA_BASH_TOK_SZ - 1)
+                        d[dlen++] = *p;
+                if (*p == '\'')
+                    p++;
+            } else if (*p == '"') {
+                for (p++; *p && *p != '"'; p++) {
+                    if (*p == '\\' && p[1] && strchr("\\\"$`", p[1]))
+                        p++;
+                    if (dlen < HA_BASH_TOK_SZ - 1)
+                        d[dlen++] = *p;
+                }
+                if (*p == '"')
+                    p++;
+            } else if (*p == '\\' && p[1]) {
+                p++;
+                if (dlen < HA_BASH_TOK_SZ - 1)
+                    d[dlen++] = *p++;
+            } else {
+                if (dlen < HA_BASH_TOK_SZ - 1)
+                    d[dlen++] = *p++;
+            }
+        }
+        d[dlen] = '\0';
+        if (dlen > 0)
+            n++;
+    }
+    return n;
+}
+
+static bool ha_is_env_assign(const char *t) {
+    if (!t || !t[0])
+        return false;
+    if (!isalpha((unsigned char)t[0]) && t[0] != '_')
+        return false;
+    const char *p = t + 1;
+    while (isalnum((unsigned char)*p) || *p == '_')
+        p++;
+    return *p == '=';
+}
+
+typedef enum { HA_BIN_GREP, HA_BIN_RG, HA_BIN_AG, HA_BIN_ACK, HA_BIN_UGREP } ha_bin_t;
+
+static const char *ha_search_bin_val_flags(ha_bin_t bin) {
+    switch (bin) {
+    case HA_BIN_RG:
+        return "ABCmtTgMP";
+    case HA_BIN_AG:
+        return "ABCmpG";
+    default:
+        return "ABCmdD";
+    }
+}
+
+static bool ha_parse_bash_search_pattern(const char *cmd, char *out, size_t out_sz) {
+    if (!cmd || !out || out_sz == 0)
+        return false;
+    char toks[HA_BASH_TOK_MAX][HA_BASH_TOK_SZ];
+    int n = ha_tokenize(cmd, toks, HA_BASH_TOK_MAX);
+    if (n == 0)
+        return false;
+
+    int i = 0;
+    while (i < n && ha_is_env_assign(toks[i]))
+        i++;
+    if (i >= n)
+        return false;
+
+    bool rtk = false;
+    for (;;) {
+        const char *t = toks[i];
+        if (strcmp(t, "env") == 0 || strcmp(t, "nice") == 0 || strcmp(t, "time") == 0 ||
+            strcmp(t, "command") == 0) {
+            i++;
+        } else if (strcmp(t, "rtk") == 0) {
+            rtk = true;
+            i++;
+        } else if (strcmp(t, "tokf") == 0 && i + 1 < n && strcmp(toks[i + 1], "run") == 0) {
+            i += 2;
+        } else {
+            break;
+        }
+        while (i < n && ha_is_env_assign(toks[i]))
+            i++;
+        if (i >= n)
+            return false;
+    }
+
+    const char *bin_tok = toks[i++];
+    ha_bin_t bin;
+
+    if (strcmp(bin_tok, "grep") == 0 || strcmp(bin_tok, "egrep") == 0 ||
+        strcmp(bin_tok, "fgrep") == 0) {
+        bin = HA_BIN_GREP;
+    } else if (strcmp(bin_tok, "rg") == 0) {
+        bin = HA_BIN_RG;
+    } else if (strcmp(bin_tok, "ag") == 0) {
+        bin = HA_BIN_AG;
+    } else if (strcmp(bin_tok, "ack") == 0) {
+        bin = HA_BIN_ACK;
+    } else if (strcmp(bin_tok, "ugrep") == 0 || strcmp(bin_tok, "ug") == 0) {
+        bin = HA_BIN_UGREP;
+    } else if (strcmp(bin_tok, "git") == 0) {
+        if (i >= n || strcmp(toks[i], "grep") != 0)
+            return false;
+        i++;
+        bin = HA_BIN_GREP;
+    } else {
+        return false;
+    }
+
+    const char *val_flags = ha_search_bin_val_flags(bin);
+    const char *pattern = NULL;
+    int e_count = 0;
+    bool end_of_flags = false;
+
+    for (; i < n; i++) {
+        const char *t = toks[i];
+
+        if (end_of_flags || t[0] != '-' || t[1] == '\0') {
+            if (!pattern)
+                pattern = t;
+            else
+                break;
+            continue;
+        }
+
+        if (t[1] == '-') {
+            if (t[2] == '\0') {
+                end_of_flags = true;
+                continue;
+            }
+            const char *name = t + 2;
+            const char *eq = strchr(name, '=');
+            size_t nlen = eq ? (size_t)(eq - name) : strlen(name);
+            if ((nlen == 6 && strncmp(name, "regexp", 6) == 0) ||
+                (nlen == 7 && strncmp(name, "pattern", 7) == 0)) {
+                pattern = eq ? eq + 1 : (i + 1 < n ? toks[++i] : NULL);
+                e_count++;
+            } else if (nlen == 4 && strncmp(name, "file", 4) == 0) {
+                return false;
+            }
+            continue;
+        }
+
+        const char *f = t + 1;
+        bool consumed_next = false;
+        while (*f) {
+            char flag = *f++;
+            if (flag == 'e') {
+                if (*f) {
+                    pattern = f;
+                    f += strlen(f);
+                } else if (!consumed_next && i + 1 < n) {
+                    pattern = toks[++i];
+                    consumed_next = true;
+                }
+                e_count++;
+            } else if (flag == 'f') {
+                return false;
+            } else if (rtk && bin == HA_BIN_GREP && flag == 'l') {
+                return false;
+            } else if (strchr(val_flags, flag)) {
+                if (*f) {
+                    f += strlen(f);
+                } else if (!consumed_next && i + 1 < n) {
+                    i++;
+                    consumed_next = true;
+                }
+            }
+        }
+    }
+
+    if (e_count > 1 || !pattern || !pattern[0])
+        return false;
+    int w = snprintf(out, out_sz, "%s", pattern);
+    return w > 0 && (size_t)w < out_sz;
+}
+
 static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *event,
                                     const char *tool, bool *coverage) {
     if (coverage) {
@@ -1025,7 +1225,7 @@ static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *
     }
     if (dialect == HA_DIALECT_EVENT) {
         if (strcmp(event, "PreToolUse") == 0 &&
-            (strcmp(tool, "Grep") == 0 || strcmp(tool, "Glob") == 0)) {
+            (strcmp(tool, "Grep") == 0 || strcmp(tool, "Glob") == 0 || strcmp(tool, "Bash") == 0)) {
             return true;
         }
         if (strcmp(event, "PostToolUse") == 0 && strcmp(tool, "Read") == 0) {
@@ -1310,6 +1510,10 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event) {
     return ha_no_project_index_guidance(event);
 }
+
+bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz) {
+    return ha_parse_bash_search_pattern(cmd, out, out_sz);
+}
 #endif
 
 static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const char *forced_event,
@@ -1358,7 +1562,18 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
         return NULL;
     }
 
-    const char *pattern = ha_obj_str(tin, "pattern");
+    char bash_pattern[HA_BASH_TOK_SZ];
+    const char *pattern;
+    if (strcmp(tool, "Bash") == 0) {
+        const char *cmd = ha_obj_str(tin, "command");
+        if (!ha_parse_bash_search_pattern(cmd, bash_pattern, sizeof(bash_pattern))) {
+            yyjson_doc_free(doc);
+            return NULL;
+        }
+        pattern = bash_pattern;
+    } else {
+        pattern = ha_obj_str(tin, "pattern");
+    }
     char token[HA_MAX_TOKEN + 1];
     if (!ha_extract_token(pattern, token, sizeof(token))) {
         yyjson_doc_free(doc);

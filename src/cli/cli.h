@@ -247,6 +247,7 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
 int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
@@ -309,7 +310,7 @@ const char *cbm_get_aider_instructions(void);
 /* ── Pre-tool hook management ─────────────────────────────────── */
 
 /* Upsert a PreToolUse hook in ~/.claude/settings.json for Claude Code.
- * Adds a Grep|Glob matcher that reminds to use MCP tools.
+ * Adds a Grep|Glob|Bash matcher that reminds to use MCP tools.
  * Returns 0 on success. */
 int cbm_upsert_claude_hooks(const char *settings_path);
 
@@ -495,7 +496,7 @@ int cbm_cmd_config(int argc, char **argv);
 
 /* hook-augment: stdin-driven Claude Code PreToolUse augmenter.
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext
- * with search_graph hits for Grep/Glob calls. NEVER blocks: every failure
+ * with search_graph hits for Grep/Glob/Bash search calls. NEVER blocks: every failure
  * path returns 0 with no stdout output. */
 int cbm_cmd_hook_augment(int argc, char **argv);
 

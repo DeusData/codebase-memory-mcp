@@ -4064,9 +4064,9 @@ static int cbm_remove_vibe_mcp_owned(const char *binary_path, const char *config
 
 /* ── Claude Code pre-tool hooks ───────────────────────────────── */
 
-/* Search augmentation runs before Grep/Glob; exact coverage context runs after
+/* Search augmentation runs before Grep/Glob/Bash; exact coverage context runs after
  * Read. Both adapters are context-only and fail open. */
-#define CMM_HOOK_SEARCH_MATCHER "Grep|Glob"
+#define CMM_HOOK_SEARCH_MATCHER "Grep|Glob|Bash"
 #define CMM_HOOK_READ_MATCHER "Read"
 /* Basename only; the full command path is resolved at install time via
  * cbm_resolve_hook_command so $CLAUDE_CONFIG_DIR is honored. */
@@ -4090,6 +4090,7 @@ static int cbm_remove_vibe_mcp_owned(const char *binary_path, const char *config
 static const char *const cmm_claude_old_matchers[] = {
     "Grep|Glob|Read|Search",
     "Grep|Glob|Read",
+    "Grep|Glob",
     NULL,
 };
 static const char *const cmm_gemini_old_matchers[] = {
@@ -5206,7 +5207,7 @@ static int cbm_remove_owned_hook_script(const char *path, const char *expected_c
 
 /* Install the search-augmenter shim to ~/.claude/hooks/.
  * The shim is a thin wrapper that delegates to `<binary> hook-augment`,
- * which adds graph context to Grep/Glob calls. It NEVER blocks a tool call:
+ * which adds graph context to Grep/Glob/Bash search calls. It NEVER blocks a tool call:
  * a missing/old/hung binary results in a silent exit 0 (issue #362/#288).
  * The legacy filename `cbm-code-discovery-gate` is retained so existing
  * settings.json entries and uninstall keep working with zero migration. */
@@ -7695,7 +7696,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
         }
     }
     if (gate_ok) {
-        printf("  hooks: PreToolUse Grep/Glob search augmentation + PostToolUse Read coverage "
+        printf("  hooks: PreToolUse Grep/Glob/Bash search augmentation + PostToolUse Read coverage "
                "(non-blocking)\n");
     }
     if (session_ok) {
