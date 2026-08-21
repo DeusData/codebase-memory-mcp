@@ -153,6 +153,11 @@ never treated as evidence of freshness or staleness, and checkout freshness is
 left to its own object. `delete_project` also removes a matching attempt
 record when no database was published.
 
+While the recorded attempt is `failed` or `cancelled`, the graph-answering
+tools also attach a stale-index warning to their results, so a rebuild that
+failed in the background cannot leave a caller trusting an older graph in
+silence. A completed rebuild clears it.
+
 ## 3. UI Settings
 
 The optional built-in graph UI stores its settings in:
