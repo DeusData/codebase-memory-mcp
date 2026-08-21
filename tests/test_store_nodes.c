@@ -2200,12 +2200,82 @@ TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
     PASS();
 }
 
+TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-sha", "/tmp/coverage-sha"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-sha", "keep.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t row = {.rel_path = "keep.c", .kind = "parse_partial", .detail = "1-2"};
+
+    /* NULL indexed_checkout_sha (non-git run) persists as NULL and reads back
+     * as no identity. */
+    cbm_coverage_meta_t no_sha_meta = {
+        .generation = "gen-0",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &no_sha_meta),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_NULL(got.indexed_checkout_sha);
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Round-trip: git-run identity persists and can be overwritten by the next
+     * staged generation. */
+    cbm_coverage_meta_t sha_meta = no_sha_meta;
+    sha_meta.generation = "gen-1";
+    sha_meta.indexed_checkout_sha = "0123456789abcdef0123456789abcdef01234567";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &sha_meta),
+              CBM_STORE_OK);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "0123456789abcdef0123456789abcdef01234567");
+    ASSERT_STR_EQ(got.generation, "gen-1");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_coverage_meta_t new_meta = sha_meta;
+    new_meta.generation = "gen-2";
+    new_meta.indexed_checkout_sha = "abcdef0123456789abcdef0123456789abcdef01";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &row, 1, &new_meta),
+              CBM_STORE_OK);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Rollback: a failed replace must retain the prior identity + generation. */
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TRIGGER fail_sha_missed_insert BEFORE INSERT ON nodes "
+                                "WHEN NEW.project = 'coverage-sha::missed' "
+                                "BEGIN SELECT RAISE(ABORT, 'forced sha shadow failure'); END;"),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t failed_meta = new_meta;
+    failed_meta.generation = "gen-must-not-commit";
+    failed_meta.indexed_checkout_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    cbm_coverage_row_t failed_row = row;
+    failed_row.detail = "changed-to-force-shadow-rebuild";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-sha", &failed_row, 1, &failed_meta),
+              CBM_STORE_ERR);
+    got = (cbm_coverage_meta_t){0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-sha", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "gen-2");
+    ASSERT_STR_EQ(got.indexed_checkout_sha, "abcdef0123456789abcdef0123456789abcdef01");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
     RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
     RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
+    RUN_TEST(store_coverage_meta_indexed_checkout_sha_roundtrip_and_rollback);
     RUN_TEST(sql_label_allowlists_match_cbm_label_is_type_like);
     RUN_TEST(sql_relation_labels_match_cbm_label_is_relation);
     RUN_TEST(store_open_memory);

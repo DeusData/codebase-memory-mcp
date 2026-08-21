@@ -36,6 +36,8 @@ enum {
     MCP_TOOLS_PAGE_SIZE = 8,
     MCP_HELP_TOOLS_WRAP_COL = 74, /* --help tool list stays readable on 80-col terminals */
     MCP_MAX_CROSS_REPO_TARGETS = 4096,
+    MCP_STATUS_SAMPLE_MAX = 16, /* per-class path samples in verbose freshness */
+    MCP_REASONS_MAX = 8,        /* freshness reasons array ceiling (see below) */
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
@@ -4542,13 +4544,169 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     return result;
 }
 
+/* Emit the bounded worktree-status snapshot inside the freshness block.
+ * Fail-closed: status_available is false whenever git status could not run
+ * clean, in which case the API guarantees zero counts and no samples — a
+ * non-git root or missing git is NEVER presented as a clean worktree. Ignored
+ * paths are deliberately absent (no --ignored in the underlying query) and
+ * must not be confused with tracked/untracked sources. */
+static void add_worktree_status_json(yyjson_mut_doc *doc, yyjson_mut_val *freshness,
+                                     const cbm_worktree_status_t *st) {
+    yyjson_mut_obj_add_bool(doc, freshness, "status_available", st->available);
+
+    yyjson_mut_val *tracked = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, tracked, "count", st->tracked_count);
+    yyjson_mut_val *tpaths = yyjson_mut_arr(doc);
+    for (int i = 0; i < st->tracked_sample_count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, tpaths, st->tracked_paths[i]);
+    }
+    yyjson_mut_obj_add_val(doc, tracked, "paths", tpaths);
+    yyjson_mut_obj_add_bool(doc, tracked, "truncated", st->tracked_truncated);
+    yyjson_mut_obj_add_val(doc, freshness, "tracked_changes", tracked);
+
+    yyjson_mut_val *untracked = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, untracked, "count", st->untracked_count);
+    yyjson_mut_val *upaths = yyjson_mut_arr(doc);
+    for (int i = 0; i < st->untracked_sample_count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, upaths, st->untracked_paths[i]);
+    }
+    yyjson_mut_obj_add_val(doc, untracked, "paths", upaths);
+    yyjson_mut_obj_add_bool(doc, untracked, "truncated", st->untracked_truncated);
+    yyjson_mut_obj_add_val(doc, freshness, "untracked_source", untracked);
+}
+
+/* BT-240: fail-closed freshness verdict against the indexed-checkout identity
+ * recorded with the DB at the successful staged-generation boundary. A live
+ * checkout SHA is not proof of the generation that produced graph content, so
+ * the verdict comes from that recorded identity, the live git HEAD and the
+ * bounded worktree status (tracked/untracked deltas):
+ *   - no indexed SHA                                  → unknown / unavailable
+ *   - indexed SHA differs from the live git HEAD      → stale / mismatch
+ *   - tracked changes present                         → stale / tracked
+ *   - untracked sources present                       → prevents current
+ *   - equal SHA + status available + no changes       → current
+ * Report-only: it never triggers indexing. Verbose-only and read-only; the
+ * live checkout is resolved fresh from the project root (never mutated). */
+static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     cbm_store_t *store, const char *project,
+                                     const char *root_path, const char *indexed_generation) {
+    yyjson_mut_val *freshness = yyjson_mut_obj(doc);
+    if (indexed_generation && indexed_generation[0]) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_generation", indexed_generation);
+    } else {
+        yyjson_mut_obj_add_str(doc, freshness, "indexed_generation", "");
+    }
+
+    cbm_coverage_meta_t meta = {0};
+    bool have_meta = store && cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
+    const char *indexed_sha = NULL;
+    if (have_meta && meta.indexed_checkout_sha && meta.indexed_checkout_sha[0]) {
+        indexed_sha = meta.indexed_checkout_sha;
+    }
+
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(root_path, &ctx);
+    const char *checkout_sha = ctx.head_sha && ctx.head_sha[0] ? ctx.head_sha : NULL;
+
+    cbm_worktree_status_t st = {0};
+    int status_rc = cbm_git_worktree_status(root_path, MCP_STATUS_SAMPLE_MAX, &st);
+    bool status_available = status_rc == 0 && st.available;
+    add_worktree_status_json(doc, freshness, &st);
+
+    if (indexed_sha) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_checkout_sha", indexed_sha);
+    } else {
+        yyjson_mut_obj_add_null(doc, freshness, "indexed_checkout_sha");
+    }
+    if (checkout_sha) {
+        yyjson_mut_obj_add_strcpy(doc, freshness, "checkout_sha", checkout_sha);
+    } else {
+        yyjson_mut_obj_add_null(doc, freshness, "checkout_sha");
+    }
+
+    /* Verdict/reasons composition. Stale reasons (identity mismatch, tracked
+     * changes) win over everything; a missing indexed identity is unknown
+     * regardless of live state; status unavailability and untracked sources
+     * both prevent "current" but only yield stale when a stale reason is
+     * already present. The reasons array keeps every applicable code in a
+     * stable order; the singular reason stays as the first (dominant) one for
+     * compatibility with consumers that read it directly. */
+    bool sha_present = indexed_sha != NULL;
+    bool live_present = checkout_sha != NULL;
+    bool sha_mismatch = sha_present && live_present && strcmp(indexed_sha, checkout_sha) != 0;
+    bool has_tracked = st.tracked_count > 0;
+    bool has_untracked = st.untracked_count > 0;
+    bool has_stale = sha_mismatch || has_tracked;
+
+    const char *verdict;
+    if (!sha_present) {
+        verdict = "unknown";
+    } else if (has_stale) {
+        verdict = "stale";
+    } else if (!live_present) {
+        verdict = "unknown";
+    } else if (!status_available) {
+        verdict = "unknown";
+    } else if (has_untracked) {
+        verdict = "unknown";
+    } else {
+        verdict = "current";
+    }
+
+    const char *reasons[MCP_REASONS_MAX];
+    int n_reasons = 0;
+    if (!sha_present) {
+        reasons[n_reasons++] = "indexed_checkout_unavailable";
+    }
+    if (sha_mismatch) {
+        reasons[n_reasons++] = "indexed_checkout_mismatch";
+    }
+    if (has_tracked) {
+        reasons[n_reasons++] = "tracked_changes_present";
+    }
+    if (!status_available) {
+        reasons[n_reasons++] = "status_unavailable";
+    }
+    if (has_untracked) {
+        reasons[n_reasons++] = "untracked_not_indexed";
+    }
+    if (n_reasons == 0) {
+        reasons[n_reasons++] = "indexed_checkout_current";
+    }
+    const char *reason = reasons[0];
+
+    const char *recommended_action;
+    if (strcmp(verdict, "current") == 0) {
+        recommended_action = "use_graph";
+    } else if (strcmp(verdict, "stale") == 0) {
+        recommended_action = "reindex_to_match_checkout";
+    } else {
+        recommended_action = "reindex_to_record_indexed_checkout";
+    }
+    yyjson_mut_obj_add_str(doc, freshness, "verdict", verdict);
+    yyjson_mut_obj_add_str(doc, freshness, "reason", reason);
+    yyjson_mut_val *reasons_val = yyjson_mut_arr(doc);
+    for (int i = 0; i < n_reasons; i++) {
+        yyjson_mut_arr_add_str(doc, reasons_val, reasons[i]);
+    }
+    yyjson_mut_obj_add_val(doc, freshness, "reasons", reasons_val);
+    yyjson_mut_obj_add_str(doc, freshness, "recommended_action", recommended_action);
+    yyjson_mut_obj_add_val(doc, root, "freshness", freshness);
+
+    if (have_meta) {
+        cbm_store_coverage_meta_clear(&meta);
+    }
+    cbm_git_worktree_status_free(&st);
+    cbm_git_context_free(&ctx);
+}
+
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
-    /* The git context block (worktree/shadow path variants) only matters when
-     * debugging index-location issues — gate it so the common status call
-     * stays lean. */
+    /* The git context block (worktree/shadow path variants) and the freshness
+     * verdict only matter when debugging index-location issues — gate them so
+     * the common status call stays lean. */
     bool verbose = cbm_mcp_get_bool_arg(args, "verbose");
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -4568,6 +4726,8 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                                       proj_info.root_path ? proj_info.root_path : "");
             if (verbose) {
                 add_git_context_json(doc, root, proj_info.root_path);
+                add_index_freshness_json(doc, root, store, project, proj_info.root_path,
+                                         proj_info.indexed_at);
             }
             safe_str_free(&proj_info.name);
             safe_str_free(&proj_info.indexed_at);

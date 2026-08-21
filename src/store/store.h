@@ -549,6 +549,11 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
+    /* Git checkout identity frozen at the successful staged-generation
+     * boundary (BT-240). NULL/"" when the run had no git context (non-git
+     * repo) or the DB predates the column. Owned by the row: meta_get
+     * allocates it, meta_clear frees it. */
+    const char *indexed_checkout_sha;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for
