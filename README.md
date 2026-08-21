@@ -683,7 +683,9 @@ explicit value, including `off`, replaces that dimension of a selected
 profile. Exceeding an effective limit fails the complete index attempt rather
 than publishing a partial graph, and an existing serving index is preserved.
 `index_status` reports the latest physical indexing attempt and Git-based
-freshness after the first recorded attempt. See
+freshness after the first recorded attempt, and while that attempt is failed or
+cancelled the graph-answering tools attach a stale-index warning so a rebuild
+that failed in the background cannot go unnoticed. See
 [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables

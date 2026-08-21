@@ -3048,6 +3048,116 @@ TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
     PASS();
 }
 
+/* A rebuild that dies on a resource limit leaves the previously published
+ * graph in service. Without a signal on the answers themselves, the caller
+ * keeps trusting a graph that no longer matches the tree. */
+TEST(stale_index_warning_reaches_graph_answers) {
+    char *cache = th_mktempdir("cbm_stale_warning");
+    ASSERT_NOT_NULL(cache);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+
+    const char *project = "StaleWarningFixture";
+    char db_path[700];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, cache), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "StaleProbe",
+                       .qualified_name = "stale.StaleProbe",
+                       .file_path = "mod.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(setup, &node), 0);
+    cbm_store_close(setup);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[128];
+    ASSERT_TRUE(cbm_index_policy_set_profile(&policy, "strict", error, sizeof(error)));
+    char attempt_id[33];
+    ASSERT_TRUE(cbm_mcp_index_attempt_begin(project, cache, "watcher", &policy, true, attempt_id));
+    ASSERT_TRUE(
+        cbm_mcp_index_attempt_transition(project, cache, attempt_id, "running", NULL, NULL, false));
+    cbm_index_resource_violation_t violation = {
+        .resource = CBM_INDEX_RESOURCE_FILES,
+        .observed = 120000,
+        .limit = 100000,
+    };
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition(project, cache, attempt_id, "failed",
+                                                 "resource_limit_exceeded", &violation, false));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char json_args[512];
+    snprintf(json_args, sizeof(json_args),
+             "{\"project\":\"%s\",\"name_pattern\":\".*StaleProbe.*\",\"format\":\"json\"}",
+             project);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", json_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":false"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    /* The answer keeps its place at content[0]; the warning rides along in the
+     * same object so a structured reader cannot miss it. */
+    ASSERT_NOT_NULL(strstr(inner, "StaleProbe"));
+    ASSERT_NOT_NULL(strstr(inner, "\"stale_index_warning\""));
+    ASSERT_NOT_NULL(strstr(inner, "index_max_files"));
+    ASSERT_NOT_NULL(strstr(inner, "120000"));
+    ASSERT_NOT_NULL(strstr(inner, "watcher"));
+    free(inner);
+    free(resp);
+
+    char default_args[512];
+    snprintf(default_args, sizeof(default_args),
+             "{\"project\":\"%s\",\"name_pattern\":\".*StaleProbe.*\"}", project);
+    resp = cbm_mcp_handle_tool(srv, "search_graph", default_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Stale index warning"));
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "StaleProbe"));
+    free(inner);
+    free(resp);
+
+    /* index_status reports the attempt in full and needs no second copy. */
+    char status_args[512];
+    snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\"}", project);
+    resp = cbm_mcp_handle_tool(srv, "index_status", status_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "stale_index_warning"));
+    free(resp);
+
+    /* A rebuild that is merely in flight is not yet a failure. */
+    char inflight_id[33];
+    ASSERT_TRUE(
+        cbm_mcp_index_attempt_begin(project, cache, "explicit", &policy, false, inflight_id));
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition(project, cache, inflight_id, "running", NULL, NULL,
+                                                 false));
+    resp = cbm_mcp_handle_tool(srv, "search_graph", json_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "stale_index_warning"));
+    free(resp);
+
+    ASSERT_TRUE(cbm_mcp_index_attempt_transition(project, cache, inflight_id, "completed", NULL,
+                                                 NULL, true));
+    resp = cbm_mcp_handle_tool(srv, "search_graph", json_args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "StaleProbe"));
+    ASSERT_NULL(strstr(resp, "stale_index_warning"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(cbm_mcp_index_attempt_remove(project));
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
 TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
     char *cache_created = th_mktempdir("cbm_attempt_fresh_cache");
     char *cache = cache_created ? strdup(cache_created) : NULL;
@@ -11857,6 +11967,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
     RUN_TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job);
+    RUN_TEST(stale_index_warning_reaches_graph_answers);
     RUN_TEST(index_attempt_freshness_requires_same_clean_git_snapshot);
     RUN_TEST(index_attempt_only_project_can_be_deleted);
 

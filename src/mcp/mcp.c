@@ -5255,6 +5255,81 @@ cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc 
     return CBM_INDEX_ATTEMPT_AVAILABLE;
 }
 
+/* Describe why the recorded attempt left the caller on an older graph. The
+ * violation detail is optional: an attempt can fail before any resource is
+ * attributed, and the warning still has to say something useful. */
+static void index_attempt_stale_cause(yyjson_val *root, char *out, size_t out_size) {
+    out[0] = '\0';
+    yyjson_val *failure = yyjson_obj_get(root, "resource_failure");
+    yyjson_val *resource =
+        failure && yyjson_is_obj(failure) ? yyjson_obj_get(failure, "resource") : NULL;
+    const char *name = resource && yyjson_is_str(resource) ? yyjson_get_str(resource) : NULL;
+    if (!name) {
+        yyjson_val *code = yyjson_obj_get(root, "failure_code");
+        if (code && yyjson_is_str(code) && yyjson_get_len(code) > 0) {
+            snprintf(out, out_size, " (%s)", yyjson_get_str(code));
+        }
+        return;
+    }
+    const char *key = cbm_index_resource_config_key(index_attempt_resource_from_name(name));
+    yyjson_val *probe_failed = yyjson_obj_get(failure, "probe_failed");
+    yyjson_val *observed = yyjson_obj_get(failure, "observed");
+    yyjson_val *limit = yyjson_obj_get(failure, "limit");
+    yyjson_val *unit = yyjson_obj_get(failure, "unit");
+    if (probe_failed && yyjson_is_bool(probe_failed) && yyjson_get_bool(probe_failed)) {
+        snprintf(out, out_size,
+                 " because the %s measurement could not be taken and the %s limit is enforced "
+                 "fail-closed",
+                 name, key);
+        return;
+    }
+    if (observed && yyjson_is_uint(observed) && limit && yyjson_is_uint(limit)) {
+        snprintf(out, out_size, " because %s reached %llu %s against the %s limit of %llu", name,
+                 (unsigned long long)yyjson_get_uint(observed),
+                 unit && yyjson_is_str(unit) ? yyjson_get_str(unit) : "units", key,
+                 (unsigned long long)yyjson_get_uint(limit));
+        return;
+    }
+    snprintf(out, out_size, " on the %s limit", key);
+}
+
+/* Fires only on a recorded terminal failure, so it costs one small record read
+ * per answered query and never probes git or the filesystem. A queued or
+ * running rebuild stays silent here and is reported by index_status. */
+static bool index_attempt_stale_warning(const char *project, char *out, size_t out_size) {
+    if (!project || !project[0] || !out || out_size == 0) {
+        return false;
+    }
+    yyjson_doc *attempt = index_attempt_read(project, NULL);
+    yyjson_val *root = attempt ? yyjson_doc_get_root(attempt) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(attempt);
+        return false;
+    }
+    yyjson_val *state = yyjson_obj_get(root, "state");
+    const char *state_name = state && yyjson_is_str(state) ? yyjson_get_str(state) : "";
+    bool cancelled = strcmp(state_name, "cancelled") == 0;
+    if (strcmp(state_name, "failed") != 0 && !cancelled) {
+        yyjson_doc_free(attempt);
+        return false;
+    }
+    yyjson_val *origin = yyjson_obj_get(root, "origin");
+    yyjson_val *finished = yyjson_obj_get(root, "finished_at");
+    char cause[CBM_SZ_256];
+    index_attempt_stale_cause(root, cause, sizeof(cause));
+    snprintf(out, out_size,
+             "Stale index warning: the last %s index attempt for project '%s' %s%s%s%s. These "
+             "results come from the previously published graph and may not match the current "
+             "working tree. Call index_status for the recorded attempt, then index_repository to "
+             "rebuild once the cause is addressed.",
+             origin && yyjson_is_str(origin) ? yyjson_get_str(origin) : "recorded", project,
+             cancelled ? "was cancelled" : "failed",
+             finished && yyjson_is_str(finished) ? " at " : "",
+             finished && yyjson_is_str(finished) ? yyjson_get_str(finished) : "", cause);
+    yyjson_doc_free(attempt);
+    return out[0] != '\0';
+}
+
 bool cbm_mcp_index_attempt_remove(const char *project) {
     index_attempt_lock_t lock;
     if (!index_attempt_lock_acquire(&lock, project)) {
@@ -12604,6 +12679,103 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     cbm_mem_collect();
 }
 
+/* Attach one stale-graph warning to a finished tool result. A JSON payload
+ * gains a `stale_index_warning` field so the signal survives structured
+ * parsing; text and tree payloads gain a trailing content block instead. The
+ * first content item is never displaced, because hook_augment and the smoke
+ * tests read it as the payload. */
+static void mcp_result_attach_stale_warning(char **result_io, const char *warning) {
+    yyjson_doc *parsed = yyjson_read(*result_io, strlen(*result_io), 0);
+    yyjson_mut_doc *document = parsed ? yyjson_mut_doc_new(NULL) : NULL;
+    yyjson_mut_val *root =
+        document ? yyjson_val_mut_copy(document, yyjson_doc_get_root(parsed)) : NULL;
+    yyjson_doc_free(parsed);
+    yyjson_mut_val *failed =
+        root && yyjson_mut_is_obj(root) ? yyjson_mut_obj_get(root, "isError") : NULL;
+    yyjson_mut_val *content =
+        root && yyjson_mut_is_obj(root) ? yyjson_mut_obj_get(root, "content") : NULL;
+    if (!content || !yyjson_mut_is_arr(content) ||
+        (failed && yyjson_mut_is_bool(failed) && yyjson_mut_get_bool(failed))) {
+        yyjson_mut_doc_free(document);
+        return;
+    }
+    yyjson_mut_doc_set_root(document, root);
+    yyjson_mut_val *item = yyjson_mut_arr_get(content, 0);
+    yyjson_mut_val *text =
+        item && yyjson_mut_is_obj(item) ? yyjson_mut_obj_get(item, "text") : NULL;
+    const char *payload = text && yyjson_mut_is_str(text) ? yyjson_mut_get_str(text) : NULL;
+    yyjson_doc *payload_document = payload ? yyjson_read(payload, strlen(payload), 0) : NULL;
+    yyjson_val *payload_root = payload_document ? yyjson_doc_get_root(payload_document) : NULL;
+    bool attached = false;
+    if (payload_root && yyjson_is_obj(payload_root)) {
+        yyjson_mut_doc *rewritten = yyjson_doc_mut_copy(payload_document, NULL);
+        yyjson_mut_val *rewritten_root = rewritten ? yyjson_mut_doc_get_root(rewritten) : NULL;
+        char *rendered = rewritten_root && yyjson_mut_obj_add_strcpy(rewritten, rewritten_root,
+                                                                     "stale_index_warning", warning)
+                             ? yyjson_mut_write(rewritten, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL)
+                             : NULL;
+        yyjson_mut_doc_free(rewritten);
+        if (rendered) {
+            (void)yyjson_mut_obj_remove_key(item, "text");
+            attached = yyjson_mut_obj_add_strcpy(document, item, "text", rendered);
+            yyjson_mut_val *structured = yyjson_mut_obj_get(root, "structuredContent");
+            if (attached && structured && yyjson_mut_is_obj(structured)) {
+                attached =
+                    yyjson_mut_obj_add_strcpy(document, structured, "stale_index_warning", warning);
+            }
+            free(rendered);
+        }
+    } else {
+        yyjson_mut_val *extra = yyjson_mut_obj(document);
+        attached = extra && yyjson_mut_obj_add_str(document, extra, "type", "text") &&
+                   yyjson_mut_obj_add_strcpy(document, extra, "text", warning) &&
+                   yyjson_mut_arr_append(content, extra);
+    }
+    yyjson_doc_free(payload_document);
+    char *replacement =
+        attached ? yyjson_mut_write(document, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL) : NULL;
+    yyjson_mut_doc_free(document);
+    if (replacement) {
+        free(*result_io);
+        *result_io = replacement;
+    }
+}
+
+/* Tools that answer from the published graph. A stale graph makes their
+ * answers quietly wrong, which is exactly the case the warning exists for.
+ * index_status and check_index_coverage already report freshness themselves,
+ * and index_repository is the remedy, so none of them are annotated. */
+static bool mcp_tool_answers_from_graph(const char *tool_name) {
+    static const char *GRAPH_TOOLS[] = {
+        "search_graph",     "query_graph",      "trace_path",  "trace_call_path",
+        "get_architecture", "get_code_snippet", "search_code",
+    };
+    for (size_t index = 0; tool_name && index < sizeof(GRAPH_TOOLS) / sizeof(GRAPH_TOOLS[0]);
+         index++) {
+        if (strcmp(tool_name, GRAPH_TOOLS[index]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A background rebuild that fails only reaches the logs and index_status,
+ * which leaves a caller querying an older graph with no visible signal. Say so
+ * on the next answer served from that graph. Every failure here is silent:
+ * a warning that cannot be produced must never turn a good answer into one. */
+static void mcp_result_warn_if_stale(const char *tool_name, const char *args_json,
+                                     char **result_io) {
+    if (!args_json || !result_io || !*result_io || !mcp_tool_answers_from_graph(tool_name)) {
+        return;
+    }
+    char *project = get_project_arg(args_json);
+    char warning[CBM_SZ_1K];
+    if (project && index_attempt_stale_warning(project, warning, sizeof(warning))) {
+        mcp_result_attach_stale_warning(result_io, warning);
+    }
+    free(project);
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     /* Phase marks bracket the WHOLE request with no unlabelled gap, so growth
      * cannot hide between them (CBM_MEM_PHASES=1; see foundation/mem.h). The
@@ -12618,6 +12790,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     cbm_mem_phase_mark("request.dispatch_tool");
     char *result = dispatch_tool(srv, tool_name, args_json);
+    mcp_result_warn_if_stale(tool_name, args_json, &result);
     cbm_mem_phase_mark("request.scope_end");
     if (srv) {
         cbm_mcp_server_request_scope_end(srv);

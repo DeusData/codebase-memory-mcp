@@ -189,6 +189,20 @@ dirty or changed-during-index snapshots, failed Git probes, and corrupt records
 are `unknown`. Dirty state is never proof of freshness or staleness. Projects
 with no attempt record retain the previous response shape.
 
+A background rebuild that fails reaches only the logs and `index_status`, which
+leaves a caller querying an older graph with nothing to warn it. Once a record
+is in a `failed` or `cancelled` state, the next answer served from that
+project's graph carries a stale-index warning naming the origin, the recorded
+finish time, and the limit that ended the attempt. The warning is attached to
+`search_graph`, `query_graph`, `trace_path`, `trace_call_path`,
+`get_architecture`, `get_code_snippet`, and `search_code`; `index_status` and
+`check_index_coverage` already report freshness themselves, and
+`index_repository` is the remedy. A JSON payload receives a
+`stale_index_warning` field so a structured reader cannot miss it, and a text
+or tree payload receives a trailing content block; the answer itself keeps its
+position and content. A queued or running rebuild is not yet a failure and
+produces no warning, and a completed rebuild clears it.
+
 ## Trust and compatibility
 
 Limits are read from the CLI-managed `_config.db`; they are not MCP request
