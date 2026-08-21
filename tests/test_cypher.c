@@ -1171,15 +1171,24 @@ TEST(cypher_exec_varlength_path_semantics_issue797) {
     ASSERT_EQ(r1.row_count, 1);
     cbm_cypher_result_free(&r1);
 
-    /* Bug 2: *2..2 from loopy — only the REAL 2-chain (leaf); the self-loop
-     * must not be reused to pad paths (relationship uniqueness). */
+    /* Bug 2: *2..2 from loopy has two relationship-unique trails: the
+     * self-loop followed by e1 reaches mid, and e1 followed by e2 reaches leaf.
+     * Reusing the self-loop within one trail remains forbidden. */
     cbm_cypher_result_t r2 = {0};
     ASSERT_EQ(cbm_cypher_execute(s,
                                  "MATCH (a {name: \"loopy\"})-[:CALLS*2..2]->(b) "
                                  "RETURN DISTINCT b.name",
                                  "test", 0, &r2),
               0);
-    ASSERT_EQ(r2.row_count, 1); /* leaf only */
+    ASSERT_EQ(r2.row_count, 2);
+    bool saw_mid = false;
+    bool saw_leaf = false;
+    for (int i = 0; i < r2.row_count; i++) {
+        saw_mid |= strcmp(r2.rows[i][0], "mid") == 0;
+        saw_leaf |= strcmp(r2.rows[i][0], "leaf") == 0;
+    }
+    ASSERT_TRUE(saw_mid);
+    ASSERT_TRUE(saw_leaf);
     cbm_cypher_result_free(&r2);
 
     /* Bug 2 amplifier: no directed path of length 5 exists at all. */
@@ -1794,6 +1803,74 @@ TEST(cypher_exec_var_length_explicit_bound_capped) {
     ASSERT_FALSE(saw_n12);
 
     cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Pin the relationship-trail contract: a self-loop edge cannot be reused
+ * within one variable-length trail, so *2..2 yields no fabricated match. */
+TEST(cypher_exec_var_length_no_reuse_self_loop) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Recursive",
+                    .qualified_name = "test.Recursive",
+                    .file_path = "recursive.go"};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    cbm_edge_t e = {.project = "test", .source_id = id, .target_id = id, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function {name: \"Recursive\"})-[:CALLS*2..2]"
+                                "->(g:Function) RETURN g.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_var_length_truncation_surfaces_warning) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    int64_t ids[18];
+    for (int i = 0; i < 18; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "node-%d", i);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = name,
+                           .file_path = "graph.c"};
+        ids[i] = cbm_store_upsert_node(s, &node);
+    }
+    for (int source = 0; source < 17; source++) {
+        for (int target = source + 1; target < 18; target++) {
+            cbm_edge_t edge = {.project = "test",
+                               .source_id = ids[source],
+                               .target_id = ids[target],
+                               .type = "CALLS"};
+            cbm_store_insert_edge(s, &edge);
+        }
+    }
+
+    cbm_cypher_result_t result = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function {name: \"node-0\"})-[:CALLS*10..10]->"
+                                "(b:Function) RETURN b.name",
+                                "test", 0, &result);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(result.warning);
+    ASSERT_TRUE(strstr(result.warning, "traversal budget") != NULL);
+    ASSERT_TRUE(result.row_count > 0);
+
+    cbm_cypher_result_free(&result);
     cbm_store_close(s);
     PASS();
 }
@@ -4037,6 +4114,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_variable_length);
     RUN_TEST(cypher_exec_variable_length_repeated_node_var_unifies);
     RUN_TEST(cypher_exec_var_length_explicit_bound_capped);
+    RUN_TEST(cypher_exec_var_length_no_reuse_self_loop);
+    RUN_TEST(cypher_exec_var_length_truncation_surfaces_warning);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);
