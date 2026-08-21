@@ -22,6 +22,7 @@
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/platform.h>
+#include <foundation/sha256.h>
 #include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
@@ -11641,19 +11642,31 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     snprintf(logpath, sizeof(logpath), "%s/timeouts.log", tmpdir);
 
     int fds[2];
+    int errfds[2];
     if (pipe(fds) != 0) {
         test_rmdir_r(tmpdir);
         FAIL("pipe failed");
+    }
+    if (pipe(errfds) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        test_rmdir_r(tmpdir);
+        FAIL("stderr pipe failed");
     }
 
     fflush(NULL);
     pid_t pid = fork();
     if (pid == 0) {
         /* Child: hook-augment with a 60ms deadline and stdin that blocks
-         * forever (parent keeps the write end open, sends nothing). */
+         * forever (parent keeps the write end open, sends nothing). Its stderr
+         * is redirected so the parent can prove the deadline is also announced
+         * there, not only in the timeouts log. */
         close(fds[1]);
         dup2(fds[0], 0);
         close(fds[0]);
+        close(errfds[0]);
+        dup2(errfds[1], 2);
+        close(errfds[1]);
         setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
         setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
         alarm(10); /* backstop: never hang the suite */
@@ -11661,6 +11674,19 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     }
     ASSERT_GT(pid, 0);
     close(fds[0]);
+    close(errfds[1]);
+
+    /* Drain the child's stderr before reaping, so a full pipe can never wedge
+     * it. EOF arrives once the child's deadline handler has run and _exit()ed. */
+    char errbuf[4096] = "";
+    size_t errlen = 0;
+    ssize_t rd;
+    while (errlen + 1 < sizeof(errbuf) &&
+           (rd = read(errfds[0], errbuf + errlen, sizeof(errbuf) - 1 - errlen)) > 0) {
+        errlen += (size_t)rd;
+    }
+    errbuf[errlen] = '\0';
+    close(errfds[0]);
 
     int status = 0;
     waitpid(pid, &status, 0);
@@ -11671,8 +11697,8 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     ASSERT_EQ(WEXITSTATUS(status), 0);
 
     /* RED before the fix: no breadcrumb existed — a fired deadline was
-     * indistinguishable from a no-match run. GREEN: the log names the
-     * deadline and the knob. */
+     * indistinguishable from a no-match run. GREEN: it is announced on BOTH
+     * the timeouts log and stderr, each naming the deadline and the knob. */
     FILE *f = fopen(logpath, "r");
     if (!f) {
         fprintf(stderr, "  [858] FAIL no timeout breadcrumb written to %s\n", logpath);
@@ -11684,6 +11710,9 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     ASSERT_NOT_NULL(got);
     ASSERT(strstr(line, "deadline_exceeded") != NULL);
     ASSERT(strstr(line, "CBM_HOOK_DEADLINE_MS") != NULL);
+
+    ASSERT(strstr(errbuf, "deadline_exceeded") != NULL);
+    ASSERT(strstr(errbuf, "CBM_HOOK_DEADLINE_MS") != NULL);
 
     cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
     cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
@@ -12679,6 +12708,46 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+/* The platform-optimized streaming SHA-256 (CommonCrypto on Apple) must produce
+ * the exact bytes the portable scalar reference does. Exercise empty input, a
+ * sub-block, the block/length-padding boundaries, and multi-block spans — both
+ * one-shot and split across updates — so any divergence surfaces. */
+TEST(cli_sha256_platform_path_matches_scalar) {
+    uint8_t buffer[4096];
+    for (size_t i = 0; i < sizeof(buffer); i++) {
+        buffer[i] = (uint8_t)((i * 31u + 7u) & 0xffu);
+    }
+    static const size_t sizes[] = {0, 1, 3, 55, 56, 63, 64, 65, 127, 128, 200, 1000, 4096};
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+        char via_api[CBM_SHA256_HEX_LEN + 1];
+        char via_scalar[CBM_SHA256_HEX_LEN + 1];
+        cbm_sha256_hex(buffer, sizes[s], via_api);
+        cbm_sha256_scalar_hex_for_testing(buffer, sizes[s], via_scalar);
+        ASSERT_STR_EQ(via_api, via_scalar);
+    }
+
+    /* Chunked updates must agree with a scalar hash of the same bytes, so the
+     * Apple CC_LONG-bounded update loop is covered too. */
+    cbm_sha256_ctx c;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_init(&c);
+    cbm_sha256_update(&c, buffer, 1);
+    cbm_sha256_update(&c, buffer + 1, 63);
+    cbm_sha256_update(&c, buffer + 64, sizeof(buffer) - 64);
+    cbm_sha256_final(&c, digest);
+    char split_hex[CBM_SHA256_HEX_LEN + 1];
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        split_hex[i * 2] = hex[digest[i] >> 4];
+        split_hex[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    split_hex[CBM_SHA256_HEX_LEN] = '\0';
+    char scalar_whole[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_scalar_hex_for_testing(buffer, sizeof(buffer), scalar_whole);
+    ASSERT_STR_EQ(split_hex, scalar_whole);
+    PASS();
+}
+
 /* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
  * so `update --ui` — a command people had in scripts and aliases — started
  * failing with "unknown update option". Retiring a choice is fine; breaking the
@@ -12952,6 +13021,7 @@ SUITE(cli) {
     RUN_TEST(cli_progress_sink_accepts_worker_json_logs);
     RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_sha256_platform_path_matches_scalar);
     RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
     RUN_TEST(cli_checksum_manifest_rejects_invalid_missing_and_conflicting_digest);
     RUN_TEST(cli_checksum_manifest_rejects_oversized_input);

@@ -90,14 +90,31 @@ static size_t g_ha_crumb_len = 0;
 
 static void ha_deadline_exit(int sig) {
     (void)sig;
-    if (g_ha_crumb_fd >= 0 && g_ha_crumb_len > 0) {
-        ssize_t w = write(g_ha_crumb_fd, g_ha_crumb_msg, g_ha_crumb_len);
-        (void)w;
+    /* async-signal-safe only: write() the prepared breadcrumb to the timeouts
+     * log (when it opened) and ALWAYS to stderr, so a fired deadline is a
+     * visible event, never a silent 0-byte exit(0). */
+    if (g_ha_crumb_len > 0) {
+        if (g_ha_crumb_fd >= 0) {
+            ssize_t w = write(g_ha_crumb_fd, g_ha_crumb_msg, g_ha_crumb_len);
+            (void)w;
+        }
+        ssize_t e = write(STDERR_FILENO, g_ha_crumb_msg, g_ha_crumb_len);
+        (void)e;
     }
     _exit(0);
 }
 
 static void ha_open_crumb_log(int deadline_ms) {
+    /* Pre-format the breadcrumb unconditionally: the handler may only write() a
+     * prepared buffer, and formatting it before the log path is resolved means
+     * stderr still gets the line even when the file cannot be opened (no HOME,
+     * unwritable cache dir) — the "never silent" guarantee holds regardless. */
+    int n = snprintf(g_ha_crumb_msg, sizeof(g_ha_crumb_msg),
+                     "hook-augment: deadline_exceeded ms=%d pid=%ld (raise via "
+                     "CBM_HOOK_DEADLINE_MS)\n",
+                     deadline_ms, (long)getpid());
+    g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
+
     const char *override = getenv("CBM_HOOK_TIMEOUT_LOG"); /* tests + power users */
     char path[CBM_SZ_1K];
     if (override && override[0]) {
@@ -113,14 +130,6 @@ static void ha_open_crumb_log(int deadline_ms) {
         snprintf(path, sizeof(path), "%s/hook-augment-timeouts.log", dir);
     }
     g_ha_crumb_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (g_ha_crumb_fd < 0) {
-        return;
-    }
-    int n = snprintf(g_ha_crumb_msg, sizeof(g_ha_crumb_msg),
-                     "hook-augment: deadline_exceeded ms=%d pid=%ld (raise via "
-                     "CBM_HOOK_DEADLINE_MS)\n",
-                     deadline_ms, (long)getpid());
-    g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
 }
 
 void cbm_hook_augment_arm_deadline(void) {
