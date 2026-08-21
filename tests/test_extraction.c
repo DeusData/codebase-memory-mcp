@@ -74,6 +74,16 @@ static int count_defs_with_label(CBMFileResult *r, const char *label) {
     return count;
 }
 
+/* Docstring of the first definition matching label+name (NULL if not found). */
+static const char *def_docstring(CBMFileResult *r, const char *label, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, label) == 0 &&
+            strcmp(r->defs.items[i].name, name) == 0)
+            return r->defs.items[i].docstring;
+    }
+    return NULL;
+}
+
 /* Convenience: extract, assert no error, return result. Caller frees. */
 static CBMFileResult *extract(const char *src, CBMLanguage lang, const char *proj,
                               const char *path) {
@@ -3187,6 +3197,87 @@ TEST(markdown_no_headings) {
     PASS();
 }
 
+/* #518: the prose body beneath a heading is captured as the Section docstring so
+ * BM25 can search markdown content, not just heading text. */
+TEST(markdown_section_body_captured) {
+    CBMFileResult *r = extract("## BROWSER AGENT\n\n"
+                               "Before writing any test file, explore the live application "
+                               "using Playwright MCP.\n\n"
+                               "## NEXT SECTION\n\n"
+                               "Totally unrelated prose here.\n",
+                               CBM_LANG_MARKDOWN, "t", "SKILL.md");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *body = def_docstring(r, "Section", "BROWSER AGENT");
+    ASSERT_NOT_NULL(body);
+    ASSERT(strstr(body, "Playwright") != NULL);
+    ASSERT(strstr(body, "test file") != NULL);
+    /* Body stops at the next heading — it must not absorb the sibling section. */
+    ASSERT(strstr(body, "unrelated") == NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #518: a heading with no prose beneath it yields no docstring (not empty text).
+ *
+ * Asserting only that the bare section has no body would be vacuous — every
+ * Section docstring is NULL on a build that never captures bodies at all, so
+ * that half passes with the feature reverted. The documented sibling in the
+ * same file is what makes the pair meaningful: one has prose and one does not,
+ * which is only true once capture works AND stops at the heading boundary. */
+TEST(markdown_section_no_body) {
+    CBMFileResult *r = extract("## Documented\n\n"
+                               "Prose about telemetry batching.\n\n"
+                               "## Empty\n",
+                               CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *documented = def_docstring(r, "Section", "Documented");
+    ASSERT_NOT_NULL(documented);
+    ASSERT(strstr(documented, "telemetry") != NULL);
+    const char *empty = def_docstring(r, "Section", "Empty");
+    ASSERT(empty == NULL || empty[0] == '\0');
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #518: the captured body is capped at CBM_MAX_COMMENT_LEN — the same budget
+ * docstrings use — and the cap must not split a UTF-8 sequence.
+ *
+ * The multi-byte character is placed deliberately, not decoratively: 498 ASCII
+ * bytes followed by U+20AC (3 bytes) puts that character across byte offsets
+ * 498-500, so a naive cut at 500 lands on its final continuation byte. An
+ * all-ASCII corpus never reaches the backoff branch at all, which is why the
+ * earlier version of this test exercised only the cap. */
+TEST(markdown_section_body_capped) {
+    enum { ASCII_RUN = CBM_MAX_COMMENT_LEN - 2 }; /* 498: U+20AC then straddles the cap */
+    char src[2048];
+    int n = snprintf(src, sizeof(src), "# Big\n\n");
+    for (int i = 0; i < ASCII_RUN; i++) {
+        src[n++] = 'a';
+    }
+    /* Three euro signs: the first straddles the cap, the rest push past it. */
+    n += snprintf(src + n, sizeof(src) - (size_t)n, "\xE2\x82\xAC\xE2\x82\xAC\xE2\x82\xAC\n");
+    src[n] = '\0';
+
+    CBMFileResult *r = extract(src, CBM_LANG_MARKDOWN, "t", "BIG.md");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *body = def_docstring(r, "Section", "Big");
+    ASSERT_NOT_NULL(body);
+
+    size_t len = strlen(body);
+    ASSERT(len <= CBM_MAX_COMMENT_LEN);
+    /* The backoff walked off the partial character rather than keeping 2 of its
+     * 3 bytes, so the result is short of the cap by exactly those 2 bytes. */
+    ASSERT_EQ((int)len, ASCII_RUN);
+    /* And the final byte is a character boundary, not a continuation byte. */
+    ASSERT(((unsigned char)body[len - 1] & 0xC0) != 0x80);
+    cbm_free_result(r);
+    PASS();
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════
  * Python __init__.py Module QN collision regression
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5775,6 +5866,10 @@ SUITE(extraction) {
     RUN_TEST(markdown_setext_headings);
     RUN_TEST(markdown_heading_content);
     RUN_TEST(markdown_no_headings);
+    /* #518 markdown section body capture */
+    RUN_TEST(markdown_section_body_captured);
+    RUN_TEST(markdown_section_no_body);
+    RUN_TEST(markdown_section_body_capped);
 
     /* __init__.py / index.ts Module QN collision regression */
     RUN_TEST(python_init_module_qn_not_collide_with_folder);

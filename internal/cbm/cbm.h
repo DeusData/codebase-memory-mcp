@@ -177,6 +177,11 @@ typedef enum {
     CBM_LANG_COUNT
 } CBMLanguage;
 
+// Byte budget for any prose attached to a definition as its docstring: leading
+// doc comments, and Markdown section bodies (#518). Shared with tests so the cap
+// is asserted against one definition rather than a copied literal.
+#define CBM_MAX_COMMENT_LEN 500
+
 // --- Extraction result structs ---
 
 typedef struct {

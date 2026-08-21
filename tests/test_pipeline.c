@@ -12069,6 +12069,84 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
     PASS();
 }
 
+/* ── #518: delta-merge FTS body indexing ─────────────────────────── */
+
+/* Count nodes_fts rows matching a single (test-controlled) alpha token. */
+static int delta_fts_match_count(sqlite3 *db, const char *term) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH '%s'", term);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int n = (sqlite3_step(st) == SQLITE_ROW) ? sqlite3_column_int(st, 0) : -1;
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Prose arriving through delta merge must land in nodes_fts.body (#518).
+ *
+ * This drives cbm_delta_patch itself rather than reimplementing its INSERT.
+ * That distinction is the whole point: nodes_fts has five columns, and a
+ * statement naming only the original four is still valid SQL that silently
+ * leaves body NULL — no compile error, no failing assertion, prose merged
+ * incrementally simply unsearchable while a full reindex looks perfect. A
+ * test that hand-rolls its own INSERT keeps passing when pipeline_delta.c
+ * regresses, because it is exercising the copy rather than the call site.
+ *
+ * Revert pipeline_delta.c's INSERT to four columns and this test must fail. */
+TEST(pipeline_delta_merge_indexes_body) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    /* Generation 1: an existing node, indexed the wholesale way. */
+    cbm_node_t base = {.project = "test",
+                       .label = "Function",
+                       .name = "existing",
+                       .qualified_name = "test.existing",
+                       .file_path = "a.c",
+                       .properties_json = "{\"docstring\":\"already indexed\"}"};
+    cbm_store_upsert_node(store, &base);
+    ASSERT_EQ(cbm_store_fts_rebuild(store), CBM_STORE_OK);
+
+    /* Generation 2 arrives incrementally: a markdown Section carrying prose.
+     *
+     * Order matters. cbm_delta_preseed reads MAX(id) and lifts the gbuf id
+     * watermark above it, which is what makes the patch's "id > max_db_id"
+     * predicate mean "inserted by this patch". A node added to the gbuf before
+     * preseed keeps a low temp id and is silently never merged, so the node
+     * must be created after. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t max_db_id = cbm_delta_preseed(store, "test", gb);
+    ASSERT_GTE(max_db_id, 0);
+
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Section", "Deployment", "test.README.deployment",
+                                   "README.md", 1, 8,
+                                   "{\"docstring\":\"rollback uses the canary alias\"}"),
+              max_db_id);
+
+    ASSERT_EQ(cbm_delta_patch(store, "test", gb, max_db_id, NULL, 0), 0);
+
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(db);
+
+    /* The merged node's prose is searchable — the assertion that fails if the
+     * delta write site stops feeding CBM_SQL_FTS_BODY_EXPR. */
+    ASSERT_GTE(delta_fts_match_count(db, "canary"), 1);
+    ASSERT_GTE(delta_fts_match_count(db, "rollback"), 1);
+    /* ...and its name is still indexed on that path. */
+    ASSERT_GTE(delta_fts_match_count(db, "deployment"), 1);
+    /* The pre-existing generation survived the patch. */
+    ASSERT_GTE(delta_fts_match_count(db, "existing"), 1);
+
+    cbm_gbuf_free(gb);
+    cbm_store_close(store);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -12380,6 +12458,8 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+    /* #518 delta-merge FTS body */
+    RUN_TEST(pipeline_delta_merge_indexes_body);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
