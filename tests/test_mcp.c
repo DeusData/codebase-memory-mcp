@@ -2003,6 +2003,129 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     PASS();
 }
 
+/* #1750: get_code_snippet must detect index-to-disk drift before slicing the
+ * live file. Once the file is edited without re-indexing, the indexed
+ * [start,end] coordinates are stale — serving the live file with them returns
+ * shifted text (or another function's body). The response must flag the drift
+ * instead of silently serving stale coordinates. */
+TEST(tool_get_code_snippet_reports_drift_after_file_change) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    struct stat source_stat;
+    ASSERT_EQ(stat(source_path, &source_stat), 0);
+#ifdef __APPLE__
+    int64_t source_mtime_ns =
+        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+        (int64_t)source_stat.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+                              (int64_t)source_stat.st_mtim.tv_nsec;
+#endif
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
+                                         source_stat.st_size),
+              CBM_STORE_OK);
+
+    /* Fresh metadata: full source served, no drift marker. */
+    char *resp =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"project\":\"test-project\","
+                            "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "func HandleRequest() error"));
+    ASSERT_NULL(strstr(resp, "source_drift"));
+    free(resp);
+
+    /* Append lines: the file gains content, so the recorded metadata no longer
+     * matches. The indexed 3-5 range is now stale for edited source. */
+    FILE *fp = fopen(source_path, "a");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 12; i++) {
+        fprintf(fp, "// padding after edit %d\n", i);
+    }
+    fclose(fp);
+
+    resp =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"project\":\"test-project\","
+                            "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_drift\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"freshness\":\"metadata_changed\""));
+    ASSERT_NOT_NULL(strstr(resp, "not available"));
+    free(resp);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #1750: search_code must not attach source sliced with stale indexed ranges
+ * when the file changed on disk after indexing. The result item is flagged
+ * source_drift instead, and the healthy path keeps attaching source. */
+TEST(tool_search_code_marks_drifted_file_without_source) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    struct stat source_stat;
+    ASSERT_EQ(stat(source_path, &source_stat), 0);
+#ifdef __APPLE__
+    int64_t source_mtime_ns =
+        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+        (int64_t)source_stat.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+                              (int64_t)source_stat.st_mtim.tv_nsec;
+#endif
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
+                                         source_stat.st_size),
+              CBM_STORE_OK);
+
+    /* Fresh metadata: source is attached to the result item. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\",\"mode\":\"full\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "func HandleRequest() error"));
+    ASSERT_NULL(strstr(resp, "source_drift"));
+    free(resp);
+
+    /* Append lines: metadata drifts; the stale indexed range must not be sliced
+     * into the response. */
+    FILE *fp = fopen(source_path, "a");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 12; i++) {
+        fprintf(fp, "// padding after edit %d\n", i);
+    }
+    fclose(fp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\",\"mode\":\"full\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_drift\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"freshness\":\"metadata_changed\""));
+    free(resp);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* EVERY tool, not just the one that was reported.
  *
  * The duplication was invisible per-tool: each result looked reasonable on its
@@ -11318,6 +11441,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+    RUN_TEST(tool_get_code_snippet_reports_drift_after_file_change);
+    RUN_TEST(tool_search_code_marks_drifted_file_without_source);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
