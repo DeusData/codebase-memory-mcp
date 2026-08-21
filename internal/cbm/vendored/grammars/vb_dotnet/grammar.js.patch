@@ -1,0 +1,170 @@
+diff --git a/grammar.js b/grammar.js
+index 909a217..9cb8282 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -47,7 +47,8 @@ module.exports = grammar({
+       $.attribute_block,
+       $.namespace_block,
+       $.type_declaration,
+-      alias($._terminator, $.blank_line) // 
++      $.preprocessor_directive,          // #Region around top-level types
++      alias($._terminator, $.blank_line) //
+     ))
+   ),
+ 
+@@ -98,16 +99,20 @@ module.exports = grammar({
+       field('name', $.namespace_name),
+       $._terminator,
+       repeat(choice(
+-        $.attribute_block, 
+-        $.type_declaration, 
++        $.attribute_block,
++        $.type_declaration,
+         $.namespace_block,
+         $.imports_statement,  // Allow imports inside namespace
++        $.preprocessor_directive,  // #Region around types in a namespace
+         alias($._terminator, $.blank_line)  // Allow blank lines
+       )),
+       kw('End'), kw('Namespace'), $._terminator
+     ),
+ 
+     // Class definition block
++    // Inherits/Implements normally appear on their own lines right after the
++    // header (the standard VB.NET form); the inline header position is kept
++    // for compatibility.
+     class_block: $ => seq(
+       field('modifiers', optional($.modifiers)),
+       kw('Class'),
+@@ -116,6 +121,10 @@ module.exports = grammar({
+       optional(field('inherits', $.inherits_clause)),
+       optional(field('implements', $.implements_clause)),
+       $._terminator,
++      repeat(choice(
++        seq(field('inherits', $.inherits_clause), $._terminator),
++        seq(field('implements', $.implements_clause), $._terminator)
++      )),
+       repeat($._member_declaration),
+       kw('End'), kw('Class'), $._terminator
+     ),
+@@ -138,6 +147,7 @@ module.exports = grammar({
+       optional($.type_parameters),
+       optional(field('implements', $.implements_clause)),
+       $._terminator,
++      repeat(seq(field('implements', $.implements_clause), $._terminator)),
+       repeat($._member_declaration),
+       kw('End'), kw('Structure'), $._terminator
+     ),
+@@ -150,6 +160,7 @@ module.exports = grammar({
+       optional($.type_parameters),
+       optional(field('inherits', $.inherits_clause)), // interfaces can inherit multiple interfaces
+       $._terminator,
++      repeat(seq(field('inherits', $.inherits_clause), $._terminator)),
+       repeat($._member_declaration),
+       kw('End'), kw('Interface'), $._terminator
+     ),
+@@ -186,6 +197,12 @@ module.exports = grammar({
+     // Implements clause (for classes or structures implementing interfaces)
+     implements_clause: $ => seq(kw('Implements'), commaSep1($.type)),
+ 
++    // `Handles Button1.Click, Me.Load` on a Sub/Function header
++    handles_clause: $ => seq(kw('Handles'), commaSep1($.handles_target)),
++    handles_target: $ => seq($.identifier, repeat1(seq('.', $.identifier))),
++    // `Implements IFace.Member` on a Sub/Function/Property header
++    member_implements_clause: $ => seq(kw('Implements'), commaSep1($.handles_target)),
++
+     // Generic type parameter definitions: e.g., (Of T As {Constraint})
+     type_parameters: $ => seq(
+       kw('Of'),
+@@ -202,13 +219,16 @@ module.exports = grammar({
+       kw('New')  // type must have a public parameterless constructor
+     ),
+ 
+-    // Attributes: <...> blocks attached to declarations
+-    attribute_block: $ => seq(
++    // Attributes: <...> blocks attached to declarations.  The terminator is
++    // optional: `<Attr()> _` continuation lines (Designer files) join the
++    // attribute and the declaration into one logical line with no terminator
++    // in between.
++    attribute_block: $ => prec.right(seq(
+       '<',
+       commaSep1($.attribute),
+       '>',
+-      $._terminator
+-    ),
++      optional($._terminator)
++    )),
+     // attribute: $ => seq(
+     //   optional(seq(field('target', $.identifier), ':')),  // e.g., Assembly: or Module: target
+     //   field('name', $.identifier),
+@@ -242,7 +262,15 @@ module.exports = grammar({
+       $.constructor_declaration,
+       $.property_declaration,
+       $.event_declaration,
+-      $.delegate_declaration    // nested delegate type
++      $.delegate_declaration,   // nested delegate type
++      $.preprocessor_directive, // #Region / #End Region between members
++      // nested types (Partial Class bodies, Designer files); delegate_declaration
++      // is already listed above, so name the block types directly rather than
++      // $.type_declaration to avoid an LR ambiguity on delegates
++      $.class_block,
++      $.structure_block,
++      $.interface_block,
++      $.enum_block
+     ),
+ 
+     // Constant definitions (inside classes or procedures)
+@@ -274,7 +302,8 @@ module.exports = grammar({
+       optional(seq('=', field('initializer', $.expression)))
+     ),
+     array_rank_specifier: $ => seq('(', optional(repeat(',')), ')'),  // e.g. "()" or "(,)" for array dimensions
+-    as_clause: $ => seq(kw('As'), field('type', $.type)),
++    // `As Type` or the `As New Type(args)` initializer shorthand
++    as_clause: $ => seq(kw('As'), choice(field('type', $.type), field('new', $.new_expression))),
+ 
+     // Type (for variables, parameters, return types, etc.)
+     type: $ => choice(
+@@ -313,6 +342,11 @@ module.exports = grammar({
+       optional($.type_parameters),
+       field('parameters', $.parameter_list),
+       optional(seq(kw('As'), field('return_type', $.type))),  // only for Function
++      // `Handles obj.Event` (WinForms wiring) or `Implements IFace.Member`
++      optional(choice(
++        field('handles', $.handles_clause),
++        field('implements', $.member_implements_clause)
++      )),
+       choice(
+         // With body:
+         seq($._terminator, repeat($.statement), kw('End'), choice(kw('Sub'), kw('Function')), $._terminator),
+@@ -341,6 +375,7 @@ module.exports = grammar({
+       field('name', $.identifier),
+       optional(field('parameters', $.parameter_list)),  // indexed properties
+       optional($.as_clause),
++      optional(field('implements', $.member_implements_clause)),
+       choice(
+         // Auto-property or declaration without body:
+         seq(optional(seq('=', field('initializer', $.expression))), $._terminator),
+@@ -449,6 +484,24 @@ module.exports = grammar({
+       $.redim_statement,
+       $.preprocessor_directive,  // allow preprocessor directives in code flow
+       $.compound_assignment_statement,
++      $.add_remove_handler_statement,
++      $.raise_event_statement,
++    ),
++
++    // `AddHandler obj.Event, AddressOf Handler` / `RemoveHandler ...`
++    add_remove_handler_statement: $ => seq(
++      choice(kw('AddHandler'), kw('RemoveHandler')),
++      field('event', $.expression),
++      token(seq(',', optional(/\r?\n/))),
++      field('handler', $.expression),
++      $._terminator
++    ),
++
++    // `RaiseEvent SomethingHappened(args)`
++    raise_event_statement: $ => seq(
++      kw('RaiseEvent'),
++      $.expression,
++      $._terminator
+     ),
+ 
+     empty_statement: $ => prec(1, $._terminator),  // a standalone line break (no-op statement)
