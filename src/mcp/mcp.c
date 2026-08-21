@@ -8504,7 +8504,7 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
+                                    int end, bool read_allowed, char **out_abs_path) {
     *out_abs_path = NULL;
     if (!root_path || !file_path) {
         return NULL;
@@ -8514,7 +8514,11 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
 
     *out_abs_path = abs_path;
-    if (cbm_path_within_root(root_path, abs_path)) {
+    /* read_allowed=false: the indexed [start,end] coordinates are stale
+     * relative to the file on disk, so slicing the live file would return
+     * shifted text. The caller still gets abs_path for display and the
+     * caller reports the drift (#1750). */
+    if (cbm_path_within_root(root_path, abs_path) && read_allowed) {
         return read_file_lines(abs_path, start, end);
     }
     return NULL;
@@ -8654,7 +8658,18 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         snippet_clipped = true;
     }
     char *abs_path = NULL;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+    /* #1750: the indexed [start,end] coordinates are only valid while the file
+     * on disk matches the recorded metadata. If the file was edited without
+     * re-indexing, slicing the live file would return shifted text (or a
+     * different function's body). Report the drift instead and keep the
+     * requested node's coordinates. */
+    bool snippet_outside = false;
+    const char *freshness = coverage_path_freshness(srv->store, node->project, root_path,
+                                                    node->file_path, &snippet_outside);
+    bool snippet_drifted = freshness && (strcmp(freshness, "metadata_changed") == 0 ||
+                                         strcmp(freshness, "missing") == 0);
+    char *source =
+        resolve_snippet_source(root_path, node->file_path, start, end, !snippet_drifted, &abs_path);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -8687,8 +8702,21 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
         }
+    } else if (snippet_drifted && freshness) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source",
+            "(source not available: file changed after indexing; re-index the project for "
+            "accurate coordinates)");
     } else {
         yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+    }
+
+    /* #1750: the recorded start/end coordinates are stale relative to the file
+     * on disk. Explicitly flag the drift so consumers can tell "current source"
+     * from "index-time coordinates", instead of silently receiving shifted text. */
+    if (snippet_drifted && freshness) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "source_drift", true);
+        yyjson_mut_obj_add_str(doc, root_obj, "freshness", freshness);
     }
 
     /* match_method — omitted for exact matches */
@@ -9069,7 +9097,8 @@ static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_resul
 
 /* Attach source or context lines to a search result JSON item. */
 static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, search_result_t *r,
-                                 int mode, int context_lines, const char *root_path) {
+                                 int mode, int context_lines, const char *root_path,
+                                 cbm_store_t *store, const char *project) {
     enum { MODE_FULL = 1 };
     if (r->start_line <= 0 || r->end_line <= 0) {
         return;
@@ -9082,6 +9111,22 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
      * followed) must not be read back into the response. Same guard the
      * snippet path already uses. */
     if (!cbm_path_within_root(root_path, abs_path)) {
+        return;
+    }
+
+    /* #1750: the indexed [start,end] ranges only describe the file as it was
+     * at index time. If the file changed on disk, attaching source/context
+     * sliced with those ranges returns shifted text (or another function's
+     * body), and the symbol attribution itself is untrustworthy. Flag the
+     * drift and attach nothing. */
+    bool outside = false;
+    const char *freshness =
+        store ? coverage_path_freshness(store, project, root_path, r->file, &outside) : NULL;
+    bool drifted = freshness && (strcmp(freshness, "metadata_changed") == 0 ||
+                                 strcmp(freshness, "missing") == 0);
+    if (drifted && freshness) {
+        yyjson_mut_obj_add_bool(doc, item, "source_drift", true);
+        yyjson_mut_obj_add_str(doc, item, "freshness", freshness);
         return;
     }
 
@@ -9286,8 +9331,9 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
 /* Phase 4: assemble JSON output from search results */
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
-                                    int context_lines, const char *root_path,
-                                    bool warn_literal_pipe, const search_metrics_t *metrics) {
+                                    int context_lines, const char *root_path, cbm_store_t *store,
+                                    const char *project, bool warn_literal_pipe,
+                                    const search_metrics_t *metrics) {
     enum { MODE_COMPACT = 0, MODE_FULL = 1, MODE_FILES = 2, SEARCH_SLOW_MS = 5000 };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -9339,7 +9385,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             yyjson_mut_arr_add_int(doc, row, r->out_degree);
             if (mode == MODE_FULL || attach_context) {
                 yyjson_mut_val *src = yyjson_mut_obj(doc);
-                attach_result_source(doc, src, r, mode, context_lines, root_path);
+                attach_result_source(doc, src, r, mode, context_lines, root_path, store, project);
                 yyjson_mut_arr_add_val(row, src);
             }
             yyjson_mut_arr_add_val(results_arr, row);
@@ -10205,9 +10251,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         result = cbm_mcp_text_result(toon_text ? toon_text : "out of memory", toon_text == NULL);
         free(toon_text);
     } else {
-        result =
-            assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
-                                   context_lines, root_path, pat_has_pipe && !use_regex, &metrics);
+        result = assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode,
+                                        context_lines, root_path, store, project,
+                                        pat_has_pipe && !use_regex, &metrics);
     }
     free(gm);
     free(sr);
