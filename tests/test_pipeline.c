@@ -288,6 +288,71 @@ TEST(pipeline_structure_nodes) {
  * ADR before the delete and restores it after the rebuild. Reproduce-first:
  * index, store an ADR, force a full re-index by adding files, assert the ADR
  * is still present and unchanged. */
+/* #1665: a persistence artifact export failure must not be reported as a
+ * repo_path problem. Create the artifact directory as a regular FILE so
+ * cbm_mkdir_p(.codebase-memory) fails deterministically (works as root too),
+ * run with persistence enabled, and assert: the run fails, the DB was
+ * published (publish happens before export), the pipeline snapshots the export
+ * error, and a clean re-run leaves the snapshot empty. */
+TEST(pipeline_export_error_snapshot_on_artifact_failure) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_export1665_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+
+    /* Block the artifact directory: a FILE at .codebase-memory makes the
+     * export's mkdir_p fail with a deterministic error on every platform. */
+    char art_block[512];
+    snprintf(art_block, sizeof(art_block), "%s/.codebase-memory", tmp);
+    f = fopen(art_block, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "block\n");
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+
+    int rc = cbm_pipeline_run(p);
+    ASSERT_NEQ(rc, 0);
+
+    /* The export runs after publish, so the DB must exist despite the failure. */
+    struct stat db_st;
+    ASSERT_EQ(stat(db_path, &db_st), 0);
+
+    const char *export_error = cbm_pipeline_export_error(p);
+    ASSERT_NOT_NULL(export_error);
+    ASSERT_TRUE(export_error[0] != '\0');
+    ASSERT_NOT_NULL(strstr(export_error, "prepare_artifact_dir"));
+    cbm_pipeline_free(p);
+
+    /* Control: remove the blocker; a fresh run succeeds and leaves no snapshot. */
+    (void)cbm_unlink(art_block);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    cbm_pipeline_set_persistence(p2, true);
+    rc = cbm_pipeline_run(p2);
+    ASSERT_EQ(rc, 0);
+    const char *export_error2 = cbm_pipeline_export_error(p2);
+    ASSERT_NOT_NULL(export_error2);
+    ASSERT_TRUE(export_error2[0] == '\0');
+    cbm_pipeline_free(p2);
+
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_adr_survives_full_reindex) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_XXXXXX");
@@ -12094,6 +12159,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
+    RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);

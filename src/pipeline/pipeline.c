@@ -157,6 +157,13 @@ struct cbm_pipeline {
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
 
+    /* Snapshot of the artifact export failure of THIS run (set only by
+     * export_after_publish failure, zeroed at run start, cleared on success).
+     * The MCP layer reads it to attribute a failed run to artifact export
+     * without consulting cbm_artifact_export_last_error() directly — that
+     * global can still hold a PREVIOUS run's error. */
+    char export_error[CBM_SZ_1K];
+
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
     cbm_registry_t *registry;
@@ -302,6 +309,10 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
     }
+}
+
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
+    return p ? p->export_error : "";
 }
 
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
@@ -2497,6 +2508,12 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
         if (rc != 0) {
             const char *err = cbm_artifact_export_last_error();
             cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            /* #1665: snapshot the error of THIS run so the MCP layer can
+             * attribute the failure truthfully, instead of re-reading the
+             * process-global export error (which may describe a previous run)
+             * and instead of the generic "Pipeline failed" hint that blames
+             * repo_path for a write-permission failure. */
+            (void)snprintf(p->export_error, sizeof(p->export_error), "%s", err ? err : "unknown");
         }
         return rc;
     }
@@ -2510,6 +2527,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->export_error[0] = '\0';
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);
