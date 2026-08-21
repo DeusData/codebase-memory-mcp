@@ -1014,6 +1014,94 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     ASSERT_TRUE(event_order);
     PASS();
 }
+
+/* #1760: a hard-killed daemon leaves its socket/anchor/identity publication
+ * behind while every lock is kernel-released. The activation guard used to
+ * treat that residue as an active generation forever ("could not be stopped
+ * safely"); it must now repair the provably-stale publication (no lifetime
+ * reservation, startup lock held) and proceed with the install. */
+TEST(cli_activation_recovers_stale_rendezvous_publication_issue1760) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-activation-stale-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char runtime_parent[512];
+    snprintf(runtime_parent, sizeof(runtime_parent), "%s/runtime", tmpdir);
+    if (test_mkdirp(runtime_parent) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("runtime parent setup failed");
+    }
+    int ready_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready_pipe[0]);
+        cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+        cbm_daemon_ipc_listener_t *listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL;
+        uint8_t result = listener ? 'R' : 'E';
+        (void)write(ready_pipe[1], &result, 1);
+        (void)close(ready_pipe[1]);
+        /* Deliberately bypass listener_close + unlink: the kernel releases the
+         * descriptors and file locks while the current-generation socket
+         * identity stays behind — exactly the hard-kill residue of #1760. */
+        _exit(listener ? 0 : 1);
+    }
+    (void)close(ready_pipe[1]);
+    uint8_t ready = 0;
+    bool child_ready = child > 0 && read(ready_pipe[0], &ready, 1) == 1 && ready == 'R';
+    (void)close(ready_pipe[0]);
+    int child_status = 0;
+    bool child_ok = child > 0 && waitpid(child, &child_status, 0) == child &&
+                    WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
+
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_set_auto_answer_for_test(0);
+    char cache_dir[512];
+    char install_dir[512];
+    char activation_log[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(install_dir, sizeof(install_dir), "%s/custom/bin", tmpdir);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson", cache_dir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_cli_set_activation_runtime_parent_for_test(runtime_parent);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
+    char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
+    int install_rc = child_ready && child_ok ? cli_test_cmd_install(4, install_argv) : -1;
+    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+
+    /* The repair identity must be gone: the endpoint is keyed the same way the
+     * CLI and the daemon derive it, so a fresh endpoint yields the same path. */
+    cbm_daemon_ipc_endpoint_t *probe = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+    const char *socket_address = probe ? cbm_daemon_ipc_endpoint_address(probe) : NULL;
+    struct stat socket_state;
+    errno = 0;
+    bool socket_gone =
+        socket_address && lstat(socket_address, &socket_state) != 0 && errno == ENOENT;
+    if (probe) {
+        cbm_daemon_ipc_endpoint_free(probe);
+    }
+
+    const char *events = read_test_file(activation_log);
+    const char *completed = events ? strstr(events, "\"phase\":\"completed\"") : NULL;
+
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(child_ready);
+    ASSERT_TRUE(child_ok);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(socket_gone);
+    ASSERT_NOT_NULL(completed);
+    PASS();
+}
 #endif
 
 TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
@@ -12967,6 +13055,7 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release);
     RUN_TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup);
+    RUN_TEST(cli_activation_recovers_stale_rendezvous_publication_issue1760);
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
