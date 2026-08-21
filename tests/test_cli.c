@@ -47,6 +47,7 @@
  * tests that exercise --yes. */
 void cbm_set_auto_answer_for_test(int value);
 int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
+char *cbm_project_name_from_path(const char *abs_path);
 int cbm_cli_checksum_manifest_digest(const char *manifest_path, const char *archive_name, char *out,
                                      size_t out_size);
 void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled);
@@ -8132,6 +8133,175 @@ TEST(cli_hook_session_resolves_custom_named_index_by_root_path) {
     PASS();
 }
 
+#ifndef _WIN32
+/* A linked git worktree is indexed as its OWN project, keyed by its checkout
+ * path. The SessionStart hook must return that project for a payload cwd inside
+ * the worktree (or a subdir of it) — never the main checkout's — and the main
+ * checkout's own resolution must be unchanged. Pins the payload-cwd → project
+ * resolution so a worktree can never regress to resolving a sibling checkout or
+ * to nothing (the historical silent-0-bytes worktree bug). */
+TEST(cli_hook_worktree_cwd_resolves_own_indexed_project) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-worktree-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char maindir[512];
+    char wtdir[512];
+    char subdir[600];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(maindir, sizeof(maindir), "%s/checkout-main", tmpdir);
+    snprintf(wtdir, sizeof(wtdir), "%s/checkout-side", tmpdir);
+    snprintf(subdir, sizeof(subdir), "%s/nested", wtdir);
+    test_mkdirp(cache);
+    test_mkdirp(maindir);
+
+    /* A real linked worktree so is_worktree/git_common_dir/canonical_root are
+     * exactly what the hook resolves against in the field. */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "cd \"%s\" && git init -q && git config user.email t@t && git config user.name t && "
+             ": > f.txt && git add f.txt && git commit -qm init && "
+             "git worktree add -q \"%s\" -b agl7branch",
+             maindir, wtdir);
+    if (system(cmd) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("git worktree setup failed");
+    }
+    test_mkdirp(subdir);
+
+    /* Register each checkout as its own indexed project under the exact
+     * path-derived name the indexer uses (the db filename == that name). */
+    char *main_name = cbm_project_name_from_path(maindir);
+    char *wt_name = cbm_project_name_from_path(wtdir);
+    ASSERT_NOT_NULL(main_name);
+    ASSERT_NOT_NULL(wt_name);
+    ASSERT_STR_NEQ(main_name, wt_name);
+    char db_main[900];
+    char db_wt[900];
+    snprintf(db_main, sizeof(db_main), "%s/%s.db", cache, main_name);
+    snprintf(db_wt, sizeof(db_wt), "%s/%s.db", cache, wt_name);
+    cbm_store_t *sm = cbm_store_open_path(db_main);
+    ASSERT_NOT_NULL(sm);
+    ASSERT_EQ(cbm_store_upsert_project(sm, main_name, maindir), CBM_STORE_OK);
+    cbm_store_close(sm);
+    cbm_store_t *sw = cbm_store_open_path(db_wt);
+    ASSERT_NOT_NULL(sw);
+    ASSERT_EQ(cbm_store_upsert_project(sw, wt_name, wtdir), CBM_STORE_OK);
+    cbm_store_close(sw);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* The two names share a prefix but diverge (checkout-main vs checkout-side),
+     * so a bare-name strstr for one never matches the other's context. */
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
+    char *wt_out = cbm_hook_augment_lifecycle_json(input);
+    bool wt_ok = wt_out && strstr(wt_out, wt_name) && strstr(wt_out, "is indexed") &&
+                 !strstr(wt_out, main_name);
+    free(wt_out);
+
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", subdir);
+    char *sub_out = cbm_hook_augment_lifecycle_json(input);
+    bool sub_ok = sub_out && strstr(sub_out, wt_name) && strstr(sub_out, "is indexed");
+    free(sub_out);
+
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             maindir);
+    char *main_out = cbm_hook_augment_lifecycle_json(input);
+    bool main_ok = main_out && strstr(main_out, main_name) && strstr(main_out, "is indexed") &&
+                   !strstr(main_out, wt_name);
+    free(main_out);
+
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    free(main_name);
+    free(wt_name);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
+             maindir, wtdir);
+    (void)system(cmd);
+    test_rmdir_r(tmpdir);
+
+    if (!wt_ok)
+        FAIL("worktree cwd must resolve the worktree's own indexed project");
+    if (!sub_ok)
+        FAIL("a subdir of the worktree must resolve the worktree's own project");
+    if (!main_ok)
+        FAIL("main-checkout resolution must be unchanged and not leak the worktree project");
+    PASS();
+}
+
+/* Completes the payload-cwd matrix (with the indexed-worktree test above and the
+ * deadline/logging contract in cli_hook_augment_deadline_breadcrumb_issue858): a
+ * linked worktree that was never indexed must yield a deliberate, non-empty "no
+ * project matched — run index_repository" notice, never a silent 0-byte reply
+ * that an agent cannot distinguish from "no matches". */
+TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-unindexed-wt-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char maindir[512];
+    char wtdir[512];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(maindir, sizeof(maindir), "%s/checkout-main", tmpdir);
+    snprintf(wtdir, sizeof(wtdir), "%s/checkout-side", tmpdir);
+    test_mkdirp(cache);
+    test_mkdirp(maindir);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "cd \"%s\" && git init -q && git config user.email t@t && git config user.name t && "
+             ": > f.txt && git add f.txt && git commit -qm init && "
+             "git worktree add -q \"%s\" -b agl7unindexed",
+             maindir, wtdir);
+    if (system(cmd) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("git worktree setup failed");
+    }
+
+    /* Index ONLY the main checkout; the worktree is deliberately left out. */
+    char *main_name = cbm_project_name_from_path(maindir);
+    ASSERT_NOT_NULL(main_name);
+    char db_main[900];
+    snprintf(db_main, sizeof(db_main), "%s/%s.db", cache, main_name);
+    cbm_store_t *sm = cbm_store_open_path(db_main);
+    ASSERT_NOT_NULL(sm);
+    ASSERT_EQ(cbm_store_upsert_project(sm, main_name, maindir), CBM_STORE_OK);
+    cbm_store_close(sm);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
+    char *wt_out = cbm_hook_augment_lifecycle_json(input);
+    bool deliberate = wt_out && wt_out[0] && strstr(wt_out, "no indexed graph project matched") &&
+                      !strstr(wt_out, "is indexed");
+    free(wt_out);
+
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             maindir);
+    char *main_out = cbm_hook_augment_lifecycle_json(input);
+    bool main_ok = main_out && strstr(main_out, main_name) && strstr(main_out, "is indexed");
+    free(main_out);
+
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    free(main_name);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
+             maindir, wtdir);
+    (void)system(cmd);
+    test_rmdir_r(tmpdir);
+
+    if (!deliberate)
+        FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
+    if (!main_ok)
+        FAIL("the indexed main checkout must still resolve in the same matrix");
+    PASS();
+}
+#endif
+
 TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-untrusted-project-XXXXXX");
@@ -13167,6 +13337,10 @@ SUITE(cli) {
     RUN_TEST(cli_augment_installs_session_context_and_subagent);
     RUN_TEST(cli_augment_session_uses_workspace_roots);
     RUN_TEST(cli_hook_session_resolves_custom_named_index_by_root_path);
+#ifndef _WIN32
+    RUN_TEST(cli_hook_worktree_cwd_resolves_own_indexed_project);
+    RUN_TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent);
+#endif
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);
     RUN_TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands);
