@@ -102,18 +102,6 @@ static const char *itoa_buf(int v) {
     return buf[idx];
 }
 
-/* ── Platform-portable mtime_ns ──────────────────────────────────── */
-
-static int64_t stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * CBM_NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 static const char *incr_mode_name(int mode) {
     switch (mode) {
     case CBM_MODE_FULL:
@@ -683,14 +671,20 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        struct stat st;
-        if (stat(files[i].path, &st) != 0) {
+        /* #1714: compare against the SAME source the hash writer used. The
+         * manifest hash is written from cbm_path_info_utf8 (see
+         * semantic_manifest_hash_file), so a stat()-based comparison is
+         * internally inconsistent: on Windows stat() truncates mtime to
+         * seconds while the recorded value carries FILETIME nanoseconds, which
+         * made every file look changed on each incremental pass. */
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(files[i].path, &info) != 0) {
             changed[i] = true;
             n_changed++;
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (info.mtime_ns != h->mtime_ns || info.size != h->size) {
             changed[i] = true;
             n_changed++;
         } else {
