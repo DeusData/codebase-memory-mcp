@@ -351,6 +351,51 @@ TEST(extract_cfml_tag_issue38) {
     PASS();
 }
 
+/* --- CFML tag dialect: script functions inside a <cfscript> block of a tag
+ * component. The HTML-derived cfml grammar keeps the <cfscript> body as an
+ * opaque cf_script_content token, so these functions only surface once the
+ * block is re-parsed with the cfscript grammar (cbm_extract_embedded_defs).
+ * Also asserts the block-relative line numbers are remapped back to host-file
+ * lines, and that a leading <cfsetting> void tag (which cascades ERROR nodes in
+ * the cfml grammar) does not prevent recovery of the functions. --- */
+TEST(extract_cfml_embedded_cfscript_defs) {
+    /* Source layout (1-based lines): 1 <cfcomponent>, 2 <cfsetting>, 3 <cfscript>,
+     * 4 greet(), 7 addTwo(), 10 </cfscript>, 11 <cffunction tagPing>, 14 close. */
+    CBMFileResult *r = extract("<cfcomponent>\n"
+                               "<cfsetting requesttimeout=\"10\">\n"
+                               "<cfscript>\n"
+                               "    public string function greet(string who) {\n"
+                               "        return \"hi \" & who;\n"
+                               "    }\n"
+                               "    private numeric function addTwo(numeric a) {\n"
+                               "        return a + 2;\n"
+                               "    }\n"
+                               "</cfscript>\n"
+                               "<cffunction name=\"tagPing\" returntype=\"string\">\n"
+                               "    <cfreturn \"pong\">\n"
+                               "</cffunction>\n"
+                               "</cfcomponent>\n",
+                               CBM_LANG_CFML, "app", "Service.cfc");
+    ASSERT_NOT_NULL(r);
+    /* Script functions inside <cfscript> are recovered ... */
+    ASSERT(has_def(r, "Function", "greet"));
+    ASSERT(has_def(r, "Function", "addTwo"));
+    /* ... alongside the tag-dialect <cffunction> in the same component. */
+    ASSERT(has_def(r, "Function", "tagPing"));
+    /* Line numbers are remapped from block-relative back to host-file lines. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Function") == 0 && strcmp(d->name, "greet") == 0) {
+            ASSERT(d->start_line == 4);
+        }
+        if (strcmp(d->label, "Function") == 0 && strcmp(d->name, "addTwo") == 0) {
+            ASSERT(d->start_line == 7);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Helm / Go template: named templates + include calls (#338) --- */
 TEST(extract_helm_templates_issue338) {
     CBMFileResult *r = extract("{{- define \"chart.fullname\" -}}\n"
@@ -1605,14 +1650,13 @@ TEST(cpp_function) {
  * node when multiple tests share a file. Each must mint a distinct Function
  * node whose name encodes the suite and case arguments. */
 TEST(cpp_gtest_same_name_collision_issue1266) {
-    CBMFileResult *r = extract(
-        "namespace demo { int assembleWidget(int s) { return s * 2; } }\n"
-        "TEST(WidgetSuite, DoublesSmallSize) { demo::assembleWidget(1); }\n"
-        "TEST(WidgetSuite, DoublesZero) { demo::assembleWidget(0); }\n"
-        "TEST(WidgetSuite, DoublesLargeSize) {\n"
-        "  demo::assembleWidget(1000);\n"
-        "}\n",
-        CBM_LANG_CPP, "t", "direct_test.cpp");
+    CBMFileResult *r = extract("namespace demo { int assembleWidget(int s) { return s * 2; } }\n"
+                               "TEST(WidgetSuite, DoublesSmallSize) { demo::assembleWidget(1); }\n"
+                               "TEST(WidgetSuite, DoublesZero) { demo::assembleWidget(0); }\n"
+                               "TEST(WidgetSuite, DoublesLargeSize) {\n"
+                               "  demo::assembleWidget(1000);\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "direct_test.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesSmallSize"));
     ASSERT(has_def(r, "Function", "TEST_WidgetSuite_DoublesZero"));
@@ -1624,10 +1668,9 @@ TEST(cpp_gtest_same_name_collision_issue1266) {
 
 /* #1266: TEST_F fixture macro also produces unique names. */
 TEST(cpp_gtest_f_unique_name_issue1266) {
-    CBMFileResult *r = extract(
-        "TEST_F(MyFixture, FirstTest) { doStuff(); }\n"
-        "TEST_F(MyFixture, SecondTest) { doOtherStuff(); }\n",
-        CBM_LANG_CPP, "t", "fixture_test.cpp");
+    CBMFileResult *r = extract("TEST_F(MyFixture, FirstTest) { doStuff(); }\n"
+                               "TEST_F(MyFixture, SecondTest) { doOtherStuff(); }\n",
+                               CBM_LANG_CPP, "t", "fixture_test.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Function", "TEST_F_MyFixture_FirstTest"));
     ASSERT(has_def(r, "Function", "TEST_F_MyFixture_SecondTest"));
@@ -3353,9 +3396,9 @@ TEST(extract_ts_decorators_survive_interleaved_comment) {
     ASSERT_FALSE(r->has_error);
     const CBMDefinition *m = find_def_by_name(r, "login");
     ASSERT_NOT_NULL(m);
-    ASSERT(decorators_contain(m, "Throttle"));  /* below the comment — always worked */
-    ASSERT(decorators_contain(m, "HttpCode"));  /* above the comment — was dropped */
-    ASSERT(decorators_contain(m, "Post"));      /* above the comment — was dropped */
+    ASSERT(decorators_contain(m, "Throttle")); /* below the comment — always worked */
+    ASSERT(decorators_contain(m, "HttpCode")); /* above the comment — was dropped */
+    ASSERT(decorators_contain(m, "Post"));     /* above the comment — was dropped */
     cbm_free_result(r);
     PASS();
 }
@@ -3450,7 +3493,6 @@ TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
     cbm_free_result(r);
     PASS();
 }
-
 
 /* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
  * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
@@ -5551,6 +5593,7 @@ SUITE(extraction) {
     RUN_TEST(extract_qml_issue42);
     RUN_TEST(extract_cfscript_issue38);
     RUN_TEST(extract_cfml_tag_issue38);
+    RUN_TEST(extract_cfml_embedded_cfscript_defs);
     RUN_TEST(extract_helm_templates_issue338);
     RUN_TEST(extract_helm_values_toplevel_issue338);
 

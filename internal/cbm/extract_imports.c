@@ -1476,6 +1476,78 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
     }
 }
 
+// Re-parse embedded script blocks flagged extract_definitions in embedded_imports
+// and walk them for DEFINITIONS, not imports. Mirrors parse_embedded_imports but
+// runs cbm_extract_definitions_body on each inner AST. Because the inner tree is
+// parsed from a slice starting at the block, its node rows are block-relative;
+// after extracting, we shift the newly-added definitions' line numbers by the
+// block's start row so they map back to the host file. CBMDefinition carries
+// only line positions (no byte offsets), so a constant row shift is a complete
+// remap. Definitions only — calls/usages inside the block are intentionally not
+// walked here (they would need byte remapping too and could pollute the call
+// graph), so this cannot corrupt existing edges.
+void cbm_extract_embedded_defs(CBMExtractCtx *ctx) {
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    if (!spec || !spec->embedded_imports) {
+        return;
+    }
+    for (const CBMEmbeddedLangSpec *e = spec->embedded_imports; e->script_node_type != NULL; e++) {
+        if (!e->extract_definitions) {
+            continue; /* this embedded block is walked for imports only */
+        }
+        const TSLanguage *embedded_lang = cbm_ts_language(e->embedded_language);
+        if (!embedded_lang) {
+            continue; /* embedded grammar not linked in — silently skip */
+        }
+        enum { MAX_EMBEDDED_BLOCKS = 64 };
+        TSNode hits[MAX_EMBEDDED_BLOCKS];
+        int hit_count = 0;
+        embedded_collect_content_nodes(ctx->root, e, hits, &hit_count, MAX_EMBEDDED_BLOCKS);
+        if (hit_count == 0) {
+            continue;
+        }
+        TSParser *parser = ts_parser_new();
+        if (!parser) {
+            continue;
+        }
+        if (!ts_parser_set_language(parser, embedded_lang)) {
+            ts_parser_delete(parser);
+            continue;
+        }
+        for (int i = 0; i < hit_count; i++) {
+            uint32_t s = ts_node_start_byte(hits[i]);
+            uint32_t end = ts_node_end_byte(hits[i]);
+            if (end <= s) {
+                continue;
+            }
+            const char *sub_src = ctx->source + s;
+            uint32_t sub_len = end - s;
+            TSTree *sub_tree = ts_parser_parse_string(parser, NULL, sub_src, sub_len);
+            if (!sub_tree) {
+                continue;
+            }
+            CBMExtractCtx sub_ctx = *ctx;
+            sub_ctx.source = sub_src;
+            sub_ctx.source_len = (int)sub_len;
+            sub_ctx.language = e->embedded_language;
+            sub_ctx.root = ts_tree_root_node(sub_tree);
+
+            int defs_before = ctx->result->defs.count;
+            cbm_extract_definitions_body(&sub_ctx);
+
+            /* Shift block-relative line numbers back to host-file lines. */
+            uint32_t row0 = ts_node_start_point(hits[i]).row;
+            for (int j = defs_before; j < ctx->result->defs.count; j++) {
+                CBMDefinition *d = &ctx->result->defs.items[j];
+                d->start_line += row0;
+                d->end_line += row0;
+            }
+            ts_tree_delete(sub_tree);
+        }
+        ts_parser_delete(parser);
+    }
+}
+
 // --- Namespace / package declaration capture ---
 // Java/Kotlin/C#/PHP put the file's symbols inside a namespace/package whose
 // name is NOT reflected in the path-based QN scheme.  Capturing it lets the
