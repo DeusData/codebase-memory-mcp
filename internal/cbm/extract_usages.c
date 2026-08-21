@@ -374,6 +374,7 @@ typedef enum {
     CBM_OCCURRENCE_VHDL_INTERFACE,
     CBM_OCCURRENCE_PINE_FUNCTION,
     CBM_OCCURRENCE_LLVM_FUNCTION,
+    CBM_OCCURRENCE_PKL_DECLARATION,
 } CBMOccurrencePolicy;
 
 typedef struct {
@@ -492,6 +493,7 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_PINE] = {NULL, NULL, CBM_OCCURRENCE_PINE_FUNCTION, false},
     [CBM_LANG_PUPPET] = {NULL, NULL, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_LLVM_IR] = {llvm_binding_nodes, NULL, CBM_OCCURRENCE_LLVM_FUNCTION, false},
+    [CBM_LANG_PKL] = {NULL, NULL, CBM_OCCURRENCE_PKL_DECLARATION, false},
     [CBM_LANG_MESON] = {NULL, meson_write_nodes, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_GN] = {NULL, gn_write_nodes, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_LINKERSCRIPT] = {NULL, linkerscript_write_nodes, CBM_OCCURRENCE_STANDARD, true},
@@ -985,6 +987,30 @@ static bool is_pine_function_binding(TSNode node) {
     return ancestor_field_binds(node, "function_declaration_statement", fields);
 }
 
+/* Pkl declares names positionally: no production labels the declared identifier
+ * with a `name` field, so the generic declared-container rule never binds them
+ * and every method name, parameter name, and property name would be re-emitted
+ * as an ordinary read of itself. Each container below holds its declared name
+ * as named child 0; annotations, defaults, and bodies follow it and stay reads.
+ * Resolve against the NEAREST container so a nested declaration's own name is
+ * the only occurrence its parent can bind. */
+static bool is_pkl_declaration_binding(TSNode node) {
+    static const char *const declaration_kinds[] = {"methodHeader",
+                                                    "typedIdentifier",
+                                                    "classProperty",
+                                                    "objectProperty",
+                                                    "clazz",
+                                                    "typeAlias",
+                                                    NULL};
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (kind_in_exact_set(ts_node_type(parent), declaration_kinds)) {
+            return named_child_contains(parent, 0, node);
+        }
+    }
+    return false;
+}
+
 static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
                               const CBMOccurrenceSpec *occurrence) {
     switch (occurrence->policy) {
@@ -1041,6 +1067,8 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
         return is_vhdl_interface_binding(node);
     case CBM_OCCURRENCE_PINE_FUNCTION:
         return is_pine_function_binding(node);
+    case CBM_OCCURRENCE_PKL_DECLARATION:
+        return is_pkl_declaration_binding(node);
     case CBM_OCCURRENCE_LLVM_FUNCTION:
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {

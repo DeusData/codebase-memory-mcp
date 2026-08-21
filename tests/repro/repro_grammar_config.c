@@ -45,7 +45,8 @@
  *   6. calls-extracted  : inv_has_call(r, callee) == 1.
  *                         Only asserted for languages that have non-empty
  *                         call_types: HCL (function_call), NICKEL (infix_expr),
- *                         JSONNET (functioncall), STARLARK (call).
+ *                         JSONNET (functioncall), STARLARK (call),
+ *                         PKL (unqualified/qualifiedAccessExpr, newExpr).
  *
  * FULL-PIPELINE (rh_index_files -> cbm_store_t*, via inv_count_* store helpers):
  *   7. callable-sourcing : inv_count_calls_by_source(store,project,&mod,&call).
@@ -85,11 +86,15 @@
  *                 Dims 1-5 ("Class"). No calls.
  *   XML        -- class_types = element -> "Class". Dims 1-5 ("Class"). No calls.
  *   PROPERTIES -- var_types = property -> "Variable". Dims 1-5 ("Variable"). No calls.
- *   PKL        -- func_types = classMethod/objectMethod -> "Function";
- *                 class_types = clazz -> "Class"; var_types = classProperty/objectProperty.
- *                 call_types = empty_types. Dims 1-5 ("Function", "Class"). No call dim.
  *
  * LANGUAGES WITH CALLABLES (dims 1-6 + R, and pipeline dims 7-8 where applicable):
+ *   PKL        -- func_types = classMethod/objectMethod -> "Function";
+ *                 class_types = clazz/typeAlias -> "Class";
+ *                 var_types = classProperty/objectProperty;
+ *                 call_types = unqualifiedAccessExpr/qualifiedAccessExpr/newExpr.
+ *                 Dims 1-8. The access-expr call types double as property reads,
+ *                 so extract_pkl_callee gates them on an `argumentList` child;
+ *                 the test adds an inline negative assertion for that gate.
  *   HCL        -- class_types = block -> "Class"; var_types = attribute;
  *                 call_types = function_call. Dims 1-6. No func_types so no pipeline
  *                 dim 7 (calls would be module-sourced with no Function anchor).
@@ -766,39 +771,72 @@ TEST(repro_grammar_config_ron) {
 
 /* ── PKL ──────────────────────────────────────────────────────────────────────
  * Idiomatic PKL (Apple Pkl) module with a class definition
- * (pkl_class_types = {"clazz"} -> "Class"), a method inside it
+ * (pkl_class_types = {"clazz", "typeAlias"} -> "Class"), methods inside it
  * (pkl_func_types = {"classMethod", "objectMethod"} -> "Function"), and
  * class properties (pkl_var_types = {"classProperty", "objectProperty"}).
- * pkl_call_types = empty_types so no call extraction occurs.
+ * pkl_call_types = {"unqualifiedAccessExpr", "qualifiedAccessExpr", "newExpr"}.
  *
- * Dims asserted: 1-5 + R ("Class" for the class def, "Function" for the method).
- * Dims 6-8 SKIPPED: call_types = empty_types in spec.
- * Expected GREEN: dims 1-5. Dim 5 RED would indicate clazz->Class or
- * classMethod->Function mapping is broken in the PKL grammar walker.
+ * Dims asserted: 1-8 (full battery) + R.
+ * Dim 6 GREEN: `makeUrl(host, port)` inside url() extracts callee "makeUrl".
+ * Dim 7 GREEN: every call site in the fixture is inside a classMethod body, so
+ *   no CALLS edge is Module-sourced. (Real-world Pkl does call at module level;
+ *   the fixture deliberately avoids it because dim 7 treats Module-sourced
+ *   in-body calls as the enclosing-func gap.)
+ * Dim 8 GREEN: makeUrl and Server are both defined in-file, so neither the
+ *   unqualified call nor the newExpr constructor edge dangles.
+ *
+ * PKL-SPECIFIC REGRESSION (asserted inline below): `unqualifiedAccessExpr` and
+ * `qualifiedAccessExpr` are the same node for a call and for a bare property
+ * read, so the interpolated `host` / `port` reads inside makeUrl must NOT be
+ * emitted as CALLS. extract_pkl_callee gates on an `argumentList` child; without
+ * that gate every property read in every Pkl file becomes a call edge.
  */
 TEST(repro_grammar_config_pkl) {
     static const char src[] =
         "module cbm.Config\n"
         "\n"
-        "function makeUrl(host: String, port: Int): String = \"http://\\(host):\\(port)\"\n"
+        "typealias Port = Int\n"
+        "\n"
+        "function makeUrl(host: String, port: Port): String = \"http://\\(host):\\(port)\"\n"
         "\n"
         "class Server {\n"
         "  host: String = \"localhost\"\n"
-        "  port: Int = 8080\n"
+        "  port: Port = 8080\n"
         "  tls: Boolean = false\n"
         "\n"
-        "  function url(): String = \"http://\\(host):\\(port)\"\n"
-        "}\n"
+        "  function url(): String = makeUrl(host, port)\n"
         "\n"
-        "server = new Server {\n"
-        "  host = \"0.0.0.0\"\n"
-        "  port = 9000\n"
+        "  function clone(): Server = new Server { host = host }\n"
         "}\n";
     static const char bad[] = "module cbm.Config\nclass Server {\n  host:";
-    if (config_struct_battery("PKL", src, CBM_LANG_PKL, "config.pkl",
-                              "Class", "Function") != 0)
+    if (config_callable_battery("PKL", src, CBM_LANG_PKL, "config.pkl",
+                                "Function", "makeUrl") != 0)
         return 1;
-    return config_robustness("PKL", bad, CBM_LANG_PKL, "config.pkl");
+
+    /* Bare property reads must not be calls (see PKL-SPECIFIC REGRESSION above). */
+    CBMFileResult *pr = inv_rx(src, CBM_LANG_PKL, "config.pkl");
+    if (!pr) {
+        printf("  %sFAIL%s  [PKL] inv_rx returned NULL\n", tf_red(), tf_reset());
+        return 1;
+    }
+    int bogus = 0;
+    for (int i = 0; i < pr->calls.count; i++) {
+        const char *cn = pr->calls.items[i].callee_name;
+        if (cn && (strcmp(cn, "host") == 0 || strcmp(cn, "port") == 0 ||
+                   strcmp(cn, "tls") == 0)) {
+            bogus++;
+        }
+    }
+    cbm_free_result(pr);
+    if (bogus != 0) {
+        printf("  %sFAIL%s  [PKL] property-read-not-call: %d bare property read(s) "
+               "emitted as a CALLS edge\n", tf_red(), tf_reset(), bogus);
+        return 1;
+    }
+
+    if (config_robustness("PKL", bad, CBM_LANG_PKL, "config.pkl") != 0)
+        return 1;
+    return config_pipeline_battery("PKL", "config.pkl", src);
 }
 
 /* ── NICKEL ───────────────────────────────────────────────────────────────────

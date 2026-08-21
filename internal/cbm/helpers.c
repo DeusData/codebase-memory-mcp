@@ -578,29 +578,14 @@ int cbm_count_branching(TSNode node, const char **branching_types) {
 
 // Loop node-type names across tree-sitter grammars, for loop-nesting depth.
 bool cbm_is_loop_node_type(const char *kind) {
-    static const char *const loops[] = {"for_statement",
-                                        "while_statement",
-                                        "do_statement",
-                                        "do_while_statement",
-                                        "for_in_statement",
-                                        "for_of_statement",
-                                        "for_each_statement",
-                                        "foreach_statement",
-                                        "enhanced_for_statement",
-                                        "for_range_loop",
-                                        "c_style_for_statement",
-                                        "for_expression",
-                                        "while_expression",
-                                        "loop_expression",
-                                        "while_let_expression",
-                                        "repeat_statement",
-                                        "repeat_while_statement",
-                                        "until",
-                                        "while_modifier",
-                                        "until_modifier",
-                                        "for",
-                                        "while",
-                                        NULL};
+    static const char *const loops[] = {
+        "for_statement", "while_statement", "do_statement", "do_while_statement",
+        "for_in_statement", "for_of_statement", "for_each_statement", "foreach_statement",
+        "enhanced_for_statement", "for_range_loop", "c_style_for_statement", "for_expression",
+        "while_expression", "loop_expression", "while_let_expression", "repeat_statement",
+        "repeat_while_statement",
+        // Pkl: `for (x in xs) { ... }` inside an object body.
+        "forGenerator", "until", "while_modifier", "until_modifier", "for", "while", NULL};
     for (const char *const *l = loops; *l; l++) {
         if (strcmp(kind, *l) == 0) {
             return true;
