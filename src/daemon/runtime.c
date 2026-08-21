@@ -2923,12 +2923,15 @@ cbm_daemon_runtime_cancel_result_t cbm_daemon_runtime_client_application_cancel(
 cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_request_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const void *request, uint32_t request_length, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms) {
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms) {
     if (response_out) {
         *response_out = NULL;
     }
     if (response_length_out) {
         *response_length_out = 0;
+    }
+    if (request_sent_out) {
+        *request_sent_out = false;
     }
     if (!client || !response_out || !response_length_out ||
         request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID ||
@@ -2985,6 +2988,9 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
         request_can_send && cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
                                                       CBM_DAEMON_RUNTIME_OP_APPLICATION_REQUEST,
                                                       wire, (uint32_t)wire_length);
+    if (request_sent_out) {
+        *request_sent_out = sent;
+    }
     bool send_cancel = false;
     cbm_mutex_lock(&client->state_mutex);
     client->application_request_sent = sent;
@@ -3083,9 +3089,9 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
     if (!cbm_daemon_runtime_client_application_token_reserve(client, &request_token)) {
         return CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
     }
-    return cbm_daemon_runtime_client_application_request_tagged(client, request_token, request,
-                                                                request_length, response_out,
-                                                                response_length_out, timeout_ms);
+    return cbm_daemon_runtime_client_application_request_tagged(
+        client, request_token, request, request_length, response_out, response_length_out, NULL,
+        timeout_ms);
 }
 
 bool cbm_daemon_runtime_client_close_begin(cbm_daemon_runtime_client_t *client) {

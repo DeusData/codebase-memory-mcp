@@ -4,13 +4,28 @@
 #ifndef CBM_DAEMON_FRONTEND_H
 #define CBM_DAEMON_FRONTEND_H
 
+#include "daemon/bootstrap.h"
 #include "daemon/runtime.h"
 #include "daemon/version_cohort.h"
+#include "mcp/mcp.h"
 
 #include <stdbool.h>
 #include <stdio.h>
 
 typedef struct cbm_daemon_maintenance_monitor cbm_daemon_maintenance_monitor_t;
+
+/* Everything the stdio frontend must replay when its authenticated daemon
+ * connection is replaced. Pointer fields are borrowed for the complete
+ * frontend call. */
+typedef struct {
+    cbm_daemon_bootstrap_config_t bootstrap;
+    const char *session_root;
+    const char *allowed_root;
+    cbm_mcp_tool_profile_t tool_profile;
+    uint8_t ui_update_mask;
+    bool ui_enabled;
+    int ui_port;
+} cbm_daemon_frontend_session_config_t;
 
 /* Called once when install/update/uninstall requests an active local command
  * to stop cooperatively. Returning false does not authorize the command to
@@ -48,9 +63,12 @@ bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **moni
  * either thread is blocked in stdio, requests cooperative cancellation for the
  * exact active request, and then bounds process exit. Kernel IPC close cancels
  * only this session's daemon work. EOF/parse failure closes the authenticated
- * session. An unexpected daemon transport failure likewise terminates the
+ * session. A transport failure before the application frame is sent replaces
+ * the daemon client and retries once. Sent or repeated failures terminate the
  * process so an agent waiting with stdin still open observes server EOF. */
 int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
-                                cbm_version_cohort_manager_t *cohort_manager, FILE *in, FILE *out);
+                                cbm_version_cohort_manager_t *cohort_manager,
+                                const cbm_daemon_frontend_session_config_t *session, FILE *in,
+                                FILE *out);
 
 #endif /* CBM_DAEMON_FRONTEND_H */

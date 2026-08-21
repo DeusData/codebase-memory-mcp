@@ -386,11 +386,12 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
 
 /* Execute using the sole outstanding token returned by token_reserve(). This
  * is the cancellable frontend path; the legacy helper above reserves
- * internally. */
+ * internally. request_sent_out reports whether the application frame crossed
+ * the local transport, including failures while awaiting its response. */
 cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_request_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const void *request, uint32_t request_length, uint8_t **response_out,
-    uint32_t *response_length_out, uint32_t timeout_ms);
+    uint32_t *response_length_out, bool *request_sent_out, uint32_t timeout_ms);
 
 /* Begin a two-phase close without freeing the client. This atomically rejects
  * future exchanges and interrupts an exchange already in flight. Exactly one
