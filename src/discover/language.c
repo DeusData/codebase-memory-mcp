@@ -204,6 +204,19 @@ static const ext_entry_t EXT_TABLE[] = {
     /* PHP */
     {".php", CBM_LANG_PHP},
 
+    /* Oracle PL/SQL (do not map .sql — stays generic SQL; .prc stays FORM) */
+    {".pks", CBM_LANG_PLSQL},
+    {".pkb", CBM_LANG_PLSQL},
+    {".pck", CBM_LANG_PLSQL},
+    {".pls", CBM_LANG_PLSQL},
+    {".plb", CBM_LANG_PLSQL},
+    {".plsql", CBM_LANG_PLSQL},
+    {".fnc", CBM_LANG_PLSQL},
+    {".trg", CBM_LANG_PLSQL},
+    {".bdy", CBM_LANG_PLSQL},
+    {".tps", CBM_LANG_PLSQL},
+    {".tpb", CBM_LANG_PLSQL},
+
     /* Protobuf */
     {".proto", CBM_LANG_PROTOBUF},
 
@@ -850,6 +863,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
+    [CBM_LANG_PLSQL] = "PL/SQL",
 
 };
 
