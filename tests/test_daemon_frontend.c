@@ -231,6 +231,9 @@ enum {
      * dev machine (see the index-supervisor calibration). */
     FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS = 30000,
     FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S = 90,
+    /* Recovery can spend most of the generic guard restarting an instrumented
+     * daemon before the clean-EOF case enters its deliberate 15s drain. */
+    FRONTEND_RECOVERY_TEST_CATASTROPHIC_TIMEOUT_S = 120,
     FRONTEND_BACKPRESSURE_MESSAGE_BYTES = 2 * 1024 * 1024,
     FRONTEND_BACKPRESSURE_FRONTEND_TIMEOUT_S = 90,
     FRONTEND_BACKPRESSURE_DAEMON_TIMEOUT_S = 90,
@@ -764,7 +767,7 @@ static bool frontend_eof_run_isolated(const char *tag, bool overflow) {
 }
 
 static int frontend_recovery_child_run(const char *parent, frontend_recovery_mode_t recovery_mode) {
-    (void)alarm(FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S);
+    (void)alarm(FRONTEND_RECOVERY_TEST_CATASTROPHIC_TIMEOUT_S);
     frontend_eof_fixture_t fixture;
     if (!frontend_eof_fixture_start(&fixture, parent)) {
         (void)frontend_eof_fixture_finish(&fixture);
