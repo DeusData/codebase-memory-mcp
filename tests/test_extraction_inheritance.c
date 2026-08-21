@@ -31,6 +31,10 @@
  *     C++     — extraction is correct (regression guards).
  *     Rust    — impl_traits array (not base_classes) is the capture point; Rust
  *               rows verify impl_traits entries for `impl Trait for Struct`.
+ *     Ruby    — green as of the fix that accompanies these rows: the
+ *               `superclass` wrapper's `constant` / `scope_resolution` child is
+ *               now matched, so `class C < Base` no longer falls through to the
+ *               raw-text fallback and stores "< Base".
  *
  * STRUCTURE
  * ─────────
@@ -1659,6 +1663,69 @@ TEST(inherit_rust_impls) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * RUBY  (expected: GREEN — regression guards for the fix in this PR)
+ *
+ * Root cause fixed here: tree-sitter-ruby wraps `class C < Base` in a
+ * `superclass` node whose child is a `constant` (or `scope_resolution`
+ * for `A::B`).  collect_bases_from_field() matched neither, so the
+ * raw-text fallback stored the whole field text "< Base" — operator
+ * included — and a base name spelled that way never resolves, so Ruby
+ * subclasses produced zero INHERITS edges.
+ *
+ * Every row therefore also asserts "<" never appears inside a captured
+ * base name: that substring IS the bug's signature.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static const inherit_case_t ruby_cases[] = {
+    /* ── single bare-constant superclass ────────────────────────── */
+    {CBM_LANG_RUBY,
+     "m.rb",
+     "class Animal\nend\n\nclass Dog < Animal\nend\n",
+     "Dog",
+     {"Animal", NULL},
+     {"<", NULL},
+     1},
+    /* ── scope-resolved superclass (A::B) ───────────────────────── */
+    {CBM_LANG_RUBY,
+     "m.rb",
+     "class ApplicationRecord < ActiveRecord::Base\nend\n",
+     "ApplicationRecord",
+     {"ActiveRecord::Base", NULL},
+     {"<", NULL},
+     1},
+    /* ── the Rails chain's second link (bare, resolves to the above) ─ */
+    {CBM_LANG_RUBY,
+     "m.rb",
+     "class ApplicationRecord < ActiveRecord::Base\nend\n"
+     "class User < ApplicationRecord\nend\n",
+     "User",
+     {"ApplicationRecord", NULL},
+     {"<", NULL},
+     1},
+    /* ── subclass declared inside a module body ─────────────────── */
+    {CBM_LANG_RUBY,
+     "m.rb",
+     "class Base\nend\n\nmodule Admin\n  class Panel < Base\n  end\nend\n",
+     "Panel",
+     {"Base", NULL},
+     {"<", NULL},
+     1},
+    /* ── exception subclass (stdlib superclass) ─────────────────── */
+    {CBM_LANG_RUBY,
+     "m.rb",
+     "class AppError < StandardError\nend\n",
+     "AppError",
+     {"StandardError", NULL},
+     {"<", NULL},
+     1},
+};
+
+TEST(inherit_ruby) {
+    RUN_CASES(ruby_cases);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * SUITE declaration
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -1668,6 +1735,7 @@ SUITE(extraction_inheritance) {
     RUN_TEST(inherit_csharp);
     RUN_TEST(inherit_cpp);
     RUN_TEST(inherit_rust_impls);
+    RUN_TEST(inherit_ruby);
 
     /* Languages expected RED (broken extractors — reproduce-first) */
     RUN_TEST(inherit_python); /* RED: identifier-node not matched in collect_bases_from_field */
