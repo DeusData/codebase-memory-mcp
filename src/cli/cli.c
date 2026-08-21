@@ -7433,7 +7433,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a, const char *ho
  * behavior (it is the same code path with mutations disabled). */
 typedef struct {
     char agent[CLI_BUF_32];
-    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook */
+    char kind[CLI_BUF_32]; /* mcp_config | instructions | skill | cleanup_skill | hook */
     char path[CLI_BUF_1K];
 } cbm_plan_entry_t;
 
@@ -7446,6 +7446,7 @@ typedef struct {
 static cbm_install_plan_t *g_install_plan = NULL;
 static int g_agent_install_errors = 0;
 static int g_agent_uninstall_errors = 0;
+static char g_blocked_shared_skill_dir[CLI_BUF_1K];
 
 static void plan_record(const char *agent, const char *kind, const char *path) {
     if (!g_install_plan || !path || !path[0]) {
@@ -7815,12 +7816,286 @@ static void install_agent_skill(const char *label, const char *skills_dir, bool 
     if (written < 0 || (size_t)written >= sizeof(skill_path)) {
         return;
     }
+    if (g_blocked_shared_skill_dir[0] &&
+        (cbm_json_mcp_paths_equal(skills_dir, g_blocked_shared_skill_dir) ||
+         cbm_same_file(skills_dir, g_blocked_shared_skill_dir))) {
+        if (!g_install_plan) {
+            printf("  skill: %s (skipped to avoid a duplicate Codex skill)\n", skill_path);
+        }
+        return;
+    }
     if (g_install_plan) {
         plan_record(label, "skill", skill_path);
         return;
     }
     int installed = cbm_install_skills(skills_dir, force, dry_run);
     printf("  skill: %s (%d installed)\n", skill_path, installed);
+}
+
+typedef enum {
+    CBM_CODEX_SKILL_ABSENT,
+    CBM_CODEX_SKILL_MANAGED,
+    CBM_CODEX_SKILL_UNOWNED,
+    CBM_CODEX_SKILL_UNSAFE,
+} cbm_codex_skill_state_t;
+
+typedef struct {
+    char canonical_dir[CLI_BUF_1K];
+    char legacy_dir[CLI_BUF_1K];
+    char canonical_file[CLI_BUF_1K];
+    char legacy_file[CLI_BUF_1K];
+    bool same_dir;
+} cbm_codex_skill_paths_t;
+
+static bool cbm_codex_skill_paths_init(const char *home, const char *config_dir,
+                                       cbm_codex_skill_paths_t *paths) {
+    if (!home || !home[0] || !config_dir || !config_dir[0] || !paths) {
+        return false;
+    }
+    memset(paths, 0, sizeof(*paths));
+    int canonical_dir =
+        snprintf(paths->canonical_dir, sizeof(paths->canonical_dir), "%s/.agents/skills", home);
+    int legacy_dir =
+        snprintf(paths->legacy_dir, sizeof(paths->legacy_dir), "%s/skills", config_dir);
+    int canonical_file = snprintf(paths->canonical_file, sizeof(paths->canonical_file),
+                                  "%s/codebase-memory/SKILL.md", paths->canonical_dir);
+    int legacy_file = snprintf(paths->legacy_file, sizeof(paths->legacy_file),
+                               "%s/codebase-memory/SKILL.md", paths->legacy_dir);
+    if (canonical_dir < 0 || (size_t)canonical_dir >= sizeof(paths->canonical_dir) ||
+        legacy_dir < 0 || (size_t)legacy_dir >= sizeof(paths->legacy_dir) || canonical_file < 0 ||
+        (size_t)canonical_file >= sizeof(paths->canonical_file) || legacy_file < 0 ||
+        (size_t)legacy_file >= sizeof(paths->legacy_file)) {
+        return false;
+    }
+    paths->same_dir = cbm_json_mcp_paths_equal(paths->canonical_dir, paths->legacy_dir) ||
+                      cbm_same_file(paths->canonical_dir, paths->legacy_dir);
+    return true;
+}
+
+static cbm_codex_skill_state_t cbm_codex_skill_state(const char *skills_dir,
+                                                     const char *skill_file) {
+    char skill_dir[CLI_BUF_1K];
+    int written = snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+    if (written < 0 || (size_t)written >= sizeof(skill_dir)) {
+        return CBM_CODEX_SKILL_UNSAFE;
+    }
+
+    struct stat state;
+    errno = 0;
+#ifndef _WIN32
+    int result = lstat(skill_dir, &state);
+#else
+    int result = stat(skill_dir, &state);
+#endif
+    if (result != 0) {
+        return errno == ENOENT ? CBM_CODEX_SKILL_ABSENT : CBM_CODEX_SKILL_UNSAFE;
+    }
+    if (!S_ISDIR(state.st_mode)) {
+        return CBM_CODEX_SKILL_UNSAFE;
+    }
+
+    errno = 0;
+#ifndef _WIN32
+    result = lstat(skill_file, &state);
+#else
+    result = stat(skill_file, &state);
+#endif
+    if (result != 0) {
+        return errno == ENOENT ? CBM_CODEX_SKILL_ABSENT : CBM_CODEX_SKILL_UNSAFE;
+    }
+    if (!S_ISREG(state.st_mode)) {
+        return CBM_CODEX_SKILL_UNSAFE;
+    }
+
+    int ownership = cbm_text_owned_document_status(skill_file, skill_content, NULL, 0);
+    if (ownership == CLI_OK) {
+        return CBM_CODEX_SKILL_MANAGED;
+    }
+    return ownership == CLI_TRUE ? CBM_CODEX_SKILL_UNOWNED : CBM_CODEX_SKILL_UNSAFE;
+}
+
+static void cbm_warn_codex_skill_conflict(const cbm_codex_skill_paths_t *paths,
+                                          const char *reason) {
+    (void)fprintf(stderr,
+                  "warning: Codex skill migration skipped: %s; documented_location=%s legacy=%s\n",
+                  reason, paths->canonical_file, paths->legacy_file);
+}
+
+static void cbm_block_shared_skill_install(const cbm_codex_skill_paths_t *paths) {
+    (void)snprintf(g_blocked_shared_skill_dir, sizeof(g_blocked_shared_skill_dir), "%s",
+                   paths->canonical_dir);
+}
+
+static void cbm_block_shared_skill_if_codex_conflicts(const char *home, const char *config_dir) {
+    cbm_codex_skill_paths_t paths;
+    if (!cbm_codex_skill_paths_init(home, config_dir, &paths) || paths.same_dir) {
+        return;
+    }
+
+    cbm_codex_skill_state_t canonical =
+        cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file);
+    cbm_codex_skill_state_t legacy = cbm_codex_skill_state(paths.legacy_dir, paths.legacy_file);
+    if (canonical == CBM_CODEX_SKILL_ABSENT && legacy != CBM_CODEX_SKILL_ABSENT) {
+        cbm_block_shared_skill_install(&paths);
+    }
+}
+
+static bool cbm_remove_codex_managed_skill(const char *skills_dir, const char *skill_file,
+                                           bool dry_run, bool uninstalling, const char *operation) {
+    cbm_codex_skill_state_t state = cbm_codex_skill_state(skills_dir, skill_file);
+    if (state == CBM_CODEX_SKILL_ABSENT) {
+        return true;
+    }
+    if (state != CBM_CODEX_SKILL_MANAGED) {
+        if (state == CBM_CODEX_SKILL_UNOWNED) {
+            printf("  preserved non-owned Codex skill: %s\n", skill_file);
+        } else if (dry_run) {
+            printf("  preserved unsafe Codex skill path: %s\n", skill_file);
+        } else if (!dry_run) {
+            record_agent_config_error(uninstalling, "Codex CLI", operation, skill_file);
+        }
+        return state == CBM_CODEX_SKILL_UNOWNED;
+    }
+    if (dry_run) {
+        printf("  Codex skill: %s (would remove)\n", skill_file);
+        return true;
+    }
+    int removed = cbm_remove_skills(skills_dir, false);
+    if (removed == CBM_SKILL_COUNT &&
+        cbm_codex_skill_state(skills_dir, skill_file) == CBM_CODEX_SKILL_ABSENT) {
+        return true;
+    }
+    record_agent_config_error(uninstalling, "Codex CLI", operation, skill_file);
+    return false;
+}
+
+static void install_codex_skill(const char *home, const char *config_dir, bool force,
+                                bool dry_run) {
+    cbm_codex_skill_paths_t paths;
+    if (!cbm_codex_skill_paths_init(home, config_dir, &paths)) {
+        if (!g_install_plan) {
+            record_agent_config_error(false, "Codex CLI", "skill_path", config_dir);
+        }
+        return;
+    }
+
+    cbm_codex_skill_state_t canonical =
+        cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file);
+    cbm_codex_skill_state_t legacy =
+        paths.same_dir ? canonical : cbm_codex_skill_state(paths.legacy_dir, paths.legacy_file);
+
+    if (g_install_plan) {
+        if (canonical == CBM_CODEX_SKILL_ABSENT &&
+            (paths.same_dir || legacy == CBM_CODEX_SKILL_ABSENT ||
+             legacy == CBM_CODEX_SKILL_MANAGED)) {
+            plan_record("Codex CLI", "skill", paths.canonical_file);
+        }
+        if (!paths.same_dir && legacy == CBM_CODEX_SKILL_MANAGED &&
+            (canonical == CBM_CODEX_SKILL_ABSENT || canonical == CBM_CODEX_SKILL_MANAGED)) {
+            plan_record("Codex CLI", "cleanup_skill", paths.legacy_file);
+        }
+        if (canonical == CBM_CODEX_SKILL_ABSENT &&
+            (legacy == CBM_CODEX_SKILL_UNOWNED || legacy == CBM_CODEX_SKILL_UNSAFE)) {
+            cbm_block_shared_skill_install(&paths);
+        }
+        return;
+    }
+
+    if (paths.same_dir) {
+        if (canonical == CBM_CODEX_SKILL_UNSAFE) {
+            record_agent_config_error(false, "Codex CLI", "skill_install", paths.canonical_file);
+            return;
+        }
+        if (!force && canonical == CBM_CODEX_SKILL_UNOWNED) {
+            printf("  preserved non-owned Codex skill: %s\n", paths.canonical_file);
+            return;
+        }
+        install_agent_skill("Codex CLI", paths.canonical_dir, force, dry_run);
+        if (!dry_run && cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file) !=
+                            CBM_CODEX_SKILL_MANAGED) {
+            record_agent_config_error(false, "Codex CLI", "skill_install", paths.canonical_file);
+        }
+        return;
+    }
+
+    if (canonical == CBM_CODEX_SKILL_UNSAFE) {
+        if (dry_run) {
+            cbm_warn_codex_skill_conflict(&paths, "the canonical skill path is unsafe");
+        } else {
+            record_agent_config_error(false, "Codex CLI", "skill_install", paths.canonical_file);
+        }
+        return;
+    }
+    if (legacy == CBM_CODEX_SKILL_UNSAFE) {
+        if (canonical == CBM_CODEX_SKILL_ABSENT) {
+            cbm_block_shared_skill_install(&paths);
+        }
+        if (force && !dry_run) {
+            record_agent_config_error(false, "Codex CLI", "legacy_skill_migration",
+                                      paths.legacy_file);
+        } else {
+            cbm_warn_codex_skill_conflict(&paths, "the legacy skill path is unsafe");
+        }
+        return;
+    }
+
+    if (!force && legacy == CBM_CODEX_SKILL_UNOWNED) {
+        if (canonical == CBM_CODEX_SKILL_ABSENT) {
+            cbm_block_shared_skill_install(&paths);
+        }
+        cbm_warn_codex_skill_conflict(&paths, "the legacy skill is not installer-owned");
+        return;
+    }
+    if (!force && canonical == CBM_CODEX_SKILL_UNOWNED) {
+        if (legacy == CBM_CODEX_SKILL_MANAGED) {
+            cbm_warn_codex_skill_conflict(&paths, "the canonical skill is not installer-owned");
+        } else {
+            printf("  preserved non-owned Codex skill: %s\n", paths.canonical_file);
+        }
+        return;
+    }
+
+    bool remove_legacy = legacy == CBM_CODEX_SKILL_MANAGED;
+    if (force && legacy == CBM_CODEX_SKILL_UNOWNED) {
+        remove_legacy = true;
+        if (dry_run) {
+            printf("  legacy Codex skill: %s (would replace for migration)\n", paths.legacy_file);
+        } else {
+            int replaced = cbm_install_skills(paths.legacy_dir, true, false);
+            printf("  legacy Codex skill: %s (%d updated for migration)\n", paths.legacy_file,
+                   replaced);
+            if (cbm_codex_skill_state(paths.legacy_dir, paths.legacy_file) !=
+                CBM_CODEX_SKILL_MANAGED) {
+                record_agent_config_error(false, "Codex CLI", "legacy_skill_migration",
+                                          paths.legacy_file);
+                return;
+            }
+        }
+    }
+
+    bool install_canonical = force || canonical == CBM_CODEX_SKILL_ABSENT;
+    if (install_canonical) {
+        install_agent_skill("Codex CLI", paths.canonical_dir, force, dry_run);
+    } else {
+        printf("  skill: %s (0 installed)\n", paths.canonical_file);
+    }
+
+    if (dry_run) {
+        if (remove_legacy) {
+            printf("  legacy Codex skill: %s (would remove after canonical install)\n",
+                   paths.legacy_file);
+        }
+        return;
+    }
+    if (cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file) !=
+        CBM_CODEX_SKILL_MANAGED) {
+        record_agent_config_error(false, "Codex CLI", "skill_install", paths.canonical_file);
+        return;
+    }
+    if (remove_legacy && cbm_remove_codex_managed_skill(paths.legacy_dir, paths.legacy_file, false,
+                                                        false, "legacy_skill_cleanup")) {
+        printf("  legacy Codex skill: %s (removed)\n", paths.legacy_file);
+    }
 }
 
 /* Derive tier siblings only from the exact shipped Verify basename. This keeps
@@ -8642,12 +8917,10 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         char config_dir[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
-        char skills_dir[CLI_BUF_1K];
         char ap[CLI_BUF_1K];
         cbm_codex_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
-        snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
         char command[CLI_BUF_8K];
         char command_windows[CLI_BUF_8K];
@@ -8666,6 +8939,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                                                  true, &preflight_failure)
                                            : CLI_ERR;
         if (preflight_result != CLI_OK) {
+            cbm_block_shared_skill_if_codex_conflicts(home, config_dir);
             if (!g_install_plan) {
                 printf("Codex CLI:\n");
                 fflush(stdout);
@@ -8680,7 +8954,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         }
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
-        install_agent_skill("Codex CLI", skills_dir, force, dry_run);
+        install_codex_skill(home, config_dir, force, dry_run);
         install_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
                 .label = "Codex CLI",
@@ -9374,6 +9648,7 @@ static void cli_clients_print_list(FILE *out);
 
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
+    g_blocked_shared_skill_dir[0] = '\0';
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (g_client_selection && !cli_clients_apply_selection(g_client_selection, &agents)) {
         return CLI_ERR;
@@ -9807,6 +10082,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_val *agent_files = yyjson_mut_arr(doc);
     yyjson_mut_val *prompt_files = yyjson_mut_arr(doc);
     yyjson_mut_val *hooks = yyjson_mut_arr(doc);
+    yyjson_mut_val *cleanup_actions = yyjson_mut_arr(doc);
     for (int i = 0; i < plan.count; i++) {
         cbm_plan_entry_t *e = &plan.items[i];
         if (strcmp(e->kind, "mcp_config") == 0) {
@@ -9825,6 +10101,14 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
         } else if (strcmp(e->kind, "prompt") == 0) {
             yyjson_mut_arr_add_strcpy(doc, prompt_files, e->path);
             yyjson_mut_arr_add_strcpy(doc, instrs, e->path);
+        } else if (strcmp(e->kind, "cleanup_skill") == 0) {
+            yyjson_mut_val *cleanup = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, cleanup, "agent", e->agent);
+            yyjson_mut_obj_add_str(doc, cleanup, "kind", "skill");
+            yyjson_mut_obj_add_str(doc, cleanup, "operation",
+                                   "remove_owned_legacy_copy_if_migrated");
+            yyjson_mut_obj_add_strcpy(doc, cleanup, "path", e->path);
+            yyjson_mut_arr_add_val(cleanup_actions, cleanup);
         } else {
             yyjson_mut_arr_add_strcpy(doc, instrs, e->path);
         }
@@ -9835,6 +10119,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_obj_add_val(doc, root, "agent_files_planned", agent_files);
     yyjson_mut_obj_add_val(doc, root, "prompt_files_planned", prompt_files);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
+    yyjson_mut_obj_add_val(doc, root, "cleanup_actions_planned", cleanup_actions);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
     yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
@@ -10523,6 +10808,40 @@ static void uninstall_agent_skill(const char *label, const char *skills_dir, boo
     printf("  %s skill: %d removed\n", label, removed);
 }
 
+static void uninstall_codex_skills(const char *home, const char *config_dir, bool dry_run) {
+    cbm_codex_skill_paths_t paths;
+    if (!cbm_codex_skill_paths_init(home, config_dir, &paths)) {
+        if (!dry_run) {
+            record_agent_config_error(true, "Codex CLI", "skill_path", config_dir);
+        }
+        return;
+    }
+
+    int removed = 0;
+    if (cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file) ==
+        CBM_CODEX_SKILL_MANAGED) {
+        if (cbm_remove_codex_managed_skill(paths.canonical_dir, paths.canonical_file, dry_run, true,
+                                           "skill_uninstall")) {
+            removed++;
+        }
+    } else {
+        (void)cbm_remove_codex_managed_skill(paths.canonical_dir, paths.canonical_file, dry_run,
+                                             true, "skill_uninstall");
+    }
+
+    if (!paths.same_dir &&
+        cbm_codex_skill_state(paths.legacy_dir, paths.legacy_file) == CBM_CODEX_SKILL_MANAGED) {
+        if (cbm_remove_codex_managed_skill(paths.legacy_dir, paths.legacy_file, dry_run, true,
+                                           "legacy_skill_uninstall")) {
+            removed++;
+        }
+    } else if (!paths.same_dir) {
+        (void)cbm_remove_codex_managed_skill(paths.legacy_dir, paths.legacy_file, dry_run, true,
+                                             "legacy_skill_uninstall");
+    }
+    printf("  Codex CLI skills: %d removed\n", removed);
+}
+
 static void uninstall_copilot_durable_context(const char *home, bool dry_run) {
     char config_dir[CLI_BUF_1K];
     char hook_path[CLI_BUF_1K];
@@ -10912,13 +11231,11 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         char config_dir[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
-        char skills_dir[CLI_BUF_1K];
         char ap[CLI_BUF_1K];
         char installed_binary[CLI_BUF_1K];
         cbm_codex_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
-        snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
         char hook_command[CLI_BUF_8K];
@@ -10950,7 +11267,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             record_agent_config_error(true, "Codex CLI", "hook_uninstall", cp);
         }
     codex_toml_done:
-        uninstall_agent_skill("Codex CLI", skills_dir, dry_run);
+        uninstall_codex_skills(home, config_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
                 .label = "Codex CLI",
