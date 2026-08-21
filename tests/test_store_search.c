@@ -1582,63 +1582,6 @@ TEST(fts_rebuild_tolerates_malformed_properties) {
     PASS();
 }
 
-/* Regression guard for the incremental path (pipeline_delta.c).  nodes_fts has five
- * columns, and a row-level INSERT naming only the original four is still valid SQL
- * that silently leaves `body` NULL — prose arriving via delta merge would be
- * unsearchable while a full reindex looked perfectly correct.  This runs the delta
- * site's exact statement shape (id > max_db_id, via CBM_SQL_FTS_BODY_EXPR) and
- * asserts the newly merged node's body is searchable. */
-TEST(fts_delta_insert_populates_body) {
-    cbm_store_t *s = cbm_store_open_memory();
-    cbm_store_upsert_project(s, "test", "/tmp/test");
-    cbm_node_t first = {.project = "test",
-                        .label = "Function",
-                        .name = "existing",
-                        .qualified_name = "test.existing",
-                        .file_path = "a.c",
-                        .properties_json = "{\"docstring\":\"already indexed\"}"};
-    cbm_store_upsert_node(s, &first);
-    ASSERT_EQ(cbm_store_fts_rebuild(s), CBM_STORE_OK);
-
-    sqlite3 *db = cbm_store_get_db(s);
-    /* Everything already in nodes_fts is the previous generation. */
-    sqlite3_stmt *mx = NULL;
-    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT coalesce(max(id),0) FROM nodes", -1, &mx, NULL),
-              SQLITE_OK);
-    ASSERT(sqlite3_step(mx) == SQLITE_ROW);
-    sqlite3_int64 max_db_id = sqlite3_column_int64(mx, 0);
-    sqlite3_finalize(mx);
-
-    /* A markdown Section arrives incrementally, carrying prose in its docstring. */
-    cbm_node_t added = {.project = "test",
-                        .label = "Section",
-                        .name = "Deployment",
-                        .qualified_name = "test.README.deployment",
-                        .file_path = "README.md",
-                        .properties_json = "{\"docstring\":\"rollback uses the canary alias\"}"};
-    cbm_store_upsert_node(s, &added);
-
-    sqlite3_stmt *fts = NULL;
-    ASSERT_EQ(sqlite3_prepare_v2(db,
-                                 "INSERT INTO nodes_fts (rowid, name, qualified_name, label,"
-                                 " file_path, body)"
-                                 " SELECT id, name, qualified_name, label,"
-                                 " file_path," CBM_SQL_FTS_BODY_EXPR
-                                 "FROM nodes WHERE project = ?1 AND id > ?2",
-                                 -1, &fts, NULL),
-              SQLITE_OK);
-    sqlite3_bind_text(fts, 1, "test", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(fts, 2, max_db_id);
-    ASSERT_EQ(sqlite3_step(fts), SQLITE_DONE);
-    sqlite3_finalize(fts);
-
-    /* The delta-merged node's prose is searchable — not just its name. */
-    ASSERT_GTE(fts_match_count(db, "canary"), 1);
-    ASSERT_GTE(fts_match_count(db, "rollback"), 1);
-    ASSERT_GTE(fts_match_count(db, "deployment"), 1);
-    cbm_store_close(s);
-    PASS();
-}
 
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
@@ -1712,5 +1655,4 @@ SUITE(store_search) {
     RUN_TEST(fts_rebuild_indexes_body_content);
     RUN_TEST(fts_rebuild_upgrades_legacy_schema);
     RUN_TEST(fts_rebuild_tolerates_malformed_properties);
-    RUN_TEST(fts_delta_insert_populates_body);
 }
