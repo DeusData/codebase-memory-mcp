@@ -551,6 +551,7 @@ typedef struct {
 typedef struct {
     const char *names[CBM_MAX_STRING_CONSTANTS];
     const char *values[CBM_MAX_STRING_CONSTANTS];
+    bool is_url_builder[CBM_MAX_STRING_CONSTANTS];
     int count;
 } CBMStringConstantMap;
 
