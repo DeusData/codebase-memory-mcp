@@ -7951,7 +7951,7 @@ static bool cbm_remove_codex_managed_skill(const char *skills_dir, const char *s
             printf("  preserved non-owned Codex skill: %s\n", skill_file);
         } else if (dry_run) {
             printf("  preserved unsafe Codex skill path: %s\n", skill_file);
-        } else if (!dry_run) {
+        } else {
             record_agent_config_error(uninstalling, "Codex CLI", operation, skill_file);
         }
         return state == CBM_CODEX_SKILL_UNOWNED;
