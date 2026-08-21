@@ -2542,6 +2542,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * CALLS edge across a language boundary. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_suppress_external_import_shadow(call->callee_name, res.strategy, &result->imports,
+                                                imp_keys, imp_count)) {
+            /* #1355: same guard as pass_calls.c — a bare call bound by an
+             * external package import must not become a CALLS edge to an
+             * unrelated project symbol of the same name. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
