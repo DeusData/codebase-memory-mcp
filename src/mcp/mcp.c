@@ -12942,7 +12942,7 @@ static char *snippet_pdf_text(const cbm_node_t *node) {
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
+                                    int end, bool read_allowed, char **out_abs_path) {
     *out_abs_path = NULL;
     if (!root_path || !file_path) {
         return NULL;
@@ -12952,7 +12952,11 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     snprintf(abs_path, apsz, "%s/%s", root_path, file_path);
 
     *out_abs_path = abs_path;
-    if (cbm_path_within_root(root_path, abs_path)) {
+    /* read_allowed=false: the indexed [start,end] coordinates are stale
+     * relative to the file on disk, so slicing the live file would return
+     * shifted text. The caller still gets abs_path for display and the
+     * caller reports the drift (#1750). */
+    if (cbm_path_within_root(root_path, abs_path) && read_allowed) {
         return read_file_lines(abs_path, start, end);
     }
     return NULL;
@@ -13440,12 +13444,25 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     }
     char *abs_path = NULL;
     char *source = NULL;
+    /* #1750: the indexed [start,end] coordinates are only valid while the file
+     * on disk matches the recorded metadata. If the file was edited without
+     * re-indexing, slicing the live file would return shifted text (or a
+     * different function's body). Report the drift instead and keep the
+     * requested node's coordinates. */
+    bool snippet_outside = false;
+    const char *freshness = NULL;
+    bool snippet_drifted = false;
     if (outline) {
         source = NULL;
     } else if (snippet_is_pdf(node->file_path)) {
         source = snippet_pdf_text(node); /* never the file's bytes */
     } else {
-        source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+        freshness = coverage_path_freshness(srv->store, node->project, root_path, node->file_path,
+                                            &snippet_outside);
+        snippet_drifted = freshness && (strcmp(freshness, "metadata_changed") == 0 ||
+                                        strcmp(freshness, "missing") == 0);
+        source = resolve_snippet_source(root_path, node->file_path, start, end, !snippet_drifted,
+                                        &abs_path);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -13547,9 +13564,22 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
         }
+    } else if (snippet_drifted && freshness) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source",
+            "(source not available: file changed after indexing; re-index the project for "
+            "accurate coordinates)");
     } else {
         yyjson_mut_obj_add_str(doc, root_obj, "source_mode", "full");
         yyjson_mut_obj_add_str(doc, root_obj, "source", "(source not available)");
+    }
+
+    /* #1750: the recorded start/end coordinates are stale relative to the file
+     * on disk. Explicitly flag the drift so consumers can tell "current source"
+     * from "index-time coordinates", instead of silently receiving shifted text. */
+    if (snippet_drifted && freshness) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "source_drift", true);
+        yyjson_mut_obj_add_str(doc, root_obj, "freshness", freshness);
     }
 
     /* match_method — omitted for exact matches */
@@ -14087,6 +14117,7 @@ typedef struct {
     int match_count;        /* exact total across the complete grep stream */
     int match_stored_count; /* bounded evidence retained for rendering */
     int match_capacity;
+    const char *freshness; /* #1750: static freshness label of the file, or NULL */
 } search_result_t;
 
 typedef struct {
@@ -14421,6 +14452,21 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
      * followed) must not be read back into the response. Same guard the
      * snippet path already uses. */
     if (!root_containment_check(containment, abs_path)) {
+        free(abs_path);
+        return;
+    }
+
+    /* #1750: the indexed [start,end] ranges only describe the file as it was
+     * at index time. If the file changed on disk, attaching source/context
+     * sliced with those ranges returns shifted text (or another function's
+     * body), and the symbol attribution itself is untrustworthy. Flag the
+     * drift and attach nothing. */
+    const char *freshness = r->freshness;
+    bool drifted = freshness && (strcmp(freshness, "metadata_changed") == 0 ||
+                                 strcmp(freshness, "missing") == 0);
+    if (drifted) {
+        yyjson_mut_obj_add_bool(doc, item, "source_drift", true);
+        yyjson_mut_obj_add_str(doc, item, "freshness", freshness);
         free(abs_path);
         return;
     }
@@ -16974,6 +17020,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         free(ids);
         free(in_degs);
         free(out_degs);
+    }
+
+    /* #1750: resolve each result file's freshness once per request. The indexed
+     * [start,end] ranges are only valid while the file matches its recorded
+     * metadata, so the renderers use this to withhold stale source/context. */
+    for (int j = 0; j < sr_count; j++) {
+        bool outside = false;
+        sr[j].freshness =
+            (store && root_path && sr[j].file)
+                ? coverage_path_freshness(store, project, root_path, sr[j].file, &outside)
+                : NULL;
     }
 
     /* Compute scores and sort */

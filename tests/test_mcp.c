@@ -3716,6 +3716,124 @@ TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget) {
     PASS();
 }
 
+/* #1750: get_code_snippet must detect index-to-disk drift before slicing the
+ * live file. Once the file is edited without re-indexing, the indexed
+ * [start,end] coordinates are stale; serving the live file with them returns
+ * shifted text (or another function's body). The response must flag the drift
+ * instead of silently serving stale coordinates. */
+TEST(tool_get_code_snippet_reports_drift_after_file_change) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    /* Same mtime source the indexer and the freshness oracle use (#1714). */
+    cbm_path_info_t path_info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+                                         path_info.size),
+              CBM_STORE_OK);
+
+    char *resp =
+        cbm_mcp_handle_tool(srv, "get_code_snippet",
+                            "{\"project\":\"test-project\","
+                            "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                            "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest() error"));
+    ASSERT_NULL(strstr(inner, "source_drift"));
+    free(inner);
+
+    /* Append lines without re-indexing: the recorded metadata no longer
+     * matches, so the indexed range is stale for the edited file. */
+    FILE *fp = fopen(source_path, "a");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 12; i++) {
+        fprintf(fp, "// padding after edit %d\n", i);
+    }
+    fclose(fp);
+
+    resp = cbm_mcp_handle_tool(srv, "get_code_snippet",
+                               "{\"project\":\"test-project\","
+                               "\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                               "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"source_drift\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\":\"metadata_changed\""));
+    ASSERT_NOT_NULL(strstr(inner, "file changed after indexing"));
+    ASSERT_NULL(strstr(inner, "func HandleRequest() error"));
+    free(inner);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #1750: search_code must not attach source sliced with stale indexed ranges
+ * when the file changed on disk after indexing. The result item is flagged
+ * source_drift instead, and the healthy path keeps attaching source. */
+TEST(tool_search_code_marks_drifted_file_without_source) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    /* Same mtime source the indexer and the freshness oracle use (#1714). */
+    cbm_path_info_t path_info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+                                         path_info.size),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\","
+                                     "\"mode\":\"full\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest() error"));
+    ASSERT_NULL(strstr(inner, "source_drift"));
+    free(inner);
+
+    /* Append lines without re-indexing: the recorded metadata no longer
+     * matches, so the indexed range is stale for the edited file. */
+    FILE *fp = fopen(source_path, "a");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 12; i++) {
+        fprintf(fp, "// padding after edit %d\n", i);
+    }
+    fclose(fp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_code",
+                               "{\"pattern\":\"HandleRequest\",\"project\":\"test-project\","
+                               "\"mode\":\"full\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"source_drift\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\":\"metadata_changed\""));
+    ASSERT_NULL(strstr(inner, "func HandleRequest() error"));
+    free(inner);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* EVERY tool, not just the one that was reported.
  *
  * The duplication was invisible per-tool: each result looked reasonable on its
@@ -25101,6 +25219,8 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
     RUN_TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget);
+    RUN_TEST(tool_get_code_snippet_reports_drift_after_file_change);
+    RUN_TEST(tool_search_code_marks_drifted_file_without_source);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
