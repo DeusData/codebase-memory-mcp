@@ -1029,6 +1029,45 @@ TEST(elixir_function) {
     PASS();
 }
 
+/* Elixir control flow is `call` nodes and `stab_clause` arms, not branch node
+ * TYPES, so the generic complexity walk scored every Elixir function 0 and the
+ * fingerprint was never computed at all — no similarity or duplicate detection. */
+TEST(elixir_complexity_and_fingerprint) {
+    CBMFileResult *r = extract("defmodule Cx do\n"
+                               "  def classify(x) do\n"
+                               "    case x do\n"
+                               "      0 -> :zero\n"
+                               "      n when n > 0 -> :pos\n"
+                               "      _ -> :neg\n"
+                               "    end\n"
+                               "  end\n"
+                               "  def plain(a), do: a\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "cx.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    CBMDefinition *cls = NULL;
+    CBMDefinition *plain = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "classify") == 0)
+            cls = &r->defs.items[i];
+        if (strcmp(r->defs.items[i].name, "plain") == 0)
+            plain = &r->defs.items[i];
+    }
+    ASSERT_NOT_NULL(cls);
+    /* The `case` itself + its 3 arms + the second arm's own `when` guard. */
+    ASSERT_EQ(5, cls->complexity);
+    ASSERT(cls->cognitive > 0);
+    ASSERT(cls->lines > 0);
+    /* A straight-line body has no decisions but still gets a line count — a
+     * language must not become nonzero everywhere just by being measured. */
+    ASSERT_NOT_NULL(plain);
+    ASSERT_EQ(0, plain->complexity);
+    ASSERT(plain->lines > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -5603,6 +5642,7 @@ SUITE(extraction) {
 
     /* Functional */
     RUN_TEST(elixir_function);
+    RUN_TEST(elixir_complexity_and_fingerprint);
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
