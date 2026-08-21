@@ -63,6 +63,10 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 
 /* ── Constants ────────────────────────────────────────────────── */
 
@@ -1000,6 +1004,15 @@ static bool resolve_self_executable(char *out, size_t outsz) {
     char buf[1024];
     uint32_t sz = sizeof(buf);
     if (_NSGetExecutablePath(buf, &sz) == 0 && buf[0]) {
+        return copy_path(out, outsz, buf);
+    }
+    return false;
+#elif defined(__FreeBSD__)
+    /* No /proc by default on FreeBSD; ask the kernel for our own path. */
+    char buf[1024];
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t cb = sizeof(buf);
+    if (sysctl(mib, 4, buf, &cb, NULL, 0) == 0 && cb > 0) {
         return copy_path(out, outsz, buf);
     }
     return false;

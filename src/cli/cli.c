@@ -9699,6 +9699,27 @@ static const char *cli_external_manager_name(const char *self_path) {
     if (strstr(self_path, "/.cargo/bin/")) {
         return "cargo";
     }
+#ifdef __FreeBSD__
+    /* FreeBSD ports/pkg install under ${LOCALBASE} (default /usr/local). pkg owns
+     * that file, so install must not drop a second copy in ~/.local/bin or edit a
+     * shell rc, and update must defer to pkg(8). Anchor at the start so a manual
+     * `install --dir=/opt/...` elsewhere is still treated as ours; --force-binary
+     * is the escape hatch for anyone who really does self-manage that prefix.
+     *
+     * LOCALBASE is configurable, so the port passes its real PREFIX via
+     * -DCBM_PKG_PREFIX; when it is absent we fall back to the documented default. */
+#ifdef CBM_PKG_PREFIX
+    if (strncmp(self_path, CBM_PKG_PREFIX "/bin/", sizeof(CBM_PKG_PREFIX "/bin/") - 1) == 0 ||
+        strncmp(self_path, CBM_PKG_PREFIX "/sbin/", sizeof(CBM_PKG_PREFIX "/sbin/") - 1) == 0) {
+        return "FreeBSD pkg";
+    }
+#else
+    if (strncmp(self_path, "/usr/local/bin/", 15) == 0 ||
+        strncmp(self_path, "/usr/local/sbin/", 16) == 0) {
+        return "FreeBSD pkg";
+    }
+#endif
+#endif
     return NULL;
 }
 
@@ -12227,6 +12248,8 @@ int cbm_cmd_update(int argc, char **argv) {
                 (void)fprintf(stderr, "  update it with: mise upgrade codebase-memory-mcp\n");
             } else if (manager && strcmp(manager, "Homebrew") == 0) {
                 (void)fprintf(stderr, "  update it with: brew upgrade codebase-memory-mcp\n");
+            } else if (manager && strcmp(manager, "FreeBSD pkg") == 0) {
+                (void)fprintf(stderr, "  update it with: pkg upgrade codebase-memory-mcp\n");
             } else {
                 (void)fprintf(stderr, "  update it through whichever tool installed it.\n");
             }

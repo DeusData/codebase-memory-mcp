@@ -12783,8 +12783,16 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
     ASSERT_NULL(
         cbm_cli_external_manager_name_for_testing("/Users/x/.local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/cbm/codebase-memory-mcp"));
-    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("build/c/test-runner"));
+#ifdef __FreeBSD__
+    /* On FreeBSD the port/pkg owns ${LOCALBASE}/bin, so a binary there IS
+     * externally managed; elsewhere the same path is unremarkable. */
+    ASSERT_NOT_NULL(
+        cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/local/bin/codebase-memory-mcp"));
+#else
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+#endif
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(""));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(NULL));
     PASS();
