@@ -452,7 +452,7 @@ overwrite user-modified agents.
 | Codex CLI | Detected | `$CODEX_HOME/config.toml` | `AGENTS.md`, skill, three read-only agents; `SessionStart` + `SubagentStart` |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
-| OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents |
+| OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
 | Antigravity | Detected | `.gemini/config/mcp_config.json` | `.gemini/GEMINI.md` |
 | Aider | Detected | — | `CONVENTIONS.md` via `.aider.conf.yml` |
 | KiloCode | Detected | `.config/kilo/kilo.jsonc` | Rule + three graph-tool subagents with deny-by-default permissions |
