@@ -5,7 +5,7 @@ import { useUiMessages } from "../lib/i18n";
 
 interface SidebarProps {
   nodes: GraphNode[];
-  onSelectPath: (path: string, nodeIds: Set<number>) => void;
+  onSelectPath: (path: string, nodeIds: Set<number>, node?: GraphNode) => void;
   selectedPath: string | null;
 }
 
@@ -61,7 +61,7 @@ function flattenSingleChild(dir: DirNode): DirNode {
 
 function TreeItem({ dir, depth, onSelect, selectedPath }: {
   dir: DirNode; depth: number;
-  onSelect: (path: string, ids: Set<number>) => void;
+  onSelect: (path: string, ids: Set<number>, node?: GraphNode) => void;
   selectedPath: string | null;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -72,7 +72,7 @@ function TreeItem({ dir, depth, onSelect, selectedPath }: {
   return (
     <div>
       <button
-        onClick={() => { setExpanded(!expanded); onSelect(dir.fullPath, dir.nodeIds); }}
+        onClick={() => { setExpanded(!expanded); onSelect(dir.fullPath, dir.nodeIds, undefined); }}
         className={`flex items-center gap-1.5 w-full text-left px-3 py-[5px] text-[12px] transition-colors ${
           isSelected ? "bg-primary/10 text-primary" : "text-foreground/60 hover:text-foreground/80 hover:bg-white/[0.03]"
         }`}
@@ -90,7 +90,7 @@ function TreeItem({ dir, depth, onSelect, selectedPath }: {
           {sortedNodes.map((gn) => (
             <button
               key={gn.id}
-              onClick={() => onSelect(dir.fullPath + "/" + gn.name, new Set([gn.id]))}
+              onClick={() => onSelect(dir.fullPath + "/" + gn.name, new Set([gn.id]), gn)}
               className="flex items-center gap-1.5 w-full text-left px-3 py-[3px] text-[11px] text-foreground/40 hover:text-foreground/60 hover:bg-white/[0.02] transition-colors"
               style={{ paddingLeft: `${(depth+1) * 16 + 12}px` }}
             >
@@ -148,7 +148,7 @@ export function Sidebar({ nodes, onSelectPath, selectedPath }: SidebarProps) {
               filtered.map((n) => (
                 <button
                   key={n.id}
-                  onClick={() => onSelectPath(n.file_path ?? "", new Set([n.id]))}
+                  onClick={() => onSelectPath(n.file_path ?? "", new Set([n.id]), n)}
                   className="flex items-center gap-2 w-full text-left px-4 py-1.5 text-[11px] hover:bg-white/[0.03] transition-colors"
                 >
                   <span className="w-[5px] h-[5px] rounded-full shrink-0" style={{ backgroundColor: n.color }} />
