@@ -16,7 +16,6 @@
 #include <ctype.h>
 
 // Buffer sizes for local arrays (base classes, params, return types).
-#define MAX_COMMENT_LEN 500
 #define MAX_BASES 16
 #define MAX_BASES_MINUS_1 15
 #define MAX_PARAMS CBM_SZ_32
@@ -1236,12 +1235,12 @@ static bool is_comment_node(const char *kind) {
             strcmp(kind, "line_comment") == 0 || strcmp(kind, "multiline_comment") == 0);
 }
 
-// Extract comment text, truncating to MAX_COMMENT_LEN.
+// Extract comment text, truncating to CBM_MAX_COMMENT_LEN.
 // #1017: snap the cut point back to a complete UTF-8 codepoint boundary.
 static char *extract_comment_text(CBMArena *a, TSNode node, const char *source) {
     char *text = cbm_node_text(a, node, source);
-    if (text && strlen(text) > MAX_COMMENT_LEN) {
-        size_t cut = MAX_COMMENT_LEN;
+    if (text && strlen(text) > CBM_MAX_COMMENT_LEN) {
+        size_t cut = CBM_MAX_COMMENT_LEN;
         while (cut > 0 && ((unsigned char)text[cut] & 0xC0) == 0x80)
             cut--;
         text[cut] = '\0';
@@ -3967,7 +3966,7 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
 // the first nested subsection or the end of the section. Nested subsections are
 // excluded because each gets its own Section node and its own body. Returns NULL
 // when there is no enclosing section or no body text. Trimmed, and capped at
-// MAX_COMMENT_LEN (the same budget docstrings use) without splitting a UTF-8
+// CBM_MAX_COMMENT_LEN (the same budget docstrings use) without splitting a UTF-8
 // sequence.
 static char *extract_markdown_section_body(CBMArena *a, TSNode heading, const char *source) {
     TSNode parent = ts_node_parent(heading);
@@ -3997,8 +3996,8 @@ static char *extract_markdown_section_body(CBMArena *a, TSNode heading, const ch
         return NULL;
     }
     size_t len = (size_t)(body_end - body_start);
-    if (len > MAX_COMMENT_LEN) {
-        len = MAX_COMMENT_LEN;
+    if (len > CBM_MAX_COMMENT_LEN) {
+        len = CBM_MAX_COMMENT_LEN;
         // Back off so the cap never splits a UTF-8 multi-byte sequence: source[start+len]
         // is the first excluded byte, and a continuation byte there means we landed
         // mid-character.
