@@ -349,11 +349,18 @@ int cbm_store_create_indexes(cbm_store_t *s);
  * only identifiers (#518).  Returns CBM_STORE_OK or CBM_STORE_ERR. */
 int cbm_store_fts_rebuild(cbm_store_t *s);
 
-/* Body expression shared by EVERY nodes_fts write site — the wholesale rebuild in
- * cbm_store_fts_rebuild and the row-level delta insert in pipeline_delta.c.  Any new
- * write site must use it too: nodes_fts carries five columns, and an INSERT naming
- * only the original four is still valid SQL that silently leaves `body` NULL, making
- * prose added on that path unsearchable while a full reindex looks correct.
+/* Body expression shared by both nodes_fts write sites: the wholesale rebuild in
+ * cbm_store_fts_rebuild and the row-level delta insert in pipeline_delta.c.  Those
+ * two are the complete set as of this writing — test fixtures build the index via
+ * cbm_store_fts_rebuild rather than spelling out their own INSERT, deliberately, so
+ * they cannot drift from the real schema.
+ *
+ * Any new write site must use this expression too: nodes_fts carries five columns,
+ * and an INSERT naming only the original four is still valid SQL that silently
+ * leaves `body` NULL, making prose added on that path unsearchable while a full
+ * reindex looks correct.  That failure has no compile error and no failing
+ * assertion, so it is caught by review and by tests that drive the production
+ * entry point, not by the compiler.
  * Feeds the node's docstring property, or '' when absent.  The json_valid() guard is
  * essential — json_extract() aborts the whole statement on malformed JSON, and pre-fix
  * databases contain such rows; a guarded row degrades to name-only indexing instead of

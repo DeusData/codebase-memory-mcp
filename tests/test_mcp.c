@@ -2484,13 +2484,12 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     component_status.end_line = 3;
     ASSERT_GT(cbm_store_upsert_node(st, &component_status), 0);
 
-    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-    ASSERT_EQ(cbm_store_exec(st,
-                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
-                             "file_path) "
-                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                             "FROM nodes;"),
-              CBM_STORE_OK);
+    /* Build the FTS index through the production rebuild rather than a hand-rolled
+     * INSERT. A fixture that spells out its own column list silently drifts from
+     * the real schema — naming only the four original columns stays valid SQL
+     * against the five-column table and just leaves `body` NULL, so the fixture
+     * would stop mirroring what search_graph actually queries (#518). */
+    ASSERT_EQ(cbm_store_fts_rebuild(st), CBM_STORE_OK);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":552,\"method\":\"tools/call\","
