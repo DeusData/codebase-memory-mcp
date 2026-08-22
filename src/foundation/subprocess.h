@@ -22,6 +22,7 @@
 
 #include <stdbool.h>
 #include <stddef.h> /* size_t (cbm_build_win_cmdline) */
+#include <stdint.h>
 
 /* How a supervised child ended. */
 typedef enum {
@@ -87,6 +88,12 @@ typedef enum {
     CBM_PROC_POLL_TERMINAL = 1
 } cbm_proc_poll_t;
 
+typedef enum {
+    CBM_PROC_TREE_RSS_ERROR = -1,
+    CBM_PROC_TREE_RSS_EMPTY = 0,
+    CBM_PROC_TREE_RSS_OK = 1,
+} cbm_proc_tree_rss_status_t;
+
 /* Spawn opts->bin and return immediately with a supervisor handle. On success,
  * *out owns the process until a terminal poll followed by destroy. Spawn copies
  * the option strings/argv it needs after return; log_ud remains caller-owned until
@@ -116,6 +123,16 @@ int cbm_subprocess_spawn(const cbm_proc_opts_t *opts, cbm_subprocess_t **out);
  * quiet-timeout), it requests graceful termination once, then force-terminates the
  * tree when cancel_grace_ms elapses. Callers must keep polling to make progress. */
 cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t *out);
+
+/* Read the current resident-set size of the complete contained process tree.
+ * OK returns an overflow-safe byte total, EMPTY means the owned tree currently
+ * has no observable members, and ERROR means no trustworthy measurement could
+ * be obtained. Individual processes that exit during enumeration are ignored. */
+cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_bytes(cbm_subprocess_t *process,
+                                                         uint64_t *rss_bytes);
+bool cbm_subprocess_root_running(const cbm_subprocess_t *process);
+bool cbm_subprocess_termination_pending(const cbm_subprocess_t *process);
+bool cbm_subprocess_supervision_active(const cbm_subprocess_t *process);
 
 /* Record an explicit cancellation request without waiting. Safe to repeat and
  * safe to call from a cancellation thread while one owner thread polls. The
@@ -183,6 +200,7 @@ bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable
  * of hoping a loaded machine reproduces it. Test builds only. */
 void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
 int cbm_subprocess_pending_spawn_eagain_for_testing(void);
+uint64_t cbm_subprocess_rss_sum_for_testing(const uint64_t *values, size_t count);
 #endif
 
 #endif /* CBM_SUBPROCESS_H */

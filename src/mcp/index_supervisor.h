@@ -22,8 +22,10 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdatomic.h>
 
+#include "foundation/index_policy.h"
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
 
 /* Worker-role state, set once from the CLI arg parser (main.c) when this process
@@ -138,8 +140,10 @@ typedef struct {
     bool tree_quiesced;
     bool supervision_failed;
     bool response_rejected; /* clean worker exceeded the bounded response protocol */
-    char *response;         /* worker result only after a contained, uncancelled CLEAN exit;
-                             * borrowed for async polls, caller-owned from the sync wrapper */
+    cbm_index_resource_violation_t resource_violation;
+    bool resource_probe_failed;
+    char *response; /* worker result only after a contained, uncancelled CLEAN exit;
+                     * borrowed for async polls, caller-owned from the sync wrapper */
 } cbm_index_worker_result_t;
 
 /* Daemon-owned, nonblocking supervisor for one contained worker process tree. */
@@ -157,6 +161,11 @@ typedef enum {
 int cbm_index_worker_start(const char *args_json, size_t memory_budget_bytes, bool single_thread,
                            const char *marker_file, const char *quarantine_file,
                            cbm_index_worker_handle_t **handle_out);
+int cbm_index_worker_start_with_policy(const char *args_json, size_t memory_budget_bytes,
+                                       const cbm_index_resource_policy_t *resource_policy,
+                                       bool single_thread, const char *marker_file,
+                                       const char *quarantine_file,
+                                       cbm_index_worker_handle_t **handle_out);
 
 /* Request-scoped variant used by interactive local CLI calls. The callback is
  * invoked by the owner thread while it polls the contained worker; log_context
@@ -220,7 +229,22 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
                                            cbm_proc_log_cb log_callback, void *log_context,
                                            const atomic_int *cancel_requested,
                                            cbm_index_worker_result_t *result);
+int cbm_index_spawn_worker_with_policy_log_cancel(
+    const char *args_json, const cbm_index_resource_policy_t *resource_policy, bool single_thread,
+    const char *marker_file, const char *quarantine_file, cbm_proc_log_cb log_callback,
+    void *log_context, const atomic_int *cancel_requested, cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef uint64_t (*cbm_index_supervisor_clock_fn)(void *context);
+typedef cbm_proc_tree_rss_status_t (*cbm_index_supervisor_rss_fn)(cbm_subprocess_t *process,
+                                                                  uint64_t *rss_bytes,
+                                                                  void *context);
+void cbm_index_supervisor_set_resource_hooks_for_testing(cbm_index_supervisor_clock_fn clock_fn,
+                                                         cbm_index_supervisor_rss_fn rss_fn,
+                                                         void *context);
+void cbm_index_supervisor_reset_resource_hooks_for_testing(void);
+#endif
 
 #endif /* CBM_INDEX_SUPERVISOR_H */

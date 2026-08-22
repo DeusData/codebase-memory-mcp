@@ -156,6 +156,8 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    cbm_index_resource_policy_t resource_policy;
+    cbm_index_resource_violation_t resource_violation;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -304,6 +306,20 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
+                                      const cbm_index_resource_policy_t *policy) {
+    if (p && policy) {
+        p->resource_policy = *policy;
+    }
+}
+
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation) {
+    if (violation) {
+        *violation = p ? p->resource_violation : (cbm_index_resource_violation_t){0};
+    }
+}
+
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name || !name[0]) {
         return false;
@@ -411,6 +427,15 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
+}
+
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p) {
+    return p && cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy
+                                                                        : NULL;
+}
+
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p) {
+    return p ? &p->resource_violation : NULL;
 }
 
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
@@ -1916,15 +1941,17 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     cbm_pipeline_persist_test_run_before_final_manifest();
 #endif
-    if (cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
-                                                   &manifest, &manifest_count) != 0) {
+    int manifest_rc =
+        cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &manifest, &manifest_count);
+    if (manifest_rc != 0) {
         cbm_log_error("pipeline.err", "phase", "semantic_manifest");
         /* db_path and db_dir are this function's strdups; the success tail and
          * the publish-failure return release them, and these two aborts must
          * too -- LSan caught exactly these paths leaking both strings. */
         free(db_dir);
         free(db_path);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                                          : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     if (!cbm_pipeline_semantic_manifests_equal(baseline_manifest, baseline_count, manifest,
                                                manifest_count)) {
@@ -2178,10 +2205,14 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
+    p->resource_violation = (cbm_index_resource_violation_t){0};
     cbm_discover_opts_t opts = {
         .mode = p->requested_mode,
         .ignore_file = NULL,
         .max_file_size = 0,
+        .resource_policy =
+            cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
+        .resource_violation = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;
     int file_count = 0;
@@ -2206,7 +2237,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
     if (rc != 0 || check_cancel(p)) {
-        rc = CBM_NOT_FOUND;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
         goto cleanup;
     }
 
@@ -2214,14 +2245,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * bytes drive exact no-op comparison and are checked against a fresh
      * rediscovery immediately before any replacement is published. */
     rc = mode_promoted
-             ? cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
-                                                          &baseline_manifest, &baseline_count)
+             ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
+                                                          &baseline_count)
              : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
                                                     file_count, p->excluded_dirs, p->excluded_count,
                                                     &p->git_ctx, p->userconfig, &baseline_manifest,
                                                     &baseline_count);
     if (rc != 0) {
-        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                               : CBM_PIPELINE_ABORT_PRESERVE_DB;
         goto cleanup;
     }
 
@@ -2265,7 +2297,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         cbm_log_info("pipeline.rediscover", "requested_mode", pipeline_mode_name(p->requested_mode),
                      "effective_mode", pipeline_mode_name(p->mode), "files", itoa_buf(file_count));
         if (rc != 0 || check_cancel(p)) {
-            rc = CBM_NOT_FOUND;
+            rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
             goto cleanup;
         }
     }

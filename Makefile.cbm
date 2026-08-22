@@ -224,6 +224,7 @@ FOUNDATION_SRCS = \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
+    src/foundation/index_policy.c \
     src/foundation/subprocess.c \
     src/foundation/sha256.c \
     src/foundation/secure_random.c \
@@ -503,6 +504,7 @@ TEST_FOUNDATION_SRCS = \
     tests/test_str_intern.c \
     tests/test_log.c \
     tests/test_str_util.c \
+    tests/test_index_policy.c \
     tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
