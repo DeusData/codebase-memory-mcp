@@ -261,6 +261,96 @@ TEST(ws_manifest_approval_refuses_overbroad_requests) {
     PASS();
 }
 
+/* #1718: the sensitive-root escape hatch broke on Windows separator spelling.
+ * The grant is recorded from cbm_canonical_path — backslashes — while the
+ * indexer hands the candidate already normalized to '/'. A byte-exact
+ * comparison made the grant never match the candidate, so an approved
+ * "Program Files" root stayed refused. '/' and '\' are equivalent everywhere
+ * else in this module (ws_is_sep); the boundary comparison must treat them
+ * equally. The classify_root home rule uses the same ws_paths_equal, so a
+ * mixed-separator home spelling is the string-level regression check; the
+ * FS-backed grant round-trip lives in the _WIN32 half, where the real
+ * canonicalization exercises it. */
+TEST(ws_approve_sensitive_matches_across_separator_styles) {
+    /* canonical spelled with '\' vs home spelled with '/' — must classify as
+     * the same directory. Pre-fix: strncmp mismatch at the separator byte, so
+     * the home rule never matched and an ordinary path under "C:\Users" fell
+     * through to CBM_WS_ALLOW. */
+    ASSERT_EQ(cbm_workspace_classify_root("C:\\Users\\dev", "C:/Users/dev", CACHE),
+              CBM_WS_DENY_SENSITIVE);
+    ASSERT_EQ(cbm_workspace_classify_root("C:/Users/dev", "C:\\Users\\dev", CACHE),
+              CBM_WS_DENY_SENSITIVE);
+    /* A sibling that differs after the same separator boundary is still a
+     * different directory: "/a/bc" must never look like "/a/b". */
+    ASSERT_EQ(cbm_workspace_classify_root("C:\\Users\\devx", "C:/Users/dev", CACHE), CBM_WS_ALLOW);
+#ifdef _WIN32
+    /* Full grant round-trip on real filesystem paths: the grant stored with
+     * '\' must lift the exact candidate the indexer passes with '/'. The
+     * sensitive class is exercised by a credential-named directory (".ssh"),
+     * which is DENY_SENSITIVE at any depth — equivalent to "Program Files"
+     * for the refusal path under test. */
+    char *cache = th_mktempdir("cbm_ws_sw");
+    ASSERT(cache != NULL);
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/.ssh/cfg", cache);
+    ASSERT_TRUE(cbm_mkdir_p(dir, 0700));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/allowed_roots", cache);
+
+    char grant[2048];
+    snprintf(grant, sizeof(grant), "!%s\\.ssh\\cfg\n", cache);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    (void)fprintf(f, "%s", grant);
+    (void)fclose(f);
+
+    char candidate[2048];
+    snprintf(candidate, sizeof(candidate), "%s/.ssh/cfg", cache);
+    /* Convert to '/' spelling, exactly as cbm_normalize_path_sep does for the
+     * indexer's candidate. */
+    char *p;
+    for (p = candidate; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    char err[1024];
+    err[0] = '\0';
+    ASSERT_TRUE(cbm_workspace_root_allowed(candidate, NULL, cache, NULL, err, sizeof(err)));
+
+    /* An unapproved sibling under the same sensitive tree stays refused. It
+     * lies outside every granted root, so the refusal is the boundary wording
+     * (kept verbatim by contract), not the sensitive hint. */
+    char sibling[2048];
+    snprintf(sibling, sizeof(sibling), "%s/.ssh/keys", cache);
+    for (p = sibling; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    err[0] = '\0';
+    ASSERT_FALSE(cbm_workspace_root_allowed(sibling, NULL, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "outside the allowed root") != NULL);
+
+    /* A strict descendant INSIDE the approved sensitive grant is contained
+     * (boundary passes) but not the exact grant, so the sensitive refusal
+     * applies and the hint names the flag. */
+    char descendant[2048];
+    snprintf(descendant, sizeof(descendant), "%s/.ssh/cfg/sub", cache);
+    for (p = descendant; *p; p++) {
+        if (*p == '\\') {
+            *p = '/';
+        }
+    }
+    err[0] = '\0';
+    ASSERT_FALSE(cbm_workspace_root_allowed(descendant, NULL, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "--approve-sensitive") != NULL);
+
+    th_cleanup(cache);
+#endif
+    PASS();
+}
+
 SUITE(workspace) {
     RUN_TEST(ws_manifest_absent_is_not_an_error);
     RUN_TEST(ws_manifest_parses_entries_and_skips_comments);
@@ -278,4 +368,5 @@ SUITE(workspace) {
     RUN_TEST(ws_posix_matching_is_case_sensitive);
     RUN_TEST(ws_null_context_disables_dependent_checks);
     RUN_TEST(ws_every_verdict_has_a_reason);
+    RUN_TEST(ws_approve_sensitive_matches_across_separator_styles);
 }

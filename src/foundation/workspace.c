@@ -212,7 +212,16 @@ static bool ws_any_component_matches(const char *path, const char *const *names,
 }
 
 /* True when b is a or lives under a. Compares on a separator boundary so
- * "/a/bc" is not treated as living under "/a/b". */
+ * "/a/bc" is not treated as living under "/a/b".
+ *
+ * '/' and '\' are equivalent here, as they are everywhere else in this module
+ * (ws_is_sep). The Windows sensitive-grant escape hatch (#1718) records the
+ * grant from cbm_canonical_path — backslashes — while the indexer candidate
+ * arrives normalized to '/'. A byte-exact comparison made the grant never
+ * match the candidate on Windows, so --approve-sensitive could not lift a
+ * "Program Files" refusal. Comparing on the separator-equivalence boundary
+ * keeps the containment semantics (a separator byte is never "part of a
+ * component name") while erasing the platform spelling difference. */
 static bool ws_is_ancestor_or_equal(const char *a, const char *b) {
     if (!a || !b || !a[0] || !b[0]) {
         return false;
@@ -221,8 +230,13 @@ static bool ws_is_ancestor_or_equal(const char *a, const char *b) {
     while (la > 1 && ws_is_sep(a[la - 1])) {
         la--;
     }
-    if (strncmp(a, b, la) != 0) {
-        return false;
+    for (size_t i = 0; i < la; i++) {
+        if (a[i] == b[i]) {
+            continue;
+        }
+        if (!(ws_is_sep(a[i]) && ws_is_sep(b[i]))) {
+            return false;
+        }
     }
     return b[la] == '\0' || ws_is_sep(b[la]);
 }
