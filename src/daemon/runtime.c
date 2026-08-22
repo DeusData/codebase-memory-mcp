@@ -50,11 +50,11 @@ void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force) {
 #include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#elif defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__NetBSD__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
@@ -159,7 +159,7 @@ typedef struct {
     HANDLE file;
     BY_HANDLE_FILE_INFORMATION information;
     LARGE_INTEGER size;
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     int fd;
     struct stat status;
 #endif
@@ -514,7 +514,7 @@ static bool runtime_activation_response_decode(
 static uint64_t runtime_current_process_id(void) {
 #ifdef _WIN32
     return (uint64_t)GetCurrentProcessId();
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     return (uint64_t)getpid();
 #else
     return 0;
@@ -528,7 +528,7 @@ static void runtime_process_image_reference_init(runtime_process_image_reference
     memset(reference, 0, sizeof(*reference));
 #ifdef _WIN32
     reference->file = INVALID_HANDLE_VALUE;
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     reference->fd = -1;
 #endif
 }
@@ -542,7 +542,7 @@ static bool runtime_process_image_reference_release(runtime_process_image_refere
     if (reference->file != INVALID_HANDLE_VALUE && !CloseHandle(reference->file)) {
         ok = false;
     }
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     if (reference->fd >= 0 && close(reference->fd) != 0) {
         ok = false;
     }
@@ -682,7 +682,7 @@ static bool runtime_mac_process_maps_file_executable(int process_id, const struc
     return false;
 }
 
-#elif defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 
 static bool runtime_posix_stat_same_image(const struct stat *first, const struct stat *second) {
     return first && second && S_ISREG(first->st_mode) && S_ISREG(second->st_mode) &&
@@ -818,12 +818,16 @@ static bool runtime_process_image_reference_acquire(
     } else if (image_fd >= 0) {
         (void)close(image_fd);
     }
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(__NetBSD__)
     if (process_id > INT_MAX) {
         return false;
     }
     int pid = (int)process_id;
+#if defined(__NetBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC_ARGS, pid, KERN_PROC_PATHNAME};
+#else
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid};
+#endif
     char path[PATH_MAX];
     size_t path_length = sizeof(path);
     bool ok = sysctl(mib, 4, path, &path_length, NULL, 0) == 0 && path_length > 0;
@@ -885,7 +889,7 @@ static bool runtime_process_image_reference_matches_process(
            runtime_mac_stat_same(&active->status, &peer.status);
     bool released = runtime_process_image_reference_release(&peer);
     return same && released;
-#elif defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     runtime_process_image_reference_t peer;
     runtime_process_image_reference_init(&peer);
     bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
