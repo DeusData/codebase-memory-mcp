@@ -755,13 +755,22 @@ static int wide_stat(const char *path, struct stat *st) {
  * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
  * discovery from walking through a junction that points outside the project
  * root, mirroring the POSIX S_ISLNK skip. */
-static int safe_stat(const char *abs_path, struct stat *st) {
+/* Fills *st and returns 0 for an entry we index. Returns CBM_NOT_FOUND otherwise,
+ * setting *is_link when the reason is that the entry is a symlink: symlinks are
+ * skipped by policy, which is not the same as failing to observe the tree. */
+static int safe_stat(const char *abs_path, struct stat *st, bool *is_link) {
+    if (is_link) {
+        *is_link = false;
+    }
 #ifdef _WIN32
     wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (wpath) {
         DWORD attr = GetFileAttributesW(wpath);
         free(wpath);
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            if (is_link) {
+                *is_link = true;
+            }
             return CBM_NOT_FOUND;
         }
     }
@@ -771,6 +780,9 @@ static int safe_stat(const char *abs_path, struct stat *st) {
         return CBM_NOT_FOUND;
     }
     if (S_ISLNK(st->st_mode)) {
+        if (is_link) {
+            *is_link = true;
+        }
         return CBM_NOT_FOUND;
     }
     return 0;
@@ -887,8 +899,14 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     struct stat st;
-    if (safe_stat(abs_path, &st) != 0) {
-        if (out->count_only) {
+    bool entry_is_symlink = false;
+    if (safe_stat(abs_path, &st, &entry_is_symlink) != 0) {
+        /* A count aborts when it cannot observe an entry, because its caller
+         * (auto-index admission) treats an unreliable count as a refusal. A
+         * symlink is not that case: it is skipped deliberately, on every walk.
+         * Failing here made one symlink anywhere in a tree refuse the whole
+         * repo, and the refusal surfaced as "unsafe_or_unavailable_path". */
+        if (out->count_only && !entry_is_symlink) {
             out->failed = true;
         }
         return;
