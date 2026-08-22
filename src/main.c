@@ -2175,6 +2175,26 @@ static void main_daemon_ctl_open_browser(int port) {
     }
 }
 
+/* Ask the daemon to enable the UI on `port`; true when it accepted.
+ *
+ * The seam below forces the refusal that the caller must survive. Reproducing it
+ * for real needs a machine loaded enough to miss a bounded handshake, which is
+ * not a state a test can ask for; it is COMPILED OUT of ordinary builds (see
+ * TEST_SEAMS in Makefile.cbm). */
+static bool main_daemon_ctl_apply_ui_config(cbm_daemon_runtime_client_t *client,
+                                            uint8_t update_mask, int port) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char forced[8];
+    if (cbm_safe_getenv("CBM_TEST_DAEMON_UI_CONFIG_REFUSED", forced, sizeof(forced), NULL) &&
+        forced[0] == '1') {
+        return false;
+    }
+#endif
+    return cbm_daemon_application_client_set_ui_config(client, update_mask, true, port,
+                                                       MAIN_CONNECT_TIMEOUT_MS) ==
+           CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
 static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_io, int port,
                                           bool open_browser) {
     if (!open_browser) {
@@ -2380,6 +2400,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     /* The committed control connection satisfied the daemon's no-client
      * startup window; configure the UI before departing. */
     int ui_port = 0;
+    bool ui_configured = false;
     if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
@@ -2388,14 +2409,30 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         bool context_set =
             main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,
                                     MAIN_CONNECT_TIMEOUT_MS);
-        if (!context_set || cbm_daemon_application_client_set_ui_config(
-                                start_result.client, update_mask, true, ui_port,
-                                MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        ui_configured = context_set &&
+                        main_daemon_ctl_apply_ui_config(start_result.client, update_mask, ui_port);
+        if (!ui_configured) {
+            /* Reaching here means the daemon is up: the control connection above
+             * already satisfied its startup window. Only the UI handshake — two
+             * requests bounded by MAIN_CONNECT_TIMEOUT_MS — came back short.
+             *
+             * Whether that is fatal depends on what was asked for. `--port`/`--open`
+             * make the UI the point of the command, so failing to configure it is a
+             * failed command. A bare `daemon start` asks for a daemon, and it got
+             * one; reporting failure there sent operators hunting for a daemon that
+             * was in fact running and healthy. It also made a loaded machine look
+             * like a broken one, because a second of scheduling delay after an
+             * abrupt shutdown is enough to miss this handshake. */
+            if (requested_port > 0 || open_browser) {
+                (void)fprintf(stderr,
+                              "error: the daemon did not accept the UI configuration; browser was "
+                              "not opened\n");
+                (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
+                return EXIT_FAILURE;
+            }
             (void)fprintf(stderr,
-                          "error: the daemon did not accept the UI configuration; browser was "
-                          "not opened\n");
-            (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
-            return EXIT_FAILURE;
+                          "warning: the daemon started but did not accept the UI configuration; "
+                          "the UI is unavailable until the next `daemon start`\n");
         }
     } else if (requested_port > 0 || open_browser) {
         (void)fprintf(stderr, "warning: this binary was built without UI support; "
@@ -2412,8 +2449,10 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
+    /* Skipped when the handshake was refused: that path announces the port as
+     * warming, which would be a promise nothing is keeping. */
     int ui_result =
-        (CBM_EMBEDDED_FILE_COUNT > 0)
+        (CBM_EMBEDDED_FILE_COUNT > 0 && ui_configured)
             ? main_daemon_ctl_finish_ui_open(&start_result.client, ui_port, open_browser)
             : EXIT_SUCCESS;
     if (start_result.client) {
