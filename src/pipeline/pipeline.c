@@ -156,6 +156,12 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    cbm_index_resource_policy_t resource_policy;
+    cbm_index_resource_violation_t resource_violation;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    cbm_pipeline_storage_probe_fn storage_probe;
+    void *storage_probe_context;
+#endif
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -304,6 +310,31 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
+                                      const cbm_index_resource_policy_t *policy) {
+    if (p && policy) {
+        p->resource_policy = *policy;
+    }
+}
+
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation) {
+    if (violation) {
+        *violation = p ? p->resource_violation : (cbm_index_resource_violation_t){0};
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_set_storage_probe_for_testing(cbm_pipeline_t *p,
+                                                cbm_pipeline_storage_probe_fn probe,
+                                                void *context) {
+    if (p) {
+        p->storage_probe = probe;
+        p->storage_probe_context = context;
+    }
+}
+#endif
+
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name || !name[0]) {
         return false;
@@ -411,6 +442,15 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
+}
+
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p) {
+    return p && cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy
+                                                                        : NULL;
+}
+
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p) {
+    return p ? &p->resource_violation : NULL;
 }
 
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
@@ -1671,7 +1711,6 @@ int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation)
     if (generation->cancelled && atomic_load(generation->cancelled)) {
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
-
     /* The staging name must be unpredictable and created exclusively. It used
      * to be "<db>.stage.<pid>.<counter>", which any other process can compute
      * in advance; this path is then unlinked and written, so in a
@@ -1916,15 +1955,17 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     cbm_pipeline_persist_test_run_before_final_manifest();
 #endif
-    if (cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
-                                                   &manifest, &manifest_count) != 0) {
+    int manifest_rc =
+        cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &manifest, &manifest_count);
+    if (manifest_rc != 0) {
         cbm_log_error("pipeline.err", "phase", "semantic_manifest");
         /* db_path and db_dir are this function's strdups; the success tail and
          * the publish-failure return release them, and these two aborts must
          * too -- LSan caught exactly these paths leaking both strings. */
         free(db_dir);
         free(db_path);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                                          : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     if (!cbm_pipeline_semantic_manifests_equal(baseline_manifest, baseline_count, manifest,
                                                manifest_count)) {
@@ -2178,10 +2219,14 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
+    p->resource_violation = (cbm_index_resource_violation_t){0};
     cbm_discover_opts_t opts = {
         .mode = p->requested_mode,
         .ignore_file = NULL,
         .max_file_size = 0,
+        .resource_policy =
+            cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
+        .resource_violation = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;
     int file_count = 0;
@@ -2206,7 +2251,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
     if (rc != 0 || check_cancel(p)) {
-        rc = CBM_NOT_FOUND;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
         goto cleanup;
     }
 
@@ -2214,14 +2259,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * bytes drive exact no-op comparison and are checked against a fresh
      * rediscovery immediately before any replacement is published. */
     rc = mode_promoted
-             ? cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
-                                                          &baseline_manifest, &baseline_count)
+             ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
+                                                          &baseline_count)
              : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
                                                     file_count, p->excluded_dirs, p->excluded_count,
                                                     &p->git_ctx, p->userconfig, &baseline_manifest,
                                                     &baseline_count);
     if (rc != 0) {
-        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                               : CBM_PIPELINE_ABORT_PRESERVE_DB;
         goto cleanup;
     }
 
@@ -2265,7 +2311,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         cbm_log_info("pipeline.rediscover", "requested_mode", pipeline_mode_name(p->requested_mode),
                      "effective_mode", pipeline_mode_name(p->mode), "files", itoa_buf(file_count));
         if (rc != 0 || check_cancel(p)) {
-            rc = CBM_NOT_FOUND;
+            rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
             goto cleanup;
         }
     }
@@ -2334,6 +2380,216 @@ cleanup:
     return rc;
 }
 
+static const cbm_index_limit_u64_t *storage_limit_for_resource(
+    const cbm_index_resource_policy_t *policy, cbm_index_resource_t resource) {
+    if (!policy) {
+        return NULL;
+    }
+    switch (resource) {
+    case CBM_INDEX_RESOURCE_CACHE_BYTES:
+        return &policy->max_cache_bytes;
+    case CBM_INDEX_RESOURCE_FREE_DISK_BYTES:
+        return &policy->min_free_disk_bytes;
+    case CBM_INDEX_RESOURCE_FINAL_DB_BYTES:
+        return &policy->max_final_db_bytes;
+    case CBM_INDEX_RESOURCE_STAGING_BYTES:
+        return &policy->max_staging_bytes;
+    case CBM_INDEX_RESOURCE_TASK_TEMP_BYTES:
+        return &policy->max_task_temp_bytes;
+    default:
+        return NULL;
+    }
+}
+
+static cbm_index_resource_t storage_enabled_probe_resource(
+    const cbm_index_resource_policy_t *policy) {
+    if (policy->max_cache_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_CACHE_BYTES;
+    }
+    if (policy->min_free_disk_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_FREE_DISK_BYTES;
+    }
+    if (policy->max_staging_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_STAGING_BYTES;
+    }
+    if (policy->max_task_temp_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_TASK_TEMP_BYTES;
+    }
+    return policy->max_final_db_bytes.enabled ? CBM_INDEX_RESOURCE_FINAL_DB_BYTES
+                                              : CBM_INDEX_RESOURCE_NONE;
+}
+
+static char *storage_root_from_final_path(const char *final_path) {
+    if (!final_path) {
+        return NULL;
+    }
+    char *root = strdup(final_path);
+    if (!root) {
+        return NULL;
+    }
+    char *slash = strrchr(root, '/');
+#ifdef _WIN32
+    char *backslash = strrchr(root, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    if (!slash) {
+        free(root);
+        return strdup(".");
+    }
+    if (slash == root) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return root;
+}
+
+static bool storage_regular_file_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    cbm_path_info_t info;
+    cbm_path_probe_status_t status = cbm_path_probe_info_utf8(path, &info);
+    if (status == CBM_PATH_PROBE_NOT_FOUND) {
+        *bytes_out = 0;
+        return true;
+    }
+    if (status != CBM_PATH_PROBE_OK || !info.is_regular || info.is_symlink || info.size < 0) {
+        return false;
+    }
+    *bytes_out = (uint64_t)info.size;
+    return true;
+}
+
+static bool storage_replaceable_old_bytes(const char *final_path, uint64_t *bytes_out) {
+    if (!final_path || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    cbm_path_info_t info;
+    cbm_path_probe_status_t status = cbm_path_probe_info_utf8(final_path, &info);
+    if (status == CBM_PATH_PROBE_NOT_FOUND) {
+        return true;
+    }
+    if (status != CBM_PATH_PROBE_OK || !info.is_regular || info.is_symlink) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(final_path);
+    if (!store) {
+        /* A file that cannot be opened is not proven replaceable. Keep its
+         * bytes in the projection rather than blocking repair of a confirmed
+         * corrupt/non-database destination. */
+        return true;
+    }
+    cbm_integrity_verdict_t verdict = cbm_store_check_integrity_verdict(store);
+    cbm_store_close(store);
+    if (verdict == CBM_INTEGRITY_TRANSIENT) {
+        return false;
+    }
+    /* A generation that cannot be proven healthy remains in current_cache but is
+     * not deducted: publication may quarantine it instead of replacing it. */
+    return verdict != CBM_INTEGRITY_OK || cbm_db_artifact_bytes(final_path, bytes_out);
+}
+
+static bool storage_probe_default(const cbm_index_resource_policy_t *policy,
+                                  cbm_pipeline_storage_checkpoint_t checkpoint,
+                                  const char *final_path, const char *staging_path,
+                                  cbm_index_storage_sample_t *sample,
+                                  cbm_index_resource_t *failed_resource) {
+    *sample = (cbm_index_storage_sample_t){0};
+    *failed_resource = CBM_INDEX_RESOURCE_NONE;
+    char *storage_root = NULL;
+    if (policy->max_cache_bytes.enabled || policy->min_free_disk_bytes.enabled) {
+        storage_root = storage_root_from_final_path(final_path);
+        if (!storage_root) {
+            *failed_resource = storage_enabled_probe_resource(policy);
+            return false;
+        }
+    }
+    uint64_t operation_bytes = 0;
+    bool need_operation =
+        staging_path &&
+        (policy->max_cache_bytes.enabled || policy->max_staging_bytes.enabled ||
+         policy->max_task_temp_bytes.enabled ||
+         (checkpoint == CBM_PIPELINE_STORAGE_PREPUBLISH && policy->max_final_db_bytes.enabled));
+    if (need_operation && !cbm_db_artifact_bytes(staging_path, &operation_bytes)) {
+        *failed_resource =
+            policy->max_staging_bytes.enabled
+                ? CBM_INDEX_RESOURCE_STAGING_BYTES
+                : (policy->max_task_temp_bytes.enabled
+                       ? CBM_INDEX_RESOURCE_TASK_TEMP_BYTES
+                       : (policy->max_final_db_bytes.enabled ? CBM_INDEX_RESOURCE_FINAL_DB_BYTES
+                                                             : CBM_INDEX_RESOURCE_CACHE_BYTES));
+        free(storage_root);
+        return false;
+    }
+    if (policy->max_cache_bytes.enabled) {
+        uint64_t cache_with_operation = 0;
+        if (!cbm_directory_size_bytes(storage_root, &cache_with_operation) ||
+            !storage_replaceable_old_bytes(final_path, &sample->replaceable_old_bytes)) {
+            *failed_resource = CBM_INDEX_RESOURCE_CACHE_BYTES;
+            free(storage_root);
+            return false;
+        }
+        sample->current_cache_bytes =
+            cache_with_operation > operation_bytes ? cache_with_operation - operation_bytes : 0;
+        sample->operation_bytes = operation_bytes;
+    }
+    if (policy->min_free_disk_bytes.enabled &&
+        !cbm_filesystem_free_bytes(storage_root, &sample->free_disk_bytes)) {
+        *failed_resource = CBM_INDEX_RESOURCE_FREE_DISK_BYTES;
+        free(storage_root);
+        return false;
+    }
+    free(storage_root);
+    if (checkpoint != CBM_PIPELINE_STORAGE_PREFLIGHT) {
+        sample->staging_bytes = operation_bytes;
+        sample->task_temp_bytes = operation_bytes;
+    }
+    if (checkpoint == CBM_PIPELINE_STORAGE_PREPUBLISH && policy->max_final_db_bytes.enabled &&
+        !storage_regular_file_bytes(staging_path, &sample->final_db_bytes)) {
+        *failed_resource = CBM_INDEX_RESOURCE_FINAL_DB_BYTES;
+        return false;
+    }
+    return true;
+}
+
+int cbm_pipeline_storage_admit(cbm_pipeline_t *p, cbm_pipeline_storage_checkpoint_t checkpoint,
+                               const char *final_path, const char *staging_path) {
+    if (!p || !cbm_index_policy_storage_enabled(&p->resource_policy)) {
+        return 0;
+    }
+    cbm_index_storage_sample_t sample;
+    cbm_index_resource_t failed_resource = CBM_INDEX_RESOURCE_NONE;
+    bool measured;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (p->storage_probe) {
+        measured = p->storage_probe(checkpoint, final_path, staging_path, &sample, &failed_resource,
+                                    p->storage_probe_context);
+    } else
+#endif
+    {
+        measured = storage_probe_default(&p->resource_policy, checkpoint, final_path, staging_path,
+                                         &sample, &failed_resource);
+    }
+    if (!measured) {
+        const cbm_index_limit_u64_t *limit =
+            storage_limit_for_resource(&p->resource_policy, failed_resource);
+        p->resource_violation = (cbm_index_resource_violation_t){
+            .resource = failed_resource,
+            .limit = limit && limit->enabled ? limit->value : 0,
+            .probe_failed = true,
+        };
+        return CBM_PIPELINE_RESOURCE_LIMIT;
+    }
+    if (!cbm_index_policy_check_storage(&p->resource_policy, &sample, &p->resource_violation)) {
+        return CBM_PIPELINE_RESOURCE_LIMIT;
+    }
+    return 0;
+}
+
 static void cleanup_staging_db(const char *path) {
     if (!path) {
         return;
@@ -2367,16 +2623,41 @@ static bool ensure_db_parent(const char *path) {
     return ok;
 }
 
+static bool staging_token_valid(const char *token) {
+    size_t length = token ? strlen(token) : 0;
+    if (length < 6U || length >= CBM_SZ_64) {
+        return false;
+    }
+    for (size_t index = 0; index < length; index++) {
+        unsigned char ch = (unsigned char)token[index];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+              ch == '-' || ch == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static char *create_staging_path(const char *final_path) {
     if (!final_path) {
         return NULL;
     }
-    static const char suffix[] = ".stage.XXXXXX";
-    size_t final_len = strlen(final_path);
-    if (final_len > SIZE_MAX - sizeof(suffix)) {
+    char suffix[CBM_SZ_128];
+    const char *stage_token = getenv("CBM_INDEX_STAGE_TOKEN");
+    if (!staging_token_valid(stage_token)) {
+        stage_token = NULL;
+    }
+    int suffix_length = stage_token && stage_token[0]
+                            ? snprintf(suffix, sizeof(suffix), ".stage.%s.XXXXXX", stage_token)
+                            : snprintf(suffix, sizeof(suffix), ".stage.XXXXXX");
+    if (suffix_length <= 0 || (size_t)suffix_length >= sizeof(suffix)) {
         return NULL;
     }
-    size_t path_size = final_len + sizeof(suffix);
+    size_t final_len = strlen(final_path);
+    if (final_len > SIZE_MAX - (size_t)suffix_length - 1U) {
+        return NULL;
+    }
+    size_t path_size = final_len + (size_t)suffix_length + 1U;
 #ifdef _WIN32
     /* The Windows cbm_mkstemp compatibility contract may expand a /tmp/
      * prefix in-place and copies through a 4 KiB scratch path. Give it that
@@ -2391,7 +2672,7 @@ static char *create_staging_path(const char *final_path) {
         return NULL;
     }
     memcpy(path, final_path, final_len);
-    memcpy(path + final_len, suffix, sizeof(suffix));
+    memcpy(path + final_len, suffix, (size_t)suffix_length + 1U);
     int fd = cbm_mkstemp(path);
     if (fd < 0) {
         free(path);
@@ -2510,10 +2791,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->resource_violation = (cbm_index_resource_violation_t){0};
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);
         return CBM_NOT_FOUND;
+    }
+    int storage_rc =
+        cbm_pipeline_storage_admit(p, CBM_PIPELINE_STORAGE_PREFLIGHT, final_path, NULL);
+    if (storage_rc != 0) {
+        free(final_path);
+        return storage_rc;
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
@@ -2557,6 +2845,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return rc;
     }
+    storage_rc =
+        cbm_pipeline_storage_admit(p, CBM_PIPELINE_STORAGE_GROWTH, final_path, staging_path);
+    if (storage_rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return storage_rc;
+    }
     if (check_cancel(p)) {
         cleanup_staging_db(staging_path);
         free(staging_path);
@@ -2587,6 +2883,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(staging_path);
         free(final_path);
         return CBM_PIPELINE_PERSIST_FAILED;
+    }
+    storage_rc =
+        cbm_pipeline_storage_admit(p, CBM_PIPELINE_STORAGE_PREPUBLISH, final_path, staging_path);
+    if (storage_rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return storage_rc;
     }
 
     cbm_replacement_prepare_t prepared = {0};
