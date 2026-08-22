@@ -10,6 +10,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
+| Latest indexing attempt | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/status/<project>.json` | JSON | Owner-private, atomically replaced status used by `index_status`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
 | Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
 | Activation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
@@ -86,6 +87,36 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `index_resource_profile` | `off` | Composed index resource baseline: `off`, `balanced`, or `strict`. |
+| `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
+| `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `index_max_rss_mb` | `off` | Optional maximum current RSS in MiB for the complete contained index-worker process tree (`64..1048576`). |
+| `index_max_duration_seconds` | `off` | Optional maximum total worker duration in seconds (`1..86400`). |
+| `index_cache_max_mb` | `off` | Optional maximum projected cache size in MiB after publication. |
+| `index_min_free_disk_mb` | `off` | Optional minimum free MiB reserved on the cache filesystem while indexing. |
+
+The profile and all six individual resource settings are disabled by default.
+An individual stored value replaces its profile dimension; storing `off`
+disables only that dimension. Profile-only limits also bound traversed
+directories, directory entries, depth, discovery time, final database size,
+staging size, and task temporary size. Effective limits apply to explicit
+indexing, automatic indexing, and watcher re-indexing,
+but not to `cross-repo-intelligence`, which does not scan or publish repository
+source indexes. Equality is allowed; exceeding a setting fails the complete
+index request and preserves any previously serving database. Worker RSS covers
+descendants and is not the same as the internal `CBM_MEM_BUDGET_MB` allocation
+budget. Total duration is independent of the existing 15-minute no-log-progress
+timeout. See
+[Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
+error-response details.
+
+After the first physical indexing attempt for a project, `index_status` adds
+`last_index_attempt` and `freshness`. Freshness is `fresh` only when a clean
+Git snapshot observed both before and after indexing still matches the current
+clean `HEAD`. A different clean `HEAD` is `stale`, while non-Git, dirty,
+changed-during-index, missing, or unreadable snapshots are `unknown`.
+`delete_project` also removes a matching attempt record when no database was
+published.
 
 ## 3. UI Settings
 

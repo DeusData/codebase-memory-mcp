@@ -151,6 +151,240 @@ TEST(pipeline_run_null) {
     PASS();
 }
 
+TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing) {
+    char *repo = th_mktempdir("cbm_pipeline_discovery_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "second.py"), "second = 2\n"), 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+
+    ASSERT_EQ(cbm_pipeline_run(pipeline), CBM_PIPELINE_RESOURCE_LIMIT);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+
+    cbm_pipeline_free(pipeline);
+    th_cleanup(repo);
+    PASS();
+}
+
+typedef struct {
+    const char *target_db;
+    cbm_pipeline_storage_checkpoint_t fail_at;
+    cbm_index_resource_t failed_resource;
+    cbm_index_storage_sample_t samples[3];
+    bool sample_set[3];
+    int calls[3];
+    int unexpected_paths;
+} pipeline_storage_probe_fake_t;
+
+static bool pipeline_storage_probe_fake(cbm_pipeline_storage_checkpoint_t checkpoint,
+                                        const char *final_db_path, const char *staging_db_path,
+                                        cbm_index_storage_sample_t *sample,
+                                        cbm_index_resource_t *failed_resource, void *context) {
+    (void)staging_db_path;
+    pipeline_storage_probe_fake_t *fake = (pipeline_storage_probe_fake_t *)context;
+    fake->calls[checkpoint]++;
+    if (fake->target_db && (!final_db_path || strcmp(fake->target_db, final_db_path) != 0)) {
+        fake->unexpected_paths++;
+    }
+    *sample = (cbm_index_storage_sample_t){
+        .current_cache_bytes = 0,
+        .free_disk_bytes = UINT64_MAX,
+    };
+    if (fake->sample_set[checkpoint]) {
+        *sample = fake->samples[checkpoint];
+    }
+    if (fake->failed_resource != CBM_INDEX_RESOURCE_NONE && checkpoint == fake->fail_at &&
+        fake->target_db && final_db_path && strcmp(fake->target_db, final_db_path) == 0) {
+        *failed_resource = fake->failed_resource;
+        return false;
+    }
+    return true;
+}
+
+static int pipeline_stage_artifact_count(const char *directory) {
+    cbm_dir_t *dir = cbm_opendir(directory);
+    if (!dir) {
+        return -1;
+    }
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strstr(entry->name, ".stage.")) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+TEST(pipeline_disabled_storage_policy_performs_no_probes) {
+    char *repo = th_mktempdir("cbm_pipeline_storage_off");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    char db_path[CBM_SZ_4K];
+    (void)snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    pipeline_storage_probe_fake_t fake = {.target_db = db_path,
+                                          .fail_at = CBM_PIPELINE_STORAGE_PREFLIGHT,
+                                          .failed_resource = CBM_INDEX_RESOURCE_FREE_DISK_BYTES};
+    cbm_pipeline_set_storage_probe_for_testing(pipeline, pipeline_storage_probe_fake, &fake);
+
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    ASSERT_EQ(fake.calls[CBM_PIPELINE_STORAGE_PREFLIGHT], 0);
+    ASSERT_EQ(fake.calls[CBM_PIPELINE_STORAGE_GROWTH], 0);
+    ASSERT_EQ(fake.calls[CBM_PIPELINE_STORAGE_PREPUBLISH], 0);
+    cbm_pipeline_free(pipeline);
+    th_cleanup(repo);
+    PASS();
+}
+
+TEST(pipeline_storage_probe_failure_preserves_old_db_and_cleans_stage) {
+    char *repo = th_mktempdir("cbm_pipeline_storage_probe");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int original(void) { return 1; }\n"), 0);
+    char db_path[CBM_SZ_4K];
+    (void)snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    cbm_pipeline_t *first = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    const char *project = cbm_pipeline_project_name(first);
+    char *project_copy = project ? strdup(project) : NULL;
+    cbm_pipeline_free(first);
+    ASSERT_NOT_NULL(project_copy);
+
+    cbm_store_t *before = cbm_store_open_path_query(db_path);
+    cbm_project_t before_project = {0};
+    ASSERT_NOT_NULL(before);
+    ASSERT_EQ(cbm_store_get_project(before, project_copy, &before_project), CBM_STORE_OK);
+    char *indexed_at = before_project.indexed_at ? strdup(before_project.indexed_at) : NULL;
+    cbm_project_free_fields(&before_project);
+    cbm_store_close(before);
+    ASSERT_NOT_NULL(indexed_at);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int changed(void) { return 2; }\n"), 0);
+
+    cbm_pipeline_t *second = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(second);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.min_free_disk_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(second, &policy);
+    pipeline_storage_probe_fake_t fake = {.target_db = db_path,
+                                          .fail_at = CBM_PIPELINE_STORAGE_PREPUBLISH,
+                                          .failed_resource = CBM_INDEX_RESOURCE_FREE_DISK_BYTES};
+    cbm_pipeline_set_storage_probe_for_testing(second, pipeline_storage_probe_fake, &fake);
+    int rc = cbm_pipeline_run(second);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(second, &violation);
+    cbm_pipeline_free(second);
+
+    cbm_store_t *after = cbm_store_open_path_query(db_path);
+    cbm_project_t after_project = {0};
+    bool preserved = after &&
+                     cbm_store_get_project(after, project_copy, &after_project) == CBM_STORE_OK &&
+                     after_project.indexed_at && strcmp(indexed_at, after_project.indexed_at) == 0;
+    cbm_project_free_fields(&after_project);
+    cbm_store_close(after);
+    int stage_count = pipeline_stage_artifact_count(repo);
+    free(indexed_at);
+    free(project_copy);
+    th_cleanup(repo);
+
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FREE_DISK_BYTES);
+    ASSERT_TRUE(violation.probe_failed);
+    ASSERT_TRUE(fake.calls[CBM_PIPELINE_STORAGE_PREPUBLISH] > 0);
+    ASSERT_TRUE(preserved);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
+TEST(pipeline_full_and_incremental_storage_limits_report_identical_failure) {
+    char *full_repo = th_mktempdir("cbm_pipeline_storage_full");
+    char *incremental_repo = th_mktempdir("cbm_pipeline_storage_incremental");
+    ASSERT_NOT_NULL(full_repo);
+    ASSERT_NOT_NULL(incremental_repo);
+    ASSERT_EQ(th_write_file(TH_PATH(full_repo, "main.c"), "int full(void) { return 1; }\n"), 0);
+    ASSERT_EQ(
+        th_write_file(TH_PATH(incremental_repo, "main.c"), "int incremental(void) { return 1; }\n"),
+        0);
+    char full_db[CBM_SZ_4K];
+    char incremental_db[CBM_SZ_4K];
+    (void)snprintf(full_db, sizeof(full_db), "%s/index.db", full_repo);
+    (void)snprintf(incremental_db, sizeof(incremental_db), "%s/index.db", incremental_repo);
+
+    cbm_pipeline_t *seed = cbm_pipeline_new(incremental_repo, incremental_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(seed);
+    ASSERT_EQ(cbm_pipeline_run(seed), 0);
+    cbm_pipeline_free(seed);
+    ASSERT_EQ(
+        th_write_file(TH_PATH(incremental_repo, "main.c"), "int incremental(void) { return 2; }\n"),
+        0);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_staging_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 100};
+    pipeline_storage_probe_fake_t full_fake = {.target_db = full_db};
+    full_fake.sample_set[CBM_PIPELINE_STORAGE_GROWTH] = true;
+    full_fake.samples[CBM_PIPELINE_STORAGE_GROWTH] =
+        (cbm_index_storage_sample_t){.free_disk_bytes = UINT64_MAX, .staging_bytes = 101};
+    pipeline_storage_probe_fake_t incremental_fake = full_fake;
+    incremental_fake.target_db = incremental_db;
+
+    cbm_pipeline_t *full = cbm_pipeline_new(full_repo, full_db, CBM_MODE_FAST);
+    cbm_pipeline_t *incremental = cbm_pipeline_new(incremental_repo, incremental_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(full);
+    ASSERT_NOT_NULL(incremental);
+    cbm_pipeline_set_resource_policy(full, &policy);
+    cbm_pipeline_set_resource_policy(incremental, &policy);
+    cbm_pipeline_set_storage_probe_for_testing(full, pipeline_storage_probe_fake, &full_fake);
+    cbm_pipeline_set_storage_probe_for_testing(incremental, pipeline_storage_probe_fake,
+                                               &incremental_fake);
+    int full_rc = cbm_pipeline_run(full);
+    int incremental_rc = cbm_pipeline_run(incremental);
+    cbm_index_resource_violation_t full_violation = {0};
+    cbm_index_resource_violation_t incremental_violation = {0};
+    cbm_pipeline_get_resource_violation(full, &full_violation);
+    cbm_pipeline_get_resource_violation(incremental, &incremental_violation);
+    cbm_pipeline_free(full);
+    cbm_pipeline_free(incremental);
+
+    ASSERT_EQ(full_rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(incremental_rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(full_violation.resource, CBM_INDEX_RESOURCE_STAGING_BYTES);
+    ASSERT_EQ(incremental_violation.resource, full_violation.resource);
+    ASSERT_EQ(incremental_violation.observed, full_violation.observed);
+    ASSERT_EQ(incremental_violation.limit, full_violation.limit);
+    ASSERT_STR_EQ(cbm_index_resource_unit(incremental_violation.resource),
+                  cbm_index_resource_unit(full_violation.resource));
+    ASSERT_EQ(full_fake.unexpected_paths, 0);
+    ASSERT_EQ(incremental_fake.unexpected_paths, 0);
+    ASSERT_EQ(full_fake.calls[CBM_PIPELINE_STORAGE_PREFLIGHT], 1);
+    ASSERT_EQ(full_fake.calls[CBM_PIPELINE_STORAGE_GROWTH], 1);
+    ASSERT_EQ(full_fake.calls[CBM_PIPELINE_STORAGE_PREPUBLISH], 0);
+    ASSERT_EQ(incremental_fake.calls[CBM_PIPELINE_STORAGE_PREFLIGHT], 1);
+    ASSERT_EQ(incremental_fake.calls[CBM_PIPELINE_STORAGE_GROWTH], 1);
+    ASSERT_EQ(incremental_fake.calls[CBM_PIPELINE_STORAGE_PREPUBLISH], 0);
+    ASSERT_EQ(pipeline_stage_artifact_count(full_repo), 0);
+    ASSERT_EQ(pipeline_stage_artifact_count(incremental_repo), 0);
+    th_cleanup(full_repo);
+    th_cleanup(incremental_repo);
+    PASS();
+}
+
 /* ── Focused: file-backed store persistence ─────────────────────── */
 
 TEST(store_file_persistence) {
@@ -2975,6 +3209,44 @@ typedef struct {
 static void mutate_semantic_input_before_final_manifest(void *userdata) {
     manifest_race_mutation_t *mutation = (manifest_race_mutation_t *)userdata;
     mutation->write_rc = th_write_file(mutation->path, mutation->replacement);
+}
+
+TEST(pipeline_late_source_limit_preserves_previous_generation) {
+    char *repo = th_mktempdir("cbm_pipeline_late_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    char db_path[512];
+    char late_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    snprintf(late_path, sizeof(late_path), "%s/late.py", repo);
+
+    manifest_race_mutation_t mutation = {
+        .path = late_path,
+        .replacement = "late = 2\n",
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    cbm_pipeline_free(pipeline);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    th_cleanup(repo);
+    PASS();
 }
 
 /* A graph and its exact manifest are one generation. If source bytes change
@@ -12083,6 +12355,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing);
+    RUN_TEST(pipeline_disabled_storage_policy_performs_no_probes);
+    RUN_TEST(pipeline_storage_probe_failure_preserves_old_db_and_cleans_stage);
+    RUN_TEST(pipeline_full_and_incremental_storage_limits_report_identical_failure);
+    RUN_TEST(pipeline_late_source_limit_preserves_previous_generation);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
