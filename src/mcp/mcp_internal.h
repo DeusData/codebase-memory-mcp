@@ -1,9 +1,12 @@
 #ifndef CBM_MCP_INTERNAL_H
 #define CBM_MCP_INTERNAL_H
 
+#include "foundation/index_policy.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h" /* cbm_changed_hunk_t */
 #include "store/store.h"       /* cbm_node_t */
+
+#include <yyjson/yyjson.h>
 
 /* White-box fault injection for deterministic cross-platform quarantine
  * safety tests. This header is internal and is not part of the MCP API. */
@@ -24,6 +27,38 @@ bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv);
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
  * On success replaces and frees *response_io; on failure it is unchanged. */
 bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice);
+
+/* Encode the complete trusted policy on an internal worker request. Callers
+ * must remove any untrusted field with the same name before invoking this. */
+bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                      const cbm_index_resource_policy_t *policy);
+bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
+                                             char *error, size_t error_size);
+bool cbm_mcp_index_task_db_path(const char *args, char *path_out, size_t path_size);
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result);
+
+typedef enum {
+    CBM_INDEX_ATTEMPT_NONE = 0,
+    CBM_INDEX_ATTEMPT_AVAILABLE,
+    CBM_INDEX_ATTEMPT_CORRUPT,
+} cbm_index_attempt_read_status_t;
+
+bool cbm_mcp_index_attempt_begin(const char *project, const char *repo_path, const char *origin,
+                                 const cbm_index_resource_policy_t *policy,
+                                 bool watcher_observed_change, char attempt_id[33]);
+bool cbm_mcp_index_attempt_transition(const char *project, const char *repo_path,
+                                      const char *attempt_id, const char *state,
+                                      const char *failure_code,
+                                      const cbm_index_resource_violation_t *violation,
+                                      bool generation_completed);
+bool cbm_mcp_index_attempt_mark_watcher_change(const char *project, const char *attempt_id);
+cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc *document,
+                                                                 yyjson_mut_val *root,
+                                                                 const char *project,
+                                                                 const char *current_root_path);
+bool cbm_mcp_index_attempt_remove(const char *project);
+void cbm_mcp_index_attempt_recover_abandoned(void);
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 

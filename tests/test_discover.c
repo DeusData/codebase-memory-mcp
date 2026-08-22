@@ -13,6 +13,21 @@ typedef struct {
     char *xdg_config_home;
 } git_env_snapshot_t;
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    uint64_t first;
+    uint64_t second;
+    uint64_t later;
+    int calls;
+} discover_clock_fake_t;
+
+static uint64_t discover_clock_fake(void *context) {
+    discover_clock_fake_t *fake = context;
+    int call = fake->calls++;
+    return call == 0 ? fake->first : call == 1 ? fake->second : fake->later;
+}
+#endif
+
 static git_env_snapshot_t save_git_env(void) {
     git_env_snapshot_t snapshot = {0};
     const char *home = getenv("HOME");
@@ -472,6 +487,326 @@ TEST(discover_bounded_count_matches_shebang_discovery) {
     ASSERT_EQ(exact_count, 3);
     ASSERT_EQ(limited, CBM_DISCOVER_LIMIT_EXCEEDED);
     ASSERT_EQ(limited_count, 2);
+    PASS();
+}
+
+TEST(discover_resource_policy_off_matches_legacy_discovery) {
+    char *base = th_mktempdir("cbm_disc_policy_off");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "src/first.c"), "int first;\n");
+    th_write_file(TH_PATH(base, "src/second.py"), "second = 2\n");
+    th_write_file(TH_PATH(base, "src/ignored.png"), "not source\n");
+
+    cbm_file_info_t *legacy_files = NULL;
+    int legacy_count = 0;
+    cbm_discover_opts_t legacy_opts = {.mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_discover(base, &legacy_opts, &legacy_files, &legacy_count), CBM_DISCOVER_OK);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_file_info_t *policy_files = NULL;
+    int policy_count = 0;
+    cbm_discover_opts_t policy_opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_discover_status_t status = cbm_discover(base, &policy_opts, &policy_files, &policy_count);
+
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(policy_count, legacy_count);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_NONE);
+    for (int index = 0; index < legacy_count; index++) {
+        ASSERT_STR_EQ(policy_files[index].rel_path, legacy_files[index].rel_path);
+        ASSERT_EQ(policy_files[index].size, legacy_files[index].size);
+    }
+
+    cbm_discover_free(legacy_files, legacy_count);
+    cbm_discover_free(policy_files, policy_count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_resource_file_limit_is_exact_and_counts_only_accepted_sources) {
+    char *base = th_mktempdir("cbm_disc_policy_files");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, ".gitignore"), "ignored.c\n");
+    th_write_file(TH_PATH(base, "accepted.c"), "int accepted;\n");
+    th_write_file(TH_PATH(base, "ignored.c"), "int ignored;\n");
+    th_write_file(TH_PATH(base, "unsupported.png"), "not source\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_NONE);
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "second.py"), "second = 2\n");
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_resource_source_bytes_allows_equality_and_rejects_one_more_byte) {
+    char *base = th_mktempdir("cbm_disc_policy_bytes");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "exact.c"), "1234567");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_source_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 7};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "plus.py"), "x");
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_SOURCE_BYTES);
+    ASSERT_EQ(violation.observed, 8);
+    ASSERT_EQ(violation.limit, 7);
+
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_profile_directory_limit_counts_root_and_admitted_directories) {
+    char *base = th_mktempdir("cbm_disc_policy_dirs");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "first/source.c"), "int first;\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_directories = (cbm_index_limit_u64_t){.enabled = true, .value = 2};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "second/source.py"), "second = 2\n");
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_DIRECTORIES);
+    ASSERT_EQ(violation.observed, 3);
+    ASSERT_EQ(violation.limit, 2);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_profile_entry_limit_counts_before_ignore_and_language_filters) {
+    char *base = th_mktempdir("cbm_disc_policy_entries");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, ".gitignore"), "ignored.c\n");
+    th_write_file(TH_PATH(base, "ignored.c"), "int ignored;\n");
+    th_write_file(TH_PATH(base, "asset.png"), "not source\n");
+    th_write_file(TH_PATH(base, "accepted.c"), "int accepted;\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_entries = (cbm_index_limit_u64_t){.enabled = true, .value = 4};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    policy.max_entries.value = 3;
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_ENTRIES);
+    ASSERT_EQ(violation.observed, 4);
+    ASSERT_EQ(violation.limit, 3);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_profile_depth_limit_allows_equality_and_rejects_child) {
+    char *base = th_mktempdir("cbm_disc_policy_depth");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "one/two/source.c"), "int source;\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_depth = (cbm_index_limit_u64_t){.enabled = true, .value = 2};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    policy.max_depth.value = 1;
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_DEPTH);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_profile_deadline_uses_monotonic_test_clock) {
+#ifndef CBM_ENABLE_TEST_SEAMS
+    SKIP_PLATFORM("discovery clock seam unavailable");
+#else
+    char *base = th_mktempdir("cbm_disc_policy_deadline");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "source.c"), "int source;\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.discovery_deadline_ms = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    discover_clock_fake_t clock = {.first = 1000, .second = 1001, .later = 1002};
+    cbm_discover_set_now_ms_for_testing(discover_clock_fake, &clock);
+    cbm_file_info_t *files = NULL;
+    int count = 99;
+    cbm_discover_status_t status = cbm_discover(base, &opts, &files, &count);
+    cbm_discover_set_now_ms_for_testing(NULL, NULL);
+
+    ASSERT_EQ(status, CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+
+    char empty[4096];
+    (void)snprintf(empty, sizeof(empty), "%s/empty", base);
+    ASSERT_EQ(th_mkdir_p(empty), 0);
+    violation = (cbm_index_resource_violation_t){0};
+    clock = (discover_clock_fake_t){.first = 2000, .second = 2001, .later = 2002};
+    cbm_discover_set_now_ms_for_testing(discover_clock_fake, &clock);
+    status = cbm_discover(empty, &opts, &files, &count);
+    cbm_discover_set_now_ms_for_testing(NULL, NULL);
+    ASSERT_EQ(status, CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+
+    violation = (cbm_index_resource_violation_t){0};
+    clock = (discover_clock_fake_t){.first = 3000, .second = 3001, .later = 3001};
+    cbm_discover_set_now_ms_for_testing(discover_clock_fake, &clock);
+    status = cbm_discover(empty, &opts, &files, &count);
+    cbm_discover_set_now_ms_for_testing(NULL, NULL);
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 0);
+    ASSERT(files == NULL);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_NONE);
+    th_cleanup(base);
+    PASS();
+#endif
+}
+
+TEST(discover_resource_file_budget_excludes_existing_oversized_skip) {
+    char *base = th_mktempdir("cbm_disc_policy_oversized");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "accepted.c"), "x");
+    th_write_file(TH_PATH(base, "oversized.py"), "123");
+    const char *saved_limit = getenv("CBM_MAX_FILE_BYTES");
+    char *saved_limit_copy = saved_limit ? strdup(saved_limit) : NULL;
+    cbm_setenv("CBM_MAX_FILE_BYTES", "2", 1);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    cbm_discover_status_t initial_status = cbm_discover(base, &opts, &files, &count);
+    bool oversized_did_not_consume_budget = initial_status == CBM_DISCOVER_OK && count == 2 &&
+                                            violation.resource == CBM_INDEX_RESOURCE_NONE;
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "second.c"), "y");
+    files = NULL;
+    count = 0;
+    cbm_discover_status_t exceeded_status = cbm_discover(base, &opts, &files, &count);
+    bool accepted_sources_exceeded = exceeded_status == CBM_DISCOVER_LIMIT_EXCEEDED &&
+                                     files == NULL && count == 0 &&
+                                     violation.resource == CBM_INDEX_RESOURCE_FILES &&
+                                     violation.observed == 2 && violation.limit == 1;
+
+    if (saved_limit_copy) {
+        cbm_setenv("CBM_MAX_FILE_BYTES", saved_limit_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    }
+    free(saved_limit_copy);
+    th_cleanup(base);
+
+    ASSERT_TRUE(oversized_did_not_consume_budget);
+    ASSERT_TRUE(accepted_sources_exceeded);
     PASS();
 }
 
@@ -1767,6 +2102,14 @@ SUITE(discover) {
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);
     RUN_TEST(discover_bounded_count_matches_shebang_discovery);
+    RUN_TEST(discover_resource_policy_off_matches_legacy_discovery);
+    RUN_TEST(discover_resource_file_limit_is_exact_and_counts_only_accepted_sources);
+    RUN_TEST(discover_resource_source_bytes_allows_equality_and_rejects_one_more_byte);
+    RUN_TEST(discover_profile_directory_limit_counts_root_and_admitted_directories);
+    RUN_TEST(discover_profile_entry_limit_counts_before_ignore_and_language_filters);
+    RUN_TEST(discover_profile_depth_limit_allows_equality_and_rejects_child);
+    RUN_TEST(discover_profile_deadline_uses_monotonic_test_clock);
+    RUN_TEST(discover_resource_file_budget_excludes_existing_oversized_skip);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);

@@ -13,6 +13,7 @@
 
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/workspace.h"
 #include "foundation/platform.h"
 #ifdef _WIN32
@@ -26,6 +27,25 @@
 #include <sys/stat.h>
 
 int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static cbm_discover_now_ms_fn g_discover_now_ms;
+static void *g_discover_now_ms_context;
+
+void cbm_discover_set_now_ms_for_testing(cbm_discover_now_ms_fn now_ms, void *context) {
+    g_discover_now_ms = now_ms;
+    g_discover_now_ms_context = context;
+}
+#endif
+
+static uint64_t discover_now_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_discover_now_ms) {
+        return g_discover_now_ms(g_discover_now_ms_context);
+    }
+#endif
+    return cbm_now_ms();
+}
 
 /* ── Hardcoded always-skip directories ──────────────────────────── */
 
@@ -414,6 +434,13 @@ typedef struct {
     int capacity;
     int max_files;
     uint64_t deadline_ms;
+    const cbm_index_resource_policy_t *resource_policy;
+    cbm_index_resource_violation_t *resource_violation;
+    uint64_t resource_started_ms;
+    uint64_t directories;
+    uint64_t entries;
+    uint64_t source_files;
+    uint64_t source_bytes;
     bool count_only;
     bool collect_excluded;
     bool limit_exceeded;
@@ -435,12 +462,39 @@ typedef struct {
     int ignored_total;
 } file_list_t;
 
+static void file_list_resource_violation(file_list_t *fl, cbm_index_resource_t resource,
+                                         uint64_t observed, uint64_t limit) {
+    if (!fl || fl->limit_exceeded || fl->failed) {
+        return;
+    }
+    fl->limit_exceeded = true;
+    if (fl->resource_violation) {
+        *fl->resource_violation = (cbm_index_resource_violation_t){
+            .resource = resource,
+            .observed = observed,
+            .limit = limit,
+        };
+    }
+}
+
 static bool file_list_should_stop(file_list_t *fl) {
     if (!fl) {
         return true;
     }
-    if (!fl->failed && fl->deadline_ms != 0 && cbm_now_ms() >= fl->deadline_ms) {
+    bool needs_now = fl->deadline_ms != 0 ||
+                     (fl->resource_policy && fl->resource_policy->discovery_deadline_ms.enabled);
+    uint64_t now = needs_now ? discover_now_ms() : 0;
+    if (!fl->failed && fl->deadline_ms != 0 && now >= fl->deadline_ms) {
         fl->failed = true;
+    }
+    if (!fl->failed && fl->resource_policy && fl->resource_policy->discovery_deadline_ms.enabled) {
+        uint64_t elapsed =
+            now >= fl->resource_started_ms ? now - fl->resource_started_ms : UINT64_C(0);
+        uint64_t limit = fl->resource_policy->discovery_deadline_ms.value;
+        if (elapsed > limit) {
+            file_list_resource_violation(fl, CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS, elapsed,
+                                         limit);
+        }
     }
     return fl->failed || fl->limit_exceeded;
 }
@@ -503,6 +557,28 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     if (fl->max_files >= 0 && fl->count >= fl->max_files) {
         fl->limit_exceeded = true;
         return;
+    }
+    uint64_t source_size = size > 0 ? (uint64_t)size : 0;
+    bool resource_accepted = fl->resource_policy && source_size <= (uint64_t)cbm_max_file_bytes();
+    if (resource_accepted) {
+        if (fl->resource_policy->max_files.enabled &&
+            fl->source_files >= fl->resource_policy->max_files.value) {
+            file_list_resource_violation(fl, CBM_INDEX_RESOURCE_FILES, fl->source_files + 1U,
+                                         fl->resource_policy->max_files.value);
+            return;
+        }
+        if (fl->resource_policy->max_source_bytes.enabled) {
+            uint64_t limit = fl->resource_policy->max_source_bytes.value;
+            if (source_size > limit || fl->source_bytes > limit - source_size) {
+                uint64_t observed = source_size > UINT64_MAX - fl->source_bytes
+                                        ? UINT64_MAX
+                                        : fl->source_bytes + source_size;
+                file_list_resource_violation(fl, CBM_INDEX_RESOURCE_SOURCE_BYTES, observed, limit);
+                return;
+            }
+            fl->source_bytes += source_size;
+        }
+        fl->source_files++;
     }
     if (fl->count_only) {
         fl->count++;
@@ -803,6 +879,7 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
 typedef struct {
     char dir[CBM_SZ_4K];
     char prefix[CBM_SZ_4K];
+    uint64_t depth;
     cbm_gitignore_t *local_gi;       /* nested .gitignore for this subtree */
     char local_gi_prefix[CBM_SZ_4K]; /* rel_prefix when local_gi was loaded */
 } walk_frame_t;
@@ -856,6 +933,7 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
         return;
     }
     slot->local_gi = parent->local_gi;
+    slot->depth = parent->depth + 1U;
     int local_prefix_length =
         snprintf(slot->local_gi_prefix, CBM_SZ_4K, "%s", parent->local_gi_prefix);
     if (local_prefix_length < 0 || local_prefix_length >= CBM_SZ_4K) {
@@ -871,6 +949,18 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
                                    const cbm_gitignore_t *global_gi,
                                    const cbm_gitignore_t *cbmignore, walk_stack_t *ws,
                                    file_list_t *out) {
+    if (out->resource_policy && out->resource_policy->max_entries.enabled) {
+        uint64_t limit = out->resource_policy->max_entries.value;
+        if (out->entries >= limit) {
+            uint64_t observed = out->entries == UINT64_MAX ? UINT64_MAX : out->entries + 1U;
+            file_list_resource_violation(out, CBM_INDEX_RESOURCE_ENTRIES, observed, limit);
+            return;
+        }
+    }
+    if (out->entries < UINT64_MAX) {
+        out->entries++;
+    }
+
     char abs_path[CBM_SZ_4K];
     char rel_path[CBM_SZ_4K];
     int absolute_length = snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
@@ -898,6 +988,24 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         if (!dir_is_cache_tree(abs_path) &&
             !should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
+            uint64_t child_depth = frame->depth == UINT64_MAX ? UINT64_MAX : frame->depth + 1U;
+            if (out->resource_policy && out->resource_policy->max_depth.enabled &&
+                child_depth > out->resource_policy->max_depth.value) {
+                file_list_resource_violation(out, CBM_INDEX_RESOURCE_DEPTH, child_depth,
+                                             out->resource_policy->max_depth.value);
+                return;
+            }
+            if (out->resource_policy && out->resource_policy->max_directories.enabled &&
+                out->directories >= out->resource_policy->max_directories.value) {
+                uint64_t observed =
+                    out->directories == UINT64_MAX ? UINT64_MAX : out->directories + 1U;
+                file_list_resource_violation(out, CBM_INDEX_RESOURCE_DIRECTORIES, observed,
+                                             out->resource_policy->max_directories.value);
+                return;
+            }
+            if (out->directories < UINT64_MAX) {
+                out->directories++;
+            }
             walk_push_subdir(ws, abs_path, rel_path, frame, out);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
@@ -980,8 +1088,12 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
             continue;
         }
 
-        cbm_dirent_t *entry;
-        while (!file_list_should_stop(out) && (entry = cbm_readdir(d)) != NULL) {
+        while (!file_list_should_stop(out)) {
+            cbm_dirent_t *entry = cbm_readdir(d);
+            if (!entry) {
+                (void)file_list_should_stop(out);
+                break;
+            }
             walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cbmignore, &ws, out);
         }
         cbm_closedir(d);
@@ -1129,6 +1241,9 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     if (ignored_total_out) {
         *ignored_total_out = 0;
     }
+    if (opts && opts->resource_violation) {
+        *opts->resource_violation = (cbm_index_resource_violation_t){0};
+    }
     if (!repo_path || !out || !count || (count_only && max_files < 0)) {
         return CBM_DISCOVER_ERROR;
     }
@@ -1203,12 +1318,25 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     file_list_t fl = {
         .max_files = count_only ? max_files : -1,
         .deadline_ms = count_only ? deadline_ms : 0,
+        .resource_policy = opts ? opts->resource_policy : NULL,
+        .resource_violation = opts ? opts->resource_violation : NULL,
+        .resource_started_ms =
+            opts && opts->resource_policy && opts->resource_policy->discovery_deadline_ms.enabled
+                ? discover_now_ms()
+                : 0,
+        .directories = 1,
         .count_only = count_only,
         .collect_excluded = !count_only && excluded_out != NULL,
         .collect_ignored = !count_only && ignored_out != NULL,
     };
+    if (fl.resource_policy && fl.resource_policy->max_directories.enabled &&
+        fl.resource_policy->max_directories.value < 1U) {
+        file_list_resource_violation(&fl, CBM_INDEX_RESOURCE_DIRECTORIES, 1,
+                                     fl.resource_policy->max_directories.value);
+    }
     walk_cache_dir_snapshot();
     walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &fl);
+    (void)file_list_should_stop(&fl);
 
     /* Cleanup */
     cbm_gitignore_free(gitignore);
@@ -1225,11 +1353,11 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         }
         return fl.limit_exceeded ? CBM_DISCOVER_LIMIT_EXCEEDED : CBM_DISCOVER_OK;
     }
-    if (fl.failed) {
+    if (fl.failed || fl.limit_exceeded) {
         cbm_discover_free(fl.files, fl.count);
         cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
         cbm_discover_free_ignored(fl.ignored, fl.ignored_count);
-        return CBM_DISCOVER_ERROR;
+        return fl.limit_exceeded ? CBM_DISCOVER_LIMIT_EXCEEDED : CBM_DISCOVER_ERROR;
     }
 
     *out = fl.files;
