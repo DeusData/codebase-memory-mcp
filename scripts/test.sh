@@ -121,6 +121,35 @@ if [ "$TSAN" -eq 1 ] && [ -n "$SUITES" ]; then
     echo "test.sh: --tsan and --suites are separate modes (the TSan leg has its own suite set). Please consult --help." >&2
     exit 2
 fi
+
+# The cli suite drives the real install and uninstall paths. HOME isolation is
+# per-test (tests/test_cli.c sets it 58 times; this script sets it none), so the
+# suite installs and uninstalls agent configurations against whatever HOME it
+# inherits. Its results are also unreliable outside isolation: against a real
+# HOME it reports different failure counts run to run, all in the agent-config
+# install/uninstall tests, where an isolated HOME is stable. Refuse rather than
+# touch the machine's agent configuration. Default mode (no --suites) runs every
+# suite, so it is covered too.
+cbm_cli_suite_selected=0
+if [ -z "$SUITES" ]; then
+    cbm_cli_suite_selected=1
+else
+    for cbm_suite in $SUITES; do
+        if [ "$cbm_suite" = "cli" ]; then
+            cbm_cli_suite_selected=1
+        fi
+    done
+fi
+if [ "$cbm_cli_suite_selected" -eq 1 ] && [ "${CBM_ALLOW_REAL_HOME:-0}" != "1" ] &&
+   { [ -e "$HOME/.claude.json" ] || [ -d "$HOME/.claude" ]; }; then
+    echo "test.sh: refusing to run the cli suite against a real HOME ($HOME)." >&2
+    echo "  That suite installs and uninstalls agent configurations for real, against" >&2
+    echo "  whatever HOME it inherits, and its results are unreliable outside isolation." >&2
+    echo "  Run it isolated instead:" >&2
+    echo "    HOME=\"\$(mktemp -d)\" CCACHE_DIR=\"$HOME/.ccache\" scripts/test.sh $*" >&2
+    echo "  Set CBM_ALLOW_REAL_HOME=1 to override, accepting that it edits your config." >&2
+    exit 2
+fi
 prev_arg=""
 
 # Also support --arch=value
