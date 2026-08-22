@@ -151,6 +151,34 @@ TEST(pipeline_run_null) {
     PASS();
 }
 
+TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing) {
+    char *repo = th_mktempdir("cbm_pipeline_discovery_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "second.py"), "second = 2\n"), 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+
+    ASSERT_EQ(cbm_pipeline_run(pipeline), CBM_PIPELINE_RESOURCE_LIMIT);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+
+    cbm_pipeline_free(pipeline);
+    th_cleanup(repo);
+    PASS();
+}
+
 /* ── Focused: file-backed store persistence ─────────────────────── */
 
 TEST(store_file_persistence) {
@@ -2975,6 +3003,44 @@ typedef struct {
 static void mutate_semantic_input_before_final_manifest(void *userdata) {
     manifest_race_mutation_t *mutation = (manifest_race_mutation_t *)userdata;
     mutation->write_rc = th_write_file(mutation->path, mutation->replacement);
+}
+
+TEST(pipeline_late_source_limit_preserves_previous_generation) {
+    char *repo = th_mktempdir("cbm_pipeline_late_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    char db_path[512];
+    char late_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    snprintf(late_path, sizeof(late_path), "%s/late.py", repo);
+
+    manifest_race_mutation_t mutation = {
+        .path = late_path,
+        .replacement = "late = 2\n",
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    cbm_pipeline_free(pipeline);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    th_cleanup(repo);
+    PASS();
 }
 
 /* A graph and its exact manifest are one generation. If source bytes change
@@ -12083,6 +12149,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing);
+    RUN_TEST(pipeline_late_source_limit_preserves_previous_generation);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */

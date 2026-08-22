@@ -6734,6 +6734,25 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
     return rc;
 }
 
+bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
+                                  char *error, size_t error_size) {
+    if (!cfg || !policy) {
+        if (error && error_size > 0) {
+            (void)snprintf(error, error_size, "index resource configuration is unavailable");
+        }
+        return false;
+    }
+    cbm_index_policy_init(policy);
+    for (size_t index = 0; index < cbm_index_policy_key_count(); index++) {
+        const char *key = cbm_index_policy_key_at(index);
+        const char *value = cbm_config_get(cfg, key, cbm_index_policy_default_value(key));
+        if (!cbm_index_policy_set(policy, key, value, error, error_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 /* THE config-key table. list, get, help, and key validation all read this one
@@ -6756,6 +6775,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
+    {CBM_INDEX_CONFIG_MAX_FILES, "off", "Max accepted source files per index, or off"},
+    {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
@@ -6779,6 +6800,31 @@ const char *cbm_cli_config_key_at_for_testing(size_t index) {
 
 static bool config_key_is_ui(const char *key) {
     return key && (strcmp(key, CBM_CONFIG_UI_ENABLED) == 0 || strcmp(key, CBM_CONFIG_UI_PORT) == 0);
+}
+
+static bool config_key_is_index_policy(const char *key) {
+    return key && (strcmp(key, CBM_INDEX_CONFIG_MAX_FILES) == 0 ||
+                   strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0);
+}
+
+static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {
+    cbm_index_resource_policy_t candidate;
+    cbm_index_policy_init(&candidate);
+    char error[CLI_BUF_256];
+    if (!cbm_index_policy_set(&candidate, key, value, error, sizeof(error))) {
+        (void)fprintf(stderr, "error: %s\n", error);
+        return CLI_ERR;
+    }
+    int rc = cbm_config_set(config, key, value);
+    if (rc != 0) {
+        /* The caller suppresses its own message for policy keys because this
+         * helper names the precise reason. That is only true if the helper
+         * speaks on every failure it can return: a validated value whose write
+         * then fails -- a locked or read-only _config.db -- used to exit
+         * non-zero having printed nothing at all. */
+        (void)fprintf(stderr, "error: failed to set %s\n", key);
+    }
+    return rc;
 }
 
 static void config_ui_read(const char *key, char *out, size_t out_sz) {
@@ -6918,10 +6964,16 @@ int cbm_cmd_config(int argc, char **argv) {
                 rc = CLI_TRUE;
             }
         } else {
-            if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
+            int set_rc =
+                config_key_is_index_policy(argv[CLI_SKIP_ONE])
+                    ? config_index_policy_write(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN])
+                    : cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
+            if (set_rc == 0) {
                 printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
             } else {
-                (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
+                if (!config_key_is_index_policy(argv[CLI_SKIP_ONE])) {
+                    (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
+                }
                 rc = CLI_TRUE;
             }
         }

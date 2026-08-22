@@ -86,6 +86,16 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
+| `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+
+The two `index_max_*` settings are independent and disabled by default. They
+apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
+to `cross-repo-intelligence`, which does not scan repository source files.
+Equality is allowed; exceeding either setting fails the complete index request
+and preserves any previously serving database. See
+[Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
+error-response details.
 
 ## 3. UI Settings
 
