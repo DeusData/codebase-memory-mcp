@@ -95,6 +95,21 @@ static bool bootstrap_worker_budget_valid(const char *text) {
     return value > 0;
 }
 
+static bool bootstrap_worker_stage_token_valid(const char *token) {
+    size_t length = token ? strlen(token) : 0;
+    if (length < 6U || length >= 64U) {
+        return false;
+    }
+    for (size_t index = 0; index < length; index++) {
+        unsigned char ch = (unsigned char)token[index];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+              ch == '-' || ch == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Keep the bootstrap role boundary exact and fail closed before any client or
  * worker state is initialized. index_supervisor owns the matching builder and
  * performs the captured-build comparison after this syntax-only classification. */
@@ -125,6 +140,12 @@ static bool bootstrap_worker_argv_exact(int argc, char *const argv[]) {
     }
     if (next < argc && bootstrap_arg_is(argv[next], "--index-worker-quarantine")) {
         if (next + 1 >= argc || !argv[next + 1] || !argv[next + 1][0]) {
+            return false;
+        }
+        next += 2;
+    }
+    if (next < argc && bootstrap_arg_is(argv[next], "--index-worker-stage-token")) {
+        if (next + 1 >= argc || !bootstrap_worker_stage_token_valid(argv[next + 1])) {
             return false;
         }
         next += 2;

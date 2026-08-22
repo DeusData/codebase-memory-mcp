@@ -9601,12 +9601,139 @@ TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery) {
               CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
 
     result.supervision_failed = false;
+    result.tree_quiesced = true;
+    result.outcome = CBM_PROC_KILLED;
+    result.resource_violation = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_TASK_TEMP_BYTES, .observed = 2048, .limit = 1024};
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE);
+    result.tree_quiesced = false;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
+    result.resource_violation = (cbm_index_resource_violation_t){0};
+    result.tree_quiesced = true;
     result.outcome = CBM_PROC_CRASH;
     result.response = NULL;
     ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
               CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE);
     ASSERT_EQ(cbm_mcp_supervised_result_disposition(-1, &result),
               CBM_MCP_SUPERVISED_RESULT_FALLBACK);
+    PASS();
+}
+
+#ifndef _WIN32
+typedef struct {
+    int calls;
+} index_worker_resource_clock_t;
+
+static uint64_t index_worker_resource_clock(void *context) {
+    index_worker_resource_clock_t *clock = context;
+    clock->calls++;
+    return clock->calls == 1 ? 100 : 1101;
+}
+
+enum {
+    IDXRESOURCE_OK = 0,
+    IDXRESOURCE_SETUP = 71,
+    IDXRESOURCE_NO_RESPONSE = 72,
+    IDXRESOURCE_BAD_CONTRACT = 73,
+    IDXRESOURCE_RETRIED = 74,
+};
+
+static int index_worker_resource_response_check(const char *repo, const char *cache) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_index_supervisor_mark_host();
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    if (!config || !server ||
+        cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1") != 0) {
+        cbm_mcp_server_free(server);
+        cbm_config_close(config);
+        return IDXRESOURCE_SETUP;
+    }
+    cbm_mcp_server_set_config(server, config);
+    index_worker_resource_clock_t clock = {0};
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_worker_resource_clock, NULL, &clock);
+    int before = cbm_index_supervisor_spawn_count();
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"mode\":\"fast\","
+                   "\"_cbm_index_policy\":{\"index_max_files\":\"off\","
+                   "\"index_max_source_mb\":\"off\",\"index_max_rss_mb\":\"off\","
+                   "\"index_max_duration_seconds\":\"off\"}}",
+                   repo);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    int after = cbm_index_supervisor_spawn_count();
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
+    int result = IDXRESOURCE_OK;
+    if (!response) {
+        result = IDXRESOURCE_NO_RESPONSE;
+    } else if (!strstr(response, "resource_limit_exceeded") ||
+               !strstr(response, "\\\"stage\\\":\\\"worker\\\"") ||
+               !strstr(response, "\\\"resource\\\":\\\"duration_ms\\\"") ||
+               !strstr(response, "\\\"observed\\\":1001") ||
+               !strstr(response, "\\\"limit\\\":1000") ||
+               !strstr(response, "\\\"unit\\\":\\\"milliseconds\\\"")) {
+        result = IDXRESOURCE_BAD_CONTRACT;
+    } else if (after - before != 1) {
+        result = IDXRESOURCE_RETRIED;
+    }
+    free(response);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    return result;
+}
+#endif
+
+TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork-isolated MCP host harness; supervisor state machine is cross-platform");
+#else
+    char *repo = th_mktempdir("cbm_worker_resource_repo");
+    char *cache = th_mktempdir("cbm_worker_resource_cache");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.c"), "int main(void) { return 0; }\n"), 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(index_worker_resource_response_check(repo, cache));
+    }
+    int status = 0;
+    bool waited = waitpid(pid, &status, 0) == pid;
+    int exit_code = waited && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int signal_code = waited && WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    th_cleanup(repo);
+    th_cleanup(cache);
+    if (exit_code != IDXRESOURCE_OK) {
+        printf("    worker resource child exit=%d signal=%d\n", exit_code, signal_code);
+    }
+    ASSERT_TRUE(waited);
+    ASSERT_EQ(signal_code, 0);
+    ASSERT_EQ(exit_code, IDXRESOURCE_OK);
+    PASS();
+#endif
+}
+
+TEST(index_supervisor_resource_probe_failure_response_is_structured) {
+    cbm_index_worker_result_t worker_result = {
+        .resource_violation =
+            {
+                .resource = CBM_INDEX_RESOURCE_CACHE_BYTES,
+                .limit = 1024,
+                .probe_failed = true,
+            },
+    };
+    char *response =
+        cbm_mcp_index_worker_resource_response("{\"repo_path\":\"/tmp/missing\"}", &worker_result);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"code\":\"resource_probe_failed\""));
+    ASSERT_NOT_NULL(strstr(response, "\"stage\":\"storage\""));
+    ASSERT_NOT_NULL(strstr(response, "\"resource\":\"cache_bytes\""));
+    ASSERT_NOT_NULL(strstr(response, "\"retryable\":true"));
+    free(response);
     PASS();
 }
 
@@ -10540,6 +10667,57 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
     PASS();
 }
 
+TEST(mcp_inprocess_autoindex_inherits_resource_policy) {
+    char *root = th_mktempdir("cbm-autoindex-policy-root");
+    char *cache = th_mktempdir("cbm-autoindex-policy-cache");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(cache);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "first.c"), "int first(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "second.c"), "int second(void) { return 2; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char saved_cwd[CBM_SZ_4K];
+    bool cwd_saved = cbm_getcwd(saved_cwd, sizeof(saved_cwd)) != NULL;
+    bool environment_ready =
+        cwd_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 && cbm_chdir(root) == 0;
+    cbm_config_t *config = environment_ready ? cbm_config_open(cache) : NULL;
+    bool configured = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                      cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
+                      cbm_config_set(config, CBM_INDEX_CONFIG_MAX_FILES, "1") == 0;
+    char *project = configured ? cbm_project_name_from_path(root) : NULL;
+    char db_path[CBM_SZ_4K] = {0};
+    if (project) {
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    }
+
+    cbm_mcp_server_t *server = configured && project ? cbm_mcp_server_new(NULL) : NULL;
+    if (server) {
+        cbm_mcp_server_set_config(server, config);
+        char *response = cbm_mcp_server_handle(
+            server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+        free(response);
+        cbm_mcp_server_free(server); /* joins the in-process auto-index thread */
+    }
+    bool limit_preserved_no_index = project && !cbm_file_exists(db_path);
+
+    cbm_config_close(config);
+    if (cwd_saved) {
+        (void)cbm_chdir(saved_cwd);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    free(project);
+    th_cleanup(root);
+    th_cleanup(cache);
+
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(configured);
+    ASSERT_NOT_NULL(server);
+    ASSERT_TRUE(limit_preserved_no_index);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
@@ -11401,6 +11579,8 @@ SUITE(mcp) {
     RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
     RUN_TEST(index_repository_cli_name_override_issue823);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
+    RUN_TEST(index_worker_resource_limit_is_trusted_structured_and_not_retried);
+    RUN_TEST(index_supervisor_resource_probe_failure_response_is_structured);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
@@ -11471,6 +11651,7 @@ SUITE(mcp) {
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
+    RUN_TEST(mcp_inprocess_autoindex_inherits_resource_policy);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
 }
 

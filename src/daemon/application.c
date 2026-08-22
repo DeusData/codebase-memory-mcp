@@ -207,7 +207,8 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
 static bool application_update_reap(cbm_daemon_application_t *application, bool wait,
                                     uint32_t timeout_ms);
 static void *application_job_thread(void *opaque);
-static char *application_auto_index_args(const char *root_path);
+static char *application_auto_index_args(cbm_daemon_application_t *application,
+                                         const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
     const char *args_json, application_job_subscribe_status_t *status_out);
@@ -303,9 +304,21 @@ static int application_worker_start_default(void *context, const char *args_json
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
+    cbm_index_resource_policy_t resource_policy;
+    char error[CBM_SZ_256] = {0};
+    char task_db_path[CBM_SZ_1K];
+    if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
+                                                 sizeof(error)) ||
+        !cbm_mcp_index_task_db_path(args_json, task_db_path, sizeof(task_db_path))) {
+        cbm_log_error("daemon.index.worker_policy", "error",
+                      error[0] ? error : "could not resolve worker index path");
+        *worker_out = NULL;
+        return -1;
+    }
     cbm_index_worker_handle_t *worker = NULL;
-    int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
-                                        quarantine_file, &worker);
+    int result = cbm_index_worker_start_with_storage_policy(
+        args_json, memory_budget_bytes, &resource_policy, task_db_path, false, marker_file,
+        quarantine_file, NULL, NULL, &worker);
     *worker_out = worker;
     return result;
 }
@@ -580,6 +593,20 @@ static void application_tmp_lock(void) {
 
 static void application_tmp_unlock(void) {
     atomic_flag_clear_explicit(&g_application_tmp_lock, memory_order_release);
+}
+
+/* The daemon's only spelling of a project root. Tool handlers normalize the
+ * separators of every path they canonicalize, so a root left in the platform's
+ * native form is a second name for one directory — and the two names then meet
+ * in comparisons that are exact: whether a watch is still live for this root,
+ * and whether an index request may join the job already running for it. The
+ * forms differ on Windows, which is where both comparisons were wrong. */
+static bool application_canonical_root(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0 || !cbm_canonical_path(path, out, out_size)) {
+        return false;
+    }
+    cbm_normalize_path_sep(out);
+    return true;
 }
 
 static bool application_cache_dir(char out[APPLICATION_PATH_CAP]) {
@@ -1232,6 +1259,12 @@ static application_attempt_decision_t application_consume_attempt(
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
     }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        execution->response =
+            cbm_mcp_index_worker_resource_response(job->args_json, &attempt->result);
+        application_attempt_free(attempt);
+        return APPLICATION_ATTEMPT_DECISION_STOP;
+    }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
         execution->unsafe_terminal = true;
         execution->supervision_failed =
@@ -1399,7 +1432,7 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             application_refresh_watch_locked(session);
             continue;
         }
-        char *args = application_auto_index_args(root_path);
+        char *args = application_auto_index_args(application, root_path);
         if (!args) {
             continue;
         }
@@ -1900,7 +1933,50 @@ static bool application_update_reap(cbm_daemon_application_t *application, bool 
     }
 }
 
-static char *application_auto_index_args(const char *root_path) {
+static bool application_index_args_add_policy(cbm_daemon_application_t *application,
+                                              yyjson_mut_doc *document, yyjson_mut_val *root) {
+    cbm_config_t *owned_config = NULL;
+    cbm_config_t *config = application ? application->config : NULL;
+    if (!config) {
+        owned_config = cbm_config_open(cbm_resolve_cache_dir());
+        config = owned_config;
+    }
+    cbm_index_resource_policy_t policy;
+    char error[CBM_SZ_256] = {0};
+    bool loaded = cbm_config_load_index_policy(config, &policy, error, sizeof(error));
+    cbm_config_close(owned_config);
+    if (!loaded) {
+        cbm_log_error("daemon.index.policy", "error", error);
+        return false;
+    }
+    cbm_system_info_t system = cbm_system_info();
+    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram,
+                              application ? (uint64_t)application->worker_memory_budget_bytes : 0);
+    return cbm_mcp_index_policy_add_to_args(document, root, &policy);
+}
+
+static char *application_index_args_replace_policy(cbm_daemon_application_t *application,
+                                                   const char *args_json) {
+    yyjson_doc *source = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_mut_doc *document = source ? yyjson_doc_mut_copy(source, NULL) : NULL;
+    yyjson_doc_free(source);
+    yyjson_mut_val *root = document ? yyjson_mut_doc_get_root(document) : NULL;
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(document);
+        return NULL;
+    }
+    while (yyjson_mut_obj_get(root, "_cbm_index_policy")) {
+        (void)yyjson_mut_obj_remove_key(root, "_cbm_index_policy");
+    }
+    char *rewritten = application_index_args_add_policy(application, document, root)
+                          ? yyjson_mut_write(document, 0, NULL)
+                          : NULL;
+    yyjson_mut_doc_free(document);
+    return rewritten;
+}
+
+static char *application_auto_index_args(cbm_daemon_application_t *application,
+                                         const char *root_path) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = document ? yyjson_mut_obj(document) : NULL;
     if (!document || !root) {
@@ -1908,7 +1984,8 @@ static char *application_auto_index_args(const char *root_path) {
         return NULL;
     }
     yyjson_mut_doc_set_root(document, root);
-    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path)
+    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path) &&
+                         application_index_args_add_policy(application, document, root)
                      ? yyjson_mut_write(document, 0, NULL)
                      : NULL;
     yyjson_mut_doc_free(document);
@@ -1951,7 +2028,7 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                      files);
     }
     bool args_required = auto_index_candidate && within_auto_index_limit;
-    char *args = args_required ? application_auto_index_args(root_path) : NULL;
+    char *args = args_required ? application_auto_index_args(application, root_path) : NULL;
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     if (application->stopping || application_request_cancelled_locked(session)) {
@@ -2178,14 +2255,19 @@ static char *application_index_execute(void *context, const char *root_path,
     if (!session || !root_path || !args_json) {
         return NULL;
     }
-    char *project_key = application_index_project_key(root_path, args_json);
+    char *trusted_args = application_index_args_replace_policy(session->application, args_json);
+    if (!trusted_args) {
+        return cbm_mcp_text_result("failed to resolve daemon index resource policy", true);
+    }
+    char *project_key = application_index_project_key(root_path, trusted_args);
     if (!project_key) {
+        free(trusted_args);
         return cbm_mcp_text_result("failed to derive index project identity", true);
     }
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
     cbm_daemon_application_job_t *job = NULL;
     for (;;) {
-        job = application_job_subscribe(session->application, project_key, root_path, args_json,
+        job = application_job_subscribe(session->application, project_key, root_path, trusted_args,
                                         &subscribe_status);
         if (job || (subscribe_status != APPLICATION_JOB_SUBSCRIBE_BUSY &&
                     subscribe_status != APPLICATION_JOB_SUBSCRIBE_CANCELLING)) {
@@ -2204,11 +2286,13 @@ static char *application_index_execute(void *context, const char *root_path,
         cbm_mutex_unlock(&session->application->mutex);
         if (queued_cancelled) {
             free(project_key);
+            free(trusted_args);
             return cbm_mcp_text_result("index operation cancelled for this session", true);
         }
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
     free(project_key);
+    free(trusted_args);
     if (!job) {
         const char *message = "daemon index coordinator is stopping or unavailable";
         if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT) {
@@ -2320,9 +2404,10 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     }
     char canonical_root[APPLICATION_PATH_CAP] = {0};
     char canonical_allowed[APPLICATION_PATH_CAP] = {0};
-    bool canonical = cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
+    bool canonical = application_canonical_root(root, canonical_root, sizeof(canonical_root));
     if (canonical && allowed_present) {
-        canonical = cbm_canonical_path(allowed, canonical_allowed, sizeof(canonical_allowed));
+        canonical =
+            application_canonical_root(allowed, canonical_allowed, sizeof(canonical_allowed));
     }
     struct stat root_status;
     canonical =
@@ -3340,7 +3425,7 @@ static int application_background_index(cbm_daemon_application_t *application,
     }
     char canonical_root[APPLICATION_PATH_CAP];
     struct stat root_status;
-    if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
+    if (!application_canonical_root(root_path, canonical_root, sizeof(canonical_root)) ||
         stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
         return -1;
     }
@@ -3351,7 +3436,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     yyjson_mut_doc_set_root(document, root);
-    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root);
+    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root) &&
+                   application_index_args_add_policy(application, document, root);
     char *default_project = cbm_project_name_from_path(canonical_root);
     bool custom_project =
         project_name[0] && (!default_project || strcmp(default_project, project_name) != 0);

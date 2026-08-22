@@ -2,6 +2,7 @@
  * test_platform.c — RED phase tests for foundation/platform.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/constants.h"
@@ -291,6 +292,93 @@ TEST(platform_file_size) {
     ASSERT_EQ(cbm_file_size("nonexistent_file_xyz.txt"), -1);
     PASS();
 }
+
+TEST(platform_storage_measurement_uses_logical_bytes_without_following_links) {
+    char *root = th_mktempdir("cbm_storage_measure");
+    ASSERT_NOT_NULL(root);
+    ASSERT_TRUE(cbm_mkdir_p(TH_PATH(root, "nested"), 0700));
+    ASSERT_EQ(th_write_file(TH_PATH(root, "first.bin"), "12345"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "nested/second.bin"), "1234567"), 0);
+#ifndef _WIN32
+    ASSERT_EQ(symlink("/dev/null", TH_PATH(root, "external-link")), 0);
+#endif
+    uint64_t bytes = 0;
+    uint64_t free_bytes = 0;
+    ASSERT_TRUE(cbm_directory_size_bytes(root, &bytes));
+    ASSERT_EQ(bytes, 12);
+    ASSERT_TRUE(cbm_filesystem_free_bytes(root, &free_bytes));
+    ASSERT_GT(free_bytes, 0);
+    th_cleanup(root);
+    PASS();
+}
+
+TEST(platform_db_artifact_measurement_saturates_and_counts_sidecars) {
+    char *root = th_mktempdir("cbm_storage_db_artifacts");
+    ASSERT_NOT_NULL(root);
+    char db[CBM_SZ_4K];
+    (void)snprintf(db, sizeof(db), "%s/project.db", root);
+    ASSERT_EQ(th_write_file(db, "12345"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "project.db-wal"), "1234567"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "project.db-shm"), "123"), 0);
+    uint64_t bytes = 0;
+    ASSERT_TRUE(cbm_db_artifact_bytes(db, &bytes));
+    ASSERT_EQ(bytes, 15);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "project.db.stage.task123.ABCDEF"), "12345678901"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "project.db.stage.task123.ABCDEF-wal"), "1234567890123"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "project.db.stage.other456.ABCDEF"), "unrelated"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "worker.log"), "12"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "worker.response"), "123"), 0);
+    ASSERT_TRUE(cbm_index_task_temp_bytes(db, "task123", TH_PATH(root, "worker.log"),
+                                          TH_PATH(root, "worker.response"), &bytes));
+    ASSERT_EQ(bytes, 29);
+    ASSERT_TRUE(cbm_index_staging_cleanup(db, "task123"));
+    ASSERT_FALSE(cbm_file_exists(TH_PATH(root, "project.db.stage.task123.ABCDEF")));
+    ASSERT_FALSE(cbm_file_exists(TH_PATH(root, "project.db.stage.task123.ABCDEF-wal")));
+    ASSERT_TRUE(cbm_file_exists(TH_PATH(root, "project.db.stage.other456.ABCDEF")));
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(TH_PATH(root, "worker.log")));
+    th_cleanup(root);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(platform_task_temp_measurement_supports_relative_database_paths) {
+    char *root = th_mktempdir("cbm_task_temp_relative");
+    ASSERT_NOT_NULL(root);
+    char saved_cwd[CBM_SZ_4K];
+    ASSERT_NOT_NULL(getcwd(saved_cwd, sizeof(saved_cwd)));
+    ASSERT_EQ(chdir(root), 0);
+
+    int write_rc = th_write_file("project.db.stage.task123.ABCDEF", "12345");
+    int wal_rc = th_write_file("project.db.stage.task123.ABCDEF-wal", "123456");
+    int other_rc = th_write_file("project.db.stage.other456.ABCDEF", "unrelated");
+    int log_rc = th_write_file("worker.log", "123");
+    int response_rc = th_write_file("worker.response", "1234");
+    uint64_t bytes = 0;
+    bool measured =
+        cbm_index_task_temp_bytes("project.db", "task123", "worker.log", "worker.response", &bytes);
+    bool cleaned = cbm_index_staging_cleanup("project.db", "task123");
+    bool own_stage_removed = !cbm_file_exists("project.db.stage.task123.ABCDEF") &&
+                             !cbm_file_exists("project.db.stage.task123.ABCDEF-wal");
+    bool other_stage_preserved = cbm_file_exists("project.db.stage.other456.ABCDEF");
+    int restore_rc = chdir(saved_cwd);
+    th_cleanup(root);
+
+    ASSERT_EQ(write_rc, 0);
+    ASSERT_EQ(wal_rc, 0);
+    ASSERT_EQ(other_rc, 0);
+    ASSERT_EQ(log_rc, 0);
+    ASSERT_EQ(response_rc, 0);
+    ASSERT_TRUE(measured);
+    ASSERT_EQ(bytes, 18);
+    ASSERT_TRUE(cleaned);
+    ASSERT_TRUE(own_stage_removed);
+    ASSERT_TRUE(other_stage_preserved);
+    ASSERT_EQ(restore_rc, 0);
+    PASS();
+}
+#endif
 
 TEST(platform_mmap) {
     /* mmap this test file and verify first bytes */
@@ -696,6 +784,11 @@ SUITE(platform) {
     RUN_TEST(platform_file_exists);
     RUN_TEST(platform_is_dir);
     RUN_TEST(platform_file_size);
+    RUN_TEST(platform_storage_measurement_uses_logical_bytes_without_following_links);
+    RUN_TEST(platform_db_artifact_measurement_saturates_and_counts_sidecars);
+#ifndef _WIN32
+    RUN_TEST(platform_task_temp_measurement_supports_relative_database_paths);
+#endif
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
     RUN_TEST(platform_path_helpers_use_per_thread_storage);

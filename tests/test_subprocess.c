@@ -82,6 +82,12 @@ TEST(subprocess_outcome_str) {
     PASS();
 }
 
+TEST(subprocess_tree_rss_sum_saturates_on_overflow) {
+    const uint64_t values[] = {UINT64_MAX - 4, 4, 1};
+    ASSERT_EQ(cbm_subprocess_rss_sum_for_testing(values, 3), UINT64_MAX);
+    PASS();
+}
+
 /* ── Layer 2: real spawn/reap (POSIX) ─────────────────────────────────────── */
 
 #ifndef _WIN32
@@ -426,6 +432,45 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
     ASSERT_TRUE(terminal);
     ASSERT_TRUE(result.cancellation_requested);
     ASSERT_TRUE(result.tree_quiesced);
+    PASS();
+#endif
+}
+
+TEST(subprocess_tree_rss_measures_contained_descendants) {
+#ifdef _WIN32
+    SKIP_PLATFORM("native Job Object process-tree RSS runs on Windows CI");
+#else
+    char pid_path[64];
+    ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(spawn_ignoring_tree(pid_path, 0, 100, &process), 0);
+    pid_t parent_pid = 0;
+    pid_t grandchild_pid = 0;
+    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 3000);
+    uint64_t rss_bytes = 0;
+    cbm_proc_tree_rss_status_t rss_status =
+        ready ? cbm_subprocess_tree_rss_bytes(process, &rss_bytes) : CBM_PROC_TREE_RSS_ERROR;
+    bool cancel_accepted = cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result;
+    bool terminal = poll_until_terminal(process, 5000, &result);
+    uint64_t final_rss = UINT64_MAX;
+    cbm_proc_tree_rss_status_t final_rss_status =
+        terminal ? cbm_subprocess_tree_rss_bytes(process, &final_rss) : CBM_PROC_TREE_RSS_ERROR;
+    if (terminal) {
+        cbm_subprocess_destroy(process);
+    } else {
+        force_probe_cleanup(parent_pid, grandchild_pid);
+    }
+    (void)unlink(pid_path);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(rss_status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(rss_bytes > 0);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_EQ(final_rss_status, CBM_PROC_TREE_RSS_EMPTY);
+    ASSERT_EQ(final_rss, 0);
     PASS();
 #endif
 }
@@ -1027,6 +1072,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_classify_non_fault_signal_is_killed);
     RUN_TEST(subprocess_classify_timeout_dominates);
     RUN_TEST(subprocess_outcome_str);
+    RUN_TEST(subprocess_tree_rss_sum_saturates_on_overflow);
     RUN_TEST(subprocess_run_clean);
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_resolves_literal_binary_name_from_path);
@@ -1037,6 +1083,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
     RUN_TEST(subprocess_spawn_returns_while_child_is_running);
+    RUN_TEST(subprocess_tree_rss_measures_contained_descendants);
     RUN_TEST(subprocess_natural_completion_is_cached_across_polls);
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);

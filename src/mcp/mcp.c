@@ -1676,7 +1676,17 @@ bool cbm_mcp_server_set_session_context(cbm_mcp_server_t *srv, const char *sessi
         return false;
     }
 
-    char *project = cbm_project_name_from_path(session_root);
+    /* Every tool handler normalizes the separators of the path it canonicalizes,
+     * so a root kept in the platform's native spelling is a second name for one
+     * directory. The two names meet when an explicit index_repository request is
+     * compared against the auto-index job started from this root: on Windows the
+     * backslash form never matched the request's slash form, and the duplicate
+     * was refused as an options conflict instead of joining the running job. */
+    char normalized_root[sizeof(srv->session_root)];
+    snprintf(normalized_root, sizeof(normalized_root), "%s", session_root);
+    cbm_normalize_path_sep(normalized_root);
+
+    char *project = cbm_project_name_from_path(normalized_root);
     if (!project || project[0] == '\0' || strlen(project) >= sizeof(srv->session_project)) {
         free(project);
         return false;
@@ -1687,8 +1697,9 @@ bool cbm_mcp_server_set_session_context(cbm_mcp_server_t *srv, const char *sessi
         free(project);
         return false;
     }
+    cbm_normalize_path_sep(allowed_copy);
 
-    snprintf(srv->session_root, sizeof(srv->session_root), "%s", session_root);
+    snprintf(srv->session_root, sizeof(srv->session_root), "%s", normalized_root);
     snprintf(srv->session_project, sizeof(srv->session_project), "%s", project);
     free(project);
 
@@ -7570,10 +7581,14 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     return degraded;
 }
 
+static bool project_db_is_servable(const char *project, const char *db_path);
+
 /* Build the response for a worker that crashed/hung/failed without producing a
  * result. The crash is already contained (this process survived); we report it
  * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
  * rest) is layered on in the probe stage. */
+static bool project_db_is_servable(const char *project, const char *db_path);
+
 static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -7629,6 +7644,59 @@ static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_ou
     }
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    free(repo_path);
+    char *response = cbm_mcp_text_result(json, true);
+    free(json);
+    return response;
+}
+
+char *cbm_mcp_index_worker_resource_response(const char *args,
+                                             const cbm_index_worker_result_t *worker_result) {
+    if (!worker_result || worker_result->resource_violation.resource == CBM_INDEX_RESOURCE_NONE) {
+        return NULL;
+    }
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *name_override = cbm_mcp_get_string_arg(args, "name");
+    char *project_name =
+        cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
+    char db_path[CBM_SZ_1K] = {0};
+    if (project_name) {
+        project_db_path(project_name, db_path, sizeof(db_path));
+    }
+
+    const cbm_index_resource_violation_t *violation = &worker_result->resource_violation;
+    bool probe_failed = worker_result->resource_probe_failed || violation->probe_failed;
+    bool worker_stage = violation->resource == CBM_INDEX_RESOURCE_RSS_BYTES ||
+                        violation->resource == CBM_INDEX_RESOURCE_DURATION_MS;
+    const char *config_key = cbm_index_resource_config_key(violation->resource);
+    char message[CBM_SZ_256];
+    (void)snprintf(message, sizeof(message),
+                   probe_failed ? "Index resource measurement failed for %s" : "Index exceeded %s",
+                   config_key);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "code",
+                           probe_failed ? "resource_probe_failed" : "resource_limit_exceeded");
+    yyjson_mut_obj_add_str(doc, root, "stage", worker_stage ? "worker" : "storage");
+    yyjson_mut_obj_add_str(doc, root, "resource", cbm_index_resource_name(violation->resource));
+    if (!probe_failed) {
+        yyjson_mut_obj_add_uint(doc, root, "observed", violation->observed);
+        yyjson_mut_obj_add_uint(doc, root, "limit", violation->limit);
+        yyjson_mut_obj_add_str(doc, root, "unit", cbm_index_resource_unit(violation->resource));
+    }
+    yyjson_mut_obj_add_bool(doc, root, "retryable", true);
+    yyjson_mut_obj_add_bool(doc, root, "serving_index_preserved",
+                            project_name && project_db_is_servable(project_name, db_path));
+    yyjson_mut_obj_add_strcpy(doc, root, "message", message);
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(project_name);
+    free(name_override);
     free(repo_path);
     char *response = cbm_mcp_text_result(json, true);
     free(json);
@@ -7778,11 +7846,105 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
         worker_result->supervision_failed) {
         return CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL;
     }
+    if (worker_result->resource_violation.resource != CBM_INDEX_RESOURCE_NONE) {
+        return CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE;
+    }
     if (worker_result->outcome == CBM_PROC_CLEAN) {
         return worker_result->response ? CBM_MCP_SUPERVISED_RESULT_SUCCESS
                                        : CBM_MCP_SUPERVISED_RESULT_FALLBACK;
     }
     return CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE;
+}
+
+bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
+                                             char *error, size_t error_size) {
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *encoded =
+        root && yyjson_is_obj(root) ? yyjson_obj_get(root, "_cbm_index_policy") : NULL;
+    if (!encoded || !yyjson_is_obj(encoded) ||
+        yyjson_obj_size(encoded) != cbm_index_policy_key_count() + 2U) {
+        yyjson_doc_free(doc);
+        (void)snprintf(error, error_size, "missing or incomplete trusted worker policy");
+        return false;
+    }
+
+    cbm_index_policy_init(policy);
+    yyjson_val *profile = yyjson_obj_get(encoded, CBM_INDEX_CONFIG_RESOURCE_PROFILE);
+    yyjson_val *override_mask = yyjson_obj_get(encoded, "_cbm_index_override_mask");
+    bool valid = profile && yyjson_is_str(profile) && override_mask &&
+                 yyjson_is_uint(override_mask) &&
+                 cbm_index_policy_set_profile(policy, yyjson_get_str(profile), error, error_size);
+    for (size_t index = 0; valid && index < cbm_index_policy_key_count(); index++) {
+        const char *key = cbm_index_policy_key_at(index);
+        yyjson_val *value = yyjson_obj_get(encoded, key);
+        valid = value && yyjson_is_str(value) &&
+                cbm_index_policy_set(policy, key, yyjson_get_str(value), error, error_size);
+    }
+    if (valid) {
+        uint64_t known_mask = cbm_index_policy_key_count() >= 64U
+                                  ? UINT64_MAX
+                                  : (UINT64_C(1) << cbm_index_policy_key_count()) - 1U;
+        uint64_t decoded_mask = yyjson_get_uint(override_mask);
+        valid = (decoded_mask & ~known_mask) == 0;
+        policy->override_mask = decoded_mask;
+    }
+    yyjson_doc_free(doc);
+    if (!valid && error && error_size > 0 && error[0] == '\0') {
+        (void)snprintf(error, error_size, "invalid trusted worker policy");
+    }
+    return valid;
+}
+
+bool cbm_mcp_index_task_db_path(const char *args, char *path_out, size_t path_size) {
+    if (!path_out || path_size == 0) {
+        return false;
+    }
+    path_out[0] = '\0';
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    char *name_override = cbm_mcp_get_string_arg(args, "name");
+    char *project =
+        cbm_project_name_from_path(name_override && name_override[0] ? name_override : repo_path);
+    char cache_path[CBM_SZ_1K];
+    cache_dir(cache_path, sizeof(cache_path));
+    int written = project ? snprintf(path_out, path_size, "%s/%s.db", cache_path, project) : -1;
+    free(project);
+    free(name_override);
+    free(repo_path);
+    return written > 0 && (size_t)written < path_size;
+}
+
+static bool load_index_policy(cbm_mcp_server_t *srv, const char *args,
+                              cbm_index_resource_policy_t *policy, char *error, size_t error_size) {
+    if (cbm_index_worker_active()) {
+        return cbm_mcp_index_policy_from_internal_args(args, policy, error, error_size);
+    }
+    cbm_config_t *owned_config = NULL;
+    cbm_config_t *config = srv ? srv->config : NULL;
+    if (!config) {
+        owned_config = cbm_config_open(cbm_resolve_cache_dir());
+        config = owned_config;
+    }
+    bool loaded = cbm_config_load_index_policy(config, policy, error, error_size);
+    cbm_config_close(owned_config);
+    return loaded;
+}
+
+bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                      const cbm_index_resource_policy_t *policy) {
+    yyjson_mut_val *encoded = yyjson_mut_obj(doc);
+    bool valid = encoded != NULL &&
+                 yyjson_mut_obj_add_strcpy(doc, encoded, CBM_INDEX_CONFIG_RESOURCE_PROFILE,
+                                           cbm_index_policy_profile_name(policy)) &&
+                 yyjson_mut_obj_add_uint(doc, encoded, "_cbm_index_override_mask",
+                                         policy ? policy->override_mask : 0);
+    for (size_t index = 0; valid && index < cbm_index_policy_key_count(); index++) {
+        const char *key = cbm_index_policy_key_at(index);
+        char value[CBM_SZ_64];
+        valid = cbm_index_policy_format(policy, key, value, sizeof(value)) &&
+                yyjson_mut_obj_add_strcpy(doc, encoded, key, value);
+    }
+    return valid && yyjson_mut_obj_add_val(doc, root, "_cbm_index_policy", encoded);
 }
 
 /* Run index_repository in a supervised worker subprocess with skip-and-continue
@@ -7796,14 +7958,20 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
  *   - a contained-failure response only if even that cannot produce a clean run.
  * A physical CBM host never falls back to its in-process pipeline: an initial
  * start/protocol failure is returned as an explicit error response. */
-static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
+                                  const cbm_index_resource_policy_t *resource_policy) {
     invalidate_cached_store(srv);
+    char task_db_path[CBM_SZ_1K];
+    if (!resource_policy || !cbm_mcp_index_task_db_path(args, task_db_path, sizeof(task_db_path))) {
+        return cbm_mcp_text_result("could not resolve worker index path", true);
+    }
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
-    int rc = cbm_index_spawn_worker_with_log_cancel(
-        args, false, NULL, NULL, srv ? srv->index_log_callback : NULL,
-        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL, &wr);
+    int rc = cbm_index_spawn_worker_with_storage_policy_log_cancel(
+        args, resource_policy, task_db_path, false, NULL, NULL,
+        srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
+        srv ? &srv->pipeline_cancel_requested : NULL, &wr);
     cbm_mcp_supervised_result_disposition_t disposition =
         cbm_mcp_supervised_result_disposition(rc, &wr);
 
@@ -7820,6 +7988,12 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         invalidate_cached_store(srv);
         return failure;
     }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        char *failure = cbm_mcp_index_worker_resource_response(args, &wr);
+        cbm_index_worker_result_free(&wr);
+        invalidate_cached_store(srv);
+        return failure;
+    }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
         /* Clean exit → transfer the worker's response (the common path). */
         char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
@@ -7828,7 +8002,6 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         invalidate_cached_store(srv);
         return resp;
     }
-
     /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
      * worker PARALLEL (there are no sequential production runs) with the
      * per-file marker JOURNAL armed; after each failed run the journal's
@@ -7876,10 +8049,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     bool terminal_cancelled = false;
     for (int i = 0; i < cap; i++) {
         cbm_index_worker_result_t wr2;
-        int rc2 = cbm_index_spawn_worker_with_log_cancel(
-            args, /*single_thread=*/false, marker_path, quarantine_path,
-            srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
-            srv ? &srv->pipeline_cancel_requested : NULL, &wr2);
+        int rc2 = cbm_index_spawn_worker_with_storage_policy_log_cancel(
+            args, resource_policy, task_db_path, /*single_thread=*/false, marker_path,
+            quarantine_path, srv ? srv->index_log_callback : NULL,
+            srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL,
+            &wr2);
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
         if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
@@ -7891,6 +8065,11 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             last_outcome = wr2.outcome;
             unsafe_terminal = true;
             terminal_cancelled = wr2.cancellation_requested;
+            cbm_index_worker_result_free(&wr2);
+            break;
+        }
+        if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+            resp = cbm_mcp_index_worker_resource_response(args, &wr2);
             cbm_index_worker_result_free(&wr2);
             break;
         }
@@ -7967,8 +8146,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
      * so it cannot itself hang. Rare given monotonic progress. */
     if (!resp && !unsafe_terminal && quarantined > 0) {
         cbm_index_worker_result_t wrp;
-        int rcp = cbm_index_spawn_worker_with_log_cancel(
-            args, /*single_thread=*/false, NULL, quarantine_path,
+        int rcp = cbm_index_spawn_worker_with_storage_policy_log_cancel(
+            args, resource_policy, task_db_path, /*single_thread=*/false, NULL, quarantine_path,
             srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
             srv ? &srv->pipeline_cancel_requested : NULL, &wrp);
         cbm_mcp_supervised_result_disposition_t partial_disposition =
@@ -7984,6 +8163,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             last_outcome = wrp.outcome;
             unsafe_terminal = true;
             terminal_cancelled = wrp.cancellation_requested;
+        } else if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+            resp = cbm_mcp_index_worker_resource_response(args, &wrp);
         }
         cbm_index_worker_result_free(&wrp);
     }
@@ -8008,16 +8189,26 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     if (!root_path || !root_path[0]) {
         return NULL;
     }
+    cbm_index_resource_policy_t policy;
+    char policy_error[CBM_SZ_256] = {0};
+    if (!load_index_policy(srv, NULL, &policy, policy_error, sizeof(policy_error))) {
+        cbm_log_error("index.policy", "error", policy_error);
+        return NULL;
+    }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path);
+    if (!yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path) ||
+        !cbm_mcp_index_policy_add_to_args(doc, root, &policy)) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
     char *args = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     if (!args) {
         return NULL;
     }
-    char *resp = index_run_supervised(srv, args);
+    char *resp = index_run_supervised(srv, args, &policy);
     free(args);
     return resp;
 }
@@ -8060,8 +8251,9 @@ static bool resolve_session_repo_path(cbm_mcp_server_t *srv, char **repo_path) {
 
 /* Preserve every index option while replacing all caller-supplied repo_path
  * keys with the one canonical path that was actually authorized. */
-static char *index_args_with_repo_path(const char *args, const char *canonical_repo_path) {
-    if (!args || !canonical_repo_path) {
+static char *index_args_with_repo_path(const char *args, const char *canonical_repo_path,
+                                       const cbm_index_resource_policy_t *policy) {
+    if (!args || !canonical_repo_path || !policy) {
         return NULL;
     }
     yyjson_doc *source = yyjson_read(args, strlen(args), 0);
@@ -8078,8 +8270,14 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
         yyjson_mut_doc_free(copy);
         return NULL;
     }
-    (void)yyjson_mut_obj_remove_key(copy_root, "repo_path");
-    if (!yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path)) {
+    while (yyjson_mut_obj_get(copy_root, "repo_path")) {
+        (void)yyjson_mut_obj_remove_key(copy_root, "repo_path");
+    }
+    while (yyjson_mut_obj_get(copy_root, "_cbm_index_policy")) {
+        (void)yyjson_mut_obj_remove_key(copy_root, "_cbm_index_policy");
+    }
+    if (!yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
+        !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy)) {
         yyjson_mut_doc_free(copy);
         return NULL;
     }
@@ -8116,6 +8314,19 @@ static char *resolved_repo_path_from_project_arg(const char *args) {
     }
     free(project);
     return root_path;
+}
+
+static bool project_db_is_servable(const char *project, const char *db_path) {
+    cbm_store_t *store = db_path && db_path[0] ? cbm_store_open_path_query(db_path) : NULL;
+    if (!store) {
+        return false;
+    }
+    cbm_project_t stored_project = {0};
+    bool servable = cbm_store_get_project(store, project, &stored_project) == CBM_STORE_OK &&
+                    stored_project.root_path && stored_project.root_path[0];
+    cbm_project_free_fields(&stored_project);
+    cbm_store_close(store);
+    return servable;
 }
 
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
@@ -8172,10 +8383,19 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
+    cbm_index_resource_policy_t resource_policy;
+    char policy_error[CBM_SZ_256] = {0};
+    if (!load_index_policy(srv, args, &resource_policy, policy_error, sizeof(policy_error))) {
+        free(mode_str);
+        free(name_override);
+        free(repo_path);
+        return cbm_mcp_text_result(policy_error, true);
+    }
+
     /* A daemon session delegates the one physical write to its shared job
      * registry only after path canonicalization and workspace authorization. */
     if (srv->index_executor) {
-        char *worker_args = index_args_with_repo_path(args, repo_path);
+        char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
         char *coordinated =
             worker_args ? srv->index_executor(srv->index_executor_context, repo_path, worker_args)
                         : NULL;
@@ -8207,7 +8427,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * installs the same guard before running the in-process pipeline. A marked
      * host fails closed if preparation or worker startup cannot complete. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *worker_args = index_args_with_repo_path(args, repo_path);
+        char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
         if (!worker_args) {
             free(mutation_project);
             free(repo_path);
@@ -8215,7 +8435,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             free(name_override);
             return cbm_mcp_text_result("failed to prepare supervised index request", true);
         }
-        char *supervised = index_run_supervised(srv, worker_args);
+        char *supervised = index_run_supervised(srv, worker_args, &resource_policy);
         free(worker_args);
         if (supervised) {
             free(mutation_project);
@@ -8279,11 +8499,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
+    cbm_pipeline_set_resource_policy(p, &resource_policy);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
     /* Bootstrap from artifact if no local DB exists */
     try_artifact_bootstrap(project_name, repo_path);
+    char serving_db_path[CBM_SZ_1K];
+    project_db_path(project_name, serving_db_path, sizeof(serving_db_path));
+    bool serving_index_was_servable = project_db_is_servable(project_name, serving_db_path);
 
     /* Close cached store — pipeline will delete + recreate the .db file */
     if (srv->owns_store && srv->store) {
@@ -8315,6 +8539,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_file_error_t *file_errors = NULL;
     int file_error_count = 0;
     cbm_pipeline_get_file_errors(p, &file_errors, &file_error_count);
+    cbm_index_resource_violation_t resource_violation = {0};
+    cbm_pipeline_get_resource_violation(p, &resource_violation);
 
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
 
@@ -8343,6 +8569,37 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
             file_errors, file_error_count, has_logfile ? logfile_path : NULL);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
+    } else if (rc == CBM_PIPELINE_RESOURCE_LIMIT &&
+               resource_violation.resource != CBM_INDEX_RESOURCE_NONE) {
+        const char *config_key = cbm_index_resource_config_key(resource_violation.resource);
+        bool discovery_resource =
+            resource_violation.resource == CBM_INDEX_RESOURCE_FILES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_SOURCE_BYTES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_DIRECTORIES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_ENTRIES ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_DEPTH ||
+            resource_violation.resource == CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS;
+        char message[CBM_SZ_256];
+        (void)snprintf(message, sizeof(message),
+                       resource_violation.probe_failed ? "Index resource probe failed for %s"
+                                                       : "Index exceeded %s",
+                       config_key);
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_str(doc, root, "code",
+                               resource_violation.probe_failed ? "resource_probe_failed"
+                                                               : "resource_limit_exceeded");
+        yyjson_mut_obj_add_str(doc, root, "stage", discovery_resource ? "discovery" : "storage");
+        yyjson_mut_obj_add_str(doc, root, "resource",
+                               cbm_index_resource_name(resource_violation.resource));
+        yyjson_mut_obj_add_uint(doc, root, "observed", resource_violation.observed);
+        yyjson_mut_obj_add_uint(doc, root, "limit", resource_violation.limit);
+        yyjson_mut_obj_add_str(doc, root, "unit",
+                               cbm_index_resource_unit(resource_violation.resource));
+        yyjson_mut_obj_add_bool(doc, root, "retryable", true);
+        yyjson_mut_obj_add_bool(doc, root, "serving_index_preserved",
+                                serving_index_was_servable &&
+                                    project_db_is_servable(project_name, serving_db_path));
+        yyjson_mut_obj_add_strcpy(doc, root, "message", message);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -11570,11 +11827,18 @@ static void *autoindex_thread(void *arg) {
         return NULL;
     }
 
+    cbm_index_resource_policy_t resource_policy;
+    char policy_error[CBM_SZ_256] = {0};
+    if (!load_index_policy(srv, NULL, &resource_policy, policy_error, sizeof(policy_error))) {
+        cbm_log_warn("autoindex.err", "msg", "resource_policy_load_failed", "error", policy_error);
+        return NULL;
+    }
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    cbm_pipeline_set_resource_policy(p, &resource_policy);
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();

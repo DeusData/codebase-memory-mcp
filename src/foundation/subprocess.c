@@ -11,6 +11,7 @@
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -18,14 +19,17 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #include "win_utf8.h" /* cbm_utf8_to_wide — spawn the worker with a wide command line so a
                        * non-ASCII repo path survives CreateProcess (#423/#20) */
 #include <stdlib.h>   /* free */
 #else
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #ifdef __APPLE__
+#include <libproc.h>
 #include <spawn.h>
 extern char **environ;
 #endif
@@ -435,6 +439,287 @@ struct cbm_subprocess {
     pid_t pgid;
 #endif
 };
+
+static void cbm_rss_add_saturated(uint64_t *total, uint64_t value) {
+    if (value > UINT64_MAX - *total) {
+        *total = UINT64_MAX;
+    } else {
+        *total += value;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+uint64_t cbm_subprocess_rss_sum_for_testing(const uint64_t *values, size_t count) {
+    uint64_t total = 0;
+    for (size_t index = 0; values && index < count; index++) {
+        cbm_rss_add_saturated(&total, values[index]);
+    }
+    return total;
+}
+#endif
+
+#ifdef _WIN32
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    DWORD capacity = 32;
+    JOBOBJECT_BASIC_PROCESS_ID_LIST *processes = NULL;
+    for (;;) {
+        size_t bytes = sizeof(*processes) + (size_t)(capacity - 1) * sizeof(ULONG_PTR);
+        if (bytes > UINT32_MAX) {
+            free(processes);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        JOBOBJECT_BASIC_PROCESS_ID_LIST *grown = realloc(processes, bytes);
+        if (!grown) {
+            free(processes);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        processes = grown;
+        ZeroMemory(processes, bytes);
+        processes->NumberOfAssignedProcesses = capacity;
+        if (QueryInformationJobObject(process->job, JobObjectBasicProcessIdList, processes,
+                                      (DWORD)bytes, NULL)) {
+            break;
+        }
+        if (GetLastError() != ERROR_MORE_DATA || capacity > (UINT32_MAX / 2U)) {
+            free(processes);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        capacity *= 2U;
+    }
+
+    uint64_t total = 0;
+    DWORD measured = 0;
+    bool root_failed = false;
+    for (DWORD index = 0; index < processes->NumberOfProcessIdsInList; index++) {
+        DWORD pid = (DWORD)processes->ProcessIdList[index];
+        HANDLE member = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!member) {
+            root_failed = root_failed || pid == process->process_id;
+            continue;
+        }
+        PROCESS_MEMORY_COUNTERS memory;
+        ZeroMemory(&memory, sizeof(memory));
+        if (GetProcessMemoryInfo(member, &memory, sizeof(memory))) {
+            cbm_rss_add_saturated(&total, (uint64_t)memory.WorkingSetSize);
+            measured++;
+        } else if (pid == process->process_id) {
+            root_failed = true;
+        }
+        CloseHandle(member);
+    }
+    DWORD listed = processes->NumberOfProcessIdsInList;
+    free(processes);
+    if (root_failed || (measured == 0 && listed > 0)) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    if (measured == 0) {
+        return CBM_PROC_TREE_RSS_EMPTY;
+    }
+    *rss_bytes = total;
+    return CBM_PROC_TREE_RSS_OK;
+}
+#elif defined(__APPLE__)
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    int capacity = proc_listallpids(NULL, 0);
+    if (capacity <= 0 || capacity > INT_MAX / (int)sizeof(pid_t) - 64) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    capacity += 64;
+    pid_t *pids = NULL;
+    int count = 0;
+    for (;;) {
+        pid_t *grown = realloc(pids, (size_t)capacity * sizeof(*pids));
+        if (!grown) {
+            free(pids);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        pids = grown;
+        count = proc_listallpids(pids, capacity * (int)sizeof(*pids));
+        if (count <= 0) {
+            free(pids);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        if (count < capacity) {
+            break;
+        }
+        if (capacity > INT_MAX / (int)sizeof(*pids) / 2) {
+            free(pids);
+            return CBM_PROC_TREE_RSS_ERROR;
+        }
+        capacity *= 2;
+    }
+
+    uint64_t total = 0;
+    int measured = 0;
+    bool root_failed = false;
+    for (int index = 0; index < count; index++) {
+        struct proc_bsdinfo info;
+        if (pids[index] <= 0) {
+            continue;
+        }
+        if (proc_pidinfo(pids[index], PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
+            (int)sizeof(info)) {
+            root_failed = root_failed || pids[index] == process->pid;
+            continue;
+        }
+        if ((pid_t)info.pbi_pgid != process->pgid) {
+            continue;
+        }
+        struct rusage_info_v2 usage;
+        if (proc_pid_rusage(pids[index], RUSAGE_INFO_V2, (rusage_info_t *)&usage) != 0) {
+            root_failed = root_failed || pids[index] == process->pid;
+            continue;
+        }
+        cbm_rss_add_saturated(&total, usage.ri_resident_size);
+        measured++;
+    }
+    free(pids);
+    if (root_failed) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    if (measured == 0) {
+        return CBM_PROC_TREE_RSS_EMPTY;
+    }
+    *rss_bytes = total;
+    return CBM_PROC_TREE_RSS_OK;
+}
+#else
+static bool cbm_proc_pid_name(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)name; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cbm_linux_proc_stat(const char *pid_name, pid_t *group, int64_t *rss_pages) {
+    char path[64];
+    int length = snprintf(path, sizeof(path), "/proc/%s/stat", pid_name);
+    if (length <= 0 || length >= (int)sizeof(path)) {
+        return false;
+    }
+    FILE *stat_file = cbm_fopen(path, "rb");
+    if (!stat_file) {
+        return false;
+    }
+    char stat_line[4096];
+    bool read = fgets(stat_line, sizeof(stat_line), stat_file) != NULL;
+    (void)fclose(stat_file);
+    char *command_end = read ? strrchr(stat_line, ')') : NULL;
+    if (!command_end || command_end[1] != ' ') {
+        return false;
+    }
+
+    char *save = NULL;
+    char *token = strtok_r(command_end + 2, " ", &save);
+    int field = 3;
+    bool have_group = false;
+    bool have_rss = false;
+    while (token) {
+        if (field == 5 || field == 24) {
+            char *end = NULL;
+            long long value = strtoll(token, &end, 10);
+            if (!end || *end != '\0') {
+                return false;
+            }
+            if (field == 5) {
+                *group = (pid_t)value;
+                have_group = true;
+            } else {
+                *rss_pages = (int64_t)value;
+                have_rss = true;
+                break;
+            }
+        }
+        token = strtok_r(NULL, " ", &save);
+        field++;
+    }
+    return have_group && have_rss;
+}
+
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    DIR *proc = opendir("/proc");
+    if (!proc) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        (void)closedir(proc);
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+
+    uint64_t total = 0;
+    int measured = 0;
+    bool root_failed = false;
+    struct dirent *entry;
+    while ((entry = readdir(proc)) != NULL) {
+        if (!cbm_proc_pid_name(entry->d_name)) {
+            continue;
+        }
+        pid_t group = 0;
+        int64_t pages = 0;
+        bool root_entry = strtol(entry->d_name, NULL, 10) == (long)process->pid;
+        if (!cbm_linux_proc_stat(entry->d_name, &group, &pages)) {
+            root_failed = root_failed || root_entry;
+            continue;
+        }
+        if (group != process->pgid || pages < 0) {
+            continue;
+        }
+        uint64_t page_count = (uint64_t)pages;
+        uint64_t bytes = page_count > UINT64_MAX / (uint64_t)page_size
+                             ? UINT64_MAX
+                             : page_count * (uint64_t)page_size;
+        cbm_rss_add_saturated(&total, bytes);
+        measured++;
+    }
+    (void)closedir(proc);
+    if (root_failed) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    if (measured == 0) {
+        return CBM_PROC_TREE_RSS_EMPTY;
+    }
+    *rss_bytes = total;
+    return CBM_PROC_TREE_RSS_OK;
+}
+#endif
+
+cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_bytes(cbm_subprocess_t *process,
+                                                         uint64_t *rss_bytes) {
+    if (!process || !rss_bytes) {
+        return CBM_PROC_TREE_RSS_ERROR;
+    }
+    *rss_bytes = 0;
+    return cbm_subprocess_tree_rss_platform(process, rss_bytes);
+}
+
+bool cbm_subprocess_root_running(const cbm_subprocess_t *process) {
+    if (!process || process->root_reaped) {
+        return false;
+    }
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    return lifecycle == CBM_SUBPROCESS_ACTIVE || lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED;
+}
+
+bool cbm_subprocess_termination_pending(const cbm_subprocess_t *process) {
+    return process && process->termination_started;
+}
+
+bool cbm_subprocess_supervision_active(const cbm_subprocess_t *process) {
+    if (!process) {
+        return false;
+    }
+    int lifecycle = atomic_load_explicit(&process->lifecycle, memory_order_acquire);
+    return lifecycle == CBM_SUBPROCESS_ACTIVE || lifecycle == CBM_SUBPROCESS_CANCEL_REQUESTED;
+}
 
 static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->outcome = CBM_PROC_SPAWN_FAILED;
