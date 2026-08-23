@@ -7,6 +7,7 @@
 
 #include "foundation/constants.h"
 #include "mcp/mcp.h"
+#include "yyjson/yyjson.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -138,6 +139,172 @@ static void emit_header(adapter_sb_t *sb, const char *client) {
               "// are overwritten; edit outside it, or remove the markers to take ownership.\n");
 }
 
+static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_str) {
+    if (!schema_str) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+    
+    /* Parse the JSON schema to extract properties and convert to TypeBox */
+    yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!doc) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+    
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *properties = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
+    
+    if (!properties) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+    
+    sb_append(sb, "Type.Object({\n");
+    
+    /* Build required properties set for fast lookup */
+    bool first_prop = true;
+    size_t idx = 0, max = 0;
+    yyjson_val *key = NULL, *val = NULL;
+    
+    yyjson_obj_foreach(properties, idx, max, key, val) {
+        const char *prop_name = yyjson_get_str(key);
+        if (!prop_name) continue;
+        
+        if (!first_prop) {
+            sb_append(sb, ",\n");
+        }
+        first_prop = false;
+        
+        sb_append(sb, "      ");
+        sb_append(sb, prop_name);
+        sb_append(sb, ": ");
+        
+        /* Check if property is required */
+        bool is_required = false;
+        if (required && yyjson_is_arr(required)) {
+            size_t req_idx = 0, req_max = yyjson_arr_size(required);
+            for (req_idx = 0; req_idx < req_max; req_idx++) {
+                yyjson_val *req_item = yyjson_arr_get(required, req_idx);
+                const char *req_name = yyjson_get_str(req_item);
+                if (req_name && strcmp(req_name, prop_name) == 0) {
+                    is_required = true;
+                    break;
+                }
+            }
+        }
+        
+        /* Get property type and description */
+        yyjson_val *type_val = yyjson_obj_get(val, "type");
+        yyjson_val *desc_val = yyjson_obj_get(val, "description");
+        yyjson_val *enum_val = yyjson_obj_get(val, "enum");
+        yyjson_val *items_val = yyjson_obj_get(val, "items");
+        
+        const char *type_str = yyjson_get_str(type_val);
+        const char *desc_str = yyjson_get_str(desc_val);
+        
+        /* Build TypeBox type based on JSON schema type */
+        if (!is_required) {
+            sb_append(sb, "Type.Optional(");
+        }
+        
+        if (type_str && strcmp(type_str, "string") == 0) {
+            if (enum_val && yyjson_is_arr(enum_val)) {
+                sb_append(sb, "Type.Union([");
+                size_t enum_idx = 0, enum_max = yyjson_arr_size(enum_val);
+                for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+                    if (enum_idx > 0) sb_append(sb, ", ");
+                    yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
+                    const char *enum_str = yyjson_get_str(enum_item);
+                    sb_append(sb, "Type.Literal(");
+                    sb_append_js_string(sb, enum_str);
+                    sb_append(sb, ")");
+                }
+                sb_append(sb, "]");
+                if (desc_str) {
+                    sb_append(sb, ", { description: ");
+                    sb_append_js_string(sb, desc_str);
+                    sb_append(sb, " }");
+                }
+                sb_append(sb, ")");
+            } else {
+                sb_append(sb, "Type.String(");
+                if (desc_str) {
+                    sb_append(sb, "{ description: ");
+                    sb_append_js_string(sb, desc_str);
+                    sb_append(sb, " }");
+                }
+                sb_append(sb, ")");
+            }
+        } else if (type_str && strcmp(type_str, "integer") == 0) {
+            sb_append(sb, "Type.Integer(");
+            if (desc_str) {
+                sb_append(sb, "{ description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        } else if (type_str && strcmp(type_str, "number") == 0) {
+            sb_append(sb, "Type.Number(");
+            if (desc_str) {
+                sb_append(sb, "{ description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        } else if (type_str && strcmp(type_str, "boolean") == 0) {
+            sb_append(sb, "Type.Boolean(");
+            if (desc_str) {
+                sb_append(sb, "{ description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        } else if (type_str && strcmp(type_str, "array") == 0) {
+            sb_append(sb, "Type.Array(");
+            if (items_val) {
+                yyjson_val *items_type = yyjson_obj_get(items_val, "type");
+                const char *items_type_str = yyjson_get_str(items_type);
+                if (items_type_str && strcmp(items_type_str, "string") == 0) {
+                    sb_append(sb, "Type.String()");
+                } else if (items_type_str && strcmp(items_type_str, "integer") == 0) {
+                    sb_append(sb, "Type.Integer()");
+                } else if (items_type_str && strcmp(items_type_str, "number") == 0) {
+                    sb_append(sb, "Type.Number()");
+                } else {
+                    sb_append(sb, "Type.Any()");
+                }
+            } else {
+                sb_append(sb, "Type.Any()");
+            }
+            if (desc_str) {
+                sb_append(sb, ", { description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        } else {
+            /* Default to Type.Any() for unknown types */
+            sb_append(sb, "Type.Any(");
+            if (desc_str) {
+                sb_append(sb, "{ description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        }
+        
+        if (!is_required) {
+            sb_append(sb, ")");
+        }
+    }
+    
+    sb_append(sb, "\n    })");
+    yyjson_doc_free(doc);
+}
+
 char *cbm_client_adapter_pi(const char *binary_path) {
     if (!binary_path || !binary_path[0]) {
         return NULL;
@@ -157,7 +324,8 @@ char *cbm_client_adapter_pi(const char *binary_path) {
      * (pods CLI) or an old AgentTool arity cannot be mistaken for this file. */
     sb_append(&sb, "// Target: @earendil-works/pi-coding-agent >= 0.74.0 (verified 0.84.2)\n"
                    "// ToolDefinition.execute(toolCallId, params, signal, onUpdate, ctx)\n");
-    sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
+    sb_append(&sb, "import { spawn } from 'node:child_process';\n");
+    sb_append(&sb, "import { Type } from 'typebox';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
     sb_append(&sb, "';\n\n");
@@ -218,10 +386,8 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         sb_append(&sb, ",\n    description: ");
         sb_append_js_string(&sb, description ? description : "");
         sb_append(&sb, ",\n    parameters: ");
-        /* input_schema is compact JSON, which is a valid JavaScript object
-         * literal; embedding it directly keeps the generated module free of a
-         * JSON.parse indirection and of any escaping drift. */
-        sb_append(&sb, schema ? schema : "{}");
+        /* Convert JSON schema to TypeBox format */
+        convert_json_schema_to_typebox(&sb, schema);
         /* 0.84.2 calls execute(toolCallId, params, signal, onUpdate, ctx).
          * The previous (args, ctx) shape bound the call id as the MCP args. */
         sb_append(&sb, ",\n    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {\n");

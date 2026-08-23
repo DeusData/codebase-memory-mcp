@@ -1130,8 +1130,11 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     ASSERT_NOT_NULL(strstr(js, "result.content"));
     ASSERT_NULL(strstr(js, "run: (args, ctx)"));
     ASSERT_NOT_NULL(strstr(js, "parameters:"));
-    /* The registry input_schema is embedded as a JSON object literal. */
-    ASSERT_NOT_NULL(strstr(js, "\"type\":\"object\""));
+    /* TypeBox parameters schema is embedded with Type.Object syntax. */
+    ASSERT_NOT_NULL(strstr(js, "Type.Object("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* TypeBox import should be present. */
+    ASSERT_NOT_NULL(strstr(js, "import { Type } from 'typebox';"));
     /* Raw JSON output is required so the bridge can parse the MCP result; the
      * human-readable path would leave `call` with nothing to JSON.parse. */
     ASSERT_NOT_NULL(strstr(js, "'cli', '--json'"));
