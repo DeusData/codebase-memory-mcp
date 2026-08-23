@@ -2669,6 +2669,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                          iec_st_var_types, iec_st_assign_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_iec61131_3_st, NULL},
 
+    // CBM_LANG_PLCOPEN_XML — CODESYS/PLCopen TC6 XML export. No grammar row:
+    // the pipeline transcodes it to textual IEC 61131-3 ST (plcopen_xml.c)
+    // and re-extracts each generated unit as CBM_LANG_IEC_ST, so this
+    // language never reaches cbm_lang_spec()/cbm_ts_language() directly.
+    // Left as a zero spec, same as CBM_LANG_OBJECTSCRIPT_EXPORT above.
+
 };
 
 _Static_assert(sizeof(lang_specs) / sizeof(lang_specs[0]) == CBM_LANG_COUNT,

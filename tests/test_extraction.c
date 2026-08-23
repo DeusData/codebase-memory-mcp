@@ -13,6 +13,7 @@
 #include "macro_table.h"
 #include "iris_export_xml.h"
 #include "twincat_xml.h"
+#include "plcopen_xml.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -5486,6 +5487,258 @@ TEST(iris_export_xml_multi_class) {
 }
 
 /* ===================================================================
+ * CODESYS/PLCopen TC6 XML export transcoding (plcopen_xml.c)
+ * =================================================================== */
+
+#define PLCOPEN_MULTI_POU                                                                       \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                              \
+    "<project xmlns=\"http://www.plcopen.org/xml/tc6_0201\">\n"                                 \
+    "  <types>\n"                                                                               \
+    "    <pous>\n"                                                                              \
+    "      <pou name=\"FB_Valve\" pouType=\"functionBlock\">\n"                                 \
+    "        <interface>\n"                                                                     \
+    "          <inputVars>\n"                                                                   \
+    "            <variable name=\"bOpen\"><type><BOOL/></type></variable>\n"                    \
+    "            <variable name=\"rSetpoint\"><type><REAL/></type>\n"                           \
+    "              <initialValue><simpleValue value=\"0.0\"/></initialValue></variable>\n"      \
+    "          </inputVars>\n"                                                                  \
+    "          <outputVars>\n"                                                                  \
+    "            <variable name=\"bDone\"><type><BOOL/></type></variable>\n"                    \
+    "          </outputVars>\n"                                                                 \
+    "          <localVars>\n"                                                                   \
+    "            <variable name=\"fbTimer\"><type><derived name=\"TON\"/></type></variable>\n"  \
+    "          </localVars>\n"                                                                  \
+    "        </interface>\n"                                                                    \
+    "        <body>\n"                                                                          \
+    "          <ST><xhtml xmlns=\"http://www.w3.org/1999/xhtml\">fbTimer(IN := bOpen);\n"       \
+    "bDone := fbTimer.Q;</xhtml></ST>\n"                                                        \
+    "        </body>\n"                                                                         \
+    "      </pou>\n"                                                                            \
+    "      <pou name=\"F_Scale\" pouType=\"function\">\n"                                       \
+    "        <interface>\n"                                                                     \
+    "          <returnType><REAL/></returnType>\n"                                              \
+    "          <inputVars><variable name=\"rIn\"><type><REAL/></type></variable></inputVars>\n" \
+    "        </interface>\n"                                                                    \
+    "        <body><ST><xhtml>F_Scale := rIn * 2.0;</xhtml></ST></body>\n"                      \
+    "      </pou>\n"                                                                            \
+    "    </pous>\n"                                                                             \
+    "  </types>\n"                                                                              \
+    "</project>\n"
+
+TEST(plcopen_xml_multi_pou_transcode) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st =
+        cbm_plcopen_to_st(&arena, PLCOPEN_MULTI_POU, (int)strlen(PLCOPEN_MULTI_POU), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(count, 2);
+
+    const char *fb_unit = NULL;
+    const char *fn_unit = NULL;
+    for (int i = 0; i < count; i++) {
+        if (strstr(st[i], "FB_Valve")) {
+            fb_unit = st[i];
+        }
+        if (strstr(st[i], "F_Scale")) {
+            fn_unit = st[i];
+        }
+    }
+    ASSERT_NOT_NULL(fb_unit);
+    ASSERT_NOT_NULL(fn_unit);
+    ASSERT(strstr(fb_unit, "FUNCTION_BLOCK FB_Valve") != NULL);
+    ASSERT(strstr(fb_unit, "END_FUNCTION_BLOCK") != NULL);
+    ASSERT(strstr(fb_unit, "fbTimer(IN := bOpen);") != NULL);
+    /* the function's PLCopen <returnType> lands in the FUNCTION signature */
+    ASSERT(strstr(fn_unit, "FUNCTION F_Scale : REAL") != NULL);
+    ASSERT(strstr(fn_unit, "END_FUNCTION") != NULL);
+    ASSERT(strstr(fn_unit, "F_Scale := rIn * 2.0;") != NULL);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(plcopen_xml_declaration_synthesis) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st =
+        cbm_plcopen_to_st(&arena, PLCOPEN_MULTI_POU, (int)strlen(PLCOPEN_MULTI_POU), &count);
+    ASSERT_NOT_NULL(st);
+    const char *fb_unit = NULL;
+    for (int i = 0; i < count; i++) {
+        if (strstr(st[i], "FB_Valve")) {
+            fb_unit = st[i];
+        }
+    }
+    ASSERT_NOT_NULL(fb_unit);
+    ASSERT(strstr(fb_unit, "VAR_INPUT") != NULL);
+    ASSERT(strstr(fb_unit, "bOpen : BOOL;") != NULL);
+    /* initialValue/simpleValue becomes `:= V` */
+    ASSERT(strstr(fb_unit, "rSetpoint : REAL := 0.0;") != NULL);
+    ASSERT(strstr(fb_unit, "VAR_OUTPUT") != NULL);
+    ASSERT(strstr(fb_unit, "bDone : BOOL;") != NULL);
+    ASSERT(strstr(fb_unit, "VAR\n") != NULL);
+    /* a <derived name="X"/> child resolves to its name attribute */
+    ASSERT(strstr(fb_unit, "fbTimer : TON;") != NULL);
+    ASSERT(strstr(fb_unit, "END_VAR") != NULL);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(plcopen_xml_extracted_through_st_grammar) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st =
+        cbm_plcopen_to_st(&arena, PLCOPEN_MULTI_POU, (int)strlen(PLCOPEN_MULTI_POU), &count);
+    ASSERT_NOT_NULL(st);
+    const char *fb_unit = NULL;
+    for (int i = 0; i < count; i++) {
+        if (strstr(st[i], "FB_Valve")) {
+            fb_unit = st[i];
+        }
+    }
+    ASSERT_NOT_NULL(fb_unit);
+    CBMFileResult *r = extract(fb_unit, CBM_LANG_IEC_ST, "t", "FB_Valve.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    bool found_class = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "FB_Valve") == 0 &&
+            strcmp(r->defs.items[i].label, "Class") == 0) {
+            found_class = true;
+        }
+    }
+    ASSERT(found_class);
+    /* A VAR_INPUT `variable_declaration` is a binding site for IEC_ST
+     * (extract_usages.c: iec_st_binding_nodes), not a module-level Variable
+     * def (extract_defs.c only mints those for a GVL's
+     * global_var_declaration_block) — so `bOpen` itself is neither a def nor
+     * an ordinary usage. Its read inside the body (`fbTimer(IN := bOpen);`)
+     * is the observable signal the synthesized declaration actually wired
+     * through to a live reference. */
+    bool found_input_usage = false;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "bOpen") == 0) {
+            found_input_usage = true;
+        }
+    }
+    ASSERT(found_input_usage);
+    bool found_call = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name &&
+            strcmp(r->calls.items[i].callee_name, "fbTimer") == 0) {
+            found_call = true;
+        }
+    }
+    ASSERT(found_call);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+#define PLCOPEN_GRAPHICAL_BODY                                       \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                   \
+    "<project xmlns=\"http://www.plcopen.org/xml/tc6_0201\">\n"      \
+    "  <types><pous>\n"                                              \
+    "    <pou name=\"FB_Ladder\" pouType=\"functionBlock\">\n"       \
+    "      <interface><localVars>\n"                                 \
+    "        <variable name=\"x\"><type><BOOL/></type></variable>\n" \
+    "      </localVars></interface>\n"                               \
+    "      <body><LD><some graphical=\"content\"/></LD></body>\n"    \
+    "    </pou>\n"                                                   \
+    "  </pous></types>\n"                                            \
+    "</project>\n"
+
+TEST(plcopen_xml_graphical_body_tolerated) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_plcopen_to_st(&arena, PLCOPEN_GRAPHICAL_BODY,
+                                  (int)strlen(PLCOPEN_GRAPHICAL_BODY), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(count, 1);
+    ASSERT(strstr(st[0], "FUNCTION_BLOCK FB_Ladder") != NULL);
+    ASSERT(strstr(st[0], "x : BOOL;") != NULL);
+    ASSERT(strstr(st[0], "END_FUNCTION_BLOCK") != NULL);
+    /* no ladder/graphical markup leaked into the ST text */
+    ASSERT(strstr(st[0], "<LD>") == NULL);
+    ASSERT(strstr(st[0], "graphical") == NULL);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "FB_Ladder.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(plcopen_xml_negatives_and_bom) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+
+    /* non-PLCopen XML is not claimed */
+    static const char other[] = "<?xml version=\"1.0\"?>\n<Project></Project>\n";
+    char **st = cbm_plcopen_to_st(&arena, other, (int)sizeof(other) - 1, &count);
+    ASSERT(st == NULL);
+    ASSERT_EQ(count, 0);
+
+    /* UTF-16 input is rejected, not garbled */
+    static const char utf16le[] =
+        "\xFF\xFE<\0p\0r\0o\0j\0e\0c\0t\0 \0x\0m\0l\0n\0s\0=\0\"\0p\0l\0c\0o\0p\0e\0n\0.\0o\0r"
+        "\0g\0/\0x\0m\0l\0\"\0>\0";
+    count = 0;
+    st = cbm_plcopen_to_st(&arena, utf16le, (int)sizeof(utf16le) - 1, &count);
+    ASSERT(st == NULL);
+    ASSERT_EQ(count, 0);
+
+    /* a UTF-8 BOM prefix is accepted */
+    static const char bom_prefix[] = "\xEF\xBB\xBF";
+    size_t bom_len = strlen(bom_prefix) + strlen(PLCOPEN_MULTI_POU);
+    char *bom_input = (char *)cbm_arena_alloc(&arena, bom_len + 1);
+    ASSERT_NOT_NULL(bom_input);
+    snprintf(bom_input, bom_len + 1, "%s%s", bom_prefix, PLCOPEN_MULTI_POU);
+    count = 0;
+    st = cbm_plcopen_to_st(&arena, bom_input, (int)bom_len, &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(count, 2);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+#define PLCOPEN_ENTITY_DECODING                                      \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                   \
+    "<project xmlns=\"http://www.plcopen.org/xml/tc6_0201\">\n"      \
+    "  <types><pous>\n"                                              \
+    "    <pou name=\"FB_Entities\" pouType=\"functionBlock\">\n"     \
+    "      <interface><localVars>\n"                                 \
+    "        <variable name=\"s\"><type><STRING/></type>\n"          \
+    "          <initialValue><simpleValue value=\"A &amp; B &lt; "   \
+    "C\"/></initialValue></variable>\n"                              \
+    "      </localVars></interface>\n"                               \
+    "      <body><ST><xhtml>s := 'x &amp; y';</xhtml></ST></body>\n" \
+    "    </pou>\n"                                                   \
+    "  </pous></types>\n"                                            \
+    "</project>\n"
+
+TEST(plcopen_xml_entity_decoding) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_plcopen_to_st(&arena, PLCOPEN_ENTITY_DECODING,
+                                  (int)strlen(PLCOPEN_ENTITY_DECODING), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(count, 1);
+    /* &amp; and &lt; decoded in both an attribute value and the ST body */
+    ASSERT(strstr(st[0], "A & B < C") != NULL);
+    ASSERT(strstr(st[0], "s := 'x & y';") != NULL);
+    ASSERT(strstr(st[0], "&amp;") == NULL);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* ===================================================================
  * TwinCAT PLC XML container transcoding (twincat_xml.c)
  * =================================================================== */
 
@@ -5804,6 +6057,14 @@ SUITE(extraction) {
     RUN_TEST(twincat_xml_gvl_globals);
     RUN_TEST(twincat_xml_itf_interface);
     RUN_TEST(twincat_xml_bom_and_utf16);
+
+    /* CODESYS/PLCopen TC6 XML exports */
+    RUN_TEST(plcopen_xml_multi_pou_transcode);
+    RUN_TEST(plcopen_xml_declaration_synthesis);
+    RUN_TEST(plcopen_xml_extracted_through_st_grammar);
+    RUN_TEST(plcopen_xml_graphical_body_tolerated);
+    RUN_TEST(plcopen_xml_negatives_and_bom);
+    RUN_TEST(plcopen_xml_entity_decoding);
 
     /* R box-module imports + member calls */
     RUN_TEST(extract_r_box_use_imports_issue218);

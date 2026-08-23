@@ -865,6 +865,9 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             : fi->language == CBM_LANG_TWINCAT
                 ? cbm_pipeline_extract_twincat(source, source_len, ec->project_name, fi->rel_path,
                                                ec->macro_table, ec->return_type_table)
+            : fi->language == CBM_LANG_PLCOPEN_XML
+                ? cbm_pipeline_extract_plcopen(source, source_len, ec->project_name, fi->rel_path,
+                                               ec->macro_table, ec->return_type_table)
                 : cbm_extract_file_ex(source, source_len, fi->language, ec->project_name,
                                       fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, ec->macro_table,
                                       ec->return_type_table);

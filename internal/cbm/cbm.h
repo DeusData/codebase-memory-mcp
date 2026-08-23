@@ -176,6 +176,7 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
     CBM_LANG_IEC_ST,               // IEC 61131-3 Structured Text (.st/.iecst — PLC languages)
     CBM_LANG_TWINCAT,              // TwinCAT 3 PLC XML container (.TcPOU/.TcDUT/.TcGVL/.TcIO)
+    CBM_LANG_PLCOPEN_XML,          // CODESYS/PLCopen TC6 XML export (<project xmlns=".../tc6_...">)
     CBM_LANG_COUNT
 } CBMLanguage;
 

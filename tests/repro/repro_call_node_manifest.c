@@ -537,9 +537,10 @@ TEST(repro_call_node_manifest_live_specs_contain_only_expected_primary_entries) 
         const CBMLangSpec *spec = cbm_lang_spec(language);
 
         /* The registry reproduction owns Nim's stale enum and the transform-only,
-         * intentionally grammar-free classifications (Studio Export, TwinCAT). */
+         * intentionally grammar-free classifications (Studio Export, TwinCAT,
+         * PLCopen XML). */
         if (language == CBM_LANG_NIM || language == CBM_LANG_OBJECTSCRIPT_EXPORT ||
-            language == CBM_LANG_TWINCAT) {
+            language == CBM_LANG_TWINCAT || language == CBM_LANG_PLCOPEN_XML) {
             continue;
         }
         if (!spec || spec->language != language) {

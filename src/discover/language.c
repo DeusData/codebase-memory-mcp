@@ -874,6 +874,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
     [CBM_LANG_IEC_ST] = "IEC 61131-3 Structured Text",
     [CBM_LANG_TWINCAT] = "TwinCAT PLC XML",
+    [CBM_LANG_PLCOPEN_XML] = "PLCopen XML",
 
 };
 

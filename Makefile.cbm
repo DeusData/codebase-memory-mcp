@@ -251,6 +251,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/twincat_xml.c \
+    $(CBM_DIR)/plcopen_xml.c \
     $(CBM_DIR)/service_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)

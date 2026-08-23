@@ -161,6 +161,13 @@ CBMFileResult *cbm_pipeline_extract_twincat(const char *source, int source_len,
                                             const CBMMacroTable *macro_table,
                                             const CBMReturnTypeTable *return_type_table);
 
+/* Transcode a CODESYS/PLCopen TC6 XML export and compose the generated IEC
+ * 61131-3 ST units (one per <pou>/<dataType>) into one cacheable result. */
+CBMFileResult *cbm_pipeline_extract_plcopen(const char *source, int source_len,
+                                            const char *project_name, const char *rel_path,
+                                            const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table);
+
 /* Materialize CONFIGURES edges from one extracted file's env-access carriers.
  * Shared by sequential definition processing and the parallel cache registry. */
 int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,

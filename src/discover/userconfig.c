@@ -142,6 +142,7 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"mojo", CBM_LANG_MOJO},
     {"iec_st", CBM_LANG_IEC_ST},
     {"twincat", CBM_LANG_TWINCAT},
+    {"plcopen_xml", CBM_LANG_PLCOPEN_XML},
     {"lean", CBM_LANG_LEAN},
     {"form", CBM_LANG_FORM},
     {"magma", CBM_LANG_MAGMA},
