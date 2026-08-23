@@ -56,20 +56,25 @@ enum { PIPELINE_TEST_OVERLONG_DB_PATH = CBM_PATH_MAX + CBM_SZ_128 };
 
 static char g_pipeline_log_capture[CBM_SZ_64K];
 static CBMLogLevel g_pipeline_prev_log_level = CBM_LOG_INFO;
+static cbm_mutex_t g_pipeline_log_capture_mutex;
 
 static void pipeline_capture_log_sink(const char *line) {
+    cbm_mutex_lock(&g_pipeline_log_capture_mutex);
     size_t used = strlen(g_pipeline_log_capture);
     size_t avail = sizeof(g_pipeline_log_capture) - used;
     if (avail <= SKIP_ONE) {
+        cbm_mutex_unlock(&g_pipeline_log_capture_mutex);
         return;
     }
     int n = snprintf(g_pipeline_log_capture + used, avail, "%s\n", line);
     if (n < 0 || (size_t)n >= avail) {
         g_pipeline_log_capture[sizeof(g_pipeline_log_capture) - SKIP_ONE] = '\0';
     }
+    cbm_mutex_unlock(&g_pipeline_log_capture_mutex);
 }
 
 static void pipeline_capture_logs_start(void) {
+    cbm_mutex_init(&g_pipeline_log_capture_mutex);
     g_pipeline_log_capture[0] = '\0';
     g_pipeline_prev_log_level = cbm_log_get_level();
     cbm_log_set_level(CBM_LOG_DEBUG);
@@ -79,6 +84,7 @@ static void pipeline_capture_logs_start(void) {
 static const char *pipeline_capture_logs_end(void) {
     cbm_log_set_sink(NULL);
     cbm_log_set_level(g_pipeline_prev_log_level);
+    cbm_mutex_destroy(&g_pipeline_log_capture_mutex);
     return g_pipeline_log_capture;
 }
 
