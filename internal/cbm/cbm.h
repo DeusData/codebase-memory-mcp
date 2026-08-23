@@ -174,6 +174,8 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
+    CBM_LANG_IEC_ST,               // IEC 61131-3 Structured Text (.st/.iecst — PLC languages)
+    CBM_LANG_TWINCAT,              // TwinCAT 3 PLC XML container (.TcPOU/.TcDUT/.TcGVL/.TcIO)
     CBM_LANG_COUNT
 } CBMLanguage;
 

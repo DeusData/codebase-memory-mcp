@@ -2517,6 +2517,44 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
 
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    /* IEC 61131-3 ST: `FUNCTION_BLOCK X EXTENDS B IMPLEMENTS I1, I2` carries
+     * both heritage lists as repeated `extends`/`implements` FIELDS on the
+     * declaration node — not as a clause child, so the generic probes below
+     * miss them. Interfaces vs superclass are told apart downstream from the
+     * target node's label (cbm_semantic_base_edge_type), so both go in here.
+     * The grammar tags the `,` separators with the same field, hence the
+     * named-node filter. */
+    if (lang == CBM_LANG_IEC_ST) {
+        const char *bases[MAX_BASES];
+        int base_count = 0;
+        uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc && base_count < MAX_BASES_MINUS_1; i++) {
+            const char *fn = ts_node_field_name_for_child(node, i);
+            if (!fn || (strcmp(fn, "extends") != 0 && strcmp(fn, "implements") != 0)) {
+                continue;
+            }
+            TSNode ch = ts_node_child(node, i);
+            if (!ts_node_is_named(ch)) {
+                continue;
+            }
+            char *base = cbm_node_text(a, ch, source);
+            if (base && base[0]) {
+                bases[base_count++] = base;
+            }
+        }
+        if (base_count > 0) {
+            const char **result =
+                (const char **)cbm_arena_alloc(a, (base_count + 1) * sizeof(const char *));
+            if (result) {
+                for (int i = 0; i < base_count; i++) {
+                    result[i] = bases[i];
+                }
+                result[base_count] = NULL;
+                return result;
+            }
+        }
+        return NULL;
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -4534,6 +4572,15 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
 // Find the body/members node inside a class node
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
+    /* IEC 61131-3 ST: METHOD/ACTION members are DIRECT children of the
+     * FUNCTION_BLOCK/PROGRAM/INTERFACE node — its `body` field holds the
+     * executable statements, so the generic field probe below would return a
+     * statement instead of a member container. TYPE declarations keep their
+     * struct/enum members one level down, in the `definition` child. */
+    if (lang == CBM_LANG_IEC_ST) {
+        TSNode def = ts_node_child_by_field_name(class_node, TS_FIELD("definition"));
+        return ts_node_is_null(def) ? class_node : def;
+    }
     // Try field names first
     static const char *body_fields[] = {"body", "members", "class_body", "declaration_list", NULL};
     for (const char **f = body_fields; *f; f++) {
@@ -6076,6 +6123,43 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 TSNode mp = cbm_find_child_by_kind(req_spec, "module_path");
                 if (!ts_node_is_null(mp)) {
                     push_var_def(ctx, cbm_node_text(a, mp, ctx->source), req_spec);
+                }
+            }
+        }
+        return;
+    /* IEC 61131-3 ST: a GVL surfaces as a top-level `global_var_declaration_block`
+     * wrapping `var_global` sections whose `variable_declaration` children carry
+     * one or more `names` fields (`a, b : BOOL;`). The default fallback would
+     * mint only the first identifier of the first declaration. */
+    case CBM_LANG_IEC_ST:
+        if (strcmp(kind, "global_var_declaration_block") == 0) {
+            uint32_t sc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < sc; i++) {
+                TSNode sec = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(sec), "var_global") != 0) {
+                    continue;
+                }
+                uint32_t dc = ts_node_named_child_count(sec);
+                for (uint32_t j = 0; j < dc; j++) {
+                    TSNode decl = ts_node_named_child(sec, j);
+                    if (strcmp(ts_node_type(decl), "variable_declaration") != 0) {
+                        continue;
+                    }
+                    uint32_t cc = ts_node_child_count(decl);
+                    for (uint32_t k = 0; k < cc; k++) {
+                        const char *fn = ts_node_field_name_for_child(decl, k);
+                        if (!fn || strcmp(fn, "names") != 0) {
+                            continue;
+                        }
+                        /* The grammar tags the `,` separators of a multi-name
+                         * declaration with the same field, so only the named
+                         * identifier children are real names. */
+                        TSNode nm = ts_node_child(decl, k);
+                        if (!ts_node_is_named(nm)) {
+                            continue;
+                        }
+                        push_var_def(ctx, cbm_node_text(a, nm, ctx->source), decl);
+                    }
                 }
             }
         }

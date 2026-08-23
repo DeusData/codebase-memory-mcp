@@ -145,6 +145,22 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     const char *source, int source_len, const char *project_name, const char *rel_path,
     const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table);
 
+/* TwinCAT project-file pass: Package nodes + DEPENDS_ON/CONTAINS_FILE edges
+ * from .plcproj, and solution references (.tsproj → Package/.xti). */
+int cbm_pipeline_pass_tcproj(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                             int file_count);
+
+/* TwinCAT project-file detection (case-insensitive suffix match). */
+bool cbm_is_plcproj_file(const char *basename);
+bool cbm_is_tsproj_file(const char *basename);
+
+/* Transcode a TwinCAT PLC XML container (.TcPOU/.TcDUT/.TcGVL/.TcIO) and
+ * compose the generated IEC 61131-3 ST units into one cacheable result. */
+CBMFileResult *cbm_pipeline_extract_twincat(const char *source, int source_len,
+                                            const char *project_name, const char *rel_path,
+                                            const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table);
+
 /* Materialize CONFIGURES edges from one extracted file's env-access carriers.
  * Shared by sequential definition processing and the parallel cache registry. */
 int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,

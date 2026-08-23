@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <Itf Name="I_Device" Id="{a1b2c3d4-0040-4000-8000-000000000040}">
+    <Declaration><![CDATA[INTERFACE I_Device]]></Declaration>
+    <Method Name="Init" Id="{a1b2c3d4-0041-4000-8000-000000000041}">
+      <Declaration><![CDATA[METHOD Init : BOOL
+VAR_INPUT
+    nId : UDINT;
+END_VAR]]></Declaration>
+    </Method>
+    <Method Name="Reset" Id="{a1b2c3d4-0042-4000-8000-000000000042}">
+      <Declaration><![CDATA[METHOD Reset]]></Declaration>
+    </Method>
+  </Itf>
+</TcPlcObject>

@@ -1224,6 +1224,7 @@ static const char *module_parents_commonlisp[] = {"source", NULL};
 static const char *module_parents_matlab[] = {"source_file", NULL};
 static const char *module_parents_form[] = {"source_file", NULL};
 static const char *module_parents_magma[] = {"source_file", NULL};
+static const char *module_parents_iec_st[] = {"source_file", NULL};
 /* tree-sitter-properties roots at `file`. */
 static const char *module_parents_properties[] = {"file", "source_file", NULL};
 
@@ -1318,6 +1319,8 @@ static const char **get_module_parents(CBMLanguage lang) {
         return module_parents_properties;
     case CBM_LANG_GOMOD: // require_directive lives at source_file top level
         return module_parents_zig;
+    case CBM_LANG_IEC_ST: // global_var_declaration_block at source_file top level
+        return module_parents_iec_st;
     default:
         return NULL;
     }

@@ -54,9 +54,9 @@ typedef struct {
 } CallNodeManifestEntry;
 
 enum {
-    EXPECTED_HISTORICAL_CALL_NODE_TOTAL = 219,
-    EXPECTED_ACTIVE_PRIMARY_TOTAL = 189,
-    EXPECTED_DIRECT_CALLS = 155,
+    EXPECTED_HISTORICAL_CALL_NODE_TOTAL = 220,
+    EXPECTED_ACTIVE_PRIMARY_TOTAL = 190,
+    EXPECTED_DIRECT_CALLS = 156,
     EXPECTED_CONSTRUCTOR_CALLS = 20,
     EXPECTED_OPERATOR_CALLS = 12,
     EXPECTED_IMPLICIT_CALLS = 2,
@@ -65,7 +65,7 @@ enum {
     EXPECTED_CALLEE_WRAPPERS = 8,
     EXPECTED_ARGUMENT_WRAPPERS = 1,
     EXPECTED_CONTROL_OR_DOCUMENT_NONCALLS = 6,
-    EXPECTED_PRIMARY_OWNERS = 189,
+    EXPECTED_PRIMARY_OWNERS = 190,
     EXPECTED_SYNTHETIC_OWNERS = 10,
     EXPECTED_NO_CALL_EDGE_OWNERS = 20,
     EXPECTED_PRIMARY_OPERATOR_CALLS = 4,
@@ -309,6 +309,7 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
           true),
     ENTRY(CBM_LANG_OBJECTSCRIPT_ROUTINE, "routine_tag_call", DIRECT_CALL, PRIMARY_EXTRACTOR, true,
           true),
+    ENTRY(CBM_LANG_IEC_ST, "call_expression", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
 };
 
 #undef ENTRY
@@ -316,7 +317,7 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
 #define MANIFEST_COUNT (sizeof(CALL_NODE_MANIFEST) / sizeof(CALL_NODE_MANIFEST[0]))
 
 _Static_assert(MANIFEST_COUNT == EXPECTED_HISTORICAL_CALL_NODE_TOTAL,
-               "call-node manifest must contain exactly 219 entries");
+               "call-node manifest must contain exactly 220 entries");
 _Static_assert(EXPECTED_DIRECT_CALLS + EXPECTED_CONSTRUCTOR_CALLS + EXPECTED_OPERATOR_CALLS +
                        EXPECTED_IMPLICIT_CALLS + EXPECTED_DSL_INVOCATIONS +
                        EXPECTED_BUILD_DEPENDENCIES + EXPECTED_CALLEE_WRAPPERS +
@@ -535,9 +536,10 @@ TEST(repro_call_node_manifest_live_specs_contain_only_expected_primary_entries) 
         CBMLanguage language = (CBMLanguage)value;
         const CBMLangSpec *spec = cbm_lang_spec(language);
 
-        /* The registry reproduction owns Nim's stale enum and Studio Export's
-         * transform-only, intentionally grammar-free classification. */
-        if (language == CBM_LANG_NIM || language == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+        /* The registry reproduction owns Nim's stale enum and the transform-only,
+         * intentionally grammar-free classifications (Studio Export, TwinCAT). */
+        if (language == CBM_LANG_NIM || language == CBM_LANG_OBJECTSCRIPT_EXPORT ||
+            language == CBM_LANG_TWINCAT) {
             continue;
         }
         if (!spec || spec->language != language) {

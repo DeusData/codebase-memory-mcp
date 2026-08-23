@@ -12,6 +12,7 @@
 #include <time.h>
 #include "macro_table.h"
 #include "iris_export_xml.h"
+#include "twincat_xml.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -5484,6 +5485,264 @@ TEST(iris_export_xml_multi_class) {
     PASS();
 }
 
+/* ===================================================================
+ * TwinCAT PLC XML container transcoding (twincat_xml.c)
+ * =================================================================== */
+
+#define TWINCAT_POU                                                                       \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                        \
+    "<TcPlcObject Version=\"1.1.0.1\" ProductVersion=\"3.1.4024.12\">\n"                  \
+    "  <POU Name=\"FB_Motor\" Id=\"{0}\" SpecialFunc=\"None\">\n"                         \
+    "    <Declaration><![CDATA[FUNCTION_BLOCK FB_Motor EXTENDS FB_Base IMPLEMENTS "       \
+    "I_Device\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR\nVAR\n    _rSpeed : "              \
+    "REAL;\nEND_VAR]]></Declaration>\n"                                                   \
+    "    <Implementation>\n"                                                              \
+    "      <ST><![CDATA[bDone := F_Check(bEnable);]]></ST>\n"                             \
+    "    </Implementation>\n"                                                             \
+    "    <Method Name=\"Start\" Id=\"{1}\">\n"                                            \
+    "      <Declaration><![CDATA[METHOD Start : BOOL\nVAR_INPUT\n    rSpeed : "           \
+    "REAL;\nEND_VAR]]></Declaration>\n"                                                   \
+    "      <Implementation>\n"                                                            \
+    "        <ST><![CDATA[Start := rSpeed > 0.0;]]></ST>\n"                               \
+    "      </Implementation>\n"                                                           \
+    "    </Method>\n"                                                                     \
+    "    <Action Name=\"A_Reset\" Id=\"{2}\">\n"                                          \
+    "      <Implementation>\n"                                                            \
+    "        <ST><![CDATA[_rSpeed := 0.0;]]></ST>\n"                                      \
+    "      </Implementation>\n"                                                           \
+    "    </Action>\n"                                                                     \
+    "    <Property Name=\"Speed\" Id=\"{3}\">\n"                                          \
+    "      <Declaration><![CDATA[PROPERTY Speed : REAL]]></Declaration>\n"                \
+    "      <Get Name=\"Get\" Id=\"{4}\">\n"                                               \
+    "        <Implementation>\n"                                                          \
+    "          <ST><![CDATA[Speed := _rSpeed;]]></ST>\n"                                  \
+    "        </Implementation>\n"                                                         \
+    "      </Get>\n"                                                                      \
+    "    </Property>\n"                                                                   \
+    "  </POU>\n"                                                                          \
+    "</TcPlcObject>\n"
+
+TEST(twincat_xml_pou_transcode) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_POU, (int)strlen(TWINCAT_POU), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT(count == 1);
+    ASSERT(strstr(st[0], "FUNCTION_BLOCK FB_Motor EXTENDS FB_Base") != NULL);
+    ASSERT(strstr(st[0], "METHOD Start : BOOL") != NULL);
+    /* <Action> has no grammar construct and is synthesized as a METHOD */
+    ASSERT(strstr(st[0], "METHOD A_Reset") != NULL);
+    ASSERT(strstr(st[0], "PROPERTY Speed : REAL") != NULL);
+    ASSERT(strstr(st[0], "END_PROPERTY") != NULL);
+    ASSERT(strstr(st[0], "END_FUNCTION_BLOCK") != NULL);
+    /* the POU body lands after the members, before the terminator */
+    ASSERT(strstr(st[0], "bDone := F_Check(bEnable);") != NULL);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(twincat_xml_pou_extracted) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_POU, (int)strlen(TWINCAT_POU), &count);
+    ASSERT_NOT_NULL(st);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "FB_Motor.st");
+    ASSERT_NOT_NULL(r);
+    bool found_fb = false;
+    bool found_start = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "FB_Motor") == 0 &&
+            strcmp(r->defs.items[i].label, "Class") == 0) {
+            found_fb = true;
+        }
+        if (strcmp(r->defs.items[i].name, "Start") == 0) {
+            found_start = true;
+        }
+    }
+    ASSERT(found_fb);
+    ASSERT(found_start);
+    bool found_call = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, "F_Check") == 0) {
+            found_call = true;
+        }
+    }
+    ASSERT(found_call);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(twincat_xml_pou_heritage) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_POU, (int)strlen(TWINCAT_POU), &count);
+    ASSERT_NOT_NULL(st);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "FB_Motor.st");
+    ASSERT_NOT_NULL(r);
+    bool found_extends = false;
+    bool found_implements = false;
+    bool found_comma = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "FB_Motor") != 0 || !r->defs.items[i].base_classes) {
+            continue;
+        }
+        for (const char **b = r->defs.items[i].base_classes; *b; b++) {
+            if (strcmp(*b, "FB_Base") == 0) {
+                found_extends = true;
+            }
+            if (strcmp(*b, "I_Device") == 0) {
+                found_implements = true;
+            }
+            if (strcmp(*b, ",") == 0) {
+                found_comma = true;
+            }
+        }
+    }
+    /* EXTENDS and IMPLEMENTS both land in base_classes; the edge type is
+     * decided downstream from the target node's label. */
+    ASSERT(found_extends);
+    ASSERT(found_implements);
+    ASSERT_FALSE(found_comma);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+#define TWINCAT_DUT                                                                     \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                      \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                               \
+    "  <DUT Name=\"ST_Config\" Id=\"{0}\">\n"                                           \
+    "    <Declaration><![CDATA[TYPE ST_Config :\nSTRUCT\n    rMax : REAL;\nEND_STRUCT\n" \
+    "END_TYPE]]></Declaration>\n"                                                       \
+    "  </DUT>\n"                                                                        \
+    "</TcPlcObject>\n"
+
+TEST(twincat_xml_dut_end_struct_semicolon) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_DUT, (int)strlen(TWINCAT_DUT), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT(count == 1);
+    /* TwinCAT omits the `;` after END_STRUCT; the grammar requires it */
+    ASSERT(strstr(st[0], "END_STRUCT;") != NULL);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "ST_Config.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    bool found = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "ST_Config") == 0) {
+            found = true;
+        }
+    }
+    ASSERT(found);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+#define TWINCAT_GVL                                                          \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                           \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                    \
+    "  <GVL Name=\"GVL_Main\" Id=\"{0}\">\n"                                 \
+    "    <Declaration><![CDATA[{attribute 'qualified_only'}\nVAR_GLOBAL\n"   \
+    "    rMaxSpeed : REAL := 250.0;\n    bStop, bReady : BOOL;\nEND_VAR]]>"  \
+    "</Declaration>\n"                                                       \
+    "  </GVL>\n"                                                             \
+    "</TcPlcObject>\n"
+
+TEST(twincat_xml_gvl_globals) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_GVL, (int)strlen(TWINCAT_GVL), &count);
+    ASSERT_NOT_NULL(st);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "GVL_Main.st");
+    ASSERT_NOT_NULL(r);
+    int globals = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Variable") == 0) {
+            globals++;
+        }
+    }
+    /* rMaxSpeed + bStop + bReady: multi-name declarations mint every name */
+    ASSERT_EQ(globals, 3);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+#define TWINCAT_ITF                                                                    \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                     \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                              \
+    "  <Itf Name=\"I_Device\" Id=\"{0}\">\n"                                           \
+    "    <Declaration><![CDATA[INTERFACE I_Device]]></Declaration>\n"                  \
+    "    <Method Name=\"Init\" Id=\"{1}\">\n"                                          \
+    "      <Declaration><![CDATA[METHOD Init : BOOL\nVAR_INPUT\n    nId : "            \
+    "UDINT;\nEND_VAR]]></Declaration>\n"                                               \
+    "    </Method>\n"                                                                  \
+    "  </Itf>\n"                                                                       \
+    "</TcPlcObject>\n"
+
+TEST(twincat_xml_itf_interface) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_ITF, (int)strlen(TWINCAT_ITF), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT(strstr(st[0], "INTERFACE I_Device") != NULL);
+    ASSERT(strstr(st[0], "END_INTERFACE") != NULL);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "I_Device.st");
+    ASSERT_NOT_NULL(r);
+    bool found_itf = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "I_Device") == 0 &&
+            strcmp(r->defs.items[i].label, "Interface") == 0) {
+            found_itf = true;
+        }
+    }
+    ASSERT(found_itf);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(twincat_xml_bom_and_utf16) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+
+    /* UTF-8 BOM is stripped and the file is accepted */
+    static const char bom_prefix[] = "\xEF\xBB\xBF";
+    size_t bom_len = strlen(bom_prefix) + strlen(TWINCAT_DUT);
+    char *bom_input = (char *)cbm_arena_alloc(&arena, bom_len + 1);
+    ASSERT_NOT_NULL(bom_input);
+    snprintf(bom_input, bom_len + 1, "%s%s", bom_prefix, TWINCAT_DUT);
+    char **st = cbm_twincat_to_st(&arena, bom_input, (int)bom_len, &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT(count == 1);
+
+    /* UTF-16 input is rejected, not garbled */
+    static const char utf16le[] = "\xFF\xFE<\0T\0c\0P\0l\0c\0O\0b\0j\0e\0c\0t\0";
+    count = 0;
+    st = cbm_twincat_to_st(&arena, utf16le, (int)sizeof(utf16le) - 1, &count);
+    ASSERT(st == NULL);
+    ASSERT_EQ(count, 0);
+
+    /* non-TwinCAT XML is not claimed */
+    static const char other[] = "<?xml version=\"1.0\"?>\n<Project></Project>\n";
+    count = 0;
+    st = cbm_twincat_to_st(&arena, other, (int)sizeof(other) - 1, &count);
+    ASSERT(st == NULL);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -5536,6 +5795,15 @@ SUITE(extraction) {
     RUN_TEST(iris_export_xml_property_parameter_index);
     RUN_TEST(iris_export_xml_calls_extracted);
     RUN_TEST(iris_export_xml_multi_class);
+
+    /* TwinCAT PLC XML containers */
+    RUN_TEST(twincat_xml_pou_transcode);
+    RUN_TEST(twincat_xml_pou_extracted);
+    RUN_TEST(twincat_xml_pou_heritage);
+    RUN_TEST(twincat_xml_dut_end_struct_semicolon);
+    RUN_TEST(twincat_xml_gvl_globals);
+    RUN_TEST(twincat_xml_itf_interface);
+    RUN_TEST(twincat_xml_bom_and_utf16);
 
     /* R box-module imports + member calls */
     RUN_TEST(extract_r_box_use_imports_issue218);

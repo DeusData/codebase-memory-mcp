@@ -167,6 +167,7 @@ extern const TSLanguage *tree_sitter_pine(void);
 extern const TSLanguage *tree_sitter_mojo(void);
 extern const TSLanguage *tree_sitter_objectscript_udl(void);
 extern const TSLanguage *tree_sitter_objectscript_routine(void);
+extern const TSLanguage *tree_sitter_iec61131_3_st(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -1636,6 +1637,26 @@ static const char *objectscript_routine_func_types[] = {"procedure", "tag", NULL
 static const char *objectscript_routine_call_types[] = {"extrinsic_function", "routine_tag_call",
                                                         NULL};
 static const char *objectscript_routine_module_types[] = {"source_file", NULL};
+
+/* IEC 61131-3 Structured Text (HeytalePazguato/tree-sitter-iec61131-3-st).
+ * FUNCTION_BLOCK and PROGRAM both own METHOD/ACTION members, so both sit in
+ * class_types; TYPE declarations (`type_definition`) cover DUT structs/enums
+ * and get the "Type" label via class_label_for_kind. GVL globals surface as
+ * top-level `global_var_declaration_block` nodes (see extract_var_names). */
+static const char *iec_st_func_types[] = {"function_declaration", "method_declaration",
+                                          "method_signature", "property_declaration", NULL};
+static const char *iec_st_class_types[] = {"function_block_declaration", "program_declaration",
+                                           "interface_declaration", "type_definition", NULL};
+static const char *iec_st_field_types[] = {"structure_field", "enumerator", NULL};
+static const char *iec_st_module_types[] = {"source_file", NULL};
+static const char *iec_st_call_types[] = {"call_expression", NULL};
+static const char *iec_st_import_types[] = {"using_directive", NULL};
+static const char *iec_st_branch_types[] = {"if_statement",  "elsif_clause",     "case_clause",
+                                            "for_statement", "while_statement",  "repeat_statement",
+                                            NULL};
+static const char *iec_st_var_types[] = {"global_var_declaration_block", NULL};
+static const char *iec_st_assign_types[] = {"assignment_statement", "reference_assignment_statement",
+                                            NULL};
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -2639,6 +2660,14 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
     // cbm_lang_spec()/cbm_ts_language() directly. Left as a zero spec.
+
+    // CBM_LANG_IEC_ST — IEC 61131-3 Structured Text.
+    // HeytalePazguato/tree-sitter-iec61131-3-st.
+    [CBM_LANG_IEC_ST] = {CBM_LANG_IEC_ST, iec_st_func_types, iec_st_class_types,
+                         iec_st_field_types, iec_st_module_types, iec_st_call_types,
+                         iec_st_import_types, iec_st_import_types, iec_st_branch_types,
+                         iec_st_var_types, iec_st_assign_types, empty_types, NULL, empty_types,
+                         NULL, NULL, tree_sitter_iec61131_3_st, NULL},
 
 };
 

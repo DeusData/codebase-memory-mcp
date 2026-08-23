@@ -2292,6 +2292,82 @@ TEST(pipeline_dbt_jinja_lineage) {
     PASS();
 }
 
+/* TwinCAT end-to-end: the .plcproj becomes a Package that owns its member
+ * files and depends on its library placeholders, the .tsproj depends on that
+ * Package, and the .TcPOU container is transcoded so the POU inside it reaches
+ * the graph as an ordinary Class with its method. Exercising this through the
+ * real pipeline (not the transcoder alone) is what proves the language
+ * dispatch, the project pass ordering, and the File-node lookups line up. */
+TEST(pipeline_twincat_project_graph) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_twincat_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "POUs/FB_Pump.TcPOU",
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                    "<TcPlcObject Version=\"1.1.0.1\">\n"
+                    "  <POU Name=\"FB_Pump\" Id=\"{1}\">\n"
+                    "    <Declaration><![CDATA[FUNCTION_BLOCK FB_Pump\nVAR_INPUT\n"
+                    "    bRun : BOOL;\nEND_VAR]]></Declaration>\n"
+                    "    <Implementation>\n"
+                    "      <ST><![CDATA[Prime();]]></ST>\n"
+                    "    </Implementation>\n"
+                    "    <Method Name=\"Prime\" Id=\"{2}\">\n"
+                    "      <Declaration><![CDATA[METHOD Prime : BOOL]]></Declaration>\n"
+                    "      <Implementation>\n"
+                    "        <ST><![CDATA[Prime := bRun;]]></ST>\n"
+                    "      </Implementation>\n"
+                    "    </Method>\n"
+                    "  </POU>\n"
+                    "</TcPlcObject>\n");
+    write_temp_file(tmp, "Demo.plcproj",
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                    "<Project xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">\n"
+                    "  <ItemGroup>\n"
+                    "    <Compile Include=\"POUs\\FB_Pump.TcPOU\">\n"
+                    "      <SubType>Code</SubType>\n"
+                    "    </Compile>\n"
+                    "  </ItemGroup>\n"
+                    "  <ItemGroup>\n"
+                    "    <PlaceholderReference Include=\"Tc2_Standard\">\n"
+                    "      <Namespace>Tc2_Standard</Namespace>\n"
+                    "    </PlaceholderReference>\n"
+                    "  </ItemGroup>\n"
+                    "</Project>\n");
+    write_temp_file(tmp, "Solution.tsproj",
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                    "<TcSmProject TcVersion=\"3.1.4024.12\">\n"
+                    "  <Project>\n"
+                    "    <Plc>\n"
+                    "      <Project GUID=\"{3}\" Name=\"Demo\" PrjFilePath=\"Demo.plcproj\" />\n"
+                    "    </Plc>\n"
+                    "  </Project>\n"
+                    "</TcSmProject>\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/twincat.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* .plcproj → Package, its library placeholder, and its member file */
+    ASSERT_EQ(named_edge_count(s, project, "DEPENDS_ON", "Demo", "Tc2_Standard"), 1);
+    ASSERT_EQ(named_edge_count(s, project, "CONTAINS_FILE", "Demo", "FB_Pump.TcPOU"), 1);
+    /* .tsproj → the PLC project it references */
+    ASSERT_EQ(named_edge_count(s, project, "DEPENDS_ON", "Solution.tsproj", "Demo"), 1);
+    /* the transcoded POU reaches the graph as a Class owning its method */
+    ASSERT_EQ(named_edge_count(s, project, "DEFINES_METHOD", "FB_Pump", "Prime"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Renaming a table must drop lineage from DEPENDENT (unchanged) SQL files on
  * the incremental path. Table/View participate in the per-file LSP surface
  * hash as registry-only labels (lsp_surface.c), so tables.sql's def change
@@ -12391,6 +12467,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);
+    RUN_TEST(pipeline_twincat_project_graph);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);

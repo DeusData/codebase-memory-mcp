@@ -152,6 +152,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"lean", "Function:2,Module:1"},
     {"move", "Function:1,Module:1"},
     {"mojo", "Class:1,Function:1,Method:1,Module:1"},
+    {"iec_st", "Class:1,Function:1,Method:1,Module:1"},
     {"smali", "Class:1,Function:1,Module:1"},
     {"systemverilog", "Class:1,Function:1,Module:1"},
     {"verilog", "Class:1,Module:1"},
