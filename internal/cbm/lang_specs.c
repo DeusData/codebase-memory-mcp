@@ -1858,8 +1858,8 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // CBM_LANG_SQL
     [CBM_LANG_SQL] = {CBM_LANG_SQL, sql_func_types, sql_class_types, sql_field_types,
                       sql_module_types, sql_call_types, empty_types, empty_types, sql_branch_types,
-                      empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
-                      NULL, tree_sitter_sql, NULL},
+                      empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL, NULL,
+                      tree_sitter_sql, NULL},
 
     // CBM_LANG_DOCKERFILE
     [CBM_LANG_DOCKERFILE] = {CBM_LANG_DOCKERFILE, empty_types, empty_types, empty_types,

@@ -14,11 +14,11 @@
 
 /* Architecture includes USAGE only for relation-to-relation lineage. This
  * keeps ordinary identifier references out of package coupling and clusters. */
-#define ST_SQL_LINEAGE_EDGE_PREDICATE                                                        \
-    "(e.type='USAGE' AND "                                                                  \
-    "EXISTS (SELECT 1 FROM nodes sn WHERE sn.id=e.source_id AND sn.project=e.project "       \
-    "AND sn.label IN (" CBM_SQL_RELATION_LABELS ")) AND "                                   \
-    "EXISTS (SELECT 1 FROM nodes tn WHERE tn.id=e.target_id AND tn.project=e.project "       \
+#define ST_SQL_LINEAGE_EDGE_PREDICATE                                                  \
+    "(e.type='USAGE' AND "                                                             \
+    "EXISTS (SELECT 1 FROM nodes sn WHERE sn.id=e.source_id AND sn.project=e.project " \
+    "AND sn.label IN (" CBM_SQL_RELATION_LABELS ")) AND "                              \
+    "EXISTS (SELECT 1 FROM nodes tn WHERE tn.id=e.target_id AND tn.project=e.project " \
     "AND tn.label IN (" CBM_SQL_RELATION_LABELS ")))"
 #include "foundation/sha256.h"
 
@@ -16703,8 +16703,8 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     const char *esql =
         has_relation_nodes
             ? "SELECT e.source_id, e.target_id FROM edges e WHERE e.project=?1 AND "
-              "(e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') OR "
-              ST_SQL_LINEAGE_EDGE_PREDICATE ")"
+              "(e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') OR " ST_SQL_LINEAGE_EDGE_PREDICATE
+              ")"
             : "SELECT source_id, target_id FROM edges "
               "WHERE project=?1 AND type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS')";
     sqlite3_stmt *estmt = NULL;
@@ -18912,8 +18912,8 @@ static int arch_cluster_count_nodes(cbm_store_t *s, const char *project, bool sc
                                     const char *norm, const char *like, int64_t *total) {
     char sql[ST_SQL_BUF];
     const char *base = "SELECT COUNT(*) FROM nodes "
-                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ","
-                       CBM_SQL_RELATION_LABELS ")";
+                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS
+                       "," CBM_SQL_RELATION_LABELS ")";
     int written = scoped ? snprintf(sql, sizeof(sql), "%s%s", base, arch_path_scope_sql())
                          : snprintf(sql, sizeof(sql), "%s", base);
     if (written <= 0 || (size_t)written >= sizeof(sql)) {
@@ -18970,8 +18970,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
 
     char nsqlbuf[ST_SQL_BUF];
     const char *base = "SELECT id, name, qualified_name, label FROM nodes "
-                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ","
-                       CBM_SQL_RELATION_LABELS ")";
+                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS
+                       "," CBM_SQL_RELATION_LABELS ")";
     int nsql_len =
         scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", base, arch_path_scope_sql())
                : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id", base);

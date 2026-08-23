@@ -1113,7 +1113,7 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
         return cached->res;
     }
     cbm_resolution_t result = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
-                                                      import_map_vals, import_map_count);
+                                                     import_map_vals, import_map_count);
     resolve_cache_put(_lineage_resolve_cache, callee_name, result);
     return result;
 }
