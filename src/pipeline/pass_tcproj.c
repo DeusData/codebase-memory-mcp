@@ -74,6 +74,18 @@ bool cbm_is_tsproj_file(const char *basename) {
     return has_suffix_icase(basename, ".tsproj");
 }
 
+/* True for any TwinCAT project-description file. Their MEANING is extracted by
+ * this pass (Package nodes, DEPENDS_ON, CONTAINS_FILE, CONFIGURES), so the
+ * definition passes must not also run the XML grammar over their markup — that
+ * mints one Class node per XML element ("Name", "Comment", "PropertyGroup",
+ * "BitSize"), which on a real solution buried the 64 genuine POU classes under
+ * 120 nodes of markup noise. File nodes still come from pass_structure, so this
+ * pass keeps finding them. */
+bool cbm_is_twincat_project_file(const char *path_or_name) {
+    return has_suffix_icase(path_or_name, ".plcproj") ||
+           has_suffix_icase(path_or_name, ".tsproj") || has_suffix_icase(path_or_name, ".xti");
+}
+
 /* Read entire file into a heap buffer (same caps as the k8s pass). */
 static char *tcproj_read_file(const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");

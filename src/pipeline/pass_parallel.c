@@ -853,6 +853,14 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
+        /* Mirror of the sequential skip: TwinCAT project descriptions carry no
+         * code, so pass_tcproj owns their meaning and the XML grammar must not
+         * mint one Class per markup element here either. */
+        if (cbm_is_twincat_project_file(fi->rel_path)) {
+            free(source);
+            continue;
+        }
+
         /* Transform-only containers (Export XML, TwinCAT PLC XML) use the same
          * cache slot as every physical file, so their generated units are
          * composed before entering the common registry and resolution

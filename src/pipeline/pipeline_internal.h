@@ -153,6 +153,9 @@ int cbm_pipeline_pass_tcproj(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
 /* TwinCAT project-file detection (case-insensitive suffix match). */
 bool cbm_is_plcproj_file(const char *basename);
 bool cbm_is_tsproj_file(const char *basename);
+/* Any TwinCAT project-description file (.plcproj/.tsproj/.xti): pass_tcproj
+ * owns their meaning, so the definition passes skip grammar extraction. */
+bool cbm_is_twincat_project_file(const char *path_or_name);
 
 /* Transcode a TwinCAT PLC XML container (.TcPOU/.TcDUT/.TcGVL/.TcIO) and
  * compose the generated IEC 61131-3 ST units into one cacheable result. */

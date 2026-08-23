@@ -931,6 +931,16 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             continue;
         }
 
+        /* TwinCAT project descriptions carry no code. cbm_pipeline_pass_tcproj
+         * turns them into Package/DEPENDS_ON/CONTAINS_FILE/CONFIGURES; running
+         * the XML grammar over their markup as well would mint one Class per
+         * element ("Name", "PropertyGroup", "BitSize"). Their File nodes come
+         * from pass_structure, so the project pass still finds them. */
+        if (cbm_is_twincat_project_file(rel)) {
+            free(source);
+            continue;
+        }
+
         /* Transform-only containers (Studio Export XML, TwinCAT PLC XML) are
          * transcoded to one cacheable aggregate so later passes see the same
          * calls/usages/semantic carriers as native source files. */

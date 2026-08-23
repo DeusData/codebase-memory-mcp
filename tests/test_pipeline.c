@@ -2362,6 +2362,28 @@ TEST(pipeline_twincat_project_graph) {
     /* the transcoded POU reaches the graph as a Class owning its method */
     ASSERT_EQ(named_edge_count(s, project, "DEFINES_METHOD", "FB_Pump", "Prime"), 1);
 
+    /* The project descriptions themselves must contribute NO code symbols: this
+     * pass owns their meaning, and running the XML grammar over their markup as
+     * well mints one Class per element ("Project", "PropertyGroup", "Name") —
+     * 120 such nodes buried the 64 real POU classes on the solution this was
+     * found on. Assert by label+file so a future Package/File node here still
+     * passes. */
+    cbm_node_t *markup = NULL;
+    int markup_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Class", &markup, &markup_count),
+              CBM_STORE_OK);
+    int from_project_files = 0;
+    for (int i = 0; i < markup_count; i++) {
+        if (markup[i].file_path && (strstr(markup[i].file_path, ".plcproj") ||
+                                    strstr(markup[i].file_path, ".tsproj"))) {
+            from_project_files++;
+        }
+    }
+    if (markup) {
+        cbm_store_free_nodes(markup, markup_count);
+    }
+    ASSERT_EQ(from_project_files, 0);
+
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
