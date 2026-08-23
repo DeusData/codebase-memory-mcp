@@ -685,7 +685,8 @@ CBMFileResult *cbm_pipeline_extract_twincat(const char *source, int source_len,
         cbm_arena_destroy(&st_arena);
         return NULL;
     }
-    aggregate->owned_results = (CBMFileResult **)calloc((size_t)unit_count, sizeof(CBMFileResult *));
+    aggregate->owned_results =
+        (CBMFileResult **)calloc((size_t)unit_count, sizeof(CBMFileResult *));
     if (!aggregate->owned_results) {
         cbm_free_result(aggregate);
         cbm_arena_destroy(&st_arena);
@@ -694,10 +695,9 @@ CBMFileResult *cbm_pipeline_extract_twincat(const char *source, int source_len,
     aggregate->cached_lang = CBM_LANG_IEC_ST;
 
     for (int ui = 0; ui < unit_count; ui++) {
-        CBMFileResult *part = cbm_extract_file_ex(st_units[ui], (int)strlen(st_units[ui]),
-                                                  CBM_LANG_IEC_ST, project_name, rel_path,
-                                                  CBM_EXTRACT_BUDGET, NULL, NULL, macro_table,
-                                                  return_type_table);
+        CBMFileResult *part = cbm_extract_file_ex(
+            st_units[ui], (int)strlen(st_units[ui]), CBM_LANG_IEC_ST, project_name, rel_path,
+            CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
         if (!part) {
             continue;
         }

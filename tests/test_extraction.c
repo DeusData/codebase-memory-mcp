@@ -5742,37 +5742,37 @@ TEST(plcopen_xml_entity_decoding) {
  * TwinCAT PLC XML container transcoding (twincat_xml.c)
  * =================================================================== */
 
-#define TWINCAT_POU                                                                       \
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                        \
-    "<TcPlcObject Version=\"1.1.0.1\" ProductVersion=\"3.1.4024.12\">\n"                  \
-    "  <POU Name=\"FB_Motor\" Id=\"{0}\" SpecialFunc=\"None\">\n"                         \
-    "    <Declaration><![CDATA[FUNCTION_BLOCK FB_Motor EXTENDS FB_Base IMPLEMENTS "       \
-    "I_Device\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR\nVAR\n    _rSpeed : "              \
-    "REAL;\nEND_VAR]]></Declaration>\n"                                                   \
-    "    <Implementation>\n"                                                              \
-    "      <ST><![CDATA[bDone := F_Check(bEnable);]]></ST>\n"                             \
-    "    </Implementation>\n"                                                             \
-    "    <Method Name=\"Start\" Id=\"{1}\">\n"                                            \
-    "      <Declaration><![CDATA[METHOD Start : BOOL\nVAR_INPUT\n    rSpeed : "           \
-    "REAL;\nEND_VAR]]></Declaration>\n"                                                   \
-    "      <Implementation>\n"                                                            \
-    "        <ST><![CDATA[Start := rSpeed > 0.0;]]></ST>\n"                               \
-    "      </Implementation>\n"                                                           \
-    "    </Method>\n"                                                                     \
-    "    <Action Name=\"A_Reset\" Id=\"{2}\">\n"                                          \
-    "      <Implementation>\n"                                                            \
-    "        <ST><![CDATA[_rSpeed := 0.0;]]></ST>\n"                                      \
-    "      </Implementation>\n"                                                           \
-    "    </Action>\n"                                                                     \
-    "    <Property Name=\"Speed\" Id=\"{3}\">\n"                                          \
-    "      <Declaration><![CDATA[PROPERTY Speed : REAL]]></Declaration>\n"                \
-    "      <Get Name=\"Get\" Id=\"{4}\">\n"                                               \
-    "        <Implementation>\n"                                                          \
-    "          <ST><![CDATA[Speed := _rSpeed;]]></ST>\n"                                  \
-    "        </Implementation>\n"                                                         \
-    "      </Get>\n"                                                                      \
-    "    </Property>\n"                                                                   \
-    "  </POU>\n"                                                                          \
+#define TWINCAT_POU                                                                 \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                  \
+    "<TcPlcObject Version=\"1.1.0.1\" ProductVersion=\"3.1.4024.12\">\n"            \
+    "  <POU Name=\"FB_Motor\" Id=\"{0}\" SpecialFunc=\"None\">\n"                   \
+    "    <Declaration><![CDATA[FUNCTION_BLOCK FB_Motor EXTENDS FB_Base IMPLEMENTS " \
+    "I_Device\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR\nVAR\n    _rSpeed : "        \
+    "REAL;\nEND_VAR]]></Declaration>\n"                                             \
+    "    <Implementation>\n"                                                        \
+    "      <ST><![CDATA[bDone := F_Check(bEnable);]]></ST>\n"                       \
+    "    </Implementation>\n"                                                       \
+    "    <Method Name=\"Start\" Id=\"{1}\">\n"                                      \
+    "      <Declaration><![CDATA[METHOD Start : BOOL\nVAR_INPUT\n    rSpeed : "     \
+    "REAL;\nEND_VAR]]></Declaration>\n"                                             \
+    "      <Implementation>\n"                                                      \
+    "        <ST><![CDATA[Start := rSpeed > 0.0;]]></ST>\n"                         \
+    "      </Implementation>\n"                                                     \
+    "    </Method>\n"                                                               \
+    "    <Action Name=\"A_Reset\" Id=\"{2}\">\n"                                    \
+    "      <Implementation>\n"                                                      \
+    "        <ST><![CDATA[_rSpeed := 0.0;]]></ST>\n"                                \
+    "      </Implementation>\n"                                                     \
+    "    </Action>\n"                                                               \
+    "    <Property Name=\"Speed\" Id=\"{3}\">\n"                                    \
+    "      <Declaration><![CDATA[PROPERTY Speed : REAL]]></Declaration>\n"          \
+    "      <Get Name=\"Get\" Id=\"{4}\">\n"                                         \
+    "        <Implementation>\n"                                                    \
+    "          <ST><![CDATA[Speed := _rSpeed;]]></ST>\n"                            \
+    "        </Implementation>\n"                                                   \
+    "      </Get>\n"                                                                \
+    "    </Property>\n"                                                             \
+    "  </POU>\n"                                                                    \
     "</TcPlcObject>\n"
 
 TEST(twincat_xml_pou_transcode) {
@@ -5818,7 +5818,8 @@ TEST(twincat_xml_pou_extracted) {
     ASSERT(found_start);
     bool found_call = false;
     for (int i = 0; i < r->calls.count; i++) {
-        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, "F_Check") == 0) {
+        if (r->calls.items[i].callee_name &&
+            strcmp(r->calls.items[i].callee_name, "F_Check") == 0) {
             found_call = true;
         }
     }
@@ -5865,13 +5866,13 @@ TEST(twincat_xml_pou_heritage) {
     PASS();
 }
 
-#define TWINCAT_DUT                                                                     \
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                      \
-    "<TcPlcObject Version=\"1.1.0.1\">\n"                                               \
-    "  <DUT Name=\"ST_Config\" Id=\"{0}\">\n"                                           \
+#define TWINCAT_DUT                                                                      \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                       \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                                \
+    "  <DUT Name=\"ST_Config\" Id=\"{0}\">\n"                                            \
     "    <Declaration><![CDATA[TYPE ST_Config :\nSTRUCT\n    rMax : REAL;\nEND_STRUCT\n" \
-    "END_TYPE]]></Declaration>\n"                                                       \
-    "  </DUT>\n"                                                                        \
+    "END_TYPE]]></Declaration>\n"                                                        \
+    "  </DUT>\n"                                                                         \
     "</TcPlcObject>\n"
 
 TEST(twincat_xml_dut_end_struct_semicolon) {
@@ -5898,14 +5899,14 @@ TEST(twincat_xml_dut_end_struct_semicolon) {
     PASS();
 }
 
-#define TWINCAT_GVL                                                          \
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                           \
-    "<TcPlcObject Version=\"1.1.0.1\">\n"                                    \
-    "  <GVL Name=\"GVL_Main\" Id=\"{0}\">\n"                                 \
-    "    <Declaration><![CDATA[{attribute 'qualified_only'}\nVAR_GLOBAL\n"   \
-    "    rMaxSpeed : REAL := 250.0;\n    bStop, bReady : BOOL;\nEND_VAR]]>"  \
-    "</Declaration>\n"                                                       \
-    "  </GVL>\n"                                                             \
+#define TWINCAT_GVL                                                         \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                          \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                   \
+    "  <GVL Name=\"GVL_Main\" Id=\"{0}\">\n"                                \
+    "    <Declaration><![CDATA[{attribute 'qualified_only'}\nVAR_GLOBAL\n"  \
+    "    rMaxSpeed : REAL := 250.0;\n    bStop, bReady : BOOL;\nEND_VAR]]>" \
+    "</Declaration>\n"                                                      \
+    "  </GVL>\n"                                                            \
     "</TcPlcObject>\n"
 
 TEST(twincat_xml_gvl_globals) {
@@ -5929,16 +5930,16 @@ TEST(twincat_xml_gvl_globals) {
     PASS();
 }
 
-#define TWINCAT_ITF                                                                    \
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                     \
-    "<TcPlcObject Version=\"1.1.0.1\">\n"                                              \
-    "  <Itf Name=\"I_Device\" Id=\"{0}\">\n"                                           \
-    "    <Declaration><![CDATA[INTERFACE I_Device]]></Declaration>\n"                  \
-    "    <Method Name=\"Init\" Id=\"{1}\">\n"                                          \
-    "      <Declaration><![CDATA[METHOD Init : BOOL\nVAR_INPUT\n    nId : "            \
-    "UDINT;\nEND_VAR]]></Declaration>\n"                                               \
-    "    </Method>\n"                                                                  \
-    "  </Itf>\n"                                                                       \
+#define TWINCAT_ITF                                                         \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                          \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                   \
+    "  <Itf Name=\"I_Device\" Id=\"{0}\">\n"                                \
+    "    <Declaration><![CDATA[INTERFACE I_Device]]></Declaration>\n"       \
+    "    <Method Name=\"Init\" Id=\"{1}\">\n"                               \
+    "      <Declaration><![CDATA[METHOD Init : BOOL\nVAR_INPUT\n    nId : " \
+    "UDINT;\nEND_VAR]]></Declaration>\n"                                    \
+    "    </Method>\n"                                                       \
+    "  </Itf>\n"                                                            \
     "</TcPlcObject>\n"
 
 TEST(twincat_xml_itf_interface) {
