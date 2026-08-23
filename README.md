@@ -777,12 +777,14 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 |---|---|
 | `FUNCTION_BLOCK`, `PROGRAM` | `Class` |
 | `FUNCTION` | `Function` |
-| `METHOD`, `ACTION`, `PROPERTY` accessor | `Method` (`DEFINES_METHOD` from its owner) |
+| `METHOD`, `PROPERTY` (Get/Set bodies nested) | `Method` (`DEFINES_METHOD` from its owner) |
 | `INTERFACE` | `Interface` |
 | `TYPE` (DUT struct/enum) | `Type` |
 | GVL entry | `Variable` |
 | `EXTENDS` | `INHERITS` |
 | `IMPLEMENTS` | `IMPLEMENTS` |
+
+`ACTION` has no equivalent in the `iec_st` grammar itself — plain `.st`/`.iecst` sources never produce one. TwinCAT and PLCopen containers synthesize it as a parameterless `METHOD` before parsing (call sites use the same `inst.Name()` shape either way), so it reaches the graph as `Method` only through those two container transcoders.
 
 Each `.plcproj` becomes a `Package` node with `DEPENDS_ON` edges to its library references (e.g. `Tc2_Standard`) and `CONTAINS_FILE` edges to its member files; a `.tsproj` gets `DEPENDS_ON` edges to the PLC projects it references and `CONFIGURES` edges to their `.xti` device descriptions. Known limitations: cross-file references to GVL variables and DUT types resolve by name rather than by declared type, so an unqualified global shared by two projects can bind loosely; a function-block instance call (`fbInst()`) resolves on the instance identifier rather than the block's type; inside a TwinCAT XML container the POU's own implementation-body line numbers can land after its methods in the extracted result (declaration lines are exact); and in PLCopen exports, array- and pointer-typed variables are dropped rather than approximated (the grammar rejects bare `ARRAY`/`POINTER` identifiers), and resource/instance-level `<globalVars>` outside a POU's `<interface>` are not transcoded.
 
