@@ -993,6 +993,21 @@ PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
+# grammar_*.c is a one-line wrapper that #includes its vendored parser.c and
+# scanner.c, and make cannot see through that include. For every other grammar
+# the vendored bytes never change, so the pattern rule above suffices. iec_st is
+# a self-maintained fork (tools/tree-sitter-iec-st): regenerating it DOES change
+# the vendored parser, and without this explicit dependency the stale object is
+# silently relinked — the binary keeps the old grammar while the source tree
+# shows the new one. Declared for all three variants (prod/test/tsan).
+IEC_ST_VENDORED_DEPS = \
+    $(CBM_DIR)/vendored/grammars/iec_st/parser.c \
+    $(CBM_DIR)/vendored/grammars/iec_st/scanner.c
+
+$(BUILD_DIR)/prod_grammar_iec_st.o: $(IEC_ST_VENDORED_DEPS)
+$(BUILD_DIR)/grammar_iec_st.o: $(IEC_ST_VENDORED_DEPS)
+$(BUILD_DIR)/tsan_grammar_iec_st.o: $(IEC_ST_VENDORED_DEPS)
+
 $(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
