@@ -100,6 +100,17 @@ Languages like **Dockerfile**, **docker-compose**, **Kubernetes manifests**, and
 - Register the pass in `pipeline.c`.
 - Add tests in `tests/test_pipeline.c` following the `TEST(infra_is_dockerfile)` and `TEST(k8s_extract_manifest)` patterns.
 
+### Transform-Only Container Languages
+
+Some formats are just another registered language wrapped in a different container — TwinCAT's PLC XML (`.TcPOU`/`.TcDUT`/`.TcGVL`/`.TcIO`) and CODESYS/PLCopen TC6 XML exports are both IEC 61131-3 Structured Text underneath, the same way ObjectScript Studio Export XML is UDL underneath. These need neither a new grammar nor an infra-pass extractor: the container is transcoded to the target language's source text and re-extracted through the normal pipeline.
+
+**When adding a new transform-only container language:**
+- Add the `CBM_LANG_<LANG>` enum value in `internal/cbm/cbm.h`; add **no** row in `lang_specs.c` — a comment there instead (see `CBM_LANG_OBJECTSCRIPT_EXPORT`/`CBM_LANG_PLCOPEN_XML`) so the absence reads as deliberate. `cbm_lang_spec()` must return `NULL` for it.
+- Write a transcoder in `internal/cbm/` that turns the container into the target language's source text (`iris_export_xml.c`, `twincat_xml.c` are the examples).
+- Write an aggregating extractor in `src/pipeline/pass_definitions.c` that runs the transcoder, re-extracts each generated unit as the target language, and composes the results into one `CBMFileResult`.
+- Add the dispatch arm in **both** `pass_definitions.c` and `pass_parallel.c` — the sequential and parallel chains must stay symmetric, or the omission breaks only parallel indexing (>50 files), silently.
+- Add a `TRANSFORM_ONLY(...)` row and update the partition counts in `tests/repro/repro_language_registry.c`, and add the language to the transform-only skip list in `tests/repro/repro_call_node_manifest.c`.
+
 ## Commit Format
 
 Use conventional commits: `type(scope): description`

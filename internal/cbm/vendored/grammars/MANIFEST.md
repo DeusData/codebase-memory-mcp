@@ -43,6 +43,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | fsharp   | `func_types` += `function_or_value_defn`; `resolve_func_name` → `function_declaration_left`/`value_declaration_left` identifier |
 | haskell  | `func_types` += `bind` (nullary value bindings; `signature` suppressed) |
 | hlsl     | added to the C-family declarator-name gate (tree-sitter-cpp derivative) |
+| iec_st   | `find_class_body`: `FUNCTION_BLOCK`/`PROGRAM`/`INTERFACE` return the declaration node itself (METHOD/ACTION members are direct children); `type_definition` uses its `definition` child. `extract_base_classes` reads the repeated `extends`/`implements` fields (named children only — the grammar tags the `,` separators with the same field). `extract_var_names`: a `global_var_declaration_block`'s `variable_declaration` mints one Variable per `names` field |
 | ispc     | added to the C-family declarator-name gate (extends tree-sitter-c) |
 | odin     | `resolve_func_name`: `procedure_declaration` → `identifier` child |
 | pascal   | `resolve_func_name`: `defProc` → `header` (`declProc`) child's `name` field |
