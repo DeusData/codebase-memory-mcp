@@ -1639,10 +1639,13 @@ static const char *objectscript_routine_call_types[] = {"extrinsic_function", "r
 static const char *objectscript_routine_module_types[] = {"source_file", NULL};
 
 /* IEC 61131-3 Structured Text (HeytalePazguato/tree-sitter-iec61131-3-st).
- * FUNCTION_BLOCK and PROGRAM both own METHOD/ACTION members, so both sit in
- * class_types; TYPE declarations (`type_definition`) cover DUT structs/enums
- * and get the "Type" label via class_label_for_kind. GVL globals surface as
- * top-level `global_var_declaration_block` nodes (see extract_var_names). */
+ * FUNCTION_BLOCK and PROGRAM both own METHOD members, so both sit in
+ * class_types; the grammar has no ACTION construct — <Action> elements are
+ * synthesized as parameterless METHOD text by the TwinCAT/PLCopen container
+ * transcoders before the parser ever runs (twincat_xml.c, plcopen_xml.c).
+ * TYPE declarations (`type_definition`) cover DUT structs/enums and get the
+ * "Type" label via class_label_for_kind. GVL globals surface as top-level
+ * `global_var_declaration_block` nodes (see extract_var_names). */
 static const char *iec_st_func_types[] = {"function_declaration", "method_declaration",
                                           "method_signature", "property_declaration", NULL};
 static const char *iec_st_class_types[] = {"function_block_declaration", "program_declaration",
@@ -2668,6 +2671,13 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                          iec_st_import_types, iec_st_import_types, iec_st_branch_types,
                          iec_st_var_types, iec_st_assign_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_iec61131_3_st, NULL},
+
+    // CBM_LANG_TWINCAT — TwinCAT 3 PLC XML container (.TcPOU/.TcDUT/.TcGVL/
+    // .TcIO). No grammar row: the pipeline transcodes it to textual IEC
+    // 61131-3 ST (twincat_xml.c) and re-extracts each generated unit as
+    // CBM_LANG_IEC_ST, so this language never reaches
+    // cbm_lang_spec()/cbm_ts_language() directly. Left as a zero spec, same
+    // as CBM_LANG_OBJECTSCRIPT_EXPORT above.
 
     // CBM_LANG_PLCOPEN_XML — CODESYS/PLCopen TC6 XML export. No grammar row:
     // the pipeline transcodes it to textual IEC 61131-3 ST (plcopen_xml.c)

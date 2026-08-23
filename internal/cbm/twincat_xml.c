@@ -87,15 +87,24 @@ static const char *tc_elem(const char *base, const char *p, const char *end, con
     out->line = 0;
     char open[TC_MAX_NAME];
     snprintf(open, sizeof(open), "<%s", tag);
-    const char *start = tc_find(p, end, open);
+    /* `<ST` must not match `<STring`: the next char has to close the name. */
+    const char *start = NULL;
+    for (const char *cursor = p; cursor < end;) {
+        const char *hit = tc_find(cursor, end, open);
+        if (!hit) {
+            return NULL;
+        }
+        const char *after = hit + strlen(open);
+        if (after < end && *after != '>' && *after != ' ' && *after != '\t' && *after != '/' &&
+            *after != '\r' && *after != '\n') {
+            cursor = after;
+            continue;
+        }
+        start = hit;
+        break;
+    }
     if (!start) {
         return NULL;
-    }
-    /* `<ST` must not match `<STring`: the next char has to close the name. */
-    const char *after = start + strlen(open);
-    if (after < end && *after != '>' && *after != ' ' && *after != '\t' && *after != '/' &&
-        *after != '\r' && *after != '\n') {
-        return tc_elem(base, after, end, tag, out);
     }
     const char *gt = tc_find(start, end, ">");
     if (!gt) {
@@ -161,7 +170,11 @@ static void tb_app(TcBuf *b, const char *s) {
  * content already past the target stays where it is. */
 static void tb_pad_to(TcBuf *b, int line) {
     while (b->line < line) {
+        int before = b->pos;
         tb_app(b, "\n");
+        if (b->pos == before) {
+            break;
+        }
     }
 }
 

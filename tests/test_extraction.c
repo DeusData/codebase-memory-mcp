@@ -5997,6 +5997,54 @@ TEST(twincat_xml_bom_and_utf16) {
     PASS();
 }
 
+/* F1 regression: tc_elem's element-name search rejects a near-miss prefix
+ * (`<STx` must not match `<ST`) and must do so by looping, not by tail
+ * recursion — a file with many such near-misses must not risk a stack
+ * overflow even where the compiler cannot sibling-call-optimize the tail
+ * call away (e.g. -O1, used by CFLAGS_TEST/CFLAGS_TSAN). */
+TEST(twincat_xml_prefix_near_miss_bounded_recursion) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    enum { kReps = 300 };
+    char decl_misses[kReps * 16 + 1];
+    decl_misses[0] = '\0';
+    for (int i = 0; i < kReps; i++) {
+        strcat(decl_misses, "<Declarationz>\n");
+    }
+    char st_misses[kReps * 6 + 1];
+    st_misses[0] = '\0';
+    for (int i = 0; i < kReps; i++) {
+        strcat(st_misses, "<STx>\n");
+    }
+
+    size_t doc_cap = strlen(decl_misses) + strlen(st_misses) + 1024;
+    char *doc = (char *)cbm_arena_alloc(&arena, doc_cap);
+    ASSERT_NOT_NULL(doc);
+    snprintf(doc, doc_cap,
+             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+             "<TcPlcObject Version=\"1.1.0.1\">\n"
+             "  <POU Name=\"FB_NearMiss\" Id=\"{0}\">\n"
+             "%s"
+             "    <Declaration><![CDATA[FUNCTION_BLOCK FB_NearMiss\n"
+             "END_FUNCTION_BLOCK]]></Declaration>\n"
+             "    <Implementation>\n"
+             "%s"
+             "      <ST><![CDATA[x := 1;]]></ST>\n"
+             "    </Implementation>\n"
+             "  </POU>\n"
+             "</TcPlcObject>\n",
+             decl_misses, st_misses);
+
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, doc, (int)strlen(doc), &count);
+    ASSERT_NOT_NULL(st);
+    ASSERT(count == 1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -6058,6 +6106,7 @@ SUITE(extraction) {
     RUN_TEST(twincat_xml_gvl_globals);
     RUN_TEST(twincat_xml_itf_interface);
     RUN_TEST(twincat_xml_bom_and_utf16);
+    RUN_TEST(twincat_xml_prefix_near_miss_bounded_recursion);
 
     /* CODESYS/PLCopen TC6 XML exports */
     RUN_TEST(plcopen_xml_multi_pou_transcode);

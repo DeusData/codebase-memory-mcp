@@ -158,7 +158,9 @@ static void resolve_ref_path(const char *anchor_rel, const char *ref, char *out,
     int nsegs = 0;
     char work[CBM_SZ_1K];
     snprintf(work, sizeof(work), "%s", joined);
-    for (char *tok = strtok(work, "/"); tok && nsegs < 64; tok = strtok(NULL, "/")) {
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(work, "/", &saveptr); tok && nsegs < 64;
+         tok = strtok_r(NULL, "/", &saveptr)) {
         if (strcmp(tok, ".") == 0 || tok[0] == '\0') {
             continue;
         }

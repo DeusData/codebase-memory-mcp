@@ -365,8 +365,9 @@ static void px_emit_body(PxBuf *b, const char *cs, const char *ce) {
 
 /* One <pou> -> one ST unit: declaration header (+ return type for
  * functions), var-section blocks, the body, functionBlock-only actions
- * synthesized as METHODs, and the matching END_* terminator. Returns NULL
- * (via *out) when the POU carries no usable name. */
+ * synthesized as METHODs, and the matching END_* terminator. When the POU
+ * carries no usable name, substitutes "PlcopenPOU" and still emits the
+ * unit. */
 static void px_emit_pou(CBMArena *arena, const PxElem *pou, char **out) {
     *out = NULL;
 
