@@ -129,6 +129,37 @@ Examples: `fix(store): set busy_timeout before WAL`, `feat(cli): add --progress 
 
 ## Pull Request Guidelines
 
+### Self-Maintained Grammar Forks
+
+Most vendored grammars are byte-for-byte upstream and never change after
+vendoring. A few are forks we maintain because upstream does not cover the
+dialect our users actually write — `iec_st` is one: the upstream IEC 61131-3
+grammar is standard-only, and standard-only does not parse production TwinCAT.
+
+The fork lives beside the other first-party grammars:
+
+1. Edit `tools/tree-sitter-iec-st/grammar.js`. Keep each dialect rule commented
+   with the real construct that motivated it, and prefer narrowing a rule over
+   widening it (an instance-argument list accepted after *any* type specifier
+   makes `s : STRING(255)` ambiguous between a string length and an argument).
+2. Regenerate in place: `cd tools/tree-sitter-iec-st && tree-sitter generate`
+   (CLI 0.26.x). Check `#define LANGUAGE_VERSION` in the generated
+   `src/parser.c` — the runtime ceiling is ABI 15, and a newer CLI that emits
+   ABI 16 must not be vendored.
+3. Copy `src/parser.c` and `src/scanner.c` into
+   `internal/cbm/vendored/grammars/iec_st/`, then refresh the digest manifest
+   with `scripts/security-vendored.sh --update`.
+4. Note the rules you added in `internal/cbm/vendored/grammars/MANIFEST.md`, so
+   a future re-vendor from upstream re-applies them instead of silently
+   reverting the dialect support.
+
+`Makefile.cbm` declares the vendored parser/scanner as explicit prerequisites of
+the `iec_st` grammar objects. `grammar_*.c` is a one-line wrapper that
+`#include`s them, and make cannot see through an include: without that
+dependency a regenerated grammar links a stale object, and the binary keeps the
+old grammar while the source tree shows the new one — with no error anywhere.
+Any future fork needs the same three lines (prod/test/tsan).
+
 ### Before You Write Code
 
 - **Open an issue first — always.** Every PR must reference a tracking issue (`Fixes #N` or `Closes #N`). Describe what you want to change and why. Wait for maintainer feedback before implementing. PRs without a prior issue discussion will be closed.
