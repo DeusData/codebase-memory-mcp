@@ -609,6 +609,47 @@ static TSNode find_first_descendant_by_kind(TSNode node,
 
 // Forward declaration for mutual recursion. Exported (see helpers.h) so the
 // unified/calls extractor shares this one resolver — see cbm_resolve_func_name.
+/* IEC 61131-3 ST: TwinCAT writes access modifiers on POU headers
+ * (`FUNCTION_BLOCK PUBLIC FB_X`, and `PUBLIC FINAL` in combination). The
+ * vendored grammar has no rule for them, so it binds the FIRST MODIFIER to the
+ * `name` field and drops the remaining tokens — including the real identifier —
+ * into an ERROR node beside it; the graph then shows a block literally called
+ * "PUBLIC". Recover the real name structurally: the ERROR node that starts on
+ * the header line after `name` holds the remaining identifiers, and the LAST of
+ * them is the POU name (`name: PUBLIC` + `ERROR(FINAL, FB_X)`). No text
+ * comparison is needed, so this works without the source buffer. The parse
+ * error itself still surfaces as a partial-parse range. */
+static TSNode iec_st_recover_pou_name(TSNode node, TSNode name_node) {
+    if (ts_node_is_null(name_node)) {
+        return name_node;
+    }
+    TSPoint name_end = ts_node_end_point(name_node);
+    uint32_t child_count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode err = ts_node_child(node, i);
+        if (!ts_node_is_error(err)) {
+            continue;
+        }
+        TSPoint err_start = ts_node_start_point(err);
+        /* Header-line only: a body-level ERROR must never rename the POU. */
+        if (err_start.row != name_end.row || err_start.column < name_end.column) {
+            continue;
+        }
+        TSNode found = {0};
+        uint32_t n = ts_node_child_count(err);
+        for (uint32_t j = 0; j < n; j++) {
+            TSNode id = ts_node_child(err, j);
+            if (strcmp(ts_node_type(id), "identifier") == 0) {
+                found = id;
+            }
+        }
+        if (!ts_node_is_null(found)) {
+            return found;
+        }
+    }
+    return name_node;
+}
+
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
 static bool is_cpp_template_inner_kind(const char *kind) {
@@ -707,6 +748,15 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         if (lang == CBM_LANG_HASKELL && strcmp(kind, "signature") == 0) {
             TSNode null_node = {0};
             return null_node;
+        }
+
+        /* IEC ST: `FUNCTION PUBLIC F_X : INT` binds the modifier to `name`;
+         * recover the real identifier (see iec_st_recover_pou_name). */
+        if (lang == CBM_LANG_IEC_ST) {
+            TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (!ts_node_is_null(nm)) {
+                return iec_st_recover_pou_name(node, nm);
+            }
         }
 
         // A parameterized ObjectScript routine wraps its tag and body in a
@@ -4401,6 +4451,13 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             break;
         }
     }
+    /* IEC ST: `FUNCTION_BLOCK PUBLIC FB_X` — the modifier occupies the `name`
+     * field, so this runs where name_node is NON-null (unlike the fallback
+     * switch above, which only fires when no name was found at all). */
+    if (ctx->language == CBM_LANG_IEC_ST) {
+        name_node = iec_st_recover_pou_name(node, name_node);
+    }
+
     if (ts_node_is_null(name_node)) {
         return;
     }

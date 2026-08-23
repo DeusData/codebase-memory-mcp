@@ -5866,6 +5866,50 @@ TEST(twincat_xml_pou_heritage) {
     PASS();
 }
 
+#define TWINCAT_POU_PUBLIC                                                            \
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                    \
+    "<TcPlcObject Version=\"1.1.0.1\">\n"                                              \
+    "  <POU Name=\"FB_Pump\" Id=\"{0}\">\n"                                           \
+    "    <Declaration><![CDATA[FUNCTION_BLOCK PUBLIC FB_Pump\nVAR\n    n : INT;\n"      \
+    "END_VAR]]></Declaration>\n"                                                        \
+    "    <Implementation><ST><![CDATA[n := 1;]]></ST></Implementation>\n"                \
+    "  </POU>\n"                                                                        \
+    "</TcPlcObject>\n"
+
+/* TwinCAT writes access modifiers on POU headers (`FUNCTION_BLOCK PUBLIC FB_X`)
+ * and the vendored grammar has no rule for them: it binds the modifier to the
+ * `name` field and drops the real identifier into an ERROR node. Without
+ * recovery the graph shows a block called "PUBLIC" — 13 of them on the real
+ * P108 solution this was found on. */
+TEST(twincat_xml_access_modifier_name_recovered) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int count = 0;
+    char **st = cbm_twincat_to_st(&arena, TWINCAT_POU_PUBLIC, (int)strlen(TWINCAT_POU_PUBLIC),
+                                  &count);
+    ASSERT_NOT_NULL(st);
+    CBMFileResult *r = extract(st[0], CBM_LANG_IEC_ST, "t", "FB_Pump.st");
+    ASSERT_NOT_NULL(r);
+    bool found_real = false;
+    bool found_modifier = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Class") != 0) {
+            continue;
+        }
+        if (strcmp(r->defs.items[i].name, "FB_Pump") == 0) {
+            found_real = true;
+        }
+        if (strcmp(r->defs.items[i].name, "PUBLIC") == 0) {
+            found_modifier = true;
+        }
+    }
+    ASSERT(found_real);
+    ASSERT_FALSE(found_modifier);
+    cbm_free_result(r);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 #define TWINCAT_DUT                                                                      \
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"                                       \
     "<TcPlcObject Version=\"1.1.0.1\">\n"                                                \
@@ -6102,6 +6146,7 @@ SUITE(extraction) {
     RUN_TEST(twincat_xml_pou_transcode);
     RUN_TEST(twincat_xml_pou_extracted);
     RUN_TEST(twincat_xml_pou_heritage);
+    RUN_TEST(twincat_xml_access_modifier_name_recovered);
     RUN_TEST(twincat_xml_dut_end_struct_semicolon);
     RUN_TEST(twincat_xml_gvl_globals);
     RUN_TEST(twincat_xml_itf_interface);
