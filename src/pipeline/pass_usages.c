@@ -181,8 +181,16 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 continue;
             }
-            cbm_resolution_t res = cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn,
-                                                        imp_keys, imp_vals, imp_count);
+            /* SQL usages are FROM/JOIN/ref lineage and may bind Table/View/Model
+             * targets (cbm_registry_resolve_lineage); every other language
+             * resolves through the default variant, whose central relation
+             * veto keeps same-named code identifiers out of the lineage layer. */
+            cbm_resolution_t res =
+                (lang == CBM_LANG_SQL)
+                    ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count)
+                    : cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                           imp_vals, imp_count);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -340,11 +348,14 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pu_module_is_dir(files[i].language));
 
+        cbm_registry_resolve_cache_begin(result->usages.count + result->throws.count +
+                                         result->rw.count + CBM_SZ_64);
         usage_resolved += resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
                                               imp_count, files[i].language);
         throw_resolved +=
             resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_cache_end();
 
         free(module_qn);
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);

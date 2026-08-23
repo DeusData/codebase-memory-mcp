@@ -2056,12 +2056,9 @@ TEST(ui_server_rejects_non_loopback_host) {
 }
 
 /* The directory browser formats readdir() entries into a fixed 32 KB response
- * buffer. The per-entry loop is clamped, but the trailing "parent"/"roots"
- * appends were not — once the entries filled the buffer, pos ran past the end
- * and the next size argument wrapped, writing out of bounds. Fill the buffer
- * with many long-named subdirectories and browse it in a forked child so an
- * overflow surfaces as a killing signal (ASan abort) rather than a clean run. */
-TEST(ui_server_browse_wide_dir_no_overflow) {
+ * buffer. A wide directory must fail explicitly instead of returning a
+ * truncated JSON document under HTTP 200. */
+TEST(ui_server_browse_wide_dir_fails_loudly) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
 #else
@@ -2090,7 +2087,8 @@ TEST(ui_server_browse_wide_dir_no_overflow) {
                  dir, port);
         char *resp = malloc(262144);
         int n = resp ? th_http(port, req, resp, 262144) : 0;
-        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 500") != NULL &&
+                  strstr(resp, "directory listing exceeds response limit") != NULL);
         free(resp);
         th_server_stop(&ts);
         _exit(ok ? 0 : 3);
@@ -2169,14 +2167,10 @@ TEST(ui_server_logs_escape_dense_no_overflow) {
 }
 
 /* The index-status endpoint renders every active job into a fixed 2 KB stack
- * buffer. http_appendf clamps its own writes, but the separator and the closing
- * bracket were raw indexes, so two jobs holding ~1 KB root paths (the field is
- * 1024 bytes and the value comes straight from POST /api/index) pushed pos to
- * the clamp and the close then wrote past the buffer. Drive it through the real
- * endpoint with the index executor stubbed out, in a forked child so the
- * overflow surfaces as a killing signal. */
+ * buffer. A saturated response must fail explicitly instead of returning
+ * truncated JSON under HTTP 200. */
 #define MAX_TEST_INDEX_JOBS 4
-TEST(ui_server_index_status_long_paths_no_overflow) {
+TEST(ui_server_index_status_long_paths_fail_loudly) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
 #else
@@ -2248,7 +2242,8 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
                  port);
         char resp[8192];
         int n = th_http(port, req, resp, sizeof(resp));
-        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 500") != NULL &&
+                  strstr(resp, "index status exceeds response limit") != NULL);
         atomic_store(&executor.release, 1);
         th_server_stop(&ts);
         _exit(ok ? 0 : 3);
@@ -2265,6 +2260,59 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
     }
     ASSERT_TRUE(WIFEXITED(status));
     ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
+/* /api/processes is bounded by an 8 KiB stack buffer. A large process list
+ * must fail explicitly instead of returning truncated, malformed JSON. */
+TEST(ui_server_processes_fails_loudly_when_response_exceeds_buffer) {
+#ifdef _WIN32
+    SKIP_PLATFORM("synthetic ps fixture is POSIX-only; production bound is shared");
+#else
+    char *tmpdir = th_mktempdir("cbm_processes");
+    ASSERT_NOT_NULL(tmpdir);
+    char ps_path[1024];
+    snprintf(ps_path, sizeof(ps_path), "%s/ps", tmpdir);
+    FILE *script = fopen(ps_path, "w");
+    ASSERT_NOT_NULL(script);
+    fputs("#!/bin/sh\n"
+          "i=0\n"
+          "while [ \"$i\" -lt 300 ]; do\n"
+          "  printf '%d 0.0 1 00:01 codebase-memory-mcp\\n' \"$((i + 1000))\"\n"
+          "  i=$((i + 1))\n"
+          "done\n",
+          script);
+    ASSERT_EQ(fclose(script), 0);
+    ASSERT_EQ(chmod(ps_path, 0755), 0);
+
+    const char *current_path = getenv("PATH");
+    char *old_path = current_path ? strdup(current_path) : NULL;
+    char synthetic_path[4096];
+    snprintf(synthetic_path, sizeof(synthetic_path), "%s:%s", tmpdir,
+             old_path ? old_path : "/usr/bin:/bin");
+    ASSERT_EQ(cbm_setenv("PATH", synthetic_path, 1), 0);
+
+    th_server_t server;
+    ASSERT_EQ(th_server_start(&server), 0);
+    int port = cbm_http_server_port(server.srv);
+    char request[256];
+    snprintf(request, sizeof(request),
+             "GET /api/processes HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+    char response[4096];
+    int received = th_http(port, request, response, sizeof(response));
+    th_server_stop(&server);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    } else {
+        cbm_unsetenv("PATH");
+    }
+    th_cleanup(tmpdir);
+    ASSERT_GT(received, 0);
+    ASSERT_EQ(th_status(response), 500);
+    ASSERT_NOT_NULL(strstr(response, "process list exceeds response limit"));
     PASS();
 #endif
 }
@@ -2413,9 +2461,10 @@ TEST(ui_server_rpc_initialize) {
 }
 
 SUITE(httpd) {
-    RUN_TEST(ui_server_browse_wide_dir_no_overflow);
+    RUN_TEST(ui_server_browse_wide_dir_fails_loudly);
     RUN_TEST(ui_server_logs_escape_dense_no_overflow);
-    RUN_TEST(ui_server_index_status_long_paths_no_overflow);
+    RUN_TEST(ui_server_index_status_long_paths_fail_loudly);
+    RUN_TEST(ui_server_processes_fails_loudly_when_response_exceeds_buffer);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_security_headers_and_rejects_duplicates);

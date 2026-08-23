@@ -147,9 +147,9 @@ static inline const char *cbm_pipeline_call_route_path_and_handler(const CBMCall
 }
 
 static inline bool cbm_pipeline_label_is_registry_symbol(const char *label) {
-    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
-                     strcmp(label, "Field") == 0);
+    /* One registry-membership contract for sequential, parallel, delta, and
+     * incremental paths; relation labels are lineage-only at resolution time. */
+    return cbm_label_is_registry_symbol(label);
 }
 
 static inline bool cbm_pipeline_label_is_import_target(const char *label) {

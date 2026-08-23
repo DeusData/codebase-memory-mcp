@@ -492,6 +492,31 @@ TEST(resolve_many_nodes) {
     PASS();
 }
 
+TEST(resolve_lineage_uses_per_file_cache_without_semantic_poisoning) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "users", "proj.schema.users", "Table");
+    cbm_registry_resolve_cache_begin(32);
+    cbm_registry_resolve_chain_calls_reset_for_test();
+
+    cbm_resolution_t ordinary =
+        cbm_registry_resolve(r, "users", "proj.query", NULL, NULL, 0);
+    ASSERT_TRUE(!ordinary.qualified_name || ordinary.qualified_name[0] == '\0');
+
+    for (int i = 0; i < 64; i++) {
+        ordinary = cbm_registry_resolve(r, "users", "proj.query", NULL, NULL, 0);
+        cbm_resolution_t lineage =
+            cbm_registry_resolve_lineage(r, "users", "proj.query", NULL, NULL, 0);
+        ASSERT_TRUE(!ordinary.qualified_name || ordinary.qualified_name[0] == '\0');
+        ASSERT_STR_EQ(lineage.qualified_name, "proj.schema.users");
+    }
+
+    ASSERT_EQ(cbm_registry_resolve_chain_calls_for_test(), 2);
+    cbm_registry_resolve_cache_end();
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* ── Confidence band ───────────────────────────────────────────── */
 
 TEST(confidence_band_high) {
@@ -1202,6 +1227,7 @@ SUITE(registry) {
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
+    RUN_TEST(resolve_lineage_uses_per_file_cache_without_semantic_poisoning);
     /* Confidence band */
     RUN_TEST(confidence_band_high);
     RUN_TEST(confidence_band_medium);

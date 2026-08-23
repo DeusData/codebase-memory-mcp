@@ -267,12 +267,31 @@ static TSNode resolve_ocaml_func_name(TSNode node) {
     return null_node;
 }
 
-// SQL: resolve create_function name from object_reference→identifier or direct identifier.
+// Last identifier (DFS pre-order) under `node`. For a schema-qualified
+// object_reference (schema.table) this is the table name; the schema prefix is
+// ignored. Leaves *found false and returns `best` unchanged if none is present.
+static TSNode sql_last_identifier(TSNode node, TSNode best, bool *found) {
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        best = node;
+        *found = true;
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        best = sql_last_identifier(ts_node_child(node, i), best, found);
+    }
+    return best;
+}
+
+// SQL: resolve create_function / create_table / create_view name. The name sits
+// on an object_reference; for a schema-qualified name (schema.table) take the
+// last identifier (the table), not the first (the schema).
 static TSNode resolve_sql_func_name(TSNode node) {
     TSNode obj_ref = cbm_find_child_by_kind(node, "object_reference");
     if (!ts_node_is_null(obj_ref)) {
-        TSNode id = cbm_find_child_by_kind(obj_ref, "identifier");
-        if (!ts_node_is_null(id)) {
+        bool found = false;
+        TSNode empty = {0};
+        TSNode id = sql_last_identifier(obj_ref, empty, &found);
+        if (found) {
             return id;
         }
     }
@@ -718,9 +737,14 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         }
 
         /* Swift and newer tree-sitter-kotlin: function_declaration has no `name`
-         * field; the function name is a `simple_identifier` child. */
+         * field; the function name is a `simple_identifier` child. A Swift
+         * protocol requirement (a bodyless `func` inside a protocol) is a
+         * separate node type with the same shape; it is named here as well as in
+         * resolve_method_name because swift_func_types now admits it, so it can
+         * reach the free-function path too and would otherwise land unnamed. */
         if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-            strcmp(kind, "function_declaration") == 0) {
+            (strcmp(kind, "function_declaration") == 0 ||
+             strcmp(kind, "protocol_function_declaration") == 0)) {
             TSNode si = cbm_find_child_by_kind(node, "simple_identifier");
             if (!ts_node_is_null(si)) {
                 return si;
@@ -4288,11 +4312,73 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     return true;
 }
 
+// Collect FROM/JOIN table references (tree-sitter-sql `relation` nodes) anywhere
+// under `node` and emit them as usages scoped to enclosing_qn. pass_usages then
+// resolves each ref_name to the referenced Table/View def and creates a USAGE
+// lineage edge (e.g. a view -> the tables it selects from). Emitting them here
+// (rather than via the generic identifier walker) sets the correct enclosing
+// scope and bypasses the is_definition_name suppression that drops them.
+static void collect_sql_relation_usages(CBMExtractCtx *ctx, TSNode node, const char *enclosing_qn) {
+    if (strcmp(ts_node_type(node), "relation") == 0) {
+        TSNode nm = resolve_sql_func_name(node); // object_reference -> identifier
+        if (!ts_node_is_null(nm)) {
+            char *tname = cbm_node_text(ctx->arena, nm, ctx->source);
+            if (tname && tname[0]) {
+                CBMUsage usage = {0};
+                usage.ref_name = tname;
+                usage.enclosing_func_qn = enclosing_qn;
+                cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
+            }
+        }
+    }
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        collect_sql_relation_usages(ctx, ts_node_child(node, i), enclosing_qn);
+    }
+}
+
+// Handle SQL DDL relation defs: CREATE TABLE / VIEW / MATERIALIZED VIEW become
+// first-class Table/View nodes rather than generic Variable nodes. The relation
+// name sits on an object_reference child (the same shape create_function uses),
+// so resolve_sql_func_name locates it. Also emits FROM/JOIN dependencies as
+// usages so lineage edges form. Returns true if handled.
+static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const char *kind) {
+    if (ctx->language != CBM_LANG_SQL) {
+        return false;
+    }
+    const char *label;
+    if (strcmp(kind, "create_table") == 0) {
+        label = "Table";
+    } else if (strcmp(kind, "create_view") == 0 || strcmp(kind, "create_materialized_view") == 0) {
+        label = "View";
+    } else {
+        return false;
+    }
+    TSNode name_node = resolve_sql_func_name(node);
+    if (ts_node_is_null(name_node)) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return false;
+    }
+    push_simple_class_def(ctx, node, name, label);
+    // Must match push_simple_class_def's QN exactly (qn_safe_segment included)
+    // or pass_usages cannot find the enclosing def for the lineage source.
+    const char *qn =
+        cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, qn_safe_segment(ctx->arena, name));
+    collect_sql_relation_usages(ctx, node, qn);
+    return true;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
 
     if (extract_config_class_def(ctx, node, kind)) {
+        return;
+    }
+    if (extract_sql_ddl_class_def(ctx, node, kind)) {
         return;
     }
 
@@ -4767,6 +4853,7 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     static const char *body_types[] = {"class_body",
                                        "interface_body",
                                        "enum_body",
+                                       "protocol_body",
                                        "template_body",
                                        "interface_type",
                                        "struct_type",
@@ -4887,7 +4974,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     }
 
     if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-        strcmp(ck, "function_declaration") == 0) {
+        (strcmp(ck, "function_declaration") == 0 ||
+         strcmp(ck, "protocol_function_declaration") == 0)) {
         return cbm_find_child_by_kind(child, "simple_identifier");
     }
 

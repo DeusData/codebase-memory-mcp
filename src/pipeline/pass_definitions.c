@@ -24,6 +24,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
 #include "iris_export_xml.h"

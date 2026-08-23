@@ -1754,10 +1754,12 @@ static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, c
         cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
 
     char esc_c[CBM_SZ_256];
+    char esc_op[CBM_SZ_512];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    cbm_json_escape(esc_op, sizeof(esc_op), p);
     char props[CBM_SZ_1K];
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"operation\":\"%s\",\"confidence\":%.2f}",
-             esc_c, p, res->confidence);
+             esc_c, esc_op, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRAPHQL_CALLS", props);
 }
 
@@ -2429,8 +2431,17 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (semantic_reference) {
                 continue;
             }
-            cbm_resolution_t res = cbm_registry_resolve(rc->registry, usage->ref_name, module_qn,
-                                                        imp_keys, imp_vals, imp_count);
+            /* SQL usages are FROM/JOIN/ref lineage and may bind Table/View/Model
+             * targets (cbm_registry_resolve_lineage); every other language
+             * resolves through the default variant, whose central relation
+             * veto keeps same-named code identifiers out of the lineage layer.
+             * Must mirror the sequential twin (pass_usages.c) exactly. */
+            cbm_resolution_t res =
+                (lang == CBM_LANG_SQL)
+                    ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count)
+                    : cbm_registry_resolve(rc->registry, usage->ref_name, module_qn, imp_keys,
+                                           imp_vals, imp_count);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }

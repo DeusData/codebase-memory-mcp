@@ -11,6 +11,15 @@
 #include <stdint.h>
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
+
+/* Architecture includes USAGE only for relation-to-relation lineage. This
+ * keeps ordinary identifier references out of package coupling and clusters. */
+#define ST_SQL_LINEAGE_EDGE_PREDICATE                                                        \
+    "(e.type='USAGE' AND "                                                                  \
+    "EXISTS (SELECT 1 FROM nodes sn WHERE sn.id=e.source_id AND sn.project=e.project "       \
+    "AND sn.label IN (" CBM_SQL_RELATION_LABELS ")) AND "                                   \
+    "EXISTS (SELECT 1 FROM nodes tn WHERE tn.id=e.target_id AND tn.project=e.project "       \
+    "AND tn.label IN (" CBM_SQL_RELATION_LABELS ")))"
 #include "foundation/sha256.h"
 
 #include <limits.h>
@@ -16606,8 +16615,10 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char nsqlbuf[ST_SQL_BUF];
-    const char *nbase = "SELECT id, qualified_name FROM nodes WHERE project=?1 AND label IN "
-                        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+    /* Relations included: a view->table USAGE across package boundaries is
+     * data-lineage coupling and belongs in the architecture picture. */
+    const char *nbase = "SELECT id, qualified_name, label FROM nodes WHERE project=?1 AND label IN "
+                        "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS "," CBM_SQL_RELATION_LABELS ")";
     int nsql = scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", nbase,
                                  arch_path_scope_sql())
                       : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id", nbase);
@@ -16627,6 +16638,7 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
 
     int ncap = CBM_SZ_256;
     int nn = 0;
+    bool has_relation_nodes = false;
     int64_t *nids = malloc((size_t)ncap * sizeof(int64_t));
     char **npkgs = malloc((size_t)ncap * sizeof(char *));
     if (!nids || !npkgs) {
@@ -16667,6 +16679,8 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         int64_t nid = sqlite3_column_int64(nstmt, 0);
         nids[nn] = nid;
         const char *qn = (const char *)sqlite3_column_text(nstmt, SKIP_ONE);
+        has_relation_nodes |=
+            cbm_label_is_relation((const char *)sqlite3_column_text(nstmt, ST_COL_3 - 1));
         npkgs[nn] = heap_strdup(cbm_qn_to_package(qn));
         if (!npkgs[nn]) {
             arch_free_pkg_lookup(nids, npkgs, nn);
@@ -16684,10 +16698,15 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     }
     sqlite3_finalize(nstmt);
 
-    /* Scan edges, count cross-package calls */
-    /* DF-1 Site 8: Include all behavioral edge types for boundary analysis */
-    const char *esql = "SELECT source_id, target_id FROM edges "
-                       "WHERE project=?1 AND type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS')";
+    /* DF-1 Site 8: include behavioral calls plus relation-only data lineage.
+     * Projects without relation nodes retain the original query exactly. */
+    const char *esql =
+        has_relation_nodes
+            ? "SELECT e.source_id, e.target_id FROM edges e WHERE e.project=?1 AND "
+              "(e.type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS') OR "
+              ST_SQL_LINEAGE_EDGE_PREDICATE ")"
+            : "SELECT source_id, target_id FROM edges "
+              "WHERE project=?1 AND type IN ('CALLS','HTTP_CALLS','ASYNC_CALLS')";
     sqlite3_stmt *estmt = NULL;
     if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &estmt, NULL) != SQLITE_OK) {
         arch_free_pkg_lookup(nids, npkgs, nn);
@@ -16797,7 +16816,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char qsqlbuf[ST_SQL_BUF];
     const char *base = "SELECT qualified_name FROM nodes WHERE project=?1 AND label IN "
-                       "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+                       "(" CBM_SQL_CALLABLE_OR_TYPE_LABELS "," CBM_SQL_RELATION_LABELS ")";
     int nsql = scoped ? snprintf(qsqlbuf, sizeof(qsqlbuf), "%s%s", base, arch_path_scope_sql())
                       : snprintf(qsqlbuf, sizeof(qsqlbuf), "%s", base);
     if (nsql <= 0 || (size_t)nsql >= sizeof(qsqlbuf)) {
@@ -18753,7 +18772,7 @@ static void cluster_disambiguate_duplicate_labels(cbm_store_t *s, cbm_cluster_in
 /* Build the cluster_info for one community c into *ci. */
 static int cluster_build_one(cbm_store_t *s, cbm_cluster_info_t *ci, int c, int n, const int *comm,
                              const int *degree, const char **names, const char **qns, int members,
-                             double cohesion) {
+                             double cohesion, bool includes_lineage) {
     memset(ci, 0, sizeof(*ci));
     ci->id = c;
     ci->members = members;
@@ -18853,7 +18872,8 @@ static int cluster_build_one(cbm_store_t *s, cbm_cluster_info_t *ci, int c, int 
         return CBM_STORE_ERR;
     }
 
-    ci->edge_types = malloc(sizeof(char *));
+    int edge_type_count = includes_lineage ? 2 : 1;
+    ci->edge_types = calloc((size_t)edge_type_count, sizeof(char *));
     if (!ci->edge_types) {
         arch_clear_cluster(ci);
         return CBM_STORE_ERR;
@@ -18865,6 +18885,15 @@ static int cluster_build_one(cbm_store_t *s, cbm_cluster_info_t *ci, int c, int 
         return CBM_STORE_ERR;
     }
     ci->edge_type_count = 1;
+    if (includes_lineage) {
+        ci->edge_types[1] = heap_strdup("USAGE");
+        if (!ci->edge_types[1]) {
+            ci->edge_type_count = 2;
+            arch_clear_cluster(ci);
+            return CBM_STORE_ERR;
+        }
+        ci->edge_type_count = 2;
+    }
     return CBM_STORE_OK;
 }
 
@@ -18883,7 +18912,8 @@ static int arch_cluster_count_nodes(cbm_store_t *s, const char *project, bool sc
                                     const char *norm, const char *like, int64_t *total) {
     char sql[ST_SQL_BUF];
     const char *base = "SELECT COUNT(*) FROM nodes "
-                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ","
+                       CBM_SQL_RELATION_LABELS ")";
     int written = scoped ? snprintf(sql, sizeof(sql), "%s%s", base, arch_path_scope_sql())
                          : snprintf(sql, sizeof(sql), "%s", base);
     if (written <= 0 || (size_t)written >= sizeof(sql)) {
@@ -18917,7 +18947,7 @@ static int arch_cluster_count_nodes(cbm_store_t *s, const char *project, bool sc
 
 static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
                          cbm_architecture_info_t *out, double resolution, int node_budget) {
-    /* 1. Load Function/Method/Class nodes, ordered by id for bsearch. */
+    /* 1. Load callable, type, and relation nodes, ordered by id for bsearch. */
     char norm[CBM_SZ_512];
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
@@ -18939,8 +18969,9 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     }
 
     char nsqlbuf[ST_SQL_BUF];
-    const char *base = "SELECT id, name, qualified_name FROM nodes "
-                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+    const char *base = "SELECT id, name, qualified_name, label FROM nodes "
+                       "WHERE project=?1 AND label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ","
+                       CBM_SQL_RELATION_LABELS ")";
     int nsql_len =
         scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", base, arch_path_scope_sql())
                : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id", base);
@@ -18957,6 +18988,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     }
     int cap = ST_INIT_CAP_8;
     int n = 0;
+    bool has_relation_nodes = false;
     int64_t *ids = malloc((size_t)cap * sizeof(int64_t));
     const char **names = malloc((size_t)cap * sizeof(char *));
     const char **qns = malloc((size_t)cap * sizeof(char *));
@@ -18979,6 +19011,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         qns[n] = NULL;
         names[n] = heap_strdup((const char *)sqlite3_column_text(st, SKIP_ONE));
         qns[n] = heap_strdup((const char *)sqlite3_column_text(st, CBM_SZ_2));
+        has_relation_nodes |=
+            cbm_label_is_relation((const char *)sqlite3_column_text(st, ST_COL_4 - 1));
         if (!names[n] || !qns[n]) {
             sqlite3_finalize(st);
             cluster_free_node_arrays(ids, names, qns, n + 1);
@@ -18998,7 +19032,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         return CBM_STORE_OK;
     }
 
-    /* 2. Load CALLS edges with both endpoints in the node set (store indices). */
+    /* 2. Load CALLS and relation-only USAGE edges with both endpoints in the
+     * node set. Projects without relations retain the original query. */
     cbm_louvain_edge_t *edges = malloc((size_t)n * sizeof(cbm_louvain_edge_t));
     int *esrc = malloc((size_t)n * sizeof(int));
     int *edst = malloc((size_t)n * sizeof(int));
@@ -19009,7 +19044,11 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         return CBM_STORE_OK; /* clusters are best-effort */
     }
     int ne = 0;
-    const char *esql = "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
+    const char *esql =
+        has_relation_nodes
+            ? "SELECT e.source_id, e.target_id FROM edges e WHERE e.project=?1 AND "
+              "(e.type='CALLS' OR " ST_SQL_LINEAGE_EDGE_PREDICATE ")"
+            : "SELECT source_id, target_id FROM edges WHERE project=?1 AND type='CALLS'";
     if (sqlite3_prepare_v2(s->db, esql, CBM_NOT_FOUND, &st, NULL) == SQLITE_OK) {
         int ecap = n;
         bind_text(st, SKIP_ONE, project);
@@ -19120,7 +19159,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             double denom = internal[c] + boundary[c];
             double cohesion = denom > 0 ? (double)internal[c] / denom : 0.0;
             if (cluster_build_one(s, &clusters[cc], c, n, comm, degree, names, qns, members[c],
-                                  cohesion) != CBM_STORE_OK) {
+                                  cohesion, has_relation_nodes) != CBM_STORE_OK) {
                 arch_free_clusters(clusters, cc);
                 free(members);
                 free(internal);

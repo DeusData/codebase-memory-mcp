@@ -56,6 +56,7 @@
 #include <windows.h>
 #include <process.h>
 #include <psapi.h> /* GetProcessMemoryInfo */
+#include <tlhelp32.h> /* CreateToolhelp32Snapshot, Process32First/Next */
 #else
 #include <sys/stat.h>
 #include <unistd.h>
@@ -586,7 +587,7 @@ static void handle_processes(cbm_http_conn_t *c) {
     int pos = 0;
 
 #ifdef _WIN32
-    /* Windows: GetProcessMemoryInfo + GetProcessTimes */
+    /* Windows: GetProcessMemoryInfo + GetProcessTimes for the current process */
     PROCESS_MEMORY_COUNTERS pmc;
     FILETIME ft_create, ft_exit, ft_kernel, ft_user;
     double user_s = 0, sys_s = 0;
@@ -604,8 +605,78 @@ static void handle_processes(cbm_http_conn_t *c) {
     }
     http_appendf(buf, sizeof(buf), &pos,
                  "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[]}",
+                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
                  (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
+
+    /* Enumerate all codebase-memory-mcp.exe processes via toolhelp snapshot */
+    int proc_count = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(pe);
+        for (BOOL ok = Process32First(hSnap, &pe); ok; ok = Process32Next(hSnap, &pe)) {
+            if (_stricmp(pe.szExeFile, "codebase-memory-mcp.exe") == 0) {
+                HANDLE hProc = OpenProcess(
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                    FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    PROCESS_MEMORY_COUNTERS ppmc;
+                    FILETIME ftc, fte, ftk, ftu;
+                    double cpu_user = 0, cpu_sys = 0;
+                    size_t proc_rss = 0;
+                    DWORD elapsed_sec = 0;
+
+                    if (GetProcessMemoryInfo(hProc, &ppmc, sizeof(ppmc)))
+                        proc_rss = ppmc.WorkingSetSize;
+
+                    if (GetProcessTimes(hProc, &ftc, &fte, &ftk, &ftu)) {
+                        ULARGE_INTEGER pu, pk;
+                        pu.LowPart = ftu.dwLowDateTime;
+                        pu.HighPart = ftu.dwHighDateTime;
+                        pk.LowPart = ftk.dwLowDateTime;
+                        pk.HighPart = ftk.dwHighDateTime;
+                        cpu_user = (double)pu.QuadPart / 1e7;
+                        cpu_sys = (double)pk.QuadPart / 1e7;
+
+                        /* 进程创建以来的运行时间 */
+                        FILETIME now_ft;
+                        GetSystemTimeAsFileTime(&now_ft);
+                        ULARGE_INTEGER now_uli, start_uli;
+                        now_uli.LowPart = now_ft.dwLowDateTime;
+                        now_uli.HighPart = now_ft.dwHighDateTime;
+                        start_uli.LowPart = ftc.dwLowDateTime;
+                        start_uli.HighPart = ftc.dwHighDateTime;
+                        /* 时钟偏移保护：防止创建时间微偏未来导致 unsigned 下溢 */
+                        if (now_uli.QuadPart > start_uli.QuadPart) {
+                            ULONGLONG elapsed_100ns = now_uli.QuadPart - start_uli.QuadPart;
+                            elapsed_sec = (DWORD)(elapsed_100ns / 10000000ULL);
+                        }
+                    }
+
+                    if (proc_count > 0)
+                        http_appendf(buf, sizeof(buf), &pos, ",");
+                    http_appendf(buf, sizeof(buf), &pos,
+                                 "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
+                                 "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
+                                 "\"command\":\"codebase-memory-mcp\","
+                                 "\"is_self\":%s}",
+                                 pe.th32ProcessID, cpu_user + cpu_sys,
+                                 (double)proc_rss / (1024.0 * 1024.0),
+                                 elapsed_sec / 86400,
+                                 (elapsed_sec % 86400) / 3600,
+                                 (elapsed_sec % 3600) / 60,
+                                 elapsed_sec % 60,
+                                 pe.th32ProcessID == (DWORD)_getpid()
+                                     ? "true" : "false");
+                    proc_count++;
+                    CloseHandle(hProc);
+                }
+            }
+        }
+        CloseHandle(hSnap);
+    }
+
+    http_appendf(buf, sizeof(buf), &pos, "]}");
 #else
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -635,15 +706,12 @@ static void handle_processes(cbm_http_conn_t *c) {
 
             if (sscanf(line, "%d %f %ld %63s %255s", &pid, &cpu, &rss, elapsed, comm) >= 4) {
                 if (proc_count > 0)
-                    buf[pos++] = ',';
+                    http_appendf(buf, sizeof(buf), &pos, ",");
                 http_appendf(buf, sizeof(buf), &pos,
                              "{\"pid\":%d,\"cpu\":%.1f,\"rss_mb\":%.1f,"
                              "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
                              pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
                              pid == (int)getpid() ? "true" : "false");
-                if (pos >= (int)sizeof(buf)) {
-                    pos = (int)sizeof(buf) - 1;
-                }
                 proc_count++;
             }
         }
@@ -651,6 +719,13 @@ static void handle_processes(cbm_http_conn_t *c) {
     }
     http_appendf(buf, sizeof(buf), &pos, "]}");
 #endif
+
+    if ((size_t)pos >= sizeof(buf)) {
+        cbm_log_warn("ui.processes.failed", "reason", "response_limit");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":\"process list exceeds response limit\"}");
+        return;
+    }
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -742,15 +817,12 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             continue;
 
         if (count > 0)
-            buf[pos++] = ',';
+            http_appendf(buf, sizeof(buf), &pos, ",");
         /* Escape directory name to prevent XSS (e.g., names with quotes/angle brackets) */
         {
             char esc[512];
             cbm_json_escape(esc, (int)sizeof(esc), ent->d_name);
             http_appendf(buf, sizeof(buf), &pos, "\"%s\"", esc);
-        }
-        if (pos >= (int)sizeof(buf)) {
-            pos = (int)sizeof(buf) - 1;
         }
         count++;
 
@@ -782,6 +854,12 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         http_appendf(buf, sizeof(buf), &pos, "],\"parent\":\"%s\"", esc_parent);
         append_roots_json(buf, sizeof(buf), &pos);
         http_appendf(buf, sizeof(buf), &pos, "}");
+    }
+    if ((size_t)pos >= sizeof(buf)) {
+        cbm_log_warn("ui.browse.failed", "reason", "response_limit");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":\"directory listing exceeds response limit\"}");
+        return;
     }
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -1181,9 +1259,11 @@ static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
     }
     http_appendf(buf, sizeof(buf), &pos, "]");
     if ((size_t)pos >= sizeof(buf)) {
-        pos = (int)sizeof(buf) - 1;
+        cbm_log_warn("ui.index_status.failed", "reason", "response_limit");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":\"index status exceeds response limit\"}");
+        return;
     }
-    buf[pos] = '\0';
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 

@@ -1531,6 +1531,183 @@ TEST(watcher_detects_git_commit) {
     PASS();
 }
 
+/* A plain directory that merely SITS UNDER an unrelated repository is not a git
+ * project. `git rev-parse --git-dir` walks up, so it answers yes for such a
+ * folder, and the watcher then inherited the ancestor's dirty state — which is
+ * permanently non-empty and has nothing to do with this directory — and
+ * reindexed on every single poll forever (#841/#937: reporters measured this in
+ * hundreds of GB of writes per day). */
+TEST(watcher_nested_non_git_dir_does_not_inherit_ancestor_dirt) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nested_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "tracked.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add tracked.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    /* Leave the ancestor permanently dirty — this is the condition that used to
+     * retrigger indexing on every poll of the nested directory. */
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "dirty.txt"), "uncommitted\n");
+    }
+
+    /* A scratch directory inside it, tracked by nothing. */
+    char nested[400];
+    snprintf(nested, sizeof(nested), "%s/scratch", tmpdir);
+    if (!cbm_mkdir_p(nested, 0755)) {
+        th_rmtree(tmpdir);
+        FAIL("mkdir nested failed");
+    }
+    {
+        char p[500];
+        th_write_file(wt_path(p, sizeof(p), nested, "notes.md"), "scratch\n");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "nested-scratch", nested);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    int after_baseline = index_call_count;
+
+    /* Three polls with the ancestor still dirty and the nested dir untouched.
+     * Under the old classification each of these reindexed. */
+    for (int i = 0; i < 3; i++) {
+        cbm_watcher_touch(w, "nested-scratch");
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(index_call_count, after_baseline);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* A genuine sub-package of a monorepo IS git-managed, and must still be watched
+ * as such — the nested-directory guard above must not disqualify it. It also
+ * must not react to a sibling package's changes: `git status` reports the whole
+ * repository regardless of -C, so without a `-- .` pathspec every package in a
+ * monorepo reindexes whenever any other one is edited. */
+TEST(watcher_monorepo_subdir_ignores_sibling_changes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_mono_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    char pkg_a[400];
+    char pkg_b[400];
+    snprintf(pkg_a, sizeof(pkg_a), "%s/pkg-a", tmpdir);
+    snprintf(pkg_b, sizeof(pkg_b), "%s/pkg-b", tmpdir);
+    if (!cbm_mkdir_p(pkg_a, 0755) || !cbm_mkdir_p(pkg_b, 0755)) {
+        th_rmtree(tmpdir);
+        FAIL("mkdir packages failed");
+    }
+    {
+        char p[500];
+        th_write_file(wt_path(p, sizeof(p), pkg_a, "a.txt"), "a\n");
+        th_write_file(wt_path(p, sizeof(p), pkg_b, "b.txt"), "b\n");
+    }
+    wt_git(tmpdir, "add -A");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "pkg-a", pkg_a);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    int after_baseline = index_call_count;
+
+    /* Edit the SIBLING package only. pkg-a is untouched. */
+    {
+        char p[500];
+        th_append_file(wt_path(p, sizeof(p), pkg_b, "b.txt"), "sibling edit\n");
+    }
+    cbm_watcher_touch(w, "pkg-a");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, after_baseline);
+
+    /* Editing pkg-a itself must still be seen — the scoping must not have
+     * silenced real changes. */
+    {
+        char p[500];
+        th_append_file(wt_path(p, sizeof(p), pkg_a, "a.txt"), "own edit\n");
+    }
+    cbm_watcher_touch(w, "pkg-a");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, after_baseline + 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* Porcelain v1 paths are repository-relative even with `git -C subdir` and a
+ * `-- .` pathspec. The freshness ledger, however, is project-relative. */
+TEST(watcher_monorepo_subdir_records_project_relative_dirty_path) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_mono_ledger_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char package[400];
+    char dirty_path[500];
+    snprintf(package, sizeof(package), "%s/packages/app", tmpdir);
+    if (wt_git(tmpdir, "init -q") != 0 || !cbm_mkdir_p(package, 0755) ||
+        th_write_file(wt_path(dirty_path, sizeof(dirty_path), package, "app.c"), "int old;\n") !=
+            0 ||
+        wt_git(tmpdir, "add -A") != 0 || wt_git(tmpdir, "commit -q -m init") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git fixture setup failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "monorepo-app", package), CBM_STORE_OK);
+    cbm_watcher_t *watcher = cbm_watcher_new(store, always_failing_index_callback, NULL);
+    ASSERT_NOT_NULL(watcher);
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "monorepo-app", package));
+    index_call_count = 0;
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0);
+
+    ASSERT_EQ(th_append_file(dirty_path, "int changed;\n"), 0);
+    cbm_watcher_touch(watcher, "monorepo-app");
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_dirty_file_state_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_list_dirty_files(store, "monorepo-app", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].rel_path, "app.c");
+    char expected_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    ASSERT_EQ(cbm_file_content_hash(dirty_path, expected_hash, sizeof(expected_hash)), 0);
+    ASSERT_STR_EQ(rows[0].observed_hash, expected_hash);
+    cbm_store_free_dirty_files(rows, count);
+
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* SHA-256 repositories emit a 64-hex-character HEAD. The watcher must retain
  * the complete object ID (plus line terminator/NUL while reading it), otherwise
  * baseline initialization silently retries forever and auto-refresh never runs. */
@@ -3796,6 +3973,9 @@ SUITE(watcher) {
 
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
+    RUN_TEST(watcher_nested_non_git_dir_does_not_inherit_ancestor_dirt);
+    RUN_TEST(watcher_monorepo_subdir_ignores_sibling_changes);
+    RUN_TEST(watcher_monorepo_subdir_records_project_relative_dirty_path);
     RUN_TEST(watcher_detects_sha256_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_marks_dirty_file_before_failed_index_callback);

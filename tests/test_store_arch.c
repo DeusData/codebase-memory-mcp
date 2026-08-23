@@ -602,6 +602,73 @@ TEST(arch_boundaries) {
     PASS();
 }
 
+/* SQL/dbt relations are architecture nodes only when their lineage edges are
+ * analyzed too; admitting Table/View/Model while scanning CALLS alone produces
+ * isolated nodes and silently drops the intended package coupling. */
+TEST(arch_relation_lineage_contributes_boundaries_and_clusters) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "relation-architecture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/relation-architecture"),
+              CBM_STORE_OK);
+
+    cbm_node_t table = {.project = project,
+                        .label = "Table",
+                        .name = "users",
+                        .qualified_name = "relation-architecture.raw.users",
+                        .file_path = "raw/schema.sql"};
+    cbm_node_t view = {.project = project,
+                       .label = "View",
+                       .name = "active_users",
+                       .qualified_name = "relation-architecture.marts.active_users",
+                       .file_path = "marts/views.sql"};
+    cbm_node_t model = {.project = project,
+                        .label = "Model",
+                        .name = "user_report",
+                        .qualified_name = "relation-architecture.analytics.user_report",
+                        .file_path = "analytics/user_report.sql"};
+    int64_t table_id = cbm_store_upsert_node(store, &table);
+    int64_t view_id = cbm_store_upsert_node(store, &view);
+    int64_t model_id = cbm_store_upsert_node(store, &model);
+    ASSERT_GT(table_id, 0);
+    ASSERT_GT(view_id, 0);
+    ASSERT_GT(model_id, 0);
+    cbm_edge_t view_table = {
+        .project = project, .source_id = view_id, .target_id = table_id, .type = "USAGE"};
+    cbm_edge_t model_view = {
+        .project = project, .source_id = model_id, .target_id = view_id, .type = "USAGE"};
+    ASSERT_GT(cbm_store_insert_edge(store, &view_table), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &model_view), 0);
+
+    const char *aspects[] = {"boundaries", "clusters"};
+    cbm_architecture_info_t info = {0};
+    ASSERT_EQ(cbm_store_get_architecture(store, project, aspects, 2, &info, 0, 1.0),
+              CBM_STORE_OK);
+    bool saw_marts_raw = false;
+    bool saw_analytics_marts = false;
+    for (int i = 0; i < info.boundary_count; i++) {
+        saw_marts_raw |= strcmp(info.boundaries[i].from, "marts") == 0 &&
+                         strcmp(info.boundaries[i].to, "raw") == 0;
+        saw_analytics_marts |= strcmp(info.boundaries[i].from, "analytics") == 0 &&
+                               strcmp(info.boundaries[i].to, "marts") == 0;
+    }
+    ASSERT_TRUE(saw_marts_raw);
+    ASSERT_TRUE(saw_analytics_marts);
+    ASSERT_EQ(info.cluster_nodes_total, 3);
+    ASSERT_TRUE(info.cluster_count > 0);
+    bool cluster_reports_usage = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        for (int j = 0; j < info.clusters[i].edge_type_count; j++) {
+            cluster_reports_usage |= strcmp(info.clusters[i].edge_types[j], "USAGE") == 0;
+        }
+    }
+    ASSERT_TRUE(cluster_reports_usage);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(store);
+    PASS();
+}
+
 /* Build a synthetic graph (nodes Functions across packages, random CALLS
  * edges) and return the wall ms of the "boundaries" aspect. Returns -1 on
  * setup/query failure. */
@@ -2298,6 +2365,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_routes_selects_result_limit_after_filtering);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_boundaries);
+    RUN_TEST(arch_relation_lineage_contributes_boundaries_and_clusters);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
     RUN_TEST(arch_layers_filter_infra_routes_and_use_route_file_package);

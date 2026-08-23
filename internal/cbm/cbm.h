@@ -752,6 +752,10 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+// dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
+// per ref()/source() call. No-op unless the file parses as SQL and actually
+// contains a dbt builtin call. Defined in extract_dbt.c.
+void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
@@ -778,5 +782,18 @@ void cbm_extract_k8s(CBMExtractCtx *ctx);
 // instead of scattering `|| strcmp(label,"Struct")==0` across the tree.
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_type_like(const char *label);
+
+// True for data-relation labels (Table, View, and dbt Model). Relations resolve as
+// lineage targets only: registry members, but never type-like and never valid
+// CALLS/THROWS/READS/WRITES targets. `label` may be NULL. Defined in helpers.c.
+bool cbm_label_is_relation(const char *label);
+
+// True for labels admitted to the cross-file name registry: Function, Method,
+// every type-like container, Variable, Field, and the relation labels. Single
+// source of truth for registry seeding — the full (pass_definitions.c),
+// parallel (pass_parallel.c) and incremental (pipeline_incremental.c) pipelines
+// all seed through this predicate so their registries never diverge.
+// `label` may be NULL (returns false). Defined in helpers.c.
+bool cbm_label_is_registry_symbol(const char *label);
 
 #endif // CBM_H

@@ -1629,6 +1629,28 @@ static bool is_streamlined_default_tool(const char *name) {
                     strcmp(name, "search_code") == 0 || strcmp(name, "trace_path") == 0);
 }
 
+static const tool_def_t *mcp_tool_def_by_name(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    /* Keep the legacy trace_call_path alias on the canonical trace_path
+     * schema and metadata; older clients still issue that tool name. */
+    if (strcmp(name, "trace_call_path") == 0) {
+        name = "trace_path";
+    }
+    for (int i = 0; i < TOOL_COUNT; i++) {
+        if (strcmp(TOOLS[i].name, name) == 0) {
+            return &TOOLS[i];
+        }
+    }
+    for (int i = 0; i < STREAMLINED_TOOL_COUNT; i++) {
+        if (strcmp(STREAMLINED_TOOLS[i].name, name) == 0) {
+            return &STREAMLINED_TOOLS[i];
+        }
+    }
+    return NULL;
+}
+
 /* Return the canonical property and required definitions used by tools/list,
  * CLI flag typing, and runtime key validation. tools/list additionally applies
  * the global closed-input policy. Static lifetime; do not free. */
@@ -1636,25 +1658,11 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
     if (!tool_name) {
         return NULL;
     }
-    /* Backward-compatible classic alias dispatches to trace_path and therefore
-     * has the same request schema even though only the canonical name is listed. */
-    if (strcmp(tool_name, "trace_call_path") == 0) {
-        tool_name = "trace_path";
-    }
     if (strcmp(tool_name, "_hidden_tools") == 0) {
         return MCP_HIDDEN_TOOL_INPUT_SCHEMA;
     }
-    for (int i = 0; i < TOOL_COUNT; i++) {
-        if (strcmp(TOOLS[i].name, tool_name) == 0) {
-            return TOOLS[i].input_schema;
-        }
-    }
-    for (int i = 0; i < STREAMLINED_TOOL_COUNT; i++) {
-        if (strcmp(STREAMLINED_TOOLS[i].name, tool_name) == 0) {
-            return STREAMLINED_TOOLS[i].input_schema;
-        }
-    }
-    return NULL;
+    const tool_def_t *def = mcp_tool_def_by_name(tool_name);
+    return def ? def->input_schema : NULL;
 }
 
 /* Registry enumeration used by top-level CLI help. Include the classic
@@ -1677,6 +1685,16 @@ const char *cbm_mcp_tool_name(int index) {
     }
     index -= STREAMLINED_TOOL_COUNT;
     return index < HELP_ONLY_TOOL_COUNT ? HELP_ONLY_TOOL_NAMES[index] : NULL;
+}
+
+const char *cbm_mcp_tool_title(const char *tool_name) {
+    const tool_def_t *def = mcp_tool_def_by_name(tool_name);
+    return def ? def->title : NULL;
+}
+
+const char *cbm_mcp_tool_description(const char *tool_name) {
+    const tool_def_t *def = mcp_tool_def_by_name(tool_name);
+    return def ? def->description : NULL;
 }
 
 /* Append at out[len] and return bytes actually written. vsnprintf returns the
@@ -7483,6 +7501,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN (" CBM_SQL_TYPE_LIKE_LABELS ") THEN 5.0 "
+        /* Relations rank with the type tier: a table IS the schema container
+         * a data question is looking for (findability-first). */
+        "               WHEN n.label IN (" CBM_SQL_RELATION_LABELS ") THEN 5.0 "
         "               ELSE 0.0 END) AS rank "
         "FROM ("
         "    SELECT rowid, bm25(nodes_fts) AS base_rank"

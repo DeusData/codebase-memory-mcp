@@ -383,10 +383,21 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
- * Returns result with qualified_name="" if unresolved. */
+ * Returns result with qualified_name="" if unresolved.
+ * Never returns a data relation (Table/View/Model): relations are lineage-only
+ * registry members and common table names (users, orders, config) collide with
+ * code identifiers in every language, so the default resolve vetoes them
+ * centrally instead of relying on per-consumer label checks. */
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Relation-permitting resolve for SQL FROM/JOIN/ref lineage usages ONLY — the
+ * one consumer allowed to bind Table/View/Model targets. Uses a separate
+ * per-file cache so relation-permitting answers cannot poison default resolution. */
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count);
 
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start
@@ -403,14 +414,20 @@ void cbm_registry_reach_cache_end(void);
 void cbm_registry_import_map_cache_begin(const char **keys, const char **vals, int count);
 void cbm_registry_import_map_cache_end(void);
 
-/* Per-file full-result cache for cbm_registry_resolve. The same
- * callee_name appears in many call sites within a file; module_qn
- * is constant per file so each name resolves identically. First
- * lookup does the full strategy chain; repeats are O(1) hash hits.
+/* Per-file full-result caches for ordinary and SQL-lineage resolution. The
+ * same callee_name appears in many references within a file; module_qn is
+ * constant per file so each name resolves identically. The variants remain
+ * separate because ordinary resolution vetoes relation nodes. First lookup
+ * does the full strategy chain; repeats are O(1) hash hits.
  * This eliminates ~75% of the resolve-chain work on K8s where the
  * same names ("Get", "Add", "New", etc) appear hundreds of times. */
 void cbm_registry_resolve_cache_begin(int estimated_capacity);
 void cbm_registry_resolve_cache_end(void);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_registry_resolve_chain_calls_reset_for_test(void);
+uint64_t cbm_registry_resolve_chain_calls_for_test(void);
+#endif
 
 /* Check if a qualified name exists in the registry. */
 bool cbm_registry_exists(const cbm_registry_t *r, const char *qn);

@@ -2736,6 +2736,190 @@ TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
     PASS();
 }
 
+/* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
+ * while the shared name registry must NOT leak those relations into other
+ * languages' textual resolution: a Python call or identifier sharing the
+ * table's name (`users`) would otherwise unique-name-bind a false CALLS/USAGE
+ * edge into the lineage layer. Pins the resolve-time relation veto
+ * (cbm_registry_resolve) together with the lineage opt-in
+ * (cbm_registry_resolve_lineage). */
+TEST(pipeline_sql_lineage_and_relation_isolation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_sql_lineage_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "schema.sql",
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+                    "CREATE VIEW active_users AS SELECT * FROM users;\n");
+    /* `users` exists project-wide ONLY as the SQL table, so without the
+     * relation veto the cross-file unique-name fallback would bind both the
+     * call and the bare reference below straight to the Table node. */
+    write_temp_file(tmp, "app.py",
+                    "def load_users():\n"
+                    "    return users()\n"
+                    "\n"
+                    "def show_users():\n"
+                    "    return users\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/sql_lineage.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    /* Positive control: the view's FROM emits real lineage. */
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "active_users", "users"), 1);
+    /* Isolation: no Python edge of any kind reaches the Table. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "load_users", "users"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "load_users", "users"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "show_users", "users"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "READS", "show_users", "users"), 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_sequential_usages_caches_repeated_lineage_resolution) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Model", "query", "proj.query", "query.sql", 1, 1, "{}");
+    int64_t target_id = cbm_gbuf_upsert_node(gb, "Table", "users", "proj.schema.users",
+                                             "schema.sql", 1, 1, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_registry_add(reg, "users", "proj.schema.users", "Table");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMUsage usage = {.ref_name = "users", .enclosing_func_qn = "proj.query"};
+    for (int i = 0; i < 64; i++) {
+        cbm_usages_push(&result.usages, &result.arena, usage);
+    }
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FULL,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {
+        {.path = "/tmp/proj/query.sql", .rel_path = "query.sql", .language = CBM_LANG_SQL}};
+
+    cbm_registry_resolve_chain_calls_reset_for_test();
+    ASSERT_EQ(cbm_pipeline_pass_usages(&ctx, files, 1), 0);
+    ASSERT_EQ(cbm_registry_resolve_chain_calls_for_test(), 1);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "USAGE", &edges, &edge_count),
+              0);
+    ASSERT_TRUE(edge_count >= 1);
+    ASSERT_EQ(edges[0]->target_id, target_id);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* dbt lineage end-to-end. A dbt project's dependency structure lives entirely
+ * in Jinja ({{ ref('x') }}), which the SQL grammar cannot read, so this is the
+ * whole value: model -> model edges across files, plus the join onto a Table
+ * declared in ordinary DDL — Model and Table are both relation labels, so one
+ * lineage layer spans both. The Python file is the isolation control: `stg_orders`
+ * exists project-wide only as a dbt model, and the registry's relation veto must
+ * keep a same-named call out of the lineage layer. */
+TEST(pipeline_dbt_jinja_lineage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dbt_lineage_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "raw_schema.sql", "CREATE TABLE customers (id INTEGER, name TEXT);\n");
+    write_temp_file(tmp, "stg_orders.sql",
+                    "SELECT id, customer_id FROM {{ source('raw', 'customers') }}\n");
+    write_temp_file(tmp, "orders_enriched.sql",
+                    "SELECT o.id, c.name\n"
+                    "FROM {{ ref('stg_orders') }} o\n"
+                    "JOIN {{ ref('stg_orders') }} c ON c.id = o.customer_id\n");
+    write_temp_file(tmp, "app.py", "def load():\n    return stg_orders()\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dbt.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    /* model -> model: the ref() lineage the SQL grammar cannot see */
+    ASSERT_TRUE(named_edge_count(s, project, "USAGE", "orders_enriched", "stg_orders") >= 1);
+    /* model -> table: source() joining dbt onto plain DDL in the same repo */
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "stg_orders", "customers"), 1);
+    /* isolation: the Python call must not reach the model */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "load", "stg_orders"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "USAGE", "load", "stg_orders"), 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Renaming a table must drop lineage from DEPENDENT (unchanged) SQL files on
+ * the incremental path. Table/View participate in the per-file LSP surface
+ * hash as registry-only labels (lsp_surface.c), so tables.sql's def change
+ * invalidates views.sql's resolution instead of slipping the early cutoff and
+ * leaving a stale view -> old-table USAGE edge. */
+TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_sql_rename_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "tables.sql", "CREATE TABLE users (id INTEGER PRIMARY KEY);\n");
+    write_temp_file(tmp, "views.sql", "CREATE VIEW active AS SELECT * FROM users;\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/sql_rename.db", tmp);
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    const char *first_project = cbm_pipeline_project_name(first);
+    cbm_store_t *first_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(first_store);
+    ASSERT_EQ(named_edge_count(first_store, first_project, "USAGE", "active", "users"), 1);
+    cbm_store_close(first_store);
+    cbm_pipeline_free(first);
+
+    write_temp_file(tmp, "tables.sql", "CREATE TABLE people (id INTEGER PRIMARY KEY);\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    const char *second_project = cbm_pipeline_project_name(second);
+    cbm_store_t *second_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(second_store);
+    /* The view's FROM still says `users`, which no longer exists: the old
+     * edge must be gone (no stale lineage), and the unchanged dependent must
+     * not have been rebound to the renamed table either. */
+    ASSERT_EQ(named_edge_count(second_store, second_project, "USAGE", "active", "users"), 0);
+    ASSERT_EQ(named_edge_count(second_store, second_project, "USAGE", "active", "people"), 0);
+    cbm_store_close(second_store);
+    cbm_pipeline_free(second);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Re-indexing only the caller must retain cross-file semantic proof for a
  * callable value whose definition lives in an unchanged file. A fresh full
  * index of the edited sources is the convergence oracle: incremental output
@@ -25536,6 +25720,10 @@ SUITE(pipeline) {
  * the default all-suite run still executes it. */
 SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
+    RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
+    RUN_TEST(pipeline_sequential_usages_caches_repeated_lineage_resolution);
+    RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
+    RUN_TEST(pipeline_dbt_jinja_lineage);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);

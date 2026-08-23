@@ -172,6 +172,35 @@ bool cbm_label_uses_source_span_selection(const char *label) {
                      cbm_label_is_type_like(label) || strcmp(label, "Module") == 0);
 }
 
+// True when `label` names a data relation: SQL CREATE TABLE / CREATE VIEW, and
+// a dbt Model (a Jinja-templated .sql file, which materializes as a warehouse
+// table or view). Relations live in the registry so FROM/JOIN and dbt ref()
+// lineage can resolve, and sharing one label class is what lets a dbt model's
+// ref() reach a Table declared in plain DDL elsewhere in the same repository.
+// They are deliberately NOT type-like: they must never satisfy inheritance,
+// impl-receiver, semantic-type, or LSP-registrar lookups, and resolver
+// fallbacks treat them as lineage-only targets (see cbm_label_is_registry_symbol
+// call sites).
+bool cbm_label_is_relation(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Table") == 0 || strcmp(label, "View") == 0 || strcmp(label, "Model") == 0;
+}
+
+// True when `label` belongs in the cross-file name registry (see cbm.h). Single
+// source of truth for every registry-seeding site — full, parallel and
+// incremental pipelines MUST admit the same set or an incremental re-resolve
+// diverges from a clean full reindex.
+bool cbm_label_is_registry_symbol(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+           cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+           strcmp(label, "Field") == 0 || cbm_label_is_relation(label);
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

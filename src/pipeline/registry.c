@@ -23,6 +23,7 @@ enum { REG_UNSIGNALLED_CANDIDATE_SCAN_LIMIT = 256 };
 
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
+#include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
@@ -282,7 +283,21 @@ typedef struct {
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
+static CBM_TLS CBMHashTable *_lineage_resolve_cache = NULL;
+static CBM_TLS uint32_t _resolve_cache_capacity = 0;
 /* Entries are malloc'd; keys are strdup'd. Both freed in _end. */
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static CBM_TLS uint64_t g_resolve_chain_calls_for_test = 0;
+
+void cbm_registry_resolve_chain_calls_reset_for_test(void) {
+    g_resolve_chain_calls_for_test = 0;
+}
+
+uint64_t cbm_registry_resolve_chain_calls_for_test(void) {
+    return g_resolve_chain_calls_for_test;
+}
+#endif
 
 static void resolve_cache_free_entry(const char *key, void *val, void *ud) {
     (void)ud;
@@ -290,23 +305,50 @@ static void resolve_cache_free_entry(const char *key, void *val, void *ud) {
     free(val);
 }
 
-void cbm_registry_resolve_cache_begin(int estimated_capacity) {
-    if (_resolve_cache) {
-        cbm_ht_foreach(_resolve_cache, resolve_cache_free_entry, NULL);
-        cbm_ht_free(_resolve_cache);
-        _resolve_cache = NULL;
+static void resolve_cache_clear(CBMHashTable **cache) {
+    if (!cache || !*cache) {
+        return;
     }
+    cbm_ht_foreach(*cache, resolve_cache_free_entry, NULL);
+    cbm_ht_free(*cache);
+    *cache = NULL;
+}
+
+static resolve_cache_entry_t *resolve_cache_get(CBMHashTable *cache, const char *callee_name) {
+    return cache ? (resolve_cache_entry_t *)cbm_ht_get(cache, callee_name) : NULL;
+}
+
+static void resolve_cache_put(CBMHashTable *cache, const char *callee_name,
+                              cbm_resolution_t result) {
+    if (!cache) {
+        return;
+    }
+    resolve_cache_entry_t *entry = (resolve_cache_entry_t *)malloc(sizeof(*entry));
+    if (!entry) {
+        return;
+    }
+    entry->res = result;
+    char *key = cbm_strdup(callee_name);
+    if (!key) {
+        free(entry);
+        return;
+    }
+    cbm_ht_set(cache, key, entry);
+}
+
+void cbm_registry_resolve_cache_begin(int estimated_capacity) {
+    resolve_cache_clear(&_resolve_cache);
+    resolve_cache_clear(&_lineage_resolve_cache);
     if (estimated_capacity < 32)
         estimated_capacity = 32;
-    _resolve_cache = cbm_ht_create((uint32_t)estimated_capacity);
+    _resolve_cache_capacity = (uint32_t)estimated_capacity;
+    _resolve_cache = cbm_ht_create(_resolve_cache_capacity);
 }
 
 void cbm_registry_resolve_cache_end(void) {
-    if (!_resolve_cache)
-        return;
-    cbm_ht_foreach(_resolve_cache, resolve_cache_free_entry, NULL);
-    cbm_ht_free(_resolve_cache);
-    _resolve_cache = NULL;
+    resolve_cache_clear(&_resolve_cache);
+    resolve_cache_clear(&_lineage_resolve_cache);
+    _resolve_cache_capacity = 0;
 }
 
 static bool qualified_prefix_related(const char *left, size_t left_len, const char *right,
@@ -960,24 +1002,14 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
-    if (!r || !callee_name) {
-        return empty_result();
-    }
-
-    /* Per-file cache: same callee_name in N call sites → 1 chain walk
-     * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
-        if (cached) {
-            return cached->res;
-        }
-    }
-
+/* The strategy chain shared by both public resolve variants (no caching here —
+ * cbm_registry_resolve owns the per-file cache). */
+static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_resolve_chain_calls_for_test++;
+#endif
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -1022,22 +1054,68 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
     }
+    return res;
+}
+
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+
+    /* Per-file cache: same callee_name in N call sites → 1 chain walk
+     * + N-1 O(1) hash hits. module_qn is constant per file so the
+     * cache key only needs callee_name. */
+    if (_resolve_cache) {
+        resolve_cache_entry_t *cached = resolve_cache_get(_resolve_cache, callee_name);
+        if (cached) {
+            return cached->res;
+        }
+    }
+
+    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
+                                                  import_map_vals, import_map_count);
+
+    /* Data relations (Table/View/Model) are lineage-only registry members: common
+     * table names (users, orders, config) collide with code identifiers across
+     * every language, so the DEFAULT resolve never returns them — a veto, not a
+     * re-route, so a name-collision does not fall through to a weaker strategy.
+     * Every consumer (CALLS/USAGE/READS/WRITES/THROWS/handlers/decorators,
+     * present and future) is thereby relation-safe by construction. The SQL
+     * lineage path opts in via cbm_registry_resolve_lineage. */
+    if (res.qualified_name && res.qualified_name[0] &&
+        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+        res = empty_result();
+    }
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
-        if (e) {
-            e->res = res;
-            char *kdup = strdup(callee_name);
-            if (kdup) {
-                cbm_ht_set(_resolve_cache, kdup, e);
-            } else {
-                free(e);
-            }
-        }
-    }
+    resolve_cache_put(_resolve_cache, callee_name, res);
     return res;
+}
+
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+    /* Relation-permitting variant for SQL FROM/JOIN/ref lineage usages ONLY. Keep
+     * its cache separate from the relation-vetoed default result so neither
+     * variant can poison the other. The table is allocated lazily: non-SQL
+     * files retain the destination parent's exact cache memory behavior. */
+    if (!_lineage_resolve_cache && _resolve_cache_capacity > 0) {
+        _lineage_resolve_cache = cbm_ht_create(CBM_SZ_32);
+    }
+    resolve_cache_entry_t *cached = resolve_cache_get(_lineage_resolve_cache, callee_name);
+    if (cached) {
+        return cached->res;
+    }
+    cbm_resolution_t result = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
+                                                      import_map_vals, import_map_count);
+    resolve_cache_put(_lineage_resolve_cache, callee_name, result);
+    return result;
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

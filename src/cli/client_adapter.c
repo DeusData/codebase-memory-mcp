@@ -57,6 +57,39 @@ static void sb_append(adapter_sb_t *sb, const char *s) {
     sb->buf[sb->len] = '\0';
 }
 
+/* Append a single-quoted JavaScript string literal, escaping the characters
+ * that could terminate or corrupt it. Avoids the fixed buffer sizing that
+ * cbm_client_adapter_escape_js imposes, so long registry descriptions fit. */
+static void sb_append_js_string(adapter_sb_t *sb, const char *s) {
+    if (!s) {
+        sb_append(sb, "''");
+        return;
+    }
+    sb_append(sb, "'");
+    for (const char *p = s; *p; p++) {
+        switch (*p) {
+        case '\\':
+            sb_append(sb, "\\\\");
+            break;
+        case '\'':
+            sb_append(sb, "\\'");
+            break;
+        case '\n':
+            sb_append(sb, "\\n");
+            break;
+        case '\r':
+            sb_append(sb, "\\r");
+            break;
+        default: {
+            char ch[2] = {*p, '\0'};
+            sb_append(sb, ch);
+            break;
+        }
+        }
+    }
+    sb_append(sb, "'");
+}
+
 bool cbm_client_adapter_escape_js(const char *in, char *out, size_t out_sz) {
     if (!in || !out || out_sz == 0) {
         return false;
@@ -128,6 +161,10 @@ char *cbm_client_adapter_pi(const char *binary_path) {
 
     adapter_sb_t sb = {0};
     emit_header(&sb, "pi");
+    /* Pin the coding-agent contract so a probe against @mariozechner/pi
+     * (pods CLI) or an old AgentTool arity cannot be mistaken for this file. */
+    sb_append(&sb, "// Target: @earendil-works/pi-coding-agent >= 0.74.0 (verified 0.84.2)\n"
+                   "// ToolDefinition.execute(toolCallId, params, signal, onUpdate, ctx)\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
@@ -139,7 +176,7 @@ char *cbm_client_adapter_pi(const char *binary_path) {
     sb_append(
         &sb, "async function call(tool, args, signal) {\n"
              "  return new Promise((resolve) => {\n"
-             "    const child = spawn(BIN, ['cli', tool, JSON.stringify(args ?? {})], {\n"
+             "    const child = spawn(BIN, ['cli', '--json', tool, JSON.stringify(args ?? {})], {\n"
              "      stdio: ['ignore', 'pipe', 'pipe'],\n"
              "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
              "    });\n"
@@ -178,11 +215,37 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         if (!name || !name[0]) {
             continue;
         }
-        sb_append(&sb, "  pi.registerTool({ name: '");
-        sb_append(&sb, name);
-        sb_append(&sb, "', run: (args, ctx) => call('");
-        sb_append(&sb, name);
-        sb_append(&sb, "', args, ctx?.signal) });\n");
+        const char *title = cbm_mcp_tool_title(name);
+        const char *description = cbm_mcp_tool_description(name);
+        const char *schema = cbm_mcp_tool_input_schema(name);
+        sb_append(&sb, "  pi.registerTool({\n");
+        sb_append(&sb, "    name: ");
+        sb_append_js_string(&sb, name);
+        sb_append(&sb, ",\n    label: ");
+        sb_append_js_string(&sb, title ? title : name);
+        sb_append(&sb, ",\n    description: ");
+        sb_append_js_string(&sb, description ? description : "");
+        sb_append(&sb, ",\n    parameters: ");
+        /* input_schema is compact JSON, which is a valid JavaScript object
+         * literal; embedding it directly keeps the generated module free of a
+         * JSON.parse indirection and of any escaping drift. */
+        sb_append(&sb, schema ? schema : "{}");
+        /* 0.84.2 calls execute(toolCallId, params, signal, onUpdate, ctx).
+         * The previous (args, ctx) shape bound the call id as the MCP args. */
+        sb_append(&sb, ",\n    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {\n");
+        sb_append(&sb, "      const result = await call(");
+        sb_append_js_string(&sb, name);
+        sb_append(&sb,
+                  ", params, signal ?? ctx?.signal);\n"
+                  "      if (result && typeof result === 'object' && result.error) {\n"
+                  "        throw new Error(String(result.error));\n"
+                  "      }\n"
+                  "      const content = result && Array.isArray(result.content)\n"
+                  "        ? result.content\n"
+                  "        : [{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }];\n"
+                  "      return { content, details: result ?? {} };\n"
+                  "    },\n"
+                  "  });\n");
     }
     sb_append(&sb, "}\n");
 

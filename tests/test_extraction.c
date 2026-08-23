@@ -649,6 +649,15 @@ TEST(java_enum_dedup_preserves_calls_issue1234) {
     ASSERT(has_def(r, "Enum", "Day"));
     ASSERT(has_def(r, "Method", "isWeekend"));
     ASSERT(has_def(r, "Method", "label"));
+    /* The enum CONSTANTS must survive alongside the methods. Reaching the
+     * methods means descending into enum_body_declarations, and the tempting
+     * way to do that -- redirecting the shared find_class_body -- also makes
+     * the constants unreachable, because they are siblings of that node rather
+     * than children. find_class_member_body exists to descend for members only
+     * and leave find_class_body (which extract_enum_members uses) alone; these
+     * two assertions are what stop that distinction being collapsed again. */
+    ASSERT(has_def(r, "Variable", "MON"));
+    ASSERT(has_def(r, "Variable", "SUN"));
     ASSERT(has_def(r, "Class", "DayUtil"));
     ASSERT(has_def(r, "Method", "describe"));
     ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
@@ -827,6 +836,21 @@ TEST(swift_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Vehicle"));
     ASSERT(has_def(r, "Method", "accelerate"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_protocol) {
+    /* A protocol requirement is a bodyless func inside a protocol body. Swift
+     * codebases are heavily protocol-driven, so the requirement is very often
+     * the declaration a reader is actually looking for — before this it was
+     * absent from the graph entirely. */
+    CBMFileResult *r = extract("protocol StudyRunning {\n    func generate() -> String\n}\n",
+                               CBM_LANG_SWIFT, "t", "StudyRunning.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "StudyRunning"));
+    ASSERT(has_def(r, "Method", "generate"));
     cbm_free_result(r);
     PASS();
 }
@@ -2511,6 +2535,152 @@ TEST(sql_invocation_call_edge) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call_exact(r, "get_user_count"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_ddl_node_labels) {
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active_users"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_view_lineage_usages) {
+    /* A view's FROM/JOIN relations are emitted as usages (ref_name = table),
+     * which pass_usages later resolves into view -> table USAGE lineage edges. */
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sql_schema_qualified_name) {
+    /* schema-qualified DDL (schema.table) is named by the table, not the schema,
+     * and FROM schema.table resolves to that table for lineage. */
+    CBMFileResult *r = extract("CREATE TABLE app.users (id INTEGER);\n"
+                               "CREATE VIEW app.active AS SELECT * FROM app.users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active"));
+    int found_users = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "users") == 0) {
+            found_users = 1;
+        }
+    }
+    ASSERT(found_users);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- dbt Jinja lineage --- */
+
+/* Helper: does the file's usage list carry `name`? */
+static int has_usage(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(dbt_model_and_ref_lineage) {
+    /* A dbt model: the file stem is the model identity, and each ref() is a
+     * dependency on another model. The SQL grammar cannot read `{{ ref(..) }}`
+     * at all, so without the dbt pass this file yields no lineage whatsoever. */
+    CBMFileResult *r = extract("SELECT o.id, c.name\n"
+                               "FROM {{ ref('stg_orders') }} o\n"
+                               "JOIN {{ ref('stg_customers') }} c ON c.id = o.customer_id\n",
+                               CBM_LANG_SQL, "t", "models/marts/orders_enriched.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Model", "orders_enriched"));
+    ASSERT(has_usage(r, "stg_orders"));
+    ASSERT(has_usage(r, "stg_customers"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_source_and_two_arg_ref) {
+    /* Both dbt builtins name the relation in their LAST string argument:
+     * source('group','table') -> table, and the two-argument
+     * ref('package','model') form -> model. */
+    CBMFileResult *r = extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
+                               "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
+                               CBM_LANG_SQL, "t", "models/stg_customers.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT(has_def(r, "Model", "stg_customers"));
+    ASSERT(has_usage(r, "customers"));
+    ASSERT(has_usage(r, "legacy_customers"));
+    /* the group/package argument is not the relation */
+    ASSERT_FALSE(has_usage(r, "raw"));
+    ASSERT_FALSE(has_usage(r, "analytics"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_ignores_non_dbt_jinja) {
+    /* Templated SQL is not dbt SQL. An Airflow-style parameter substitution has
+     * Jinja but no dbt builtin, so the dbt pass must contribute NOTHING — no
+     * Model node named after the file, and no usage minted from the template
+     * variables. This is the gate that keeps every non-dbt repository free of
+     * fabricated data-lineage vocabulary.
+     *
+     * The ordinary SQL identifier path is unaffected and still sees the literal
+     * `FROM events`; the second extraction below is the control proving that
+     * usage is pre-existing SQL behaviour rather than anything dbt added. */
+    CBMFileResult *r = extract("SELECT * FROM events WHERE day = '{{ ds }}'\n"
+                               "  AND region = '{{ params.region_code }}'\n",
+                               CBM_LANG_SQL, "t", "queries/daily_events.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(has_def(r, "Model", "daily_events"));
+
+    /* Control: the same statement with the templates replaced by plain string
+     * literals. Both parse as SQL identically, so an equal usage count is the
+     * precise statement of "the dbt pass contributed nothing here" — stronger
+     * than naming individual identifiers, and immune to how SQL happens to
+     * tokenize the template text. */
+    CBMFileResult *plain = extract("SELECT * FROM events WHERE day = '2026-01-01'\n"
+                                   "  AND region = 'eu-west'\n",
+                                   CBM_LANG_SQL, "t", "queries/daily_events.sql");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_FALSE(has_def(plain, "Model", "daily_events"));
+    ASSERT_EQ(r->usages.count, plain->usages.count);
+    ASSERT_EQ(r->defs.count, plain->defs.count);
+    cbm_free_result(plain);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dbt_plain_sql_untouched) {
+    /* Plain DDL keeps producing exactly the Table/View relations it did before
+     * the dbt pass existed — no Model node, and the FROM lineage is unchanged. */
+    CBMFileResult *r = extract("CREATE TABLE users (id INTEGER);\n"
+                               "CREATE VIEW active_users AS SELECT * FROM users;\n",
+                               CBM_LANG_SQL, "t", "schema.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Table", "users"));
+    ASSERT(has_def(r, "View", "active_users"));
+    ASSERT_FALSE(has_def(r, "Model", "schema"));
     cbm_free_result(r);
     PASS();
 }
@@ -6579,6 +6749,7 @@ SUITE(extraction) {
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(swift_class);
+    RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
     RUN_TEST(kotlin_class);
     RUN_TEST(kotlin_operator_and_convention_calls_emit_call_sites);
@@ -6708,6 +6879,13 @@ SUITE(extraction) {
     RUN_TEST(html_elements);
     RUN_TEST(sql_function);
     RUN_TEST(sql_invocation_call_edge);
+    RUN_TEST(sql_ddl_node_labels);
+    RUN_TEST(sql_view_lineage_usages);
+    RUN_TEST(sql_schema_qualified_name);
+    RUN_TEST(dbt_model_and_ref_lineage);
+    RUN_TEST(dbt_source_and_two_arg_ref);
+    RUN_TEST(dbt_ignores_non_dbt_jinja);
+    RUN_TEST(dbt_plain_sql_untouched);
     RUN_TEST(meson_project);
     RUN_TEST(css_rules);
     RUN_TEST(css_function_call_edge);
