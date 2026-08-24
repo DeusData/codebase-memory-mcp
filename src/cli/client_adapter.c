@@ -150,12 +150,16 @@ static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *d
             sb_append(sb, "Type.Union([");
             size_t enum_idx = 0, enum_max = yyjson_arr_size(enum_val);
             for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
-                if (enum_idx > 0) sb_append(sb, ", ");
+                if (enum_idx > 0) {
+                    sb_append(sb, ", ");
+                }
                 yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
                 const char *enum_str = yyjson_get_str(enum_item);
-                sb_append(sb, "Type.Literal(");
-                sb_append_js_string(sb, enum_str);
-                sb_append(sb, ")");
+                if (enum_str) {
+                    sb_append(sb, "Type.Literal(");
+                    sb_append_js_string(sb, enum_str);
+                    sb_append(sb, ")");
+                }
             }
             sb_append(sb, "]");
             if (desc_str) {
