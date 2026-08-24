@@ -153,8 +153,13 @@ static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_
     }
     
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *properties = yyjson_obj_get(root, "properties");
+    if (!root) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
     
+    yyjson_val *properties = yyjson_obj_get(root, "properties");
     if (!properties) {
         sb_append(sb, "Type.Object({})");
         yyjson_doc_free(doc);
@@ -172,6 +177,9 @@ static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_
         if (!prop_name) {
             continue;
         }
+        
+        /* Suppress unused parameter warning */
+        (void)val;
         
         if (!first_prop) {
             sb_append(sb, ",\n");
