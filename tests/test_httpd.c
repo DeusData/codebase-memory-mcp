@@ -1169,22 +1169,31 @@ TEST(ui_server_mutations_require_json_content_type) {
 TEST(ui_server_rpc_allows_only_ui_read_tools) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
-    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
-                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
     char req[1024];
-    snprintf(req, sizeof(req),
-             "POST /rpc HTTP/1.1\r\n"
-             "Content-Type: application/json\r\n"
-             "Content-Length: %d\r\n\r\n%s",
-             (int)strlen(body), body);
     char resp[8192];
-    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
-    ASSERT_GT(n, 0);
-    ASSERT_EQ(th_status(resp), 200);
-    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    int n;
 
-    static const char *blocked_tools[] = {"delete_project", "manage_adr", "ingest_traces",
-                                          "index_repository"};
+    static const char *allowed_tools[] = {"list_projects", "get_code_snippet", "get_graph_schema"};
+    for (size_t i = 0; i < sizeof(allowed_tools) / sizeof(allowed_tools[0]); i++) {
+        char allowed_body[512];
+        snprintf(allowed_body, sizeof(allowed_body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"%s\",\"arguments\":{}}}",
+                 allowed_tools[i]);
+        snprintf(req, sizeof(req),
+                 "POST /rpc HTTP/1.1\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 strlen(allowed_body), allowed_body);
+        n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 200);
+        ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+        ASSERT_NULL(strstr(resp, "UI RPC method is not allowed"));
+    }
+
+    static const char *blocked_tools[] = {"search_graph", "delete_project", "manage_adr",
+                                          "ingest_traces", "index_repository"};
     for (size_t i = 0; i < sizeof(blocked_tools) / sizeof(blocked_tools[0]); i++) {
         char blocked_body[512];
         snprintf(blocked_body, sizeof(blocked_body),
