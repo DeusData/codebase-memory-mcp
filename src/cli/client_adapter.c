@@ -139,6 +139,115 @@ static void emit_header(adapter_sb_t *sb, const char *client) {
               "// are overwritten; edit outside it, or remove the markers to take ownership.\n");
 }
 
+static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *desc_str) {
+    yyjson_val *type_val = yyjson_obj_get(val, "type");
+    yyjson_val *enum_val = yyjson_obj_get(val, "enum");
+    yyjson_val *items_val = yyjson_obj_get(val, "items");
+    const char *type_str = yyjson_get_str(type_val);
+    
+    if (type_str && strcmp(type_str, "string") == 0) {
+        if (enum_val && yyjson_is_arr(enum_val)) {
+            sb_append(sb, "Type.Union([");
+            size_t enum_idx = 0, enum_max = yyjson_arr_size(enum_val);
+            for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+                if (enum_idx > 0) sb_append(sb, ", ");
+                yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
+                const char *enum_str = yyjson_get_str(enum_item);
+                sb_append(sb, "Type.Literal(");
+                sb_append_js_string(sb, enum_str);
+                sb_append(sb, ")");
+            }
+            sb_append(sb, "]");
+            if (desc_str) {
+                sb_append(sb, ", { description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        } else {
+            sb_append(sb, "Type.String(");
+            if (desc_str) {
+                sb_append(sb, "{ description: ");
+                sb_append_js_string(sb, desc_str);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+        }
+    } else if (type_str && strcmp(type_str, "integer") == 0) {
+        sb_append(sb, "Type.Integer(");
+        if (desc_str) {
+            sb_append(sb, "{ description: ");
+            sb_append_js_string(sb, desc_str);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+    } else if (type_str && strcmp(type_str, "number") == 0) {
+        sb_append(sb, "Type.Number(");
+        if (desc_str) {
+            sb_append(sb, "{ description: ");
+            sb_append_js_string(sb, desc_str);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+    } else if (type_str && strcmp(type_str, "boolean") == 0) {
+        sb_append(sb, "Type.Boolean(");
+        if (desc_str) {
+            sb_append(sb, "{ description: ");
+            sb_append_js_string(sb, desc_str);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+    } else if (type_str && strcmp(type_str, "array") == 0) {
+        sb_append(sb, "Type.Array(");
+        if (items_val) {
+            yyjson_val *items_type = yyjson_obj_get(items_val, "type");
+            const char *items_type_str = yyjson_get_str(items_type);
+            if (items_type_str && strcmp(items_type_str, "string") == 0) {
+                sb_append(sb, "Type.String()");
+            } else if (items_type_str && strcmp(items_type_str, "integer") == 0) {
+                sb_append(sb, "Type.Integer()");
+            } else if (items_type_str && strcmp(items_type_str, "number") == 0) {
+                sb_append(sb, "Type.Number()");
+            } else {
+                sb_append(sb, "Type.Any()");
+            }
+        } else {
+            sb_append(sb, "Type.Any()");
+        }
+        if (desc_str) {
+            sb_append(sb, ", { description: ");
+            sb_append_js_string(sb, desc_str);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+    } else {
+        /* Default to Type.Any() for unknown types */
+        sb_append(sb, "Type.Any(");
+        if (desc_str) {
+            sb_append(sb, "{ description: ");
+            sb_append_js_string(sb, desc_str);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+    }
+}
+
+static bool is_property_required(yyjson_val *required, const char *prop_name) {
+    if (!required || !yyjson_is_arr(required)) {
+        return false;
+    }
+    
+    size_t req_idx = 0, req_max = yyjson_arr_size(required);
+    for (req_idx = 0; req_idx < req_max; req_idx++) {
+        yyjson_val *req_item = yyjson_arr_get(required, req_idx);
+        const char *req_name = yyjson_get_str(req_item);
+        if (req_name && strcmp(req_name, prop_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_str) {
     if (!schema_str) {
         sb_append(sb, "Type.Object({})");
@@ -164,7 +273,6 @@ static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_
     
     sb_append(sb, "Type.Object({\n");
     
-    /* Build required properties set for fast lookup */
     bool first_prop = true;
     size_t idx = 0, max = 0;
     yyjson_val *key = NULL, *val = NULL;
@@ -183,26 +291,10 @@ static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_
         sb_append(sb, ": ");
         
         /* Check if property is required */
-        bool is_required = false;
-        if (required && yyjson_is_arr(required)) {
-            size_t req_idx = 0, req_max = yyjson_arr_size(required);
-            for (req_idx = 0; req_idx < req_max; req_idx++) {
-                yyjson_val *req_item = yyjson_arr_get(required, req_idx);
-                const char *req_name = yyjson_get_str(req_item);
-                if (req_name && strcmp(req_name, prop_name) == 0) {
-                    is_required = true;
-                    break;
-                }
-            }
-        }
+        bool is_required = is_property_required(required, prop_name);
         
-        /* Get property type and description */
-        yyjson_val *type_val = yyjson_obj_get(val, "type");
+        /* Get property description */
         yyjson_val *desc_val = yyjson_obj_get(val, "description");
-        yyjson_val *enum_val = yyjson_obj_get(val, "enum");
-        yyjson_val *items_val = yyjson_obj_get(val, "items");
-        
-        const char *type_str = yyjson_get_str(type_val);
         const char *desc_str = yyjson_get_str(desc_val);
         
         /* Build TypeBox type based on JSON schema type */
@@ -210,91 +302,7 @@ static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_
             sb_append(sb, "Type.Optional(");
         }
         
-        if (type_str && strcmp(type_str, "string") == 0) {
-            if (enum_val && yyjson_is_arr(enum_val)) {
-                sb_append(sb, "Type.Union([");
-                size_t enum_idx = 0, enum_max = yyjson_arr_size(enum_val);
-                for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
-                    if (enum_idx > 0) sb_append(sb, ", ");
-                    yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
-                    const char *enum_str = yyjson_get_str(enum_item);
-                    sb_append(sb, "Type.Literal(");
-                    sb_append_js_string(sb, enum_str);
-                    sb_append(sb, ")");
-                }
-                sb_append(sb, "]");
-                if (desc_str) {
-                    sb_append(sb, ", { description: ");
-                    sb_append_js_string(sb, desc_str);
-                    sb_append(sb, " }");
-                }
-                sb_append(sb, ")");
-            } else {
-                sb_append(sb, "Type.String(");
-                if (desc_str) {
-                    sb_append(sb, "{ description: ");
-                    sb_append_js_string(sb, desc_str);
-                    sb_append(sb, " }");
-                }
-                sb_append(sb, ")");
-            }
-        } else if (type_str && strcmp(type_str, "integer") == 0) {
-            sb_append(sb, "Type.Integer(");
-            if (desc_str) {
-                sb_append(sb, "{ description: ");
-                sb_append_js_string(sb, desc_str);
-                sb_append(sb, " }");
-            }
-            sb_append(sb, ")");
-        } else if (type_str && strcmp(type_str, "number") == 0) {
-            sb_append(sb, "Type.Number(");
-            if (desc_str) {
-                sb_append(sb, "{ description: ");
-                sb_append_js_string(sb, desc_str);
-                sb_append(sb, " }");
-            }
-            sb_append(sb, ")");
-        } else if (type_str && strcmp(type_str, "boolean") == 0) {
-            sb_append(sb, "Type.Boolean(");
-            if (desc_str) {
-                sb_append(sb, "{ description: ");
-                sb_append_js_string(sb, desc_str);
-                sb_append(sb, " }");
-            }
-            sb_append(sb, ")");
-        } else if (type_str && strcmp(type_str, "array") == 0) {
-            sb_append(sb, "Type.Array(");
-            if (items_val) {
-                yyjson_val *items_type = yyjson_obj_get(items_val, "type");
-                const char *items_type_str = yyjson_get_str(items_type);
-                if (items_type_str && strcmp(items_type_str, "string") == 0) {
-                    sb_append(sb, "Type.String()");
-                } else if (items_type_str && strcmp(items_type_str, "integer") == 0) {
-                    sb_append(sb, "Type.Integer()");
-                } else if (items_type_str && strcmp(items_type_str, "number") == 0) {
-                    sb_append(sb, "Type.Number()");
-                } else {
-                    sb_append(sb, "Type.Any()");
-                }
-            } else {
-                sb_append(sb, "Type.Any()");
-            }
-            if (desc_str) {
-                sb_append(sb, ", { description: ");
-                sb_append_js_string(sb, desc_str);
-                sb_append(sb, " }");
-            }
-            sb_append(sb, ")");
-        } else {
-            /* Default to Type.Any() for unknown types */
-            sb_append(sb, "Type.Any(");
-            if (desc_str) {
-                sb_append(sb, "{ description: ");
-                sb_append_js_string(sb, desc_str);
-                sb_append(sb, " }");
-            }
-            sb_append(sb, ")");
-        }
+        append_typebox_type(sb, val, desc_str);
         
         if (!is_required) {
             sb_append(sb, ")");
