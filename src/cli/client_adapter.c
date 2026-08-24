@@ -144,53 +144,53 @@ static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_
         sb_append(sb, "Type.Object({})");
         return;
     }
-    
+
     /* Parse the JSON schema to extract properties and convert to TypeBox */
     yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
     if (!doc) {
         sb_append(sb, "Type.Object({})");
         return;
     }
-    
+
     yyjson_val *root = yyjson_doc_get_root(doc);
     if (!root) {
         sb_append(sb, "Type.Object({})");
         yyjson_doc_free(doc);
         return;
     }
-    
+
     yyjson_val *properties = yyjson_obj_get(root, "properties");
     if (!properties) {
         sb_append(sb, "Type.Object({})");
         yyjson_doc_free(doc);
         return;
     }
-    
+
     sb_append(sb, "Type.Object({\n");
-    
+
     bool first_prop = true;
     size_t idx = 0, max = 0;
     yyjson_val *key = NULL, *val = NULL;
-    
+
     yyjson_obj_foreach(properties, idx, max, key, val) {
         const char *prop_name = yyjson_get_str(key);
         if (!prop_name) {
             continue;
         }
-        
+
         /* Suppress unused parameter warning */
         (void)val;
-        
+
         if (!first_prop) {
             sb_append(sb, ",\n");
         }
         first_prop = false;
-        
+
         sb_append(sb, "      ");
         sb_append(sb, prop_name);
         sb_append(sb, ": Type.String()");
     }
-    
+
     sb_append(sb, "\n    })");
     yyjson_doc_free(doc);
 }
